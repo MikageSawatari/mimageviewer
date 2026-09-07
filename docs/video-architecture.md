@@ -47,10 +47,32 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 
 ### Native presenter の表示解像度 scaling
 
-`Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
+通常動画を V で拡大・パンするモードの source 部分矩形、入力所有、surface policy、shader の
+設計正本は [video-zoom-pan-plan.md](video-zoom-pan-plan.md)。このモードも native presenter の
+表示解像度 scaling を使い、倍率変更は swap chain resize ではなく draw 定数だけを更新する。
+
+通常動画の拡大状態は `ViewerContextBundle::video_zoom_state` が viewer context / 項目単位で所有する。
+`App::video_zoom_state` は mount 中の context の投影であり、
+`VideoPlayer::set_native_video_zoom_state` → `SetVideoZoomState` の typed command で render thread の
+`NativeRenderCore::video_zoom_state` へ値 snapshot を渡す。render core は frame の source 寸法、SAR、
+orientation と現在の video target 寸法から、向き補正後 source 座標の origin / extent を draw ごとに
+導出する。activation だけが surface / preparation signature に入り、倍率と中心は入らないため、
+wheel / drag ごとに swap chain を作り直さない。項目変更、fullscreen 終了、park、動画→音声、
+音楽 VST shell への遷移では App state と presenter snapshot を破棄し、次項目へ持ち越さない。
+
+入力可否の共通境界は `native_video_view_input_available` が所有する。fullscreen の対象項目であり、
+動画→音声モードでも同項目の音楽 VST shell でもないことを 360 / 通常動画拡大で共有し、各モードの
+active 条件だけを後段で重ねる。detached 専用 predicate は追加せず、既存 placement の意味を変えない。
+通常動画拡大の wheel は presenter が確定した video target rect 内のポインタ座標を App へ渡し、
+`pointer_region_owns_wheel` が示すシークストリップ、端パネル、モーダルの領域では取得しない。
+左押下は `ZoomPan` がドラッグ終了まで所有する。
+
+通常表示での `Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
 chain を DComp transform で拡大・縮小する。shader を使う 4 方式は映像表示矩形の物理 pixel 寸法で
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
-video visual transform は等倍 + 中央寄せだけになる。
+video visual transform は等倍 + 中央寄せだけになる。通常動画拡大中は `OS に任せる` も標準
+resample を強制し、表示領域全体の surface へ source 部分矩形を resolve する。範囲外は最終 target の
+clear や背面 visual に任せず、Lanczos / nearest / NIS / Anime4K の各 resolve が不透明黒を返す。
 
 ```
 decoder の BGRA frame
@@ -301,7 +323,7 @@ VST3 パネル表示中は callout を描画せず、HUD region にも含めな�
 
 上部情報バーの固定状態は動画専用の `video_top_bar_locked`、動画下部は永続化用の
 `video_seek_bar_locked` / `video_seek_strip_locked` を Settings の正本とする。下部の変更経路は
-`VideoBottomLock::{None, BarOnly, BarAndStrip}` に復元してから App → native command → presenter →
+静止画とも共有する `BottomBarLock::{None, BarOnly, BarAndStrip}` に復元してから App → native command → presenter →
 overlay / layout まで同期し、「バー非固定 + ストリップ固定」を実行時の型で表現しない。
 既定の固定なしは従来の上下端 hover と touch chrome latch による自動表示を維持する。
 上部だけを固定しても下部は固定されず、
@@ -333,7 +355,7 @@ HUD ボタンが表示中ずっと hover もクリックもできなくなる (�
 
 各バーとシークストリップには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
 `ui_fullscreen::draw_icons::draw_seek_lock_icon` を共有し、native 側で同じベクター形状を複製しない。
-クリックは typed overlay command で App へ戻し、下部は `VideoBottomLock` の遷移で永続 bool を更新して
+クリックは typed overlay command で App へ戻し、下部は `BottomBarLock` の遷移で永続 bool を更新して
 `save()` した後、最新の固定状態と余白を presenter へ再同期する。ストリップ鍵は右上 28pt 角、
 現在の範囲表示はその左へ置き、鍵矩形は seek / drag の開始対象から除外する。wheel は鍵上でも
 ストリップの範囲変更として消費する。鍵はストリップ全面の `click_and_drag` と重なるので、
@@ -820,6 +842,11 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 `video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
 明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
 サムネイル軸、2 種類の worker を 1 session として所有する。
+
+通常バーの表示方針とストリップ配置は presenter の `VideoSeekGeometry::resolve` が一度だけ解決する。
+場面サムネイル表示中に通常バーを隠す場合は `normal_bar_height = 0` とし、ストリップ矩形、HUD の
+入力領域、固定映像領域、下端ホバー、左右 / VST パネルが同じ解決値を見る。表示する場合と音声波形
+表示中は `HUD_BOTTOM_HEIGHT` を保つため、従来座標と予約高を変えない。
 
 **全体表示では中心位置は状態ではなく導出値**で、`pin_whole_center` だけが書く。軸の真ん中
 (場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した

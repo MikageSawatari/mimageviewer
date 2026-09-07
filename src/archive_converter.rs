@@ -71,6 +71,11 @@ pub enum ArchiveFormat {
 }
 
 impl ArchiveFormat {
+    /// 通常フォルダで変換対象として扱う非 ZIP アーカイブ形式。
+    ///
+    /// UI で対応形式名を列挙するときもこの一覧を使い、形式追加時に表示だけが古くなるのを防ぐ。
+    pub const CONVERTIBLE: [Self; 3] = [Self::Rar, Self::SevenZ, Self::Lzh];
+
     /// 拡張子から「クリック時に変換ダイアログへ誘導する」形式を判定する。
     /// 大文字小文字無視。対応外なら None。**ZIP/CBZ は含めない** (通常はネイティブの
     /// ZIP 閲覧経路で開くため。`GridItem::ConvertibleArchive` の分類にも使われるので、
@@ -110,6 +115,15 @@ impl ArchiveFormat {
             Self::Lzh => "LZH",
             Self::Zip => "ZIP",
         }
+    }
+
+    /// 変換対象形式の表示名を、設定画面と同じ区切りで返す。
+    pub fn convertible_labels() -> String {
+        Self::CONVERTIBLE
+            .iter()
+            .map(|format| format.label())
+            .collect::<Vec<_>>()
+            .join(" / ")
     }
 }
 
@@ -2017,6 +2031,47 @@ mod tests {
         // CBZ / ZIP はネイティブ ZIP 扱いなので変換フォーマットではない (folder_tree 側で判定)。
         assert_eq!(ArchiveFormat::from_extension("zip"), None);
         assert_eq!(ArchiveFormat::from_extension("cbz"), None);
+        assert_eq!(
+            ArchiveFormat::convertible_labels(),
+            "RAR / 7z / LZH",
+            "一覧や設定で使う形式名は変換対象形式の単一定義から組み立てる"
+        );
+    }
+
+    /// `CONVERTIBLE` と `from_extension` は「どの形式を変換対象として扱うか」という
+    /// 同じ問いに別々に答えている。片方だけ直すと、一覧には出るのに形式名の表示から漏れる
+    /// (またはその逆) という分かれ方をする。**`match` を網羅で書いてあるので、variant を
+    /// 足すとこのテストがコンパイルエラーになる。**
+    #[test]
+    fn convertible_list_and_from_extension_answer_the_same_question() {
+        for format in [
+            ArchiveFormat::Rar,
+            ArchiveFormat::SevenZ,
+            ArchiveFormat::Lzh,
+            ArchiveFormat::Zip,
+        ] {
+            let expected = match format {
+                // 拡張子から変換経路へ誘導する形式。
+                ArchiveFormat::Rar | ArchiveFormat::SevenZ | ArchiveFormat::Lzh => true,
+                // ZIP/CBZ はネイティブに開くので、拡張子からは変換経路へ載せない。
+                ArchiveFormat::Zip => false,
+            };
+            assert_eq!(
+                ArchiveFormat::CONVERTIBLE.contains(&format),
+                expected,
+                "{format:?} の CONVERTIBLE 所属が from_extension の方針と食い違っています"
+            );
+        }
+
+        // `from_extension` が返す形式は必ず `CONVERTIBLE` に居る。
+        for ext in ["rar", "7z", "lzh", "lha", "cbr", "cb7"] {
+            if let Some(format) = ArchiveFormat::from_extension(ext) {
+                assert!(
+                    ArchiveFormat::CONVERTIBLE.contains(&format),
+                    "from_extension({ext:?}) が CONVERTIBLE 外の {format:?} を返しました"
+                );
+            }
+        }
     }
 
     #[test]

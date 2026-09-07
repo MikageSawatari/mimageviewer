@@ -347,6 +347,7 @@ impl App {
                     .is_some_and(|target| target.matches_loaded_container(&src))
             })
             .cloned();
+        self.transition_favorite_view_for_path(Some(&src));
         self.prepare_main_grid_archive_transition_for_load(&transition_owner, &cached_zip);
         self.authorize_smart_folder_session_alias(&src, &cached_zip);
         self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
@@ -360,6 +361,8 @@ impl App {
             .as_ref()
             .is_some_and(|cur| crate::folder_tree::path_eq(cur, &cached_zip))
         {
+            let current = self.effective_folder();
+            self.transition_favorite_view_for_path(current.as_deref());
             return false;
         }
         self.address = src.to_string_lossy().to_string();
@@ -376,7 +379,8 @@ impl App {
         if let Some(state) = restore_bookmark_view {
             self.bookmark_view_state = Some(state);
         }
-        self.archive_source_override = Some(src);
+        self.archive_source_override = Some(src.clone());
+        self.transition_favorite_view_for_path(Some(&src));
         self.commit_main_grid_archive_transition(&transition_owner);
         true
     }
@@ -1058,6 +1062,9 @@ impl App {
                 }
                 if let Some(source) = src.as_deref() {
                     self.authorize_smart_folder_session_alias(source, &nav);
+                    // cache ZIP は実装 alias。初回継承値も user-facing source へ入る直前の
+                    // 有効状態から採る。
+                    self.transition_favorite_view_for_path(Some(source));
                 }
                 self.prepare_main_grid_archive_transition_for_load(&open_owner, &nav);
                 let transition_owner = open_owner.clone();
@@ -1071,6 +1078,8 @@ impl App {
                     .as_ref()
                     .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
                 if !loaded {
+                    let current = self.effective_folder();
+                    self.transition_favorite_view_for_path(current.as_deref());
                     if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                         self.cancel_bookmark_open_request(
                             owner.request_id,
@@ -1099,7 +1108,8 @@ impl App {
                     if let Some(state) = restore_bookmark_view {
                         self.bookmark_view_state = Some(state);
                     }
-                    self.archive_source_override = Some(src);
+                    self.archive_source_override = Some(src.clone());
+                    self.transition_favorite_view_for_path(Some(&src));
                 }
                 self.commit_main_grid_archive_transition(&transition_owner);
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {

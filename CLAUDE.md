@@ -1717,6 +1717,27 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
+6.4. **記録済みクラッシュの棚卸し (最初に回す)**:
+
+   ```powershell
+   .\scripts\check-panic-log.ps1
+   ```
+
+   `%APPDATA%\mimageviewer\logs\panic.log` に残っている panic を種別ごとにまとめ、
+   `docs/panic-acknowledged.tsv` に disposition (`fixed` / `filed` / `external`) が無いものが
+   あれば **exit 1** する。アプリは起動しないし、ログを書き換えもしない。
+
+   - **`panic.log` は起動時にローテーションしない**ので、何日も前のクラッシュがそのまま残る。
+     4 MiB を超えたときだけ `panic.log.bak` へ 1 世代退避するので、script は両方を読む
+   - 落ちたら、**閾値やベースラインで黙らせない**。直す・バックログへ起票する・依存側の問題だと
+     説明する、のいずれかを行い、その結果を tsv へ書く。fingerprint 列は script の出力から
+     コピーする (手で書くと数字の正規化がずれて一致しない)
+   - **これを入れた経緯**: v3.6.0 の出荷直前に「複数ウィンドウで PDF を開くと必ず落ちる」が
+     実機で出た。そのとき panic.log を開いたら、**2026-04 以降のクラッシュが 15 種 52 件**
+     記録されていて、同族の binding 不整合 2 件は 10 日前から入っていた。
+     チェックリストには既に R8「panic.log を確認」があり、**手順ではなく実行が抜けていた**
+     (バックログ §1.196)
+
 6.5. **GitHub Actions の CI が緑であることを確認** (`gh run list --limit 5`)。
    赤なら原因を直してからリリース作業に入る。特に `cargo check (ubuntu / non-Windows cfg)` は
    **`cfg(windows)` 漏れの番人**で、Windows 機のローカルビルドでは原理的に出ない失敗を拾う

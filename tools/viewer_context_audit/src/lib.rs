@@ -17,6 +17,14 @@ use syn::{
 const REGISTRY_PATH: &str = "src/app/viewer_context_registry.rs";
 const APP_TESTS_PATH: &str = "src/app/tests.rs";
 
+/// A6 asks whether a `*_for_test` call sits under `cfg(test)`, but it reads one file at a
+/// time, so a module whose `#[cfg(test)]` attribute lives in the parent file looks like
+/// production code. Name those files here: `src/app/tests.rs`, and anything a `tests`
+/// directory under `src` holds.
+fn is_cfg_test_module_file(relative: &str) -> bool {
+    relative == APP_TESTS_PATH || relative.split('/').any(|segment| segment == "tests")
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Rule {
     A1,
@@ -144,7 +152,6 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items (self) -> & 'a [GridItem]",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_cache (self) -> & 'a ItemsGenerationMap < FsCacheEntry >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_last_sync_stamp (self) -> Option < & 'a ViewerSyncStamp >",
-    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_detached_window_id (self) -> Option < u64 >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pdf_password_request (self) -> Option < & 'a PdfPasswordRequest >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn current_folder (self) -> Option < & 'a Path >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items_generation (self) -> u64",
@@ -171,6 +178,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_main (& self) -> ViewerContextId",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn mounted_viewer_context_id (& self) -> Option < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn detached_viewer_window_id (& self) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window_binding_probe (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
@@ -307,7 +315,7 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         violations.extend(analyze_test_api(
             &relative,
             &source,
-            relative == APP_TESTS_PATH,
+            is_cfg_test_module_file(&relative),
         )?);
     }
     violations.sort_by(|left, right| {
@@ -2062,6 +2070,36 @@ mod tests {
         assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
+    #[test]
+    fn a6_treats_a_tests_directory_module_as_cfg_test() {
+        // `src/ui_fullscreen/tests/*.rs` carries its `#[cfg(test)]` in the parent file, so
+        // reading the module alone must not report its test-only calls as production ones.
+        assert!(is_cfg_test_module_file(APP_TESTS_PATH));
+        assert!(is_cfg_test_module_file(
+            "src/ui_fullscreen/tests/still_seek_rotation.rs"
+        ));
+        assert!(!is_cfg_test_module_file("src/ui_fullscreen.rs"));
+        assert!(!is_cfg_test_module_file("src/tests_helper.rs"));
+
+        let source = r#"
+            fn reads_the_owner(app: &mut App) {
+                app.helper_for_test();
+            }
+        "#;
+        assert!(has_rule(
+            &analyze_test_api("src/fixture.rs", source, false).unwrap(),
+            Rule::A6,
+        ));
+        assert!(!has_rule(
+            &analyze_test_api(
+                "src/ui_fullscreen/tests/still_seek_rotation.rs",
+                source,
+                true,
+            )
+            .unwrap(),
+            Rule::A6,
+        ));
+    }
     #[test]
     fn a2a_flags_bundle_field_swap_but_not_an_unrelated_field() {
         assert_flagged_and_clear(

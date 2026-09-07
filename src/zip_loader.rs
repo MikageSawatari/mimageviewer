@@ -18,8 +18,9 @@
 //! - **ナビゲーション時クリア**: 別フォルダ/ZIP を開いたら `clear_all()` で全破棄し、
 //!   外側 ZIP を切り替えても古いキャッシュが居残らないようにする。
 //!
-//! 外側 ZIP は位置指定 reader の `ZipArchive` template を共有し、request ごとの clone で読む。
-//! clone は独立した論理位置を持つため、同じ書庫の並列読みでも file position は競合しない。
+//! 外側 ZIP は位置指定 reader の `ZipArchive` template をプロセスで共有し、request ごとの clone
+//! で読む。clone は独立した論理位置を持つため、同じ書庫の並列読みでも file position は競合しない。
+//! template は `(path, mtime, len)` で検証する 8 書庫 LRU であり、別 context の移動では消さない。
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
@@ -427,6 +428,7 @@ impl ArchiveDirectoryCache {
             .retain(|entry| entry.key != *key || !Arc::ptr_eq(&entry.slot, slot));
     }
 
+    #[cfg(feature = "dev-tools")]
     fn clear(&self) {
         lock_unpoisoned(&self.inner).entries.clear();
     }
@@ -439,6 +441,16 @@ impl ArchiveDirectoryCache {
     #[cfg(test)]
     fn len(&self) -> usize {
         lock_unpoisoned(&self.inner).entries.len()
+    }
+
+    #[cfg(test)]
+    fn slot_for_path_for_test(&self, path: &Path) -> Option<Arc<ArchiveTemplateSlot>> {
+        let key = ArchiveCacheKey::from_path(path).ok()?;
+        lock_unpoisoned(&self.inner)
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| Arc::clone(&entry.slot))
     }
 }
 
@@ -615,11 +627,19 @@ fn decoded_name_cache_put(
     cache.push((key, map));
 }
 
-/// 外側のフォルダ/ZIP/PDF を切り替えたときに呼ぶ。
-/// 内側 ZIP bytes と外側 ZIP の解析済み目次を破棄し、古い書庫を居残らせない。
-/// 関数名は既存呼び出しとの互換のため維持する。
+/// 外側のフォルダ/ZIP/PDF を切り替えたとき、内側 ZIP bytes だけを破棄する。
+///
+/// 解析済み目次はプロセス共有であり、別 context の移動では失効させない。
+/// `ArchiveCacheKey` の path + mtime + len が変われば次の lookup で自動的に外れ、
+/// 変わらない書庫は 8 書庫上限の LRU 内で再利用する。
 pub fn clear_nested_cache() {
     NESTED_CACHE.clear();
+}
+
+/// ベンチマークで cold miss を再現するためだけに、共有目次 cache を明示的に破棄する。
+/// 通常の navigation / reload から呼んではならない。
+#[cfg(feature = "dev-tools")]
+pub fn clear_archive_directory_cache_for_benchmark() {
     ARCHIVE_DIRECTORY_CACHE.clear();
 }
 
@@ -1702,6 +1722,74 @@ mod tests {
             b"PAGE"
         );
         assert_eq!(cache.parse_count(), 1);
+    }
+
+    #[test]
+    fn clearing_nested_bytes_keeps_the_shared_archive_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unrelated-folder-move.zip");
+        let nested_name = "chapter.zip";
+        write_test_zip(&path, &[("page.jpg", b"PAGE")]);
+
+        assert_eq!(
+            read_with_directory_cache(&ARCHIVE_DIRECTORY_CACHE, &path, "page.jpg", None,).unwrap(),
+            b"PAGE"
+        );
+        let warmed_slot = ARCHIVE_DIRECTORY_CACHE
+            .slot_for_path_for_test(&path)
+            .expect("the parsed directory must be cached");
+        NESTED_CACHE.insert(
+            path.clone(),
+            nested_name.to_owned(),
+            Arc::new(vec![1, 2, 3]),
+        );
+
+        clear_nested_cache();
+
+        assert!(NESTED_CACHE.get(&path, nested_name).is_none());
+        let retained_slot = ARCHIVE_DIRECTORY_CACHE
+            .slot_for_path_for_test(&path)
+            .expect("an unrelated context move must retain the ready directory template");
+        assert!(Arc::ptr_eq(&retained_slot, &warmed_slot));
+        assert_eq!(
+            read_with_directory_cache(&ARCHIVE_DIRECTORY_CACHE, &path, "page.jpg", None,).unwrap(),
+            b"PAGE"
+        );
+        let reused_slot = ARCHIVE_DIRECTORY_CACHE
+            .slot_for_path_for_test(&path)
+            .expect("the next read must retain the ready directory template");
+        assert!(
+            Arc::ptr_eq(&reused_slot, &warmed_slot),
+            "the next read must reuse the same parsed directory"
+        );
+    }
+
+    #[test]
+    fn shared_directory_cache_reparses_when_the_archive_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed-shared.zip");
+        write_test_zip(&path, &[("page.jpg", b"OLD")]);
+        assert_eq!(
+            read_with_directory_cache(&ARCHIVE_DIRECTORY_CACHE, &path, "page.jpg", None,).unwrap(),
+            b"OLD"
+        );
+        let old_slot = ARCHIVE_DIRECTORY_CACHE
+            .slot_for_path_for_test(&path)
+            .expect("the first archive identity must be cached");
+
+        write_test_zip(&path, &[("page.jpg", b"NEW-LONGER")]);
+
+        assert_eq!(
+            read_with_directory_cache(&ARCHIVE_DIRECTORY_CACHE, &path, "page.jpg", None,).unwrap(),
+            b"NEW-LONGER"
+        );
+        let new_slot = ARCHIVE_DIRECTORY_CACHE
+            .slot_for_path_for_test(&path)
+            .expect("the changed archive identity must be cached");
+        assert!(
+            !Arc::ptr_eq(&new_slot, &old_slot),
+            "a size or mtime change must create and parse a new directory template"
+        );
     }
 
     #[test]

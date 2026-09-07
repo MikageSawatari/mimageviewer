@@ -94,8 +94,22 @@ fn extension_might_have_xmp(path: &Path) -> bool {
 ///   先頭付近に置かれるので 512KB あれば実用上十分。これにより UI 同期スレッド
 ///   での丸読みハングを防ぐ。
 pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
+    read_tweet_info_counted(path).info
+}
+
+pub(crate) struct XmpTweetRead {
+    pub info: Option<XmpTweetInfo>,
+    pub bytes_read: u64,
+}
+
+/// `read_tweet_info` と同じ読み取りを行い、perf 計装用に実際にバッファへ
+/// 読み込んだバイト数も返す。
+pub(crate) fn read_tweet_info_counted(path: &Path) -> XmpTweetRead {
     if !extension_might_have_xmp(path) {
-        return None;
+        return XmpTweetRead {
+            info: None,
+            bytes_read: 0,
+        };
     }
     let small_image = matches!(
         lowercase_ext(path).as_deref(),
@@ -104,17 +118,34 @@ pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
         Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
     );
     if small_image {
-        let bytes = std::fs::read(path).ok()?;
-        return read_tweet_info_from_bytes(&bytes);
+        let Ok(bytes) = std::fs::read(path) else {
+            return XmpTweetRead {
+                info: None,
+                bytes_read: 0,
+            };
+        };
+        return XmpTweetRead {
+            info: read_tweet_info_from_bytes(&bytes),
+            bytes_read: bytes.len() as u64,
+        };
     }
     // 大容量コンテナ系: 先頭 FALLBACK_SCAN_LIMIT のみ
     use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
+    let Ok(f) = std::fs::File::open(path) else {
+        return XmpTweetRead {
+            info: None,
+            bytes_read: 0,
+        };
+    };
     let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
-    f.take(FALLBACK_SCAN_LIMIT as u64)
+    let read_ok = f
+        .take(FALLBACK_SCAN_LIMIT as u64)
         .read_to_end(&mut buf)
-        .ok()?;
-    read_tweet_info_from_bytes(&buf)
+        .is_ok();
+    XmpTweetRead {
+        info: read_ok.then(|| read_tweet_info_from_bytes(&buf)).flatten(),
+        bytes_read: buf.len() as u64,
+    }
 }
 
 /// バイト列版 (ZIP 内画像などで使用)。拡張子で事前フィルタできないので、

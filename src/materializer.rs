@@ -38,18 +38,12 @@ pub enum MaterializeSource {
         path: PathBuf,
         target_millis: u64,
     },
-    /// UI スレッドで既に組み上がった画素。見開きの合成がここへ来る。
-    ///
-    /// **ディスク上のどのファイルでもない。** 画素は `MaterializeRequest::rendered_pixels`
-    /// が運ぶ (`Arc<ColorImage>` は Hash にできないので cache key には入れられない)。
-    /// ここには一時ファイル名にする `label` だけを置く。
-    ///
-    /// **画素の指紋は持たない。** 元ファイルが無い = stamp が採れないので、この source は
-    /// `lookup_reusable` にも cache への insert にも通らない (どちらも `modified_ns` を
-    /// 要求する)。同一性を作っても読み手がいないので、v3.5.0 まで UI 入力ハンドラ内で
-    /// 回していた全画素 SHA-256 (実測 12MP で 24ms) は捨てた (レビュー F05)。
-    Rendered {
+    /// 左右を worker で個別に decode・合成してから 1 枚へ連結する見開き。
+    /// 単一の source stamp では表せないため、当面 cache は常に miss とする。
+    MergedSpread {
         label: String,
+        left: Box<MaterializeSource>,
+        right: Box<MaterializeSource>,
     },
 }
 
@@ -74,15 +68,14 @@ impl MaterializeSource {
                 path.display(),
                 *target_millis as f64 / 1000.0
             ),
-            Self::Rendered { label, .. } => label.clone(),
+            Self::MergedSpread { label, .. } => label.clone(),
         }
     }
 
     /// decode / source validation に使う物理ファイル。変換アーカイブでは、利用者から
     /// 見えている書庫ではなく cache ZIP を指す。
     ///
-    /// `Rendered` は物理ファイルを持たないので `None`。**空パスで代用しない** —
-    /// 呼び出し側に「無いときどうするか」を書かせる。
+    /// 見開きは物理ファイルが 2 本あるので None。空パスで代用しない。
     fn source_path(&self) -> Option<&Path> {
         match self {
             Self::File { path, .. } => Some(path),
@@ -90,7 +83,7 @@ impl MaterializeSource {
             Self::PdfPage { pdf_path, .. } => Some(pdf_path),
             // 動画ファイルは実在するので stamp が採れる。同じ位置での再起動は cache に当たる。
             Self::VideoFrame { path, .. } => Some(path),
-            Self::Rendered { .. } => None,
+            Self::MergedSpread { .. } => None,
         }
     }
 
@@ -105,7 +98,7 @@ impl MaterializeSource {
             Self::ZipEntry { .. } => MaterializeSourceKind::ZipEntry,
             Self::PdfPage { .. } => MaterializeSourceKind::PdfPage,
             Self::VideoFrame { .. } => MaterializeSourceKind::VideoFrame,
-            Self::Rendered { .. } => MaterializeSourceKind::Rendered,
+            Self::MergedSpread { .. } => MaterializeSourceKind::MergedSpread,
         }
     }
 
@@ -142,7 +135,7 @@ impl MaterializeSource {
                     .unwrap_or_else(|| "video".to_string());
                 format!("{stem}-{:.3}s.png", *target_millis as f64 / 1000.0)
             }
-            Self::Rendered { label, .. } => format!("{label}.png"),
+            Self::MergedSpread { label, .. } => format!("{label}.png"),
         }
     }
 }
@@ -171,6 +164,15 @@ pub struct PageEditContext {
     pub load_page_params_from_db: bool,
 }
 
+#[derive(Clone)]
+pub enum MaterializePageEdits {
+    Single(PageEditContext),
+    Spread {
+        left: PageEditContext,
+        right: PageEditContext,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MaterializePolicy {
     /// 一時ファイルへ、ページに加えた編集を反映して書き出す。**常に再エンコードする。**
@@ -185,12 +187,8 @@ pub enum MaterializePolicy {
 pub struct MaterializeRequest {
     pub source: MaterializeSource,
     pub policy: MaterializePolicy,
-    pub page_edits: Option<PageEditContext>,
+    pub page_edits: Option<MaterializePageEdits>,
     pub pdf_render_long_edge: u32,
-    /// `MaterializeSource::Rendered` のときだけ `Some`。UI スレッドで組み上げた画素を
-    /// そのまま運ぶ。cache key に入れられない (`Arc<ColorImage>` は Hash ではない) ので
-    /// source ではなく request が持つ。
-    pub rendered_pixels: Option<Arc<egui::ColorImage>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,8 +198,8 @@ pub enum MaterializeSourceKind {
     ZipEntry,
     /// 動画の 1 フレーム。ワーカーで decode する。
     VideoFrame,
-    /// 既に組み上がった画素 (見開き合成)。
-    Rendered,
+    /// worker で左右を合成する見開き。
+    MergedSpread,
     PdfPage,
 }
 
@@ -238,7 +236,7 @@ pub fn decide_materialization(
             MaterializeSourceKind::ZipEntry
             | MaterializeSourceKind::PdfPage
             | MaterializeSourceKind::VideoFrame
-            | MaterializeSourceKind::Rendered => MaterializeDecision::RefuseVirtualPage,
+            | MaterializeSourceKind::MergedSpread => MaterializeDecision::RefuseVirtualPage,
         },
         // 動画・音声 (`OtherFile`) はどちらの一時ポリシーでも実ファイルを渡す。
         // 数 GB を一時フォルダーへ複製する代償が、上書き保存に対する安全側の利益に
@@ -250,7 +248,7 @@ pub fn decide_materialization(
             // 合成・動画フレーム・PDF ページには「編集前のバイト列」が存在しない。
             MaterializeSourceKind::PdfPage
             | MaterializeSourceKind::VideoFrame
-            | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
+            | MaterializeSourceKind::MergedSpread => MaterializeDecision::RenderPng,
         },
         MaterializePolicy::TempEdited => match source {
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
@@ -258,7 +256,7 @@ pub fn decide_materialization(
             | MaterializeSourceKind::ZipEntry
             | MaterializeSourceKind::PdfPage
             | MaterializeSourceKind::VideoFrame
-            | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
+            | MaterializeSourceKind::MergedSpread => MaterializeDecision::RenderPng,
         },
     }
 }
@@ -483,6 +481,29 @@ struct LoadedPageEdits {
     fingerprint: [u8; 32],
 }
 
+enum LoadedMaterializePageEdits {
+    Single(LoadedPageEdits),
+    Spread {
+        left: LoadedPageEdits,
+        right: LoadedPageEdits,
+    },
+}
+
+impl LoadedMaterializePageEdits {
+    fn fingerprint(&self) -> [u8; 32] {
+        match self {
+            Self::Single(edits) => edits.fingerprint,
+            Self::Spread { left, right } => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(b"merged-spread-edits-v1");
+                hasher.update(left.fingerprint);
+                hasher.update(right.fingerprint);
+                hasher.finalize().into()
+            }
+        }
+    }
+}
+
 impl MaterializeSession {
     pub fn ensure_current(&self, cancel: &AtomicBool, generation: u64) -> Result<(), String> {
         check_current(&self.inner, cancel, generation)
@@ -496,16 +517,24 @@ impl MaterializeSession {
     ) -> Result<PreparedMaterializedFile, String> {
         check_current(&self.inner, cancel, generation)?;
 
-        let loaded_edits =
-            if request.policy == MaterializePolicy::TempEdited && request.page_edits.is_some() {
-                Some(self.load_page_edits(
-                    request.page_edits.as_ref().expect("checked above"),
-                    cancel,
-                    generation,
-                )?)
-            } else {
-                None
-            };
+        let loaded_edits = if request.policy == MaterializePolicy::TempEdited {
+            match request.page_edits.as_ref() {
+                Some(MaterializePageEdits::Single(context)) => {
+                    Some(LoadedMaterializePageEdits::Single(
+                        self.load_page_edits(context, cancel, generation)?,
+                    ))
+                }
+                Some(MaterializePageEdits::Spread { left, right }) => {
+                    Some(LoadedMaterializePageEdits::Spread {
+                        left: self.load_page_edits(left, cancel, generation)?,
+                        right: self.load_page_edits(right, cancel, generation)?,
+                    })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let decision = decide_materialization(request.source.source_kind(), request.policy);
         if decision == MaterializeDecision::RefuseVirtualPage {
             return Err(virtual_page_refusal_message(&request.source));
@@ -520,9 +549,10 @@ impl MaterializeSession {
             })?;
             return Ok(PreparedMaterializedFile::direct(direct_path.to_path_buf()));
         }
-        // `Rendered` には元ファイルが無いので stamp を採れない。**空 stamp は cache を
+        // `MergedSpread` には単一の元ファイルが無いので stamp を採れない。**空 stamp は cache を
         // 常に miss させる** (`lookup_reusable` が `modified_ns.is_some()` を要求する)。
-        // 画素は既に手元にあり、やり直しは encode だけなので、これでよい。
+        // 左右 2 source の stamp を単一 source 用 cache key へ不完全に畳まず、見開きは
+        // 当面つねに worker で decode・合成し直す。
         let source_stamp = match request.source.source_path() {
             Some(path) => file_stamp(path)?,
             None => FileStamp::default(),
@@ -530,7 +560,7 @@ impl MaterializeSession {
 
         let edit_fingerprint = loaded_edits
             .as_ref()
-            .map(|loaded| loaded.fingerprint)
+            .map(LoadedMaterializePageEdits::fingerprint)
             .unwrap_or([0; 32]);
         let pdf_render_long_edge = normalized_pdf_render_long_edge(request.pdf_render_long_edge);
         let key = CacheKey {
@@ -570,42 +600,19 @@ impl MaterializeSession {
                     generation,
                 ),
                 MaterializeDecision::RenderPng => {
-                    // 既に組み上がった画素は decode も焼き込みもせず、そのまま encode する。
-                    // 補正・回転・注釈は UI 側で反映済みの表示画素だから。
-                    let image = if let MaterializeSource::Rendered { .. } = &request.source {
-                        let pixels = request
-                            .rendered_pixels
-                            .as_ref()
-                            .ok_or_else(|| "組み上げた画素が渡されていません".to_string())?;
-                        egui::ColorImage::clone(pixels)
-                    } else if let MaterializeSource::VideoFrame {
+                    let image = if let MaterializeSource::VideoFrame {
                         path,
                         target_millis,
                     } = &request.source
                     {
                         decode_video_frame(path, *target_millis)?
                     } else {
-                        let source = composite_source(&request.source)?;
-                        let image = crate::books::decode_composite_source_for_materialization(
-                            &source,
+                        render_materialize_source(
+                            &request.source,
+                            loaded_edits.as_ref(),
                             pdf_render_long_edge,
-                            Arc::clone(cancel),
-                        )?;
-                        image
-                    };
-                    check_current(&self.inner, cancel, generation)?;
-                    let image = if let Some(loaded) = loaded_edits {
-                        if loaded.requires_composite {
-                            crate::books::compose_book_page_for_materialization(
-                                image,
-                                &loaded.snapshot,
-                                Arc::clone(cancel),
-                            )?
-                        } else {
-                            image
-                        }
-                    } else {
-                        image
+                            cancel,
+                        )?
                     };
                     check_current(&self.inner, cancel, generation)?;
                     let rgba = crate::capture::color_image_to_rgba(&image);
@@ -840,7 +847,7 @@ fn virtual_page_refusal_message(source: &MaterializeSource) -> String {
         MaterializeSource::ZipEntry { .. } => "圧縮ファイル内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::PdfPage { .. } => "PDF 内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::File { .. } => "元のファイルを渡せません".to_string(),
-        MaterializeSource::VideoFrame { .. } | MaterializeSource::Rendered { .. } => {
+        MaterializeSource::VideoFrame { .. } | MaterializeSource::MergedSpread { .. } => {
             "見開きの合成と動画のフレームには元のファイルがありません。「一時ファイル」を渡す設定にしてください".to_string()
         }
     }
@@ -905,6 +912,64 @@ fn copy_original_file(
     }
 }
 
+fn render_materialize_source(
+    source: &MaterializeSource,
+    edits: Option<&LoadedMaterializePageEdits>,
+    pdf_render_long_edge: u32,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    match source {
+        MaterializeSource::MergedSpread { left, right, .. } => {
+            let (left_edits, right_edits) = match edits {
+                Some(LoadedMaterializePageEdits::Spread { left, right }) => {
+                    (Some(left), Some(right))
+                }
+                Some(LoadedMaterializePageEdits::Single(_)) => {
+                    return Err("見開きに単ページの編集情報が渡されました".to_string());
+                }
+                None => (None, None),
+            };
+            let left = render_materialize_page(left, left_edits, pdf_render_long_edge, cancel)?;
+            let right = render_materialize_page(right, right_edits, pdf_render_long_edge, cancel)?;
+            crate::capture::combine_spread_color_images(&left, &right)
+        }
+        _ => {
+            let edits = match edits {
+                Some(LoadedMaterializePageEdits::Single(edits)) => Some(edits),
+                Some(LoadedMaterializePageEdits::Spread { .. }) => {
+                    return Err("単ページに見開きの編集情報が渡されました".to_string());
+                }
+                None => None,
+            };
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel)
+        }
+    }
+}
+
+fn render_materialize_page(
+    source: &MaterializeSource,
+    edits: Option<&LoadedPageEdits>,
+    pdf_render_long_edge: u32,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    let source = composite_source(source)?;
+    let image = crate::books::decode_composite_source_for_materialization(
+        &source,
+        pdf_render_long_edge,
+        Arc::clone(cancel),
+    )?;
+    match edits {
+        Some(edits) if edits.requires_composite => {
+            crate::books::compose_book_page_for_materialization(
+                image,
+                &edits.snapshot,
+                Arc::clone(cancel),
+            )
+        }
+        _ => Ok(image),
+    }
+}
+
 fn composite_source(source: &MaterializeSource) -> Result<crate::books::CompositeSource, String> {
     Ok(match source {
         MaterializeSource::File {
@@ -931,7 +996,7 @@ fn composite_source(source: &MaterializeSource) -> Result<crate::books::Composit
         MaterializeSource::File {
             image_page: false, ..
         } => return Err("この実ファイルは画像として実体化できません".to_string()),
-        MaterializeSource::VideoFrame { .. } | MaterializeSource::Rendered { .. } => {
+        MaterializeSource::VideoFrame { .. } | MaterializeSource::MergedSpread { .. } => {
             return Err("この対象は画像 decode 経路へ渡せません".to_string());
         }
     })
@@ -1610,7 +1675,6 @@ mod tests {
             policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
-            rendered_pixels: None,
         }
     }
 
@@ -1816,20 +1880,20 @@ mod tests {
     /// 合成した見開きにも動画のフレームにも、対応する元ファイルは無い。**それらしい
     /// 一時ファイルを「元のファイル」として渡さない。**
     #[test]
-    fn rendered_pixels_encode_under_temp_policies_and_refuse_the_real_file_policy() {
+    fn merged_spreads_encode_under_temp_policies_and_refuse_the_real_file_policy() {
         for policy in [
             MaterializePolicy::TempEdited,
             MaterializePolicy::TempOriginal,
         ] {
             assert_eq!(
-                decide_materialization(MaterializeSourceKind::Rendered, policy),
+                decide_materialization(MaterializeSourceKind::MergedSpread, policy),
                 MaterializeDecision::RenderPng,
                 "{policy:?}"
             );
         }
         assert_eq!(
             decide_materialization(
-                MaterializeSourceKind::Rendered,
+                MaterializeSourceKind::MergedSpread,
                 MaterializePolicy::OriginalFile
             ),
             MaterializeDecision::RefuseVirtualPage
@@ -1843,9 +1907,15 @@ mod tests {
     /// v3.5.0 まで、cache key を作るためだけに UI 入力ハンドラ内で全画素 SHA-256 を回して
     /// いた (実測 12MP で 24ms)。読み手のいない同一性は作らない (レビュー F05)。
     #[test]
-    fn a_rendered_source_is_never_cached_so_it_needs_no_pixel_identity() {
-        let source = MaterializeSource::Rendered {
+    fn a_merged_spread_is_never_cached_with_a_single_source_stamp() {
+        let page = || MaterializeSource::File {
+            path: PathBuf::from("page.png"),
+            image_page: true,
+        };
+        let source = MaterializeSource::MergedSpread {
             label: "spread".to_string(),
+            left: Box::new(page()),
+            right: Box::new(page()),
         };
 
         assert!(
@@ -1858,46 +1928,35 @@ mod tests {
         );
     }
 
-    /// 画素は request が運ぶ。source だけ来て画素が無い組み合わせは**黙って空の PNG を
-    /// 書かず**、失敗として返す。
     #[test]
-    fn a_rendered_source_without_pixels_fails_instead_of_writing_an_empty_image() {
+    fn merged_spread_decodes_both_sources_and_writes_one_image() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = Materializer::new_at(temp.path().join("materialized"), 82, false);
-        let generation = manager.begin_generation();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let request = MaterializeRequest {
-            source: MaterializeSource::Rendered {
-                label: "spread".to_string(),
-            },
-            policy: MaterializePolicy::TempEdited,
-            page_edits: None,
-            pdf_render_long_edge: 4096,
-            rendered_pixels: None,
-        };
-
-        let error = match manager.session().materialize(&request, &cancel, generation) {
-            Ok(_) => panic!("a Rendered source without pixels must not produce a file"),
-            Err(error) => error,
-        };
-        assert!(error.contains("画素"));
-    }
-
-    #[test]
-    fn rendered_pixels_are_written_under_the_label_they_were_given() {
-        let temp = tempfile::tempdir().unwrap();
+        let left_path = temp.path().join("left.png");
+        let right_path = temp.path().join("right.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&left_path)
+            .unwrap();
+        image::RgbaImage::from_pixel(1, 3, image::Rgba([0, 0, 255, 255]))
+            .save(&right_path)
+            .unwrap();
         let manager = Materializer::new_at(temp.path().join("materialized"), 83, false);
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
-        let image = egui::ColorImage::new([2, 1], vec![egui::Color32::from_rgb(9, 9, 9); 2]);
         let request = MaterializeRequest {
-            source: MaterializeSource::Rendered {
+            source: MaterializeSource::MergedSpread {
                 label: "page04_page05".to_string(),
+                left: Box::new(MaterializeSource::File {
+                    path: left_path,
+                    image_page: true,
+                }),
+                right: Box::new(MaterializeSource::File {
+                    path: right_path,
+                    image_page: true,
+                }),
             },
-            policy: MaterializePolicy::TempEdited,
+            policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
-            rendered_pixels: Some(Arc::new(image)),
         };
 
         let prepared = manager
@@ -1910,7 +1969,75 @@ mod tests {
             prepared.path().file_name().unwrap().to_string_lossy(),
             "page04_page05.png"
         );
-        assert!(prepared.path().metadata().unwrap().len() > 0);
+        let image = image::open(prepared.path()).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (3, 3));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(2, 0).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(0, 2).0, [0, 0, 0, 0]);
+    }
+
+    fn loaded_stage(stage: crate::bake_stage::BakeStage) -> LoadedPageEdits {
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.post_filter = crate::adjustment::PostFilter::Sepia;
+        let ai = None;
+        LoadedPageEdits {
+            snapshot: crate::books::BakedEditSnapshot {
+                params,
+                rotation: crate::rotation_db::Rotation::None,
+                conceal: None,
+                erase: None,
+                local_adjust: None,
+                comic: None,
+                comic_source_dims: None,
+                export_crop: None,
+                crop_legacy_writeback: None,
+                format: crate::capture::CaptureFormat::Png,
+                jpeg_matte: crate::capture::JpegMatte::Black,
+                stage,
+                creative_lut: None,
+                ai,
+            },
+            requires_composite: true,
+            fingerprint: [stage as u8; 32],
+        }
+    }
+
+    #[test]
+    fn merged_spread_uses_each_pages_selected_external_tool_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let left_path = temp.path().join("stage-left.png");
+        let right_path = temp.path().join("stage-right.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([40, 160, 220, 255]))
+            .save(&left_path)
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([220, 40, 80, 255]))
+            .save(&right_path)
+            .unwrap();
+        let source = MaterializeSource::MergedSpread {
+            label: "stage-spread".to_string(),
+            left: Box::new(MaterializeSource::File {
+                path: left_path,
+                image_page: true,
+            }),
+            right: Box::new(MaterializeSource::File {
+                path: right_path,
+                image_page: true,
+            }),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let edits = LoadedMaterializePageEdits::Spread {
+            left: loaded_stage(crate::bake_stage::BakeStage::Edits),
+            right: loaded_stage(crate::bake_stage::BakeStage::Edits),
+        };
+        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel).unwrap();
+        let display = LoadedMaterializePageEdits::Spread {
+            left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
+            right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
+        };
+        let adjusted = render_materialize_source(&source, Some(&display), 4096, &cancel).unwrap();
+
+        assert_eq!(plain.size, adjusted.size);
+        assert_ne!(plain.pixels, adjusted.pixels);
     }
 
     #[test]
@@ -2107,7 +2234,6 @@ mod tests {
             policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
-            rendered_pixels: None,
         };
 
         let prepared = manager

@@ -27,6 +27,7 @@ pub(crate) struct RestorePresence {
     pub(crate) local_adjustments: BTreeSet<String>,
     pub(crate) comics: BTreeSet<String>,
     pub(crate) rotations: BTreeSet<String>,
+    pub(crate) crops: BTreeSet<String>,
     /// Destination page keys with any restored sidecar-backed edit. The UI uses this union to
     /// evict only thumbnails that may have materialized the pre-restore edit-preview state.
     pub(crate) page_edits: BTreeSet<String>,
@@ -628,6 +629,9 @@ fn load_restore_runtime_updates(
             .is_some_and(|objects| !objects.is_empty())
         {
             presence.comics.insert(key.clone());
+        }
+        if entry.export_crop.is_some() {
+            presence.crops.insert(key.clone());
         }
         if let Some((folder, rel_key)) = sidecar_coords_for_key(&families, &key) {
             mirrors.push(RestoreSidecarMirror {

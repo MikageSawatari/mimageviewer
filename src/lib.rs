@@ -5,6 +5,22 @@
 //! integration tests share one compiled crate instead of compiling the same
 //! modules independently from both `main.rs` and `lib.rs`.
 
+/// Windows' process heap serialises large allocations behind one lock, and this app
+/// allocates from many threads at once: decode workers hand back megabyte buffers while
+/// the UI thread wants a few hundred kilobytes to draw the next page.
+///
+/// Measured on 2026-09-05, that lock was the page-turn hitch. Spans that allocated ran at
+/// 12% busy - time passing without cycles accruing - while the arithmetic between them,
+/// microseconds away on the same thread, ran at 98%. Removing one allocation from the
+/// hot path took its span from 12% to 96% busy, and the same signature then showed up in
+/// other spans that allocate, because the contention is the heap rather than any one
+/// caller.
+///
+/// mimalloc gives each thread its own arena, so the contention has nowhere to happen
+/// rather than being moved from one caller to the next.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
@@ -86,6 +102,7 @@ pub mod external_links;
 pub mod external_metadata;
 pub mod external_tool;
 pub mod fast_resize;
+mod favorite_view_state;
 pub mod file_drag;
 pub mod filename_sort;
 pub mod filename_stack;
@@ -178,6 +195,7 @@ pub mod rating_write_worker;
 mod remote_ipc;
 pub mod rename_key_migration;
 pub mod ring_shortcut;
+mod rotation_cache;
 pub mod rotation_db;
 pub mod save_with_metadata;
 pub mod search_index_db;
@@ -219,6 +237,8 @@ mod ui_crop;
 pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]
+pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapshot_fixture;
@@ -231,7 +251,7 @@ mod ui_fullscreen;
 pub use ui_fullscreen::{
     draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
     draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 pub mod ui_helpers;
 mod ui_main;
@@ -1365,6 +1385,7 @@ pub fn run() -> eframe::Result {
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();
             app.hydrate_adjustment_favorite_params();
+            app.hydrate_favorite_view_states();
             emit_startup("hydrate_adj_favs", Some(t));
             // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
             // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、

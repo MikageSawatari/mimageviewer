@@ -149,8 +149,7 @@ impl App {
 
     fn clear_snapshot_index_space_derived_state(&mut self) {
         self.slideshow_scroll_range_cache = None;
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.continuous_reading_scroll_transition = None;
@@ -753,7 +752,7 @@ impl App {
         // 「★バッジが全部消える」「★一時解除中が発動しない」原因になる)。
         // 既存の load_folder 経路 (= self.start_loading_items) と同様に invalidate する。
         self.rating_cache.clear();
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.clear_tags_cache();
         self.mark_color_filter_scope_dirty();
 

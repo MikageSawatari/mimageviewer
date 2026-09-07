@@ -252,34 +252,124 @@ pub struct MonoToneAxis {
 /// 残差を返す。平均・共分散・主成分軸は許容値に依存しないため、この値は
 /// `mono_tolerance` が変わっても再利用できる。判定不能な極小サンプル、
 /// ほぼ単色な画像、主成分軸が縮退した画像では `None` を返す。
+/// Wall and executed cycles for the three parts of `mono_tone_axis`.
+///
+/// Its caller measured 7.5% busy - it waits rather than computes - and the only
+/// operations here that can wait are the two allocations and touching the source
+/// pixels. This says which, without guessing a tenth time.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MonoToneAxisTiming {
+    pub sample_ms: f64,
+    pub sample_cycles: u64,
+    pub compute_ms: f64,
+    pub compute_cycles: u64,
+    pub residual_ms: f64,
+    pub residual_cycles: u64,
+}
+
+#[cfg(windows)]
+static MONO_TIMING: std::sync::Mutex<Option<MonoToneAxisTiming>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn cycles_now() -> u64 {
+    let mut c = 0u64;
+    unsafe {
+        let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
+            windows::Win32::System::Threading::GetCurrentThread(),
+            &mut c,
+        );
+    }
+    c
+}
+
+/// Take and clear the accumulated split. Returns `None` when nothing ran.
+#[cfg(windows)]
+pub fn take_mono_tone_axis_timing() -> Option<MonoToneAxisTiming> {
+    MONO_TIMING.lock().ok().and_then(|mut slot| slot.take())
+}
+
+#[cfg(not(windows))]
+pub fn take_mono_tone_axis_timing() -> Option<()> {
+    None
+}
+
+thread_local! {
+    /// Reused sample and residual buffers.
+    ///
+    /// Both are bounded by `MONO_SAMPLE_LIMIT`, so a fresh `Vec` each call asked the
+    /// process heap for ~200KB and ~64KB every time. Those sizes are above the low
+    /// fragmentation heap's threshold, so they take the general, lock-protected path -
+    /// contended against decode workers allocating megabytes. Measured on 2026-09-05:
+    /// the two allocating parts of this function ran at 12.2% and 11.5% busy while the
+    /// arithmetic between them ran at 98.2%. The wait was the allocator, not the work.
+    static MONO_SCRATCH: std::cell::RefCell<(Vec<[f32; 3]>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
+    // Reentrancy would only mean falling back to owned buffers, never wrong numbers.
+    MONO_SCRATCH
+        .with(|scratch| {
+            scratch.try_borrow_mut().ok().map(|mut buffers| {
+                let (samples, residuals) = &mut *buffers;
+                mono_tone_axis_with(src, samples, residuals)
+            })
+        })
+        .unwrap_or_else(|| {
+            let (mut samples, mut residuals) = (Vec::new(), Vec::new());
+            mono_tone_axis_with(src, &mut samples, &mut residuals)
+        })
+}
+
+fn mono_tone_axis_with(
+    src: &ColorImage,
+    samples: &mut Vec<[f32; 3]>,
+    residuals: &mut Vec<f32>,
+) -> Option<MonoToneAxis> {
     let total = src.pixels.len();
     if total == 0 {
         return None;
     }
+    // Only read the clocks when the log will use them: this runs on every page turn.
+    #[cfg(windows)]
+    let timing_on = crate::perf::is_enabled();
+    #[cfg(windows)]
+    let sample_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
-    let samples: Vec<[f32; 3]> = src
-        .pixels
-        .iter()
-        .step_by(stride)
-        .filter(|pixel| pixel.a() >= 16)
-        .take(MONO_SAMPLE_LIMIT)
-        .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
-        .collect();
+    samples.clear();
+    samples.reserve(MONO_SAMPLE_LIMIT);
+    samples.extend(
+        src.pixels
+            .iter()
+            .step_by(stride)
+            .filter(|pixel| pixel.a() >= 16)
+            .take(MONO_SAMPLE_LIMIT)
+            .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32]),
+    );
+    #[cfg(windows)]
+    let (sample_ms, sample_cycles) = sample_started.map_or((0.0, 0), |(t, c)| {
+        (
+            t.elapsed().as_secs_f64() * 1000.0,
+            cycles_now().saturating_sub(c),
+        )
+    });
     if samples.len() < 8 {
         return None;
     }
+    #[cfg(windows)]
+    let compute_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
 
     let inv_n = 1.0 / samples.len() as f32;
     let mut mean = [0.0_f32; 3];
-    for sample in &samples {
+    for sample in samples.iter() {
         for channel in 0..3 {
             mean[channel] += sample[channel] * inv_n;
         }
     }
 
     let mut covariance = [[0.0_f32; 3]; 3];
-    for sample in &samples {
+    for sample in samples.iter() {
         let d = [
             sample[0] - mean[0],
             sample[1] - mean[1],
@@ -310,22 +400,42 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
         axis = [next[0] / length, next[1] / length, next[2] / length];
     }
 
-    let mut residuals = samples
-        .iter()
-        .map(|sample| {
-            let d = [
-                sample[0] - mean[0],
-                sample[1] - mean[1],
-                sample[2] - mean[2],
-            ];
-            let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
-            let residual_sq =
-                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
-            residual_sq.sqrt()
-        })
-        .collect::<Vec<_>>();
+    #[cfg(windows)]
+    let (compute_ms, compute_cycles) = compute_started.map_or((0.0, 0), |(t, c)| {
+        (
+            t.elapsed().as_secs_f64() * 1000.0,
+            cycles_now().saturating_sub(c),
+        )
+    });
+    #[cfg(windows)]
+    let residual_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
+    residuals.clear();
+    residuals.reserve(samples.len());
+    residuals.extend(samples.iter().map(|sample| {
+        let d = [
+            sample[0] - mean[0],
+            sample[1] - mean[1],
+            sample[2] - mean[2],
+        ];
+        let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+        let residual_sq =
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+        residual_sq.sqrt()
+    }));
     let percentile_index = required_mono_inliers(residuals.len()) - 1;
     let (_, p95, _) = residuals.select_nth_unstable_by(percentile_index, |a, b| a.total_cmp(b));
+    #[cfg(windows)]
+    if timing_on && let Ok(mut slot) = MONO_TIMING.lock() {
+        let acc = slot.get_or_insert_with(MonoToneAxisTiming::default);
+        acc.sample_ms += sample_ms;
+        acc.sample_cycles += sample_cycles;
+        acc.compute_ms += compute_ms;
+        acc.compute_cycles += compute_cycles;
+        if let Some((t, c)) = residual_started {
+            acc.residual_ms += t.elapsed().as_secs_f64() * 1000.0;
+            acc.residual_cycles += cycles_now().saturating_sub(c);
+        }
+    }
     Some(MonoToneAxis {
         mean,
         axis,

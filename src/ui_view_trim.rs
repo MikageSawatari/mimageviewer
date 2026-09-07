@@ -907,7 +907,7 @@ impl App {
     #[cfg(windows)]
     fn detached_view_trim_runtime_window_id(&self) -> Option<u64> {
         self.viewer_session_is_detached()
-            .then_some(self.detached_viewer_window_id)
+            .then_some(self.detached_viewer_window_id())
             .flatten()
     }
 

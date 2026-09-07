@@ -5,6 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! {
+    static READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn read_operations_for_test() -> usize {
+    READ_OPERATIONS.get()
+}
+
 /// 回転角度 (時計回り)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rotation {
@@ -84,12 +94,26 @@ impl RotationDb {
     }
 
     pub fn open_readonly() -> Result<Self, rusqlite::Error> {
+        Self::open_readonly_at(&Self::db_path())
+    }
+
+    pub(crate) fn open_readonly_at(path: &Path) -> Result<Self, rusqlite::Error> {
+        #[cfg(test)]
+        READ_OPERATIONS.set(READ_OPERATIONS.get() + 1);
         let conn = rusqlite::Connection::open_with_flags(
-            Self::db_path(),
+            path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self { conn })
+    }
+
+    /// The open connection already knows this path; this accessor performs no I/O.
+    pub(crate) fn file_path(&self) -> Option<PathBuf> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 
     /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。
@@ -128,6 +152,8 @@ impl RotationDb {
     /// 正規化済みページキーから回転角度を取得し、DB/query failure を呼び出し側へ返す。
     /// 元ファイルを外部編集へ渡せるかの最終 guard など、失敗を「回転なし」と扱えない経路で使う。
     pub fn get_key_checked(&self, key: &str) -> Result<Option<Rotation>, rusqlite::Error> {
+        #[cfg(test)]
+        READ_OPERATIONS.set(READ_OPERATIONS.get() + 1);
         use rusqlite::OptionalExtension as _;
 
         let mut stmt = self
@@ -156,6 +182,8 @@ impl RotationDb {
             .collect::<Vec<_>>();
         let mut result = HashMap::new();
         for chunk in keys.chunks(500) {
+            #[cfg(test)]
+            READ_OPERATIONS.set(READ_OPERATIONS.get() + 1);
             let placeholders = (1..=chunk.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()

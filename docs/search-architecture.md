@@ -487,6 +487,9 @@ UI (render_search_bar)
     Pass 2 (Image / Video、on-demand メタ):
        - target に応じて必要なメタだけ読む (PNG tEXt / JPEG EXIF UserComment AI メタ / EXIF / XMP /
          動画コンテナメタ / dc:subject)
+       - 専用 `rayon::ThreadPool` の 8 並列。背景索引用 `ActivityGate` には載せない
+       - XMP cache miss は正規化 path ごとの `OnceLock` で 1 回だけ読み、
+         同じ path が items に重複しても addition は 1 key だけ返す
     → 検索中は item 単位の done/total を SearchPending の atomic snapshot に反映
     → 合格 idx を HashSet<usize> に反映 (search_filter)
 ```
@@ -501,6 +504,16 @@ UI (render_search_bar)
   画像のメタ検索は行わない (§4.6)。
 - 検索中表示は処理済み item 数 / 総 item 数を出す。1 item 内のメタ読み取り中は、その item が完了するまで
   数字は進まない。
+- **PNG の path/bytes 経路は同じ `Read + Seek` チャンク走査を使う**。path は
+  `File`、ZIP 等の bytes は `Cursor<&[u8]>` を渡し、署名と各 chunk header、
+  `tEXt` / `zTXt` / `iTXt` payload だけを読む。IDAT 等は payload + CRC を
+  seek するため、IDAT 後方の text も拾いつつ画像データ本体を読まない。
+- **JPEG EXIF は marker header だけを辿り、SOS/EOI 前の prefix を
+  `rexif::parse_buffer` に渡す**。prefix 上限は 16 MiB。破損 marker / 上限超過は
+  EXIF 無しとし、全体読みへ fallback しない。TIFF は任意 offset の IFD を保つため
+  magic で明示分岐した全体読みを維持する。
+- cancel は各 Pass 2 item の開始前に確認する。既に開始した最大 8 件は完了を待ち、
+  そこまでの match を従来どおり部分結果として返す。
 - 件数バッジは可視マッチ全体を「X/Y 件」で数える。
 - フィルタが効いている元フォルダでは BS / Alt+↑ / アドレスバーの ⬆ による
   親移動を no-op / disabled にする。検索結果から子フォルダへ入った後は既存どおり
@@ -511,6 +524,13 @@ on-demand で必要なソースだけを読む方が (a) 検索漏れゼロ、(b
 一覧」だけに閉じられる、(c) 実装が単純。重い読み取りは worker スレッド上で
 行い、UI スレッドでは実行しない。詳細は
 [search-container-item-redesign.md](search-container-item-redesign.md) §4.1。
+
+`--perf-log` では `search.metadata_filter_done` を 1 検索 1 件記録する。
+`pass1_ms` / `pass2_ms` / `total_ms`、`items_total` / `items_scanned` /
+`pass2_items`、`pass2_file_reads`、`bytes_read`、`matches`、`cancelled` を
+含む。FFmpeg が内部で読む正確なバイト数は取得できないため、該当件数は
+`unmeasured_video_reads` に分離する。
+`python scripts/analyze_perf.py <log> metadata-search` で検索ごとの値と中央値を表示できる。
 
 ### 5.3 Ctrl+G — グローバルメタ検索 (streaming)
 

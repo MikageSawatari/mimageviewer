@@ -49,6 +49,66 @@ Path 経由のヘルパーは使わない。
 
 ---
 
+## 1.2 遅いフレームを壁時計だけで割らない — 計算と待ちは別物
+
+**`Instant` は「実行した時間」ではなく「経過した時間」を測る。** スレッドがロックや
+アロケータを待っている間も進むので、壁時計だけを段に分けていくと、**待ち時間は必ずどこかの
+段に付いて回る**。そこに重い処理が無くても、である。
+
+`App::thread_cycles_now()` (`QueryThreadCycleTime`) は**そのスレッドが実際に実行した
+サイクル数**を返す。壁時計と並べると区別がつく:
+
+- `cycles / ms` がマシンのクロック相当 → **計算している**。関数を軽くする話
+- クロックの一部しか出ない → **待っている**。関数をいくら分割しても見つからない
+
+### 2026-09-05 の実例 — これを 8 段階遅れて気付いた
+
+「ページ送り中に 1 秒に 1 回ほど短く止まる」という報告を、壁時計だけで
+`App::update` → fullscreen render → land_target → wrapper → page turn decision →
+`ensure_passthrough_rendition` → `build_pixels` と **8 段階**割った。分割は毎回正しく
+1 か所へ収束したのに、**その関数には 15ms も使う処理が無かった** (サンプル上限 16,384、
+ソートではなく `select_nth`、96% の呼び出しは何も生成しない)。
+
+サイクル数を並べた瞬間に分かった:
+
+| フレームの壁時計 | 実行速度 |
+| --- | ---: |
+| 5ms 未満 | 96.8% |
+| 20〜60ms | 14.8% |
+| 60ms 超 | **8.4%** |
+
+**79ms のフレームで実際に計算していたのは約 6.6ms 分**だった。さらに同じ関数の中を
+3 つに割ると、**確保を伴う 2 区間が 12%、その間の演算だけが 98%**。数マイクロ秒しか
+離れていない区間で差が出たので、システム負荷でもスケジューリングでもなく
+**アロケータの待ち**と確定した。
+
+原因は Windows のプロセスヒープ。**大きい確保 (LFH の閾値 ~16KB 超) はグローバルロック付きの
+汎用パス**を通り、デコードワーカーが MB 単位で確保・解放する裏で UI スレッドが待たされていた。
+Rust に GC は無く、`Vec` の確保はそのまま `HeapAlloc` へ行く。
+
+対処は 2 段階:
+
+1. **上限が決まっているバッファを使い回す** (`colorize::mono_tone_axis` の thread-local scratch)。
+   その区間は 12.2% → 95.6% busy。ただし**待ちは隣の段へ移動した** — 共有ロックの典型。
+2. **`mimalloc` を `#[global_allocator]` にする** (`src/lib.rs`)。スレッドごとの領域を持つので
+   競合が構造的に消える。**フレームの待ち 63% → 5%**、5ms 未満のフレーム 91.5% → 99.0%、
+   60ms 超 0.22% → 0.02%。全バケットが 96〜98% busy になった。
+
+**教訓**: 遅いフレームを見つけたら、割り始める前に **1 回だけサイクル数を測る**。
+「計算しているのか、待っているのか」で打つ手が全く違う。
+
+### 恒久的に使える計装
+
+perf ログ有効時のみ動作し、無効時は時計を読まない:
+
+- `frame.begin` の `prev_update_ms` / `prev_update_cycles_per_ms` — フレーム全体の実行率
+- `frame.begin` の `prev_outside_ms` — eframe の描画と present (= 自分のコードの外)
+- `ui.update_breakdown` (23 段) / `ui.fs_render_breakdown` (56 段) — 各段の `_ms` と `_cycles`
+
+**待ちを疑うときは `_ms` と `_cycles` を必ず対で読む。**
+
+---
+
 ## 2. 非同期 I/O の実装テンプレ
 
 ```rust
@@ -188,6 +248,34 @@ queue + boot-retry のままで、worker は JSON の write / remove / rename �
 保留する typed state が必要であり、保存だけを先行させてはならない。
 
 ---
+
+### 2.5 静止画シーク回転 reader の所有境界
+
+`RotationCache` は既存の item-index 回転 map と `StillSeekRotationsPending { cancel, rx,
+generation, requests }` を一緒に持つ。`ViewerContextBundle` は従来の `rotation_cache` の
+交換・退避経路をそのまま使い、fork の clone は確定値だけをコピーして pending を共有しない。
+detached の述語・viewport routing・ジェスチャ・サムネイル要求の ownership は変更しない。
+
+- 新しい取得範囲は古い pending を cancel する。同じ範囲を待つ frame は再起動しない。
+- 列/preview が要求を持たなくなるとき、fullscreen 終了、items 差し替え、回転値の失効、
+  metadata import による cache 置換、owner の drop で対応する pending を cancel する。
+- worker は open 前・ページごとの SELECT 前・結果送信前に cancel を確認する。
+- poll は items generation を照合し、`entry.or_insert` 相当で新しい UI の回転を優先する。
+  他 context の cache・token は触らない。結果到着時に起点 viewport を wake し、UI は待機しない。
+
+`--perf-log` の `still_seek.rotation_read` は worker の DB open + read 時間 (`ms`)、件数、
+失敗有無を持つ。保存回転が未確定の表示と見開き依存は [display-pipeline.md §1.6](display-pipeline.md#16-静止画シーク列プレビューの保存回転) を参照。
+
+**操作時の設定保存は今回の明示的な例外として残す。** 列の開閉・バー/列固定の
+`settings.save()` は毎 frame ではなく、設定が変わる操作時だけ呼ばれる。
+2026-09-07、隔離した設定 DB + お気に入り上限 100 件で実 API を 51 回測定した結果は、
+初回（世代バックアップ込み）8.319ms、以後 50 回の中央値 2.111ms / p95 3.206ms / 最大 6.176ms。
+測定コマンドは `cargo test -p mimageviewer --lib still_seek_settings_save_measurement -- --ignored --nocapture`。
+これはこの環境の測定であり、低速ディスクでの上限保証ではない。全設定 snapshot の保存・
+最初の user save の世代管理を共有しているため、列の操作だけを非同期にすると他の同期保存より
+古い snapshot が後着する可能性がある。頻度と測定値を根拠に今回は維持し、非同期化する場合は
+全 Settings writer の順序保証をまとめて扱う。「描画時の回転 read は非同期」と、
+「設定変更操作まで含めて一切同期 I/O がない」は区別する。
 
 ## 3. GPU テクスチャアップロード
 

@@ -1616,6 +1616,15 @@ fn fs_anime4k_resolve(@builtin(position) position: vec4<f32>) -> @location(0) ve
     let oriented_source_position = params.source_region.xy
         + target_position * params.source_region.zw / vec2<f32>(params.output_size)
         - vec2<f32>(0.5, 0.5);
+    let raw_size = vec2<f32>(params.source_size);
+    let oriented_size = vec2<f32>(
+        dot(abs(params.inverse_x), raw_size),
+        dot(abs(params.inverse_y), raw_size),
+    );
+    if any(oriented_source_position < vec2<f32>(-0.5))
+        || any(oriented_source_position >= oriented_size - vec2<f32>(0.5)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     let source_position = oriented_source_position.x * params.inverse_x
         + oriented_source_position.y * params.inverse_y
         + params.inverse_offset;

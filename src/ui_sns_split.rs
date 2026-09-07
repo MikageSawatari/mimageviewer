@@ -2240,13 +2240,17 @@ mod tests {
         );
         assert_eq!(state.sns_split_frames, expected_frames);
         assert_eq!(state.selection, original_selection);
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Single(page) => {
-                assert_eq!(page.base_pixels.size, image_size);
-                assert_eq!(page.base_pixels.pixels[0], egui::Color32::RED);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert_eq!(page.predicted_size, image_size);
+                assert!(matches!(
+                    page.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == &app.tmp.path().join("sns-left.png")
+                ));
             }
-            crate::export_dialog::ExportPixels::Spread { .. } => {
-                panic!("SNS 分割は編集対象の単ページだけを snapshot する")
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("SNS 分割は編集対象の単ページだけを worker 合成へ渡す")
             }
         }
     }

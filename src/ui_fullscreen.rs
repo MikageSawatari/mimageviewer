@@ -19,6 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,8 +28,10 @@ use crate::ai::ModelKind;
 use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
-    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOpenPerfRecorder, FsOpenPerfSpan,
+    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, PassthroughRenditionPerfCall, PassthroughRenditionPerfRecorder,
+    PassthroughRenditionPerfSpan, PollPrefetchOrigin, ViewerPresentation,
     build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
@@ -81,6 +84,1393 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 /// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
+
+const FS_RENDER_PERF_STAGE_COUNT: usize = 56;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsRenderPerfStage {
+    FrameStart,
+    HarvestPageDims,
+    ReconcileFullscreenPageSlice,
+    FsPageTurnDecisionForFrame,
+    PageTurnTargetLoadAndPrefetchWindow,
+    PollPrefetch,
+    NativeVideoBackdrop,
+    StatePrecompute,
+    ViewportPreparation,
+    ViewportRender,
+    FsViewportBreakdownEmit,
+    ViewportShownStateUpdate,
+    FsNavigationClose,
+    FsNavigationCtrlSiblingMouse,
+    FsNavigationPageOther,
+    FsNavigationBeginSequence,
+    FsNavigationLandSeekContinuous,
+    FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+    FsNavigationLandOpenOtherPageDecisionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionRemainder,
+    FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+    FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+    FsNavigationLandOpenOtherVideoAudioVst,
+    FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+    FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+    FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+    FsNavigationLandOpenOtherFullscreenCursorState,
+    FsNavigationLandOpenOtherRemainder,
+    FsNavigationLandOpenRecordReadingHistory,
+    FsNavigationLandOpenRecordBookResume,
+    FsNavigationLandOpenStartMetadataLoad,
+    FsNavigationLandOpenStartFsLoad,
+    FsNavigationLandOpenUpdatePrefetchWindow,
+    FsNavigationLandOpenRefreshVideoMarkerCache,
+    FsNavigationLandOpenRefreshPdfPromotion,
+    FsNavigationLandOpenResetFileRuntime,
+    FsNavigationLandOpenViewerPresentation,
+    FsNavigationLandOpenRemainder,
+    FsNavigationLandRemainder,
+    FsNavigationSlideshowAdvance,
+    FsNavigationSlideshowOther,
+    FsNavigationRemainder,
+    FsBoundaryHint,
+    HandleFsRepaint,
+    Tail,
+}
+
+impl FsRenderPerfStage {
+    const ALL: [Self; FS_RENDER_PERF_STAGE_COUNT] = [
+        Self::FrameStart,
+        Self::HarvestPageDims,
+        Self::ReconcileFullscreenPageSlice,
+        Self::FsPageTurnDecisionForFrame,
+        Self::PageTurnTargetLoadAndPrefetchWindow,
+        Self::PollPrefetch,
+        Self::NativeVideoBackdrop,
+        Self::StatePrecompute,
+        Self::ViewportPreparation,
+        Self::ViewportRender,
+        Self::FsViewportBreakdownEmit,
+        Self::ViewportShownStateUpdate,
+        Self::FsNavigationClose,
+        Self::FsNavigationCtrlSiblingMouse,
+        Self::FsNavigationPageOther,
+        Self::FsNavigationBeginSequence,
+        Self::FsNavigationLandSeekContinuous,
+        Self::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        Self::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        Self::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionRemainder,
+        Self::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        Self::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        Self::FsNavigationLandOpenOtherVideoAudioVst,
+        Self::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        Self::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        Self::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        Self::FsNavigationLandOpenOtherFullscreenCursorState,
+        Self::FsNavigationLandOpenOtherRemainder,
+        Self::FsNavigationLandOpenRecordReadingHistory,
+        Self::FsNavigationLandOpenRecordBookResume,
+        Self::FsNavigationLandOpenStartMetadataLoad,
+        Self::FsNavigationLandOpenStartFsLoad,
+        Self::FsNavigationLandOpenUpdatePrefetchWindow,
+        Self::FsNavigationLandOpenRefreshVideoMarkerCache,
+        Self::FsNavigationLandOpenRefreshPdfPromotion,
+        Self::FsNavigationLandOpenResetFileRuntime,
+        Self::FsNavigationLandOpenViewerPresentation,
+        Self::FsNavigationLandOpenRemainder,
+        Self::FsNavigationLandRemainder,
+        Self::FsNavigationSlideshowAdvance,
+        Self::FsNavigationSlideshowOther,
+        Self::FsNavigationRemainder,
+        Self::FsBoundaryHint,
+        Self::HandleFsRepaint,
+        Self::Tail,
+    ];
+}
+
+const FS_NAVIGATION_PERF_SPAN_COUNT: usize = 18;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum FsNavigationPerfSpan {
+    Close,
+    CtrlSiblingMouse,
+    Page,
+    BeginSequence,
+    LandTarget,
+    LandSeekContinuous,
+    LandOpen,
+    LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    LandOpenOtherFsPageTurnDecisionForFrame,
+    LandOpenOtherDeferPageTurnFullResolutionWork,
+    LandOpenOtherSyncMainSelectionFromViewerIdx,
+    LandOpenOtherVideoAudioVst,
+    LandOpenOtherTryStartVideoTileFastSwap,
+    LandOpenOtherTryStartNativeVideoFastSwap,
+    LandOpenOtherCancelStaleVideoTileReopen,
+    LandOpenOtherFullscreenCursorState,
+    Slideshow,
+    SlideshowAdvance,
+}
+
+const FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT: usize = 7;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum FsPageTurnDecisionPerfSpan {
+    OriginalPreviewActiveForFrame,
+    ResolveNavigationSequenceTarget,
+    ResolveFsDisplayTex,
+    EnsurePassthroughRendition,
+    ResolveOriginalPreviewTex,
+    EnsureNavigationTargetThumbnailRequests,
+    CacheLookup,
+}
+
+#[derive(Debug, Default)]
+struct FsPageTurnDecisionPerfRecorder {
+    original_preview_active_for_frame: std::time::Duration,
+    resolve_navigation_sequence_target: std::time::Duration,
+    resolve_fs_display_tex: std::time::Duration,
+    ensure_passthrough_rendition: std::time::Duration,
+    passthrough_rendition: PassthroughRenditionPerfRecorder,
+    resolve_original_preview_tex: std::time::Duration,
+    ensure_navigation_target_thumbnail_requests: std::time::Duration,
+    cache_lookup: std::time::Duration,
+    cycles: [u64; FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT],
+    cache_hit: Option<bool>,
+}
+
+impl FsPageTurnDecisionPerfRecorder {
+    fn add(&mut self, span: FsPageTurnDecisionPerfSpan, elapsed: std::time::Duration, cycles: u64) {
+        let target = match span {
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame => {
+                &mut self.original_preview_active_for_frame
+            }
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget => {
+                &mut self.resolve_navigation_sequence_target
+            }
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex => &mut self.resolve_fs_display_tex,
+            FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition => {
+                &mut self.ensure_passthrough_rendition
+            }
+            FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex => {
+                &mut self.resolve_original_preview_tex
+            }
+            FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests => {
+                &mut self.ensure_navigation_target_thumbnail_requests
+            }
+            FsPageTurnDecisionPerfSpan::CacheLookup => &mut self.cache_lookup,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+
+    fn resolve_navigation_sequence_target_categorized(&self) -> std::time::Duration {
+        self.resolve_fs_display_tex
+            + self.ensure_passthrough_rendition
+            + self.resolve_original_preview_tex
+            + self.ensure_navigation_target_thumbnail_requests
+    }
+
+    fn categorized(&self) -> std::time::Duration {
+        self.original_preview_active_for_frame
+            + self.resolve_navigation_sequence_target
+            + self.cache_lookup
+    }
+
+    fn cycles(&self, span: FsPageTurnDecisionPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn resolve_navigation_sequence_target_categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests)
+    }
+
+    fn categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget)
+            + self.cycles(FsPageTurnDecisionPerfSpan::CacheLookup)
+    }
+}
+
+#[derive(Debug, Default)]
+struct FsNavigationPerfRecorder {
+    close: std::time::Duration,
+    ctrl_sibling_mouse: std::time::Duration,
+    page: std::time::Duration,
+    begin_sequence: std::time::Duration,
+    land_target: std::time::Duration,
+    land_seek_continuous: std::time::Duration,
+    land_open: std::time::Duration,
+    land_open_other_should_block_detached_independent_still_navigation_to_video:
+        std::time::Duration,
+    land_open_other_fs_page_turn_decision_for_frame: std::time::Duration,
+    land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder,
+    land_open_other_defer_page_turn_full_resolution_work: std::time::Duration,
+    land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration,
+    land_open_other_video_audio_vst: std::time::Duration,
+    land_open_other_try_start_video_tile_fast_swap: std::time::Duration,
+    land_open_other_try_start_native_video_fast_swap: std::time::Duration,
+    land_open_other_cancel_stale_video_tile_reopen: std::time::Duration,
+    land_open_other_fullscreen_cursor_state: std::time::Duration,
+    open_fullscreen: FsOpenPerfRecorder,
+    slideshow: std::time::Duration,
+    slideshow_advance: std::time::Duration,
+    cycles: [u64; FS_NAVIGATION_PERF_SPAN_COUNT],
+}
+
+impl FsNavigationPerfRecorder {
+    fn add(&mut self, span: FsNavigationPerfSpan, elapsed: std::time::Duration, cycles: u64) {
+        let target = match span {
+            FsNavigationPerfSpan::Close => &mut self.close,
+            FsNavigationPerfSpan::CtrlSiblingMouse => &mut self.ctrl_sibling_mouse,
+            FsNavigationPerfSpan::Page => &mut self.page,
+            FsNavigationPerfSpan::BeginSequence => &mut self.begin_sequence,
+            FsNavigationPerfSpan::LandTarget => &mut self.land_target,
+            FsNavigationPerfSpan::LandSeekContinuous => &mut self.land_seek_continuous,
+            FsNavigationPerfSpan::LandOpen => &mut self.land_open,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo => {
+                &mut self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            }
+            FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame => {
+                &mut self.land_open_other_fs_page_turn_decision_for_frame
+            }
+            FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork => {
+                &mut self.land_open_other_defer_page_turn_full_resolution_work
+            }
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx => {
+                &mut self.land_open_other_sync_main_selection_from_viewer_idx
+            }
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst => {
+                &mut self.land_open_other_video_audio_vst
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap => {
+                &mut self.land_open_other_try_start_video_tile_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap => {
+                &mut self.land_open_other_try_start_native_video_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen => {
+                &mut self.land_open_other_cancel_stale_video_tile_reopen
+            }
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState => {
+                &mut self.land_open_other_fullscreen_cursor_state
+            }
+            FsNavigationPerfSpan::Slideshow => &mut self.slideshow,
+            FsNavigationPerfSpan::SlideshowAdvance => &mut self.slideshow_advance,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+
+    fn land_open_other_categorized(&self) -> std::time::Duration {
+        self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            + self.land_open_other_fs_page_turn_decision_for_frame
+            + self.land_open_other_defer_page_turn_full_resolution_work
+            + self.land_open_other_sync_main_selection_from_viewer_idx
+            + self.land_open_other_video_audio_vst
+            + self.land_open_other_try_start_video_tile_fast_swap
+            + self.land_open_other_try_start_native_video_fast_swap
+            + self.land_open_other_cancel_stale_video_tile_reopen
+            + self.land_open_other_fullscreen_cursor_state
+    }
+
+    fn cycles(&self, span: FsNavigationPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn land_open_other_categorized_cycles(&self) -> u64 {
+        self.cycles(
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ) + self.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState)
+    }
+}
+
+#[derive(Debug)]
+struct FsRenderPerfRecorder {
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    started_cycles: u64,
+    last_mark_cycles: u64,
+    stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
+    next_stage: usize,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
+}
+
+impl FsRenderPerfRecorder {
+    fn new(started_at: std::time::Instant, started_cycles: u64) -> Self {
+        Self {
+            started_at,
+            last_mark_at: started_at,
+            started_cycles,
+            last_mark_cycles: started_cycles,
+            stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
+            stage_cycles: [0; FS_RENDER_PERF_STAGE_COUNT],
+            next_stage: 0,
+            navigation_page_turn_decision_cache_hit: None,
+            navigation_passthrough_rendition_calls: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, stage: FsRenderPerfStage) {
+        self.mark_at(stage, std::time::Instant::now(), App::thread_cycles_now());
+    }
+
+    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant, cycles: u64) {
+        debug_assert_eq!(
+            FsRenderPerfStage::ALL.get(self.next_stage).copied(),
+            Some(stage)
+        );
+        self.stage_ms[stage as usize] =
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.stage_cycles[stage as usize] = cycles.saturating_sub(self.last_mark_cycles);
+        self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
+        self.next_stage += 1;
+    }
+
+    fn mark_navigation_at(
+        &mut self,
+        navigation: FsNavigationPerfRecorder,
+        now: std::time::Instant,
+        cycles: u64,
+    ) {
+        // Parent totals contain their explicitly timed child calls. Publish only each parent's
+        // residual alongside leaf stages so the render total counts every interval exactly once.
+        debug_assert!(navigation.begin_sequence + navigation.land_target <= navigation.page);
+        debug_assert!(
+            navigation.land_seek_continuous + navigation.land_open <= navigation.land_target
+        );
+        debug_assert!(navigation.slideshow_advance <= navigation.slideshow);
+        let page_other = navigation
+            .page
+            .saturating_sub(navigation.begin_sequence + navigation.land_target);
+        let open_total = navigation.open_fullscreen.elapsed(FsOpenPerfSpan::Total);
+        let open_categorized = navigation.open_fullscreen.categorized();
+        let land_open_other_categorized = navigation.land_open_other_categorized();
+        let page_turn_decision = &navigation.land_open_other_page_turn_decision;
+        let passthrough_rendition = &page_turn_decision.passthrough_rendition;
+        debug_assert!(
+            passthrough_rendition.categorized() <= page_turn_decision.ensure_passthrough_rendition
+        );
+        let passthrough_rendition_remainder = page_turn_decision
+            .ensure_passthrough_rendition
+            .saturating_sub(passthrough_rendition.categorized());
+        let resolve_sequence_categorized =
+            page_turn_decision.resolve_navigation_sequence_target_categorized();
+        debug_assert!(
+            resolve_sequence_categorized <= page_turn_decision.resolve_navigation_sequence_target
+        );
+        let resolve_sequence_remainder = page_turn_decision
+            .resolve_navigation_sequence_target
+            .saturating_sub(resolve_sequence_categorized);
+        debug_assert!(
+            page_turn_decision.categorized()
+                <= navigation.land_open_other_fs_page_turn_decision_for_frame
+        );
+        let page_turn_decision_remainder = navigation
+            .land_open_other_fs_page_turn_decision_for_frame
+            .saturating_sub(page_turn_decision.categorized());
+        debug_assert!(open_categorized <= open_total);
+        debug_assert!(open_total + land_open_other_categorized <= navigation.land_open);
+        let land_open_other_remainder = navigation
+            .land_open
+            .saturating_sub(open_total + land_open_other_categorized);
+        let open_remainder = open_total.saturating_sub(open_categorized);
+        let land_remainder = navigation
+            .land_target
+            .saturating_sub(navigation.land_seek_continuous + navigation.land_open);
+        let slideshow_other = navigation
+            .slideshow
+            .saturating_sub(navigation.slideshow_advance);
+        let categorized = navigation.close
+            + navigation.ctrl_sibling_mouse
+            + navigation.page
+            + navigation.slideshow;
+        let navigation_total = now.duration_since(self.last_mark_at);
+        debug_assert!(categorized <= navigation_total);
+        let remainder = navigation_total.saturating_sub(categorized);
+
+        let page_cycles = navigation.cycles(FsNavigationPerfSpan::Page);
+        let begin_sequence_cycles = navigation.cycles(FsNavigationPerfSpan::BeginSequence);
+        let land_target_cycles = navigation.cycles(FsNavigationPerfSpan::LandTarget);
+        debug_assert!(begin_sequence_cycles + land_target_cycles <= page_cycles);
+        let page_other_cycles =
+            page_cycles.saturating_sub(begin_sequence_cycles + land_target_cycles);
+        let land_seek_continuous_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandSeekContinuous);
+        let land_open_cycles = navigation.cycles(FsNavigationPerfSpan::LandOpen);
+        debug_assert!(land_seek_continuous_cycles + land_open_cycles <= land_target_cycles);
+        let land_remainder_cycles =
+            land_target_cycles.saturating_sub(land_seek_continuous_cycles + land_open_cycles);
+        let passthrough_rendition_cycles = passthrough_rendition.categorized_cycles();
+        let ensure_passthrough_rendition_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition);
+        debug_assert!(passthrough_rendition_cycles <= ensure_passthrough_rendition_cycles);
+        let passthrough_rendition_remainder_cycles =
+            passthrough_rendition.remainder_cycles(ensure_passthrough_rendition_cycles);
+        let resolve_sequence_categorized_cycles =
+            page_turn_decision.resolve_navigation_sequence_target_categorized_cycles();
+        let resolve_sequence_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget);
+        debug_assert!(resolve_sequence_categorized_cycles <= resolve_sequence_cycles);
+        let resolve_sequence_remainder_cycles =
+            resolve_sequence_cycles.saturating_sub(resolve_sequence_categorized_cycles);
+        let page_turn_decision_categorized_cycles = page_turn_decision.categorized_cycles();
+        let page_turn_decision_total_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame);
+        debug_assert!(page_turn_decision_categorized_cycles <= page_turn_decision_total_cycles);
+        let page_turn_decision_remainder_cycles =
+            page_turn_decision_total_cycles.saturating_sub(page_turn_decision_categorized_cycles);
+        let open_total_cycles = navigation.open_fullscreen.cycles(FsOpenPerfSpan::Total);
+        let open_categorized_cycles = navigation.open_fullscreen.categorized_cycles();
+        debug_assert!(open_categorized_cycles <= open_total_cycles);
+        let land_open_other_categorized_cycles = navigation.land_open_other_categorized_cycles();
+        debug_assert!(open_total_cycles + land_open_other_categorized_cycles <= land_open_cycles);
+        let land_open_other_remainder_cycles =
+            land_open_cycles.saturating_sub(open_total_cycles + land_open_other_categorized_cycles);
+        let open_remainder_cycles = open_total_cycles.saturating_sub(open_categorized_cycles);
+        let slideshow_cycles = navigation.cycles(FsNavigationPerfSpan::Slideshow);
+        let slideshow_advance_cycles = navigation.cycles(FsNavigationPerfSpan::SlideshowAdvance);
+        debug_assert!(slideshow_advance_cycles <= slideshow_cycles);
+        let slideshow_other_cycles = slideshow_cycles.saturating_sub(slideshow_advance_cycles);
+        let categorized_cycles = navigation.cycles(FsNavigationPerfSpan::Close)
+            + navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse)
+            + page_cycles
+            + slideshow_cycles;
+        let navigation_total_cycles = cycles.saturating_sub(self.last_mark_cycles);
+        debug_assert!(categorized_cycles <= navigation_total_cycles);
+        let remainder_cycles = navigation_total_cycles.saturating_sub(categorized_cycles);
+
+        self.navigation_page_turn_decision_cache_hit = page_turn_decision.cache_hit;
+        self.navigation_passthrough_rendition_calls = passthrough_rendition.calls.clone();
+        let stages = [
+            (FsRenderPerfStage::FsNavigationClose, navigation.close),
+            (
+                FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+                navigation.ctrl_sibling_mouse,
+            ),
+            (FsRenderPerfStage::FsNavigationPageOther, page_other),
+            (
+                FsRenderPerfStage::FsNavigationBeginSequence,
+                navigation.begin_sequence,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                navigation.land_seek_continuous,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.land_open_other_should_block_detached_independent_still_navigation_to_video,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.original_preview_active_for_frame,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.resolve_fs_display_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.source_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.build_pixels,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.load_texture,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cache_insert,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.resolve_original_preview_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.ensure_navigation_target_thumbnail_requests,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.land_open_other_defer_page_turn_full_resolution_work,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.land_open_other_sync_main_selection_from_viewer_idx,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.land_open_other_video_audio_vst,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.land_open_other_try_start_video_tile_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.land_open_other_try_start_native_video_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.land_open_other_cancel_stale_video_tile_reopen,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.land_open_other_fullscreen_cursor_state,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder,
+            ),
+            (FsRenderPerfStage::FsNavigationLandRemainder, land_remainder),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowAdvance,
+                navigation.slideshow_advance,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowOther,
+                slideshow_other,
+            ),
+            (FsRenderPerfStage::FsNavigationRemainder, remainder),
+        ];
+        for (stage, elapsed) in stages {
+            debug_assert_eq!(
+                FsRenderPerfStage::ALL.get(self.next_stage).copied(),
+                Some(stage)
+            );
+            self.stage_ms[stage as usize] = elapsed.as_secs_f64() * 1000.0;
+            self.next_stage += 1;
+        }
+        let cycle_stages = [
+            (
+                FsRenderPerfStage::FsNavigationClose,
+                navigation.cycles(FsNavigationPerfSpan::Close),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+                navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse),
+            ),
+            (FsRenderPerfStage::FsNavigationPageOther, page_other_cycles),
+            (
+                FsRenderPerfStage::FsNavigationBeginSequence,
+                begin_sequence_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                land_seek_continuous_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::SourceLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::BuildPixels),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::LoadTexture),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheInsert),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandRemainder,
+                land_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowAdvance,
+                slideshow_advance_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowOther,
+                slideshow_other_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationRemainder,
+                remainder_cycles,
+            ),
+        ];
+        for (stage, stage_cycles) in cycle_stages {
+            self.stage_cycles[stage as usize] = stage_cycles;
+        }
+        self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
+    }
+
+    fn finish(self) -> FsRenderPerfBreakdown {
+        self.finish_at(std::time::Instant::now(), App::thread_cycles_now())
+    }
+
+    fn finish_at(
+        mut self,
+        finished_at: std::time::Instant,
+        finished_cycles: u64,
+    ) -> FsRenderPerfBreakdown {
+        // `render_fullscreen_viewport` has intentional early returns. Attribute the interval up
+        // to that return to the currently active stage and leave later stages at zero.
+        if self.next_stage < FS_RENDER_PERF_STAGE_COUNT {
+            self.stage_ms[self.next_stage] =
+                finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.stage_cycles[self.next_stage] =
+                finished_cycles.saturating_sub(self.last_mark_cycles);
+            self.next_stage += 1;
+        }
+        debug_assert!(self.next_stage <= FS_RENDER_PERF_STAGE_COUNT);
+
+        let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
+        let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        let total_cycles = finished_cycles.saturating_sub(self.started_cycles);
+        let accounted_cycles = self.stage_cycles.iter().sum::<u64>();
+        FsRenderPerfBreakdown {
+            total_ms,
+            stage_ms: self.stage_ms,
+            unaccounted_ms: total_ms - accounted_ms,
+            total_cycles,
+            stage_cycles: self.stage_cycles,
+            unaccounted_cycles: total_cycles.saturating_sub(accounted_cycles),
+            navigation_page_turn_decision_cache_hit: self.navigation_page_turn_decision_cache_hit,
+            navigation_passthrough_rendition_calls: self.navigation_passthrough_rendition_calls,
+        }
+    }
+}
+
+#[inline]
+fn fs_render_perf_start_with(
+    perf_on: bool,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<FsRenderPerfRecorder> {
+    perf_on.then(|| FsRenderPerfRecorder::new(now(), cycles_now()))
+}
+
+#[inline]
+fn mark_fs_render_perf(recorder: &mut Option<FsRenderPerfRecorder>, stage: FsRenderPerfStage) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span_with(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_page_turn_decision_perf_span_with(
+        recorder,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    )
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span_with(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_fs_page_turn_decision_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
+#[inline]
+fn start_fs_navigation_perf_span_with(
+    recorder: &Option<FsNavigationPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_fs_navigation_perf_span(
+    recorder: &Option<FsNavigationPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_navigation_perf_span_with(recorder, std::time::Instant::now, App::thread_cycles_now)
+}
+
+#[inline]
+fn finish_fs_navigation_perf_span_with(
+    recorder: &mut Option<FsNavigationPerfRecorder>,
+    span: FsNavigationPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_fs_navigation_perf_span(
+    recorder: &mut Option<FsNavigationPerfRecorder>,
+    span: FsNavigationPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_fs_navigation_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
+#[inline]
+fn finish_fs_navigation_perf_with(
+    navigation: &mut Option<FsNavigationPerfRecorder>,
+    render: &mut Option<FsRenderPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(navigation), Some(render)) = (navigation.take(), render.as_mut()) {
+        render.mark_navigation_at(navigation, now(), cycles_now());
+    }
+}
+
+#[inline]
+fn finish_fs_navigation_perf(
+    navigation: &mut Option<FsNavigationPerfRecorder>,
+    render: &mut Option<FsRenderPerfRecorder>,
+) {
+    finish_fs_navigation_perf_with(
+        navigation,
+        render,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
+#[inline]
+fn finish_fs_render_perf(
+    recorder: &mut Option<FsRenderPerfRecorder>,
+    frame_number: u64,
+    input_seq: u64,
+    fs_idx: Option<usize>,
+) {
+    if let Some(recorder) = recorder.take() {
+        let breakdown = recorder.finish();
+        if breakdown.total_ms > 8.0 {
+            breakdown.emit(frame_number, input_seq, fs_idx);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FsRenderPerfBreakdown {
+    total_ms: f64,
+    stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    unaccounted_ms: f64,
+    total_cycles: u64,
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
+    unaccounted_cycles: u64,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
+}
+
+impl FsRenderPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, FsRenderPerfStage); FS_RENDER_PERF_STAGE_COUNT] = [
+        ("frame_start_ms", FsRenderPerfStage::FrameStart),
+        ("harvest_page_dims_ms", FsRenderPerfStage::HarvestPageDims),
+        (
+            "reconcile_fullscreen_page_slice_ms",
+            FsRenderPerfStage::ReconcileFullscreenPageSlice,
+        ),
+        (
+            "fs_page_turn_decision_for_frame_ms",
+            FsRenderPerfStage::FsPageTurnDecisionForFrame,
+        ),
+        (
+            "page_turn_target_load_and_prefetch_window_ms",
+            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
+        ),
+        ("poll_prefetch_ms", FsRenderPerfStage::PollPrefetch),
+        (
+            "native_video_backdrop_ms",
+            FsRenderPerfStage::NativeVideoBackdrop,
+        ),
+        ("state_precompute_ms", FsRenderPerfStage::StatePrecompute),
+        (
+            "viewport_preparation_ms",
+            FsRenderPerfStage::ViewportPreparation,
+        ),
+        ("viewport_render_ms", FsRenderPerfStage::ViewportRender),
+        (
+            "fs_viewport_breakdown_emit_ms",
+            FsRenderPerfStage::FsViewportBreakdownEmit,
+        ),
+        (
+            "viewport_shown_state_update_ms",
+            FsRenderPerfStage::ViewportShownStateUpdate,
+        ),
+        (
+            "handle_fs_navigation_close_ms",
+            FsRenderPerfStage::FsNavigationClose,
+        ),
+        (
+            "handle_fs_navigation_ctrl_sibling_mouse_ms",
+            FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+        ),
+        (
+            "handle_fs_navigation_page_other_ms",
+            FsRenderPerfStage::FsNavigationPageOther,
+        ),
+        (
+            "handle_fs_navigation_begin_sequence_ms",
+            FsRenderPerfStage::FsNavigationBeginSequence,
+        ),
+        (
+            "handle_fs_navigation_land_target_seek_continuous_ms",
+            FsRenderPerfStage::FsNavigationLandSeekContinuous,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_should_block_detached_independent_still_navigation_to_video_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_original_preview_active_for_frame_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_fs_display_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_source_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_build_pixels_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_load_texture_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_insert_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_original_preview_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_navigation_target_thumbnail_requests_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_defer_page_turn_full_resolution_work_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_sync_main_selection_from_viewer_idx_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_video_audio_vst_active_exit_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_video_tile_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_native_video_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_cancel_stale_video_tile_reopen_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fullscreen_cursor_state_restore_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_reading_history_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_book_resume_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_metadata_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_fs_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_update_prefetch_window_ms",
+            FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_video_marker_cache_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_pdf_promotion_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_reset_file_runtime_ms",
+            FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_viewer_presentation_ms",
+            FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandRemainder,
+        ),
+        (
+            "handle_fs_navigation_slideshow_advance_ms",
+            FsRenderPerfStage::FsNavigationSlideshowAdvance,
+        ),
+        (
+            "handle_fs_navigation_slideshow_other_ms",
+            FsRenderPerfStage::FsNavigationSlideshowOther,
+        ),
+        (
+            "handle_fs_navigation_remainder_ms",
+            FsRenderPerfStage::FsNavigationRemainder,
+        ),
+        ("fs_boundary_hint_ms", FsRenderPerfStage::FsBoundaryHint),
+        ("handle_fs_repaint_ms", FsRenderPerfStage::HandleFsRepaint),
+        ("tail_ms", FsRenderPerfStage::Tail),
+    ];
+
+    fn emit(&self, frame_number: u64, input_seq: u64, fs_idx: Option<usize>) {
+        let passthrough_rendition_total_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_ms[stage as usize])
+            .sum::<f64>();
+        let passthrough_rendition_total_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_cycles[stage as usize])
+            .sum::<u64>();
+        let passthrough_rendition_cache_hits = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(true))
+            .count();
+        let passthrough_rendition_cache_misses = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(false))
+            .count();
+        let cycle_field_names = Self::EVENT_FIELDS.map(|(field, _)| {
+            format!(
+                "{}_cycles",
+                field
+                    .strip_suffix("_ms")
+                    .expect("fullscreen render perf stage field must end in _ms")
+            )
+        });
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT * 2 + 13);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push((
+            "idx",
+            fs_idx.map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        extras.push(("total_cycles", serde_json::Value::from(self.total_cycles)));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_hit",
+            self.navigation_page_turn_decision_cache_hit
+                .map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
+            serde_json::Value::from(passthrough_rendition_total_ms),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cycles",
+            serde_json::Value::from(passthrough_rendition_total_cycles),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_call_count",
+            serde_json::Value::from(self.navigation_passthrough_rendition_calls.len()),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_hit_count",
+            serde_json::Value::from(passthrough_rendition_cache_hits),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_miss_count",
+            serde_json::Value::from(passthrough_rendition_cache_misses),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_calls",
+            serde_json::to_value(&self.navigation_passthrough_rendition_calls)
+                .unwrap_or(serde_json::Value::Null),
+        ));
+        for ((field, stage), cycle_field) in
+            Self::EVENT_FIELDS.into_iter().zip(cycle_field_names.iter())
+        {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+            extras.push((
+                cycle_field.as_str(),
+                serde_json::Value::from(self.stage_cycles[stage as usize]),
+            ));
+        }
+        extras.push((
+            "unaccounted_ms",
+            serde_json::Value::from(self.unaccounted_ms),
+        ));
+        extras.push((
+            "unaccounted_cycles",
+            serde_json::Value::from(self.unaccounted_cycles),
+        ));
+        crate::perf::event("ui", "fs_render_breakdown", None, input_seq, &extras);
+    }
+}
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1749,22 +3139,965 @@ use self::draw_icons::*;
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
 pub(crate) const TOP_BAR_HEIGHT: f32 = 44.0;
-/// 静止画フルスクリーン下端のページシークバーの高さ。下端まで伸びる左右パネル
-/// (補正パネル / メタデータパネル) はこの分だけ下端を空けてシークバーと重ならない
-/// ようにする (`draw_fullscreen_seek_overlay` の panel_rect と同じ高さ)。
+/// 静止画フルスクリーン下端の通常ページシークバーの高さ。
+/// 実際の下端 chrome 高は [`StillSeekGeometry`] で一度だけ解決する。
 pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
-const FS_SEEK_HOVER_HEIGHT: f32 = 78.0;
+const FS_SEEK_HOVER_MARGIN: f32 = 40.0;
+const STILL_SEEK_STRIP_CELL_GAP: f32 = 4.0;
+const STILL_SEEK_STRIP_OVERSCAN_CELLS: usize = 2;
+/// 極端に縦長なページでも、操作可能なセル幅を高さの 35% は残す。
+const STILL_SEEK_STRIP_MIN_CELL_ASPECT: f32 = 0.35;
+const STILL_SEEK_PREVIEW_MAX_WIDTH: f32 = 240.0;
+/// 見開きプレビューの 2 枚の間隔。本の綴じ目に相当するので詰めておく。
+const STILL_SEEK_PREVIEW_PANE_GAP: f32 = 3.0;
+const STILL_SEEK_PREVIEW_MAX_HEIGHT: f32 = 180.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillSeekGeometry {
+    bar_height: f32,
+    strip_height: f32,
+    total_height: f32,
+    /// `BottomBarLock` に従って画像領域から除く高さ。
+    reserved_height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekDirections {
+    strip_rtl: bool,
+    bar_rtl: bool,
+}
+
+fn resolve_still_seek_directions(
+    reading_direction: ReadingDirection,
+    bar_direction: crate::settings::FullscreenSeekDirection,
+) -> StillSeekDirections {
+    StillSeekDirections {
+        strip_rtl: reading_direction == ReadingDirection::Rtl,
+        bar_rtl: bar_direction.is_rtl(reading_direction),
+    }
+}
+
+fn draw_still_seek_strip_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    for offset in [-0.68_f32, 0.0, 0.68] {
+        painter.rect_stroke(
+            egui::Rect::from_center_size(
+                center + egui::vec2(offset * radius, 0.0),
+                egui::vec2(radius * 0.55, radius * 1.15),
+            ),
+            1.0,
+            egui::Stroke::new(1.2, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+impl StillSeekGeometry {
+    fn resolve(
+        strip_visible: bool,
+        strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+        bar_with_strip: crate::settings::StillSeekBarWithStrip,
+        bottom_lock: crate::settings::BottomBarLock,
+    ) -> Self {
+        let strip_height = if strip_visible {
+            strip_height.points()
+        } else {
+            0.0
+        };
+        let bar_height = if bar_with_strip.is_visible(strip_visible) {
+            FS_SEEK_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        let total_height = bar_height + strip_height;
+        let reserved_height = match bottom_lock {
+            crate::settings::BottomBarLock::None => 0.0,
+            crate::settings::BottomBarLock::BarOnly => bar_height,
+            crate::settings::BottomBarLock::BarAndStrip => total_height,
+        };
+        Self {
+            bar_height,
+            strip_height,
+            total_height,
+            reserved_height,
+        }
+    }
+
+    fn bar_only() -> Self {
+        Self::resolve(
+            false,
+            crate::video::seek_strip_layout::SeekStripHeight::Large,
+            crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarOnly,
+        )
+    }
+
+    fn panel_rect(self, full_rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), full_rect.bottom() - self.total_height),
+            full_rect.right_bottom(),
+        )
+        .intersect(full_rect)
+    }
+
+    fn bar_rect(self, full_rect: egui::Rect) -> Option<egui::Rect> {
+        (self.bar_height > 0.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(full_rect.left(), full_rect.bottom() - self.bar_height),
+                full_rect.right_bottom(),
+            )
+            .intersect(full_rect)
+        })
+    }
+
+    fn strip_rect(self, full_rect: egui::Rect) -> Option<egui::Rect> {
+        (self.strip_height > 0.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    full_rect.left(),
+                    full_rect.bottom() - self.bar_height - self.strip_height,
+                ),
+                egui::pos2(full_rect.right(), full_rect.bottom() - self.bar_height),
+            )
+            .intersect(full_rect)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillSeekStripCell {
+    /// `FullscreenSeekInfo::image_indices` 上の位置。
+    source_pos: usize,
+    /// `App::items` / `App::thumbnails` 上の位置。
+    idx: usize,
+    /// セル幅とテクスチャ描画の両方に適用するページ回転。
+    rotation: crate::rotation_db::Rotation,
+    rect: egui::Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StillSeekStripLayout {
+    /// 画面上の左から右の順。
+    cells: Vec<StillSeekStripCell>,
+    /// `FullscreenSeekInfo::image_indices` 上の半開区間。overscan を含む。
+    request_start: usize,
+    request_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripThumbnail {
+    Loaded(egui::Vec2, crate::rotation_db::Rotation),
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripSourceStep {
+    TowardStart,
+    TowardEnd,
+}
+
+impl StillSeekStripSourceStep {
+    fn next(self, source_pos: usize, total: usize) -> Option<usize> {
+        match self {
+            Self::TowardStart => source_pos.checked_sub(1),
+            Self::TowardEnd => source_pos.checked_add(1).filter(|next| *next < total),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripScreenSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripGrowth {
+    Active {
+        next_source_pos: usize,
+        outer_edge: f32,
+        source_step: StillSeekStripSourceStep,
+        screen_side: StillSeekStripScreenSide,
+    },
+    Stopped,
+}
+
+fn still_seek_strip_cell_geometry(
+    thumbnail: StillSeekStripThumbnail,
+    cell_height: f32,
+) -> Option<(f32, crate::rotation_db::Rotation)> {
+    match thumbnail {
+        StillSeekStripThumbnail::Loaded(size, rotation) => {
+            let size = rotated_display_size(size, rotation);
+            let aspect = if size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0
+            {
+                size.x / size.y
+            } else {
+                // TextureHandle の寸法は通常必ず正だが、終端状態を未読み込み扱いにして
+                // 列を永久停止させない。
+                1.0
+            };
+            Some((
+                (cell_height * aspect).max(cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT),
+                rotation,
+            ))
+        }
+        StillSeekStripThumbnail::Failed => Some((cell_height, crate::rotation_db::Rotation::None)),
+        StillSeekStripThumbnail::Unavailable => None,
+    }
+}
+
+fn grow_still_seek_strip_side(
+    growth: &mut StillSeekStripGrowth,
+    image_indices: &[usize],
+    row_rect: egui::Rect,
+    cell_height: f32,
+    thumbnail_for_idx: &mut impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> Option<StillSeekStripCell> {
+    let StillSeekStripGrowth::Active {
+        next_source_pos,
+        outer_edge,
+        source_step,
+        screen_side,
+    } = *growth
+    else {
+        return None;
+    };
+    let idx = image_indices[next_source_pos];
+    let Some((cell_width, rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(idx), cell_height)
+    else {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    };
+    let rect = match screen_side {
+        StillSeekStripScreenSide::Left => egui::Rect::from_min_max(
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP - cell_width,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y + cell_height * 0.5,
+            ),
+        ),
+        StillSeekStripScreenSide::Right => egui::Rect::from_min_size(
+            egui::pos2(
+                outer_edge + STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::vec2(cell_width, cell_height),
+        ),
+    };
+    let fits = match screen_side {
+        StillSeekStripScreenSide::Left => rect.left() >= row_rect.left(),
+        StillSeekStripScreenSide::Right => rect.right() <= row_rect.right(),
+    };
+    if !fits {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    }
+
+    *growth = match source_step.next(next_source_pos, image_indices.len()) {
+        Some(next_source_pos) => StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: match screen_side {
+                StillSeekStripScreenSide::Left => rect.left(),
+                StillSeekStripScreenSide::Right => rect.right(),
+            },
+            source_step,
+            screen_side,
+        },
+        None => StillSeekStripGrowth::Stopped,
+    };
+    Some(StillSeekStripCell {
+        source_pos: next_source_pos,
+        idx,
+        rotation,
+        rect,
+    })
+}
+
+/// 現在ページを帯の中央へ置き、ロード済みのページだけで左右へ 1 枚ずつ成長させる。
+///
+/// セル幅・位置・表示順・要求範囲をここで一度だけ決め、描画と当たり判定は完成した
+/// `cells` を共有する。未読み込みに当たった側は止めるが、要求範囲は配置済み範囲から
+/// overscan ぶん外へ延ばすため、停止位置のページがロードされれば次フレームで成長する。
+fn still_seek_strip_layout(
+    image_indices: &[usize],
+    current_pos: usize,
+    row_rect: egui::Rect,
+    cell_height: f32,
+    rtl: bool,
+    mut thumbnail_for_idx: impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> StillSeekStripLayout {
+    if image_indices.is_empty() {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
+            request_start: 0,
+            request_end: 0,
+        };
+    }
+    let total = image_indices.len();
+    let current_pos = current_pos.min(total - 1);
+    let current_idx = image_indices[current_pos];
+    let Some((current_width, current_rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(current_idx), cell_height)
+    else {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
+            request_start: current_pos.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
+            request_end: current_pos
+                .saturating_add(1 + STILL_SEEK_STRIP_OVERSCAN_CELLS)
+                .min(total),
+        };
+    };
+
+    let current_rect =
+        egui::Rect::from_center_size(row_rect.center(), egui::vec2(current_width, cell_height));
+    let source_step_left = if rtl {
+        StillSeekStripSourceStep::TowardEnd
+    } else {
+        StillSeekStripSourceStep::TowardStart
+    };
+    let source_step_right = if rtl {
+        StillSeekStripSourceStep::TowardStart
+    } else {
+        StillSeekStripSourceStep::TowardEnd
+    };
+    let mut left_growth = source_step_left.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.left(),
+            source_step: source_step_left,
+            screen_side: StillSeekStripScreenSide::Left,
+        },
+    );
+    let mut right_growth = source_step_right.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.right(),
+            source_step: source_step_right,
+            screen_side: StillSeekStripScreenSide::Right,
+        },
+    );
+    let mut left_cells = Vec::new();
+    let mut right_cells = Vec::new();
+    loop {
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut left_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            left_cells.push(cell);
+        }
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut right_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            right_cells.push(cell);
+        }
+        if matches!(left_growth, StillSeekStripGrowth::Stopped)
+            && matches!(right_growth, StillSeekStripGrowth::Stopped)
+        {
+            break;
+        }
+    }
+
+    left_cells.reverse();
+    let mut cells = Vec::with_capacity(left_cells.len() + 1 + right_cells.len());
+    cells.extend(left_cells);
+    cells.push(StillSeekStripCell {
+        source_pos: current_pos,
+        idx: current_idx,
+        rotation: current_rotation,
+        rect: current_rect,
+    });
+    cells.extend(right_cells);
+    let visible_start = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .min()
+        .unwrap_or(current_pos);
+    let visible_end = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .max()
+        .unwrap_or(current_pos)
+        .saturating_add(1);
+    StillSeekStripLayout {
+        cells,
+        request_start: visible_start.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
+        request_end: visible_end
+            .saturating_add(STILL_SEEK_STRIP_OVERSCAN_CELLS)
+            .min(total),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekPosition {
+    TrackFraction(f32),
+    SourcePosition(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekTrackAction {
+    None,
+    Seek,
+    OpenStrip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekTrackInteraction {
+    action: StillSeekTrackAction,
+    note_seek_activity: bool,
+}
+
+/// One owner for the mutually exclusive still-image seek gestures.
+///
+/// The track variant keeps the shared vertical-vs-horizontal decision state. The strip variant
+/// keeps one immutable press snapshot plus the live layout center, matching the video strip's
+/// drag ownership. A committed strip center remains here after release; it is discarded when the
+/// actual page changes. The response handler owns press, move, and release; page-position sync and
+/// context suspension / fullscreen teardown own interruption outside it. The mounted viewer
+/// context owns this value through ViewerContextBundle; suspending that context interrupts
+/// only a live pointer gesture and retains its committed center.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum StillSeekGesture {
+    #[default]
+    Idle,
+    Track(crate::video::seek_strip::SeekRowGesture),
+    Strip {
+        origin_center_pos: usize,
+        // egui no longer supplies total_drag_delta on release; retain both axes for close.
+        origin_pointer: egui::Pos2,
+        layout_center_pos: usize,
+        page_pos_at_origin: usize,
+    },
+    StripCommitted {
+        layout_center_pos: usize,
+        page_pos_at_commit: usize,
+    },
+}
+
+impl StillSeekGesture {
+    #[cfg(windows)]
+    pub(crate) fn interrupt(&mut self) {
+        if matches!(self, Self::Track(_) | Self::Strip { .. }) {
+            *self = Self::Idle;
+        }
+    }
+
+    fn strip_layout_center(self, current_pos: usize) -> usize {
+        match self {
+            Self::Strip {
+                layout_center_pos, ..
+            }
+            | Self::StripCommitted {
+                layout_center_pos, ..
+            } => layout_center_pos,
+            Self::Idle | Self::Track(_) => current_pos,
+        }
+    }
+
+    /// A moved strip is scoped to the page that was current while it was moved. Any real page
+    /// change returns the strip to the new current page, regardless of which navigation entry
+    /// point produced that change. Track dragging is intentionally preserved because the seek bar
+    /// itself changes pages while its pointer gesture remains active.
+    fn recenter_if_page_changed(&mut self, current_pos: usize) {
+        let page_changed = match *self {
+            Self::Strip {
+                page_pos_at_origin, ..
+            } => page_pos_at_origin != current_pos,
+            Self::StripCommitted {
+                page_pos_at_commit, ..
+            } => page_pos_at_commit != current_pos,
+            Self::Idle | Self::Track(_) => false,
+        };
+        if page_changed {
+            *self = Self::Idle;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(self) -> bool {
+        matches!(self, Self::Track(_) | Self::Strip { .. })
+    }
+}
+
+/// Interpret one real egui response frame for the still-image seek track.
+///
+/// Keeping the response ordering here lets handler-level tests drive the same state transition
+/// code as production instead of testing `SeekRowGesture` in isolation.
+fn handle_still_seek_track_response(
+    response: &egui::Response,
+    gesture: &mut StillSeekGesture,
+) -> StillSeekTrackInteraction {
+    if response.drag_started()
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        // `Sense::click_and_drag` does not report `drag_started` on the press frame. It first
+        // becomes true after movement has crossed egui's drag threshold, so the current pointer
+        // is already displaced. Recover the actual press origin or the first update sees a zero
+        // delta and leaves the gesture undecided until another move event happens.
+        let origin = pointer_pos - response.total_drag_delta().unwrap_or_default();
+        *gesture = StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::new(origin));
+    }
+
+    let note_seek_activity = response.dragged() && response.interact_pointer_pos().is_some();
+    let mut action = if response.clicked() {
+        StillSeekTrackAction::Seek
+    } else if (response.dragged() || response.drag_stopped())
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        let decision = match gesture {
+            StillSeekGesture::Track(gesture) => Some(gesture.update(pointer_pos)),
+            StillSeekGesture::Idle
+            | StillSeekGesture::Strip { .. }
+            | StillSeekGesture::StripCommitted { .. } => None,
+        };
+        match decision {
+            Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
+                StillSeekTrackAction::OpenStrip
+            }
+            Some(crate::video::seek_strip::SeekRowDecision::Scrub) => StillSeekTrackAction::Seek,
+            Some(crate::video::seek_strip::SeekRowDecision::Undecided) | None => {
+                StillSeekTrackAction::None
+            }
+        }
+    } else {
+        StillSeekTrackAction::None
+    };
+
+    if response.drag_stopped() {
+        if matches!(
+            gesture,
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+        ) {
+            action = StillSeekTrackAction::Seek;
+        }
+        if matches!(gesture, StillSeekGesture::Track(_)) {
+            *gesture = StillSeekGesture::Idle;
+        }
+    }
+
+    StillSeekTrackInteraction {
+        action,
+        note_seek_activity,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekStripInteraction {
+    closed_by_drag: bool,
+    note_seek_activity: bool,
+}
+
+/// Own the strip drag latch for one real egui response frame.
+fn handle_still_seek_strip_response(
+    response: &egui::Response,
+    layout_center_pos: usize,
+    current_page_pos: usize,
+    image_count: usize,
+    cell_width: f32,
+    strip_bottom: f32,
+    // 画面上のセルの並びが元ページ順の逆かどうか。**送る向きはこれに従う。**
+    // 動画は常に左→右なので `center_index_after_drag` に向きの概念が無く、
+    // 右→左で読む本ではそのままだと指と逆へ動く (2026-09-06 利用者報告)。
+    rtl: bool,
+    gesture: &mut StillSeekGesture,
+) -> StillSeekStripInteraction {
+    if response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let origin = pointer - response.total_drag_delta().unwrap_or_default();
+        *gesture = StillSeekGesture::Strip {
+            origin_center_pos: layout_center_pos,
+            origin_pointer: origin,
+            layout_center_pos,
+            page_pos_at_origin: current_page_pos,
+        };
+    }
+
+    let pointer = response.interact_pointer_pos();
+    let closed_by_drag = (response.dragged() || response.drag_stopped())
+        && pointer.is_some_and(|pointer| match *gesture {
+            StillSeekGesture::Strip { origin_pointer, .. } => {
+                crate::video::seek_strip::strip_drag_closes_downward(
+                    origin_pointer,
+                    pointer,
+                    strip_bottom,
+                )
+            }
+            StillSeekGesture::Idle
+            | StillSeekGesture::Track(_)
+            | StillSeekGesture::StripCommitted { .. } => false,
+        });
+    let note_seek_activity = response.dragged() && pointer.is_some();
+
+    if closed_by_drag {
+        *gesture = StillSeekGesture::Idle;
+    } else if (response.dragged() || response.drag_stopped())
+        && let Some(pointer) = pointer
+        && let StillSeekGesture::Strip {
+            origin_center_pos,
+            origin_pointer,
+            page_pos_at_origin,
+            ..
+        } = *gesture
+        && let Some(center) = crate::video::seek_strip::center_index_after_drag(
+            origin_center_pos as f64,
+            // 画面上の移動量を「元ページ順での移動量」へ直してから渡す。指の下の
+            // セルが同じページを指し続ける向きは、並びが反転すれば反転する。
+            if rtl {
+                origin_pointer.x - pointer.x
+            } else {
+                pointer.x - origin_pointer.x
+            },
+            cell_width,
+        )
+    {
+        let layout_center_pos = center
+            .round()
+            .clamp(0.0, image_count.saturating_sub(1) as f64)
+            as usize;
+        if response.drag_stopped() {
+            *gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos,
+                page_pos_at_commit: current_page_pos,
+            };
+        } else {
+            *gesture = StillSeekGesture::Strip {
+                origin_center_pos,
+                origin_pointer,
+                layout_center_pos,
+                page_pos_at_origin,
+            };
+        }
+    } else if response.drag_stopped()
+        && let StillSeekGesture::Strip {
+            layout_center_pos, ..
+        } = *gesture
+    {
+        // A release normally retains `interact_pointer_pos`, but if the platform drops that
+        // final coordinate, commit the last center shown instead of leaving a dead drag owner.
+        *gesture = StillSeekGesture::StripCommitted {
+            layout_center_pos,
+            page_pos_at_commit: current_page_pos,
+        };
+    }
+
+    StillSeekStripInteraction {
+        closed_by_drag,
+        note_seek_activity,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedStillSeekTarget {
+    /// プレビューに出すページ。**見開きでは着地後に表示される 1〜2 ページ全部**を、
+    /// 元ページ順で入れる。
+    ///
+    /// カーソル下の 1 枚だけを出していた版は、見開きで「プレビューは 1 枚なのに
+    /// 開くと 2 ページ」になった (2026-09-05 利用者報告)。プレビューは
+    /// **押した結果の予告**なので、着地後に見えるものと同じ枚数にする。
+    preview_pages: Vec<usize>,
+    landing_idx: usize,
+    display_pos: usize,
+}
+
+/// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
+/// 強調とプレビューはこの同じ表示ユニット解決を使う。
+fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
+    units
+        .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
+        .map(|unit| unit.pages.clone())
+        .unwrap_or_else(|| vec![idx])
+}
+
+/// シーク位置から、プレビューに出すページと着地先を解く。
+///
+/// **ユニットを 2 つ受ける。** 連結読みではシークがページ単位なのに、見開き設定なら
+/// 画面には 2 ページ並ぶ (`continuous_reading_units_and_pos` が見開きユニットで段を組む)。
+/// 着地の粒度 (`landing_units`) と、プレビューの枚数 (`preview_units`) は同じではない。
+/// 1 つにまとめていた版は、連結読み + 見開きでプレビューが 1 枚になった
+/// (2026-09-05 利用者報告)。ページ送りの挙動は `landing_units` 側だけが決める。
+fn resolve_still_seek_target(
+    image_indices: &[usize],
+    landing_units: Option<&[SpreadDisplayUnit]>,
+    preview_units: Option<&[SpreadDisplayUnit]>,
+    position: StillSeekPosition,
+) -> Option<ResolvedStillSeekTarget> {
+    if image_indices.is_empty() {
+        return None;
+    }
+    match position {
+        StillSeekPosition::TrackFraction(fraction) => {
+            if let Some(units) = landing_units.filter(|units| !units.is_empty()) {
+                let display_pos = spread_seek_unit_from_fraction(fraction, units.len());
+                let landing_idx = units[display_pos].anchor_idx();
+                Some(ResolvedStillSeekTarget {
+                    preview_pages: units[display_pos].pages.clone(),
+                    landing_idx,
+                    display_pos,
+                })
+            } else {
+                let display_pos = if image_indices.len() <= 1 {
+                    0
+                } else {
+                    (fraction.clamp(0.0, 1.0) * (image_indices.len() - 1) as f32).round() as usize
+                }
+                .min(image_indices.len() - 1);
+                let landing_idx = image_indices[display_pos];
+                Some(ResolvedStillSeekTarget {
+                    preview_pages: pages_on_screen_with(landing_idx, preview_units),
+                    landing_idx,
+                    display_pos,
+                })
+            }
+        }
+        StillSeekPosition::SourcePosition(source_pos) => {
+            let source_pos = source_pos.min(image_indices.len() - 1);
+            let pointed_idx = image_indices[source_pos];
+            let unit = landing_units.and_then(|units| {
+                units.iter().enumerate().find_map(|(unit_pos, unit)| {
+                    unit.pages
+                        .contains(&pointed_idx)
+                        .then_some((unit_pos, unit))
+                })
+            });
+            let (preview_pages, landing_idx, display_pos) = match unit {
+                Some((unit_pos, unit)) => (unit.pages.clone(), unit.anchor_idx(), unit_pos),
+                None => (
+                    pages_on_screen_with(pointed_idx, preview_units),
+                    pointed_idx,
+                    source_pos,
+                ),
+            };
+            Some(ResolvedStillSeekTarget {
+                preview_pages,
+                landing_idx,
+                display_pos,
+            })
+        }
+    }
+}
+
+fn still_seek_source_position_at_pointer(
+    layout: &StillSeekStripLayout,
+    pointer: egui::Pos2,
+) -> Option<usize> {
+    layout
+        .cells
+        .iter()
+        .find(|cell| cell.rect.contains(pointer))
+        .map(|cell| cell.source_pos)
+}
+
+/// レイアウト closure が参照し得る source page だけを、中央から左右へ有界に集める。
+/// 現在セルは常に帯の中央なので、片側が読む最大数は帯幅の半分とセル幅下限から決まる。
+fn still_seek_strip_rotation_candidates(
+    image_indices: &[usize],
+    current_pos: usize,
+    row_width: f32,
+    cell_height: f32,
+) -> Vec<usize> {
+    if image_indices.is_empty() {
+        return Vec::new();
+    }
+    let current_pos = current_pos.min(image_indices.len() - 1);
+    let min_step = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT + STILL_SEEK_STRIP_CELL_GAP;
+    let per_side = if row_width.is_finite() && cell_height.is_finite() && min_step > 0.0 {
+        ((row_width.max(0.0) * 0.5 / min_step).ceil() as usize).saturating_add(2)
+    } else {
+        2
+    };
+    let start = current_pos.saturating_sub(per_side);
+    let end = current_pos
+        .saturating_add(per_side + 1)
+        .min(image_indices.len());
+    image_indices[start..end].to_vec()
+}
+
+fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let size = if texture_size.x > 0.0 && texture_size.y > 0.0 {
+        let scale = (bounds.width() / texture_size.x).min(bounds.height() / texture_size.y);
+        texture_size * scale
+    } else {
+        bounds.size()
+    };
+    egui::Rect::from_center_size(bounds.center(), size.min(bounds.size()))
+}
+
+struct StillSeekPreviewPage {
+    texture: egui::TextureHandle,
+    rotation: crate::rotation_db::Rotation,
+}
+
+enum StillSeekSpreadPreparation {
+    Single,
+    Ready(Arc<Vec<SpreadDisplayUnit>>),
+    Refreshing {
+        nav: Arc<Vec<usize>>,
+        displayed: Arc<Vec<SpreadDisplayUnit>>,
+    },
+}
+
+impl StillSeekSpreadPreparation {
+    fn units(&self) -> Option<&Arc<Vec<SpreadDisplayUnit>>> {
+        match self {
+            Self::Single => None,
+            Self::Ready(units) => Some(units),
+            Self::Refreshing { displayed, .. } => Some(displayed),
+        }
+    }
+}
+
+/// シーク位置のプレビューを描く。
+///
+/// `textures` は**着地後に表示されるページと同じ枚数・同じ並び**を受け取る
+/// (見開きなら 2 枚、右→左読みなら呼び出し側で反転済み)。未読み込みのページは
+/// `None` のまま枠だけ描き、読み込み後に差し替わる。
+fn paint_still_seek_preview(
+    painter: &egui::Painter,
+    full_rect: egui::Rect,
+    panel_top: f32,
+    pointer_x: f32,
+    textures: &[Option<StillSeekPreviewPage>],
+    label: &str,
+) {
+    let pane_count = textures.len().max(1);
+    // 1 枚あたりの幅は、全体が最大幅に収まるように分け合う。見開きでも吹き出しが
+    // 横に伸びて画面からはみ出さないようにする。
+    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH
+        - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    let pane_size = textures
+        .iter()
+        .filter_map(|tex| tex.as_ref())
+        .map(|page| {
+            let size = rotated_display_size(page.texture.size_vec2(), page.rotation);
+            let scale = (per_pane_max_width / size.x.max(1.0))
+                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
+            size * scale
+        })
+        .fold(egui::Vec2::ZERO, |acc, size| {
+            egui::vec2(acc.x.max(size.x), acc.y.max(size.y))
+        });
+    let pane_size = if pane_size == egui::Vec2::ZERO {
+        // まだ 1 枚も読めていないときの見た目。読み込み後に伸縮しすぎないよう、
+        // 1 枚版の従来サイズを枚数ぶん並べた大きさにする。
+        egui::vec2(160.0_f32.min(per_pane_max_width), 100.0)
+    } else {
+        pane_size
+    };
+    let desired_image_size = egui::vec2(
+        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32,
+        pane_size.y,
+    );
+    let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
+    let min_left = full_rect.left() + 8.0;
+    let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
+    let left = (pointer_x - bubble_size.x * 0.5).clamp(min_left, max_left);
+    let bubble_rect = egui::Rect::from_min_size(
+        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
+        bubble_size,
+    );
+    let background = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 244);
+    painter.rect_filled(bubble_rect, 6.0, background);
+    painter.rect_stroke(
+        bubble_rect,
+        6.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(104)),
+        egui::StrokeKind::Inside,
+    );
+    let arrow_x = pointer_x.clamp(bubble_rect.left() + 12.0, bubble_rect.right() - 12.0);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(arrow_x - 7.0, bubble_rect.bottom()),
+            egui::pos2(arrow_x + 7.0, bubble_rect.bottom()),
+            egui::pos2(arrow_x, bubble_rect.bottom() + 8.0),
+        ],
+        background,
+        egui::Stroke::NONE,
+    ));
+    let image_bounds = egui::Rect::from_min_max(
+        bubble_rect.min + egui::vec2(6.0, 6.0),
+        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
+    );
+    let pane_width = (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    for (pane, texture) in textures.iter().enumerate() {
+        let left = image_bounds.left() + (pane_width + STILL_SEEK_PREVIEW_PANE_GAP) * pane as f32;
+        let pane_bounds = egui::Rect::from_min_size(
+            egui::pos2(left, image_bounds.top()),
+            egui::vec2(pane_width, image_bounds.height()),
+        );
+        match texture {
+            Some(page) => {
+                crate::app::draw_rotated_image(
+                    painter,
+                    page.texture.id(),
+                    fit_texture_rect(
+                        rotated_display_size(page.texture.size_vec2(), page.rotation),
+                        pane_bounds,
+                    ),
+                    page.rotation,
+                );
+            }
+            None => {
+                painter.text(
+                    pane_bounds.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読み込み中…",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(170),
+                );
+            }
+        }
+    }
+    if textures.is_empty() {
+        painter.text(
+            image_bounds.center(),
+            egui::Align2::CENTER_CENTER,
+            "読み込み中…",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_gray(170),
+        );
+    }
+    painter.text(
+        egui::pos2(bubble_rect.center().x, bubble_rect.bottom() - 12.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::monospace(13.0),
+        FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+    );
+}
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
-pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+pub(crate) fn metadata_panel_rect_with_seek_height(
+    full_rect: egui::Rect,
+    seek_height: f32,
+) -> egui::Rect {
     let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width().max(0.0) * 0.5);
     let panel_top = full_rect.min.y + TOP_BAR_HEIGHT;
-    let panel_bottom = (full_rect.max.y - FS_SEEK_BAR_HEIGHT).max(panel_top);
+    let panel_bottom = (full_rect.max.y - seek_height).max(panel_top);
     egui::Rect::from_min_max(
         egui::pos2(full_rect.max.x - panel_w, panel_top),
         egui::pos2(full_rect.max.x, panel_bottom),
     )
+}
+
+pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    metadata_panel_rect_with_seek_height(full_rect, StillSeekGeometry::bar_only().total_height)
 }
 
 fn fullscreen_top_bar_rect(full_rect: egui::Rect) -> egui::Rect {
@@ -2180,19 +4513,49 @@ fn still_touch_panel_handle_rect(
     full_rect: egui::Rect,
     edge: crate::ui_helpers::PanelEdge,
 ) -> egui::Rect {
+    still_touch_panel_handle_rect_with_seek_height(
+        full_rect,
+        edge,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn still_touch_panel_handle_rect_with_seek_height(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+    seek_height: f32,
+) -> egui::Rect {
     touch_panel_handle_rect(
         full_rect,
         edge,
         TOP_BAR_HEIGHT,
-        FS_SEEK_BAR_HEIGHT,
+        seek_height,
         TOUCH_PANEL_HANDLE_WIDTH_PT,
     )
 }
 
 fn still_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    still_touch_panel_handle_rects_with_seek_height(
+        full_rect,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn still_touch_panel_handle_rects_with_seek_height(
+    full_rect: egui::Rect,
+    seek_height: f32,
+) -> [egui::Rect; 2] {
     [
-        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Left),
-        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Right),
+        still_touch_panel_handle_rect_with_seek_height(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Left,
+            seek_height,
+        ),
+        still_touch_panel_handle_rect_with_seek_height(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Right,
+            seek_height,
+        ),
     ]
 }
 
@@ -2202,8 +4565,24 @@ fn visible_still_touch_panel_handle_rects(
     left_panel_open: bool,
     right_panel_open: bool,
 ) -> [egui::Rect; 2] {
+    visible_still_touch_panel_handle_rects_with_seek_height(
+        full_rect,
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn visible_still_touch_panel_handle_rects_with_seek_height(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    seek_height: f32,
+) -> [egui::Rect; 2] {
     visible_touch_panel_handle_rects(
-        still_touch_panel_handle_rects(full_rect),
+        still_touch_panel_handle_rects_with_seek_height(full_rect, seek_height),
         handles_enabled,
         left_panel_open,
         right_panel_open,
@@ -2240,12 +4619,31 @@ fn extend_touch_excluded_with_panel_handles(
     left_panel_open: bool,
     right_panel_open: bool,
 ) {
+    extend_touch_excluded_with_panel_handles_and_seek_height(
+        excluded,
+        full_rect,
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+        StillSeekGeometry::bar_only().total_height,
+    );
+}
+
+fn extend_touch_excluded_with_panel_handles_and_seek_height(
+    excluded: &mut Vec<egui::Rect>,
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    seek_height: f32,
+) {
     excluded.extend(
-        visible_still_touch_panel_handle_rects(
+        visible_still_touch_panel_handle_rects_with_seek_height(
             full_rect,
             handles_enabled,
             left_panel_open,
             right_panel_open,
+            seek_height,
         )
         .into_iter()
         .filter(egui::Rect::is_positive),
@@ -2683,13 +5081,34 @@ fn fullscreen_side_panel_rects(
     right_panel_visible: bool,
     left_panel_visible: bool,
 ) -> FullscreenSidePanelRects {
+    fullscreen_side_panel_rects_with_seek_height(
+        full_rect,
+        chrome_enabled,
+        mode,
+        right_panel_visible,
+        left_panel_visible,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn fullscreen_side_panel_rects_with_seek_height(
+    full_rect: egui::Rect,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+    seek_height: f32,
+) -> FullscreenSidePanelRects {
     if !chrome_enabled {
         return FullscreenSidePanelRects::default();
     }
     let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
     FullscreenSidePanelRects {
         left: if left_panel_visible {
-            Some(adjustment_panel_rect(full_rect))
+            Some(adjustment_panel_rect_with_seek_height(
+                full_rect,
+                seek_height,
+            ))
         } else if click_mode {
             Some(panel_callout_edge_rect(
                 full_rect,
@@ -2699,7 +5118,7 @@ fn fullscreen_side_panel_rects(
             None
         },
         right: Some(if right_panel_visible {
-            metadata_panel_rect(full_rect)
+            metadata_panel_rect_with_seek_height(full_rect, seek_height)
         } else if click_mode {
             panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
         } else {
@@ -2717,15 +5136,38 @@ fn fullscreen_side_panel_contains_pointer(
     left_panel_visible: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    fullscreen_side_panel_contains_pointer_with_seek_height(
+        full_rect,
+        pos,
+        chrome_enabled,
+        mode,
+        right_panel_visible,
+        left_panel_visible,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn fullscreen_side_panel_contains_pointer_with_seek_height(
+    full_rect: egui::Rect,
+    pos: egui::Pos2,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     if !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
         return false;
     }
-    fullscreen_side_panel_rects(
+    fullscreen_side_panel_rects_with_seek_height(
         full_rect,
         chrome_enabled,
         mode,
         right_panel_visible,
         left_panel_visible,
+        seek_height,
     )
     .iter()
     .any(|rect| rect.contains(pos))
@@ -2962,8 +5404,24 @@ pub(crate) fn metadata_panel_hover_active_at(
     was_active: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    metadata_panel_hover_active_at_with_seek_height(
+        full_rect,
+        pointer_pos,
+        was_active,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+pub(crate) fn metadata_panel_hover_active_at_with_seek_height(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     let activation_rect = metadata_panel_hover_activation_rect(full_rect);
-    let sustain_rect = metadata_panel_rect(full_rect)
+    let sustain_rect = metadata_panel_rect_with_seek_height(full_rect, seek_height)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|p| {
         fullscreen_edge_hover_allowed(p, navigator_exclusion)
@@ -2980,13 +5438,29 @@ fn adjustment_panel_hover_active_at(
     was_active: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    adjustment_panel_hover_active_at_with_seek_height(
+        full_rect,
+        pointer_pos,
+        was_active,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn adjustment_panel_hover_active_at_with_seek_height(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     let strip =
         crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
     let activation_rect = egui::Rect::from_min_max(
         full_rect.left_top(),
         egui::pos2(full_rect.left() + strip, full_rect.bottom()),
     );
-    let sustain_rect = adjustment_panel_rect(full_rect)
+    let sustain_rect = adjustment_panel_rect_with_seek_height(full_rect, seek_height)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|pos| {
         fullscreen_edge_hover_allowed(pos, navigator_exclusion)
@@ -3477,62 +5951,7 @@ pub(crate) struct ExportDialogTarget {
     original_format: crate::save_with_metadata::SrcFormat,
     source_dir: std::path::PathBuf,
     pub(crate) basename: String,
-    pub(crate) pixels: crate::export_dialog::ExportPixels,
-}
-
-fn scale_sns_split_frames_to_export_pixels(
-    frames: &[crate::export_crop::CropRect],
-    source_size: [usize; 2],
-    target_size: [usize; 2],
-) -> Result<Vec<crate::export_crop::CropRect>, String> {
-    if frames.is_empty() {
-        return Ok(Vec::new());
-    }
-    let source_width = source_size[0].max(1) as f64;
-    let source_height = source_size[1].max(1) as f64;
-    let target_width = target_size[0].max(1);
-    let target_height = target_size[1].max(1);
-    let scale_x = target_width as f64 / source_width;
-    let scale_y = target_height as f64 / source_height;
-
-    // source の共有境界を同じ最近傍丸めで target へ写す。先頭枠の幅を全枠へ
-    // 複製すると、割り切れない余り (832 / 3 など) が末尾から失われる。
-    let frame_count = frames.len();
-    if target_width < frame_count {
-        return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-    }
-
-    let scale_boundary = |value: f32, scale: f64, limit: usize| -> Option<usize> {
-        let scaled = f64::from(value) * scale;
-        scaled
-            .is_finite()
-            .then(|| scaled.round().clamp(0.0, limit as f64) as usize)
-    };
-    let mut scaled = Vec::with_capacity(frame_count);
-    for frame in frames {
-        let Some(min_x) = scale_boundary(frame.min_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_x) = scale_boundary(frame.max_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(min_y) = scale_boundary(frame.min_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_y) = scale_boundary(frame.max_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        if max_x <= min_x || max_y <= min_y {
-            return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-        }
-        scaled.push(crate::export_crop::CropRect {
-            min_x: min_x as f32,
-            min_y: min_y as f32,
-            max_x: max_x as f32,
-            max_y: max_y as f32,
-        });
-    }
-    Ok(scaled)
+    pub(crate) composite: crate::export_dialog::ExportComposite,
 }
 
 fn export_batch_selection_update(
@@ -6480,6 +8899,22 @@ impl App {
         fs_idx: usize,
         original_preview_active: bool,
     ) {
+        let mut perf = None;
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            &mut perf,
+        );
+    }
+
+    fn resolve_fs_navigation_sequence_target_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        original_preview_active: bool,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) {
         let Some(target) = self
             .fs_holdover_tex
             .as_ref()
@@ -6503,7 +8938,13 @@ impl App {
         }
 
         if accept_rendition {
+            let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
             self.ensure_navigation_target_thumbnail_requests(ctx, &target.pages);
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                perf_t0,
+            );
         }
         let bypasses_final_pipeline =
             self.fs_display_bypasses_final_pipeline(original_preview_active);
@@ -6512,9 +8953,23 @@ impl App {
                 // この frame は描画側も raw source を明示的に選ぶ。通常表示では下の final
                 // pipeline gate を維持するため、白黒からカラーへの途中切替を見せない契約は
                 // 緩めず、利用者が元画像を要求した frame だけ readiness source を揃える。
-                self.resolve_original_preview_tex(*idx).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_original_preview_tex(*idx).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex,
+                    perf_t0,
+                );
+                ready
             } else {
-                self.resolve_fs_display_tex(*idx, true).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_fs_display_tex(*idx, true).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+                    perf_t0,
+                );
+                ready
                     || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
                         && matches!(
                             self.thumbnails.get(*idx),
@@ -6527,10 +8982,19 @@ impl App {
             .iter()
             .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
         let rendition_ready = accept_rendition
-            && target
-                .pages
-                .iter()
-                .all(|idx| self.ensure_passthrough_rendition(ctx, *idx).is_some());
+            && target.pages.iter().all(|idx| {
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let passthrough_perf = perf.as_mut().map(|perf| &mut perf.passthrough_rendition);
+                let ready = self
+                    .ensure_passthrough_rendition_with_perf(ctx, *idx, passthrough_perf)
+                    .is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition,
+                    perf_t0,
+                );
+                ready
+            });
         let rendition_failed = accept_rendition
             && target
                 .pages
@@ -7189,7 +9653,8 @@ impl App {
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
         let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
-        let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+        let bottom_m = (self.still_seek_geometry_for_idx(fs_idx, false).total_height + 8.0)
+            .min(image_rect.height() * 0.25);
         let pan_band = egui::Rect::from_min_max(
             egui::pos2(image_rect.left(), image_rect.top() + top_m),
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
@@ -7976,25 +10441,24 @@ fn capture_region_outside_rects(bounds: egui::Rect, hole: egui::Rect) -> [egui::
 /// 描画 (`draw_adjustment_panel`) と当たり判定 (ホバー閉じ / ホイール /
 /// クリック抑制) は必ずこの関数の rect を使うこと。幅がずれると「見えているのに
 /// 枠外扱い」になり、パネルが閉じる・操作がページ送りに化ける。
-fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+fn adjustment_panel_rect_with_seek_height(full_rect: egui::Rect, seek_height: f32) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
         egui::pos2(
             full_rect.min.x + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH,
             // 下端のページシークバーと重ならないよう、元の下端マージンとシークバー高さの
             // 大きい方だけ下端を空ける。
-            full_rect.max.y
-                - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN.max(FS_SEEK_BAR_HEIGHT),
+            full_rect.max.y - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN.max(seek_height),
         ),
     )
 }
 
+fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    adjustment_panel_rect_with_seek_height(full_rect, StillSeekGeometry::bar_only().total_height)
+}
+
 fn fullscreen_seek_panel_rect(full_rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(
-        egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_BAR_HEIGHT),
-        full_rect.right_bottom(),
-    )
-    .intersect(full_rect)
+    StillSeekGeometry::bar_only().panel_rect(full_rect)
 }
 
 fn fullscreen_seek_separator_y(panel_rect: egui::Rect, locked: bool) -> f32 {
@@ -8104,10 +10568,11 @@ fn compare_shader_visible_region(
 ///
 /// `right_panel_width` は 0 でなければ右端を空ける。パネル自身の矩形と同じ値を渡すこと
 /// (別々に clamp すると幅が食い違う)。
-fn fullscreen_rect_excluding_fixed_bars(
+fn fullscreen_rect_excluding_fixed_bars_with_seek_height(
     full_rect: egui::Rect,
     top_locked: bool,
     seek_locked: bool,
+    seek_height: f32,
     fixed_bar_gap_px: u32,
     right_panel_width: f32,
 ) -> egui::Rect {
@@ -8118,7 +10583,7 @@ fn fullscreen_rect_excluding_fixed_bars(
         full_rect.top()
     };
     let bottom = if seek_locked {
-        (full_rect.bottom() - FS_SEEK_BAR_HEIGHT - gap).max(top + 1.0)
+        (full_rect.bottom() - seek_height - gap).max(top + 1.0)
     } else {
         full_rect.bottom()
     };
@@ -8129,6 +10594,23 @@ fn fullscreen_rect_excluding_fixed_bars(
         full_rect.right()
     };
     egui::Rect::from_min_max(egui::pos2(full_rect.left(), top), egui::pos2(right, bottom))
+}
+
+fn fullscreen_rect_excluding_fixed_bars(
+    full_rect: egui::Rect,
+    top_locked: bool,
+    seek_locked: bool,
+    fixed_bar_gap_px: u32,
+    right_panel_width: f32,
+) -> egui::Rect {
+    fullscreen_rect_excluding_fixed_bars_with_seek_height(
+        full_rect,
+        top_locked,
+        seek_locked,
+        StillSeekGeometry::bar_only().total_height,
+        fixed_bar_gap_px,
+        right_panel_width,
+    )
 }
 
 /// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
@@ -8145,6 +10627,8 @@ fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+    #[cfg(test)]
+    NAV_INDICES_BUILD_COUNT.set(NAV_INDICES_BUILD_COUNT.get() + 1);
     visible_indices
         .iter()
         .copied()
@@ -8158,6 +10642,21 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NAV_INDICES_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_nav_indices_build_count_for_test() {
+    NAV_INDICES_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn nav_indices_build_count_for_test() -> usize {
+    NAV_INDICES_BUILD_COUNT.get()
 }
 
 fn is_spread_pairable_item(item: Option<&GridItem>) -> bool {
@@ -8785,7 +11284,7 @@ fn is_landscape(
         .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
 }
 
-fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
+pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
     fn from_usize(dims: [usize; 2]) -> Option<(u32, u32)> {
         Some((u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?))
     }
@@ -8814,6 +11313,189 @@ fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
 struct SpreadDisplayUnit {
     nav_start: usize,
     pages: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SpreadDisplayUnitsToken {
+    items_generation: u64,
+    spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
+    landscape_epoch: u64,
+    nav: Vec<usize>,
+}
+
+impl SpreadDisplayUnitsToken {
+    fn matches(
+        &self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+        landscape_epoch: u64,
+    ) -> bool {
+        self.items_generation == items_generation
+            && self.spread_mode == spread_mode
+            && self.shift_anchor_idx == shift_anchor_idx
+            && self.landscape_epoch == landscape_epoch
+            && self.nav == nav
+    }
+
+    fn identifies_nav(&self, nav: &[usize], items_generation: u64) -> bool {
+        self.items_generation == items_generation && self.nav == nav
+    }
+}
+
+/// 見開き表示単位列を所有する viewer context 単位のキャッシュ。
+///
+/// nav は index 列そのものを token に保持し、並べ替え・絞り込み・連結読みの列切替を
+/// `items_generation` とは独立に識別する。`landscape_epoch` は、cached nav 上で
+/// 「縦長扱い」と「横長」が反転した場合だけ進む。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpreadDisplayUnitsCache {
+    token: Option<SpreadDisplayUnitsToken>,
+    units: Arc<Vec<SpreadDisplayUnit>>,
+    tracked_indices: HashSet<usize>,
+    landscape_indices: HashSet<usize>,
+    landscape_epoch: u64,
+    rotation_recheck_all: bool,
+    rotation_recheck_indices: HashSet<usize>,
+}
+
+impl SpreadDisplayUnitsCache {
+    /// A rotation reload does not erase the already displayed unit mapping.
+    /// Keep its input widgets/targets alive until the new metadata is ready, but
+    /// never reuse it across a different book, order, mode, or shift anchor.
+    fn units_during_rotation_reload(
+        &self,
+        nav: &[usize],
+        generation: u64,
+        mode: SpreadMode,
+        shift_anchor: Option<usize>,
+    ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
+        self.token
+            .as_ref()
+            .filter(|token| {
+                token.identifies_nav(nav, generation)
+                    && token.spread_mode == mode
+                    && token.shift_anchor_idx == shift_anchor
+            })
+            .map(|_| Arc::clone(&self.units))
+    }
+
+    fn get(
+        &self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+    ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
+        self.token
+            .as_ref()
+            .is_some_and(|token| {
+                token.matches(
+                    nav,
+                    items_generation,
+                    spread_mode,
+                    shift_anchor_idx,
+                    self.landscape_epoch,
+                )
+            })
+            .then(|| Arc::clone(&self.units))
+    }
+
+    fn install(
+        &mut self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+        landscape_flags: &[bool],
+        units: Vec<SpreadDisplayUnit>,
+    ) -> Arc<Vec<SpreadDisplayUnit>> {
+        self.token = Some(SpreadDisplayUnitsToken {
+            items_generation,
+            spread_mode,
+            shift_anchor_idx,
+            landscape_epoch: self.landscape_epoch,
+            nav: nav.to_vec(),
+        });
+        self.tracked_indices = nav.iter().copied().collect();
+        self.landscape_indices = nav
+            .iter()
+            .zip(landscape_flags)
+            .filter_map(|(&idx, &landscape)| landscape.then_some(idx))
+            .collect();
+        self.rotation_recheck_all = false;
+        self.rotation_recheck_indices.clear();
+        self.units = Arc::new(units);
+        Arc::clone(&self.units)
+    }
+
+    fn tracks(&self, items_generation: u64, idx: usize) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| token.items_generation == items_generation)
+            && self.tracked_indices.contains(&idx)
+    }
+
+    fn reconcile_landscape(&mut self, items_generation: u64, idx: usize, landscape: bool) {
+        if !self.tracks(items_generation, idx) {
+            return;
+        }
+        let was_landscape = self.landscape_indices.contains(&idx);
+        if was_landscape == landscape {
+            return;
+        }
+        if landscape {
+            self.landscape_indices.insert(idx);
+        } else {
+            self.landscape_indices.remove(&idx);
+        }
+        self.landscape_epoch = self.landscape_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn mark_rotation_for_recheck(&mut self, items_generation: u64, idx: usize) {
+        if self.tracks(items_generation, idx) {
+            self.rotation_recheck_indices.insert(idx);
+        }
+    }
+
+    pub(crate) fn mark_all_rotations_for_recheck(&mut self, items_generation: u64) {
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.items_generation == items_generation)
+        {
+            self.rotation_recheck_all = true;
+            self.rotation_recheck_indices.clear();
+        }
+    }
+
+    fn take_rotation_rechecks(&mut self, nav: &[usize], items_generation: u64) -> Vec<usize> {
+        if !self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.identifies_nav(nav, items_generation))
+        {
+            self.rotation_recheck_all = false;
+            self.rotation_recheck_indices.clear();
+            return Vec::new();
+        }
+        if self.rotation_recheck_all {
+            self.rotation_recheck_all = false;
+            self.rotation_recheck_indices.clear();
+            return nav.to_vec();
+        }
+        self.rotation_recheck_indices.drain().collect()
+    }
+
+    fn tracked_indices(&self, items_generation: u64) -> Vec<usize> {
+        self.token
+            .as_ref()
+            .filter(|token| token.items_generation == items_generation)
+            .map(|token| token.nav.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl SpreadDisplayUnit {
@@ -8883,6 +11565,20 @@ fn build_spread_display_units(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static SPREAD_DISPLAY_UNITS_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_spread_display_units_build_count_for_test() {
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn spread_display_units_build_count_for_test() -> usize {
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.get()
+}
 #[cfg(test)]
 fn build_spread_display_units_with_landscape(
     nav: &[usize],
@@ -9835,11 +12531,87 @@ pub(crate) struct FsKeyAction {
 
 #[derive(Clone)]
 pub(crate) struct FsSeekInfo {
-    image_indices: Vec<usize>,
+    image_indices: Arc<Vec<usize>>,
     current_pos: usize,
     media_count: usize,
     video_count: usize,
     other_count: usize,
+}
+
+impl FsSeekInfo {
+    /// The page track/thumbnail content is available only for an all-image navigation list.
+    /// Geometry and painting must use this same decision, including on the first frame.
+    fn has_page_strip_content(&self) -> bool {
+        self.media_count == self.image_indices.len() && !self.image_indices.is_empty()
+    }
+}
+
+/// 表示順から導出する一覧と seek 情報をまとめて所有する viewer context 単位のキャッシュ。
+///
+/// 3 つを別 field に戻すと失効点が再び分裂するため、破棄は常に単一メソッドで
+/// 一括して行う。main / detached 間ではこの owner 自体を共有せず bundle と一緒に交換する。
+#[derive(Default)]
+pub(crate) struct ViewerNavigationCaches {
+    source: Option<(u64, ReadingFlow)>,
+    nav_indices: Option<Arc<Vec<usize>>>,
+    still_image_indices: Option<Arc<Vec<usize>>>,
+    fs_seek_info: Option<(usize, FsSeekInfo)>,
+}
+
+impl ViewerNavigationCaches {
+    pub(crate) fn invalidate(&mut self) {
+        self.source = None;
+        self.nav_indices = None;
+        self.still_image_indices = None;
+        self.fs_seek_info = None;
+    }
+
+    fn ensure_source(&mut self, items_generation: u64, reading_flow: ReadingFlow) {
+        let source = (items_generation, reading_flow);
+        if self.source == Some(source) {
+            return;
+        }
+        self.invalidate();
+        self.source = Some(source);
+    }
+
+    fn nav_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.nav_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_nav_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.nav_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn still_image_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.still_image_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_still_image_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.still_image_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn fs_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
+        self.fs_seek_info
+            .as_ref()
+            .filter(|(cached_idx, _)| *cached_idx == fs_idx)
+            .map(|(_, info)| info.clone())
+    }
+
+    fn install_fs_seek_info(&mut self, fs_idx: usize, info: FsSeekInfo) {
+        self.fs_seek_info = Some((fs_idx, info));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_entries_for_test(&self) -> bool {
+        self.nav_indices.is_some()
+            || self.still_image_indices.is_some()
+            || self.fs_seek_info.is_some()
+    }
 }
 
 // Page labels live on the fullscreen viewer's fixed dark surfaces. They must
@@ -10136,6 +12908,123 @@ pub fn draw_still_panel_reach_snapshot_fixture(
     }
 }
 
+/// Visual-only fixture for the still page seek strip and hover preview.
+#[doc(hidden)]
+pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::from_rgb(18, 22, 30));
+    let geometry = StillSeekGeometry::resolve(
+        true,
+        crate::video::seek_strip_layout::SeekStripHeight::Medium,
+        crate::settings::StillSeekBarWithStrip::Show,
+        crate::settings::BottomBarLock::BarAndStrip,
+    );
+    let panel = geometry.panel_rect(full_rect);
+    ui.painter().rect_filled(
+        panel,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(8, 10, 14, 244),
+    );
+    let strip = geometry.strip_rect(full_rect).unwrap();
+    let strip_lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+    let row = egui::Rect::from_min_max(
+        strip.min + egui::vec2(18.0, 5.0),
+        egui::pos2(strip_lock.left() - 6.0, strip.bottom() - 5.0),
+    );
+    let cell_height =
+        strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
+    let colors = [
+        egui::Color32::from_rgb(64, 87, 118),
+        egui::Color32::from_rgb(118, 80, 64),
+        egui::Color32::from_rgb(71, 110, 79),
+        egui::Color32::from_rgb(111, 72, 114),
+        egui::Color32::from_rgb(120, 112, 70),
+        egui::Color32::from_rgb(65, 105, 115),
+    ];
+    let image_indices = [0, 1, 2, 3, 4, 5];
+    let sizes = [
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(3.0, 2.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+    ];
+    let rotations = [
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::Cw90,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+    ];
+    let layout = still_seek_strip_layout(&image_indices, 2, row, cell_height, false, |idx| {
+        StillSeekStripThumbnail::Loaded(sizes[idx], rotations[idx])
+    });
+    for cell in &layout.cells {
+        let rect = cell.rect;
+        let color = colors[cell.idx];
+        ui.painter().rect_filled(rect, 3.0, color);
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_top()],
+            egui::Stroke::new(2.0, egui::Color32::from_white_alpha(90)),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            (cell.source_pos + 18).to_string(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+        );
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(
+                if cell.source_pos == 2 || cell.source_pos == 3 {
+                    3.0
+                } else {
+                    1.0
+                },
+                if cell.source_pos == 2 || cell.source_pos == 3 {
+                    egui::Color32::from_rgb(112, 174, 255)
+                } else {
+                    egui::Color32::from_gray(76)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+    draw_seek_strip_lock_button_visual(ui.painter(), strip_lock, false, true);
+    let bar = geometry.bar_rect(full_rect).unwrap();
+    let track = egui::Rect::from_center_size(
+        egui::pos2(full_rect.center().x - 28.0, bar.center().y),
+        egui::vec2(full_rect.width() - 150.0, 8.0),
+    );
+    ui.painter()
+        .rect_filled(track, 4.0, egui::Color32::from_gray(88));
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(track.min, egui::pos2(track.center().x, track.bottom())),
+        4.0,
+        egui::Color32::from_rgb(112, 174, 255),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(track.center().x, track.center().y),
+        6.0,
+        egui::Color32::from_rgb(232, 240, 255),
+    );
+    // 見開き 2 ページぶんの枠を出す fixture。実テクスチャは持たないので
+    // 「読み込み中…」が 2 面に並ぶ形になり、ペア表示のレイアウトを固定できる。
+    paint_still_seek_preview(
+        ui.painter(),
+        full_rect,
+        panel.top(),
+        full_rect.center().x + 40.0,
+        &[None, None],
+        "20-21 / 128",
+    );
+}
+
 /// Visual-only fixture for the music touch-panel handles. Production margin,
 /// handle geometry, visibility, and painting are reused so the snapshot also
 /// guards the empty-margin boundary around the mock waveform.
@@ -10224,11 +13113,13 @@ impl App {
     /// (PDF を開き直して items 世代が変わると `page_dims_cache` も失効するため、
     /// サムネイル未読込と重なると供給源がゼロになる)。
     pub(crate) fn harvest_page_dims(&mut self) {
-        let generation = self.items_generation;
-        for (&idx, entry) in &self.fs_cache {
-            if let Some(dims) = fs_cache_entry_page_dims(entry) {
-                self.page_dims_cache.record(generation, idx, dims);
-            }
+        let live_dims = self
+            .fs_cache
+            .iter()
+            .filter_map(|(&idx, entry)| fs_cache_entry_page_dims(entry).map(|dims| (idx, dims)))
+            .collect::<Vec<_>>();
+        for (idx, dims) in live_dims {
+            self.record_page_dims_for_spread(idx, dims);
         }
         // retained composite は現在ページを表示するための経路なので、そのページだけ見る。
         let retained = self.fullscreen_idx.and_then(|idx| {
@@ -10236,27 +13127,146 @@ impl App {
                 .map(|dims| (idx, dims))
         });
         if let Some((idx, dims)) = retained {
-            self.page_dims_cache.record(generation, idx, dims);
+            self.record_page_dims_for_spread(idx, dims);
         }
     }
 
-    fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Vec<SpreadDisplayUnit> {
-        // `get_rotations_for_indices` が mutable なのは DB 未読分を idx cache へ memoize するため。
-        // fs_cache / thumbnails の借用より先に nav 全体を一括取得して借用を分離する。
-        let rotations = self.get_rotations_for_indices(nav);
-        build_spread_display_units(
-            nav,
-            &rotations,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        )
+    /// `fs_cache` へ静止画を挿入した直後に呼び、同じ frame 内で寸法確定を token へ反映する。
+    pub(crate) fn record_fs_cache_page_dims_for_spread(&mut self, idx: usize) {
+        let dims = self.fs_cache.get(&idx).and_then(fs_cache_entry_page_dims);
+        if let Some(dims) = dims {
+            self.record_page_dims_for_spread(idx, dims);
+        }
     }
 
+    /// 判明した pixel 寸法を保持し、cached nav 上の横長性が変わった場合だけ epoch を進める。
+    pub(crate) fn record_page_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
+        self.page_dims_cache
+            .record(self.items_generation, idx, dims);
+        self.reconcile_spread_landscape_for_idx(idx);
+    }
+
+    /// PDF page box 等の layout 寸法版。pixel 寸法と同じ失効境界を通す。
+    pub(crate) fn record_page_layout_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
+        self.page_dims_cache
+            .record_layout(self.items_generation, idx, dims);
+        self.reconcile_spread_landscape_for_idx(idx);
+    }
+
+    /// 現在 cache 済みの回転を使って、1 ページの横長性だけを再照合する。
+    pub(crate) fn reconcile_spread_landscape_for_idx(&mut self, idx: usize) {
+        if !self
+            .spread_display_units_cache
+            .tracks(self.items_generation, idx)
+        {
+            return;
+        }
+        let Some(&rotation) = self.rotation_cache.get(&idx) else {
+            // 外部 DB 更新のため回転 cache を捨てた直後は、次の表示単位参照で一括再読込する。
+            self.spread_display_units_cache
+                .mark_rotation_for_recheck(self.items_generation, idx);
+            return;
+        };
+        self.reconcile_spread_landscape_with_rotation(idx, rotation);
+    }
+
+    pub(crate) fn reconcile_spread_landscape_with_rotation(
+        &mut self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) {
+        let landscape = is_spread_pairable_item(self.items.get(idx))
+            && is_landscape(
+                idx,
+                rotation,
+                &self.fs_cache,
+                &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
+            );
+        self.spread_display_units_cache
+            .reconcile_landscape(self.items_generation, idx, landscape);
+    }
+
+    /// worker が現在の rotation cache 全体を差し替えた経路、および全回転リセット用。
+    pub(crate) fn reconcile_spread_landscapes_from_rotation_cache(&mut self) {
+        let tracked = self
+            .spread_display_units_cache
+            .tracked_indices(self.items_generation);
+        for idx in tracked {
+            let rotation = self
+                .rotation_cache
+                .get(&idx)
+                .copied()
+                .unwrap_or(crate::rotation_db::Rotation::None);
+            self.reconcile_spread_landscape_with_rotation(idx, rotation);
+        }
+    }
+
+    fn refresh_spread_rotation_rechecks(&mut self, nav: &[usize]) {
+        let mut indices = self
+            .spread_display_units_cache
+            .take_rotation_rechecks(nav, self.items_generation);
+        if indices.is_empty() {
+            return;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let rotations = self.get_rotations_for_indices(&indices);
+        for (&idx, rotation) in indices.iter().zip(rotations) {
+            self.reconcile_spread_landscape_with_rotation(idx, rotation);
+        }
+    }
+
+    fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Arc<Vec<SpreadDisplayUnit>> {
+        self.refresh_spread_rotation_rechecks(nav);
+        if let Some(units) = self.spread_display_units_cache.get(
+            nav,
+            self.items_generation,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+        ) {
+            return units;
+        }
+
+        // DB 未読の回転は nav 全体で一括取得し、idx cache へ memoize する。
+        let rotations = self.get_rotations_for_indices(nav);
+        let landscape_flags = nav
+            .iter()
+            .enumerate()
+            .map(|(nav_pos, &idx)| {
+                is_spread_pairable_item(self.items.get(idx))
+                    && is_landscape(
+                        idx,
+                        rotations
+                            .get(nav_pos)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                        &self.fs_cache,
+                        &self.thumbnails,
+                        &self.page_dims_cache,
+                        self.items_generation,
+                    )
+            })
+            .collect::<Vec<_>>();
+        let units = build_spread_display_units_with_predicates(
+            nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
+        #[cfg(test)]
+        SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
+        self.spread_display_units_cache.install(
+            nav,
+            self.items_generation,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &landscape_flags,
+            units,
+        )
+    }
     /// 分割を織り込んだ表示ステップ列。分割モードでなければ `None`。
     ///
     /// 分割するのは「静止画」かつ「保存回転を反映して横長」のページ。**縦横比の判定は
@@ -10476,9 +13486,31 @@ impl App {
     #[cfg(test)]
     pub(crate) fn spread_display_unit_pages_for_test(&mut self, nav: &[usize]) -> Vec<Vec<usize>> {
         self.build_spread_display_units_for_nav(nav)
-            .into_iter()
+            .iter()
             .map(|unit| unit.screen_pages(self.spread_mode))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uncached_spread_display_unit_pages_for_test(
+        &mut self,
+        nav: &[usize],
+    ) -> Vec<Vec<usize>> {
+        let rotations = self.get_rotations_for_indices(nav);
+        build_spread_display_units(
+            nav,
+            &rotations,
+            &self.items,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        )
+        .into_iter()
+        .map(|unit| unit.screen_pages(self.spread_mode))
+        .collect()
     }
 
     pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
@@ -10536,13 +13568,21 @@ impl App {
         let right_open = self.metadata_panel_click_shown()
             || self.fs_info_panel.hover_active
             || self.fullscreen_tag_picker_open;
+        let seek_height = self
+            .fullscreen_idx
+            .map(|idx| self.still_seek_geometry_for_idx(idx, false).total_height)
+            .unwrap_or_else(|| StillSeekGeometry::bar_only().total_height);
         for (edge, rect) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
         ]
         .into_iter()
-        .zip(visible_still_touch_panel_handle_rects(
-            full_rect, true, left_open, right_open,
+        .zip(visible_still_touch_panel_handle_rects_with_seek_height(
+            full_rect,
+            true,
+            left_open,
+            right_open,
+            seek_height,
         )) {
             if !rect.is_positive() {
                 continue;
@@ -10854,7 +13894,7 @@ impl App {
         // 維持される内部遷移を含む)。fullscreen_idx に依存しない判定なのでこの分岐は残す。
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
-            && let Some(window_id) = self.detached_viewer_window_id
+            && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -10869,7 +13909,7 @@ impl App {
         // detached ID を返すことで OS 窓の作り直しを無くす。
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
-            && let Some(window_id) = self.detached_viewer_window_id
+            && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -10884,7 +13924,7 @@ impl App {
         if matches!(
             self.fs_viewport_presentation,
             Some(ViewerPresentation::DetachedWindow)
-        ) && let Some(window_id) = self.detached_viewer_window_id
+        ) && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -13333,9 +16373,40 @@ impl App {
             && !self.analysis_mode
     }
 
-    fn fullscreen_seek_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.settings.fullscreen_seek_bar_locked
-            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
+    fn still_seek_geometry_for_idx(&mut self, fs_idx: usize, is_video: bool) -> StillSeekGeometry {
+        let allowed = self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
+        let strip_visible = self.settings.still_seek_strip_visible
+            && allowed
+            && self
+                .fullscreen_seek_info_cached(fs_idx)
+                .is_some_and(|info| info.has_page_strip_content());
+        let bottom_lock = if allowed {
+            self.settings.still_bottom_lock()
+        } else {
+            crate::settings::BottomBarLock::None
+        };
+        StillSeekGeometry::resolve(
+            strip_visible,
+            self.settings.still_seek_strip_height,
+            self.settings.still_seek_bar_with_strip,
+            bottom_lock,
+        )
+    }
+
+    /// サムネイル列の全入口（ボタン、上下ドラッグ、キー）から同じ設定を更新する。
+    fn set_still_seek_strip_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        let changed = self.settings.still_seek_strip_visible != visible
+            || (!visible && self.settings.still_bottom_lock().strip_locked());
+        if !changed {
+            return;
+        }
+        self.settings.set_still_seek_strip_visible(visible);
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
+    fn toggle_still_seek_strip_visible(&mut self, ctx: &egui::Context) {
+        self.set_still_seek_strip_visible(ctx, !self.settings.still_seek_strip_visible);
     }
 
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
@@ -13400,11 +16471,15 @@ impl App {
     ///
     /// 音楽ビューだけパネルの既定幅が違う (`MUSIC_RIGHT_PANEL_WIDTH`)。ここで静止画の幅を
     /// 使うと、確保した帯とパネルの左端が食い違って隙間か重なりが出る (backlog §1.158)。
-    fn locked_info_panel_reserved_width(&self, full_rect: egui::Rect, fs_idx: usize) -> f32 {
+    fn locked_info_panel_reserved_width(&mut self, full_rect: egui::Rect, fs_idx: usize) -> f32 {
         if self.fs_music_view_active(fs_idx) {
             crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
         } else {
-            metadata_panel_rect(full_rect).width()
+            metadata_panel_rect_with_seek_height(
+                full_rect,
+                self.still_seek_geometry_for_idx(fs_idx, false).total_height,
+            )
+            .width()
         }
     }
 
@@ -13414,7 +16489,7 @@ impl App {
     /// 縮んだ矩形から元の幅を逆算すると、幅がクランプに掛かる狭い窓で逆算が成り立たず、
     /// パネルがウィンドウの外へはみ出す (640pt で 55pt はみ出し。v3.5.0 レビュー F11)。
     fn locked_info_panel_reserved_width_effective(
-        &self,
+        &mut self,
         full_rect: egui::Rect,
         fs_idx: usize,
         is_video: bool,
@@ -13425,25 +16500,26 @@ impl App {
     }
 
     fn fullscreen_media_rect(
-        &self,
+        &mut self,
         full_rect: egui::Rect,
         fs_idx: usize,
         is_video: bool,
     ) -> egui::Rect {
-        fullscreen_rect_excluding_fixed_bars(
+        let seek_geometry = self.still_seek_geometry_for_idx(fs_idx, is_video);
+        fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full_rect,
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
-            self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
+            seek_geometry.reserved_height > 0.0,
+            seek_geometry.reserved_height,
             self.settings.fullscreen_fixed_bar_gap_px,
             self.locked_info_panel_reserved_width_effective(full_rect, fs_idx, is_video),
         )
     }
 
-    fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
-        let display_order = self.current_grid_order();
-        let image_indices = build_image_reading_indices(&self.items, display_order);
+    fn fullscreen_seek_info(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+        let image_indices = self.get_still_image_indices();
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let nav_indices = build_nav_indices(&self.items, display_order);
+        let nav_indices = self.get_nav_indices();
         let (video_count, other_count) =
             count_seek_overlay_non_image_items(&self.items, &nav_indices);
         let media_count = image_indices.len() + video_count + other_count;
@@ -13460,17 +16536,17 @@ impl App {
     ///
     /// シークバー (locked 時は常時表示) とページ番号 overlay (既定 ON) は毎フレーム
     /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
-    /// フレームごとに作り直すのは純粋な無駄なので、`cached_nav_indices` と同じ
-    /// 無効化点 (rebuild_visible_indices / rebuild_details_order) でクリアされる
-    /// キャッシュに乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
+    /// フレームごとに作り直すのは純粋な無駄なので、一覧キャッシュと同じ owner に
+    /// 乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
     fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
-        if let Some((cached_idx, info)) = self.cached_fs_seek_info.as_ref()
-            && *cached_idx == fs_idx
-        {
-            return Some(info.clone());
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(info) = self.viewer_navigation_caches.fs_seek_info(fs_idx) {
+            return Some(info);
         }
         let info = self.fullscreen_seek_info(fs_idx)?;
-        self.cached_fs_seek_info = Some((fs_idx, info.clone()));
+        self.viewer_navigation_caches
+            .install_fs_seek_info(fs_idx, info.clone());
         Some(info)
     }
 
@@ -13526,6 +16602,39 @@ impl App {
         format_fullscreen_page_number_label(total, &positions)
     }
 
+    /// Labels in the seek overlay consume its prepared unit snapshot. Calling the
+    /// general resolver here would reopen the synchronous rotation-read path.
+    fn still_seek_label_for_prepared_units(
+        &self,
+        page_idx: usize,
+        info: &FsSeekInfo,
+        continuous: bool,
+        units: Option<&[SpreadDisplayUnit]>,
+    ) -> Option<String> {
+        let pair = if continuous || !self.spread_mode.is_spread() {
+            SpreadPair::Single
+        } else if let Some((left, right)) = self.fullscreen_page_layout.spread_pair()
+            && (page_idx == left || page_idx == right)
+        {
+            SpreadPair::Double { left, right }
+        } else {
+            units
+                .and_then(|units| find_spread_display_unit(units, page_idx))
+                .map_or(SpreadPair::Single, |(_, unit)| {
+                    unit.spread_pair(self.spread_mode)
+                })
+        };
+        let pages = match pair {
+            SpreadPair::Single => vec![page_idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        let positions = pages
+            .into_iter()
+            .filter_map(|idx| image_reading_position(&info.image_indices, idx))
+            .collect::<Vec<_>>();
+        format_fullscreen_page_number_label(info.image_indices.len(), &positions)
+    }
+
     pub(crate) fn fullscreen_page_number_label(&mut self, fs_idx: usize) -> Option<String> {
         // 毎フレーム呼ばれる (overlay 既定 ON)。display order の clone + 全 items の
         // filter+collect を避け、シークバーと共有のキャッシュ済み reading indices を使う。
@@ -13544,7 +16653,10 @@ impl App {
         if !self.settings.fullscreen_page_number_overlay || right_panel_visible {
             return;
         }
-        if self.fullscreen_seek_bar_locked_for_idx(fs_idx, false) {
+        if self.fs_seek_overlay_visible
+            && self.settings.still_bottom_lock().bar_locked()
+            && self.still_seek_geometry_for_idx(fs_idx, false).bar_height > 0.0
+        {
             return;
         }
         let Some(label) = self.fullscreen_page_number_label(fs_idx) else {
@@ -13558,7 +16670,7 @@ impl App {
         let padding = egui::vec2(8.0, 4.0);
         let size = galley.size() + padding * 2.0;
         let bottom_avoid = if self.fs_seek_overlay_visible {
-            FS_SEEK_BAR_HEIGHT + 8.0
+            self.still_seek_geometry_for_idx(fs_idx, false).total_height + 8.0
         } else {
             0.0
         };
@@ -13633,19 +16745,33 @@ impl App {
         current_idx: usize,
         target_idx: usize,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         if self.continuous_reading_active_for_idx(current_idx)
             && self.continuous_reading_supported_idx(target_idx)
         {
             // A discrete page-unit command inside one continuous stream changes
             // its anchor; it is not a fresh fullscreen file open.
+            let seek_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.seek_to_continuous_page_with_contract(ctx, target_idx, load_contract);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandSeekContinuous,
+                seek_perf_t0,
+            );
         } else {
+            let open_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.open_fullscreen_from_fs_navigation_with_contract(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 load_contract,
+                fs_navigation_perf,
+            );
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpen,
+                open_perf_t0,
             );
         }
     }
@@ -13660,22 +16786,26 @@ impl App {
         touch_chrome_latched: bool,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
+        self.poll_still_seek_rotations();
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
         if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
-            self.fs_seek_drag_active = false;
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
-        if !primary_down {
-            self.fs_seek_drag_active = false;
-        }
-        let locked = self.settings.fullscreen_seek_bar_locked;
+        let bottom_lock = self.settings.still_bottom_lock();
+        let locked = bottom_lock.bar_locked();
+        let strip_locked = bottom_lock.strip_locked();
+        let geometry = self.still_seek_geometry_for_idx(fs_idx, false);
 
         let bottom_band = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_HOVER_HEIGHT),
+            egui::pos2(
+                full_rect.left(),
+                full_rect.bottom() - geometry.total_height - FS_SEEK_HOVER_MARGIN,
+            ),
             full_rect.right_bottom(),
         );
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
@@ -13686,7 +16816,7 @@ impl App {
         });
         // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
         // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
-        let panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let panel_rect = geometry.panel_rect(full_rect);
         let visibility = StillSeekBarVisibilityInputs {
             allowed: true,
             locked,
@@ -13700,11 +16830,12 @@ impl App {
             content_available: true,
         };
         if !still_seek_bar_visible_from_inputs(visibility) {
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
         let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
-            self.fs_seek_drag_active = false;
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         };
 
@@ -13726,38 +16857,78 @@ impl App {
             ),
         );
 
-        let lock_x = panel_rect.right() - BAR_BUTTON_SIZE - 6.0;
-        let lock_y = panel_rect.center().y - BAR_BUTTON_SIZE * 0.5;
-        let lock_resp = draw_bar_button(
-            ui,
-            lock_x,
-            lock_y,
-            "fullscreen_seek_lock",
-            |hovered| bar_button_bg(hovered, locked),
-            locked,
-            |p, c, r| draw_seek_lock_icon(p, c, r, locked),
-        );
-        let lock_resp = lock_resp.hover_tip_dark(if locked {
-            "シークバー固定を解除"
+        let bar_rect = geometry.bar_rect(full_rect);
+        let strip_rect = geometry.strip_rect(full_rect);
+        let strip_lock_rect =
+            strip_rect.map(crate::video::seek_strip_layout::seek_strip_lock_button_rect);
+        let toggle_x = if let Some(bar_rect) = bar_rect {
+            bar_rect.right() - BAR_BUTTON_SIZE * 2.0 - 10.0
         } else {
-            "シークバーを固定表示"
+            strip_lock_rect.map_or(panel_rect.right() - BAR_BUTTON_SIZE - 6.0, |lock_rect| {
+                lock_rect.left() - BAR_BUTTON_SIZE - 4.0
+            })
+        };
+        let toggle_y = bar_rect.map_or_else(
+            || {
+                strip_lock_rect.map_or(panel_rect.center().y, |rect| rect.center().y)
+                    - BAR_BUTTON_SIZE * 0.5
+            },
+            |rect| rect.center().y - BAR_BUTTON_SIZE * 0.5,
+        );
+        let strip_visible = self.settings.still_seek_strip_visible;
+        let strip_resp = draw_bar_button(
+            ui,
+            toggle_x,
+            toggle_y,
+            "fullscreen_still_seek_strip",
+            |hovered| bar_button_bg(hovered, strip_visible),
+            strip_visible,
+            draw_still_seek_strip_icon,
+        )
+        .hover_tip_dark(if strip_visible {
+            "サムネイル列を隠す"
+        } else {
+            "サムネイル列を表示"
         });
-        if lock_resp.clicked() {
-            self.settings.fullscreen_seek_bar_locked = !locked;
-            self.settings.save();
-            ctx.request_repaint();
+        if strip_resp.clicked() {
+            self.toggle_still_seek_strip_visible(ctx);
+        }
+        if let Some(bar_rect) = bar_rect {
+            let lock_x = bar_rect.right() - BAR_BUTTON_SIZE - 6.0;
+            let lock_y = bar_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+            let lock_resp = draw_bar_button(
+                ui,
+                lock_x,
+                lock_y,
+                "fullscreen_seek_lock",
+                |hovered| bar_button_bg(hovered, locked),
+                locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+            );
+            let lock_resp = lock_resp.hover_tip_dark(if locked {
+                "シークバー固定を解除"
+            } else {
+                "シークバーを固定表示"
+            });
+            if lock_resp.clicked() {
+                self.settings.set_still_seek_bar_locked(!locked);
+                self.settings.save();
+                ctx.request_repaint();
+            }
         }
 
-        let content_right = (lock_x - 6.0).max(panel_rect.left());
+        let bar_content_right = bar_rect.map_or(panel_rect.right(), |_| toggle_x - 6.0);
         let content_rect = egui::Rect::from_min_max(
-            panel_rect.min,
-            egui::pos2(content_right, panel_rect.bottom()),
+            bar_rect.unwrap_or(panel_rect).min,
+            egui::pos2(
+                bar_content_right.max(panel_rect.left()),
+                panel_rect.bottom(),
+            ),
         );
         let painter = ui.painter();
 
-        let all_nav_items_are_images =
-            info.media_count == info.image_indices.len() && !info.image_indices.is_empty();
-        if !all_nav_items_are_images {
+        if !info.has_page_strip_content() {
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             let summary = Self::fullscreen_mixed_media_summary(&info);
             painter.text(
                 content_rect.center(),
@@ -13770,16 +16941,50 @@ impl App {
         }
 
         let total = info.image_indices.len();
-        // レイアウト、pointer→page、fill、knob の全経路で同じ実効方向を共有する。
-        let is_rtl = self
-            .settings
-            .fullscreen_seek_direction
-            .is_rtl(self.reading_direction);
+        let directions = resolve_still_seek_directions(
+            self.reading_direction,
+            self.settings.fullscreen_seek_direction,
+        );
+        // サムネイル列のページ順とセルの pointer→page は本の読み方向に従う。
+        // 通常バーのクリック、塗り、つまみ、プレビュー位置は独立したシークバー方向設定に従う。
+        let strip_is_rtl = directions.strip_rtl;
+        let bar_is_rtl = directions.bar_rtl;
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
+        // The shared spread resolver also reads rotations on a cache miss. Prepare
+        // its complete dependency before invoking it, so this overlay cannot reach
+        // SQLite indirectly via pairing or page-number labels either. A reload
+        // retains the displayed mapping so it cannot swallow a release event.
+        let spread_preparation = if self.spread_mode.is_spread() {
+            let nav = self.get_nav_indices();
+            if self.rotation_cache.has_rotations_for_nav(&nav) {
+                StillSeekSpreadPreparation::Ready(self.build_spread_display_units_for_nav(&nav))
+            } else if let Some(displayed) = self
+                .spread_display_units_cache
+                .units_during_rotation_reload(
+                    &nav,
+                    self.items_generation,
+                    self.spread_mode,
+                    self.spread_shift_anchor_idx,
+                )
+            {
+                StillSeekSpreadPreparation::Refreshing { nav, displayed }
+            } else {
+                self.start_still_seek_rotations(ctx, &nav);
+                painter.text(
+                    content_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読み込み中…",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(170),
+                );
+                return None;
+            }
+        } else {
+            StillSeekSpreadPreparation::Single
+        };
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
-            let nav = self.get_nav_indices();
-            let units = self.build_spread_display_units_for_nav(&nav);
+            let units = Arc::clone(spread_preparation.units().expect("prepared spread"));
             match find_spread_display_unit(&units, fs_idx) {
                 Some((unit_index, _)) => Some((units, unit_index)),
                 None => None,
@@ -13787,187 +16992,488 @@ impl App {
         } else {
             None
         };
-        let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
-        let font = egui::FontId::monospace(13.0);
-        let sample_positions =
-            if !continuous_label_mode && self.spread_mode.is_spread() && total >= 2 {
-                if self.spread_mode.is_rtl() {
-                    vec![total, total - 1]
-                } else {
-                    vec![total - 1, total]
-                }
-            } else {
-                vec![total]
-            };
-        let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
-            .unwrap_or_else(|| format!("{} / {}", total, total));
-        let sample_galley = painter.layout_no_wrap(
-            sample_label,
-            font.clone(),
-            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
-        );
-        let label_width = (sample_galley.size().x + 18.0)
-            .max(64.0)
-            .min((inner.width() * 0.32).max(64.0));
-        let gap = 12.0;
-        let (label_rect, track_rect) = if is_rtl {
-            let label_rect =
-                egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
-            let track_rect = egui::Rect::from_min_max(
-                egui::pos2(label_rect.right() + gap, inner.center().y - 4.0),
-                egui::pos2(inner.right(), inner.center().y + 4.0),
-            );
-            (label_rect, track_rect)
-        } else {
-            let label_rect = egui::Rect::from_min_max(
-                egui::pos2(inner.right() - label_width, inner.top()),
-                inner.right_bottom(),
-            );
-            let track_rect = egui::Rect::from_min_max(
-                egui::pos2(inner.left(), inner.center().y - 4.0),
-                egui::pos2(label_rect.left() - gap, inner.center().y + 4.0),
-            );
-            (label_rect, track_rect)
-        };
-        if track_rect.width() < 48.0 {
-            return None;
-        }
-
-        let mut display_pos = spread_seek
-            .as_ref()
-            .map_or(info.current_pos.min(total - 1), |(_, unit_index)| {
-                *unit_index
-            });
-        let mut target = None;
-        let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
-        let response = ui.interact(
-            hit_rect,
-            ui.make_persistent_id("fullscreen_seek_track"),
-            egui::Sense::click_and_drag(),
-        );
-        if response.hovered() || response.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-
-        let seek_pointer = if response.dragged() || response.clicked() {
-            response.interact_pointer_pos()
+        let spread_units = spread_seek.as_ref().map(|(units, _)| units.as_slice());
+        // 連結読みでも見開き設定なら画面には 2 ページ並ぶ
+        // (`continuous_reading_units_and_pos` が見開きユニットで段を組む)。シークの粒度は
+        // ページのままにしつつ、プレビューの枚数だけはその並びに合わせる。
+        let continuous_preview_units = if continuous_label_mode && self.spread_mode.is_spread() {
+            spread_preparation.units().cloned()
         } else {
             None
         };
-        if response.dragged() {
-            self.fs_seek_drag_active = true;
-        }
-        if let Some(pointer_pos) = seek_pointer {
-            let fraction = fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
-            let pos = if let Some((units, _)) = spread_seek.as_ref() {
-                spread_seek_unit_from_fraction(fraction, units.len())
+        let preview_units = spread_units.or_else(|| {
+            continuous_preview_units
+                .as_ref()
+                .map(|units| units.as_slice())
+        });
+        let highlighted_pages: HashSet<usize> = pages_on_screen_with(fs_idx, preview_units)
+            .into_iter()
+            .collect();
+        let mut requested_pages = Vec::new();
+        let mut requested_rotations = Vec::new();
+        let mut preview: Option<ResolvedStillSeekTarget> = None;
+        let mut preview_pointer_x = None;
+        let mut target = None;
+        let mut strip_display_pos = None;
+
+        if let Some(strip_rect) = strip_rect {
+            self.fs_seek_gesture
+                .recenter_if_page_changed(info.current_pos);
+            let strip_lock_rect = strip_lock_rect.expect("visible strip has a lock button rect");
+            let strip_content_right = if bar_rect.is_some() {
+                strip_lock_rect.left() - 6.0
             } else {
-                if total <= 1 {
-                    0
-                } else {
-                    (fraction * (total - 1) as f32).round() as usize
-                }
-                .min(total - 1)
+                toggle_x - 6.0
             };
-            display_pos = pos;
-            if let Some((units, current_unit_index)) = spread_seek.as_ref() {
-                if pos != *current_unit_index {
-                    target = Some(units[pos].anchor_idx());
+            let strip_content = egui::Rect::from_min_max(
+                strip_rect.min + egui::vec2(6.0, 5.0),
+                egui::pos2(
+                    strip_content_right.max(strip_rect.left() + 6.0),
+                    strip_rect.bottom() - 5.0,
+                ),
+            );
+            let cell_height = (strip_rect.height()
+                - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
+                .max(1.0);
+            let strip_layout_center = self.fs_seek_gesture.strip_layout_center(info.current_pos);
+            // Layout reads memory only. Unknown rotation stops growth on that
+            // side, rather than briefly placing a cell with the wrong aspect.
+            let rotation_candidates = still_seek_strip_rotation_candidates(
+                &info.image_indices,
+                strip_layout_center,
+                strip_content.width(),
+                cell_height,
+            );
+            requested_rotations.extend(rotation_candidates);
+            let layout = still_seek_strip_layout(
+                &info.image_indices,
+                strip_layout_center,
+                strip_content,
+                cell_height,
+                strip_is_rtl,
+                |idx| match self.thumbnails.get(idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => self
+                        .rotation_cache
+                        .get(&idx)
+                        .map_or(StillSeekStripThumbnail::Unavailable, |&rotation| {
+                            StillSeekStripThumbnail::Loaded(tex.size_vec2(), rotation)
+                        }),
+                    Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
+                    Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
+                        StillSeekStripThumbnail::Unavailable
+                    }
+                },
+            );
+            requested_pages.extend(
+                info.image_indices[layout.request_start..layout.request_end]
+                    .iter()
+                    .copied(),
+            );
+            let row_rect = layout
+                .cells
+                .first()
+                .zip(layout.cells.last())
+                .map(|(first, last)| {
+                    egui::Rect::from_min_max(
+                        egui::pos2(first.rect.left(), strip_content.top()),
+                        egui::pos2(last.rect.right(), strip_content.bottom()),
+                    )
+                    .intersect(strip_content)
+                })
+                .unwrap_or_else(|| {
+                    egui::Rect::from_center_size(
+                        strip_content.center(),
+                        egui::vec2(0.0, strip_content.height()),
+                    )
+                });
+            let strip_response = ui.interact(
+                row_rect,
+                ui.make_persistent_id("fullscreen_still_seek_strip_row"),
+                egui::Sense::click_and_drag(),
+            );
+            if strip_response.hovered() || strip_response.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // `interact_pointer_pos` はボタンを押している間しか返らない。ホバーだけで
+            // プレビューを出すので `hover_pos` も見る (2026-09-05 利用者報告:
+            // 「ホバーでプレビューが出ない」)。
+            let pointer = strip_response
+                .interact_pointer_pos()
+                .or_else(|| strip_response.hover_pos());
+            // The response handler owns the immutable press origin, live center, and release
+            // commit. The page-position sync above is the only non-close path that discards a
+            // committed center.
+            let strip_interaction = handle_still_seek_strip_response(
+                &strip_response,
+                strip_layout_center,
+                info.current_pos,
+                total,
+                self.settings
+                    .still_seek_strip_height
+                    .window_cell_width_points(),
+                // Rect::bottom is exclusive at the monitor edge. Keep the shared close
+                // predicate unchanged, but cap its boundary at the last physical pixel.
+                strip_rect
+                    .bottom()
+                    .min(full_rect.bottom() - 1.0 / ctx.pixels_per_point()),
+                strip_is_rtl,
+                &mut self.fs_seek_gesture,
+            );
+            let strip_closed_by_drag = strip_interaction.closed_by_drag;
+            if strip_closed_by_drag {
+                self.set_still_seek_strip_visible(ctx, false);
+            }
+            let pointed_source_pos =
+                pointer.and_then(|pointer| still_seek_source_position_at_pointer(&layout, pointer));
+            if (strip_response.hovered() || strip_response.dragged())
+                && self.settings.still_seek_hover_preview_mode.is_visible(true)
+                && let Some(source_pos) = pointed_source_pos
+            {
+                preview = resolve_still_seek_target(
+                    &info.image_indices,
+                    spread_units,
+                    preview_units,
+                    StillSeekPosition::SourcePosition(source_pos),
+                );
+                preview_pointer_x = pointer.map(|p| p.x);
+            }
+            if strip_interaction.note_seek_activity {
+                self.fs_seek_drag_active = true;
+                self.note_fullscreen_seek_activity();
+            }
+            if !strip_closed_by_drag
+                && strip_response.clicked()
+                && let Some(source_pos) = pointed_source_pos
+                && let Some(resolved) = resolve_still_seek_target(
+                    &info.image_indices,
+                    spread_units,
+                    preview_units,
+                    StillSeekPosition::SourcePosition(source_pos),
+                )
+            {
+                strip_display_pos = Some(resolved.display_pos);
+                if resolved.landing_idx != fs_idx || continuous_label_mode {
+                    target = Some(resolved.landing_idx);
                 }
+            }
+
+            let strip_painter = painter.with_clip_rect(strip_content);
+            for cell in &layout.cells {
+                strip_painter.rect_filled(cell.rect, 3.0, egui::Color32::from_gray(30));
+                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(cell.idx) {
+                    let display_size = rotated_display_size(tex.size_vec2(), cell.rotation);
+                    crate::app::draw_rotated_image(
+                        &strip_painter,
+                        tex.id(),
+                        fit_texture_rect(display_size, cell.rect.shrink(2.0)),
+                        cell.rotation,
+                    );
+                } else {
+                    strip_painter.text(
+                        cell.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "…",
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::from_gray(150),
+                    );
+                }
+                let selected = highlighted_pages.contains(&cell.idx);
+                strip_painter.rect_stroke(
+                    cell.rect,
+                    3.0,
+                    egui::Stroke::new(
+                        if selected { 3.0 } else { 1.0 },
+                        if selected {
+                            egui::Color32::from_rgb(112, 174, 255)
+                        } else {
+                            egui::Color32::from_gray(76)
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            // body より後に登録し、鍵の当たり判定をセル操作へ渡さない。位置と見た目、
+            // および 3 状態の固定モデルは動画ストリップと共有する。
+            let strip_lock_response = ui
+                .interact(
+                    strip_lock_rect,
+                    egui::Id::new("fullscreen_still_seek_strip_lock"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            draw_seek_strip_lock_button_visual(
+                painter,
+                strip_lock_rect,
+                strip_lock_response.hovered(),
+                strip_locked,
+            );
+            let strip_lock_response = strip_lock_response.hover_tip_dark(if strip_locked {
+                "サムネイル列の固定を解除"
             } else {
-                let target_idx = info.image_indices[pos];
-                if target_idx != fs_idx || continuous_label_mode {
-                    if continuous_label_mode {
-                        self.seek_to_continuous_page_with_contract(
-                            ctx,
-                            target_idx,
-                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
-                        );
+                "サムネイル列を固定表示"
+            });
+            if strip_lock_response.clicked() {
+                self.settings.set_still_seek_strip_locked(!strip_locked);
+                self.settings.save();
+                ctx.request_repaint();
+            }
+        }
+        if geometry.bar_height > 0.0 {
+            let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
+            let font = egui::FontId::monospace(13.0);
+            let sample_positions =
+                if !continuous_label_mode && self.spread_mode.is_spread() && total >= 2 {
+                    if self.spread_mode.is_rtl() {
+                        vec![total, total - 1]
                     } else {
-                        target = Some(target_idx);
+                        vec![total - 1, total]
+                    }
+                } else {
+                    vec![total]
+                };
+            let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
+                .unwrap_or_else(|| format!("{} / {}", total, total));
+            let sample_galley = painter.layout_no_wrap(
+                sample_label,
+                font.clone(),
+                FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+            );
+            let label_width = (sample_galley.size().x + 18.0)
+                .max(64.0)
+                .min((inner.width() * 0.32).max(64.0));
+            let gap = 12.0;
+            let (label_rect, track_rect) = if bar_is_rtl {
+                let label_rect =
+                    egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
+                let track_rect = egui::Rect::from_min_max(
+                    egui::pos2(label_rect.right() + gap, inner.center().y - 4.0),
+                    egui::pos2(inner.right(), inner.center().y + 4.0),
+                );
+                (label_rect, track_rect)
+            } else {
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.right() - label_width, inner.top()),
+                    inner.right_bottom(),
+                );
+                let track_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.left(), inner.center().y - 4.0),
+                    egui::pos2(label_rect.left() - gap, inner.center().y + 4.0),
+                );
+                (label_rect, track_rect)
+            };
+            if track_rect.width() >= 48.0 {
+                let mut display_pos = spread_seek
+                    .as_ref()
+                    .map_or(info.current_pos.min(total - 1), |(_, unit_index)| {
+                        *unit_index
+                    });
+                if let Some(pos) = strip_display_pos {
+                    display_pos = pos;
+                }
+                let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
+                let response = ui.interact(
+                    hit_rect,
+                    ui.make_persistent_id("fullscreen_seek_track"),
+                    egui::Sense::click_and_drag(),
+                );
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+
+                let pointer_pos = response
+                    .interact_pointer_pos()
+                    .or_else(|| response.hover_pos());
+                let resolved_at_pointer = pointer_pos.and_then(|pointer_pos| {
+                    let fraction =
+                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, bar_is_rtl);
+                    resolve_still_seek_target(
+                        &info.image_indices,
+                        spread_units,
+                        preview_units,
+                        StillSeekPosition::TrackFraction(fraction),
+                    )
+                });
+
+                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
+                if (response.hovered() || response.dragged())
+                    && let (Some(pointer_pos), Some(resolved)) =
+                        (pointer_pos, resolved_at_pointer.as_ref())
+                {
+                    if self
+                        .settings
+                        .still_seek_hover_preview_mode
+                        .is_visible(strip_visible)
+                    {
+                        preview = Some(resolved.clone());
+                        preview_pointer_x = Some(pointer_pos.x);
                     }
                 }
+
+                let interaction =
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture);
+                if interaction.note_seek_activity {
+                    self.fs_seek_drag_active = true;
+                    self.note_fullscreen_seek_activity();
+                }
+                match interaction.action {
+                    StillSeekTrackAction::Seek => {
+                        if let Some(resolved) = resolved_at_pointer.as_ref() {
+                            display_pos = resolved.display_pos;
+                            if resolved.landing_idx != fs_idx || continuous_label_mode {
+                                target = Some(resolved.landing_idx);
+                            }
+                        }
+                    }
+                    StillSeekTrackAction::OpenStrip => {
+                        self.set_still_seek_strip_visible(ctx, true);
+                    }
+                    StillSeekTrackAction::None => {}
+                }
+
+                painter.rect_filled(
+                    track_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
+                );
+                let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
+                let fraction = if spread_seek.is_some() {
+                    spread_seek_unit_fraction(display_pos, seek_unit_count)
+                } else if total <= 1 {
+                    0.0
+                } else {
+                    display_pos as f32 / (total - 1) as f32
+                };
+                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, bar_is_rtl);
+                let filled_rect = if bar_is_rtl {
+                    egui::Rect::from_min_max(
+                        egui::pos2(knob_x, track_rect.top()),
+                        track_rect.right_bottom(),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        track_rect.min,
+                        egui::pos2(knob_x, track_rect.bottom()),
+                    )
+                };
+                painter.rect_filled(
+                    filled_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
+                );
+                for tick in crate::seek_ruler::page_ruler_ticks(
+                    seek_unit_count,
+                    track_rect.width(),
+                    crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+                ) {
+                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, bar_is_rtl);
+                    let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+                    let (height, gray) = if tick.major {
+                        (
+                            crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                            crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                        )
+                    } else {
+                        (
+                            crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                            crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                        )
+                    };
+                    painter.line_segment(
+                        [egui::pos2(x, top), egui::pos2(x, top + height)],
+                        egui::Stroke::new(
+                            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                            egui::Color32::from_gray(gray),
+                        ),
+                    );
+                }
+                painter.circle_filled(
+                    egui::pos2(knob_x, track_rect.center().y),
+                    6.0,
+                    egui::Color32::from_rgb(232, 240, 255),
+                );
+                painter.circle_stroke(
+                    egui::pos2(knob_x, track_rect.center().y),
+                    6.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
+                );
+
+                let label_idx = spread_seek.as_ref().map_or_else(
+                    || info.image_indices[display_pos],
+                    |(units, _)| units[display_pos].anchor_idx(),
+                );
+                let label = self
+                    .still_seek_label_for_prepared_units(
+                        label_idx,
+                        &info,
+                        continuous_label_mode,
+                        preview_units,
+                    )
+                    .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
+                painter.text(
+                    label_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    font,
+                    FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+                );
             }
         }
 
-        painter.rect_filled(
-            track_rect,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
-        );
-        let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
-        let fraction = if spread_seek.is_some() {
-            spread_seek_unit_fraction(display_pos, seek_unit_count)
-        } else if total <= 1 {
-            0.0
-        } else {
-            display_pos as f32 / (total - 1) as f32
+        if let Some(preview) = preview.as_ref() {
+            requested_pages.extend(preview.preview_pages.iter().copied());
+            requested_rotations.extend(preview.preview_pages.iter().copied());
+        }
+        self.ensure_still_seek_thumbnail_requests(ctx, &requested_pages);
+        requested_rotations.sort_unstable();
+        requested_rotations.dedup();
+        let rotation_indices = match &spread_preparation {
+            StillSeekSpreadPreparation::Refreshing { nav, .. } => nav.as_slice(),
+            _ => &requested_rotations,
         };
-        let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
-        let filled_rect = if is_rtl {
-            egui::Rect::from_min_max(
-                egui::pos2(knob_x, track_rect.top()),
-                track_rect.right_bottom(),
-            )
-        } else {
-            egui::Rect::from_min_max(track_rect.min, egui::pos2(knob_x, track_rect.bottom()))
-        };
-        painter.rect_filled(
-            filled_rect,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
-        );
-        for tick in crate::seek_ruler::page_ruler_ticks(
-            seek_unit_count,
-            track_rect.width(),
-            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
-        ) {
-            let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
-            let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
-            let (height, gray) = if tick.major {
-                (
-                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
-                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+        self.start_still_seek_rotations(ctx, rotation_indices);
+        if let Some(preview) = preview.as_ref() {
+            // 画面上の並びに合わせる。右→左読みでは元ページ順の逆から見える。
+            let mut pages = preview.preview_pages.clone();
+            if strip_is_rtl {
+                pages.reverse();
+            }
+            let textures: Vec<Option<StillSeekPreviewPage>> = pages
+                .iter()
+                .map(|idx| {
+                    self.thumbnails.get(*idx).and_then(|state| {
+                        if let ThumbnailState::Loaded { tex, .. } = state {
+                            self.rotation_cache
+                                .get(idx)
+                                .map(|&rotation| StillSeekPreviewPage {
+                                    texture: tex.clone(),
+                                    rotation,
+                                })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            // ラベルは着地先から作る。見開きなら既存のページ番号表記がそのまま
+            // ペア表記 (`12-13 / 180` / `13,12 / 180`) になる。
+            let label = self
+                .still_seek_label_for_prepared_units(
+                    preview.landing_idx,
+                    &info,
+                    continuous_label_mode,
+                    preview_units,
                 )
-            } else {
-                (
-                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
-                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
-                )
-            };
-            painter.line_segment(
-                [egui::pos2(x, top), egui::pos2(x, top + height)],
-                egui::Stroke::new(
-                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
-                    egui::Color32::from_gray(gray),
-                ),
+                .unwrap_or_default();
+            paint_still_seek_preview(
+                painter,
+                full_rect,
+                panel_rect.top(),
+                preview_pointer_x.unwrap_or(full_rect.center().x),
+                &textures,
+                &label,
             );
         }
-        painter.circle_filled(
-            egui::pos2(knob_x, track_rect.center().y),
-            6.0,
-            egui::Color32::from_rgb(232, 240, 255),
-        );
-        painter.circle_stroke(
-            egui::pos2(knob_x, track_rect.center().y),
-            6.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
-        );
-
-        let label_idx = spread_seek.as_ref().map_or_else(
-            || info.image_indices[display_pos],
-            |(units, _)| units[display_pos].anchor_idx(),
-        );
-        let label = self
-            .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
-            .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
-        painter.text(
-            label_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font,
-            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
-        );
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
         }
@@ -14556,7 +18062,7 @@ impl App {
     /// span burned CPU or waited: a busy span reports the machine's real clock rate, a
     /// blocked one reports a small fraction of it (backlog 1.129).
     #[cfg(windows)]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         let mut cycles = 0u64;
         unsafe {
             let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
@@ -14568,11 +18074,16 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         0
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
+        let mut fs_render_perf = fs_render_perf_start_with(
+            crate::perf::is_enabled(),
+            std::time::Instant::now,
+            Self::thread_cycles_now,
+        );
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -14584,15 +18095,31 @@ impl App {
             if self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active() {
                 self.render_embedded_fs_nav_holdover(ctx);
             }
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                None,
+            );
             return;
         };
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FrameStart);
 
         self.harvest_page_dims();
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HarvestPageDims);
         self.reconcile_fullscreen_page_slice(fs_idx);
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::ReconcileFullscreenPageSlice,
+        );
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
         let stop_page_needs_load =
             matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::FsPageTurnDecisionForFrame,
+        );
         if self
             .ensure_fs_page_turn_target_load(page_turn_decision, fs_idx)
             .is_some()
@@ -14604,11 +18131,16 @@ impl App {
                 self.update_prefetch_window(fs_idx);
             }
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
+        );
 
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
-        self.poll_prefetch(ctx);
+        self.poll_prefetch(ctx, PollPrefetchOrigin::FullscreenViewport);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::PollPrefetch);
 
         // ── 状態の事前計算 ──
         // 動画フルスクリーンの黒 backdrop は **presenter HWND が未確定の起動中だけ**
@@ -14635,8 +18167,15 @@ impl App {
             } else {
                 self.hide_native_video_black_backdrop_if_shown(ctx);
             }
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                Some(fs_idx),
+            );
             return;
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::NativeVideoBackdrop);
 
         self.advance_animation(ctx, fs_idx);
         // 見開きペアを 1 回だけ解決し、以降のフレーム処理で再利用する
@@ -14692,6 +18231,7 @@ impl App {
         let hint_start_before = self.fs_boundary_hint.map(|h| h.started_at());
         let mut had_user_input_in_frame = false;
         let prev_foreground_hwnd = self.fs_prev_foreground_hwnd;
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::StatePrecompute);
 
         // ── ビューポート構築 ──
         #[cfg(windows)]
@@ -14879,6 +18419,7 @@ impl App {
             // window の表示フェード露出を動画 backdrop と同じ手順で避ける。
             fs_builder = fs_builder.with_visible(false);
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::ViewportPreparation);
         let fs_viewport_t0 = std::time::Instant::now();
         let mut fs_setup_ms = 0.0_f64;
         let mut fs_input_ms = 0.0_f64;
@@ -15503,12 +19044,8 @@ impl App {
                                     if self.fs_music_view_active(fs_idx) {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
-                                        music_view_frame_ui = self.draw_fs_music_view(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            // 解析モード / VST3 コンパクトは `image_rect` を
-                                            // 別の規則で作るので、この帯は存在しない。
+                                        // These modes construct image_rect without a panel band.
+                                        let reserved_panel_width =
                                             if analysis_active || vst3_compact_active {
                                                 0.0
                                             } else {
@@ -15517,7 +19054,12 @@ impl App {
                                                     fs_idx,
                                                     state.is_video,
                                                 )
-                                            },
+                                            };
+                                        music_view_frame_ui = self.draw_fs_music_view(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            reserved_panel_width,
                                             fs_idx,
                                         );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
@@ -16012,6 +19554,9 @@ impl App {
                         let panels_t0 = std::time::Instant::now();
                         let mut side_panel_visible = false;
                         let mut right_panel_visible = false;
+                        let still_seek_height = self
+                            .still_seek_geometry_for_idx(fs_idx, state.is_video)
+                            .total_height;
                         // 音声 (音楽ビュー) は画像フルスクリーンの左右パネル (補正 / メタデータ /
                         // 表示トリム / 分析 / パノラマ等) を一切描かない。draw_fs_music_view が
                         // 自前の UI (上情報バー + 下シークバー) を描くので、動画が native presenter に
@@ -16122,13 +19667,17 @@ impl App {
                         } else if adjustment_active {
                             // 左補正パネル。右情報パネルは独立した表示条件で描く。
                             side_panel_visible = true;
-                            let panel_rect = adjustment_panel_rect(full_rect);
+                            let panel_rect = adjustment_panel_rect_with_seek_height(
+                                full_rect,
+                                still_seek_height,
+                            );
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
                             right_panel_visible = self.draw_metadata_panel(
                                 ui,
                                 ctx,
                                 full_rect,
                                 info_panel_lock_effective,
+                                still_seek_height,
                             );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
@@ -16152,6 +19701,7 @@ impl App {
                                 ctx,
                                 full_rect,
                                 info_panel_lock_effective,
+                                still_seek_height,
                             );
                             side_panel_visible = right_panel_visible;
                         }
@@ -16860,6 +20410,7 @@ impl App {
             }
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::ViewportRender);
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
             let fs_outer_ms = (fs_viewport_ms - fs_closure_ms).max(0.0);
             let fs_closure_tracked_ms = fs_setup_ms + fs_central_ms + fs_vst_manager_ms;
@@ -16985,6 +20536,10 @@ impl App {
                 ],
             );
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::FsViewportBreakdownEmit,
+        );
 
         if !embedded {
             // embedded のときは専用 viewport を作っていないので shown フラグは
@@ -16995,9 +20550,13 @@ impl App {
                 self.fs_viewport_presentation = Some(desired_viewport_presentation);
             }
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::ViewportShownStateUpdate,
+        );
 
         // ── ナビゲーション & スライドショー処理 ──
-        self.handle_fs_navigation(
+        self.handle_fs_navigation_with_render_perf(
             ctx,
             close_fs,
             close_to_page_list,
@@ -17007,6 +20566,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            &mut fs_render_perf,
         );
 
         // hint_start_before と一致 = このフレームで再設定されていない
@@ -17018,7 +20578,16 @@ impl App {
                 self.fs_boundary_hint = None;
             }
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FsBoundaryHint);
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HandleFsRepaint);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::Tail);
+        finish_fs_render_perf(
+            &mut fs_render_perf,
+            self.frame_counter,
+            self.input_seq,
+            Some(fs_idx),
+        );
     }
 
     // ── 状態準備ヘルパー ────────────────────────────────────────────────
@@ -17485,8 +21054,35 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
+        let mut perf = None;
+        self.fs_page_turn_decision_for_frame_with_perf(ctx, fs_idx, &mut perf)
+    }
+
+    fn fs_page_turn_decision_for_frame_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) -> FsPageTurnDecision {
+        let original_preview_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
         let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
-        self.resolve_fs_navigation_sequence_target(ctx, fs_idx, original_preview_active);
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+            original_preview_perf_t0,
+        );
+        let resolve_sequence_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            perf,
+        );
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget,
+            resolve_sequence_perf_t0,
+        );
         let (rendition_sequence_active, passthrough_rendition_ready) =
             self.fs_navigation_sequence_rendition_state(fs_idx);
         #[cfg(not(windows))]
@@ -17506,15 +21102,27 @@ impl App {
                 self.fs_page_turn_input_held(ctx, fs_idx);
             let frame_nr = ctx.cumulative_frame_nr();
             let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
-            if let Some(cached) = ctx
+            let cache_lookup_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+            let cached = ctx
                 .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
                 .filter(|cached| {
                     cached.frame_nr == frame_nr
                         && cached.items_generation == self.items_generation
                         && cached.idx == fs_idx
-                })
-            {
+                });
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::CacheLookup,
+                cache_lookup_perf_t0,
+            );
+            if let Some(cached) = cached {
+                if let Some(perf) = perf {
+                    perf.cache_hit = Some(true);
+                }
                 return cached.decision;
+            }
+            if let Some(perf) = perf {
+                perf.cache_hit = Some(false);
             }
             let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let mut burst_state = ctx
@@ -18915,23 +22523,39 @@ impl App {
     // ── 見開きペアリング ────────────────────────────────────────────────
 
     /// build_nav_indices の結果をキャッシュして返す。
-    fn get_nav_indices(&mut self) -> Vec<usize> {
-        if let Some(ref cached) = self.cached_nav_indices {
-            return cached.clone();
+    fn get_nav_indices(&mut self) -> Arc<Vec<usize>> {
+        crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
+            self.viewer_navigation_caches
+                .ensure_source(self.items_generation, self.reading_flow);
+            if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
+                return cached;
+            }
+            let nav = build_nav_indices(&self.items, self.current_grid_order());
+            self.viewer_navigation_caches.install_nav_indices(nav)
+        })
+    }
+
+    /// 連結読み・先読み用の静止画一覧を viewer context 内で共有する。
+    pub(crate) fn get_still_image_indices(&mut self) -> Arc<Vec<usize>> {
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
+            return cached;
         }
-        let nav = build_nav_indices(&self.items, self.current_grid_order());
-        self.cached_nav_indices = Some(nav.clone());
-        nav
+        let indices =
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order());
+        self.viewer_navigation_caches
+            .install_still_image_indices(indices)
     }
 
     pub(crate) fn fullscreen_large_jump_target(
-        &self,
+        &mut self,
         fs_idx: usize,
         forward: bool,
     ) -> Option<usize> {
-        crate::ui_helpers::large_jump_page_idx(
-            &self.items,
-            self.current_grid_order(),
+        let nav = self.get_still_image_indices();
+        crate::ui_helpers::large_jump_page_idx_from_nav_indices(
+            &nav,
             fs_idx,
             self.settings.fullscreen_jump_mode,
             self.settings.fullscreen_jump_percent,
@@ -18953,7 +22577,7 @@ impl App {
         // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
         // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
         let nav = if self.continuous_reading_active_for_idx(idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -18999,7 +22623,7 @@ impl App {
             None => return FsPageNav::Delta(base_delta),
         };
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -19045,7 +22669,7 @@ impl App {
         dir: i32,
     ) -> Option<(usize, usize)> {
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -20703,6 +24327,11 @@ impl App {
         // 画像スライドショーに参加しない。
         let key_s =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_seek_strip_toggle = self.fs_context_menu_idx.is_none()
+            && self.fullscreen_seek_overlay_allowed(fs_idx, current_item_is_video)
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSeekStripToggle);
         let key_r = !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
@@ -20837,7 +24466,7 @@ impl App {
                      key_z_event={} key_v_raw={} key_z_raw={} key_v_final={} key_z_final={} \
                      pano_active={} continuous={} spread_double={} detect_pano={}",
                     fs_idx,
-                    self.detached_viewer_window_id,
+                    self.detached_viewer_window_id(),
                     focused,
                     current_foreground_hwnd(),
                     self.detached_viewer_host_debug_state(),
@@ -21616,6 +25245,10 @@ impl App {
             }
         }
 
+        if key_seek_strip_toggle {
+            self.toggle_still_seek_strip_visible(ctx);
+        }
+
         // Space: スライドショー中→停止、停止中→画像をチェック。
         // 動画モードでは `current_item_is_video_for_space` で gate されているため
         // `key_space` は常に false (= ここには到達しない)。Video アームを残しておくと
@@ -22178,7 +25811,7 @@ impl App {
     /// タップ分類の除外とマウスのエッジ抑止が同じ幾何から導かれるように、
     /// パネル矩形の求め方はここ 1 か所に置く。
     pub(crate) fn fullscreen_navigator_panel_rect(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> Option<egui::Rect> {
@@ -22198,7 +25831,7 @@ impl App {
     }
 
     pub(crate) fn fullscreen_navigator_edge_exclusion(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> Option<egui::Rect> {
@@ -23437,11 +27070,15 @@ impl App {
                     });
             return (FsPageNav::None, false);
         }
-        let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let seek_geometry = self
+            .fullscreen_idx
+            .map(|idx| self.still_seek_geometry_for_idx(idx, state.is_video))
+            .unwrap_or_else(StillSeekGeometry::bar_only);
+        let seek_panel_rect = seek_geometry.panel_rect(full_rect);
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
-                && (self.settings.fullscreen_seek_bar_locked
+                && (self.settings.still_bottom_lock().bar_locked()
                     || self.fs_seek_drag_active
                     || touch_chrome_latched
                     || ctx.input(|i| {
@@ -23626,6 +27263,7 @@ impl App {
             full_rect,
             side_panel_chrome_enabled && passive_side_panel_hover_enabled,
             navigator_exclusion,
+            seek_geometry.total_height,
         );
 
         // ── ホイール ──
@@ -23682,7 +27320,7 @@ impl App {
                 i.pointer
                     .hover_pos()
                     .map(|p| {
-                        let in_side_panel = fullscreen_side_panel_contains_pointer(
+                        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
                             full_rect,
                             p,
                             side_panel_chrome_enabled,
@@ -23690,6 +27328,7 @@ impl App {
                             has_right_panel,
                             self.adjustment_mode.is_open(),
                             navigator_exclusion,
+                            seek_geometry.total_height,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
                             full_rect,
@@ -23819,11 +27458,12 @@ impl App {
                 )
                 && !self.analysis_mode
                 && self.fullscreen_idx.is_some()
-                && adjustment_panel_hover_active_at(
+                && adjustment_panel_hover_active_at_with_seek_height(
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode.is_open(),
                     navigator_exclusion,
+                    seek_geometry.total_height,
                 );
             if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
@@ -23958,12 +27598,13 @@ impl App {
                 touch_help_phase_before = None;
             }
         }
-        let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects(
+        let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects_with_seek_height(
             full_rect,
             side_panel_chrome_enabled,
             self.settings.fullscreen_side_panel_mode,
             has_right_panel,
             self.adjustment_mode.is_open(),
+            seek_geometry.total_height,
         )
         .iter()
         .collect();
@@ -23987,12 +27628,13 @@ impl App {
         if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
             touch_excluded.push(navigator_rect);
         }
-        extend_touch_excluded_with_panel_handles(
+        extend_touch_excluded_with_panel_handles_and_seek_height(
             &mut touch_excluded,
             full_rect,
             side_panel_chrome_enabled && touch_chrome_latched,
             self.adjustment_mode.is_open(),
             has_right_panel,
+            seek_geometry.total_height,
         );
         if touch_help_phase_before.is_some() {
             // The modal guide owns the whole surface, including chrome which
@@ -24617,15 +28259,17 @@ impl App {
                                 let has_right_panel = self.metadata_panel_click_shown()
                                     || self.fs_info_panel.hover_active
                                     || self.fullscreen_tag_picker_open;
-                                let in_side_panel = fullscreen_side_panel_contains_pointer(
-                                    full_rect,
-                                    pos,
-                                    side_panel_chrome_enabled,
-                                    self.settings.fullscreen_side_panel_mode,
-                                    has_right_panel,
-                                    self.adjustment_mode.is_open(),
-                                    navigator_exclusion,
-                                );
+                                let in_side_panel =
+                                    fullscreen_side_panel_contains_pointer_with_seek_height(
+                                        full_rect,
+                                        pos,
+                                        side_panel_chrome_enabled,
+                                        self.settings.fullscreen_side_panel_mode,
+                                        has_right_panel,
+                                        self.adjustment_mode.is_open(),
+                                        navigator_exclusion,
+                                        seek_geometry.total_height,
+                                    );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
                                 // Mouse clicks stay suppressed in continuous reading. The wheel is
@@ -24984,12 +28628,11 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        let display_order = self.current_grid_order().to_vec();
+        let image_indices = self.get_still_image_indices();
         // **自動送りは、読み手が自分で送るのと同じ歩幅にする。**分割を無視すると、
         // スライドショーを始めた瞬間に分割が解除されて画面が大きく変わってしまう
         // (2026-08-26 の実機判断)。
         let slide_nav = if self.spread_mode.is_spread() || self.spread_mode.is_split() {
-            let image_indices = build_image_reading_indices(&self.items, &display_order);
             self.spread_page_nav_for_indices(&image_indices, cur, 1)
         } else {
             FsPageNav::Delta(1)
@@ -25008,7 +28651,7 @@ impl App {
             // 別ページの半分へ。着地してから左右を確定する。
             FsPageNav::Split(step) => Some(step.source_idx),
             FsPageNav::Delta(delta) => {
-                crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
+                crate::ui_helpers::adjacent_idx_in_order(&image_indices, cur, delta)
             }
             FsPageNav::None | FsPageNav::Boundary { .. } => None,
         };
@@ -25242,11 +28885,13 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        let mut fs_navigation_perf = None;
         self.open_fullscreen_from_fs_navigation_with_contract(
             ctx,
             idx,
             history_trigger,
             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            &mut fs_navigation_perf,
         );
     }
 
@@ -25256,14 +28901,26 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         #[cfg(windows)]
-        if self.should_block_detached_independent_still_navigation_to_video(idx) {
+        let should_block_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let should_block = self.should_block_detached_independent_still_navigation_to_video(idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+            should_block_perf_t0,
+        );
+        #[cfg(windows)]
+        if should_block {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
             self.log_detached_image_window_debug(format!(
                 "blocked_independent_still_video_navigation target_idx={idx} \
                  current_idx={:?} window_id={:?}",
-                self.fullscreen_idx, self.detached_viewer_window_id
+                self.fullscreen_idx,
+                self.detached_viewer_window_id()
             ));
             ctx.request_repaint();
             return;
@@ -25271,26 +28928,64 @@ impl App {
 
         let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
         let materialization = if target_is_still_page && self.fullscreen_idx.is_some() {
-            self.fs_page_turn_decision_for_frame(ctx, idx)
-                .navigation_target_open_materialization()
+            let page_turn_decision_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+            let mut page_turn_decision_perf = fs_navigation_perf
+                .as_ref()
+                .map(|_| FsPageTurnDecisionPerfRecorder::default());
+            let page_turn_decision = self.fs_page_turn_decision_for_frame_with_perf(
+                ctx,
+                idx,
+                &mut page_turn_decision_perf,
+            );
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame,
+                page_turn_decision_perf_t0,
+            );
+            if let (Some(navigation_perf), Some(page_turn_decision_perf)) =
+                (fs_navigation_perf.as_mut(), page_turn_decision_perf)
+            {
+                navigation_perf.land_open_other_page_turn_decision = page_turn_decision_perf;
+            }
+            page_turn_decision.navigation_target_open_materialization()
         } else {
             FsOpenMaterialization::Eager
         };
         if !matches!(materialization, FsOpenMaterialization::Eager) {
+            let defer_full_resolution_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.defer_page_turn_full_resolution_work();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                defer_full_resolution_perf_t0,
+            );
         }
 
+        let sync_selection_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.sync_main_selection_from_viewer_idx(idx);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+            sync_selection_perf_t0,
+        );
 
         // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
         // (presenter re-hide) へ戻す。以降は下の音声モード keep 分岐が hidden presenter を
         // source-swap するので、通常の音声モード継続ナビになる (VST GUI は閉じる)。
+        #[cfg(windows)]
+        let video_audio_vst_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         #[cfg(windows)]
         if let Some(cur) = self.fullscreen_idx
             && self.video_audio_vst_active_for(cur)
         {
             self.exit_video_audio_vst(ctx, cur);
         }
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst,
+            video_audio_vst_perf_t0,
+        );
 
         // 動画→音声モード (Inc 7): 音声モードのまま隣の動画へ file-nav (前後ファイルボタン /
         // キーボード ↑↓) したときは、hidden presenter を音声モードのまま source-swap で再利用する
@@ -25305,31 +29000,79 @@ impl App {
             && matches!(self.items.get(idx), Some(GridItem::Video(_)))
         {
             self.source_swap_keep_audio_mode = true;
+            let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let started =
                 self.try_start_native_video_fast_swap(ctx, idx, Some(true), true, history_trigger);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                native_video_fast_swap_perf_t0,
+            );
             self.source_swap_keep_audio_mode = false;
             if started {
                 return;
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
+            let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let cursor_state = self.fullscreen_cursor_state();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                cursor_state_perf_t0,
+            );
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
                 );
             }
-            self.open_fullscreen(idx, history_trigger);
+            let open_fullscreen_perf = fs_navigation_perf
+                .as_mut()
+                .map(|perf| &mut perf.open_fullscreen);
+            self.open_fullscreen_with_materialization_and_contract(
+                idx,
+                history_trigger,
+                FsOpenMaterialization::Eager,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                open_fullscreen_perf,
+            );
+            let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                restore_cursor_state_perf_t0,
+            );
             return;
         }
 
         #[cfg(windows)]
-        if self.try_start_video_tile_fast_swap(ctx, idx) {
+        let video_tile_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let video_tile_fast_swap_started = self.try_start_video_tile_fast_swap(ctx, idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+            video_tile_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if video_tile_fast_swap_started {
             return;
         }
         #[cfg(windows)]
-        if self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger) {
+        let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let native_video_fast_swap_started =
+            self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            native_video_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if native_video_fast_swap_started {
             return;
         }
 
@@ -25341,27 +29084,49 @@ impl App {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
         } else {
+            let cancel_stale_video_tile_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "fs-navigation");
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                cancel_stale_video_tile_perf_t0,
+            );
         }
 
+        let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         let cursor_state = self.fullscreen_cursor_state();
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            cursor_state_perf_t0,
+        );
         if self.adjustment_mode.is_open() {
             crate::ime_focus::record_side_panel_close(
                 ctx,
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
+        let open_fullscreen_perf = fs_navigation_perf
+            .as_mut()
+            .map(|perf| &mut perf.open_fullscreen);
         self.open_fullscreen_with_materialization_and_contract(
             idx,
             history_trigger,
             materialization,
             load_contract,
+            open_fullscreen_perf,
         );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
         // has already marked the cursor active before reaching this helper.
+        let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            restore_cursor_state_perf_t0,
+        );
 
         #[cfg(windows)]
         {
@@ -25390,14 +29155,17 @@ impl App {
         fs_idx: usize,
         at_end: bool,
     ) -> Option<usize> {
-        let display_order = self.current_grid_order().to_vec();
         let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
-        let target = crate::ui_helpers::boundary_page_navigation_idx(
-            &self.items,
-            &display_order,
-            at_end,
-            continuous_reading,
-        )?;
+        let nav = if continuous_reading {
+            self.get_still_image_indices()
+        } else {
+            self.get_nav_indices()
+        };
+        let target = if at_end {
+            nav.last().copied()
+        } else {
+            nav.first().copied()
+        }?;
         if target != fs_idx {
             Some(target)
         } else {
@@ -25898,7 +29666,39 @@ impl App {
         jump_to: Option<usize>,
         fs_idx: usize,
     ) {
+        let mut fs_render_perf = None;
+        self.handle_fs_navigation_with_render_perf(
+            ctx,
+            close_fs,
+            close_to_page_list,
+            ctrl_nav,
+            sibling_nav,
+            mouse_nav,
+            page_nav,
+            jump_to,
+            fs_idx,
+            &mut fs_render_perf,
+        );
+    }
+
+    fn handle_fs_navigation_with_render_perf(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        close_to_page_list: bool,
+        ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
+        page_nav: FsPageNav,
+        jump_to: Option<usize>,
+        fs_idx: usize,
+        fs_render_perf: &mut Option<FsRenderPerfRecorder>,
+    ) {
+        let mut fs_navigation_perf = fs_render_perf
+            .as_ref()
+            .map(|_| FsNavigationPerfRecorder::default());
         if close_fs {
+            let close_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             #[cfg(windows)]
             let presentation_was_transitioning =
                 self.video_presentation_transition.is_transitioning();
@@ -25926,7 +29726,13 @@ impl App {
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Close,
+                close_perf_t0,
+            );
         } else if close_to_page_list {
+            let close_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
             if self.adjustment_mode.is_open() {
@@ -25952,6 +29758,11 @@ impl App {
                 );
             }
             ctx.request_repaint();
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Close,
+                close_perf_t0,
+            );
         }
         // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が
         // 表示遷移を完結させるので、handle_fs_navigation 経由の通常 nav 経路は
@@ -25962,6 +29773,7 @@ impl App {
             && (self.video_tile_swap_pending.is_some()
                 || self.native_video_fast_swap_pending.is_some())
         {
+            finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
             return;
         }
         // Ctrl+↑↓ はフルスクリーンを保ったまま現在コンテキストの前後へ飛び、
@@ -25973,25 +29785,51 @@ impl App {
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if let Some(delta) = sibling_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if let Some(nav) = mouse_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             self.mouse_ring_nav = Some(nav);
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if !close_fs && !close_to_page_list {
+            let page_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 if !self.fs_navigation_sequence_blocks_new_target() {
+                    let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                     self.land_still_page_navigation_target(
                         ctx,
                         fs_idx,
                         new_idx,
                         crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                        &mut fs_navigation_perf,
+                    );
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::LandTarget,
+                        land_perf_t0,
                     );
                 }
             } else if let FsPageNav::Split(step) = page_nav {
@@ -26007,17 +29845,31 @@ impl App {
                         fs_idx,
                         Some(step.source_idx),
                     );
-                    if self.begin_fs_page_navigation_sequence(
+                    let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                    let sequence_started = self.begin_fs_page_navigation_sequence(
                         ctx,
                         fs_idx,
                         step.source_idx,
                         accept_rendition,
-                    ) {
+                    );
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::BeginSequence,
+                        begin_perf_t0,
+                    );
+                    if sequence_started {
+                        let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.land_still_page_navigation_target(
                             ctx,
                             fs_idx,
                             step.source_idx,
                             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            &mut fs_navigation_perf,
+                        );
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::LandTarget,
+                            land_perf_t0,
                         );
                     }
                     // **着地できたときだけ**左右を確定する。遷移が断られた場合に
@@ -26053,19 +29905,33 @@ impl App {
                             fs_idx,
                             moved.then_some(new_idx),
                         );
-                        if !moved
-                            || self.begin_fs_page_navigation_sequence(
+                        if !moved || {
+                            let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                            let sequence_started = self.begin_fs_page_navigation_sequence(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 accept_rendition,
-                            )
-                        {
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::BeginSequence,
+                                begin_perf_t0,
+                            );
+                            sequence_started
+                        } {
+                            let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::LandTarget,
+                                land_perf_t0,
                             );
                         }
                     }
@@ -26098,13 +29964,18 @@ impl App {
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = crate::ui_helpers::adjacent_page_navigation_idx(
-                    &self.items,
-                    &display_order,
-                    fs_idx,
-                    nav_delta.signum(),
-                    self.continuous_reading_active_for_idx(fs_idx),
-                ) {
+                } else if let Some(new_idx) = if self.continuous_reading_active_for_idx(fs_idx) {
+                    let nav = self.get_still_image_indices();
+                    crate::ui_helpers::adjacent_idx_in_order(&nav, fs_idx, nav_delta.signum())
+                } else {
+                    crate::ui_helpers::adjacent_page_navigation_idx(
+                        &self.items,
+                        &display_order,
+                        fs_idx,
+                        nav_delta.signum(),
+                        false,
+                    )
+                } {
                     let moved = new_idx != fs_idx;
                     if !moved || !self.fs_navigation_sequence_blocks_new_target() {
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -26112,19 +29983,33 @@ impl App {
                             fs_idx,
                             moved.then_some(new_idx),
                         );
-                        if !moved
-                            || self.begin_fs_page_navigation_sequence(
+                        if !moved || {
+                            let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                            let sequence_started = self.begin_fs_page_navigation_sequence(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 accept_rendition,
-                            )
-                        {
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::BeginSequence,
+                                begin_perf_t0,
+                            );
+                            sequence_started
+                        } {
+                            let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::LandTarget,
+                                land_perf_t0,
                             );
                         }
                     }
@@ -26142,6 +30027,11 @@ impl App {
                     ));
                 }
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Page,
+                page_nav_perf_t0,
+            );
         }
 
         // ── スライドショー タイマー ──
@@ -26149,6 +30039,7 @@ impl App {
         // in-flight 中に旧フォルダで誤って advance するのを防ぐ (SlideshowNext は発火時に
         // slideshow_playing=false にしているのでそもそも入らない)。手動 Ctrl+↑↓ が
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
+        let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing && !close_fs && !self.fs_nav_is_locked() {
             let now = std::time::Instant::now();
             let anchored = self
@@ -26158,13 +30049,34 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             } else {
                 if let Some(cur) = self.fullscreen_idx
-                    && self.advance_continuous_slideshow_scroll(ctx, cur, now)
+                    && {
+                        let advance_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                        let advanced = self.advance_continuous_slideshow_scroll(ctx, cur, now);
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::SlideshowAdvance,
+                            advance_perf_t0,
+                        );
+                        advanced
+                    }
                 {
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::Slideshow,
+                        slideshow_perf_t0,
+                    );
+                    finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
                     return;
                 }
                 if now >= self.slideshow_next_at {
                     if let Some(cur) = self.fullscreen_idx {
+                        let advance_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.advance_slideshow(ctx, cur);
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::SlideshowAdvance,
+                            advance_perf_t0,
+                        );
                     }
                     // 前進 / 折り返し / 次フォルダ発火 (async) いずれも次フレームで反映する。
                     ctx.request_repaint();
@@ -26175,6 +30087,12 @@ impl App {
                 }
             }
         }
+        finish_fs_navigation_perf_span(
+            &mut fs_navigation_perf,
+            FsNavigationPerfSpan::Slideshow,
+            slideshow_perf_t0,
+        );
+        finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
     }
 
     /// フルスクリーンの再描画リクエストを管理する。
@@ -26567,7 +30485,7 @@ impl App {
         self.fs_vertical_scroll += delta;
         ctx.request_repaint();
     }
-    fn continuous_reading_viewport_len_for_flow(&self, ctx: &egui::Context) -> f32 {
+    fn continuous_reading_viewport_len_for_flow(&mut self, ctx: &egui::Context) -> f32 {
         let viewport = ctx.content_rect();
         let viewport = self
             .fullscreen_idx
@@ -26583,7 +30501,7 @@ impl App {
         }
     }
 
-    fn continuous_reading_key_step_px(&self, ctx: &egui::Context) -> f32 {
+    fn continuous_reading_key_step_px(&mut self, ctx: &egui::Context) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -26592,7 +30510,7 @@ impl App {
                 / 100.0)
     }
 
-    fn continuous_reading_wheel_delta_px(&self, ctx: &egui::Context, wheel_y: f32) -> f32 {
+    fn continuous_reading_wheel_delta_px(&mut self, ctx: &egui::Context, wheel_y: f32) -> f32 {
         let notches = wheel_y / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA;
         -notches
             * self.continuous_reading_viewport_len_for_flow(ctx)
@@ -26603,7 +30521,10 @@ impl App {
                 / 100.0)
     }
 
-    pub(crate) fn continuous_reading_gamepad_speed_px_per_sec(&self, ctx: &egui::Context) -> f32 {
+    pub(crate) fn continuous_reading_gamepad_speed_px_per_sec(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -26612,7 +30533,7 @@ impl App {
                 / 100.0)
     }
 
-    fn slideshow_continuous_scroll_step_px(&self, ctx: &egui::Context) -> f32 {
+    fn slideshow_continuous_scroll_step_px(&mut self, ctx: &egui::Context) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -26837,11 +30758,8 @@ impl App {
         direction: f32,
         history_trigger: crate::app::HistoryTrigger,
     ) {
-        self.scroll_vertical_reading_by(
-            ctx,
-            direction * self.continuous_reading_key_step_px(ctx),
-            history_trigger,
-        );
+        let delta = direction * self.continuous_reading_key_step_px(ctx);
+        self.scroll_vertical_reading_by(ctx, delta, history_trigger);
     }
 
     pub(crate) fn persist_current_spread_mode(&self) {
@@ -27105,6 +31023,7 @@ impl App {
             return;
         }
         self.spread_mode = mode;
+        self.settings.update_active_favorite_spread_mode(mode);
         self.spread_shift_anchor_idx = None;
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
@@ -27136,6 +31055,7 @@ impl App {
             return;
         }
         self.reading_flow = flow;
+        self.settings.update_active_favorite_reading_flow(flow);
         self.spread_shift_anchor_idx = None;
         self.reset_continuous_reading_transform();
         self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
@@ -27160,6 +31080,7 @@ impl App {
             return false;
         }
         self.spread_mode = new_mode;
+        self.settings.update_active_favorite_spread_mode(new_mode);
         self.spread_shift_anchor_idx = None;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         true
@@ -27225,8 +31146,7 @@ impl App {
         &mut self,
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
-        let display_order = self.current_grid_order().to_vec();
-        let image_indices = build_image_reading_indices(&self.items, &display_order);
+        let image_indices = self.get_still_image_indices();
         let mut image_units = Vec::new();
 
         if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
@@ -27243,7 +31163,7 @@ impl App {
             let spread_mode = self.spread_mode;
             image_units.extend(
                 self.build_spread_display_units_for_nav(&image_indices)
-                    .into_iter()
+                    .iter()
                     .map(|unit| {
                         ContinuousReadingUnitSpec::pages(
                             unit.anchor_idx(),
@@ -27926,6 +31846,10 @@ impl App {
         // 連結読みも見開き構成なら相方が一緒に出ている。**昇格を止めるのは画面から
         // 外れたページだけ** (§1.157: この判定が 8 か所に散っていた)。
         let displayed_partner = self.displayed_spread_partner(current_idx);
+        self.discard_animation_expansion_confirmation_outside_display(
+            current_idx,
+            displayed_partner,
+        );
         let stale_promotions = self
             .fs_pending
             .iter()
@@ -30560,7 +34484,11 @@ impl App {
             // and zoom needs to be resolved only once.
             let zip_input = if self.fs_zoom_mode_engaged() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
-                let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+                let bottom_m = (self
+                    .still_seek_geometry_for_idx(left_idx, false)
+                    .total_height
+                    + 8.0)
+                    .min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
                     egui::pos2(image_rect.left(), image_rect.top() + top_m),
                     egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
@@ -31110,7 +35038,7 @@ impl App {
     /// 何も出ていない) か判定する。`true` かつアイドル時間が設定秒数を超えたら
     /// マウスカーソルを `CursorIcon::None` で非表示にする。
     fn fs_ui_is_clean(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         _is_video: bool,
@@ -35338,7 +39266,7 @@ impl App {
         job
     }
 
-    fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
+    pub(crate) fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         match item {
             GridItem::Image(path) => Some(crate::capture::basename_for_path(path)),
@@ -35390,7 +39318,7 @@ impl App {
             self.show_feedback_toast("エクスポート中です".to_string());
             return false;
         }
-        // SNS 自身は snapshot の準備が成功するまで active のままにする。編集モードは
+        // SNS 自身は合成要求の準備が成功するまで active のままにする。編集モードは
         // 相互排他なので、SNS 経路ではこの 1 モードだけを例外にできる。
         if (self.is_overlay_edit_mode_active() && !(sns_split_export && self.sns_split.is_some()))
             || self.adjustment_mode.is_open()
@@ -35405,7 +39333,7 @@ impl App {
             return false;
         }
         let target = match if sns_split_export {
-            // 分割枠を作った 1 ページだけを snapshot する。通常 Ctrl+E の
+            // 分割枠を作った 1 ページだけを worker 合成へ渡す。通常 Ctrl+E の
             // 見開き合成経路は変更しない。
             self.prepare_single_export_dialog_target(ctx, fs_idx)
         } else {
@@ -35417,25 +39345,23 @@ impl App {
                 return false;
             }
         };
-        let sns_split_frames = match (sns_split, &target.pixels) {
-            (Some((frames, source_size)), crate::export_dialog::ExportPixels::Single(page)) => {
-                match scale_sns_split_frames_to_export_pixels(
+        let (sns_split_frames, sns_split_source_size) = match (sns_split, &target.composite) {
+            (Some((frames, source_size)), crate::export_dialog::ExportComposite::Single(page)) => {
+                if let Err(err) = crate::books::scale_export_crop_overrides(
                     &frames,
                     source_size,
-                    page.base_pixels.size,
+                    page.predicted_size,
                 ) {
-                    Ok(frames) => frames,
-                    Err(err) => {
-                        self.show_feedback_toast(err);
-                        return false;
-                    }
+                    self.show_feedback_toast(err);
+                    return false;
                 }
+                (frames, Some(source_size))
             }
-            (Some(_), crate::export_dialog::ExportPixels::Spread { .. }) => {
+            (Some(_), crate::export_dialog::ExportComposite::Spread { .. }) => {
                 self.show_feedback_toast("SNS 分割の単ページを準備できませんでした".to_string());
                 return false;
             }
-            (None, _) => Vec::new(),
+            (None, _) => (Vec::new(), None),
         };
 
         let output_dir = self
@@ -35446,7 +39372,7 @@ impl App {
             .unwrap_or_else(|| target.source_dir.clone());
         let original_selection = self.settings.export_batch_selection;
         let mut selection = original_selection;
-        let has_conceal_mask = target.pixels.has_conceal_mask();
+        let has_conceal_mask = target.composite.has_conceal_mask();
         if !sns_split_export {
             for i in 1..selection.len() {
                 if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
@@ -35460,7 +39386,7 @@ impl App {
         let original_include_metadata = self.settings.export_embed_metadata;
 
         // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
-        // snapshot と枠変換が揃った時だけ SNS モードを確定終了する。
+        // source・編集 snapshot と枠の検証が揃った時だけ SNS モードを確定終了する。
         if sns_split_export {
             self.reset_sns_split_mode();
         }
@@ -35473,7 +39399,7 @@ impl App {
                 self.settings.export_fallback_format,
             ),
             scale: if sns_split_export {
-                // 分割の書き出しは投稿用なので、既定で長辺を抑える。表示 pixels には
+                // 分割の書き出しは投稿用なので、既定で長辺を抑える。合成結果には
                 // AI 拡大が焼き込まれることがあり、実測で 1 枚 5.6MB と X の PNG 上限
                 // (5MB) 際まで膨らんだ。長辺指定は**元が小さければ何もしない**ので、
                 // AI 拡大を使っていない画像は等倍のまま出る。
@@ -35491,7 +39417,8 @@ impl App {
             selection,
             has_conceal_mask,
             sns_split_frames,
-            pixels: target.pixels,
+            sns_split_source_size,
+            composite: target.composite,
             original_selection,
             original_include_metadata,
             initial_focus_done: false,
@@ -35523,14 +39450,14 @@ impl App {
         self.ensure_export_local_adjust_ready(ctx, &[idx])?;
         let (source, source_label, original_format, source_dir, basename) =
             self.export_source_info_for_idx(idx)?;
-        let pixels = self.export_page_pixels_for_idx(ctx, idx)?;
+        let composite = self.export_page_composite_for_idx(ctx, idx)?;
         Ok(ExportDialogTarget {
             source,
             source_label,
             original_format,
             source_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Single(pixels),
+            composite: crate::export_dialog::ExportComposite::Single(composite),
         })
     }
 
@@ -35545,8 +39472,8 @@ impl App {
         let (_, left_label, _, left_dir, left_basename) =
             self.export_source_info_for_idx(left_idx)?;
         let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
-        let left = self.export_page_pixels_for_idx(ctx, left_idx)?;
-        let right = self.export_page_pixels_for_idx(ctx, right_idx)?;
+        let left = self.export_page_composite_for_idx(ctx, left_idx)?;
+        let right = self.export_page_composite_for_idx(ctx, right_idx)?;
         let basename =
             crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
         Ok(ExportDialogTarget {
@@ -35555,7 +39482,7 @@ impl App {
             original_format: crate::save_with_metadata::SrcFormat::Other("spread".to_string()),
             source_dir: left_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Spread { left, right },
+            composite: crate::export_dialog::ExportComposite::Spread { left, right },
         })
     }
 
@@ -35564,18 +39491,16 @@ impl App {
         ctx: &egui::Context,
         indices: &[usize],
     ) -> Result<(), String> {
-        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
-        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
-        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
+        // §1.177 で準備処理そのものを worker 所有へ移すまでは、従来どおり commit 完了を
+        // 待ってから source + snapshot を確定する。進行中のマスク状態を取り込まないための gate。
         if self.erase_inpaint_pending.keys().any(|k| {
             indices.contains(&k.idx) && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
         }) {
             return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
         }
 
-        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
-        // pre-erase pixels を書き出してしまう。ensure_erase_result_texture をここで
-        // 呼んで commit を再投入し、結果が揃うまで Ctrl+E を保留する。
+        // 保存済みマスクの commit を再投入し、従来の準備契約どおり結果が揃うまで
+        // Ctrl+E を保留する。この同期準備の廃止は §1.177 の範囲。
         for &idx in indices {
             if self.mask_pages.contains(&idx) {
                 let _ = self.ensure_erase_result_texture(ctx, idx);
@@ -35619,126 +39544,90 @@ impl App {
         Ok(())
     }
 
-    fn export_page_pixels_for_idx(
+    fn export_page_composite_for_idx(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Result<crate::export_dialog::ExportPagePixels, String> {
-        // 注釈 (comic) があれば最終 composite に焼き込んでから export する (最前面 D1)。
-        // 注釈が無ければ素の final composite。ここで得るのは「現在の設定で隠蔽まで
-        // 焼き込み済み」の表示スナップショットで、`_0` はこれをそのまま書き出す。
-        let base_pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
-            Some(p) => p,
-            None => self
-                .ensure_final_composite_pixels(ctx, idx)
-                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?,
-        };
-        // プリセット出力 (_1〜_4) は隠蔽のパラメータだけが違う同じ絵なので、隠蔽の入力
-        // まで戻って再合成する材料を別に持つ。base_pixels へマスクを重ねるだけだと隠蔽が
-        // 二重に掛かる (v1.1.0 の退行はこれを避けようとして conceal_mask=None を固定し、
-        // プリセット出力ごと止めていた)。
-        let conceal_variant = self
-            .export_conceal_variant_for_idx(ctx, idx)
-            .map(std::sync::Arc::new);
-        // crop は表示には反映しないので、export の最終段で base_pixels (= final
-        // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
-        let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
-        let rotation = self.get_rotation(idx);
-        Ok(crate::export_dialog::ExportPagePixels {
-            base_pixels,
-            conceal_variant,
-            crop,
-            rotation,
-        })
-    }
-
-    /// プリセット出力用の「隠蔽適用前」スナップショット。隠蔽マスクを持たないページは
-    /// `None` = プリセット出力は選べない (本来の条件)。
-    fn export_conceal_variant_for_idx(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantSource> {
-        // 表示側で隠蔽合成の入力になっているものと同じ段 (raw → 消しゴム → 補正レイヤー)。
-        let (base, _) = self.current_conceal_source_pixels(idx)?;
-        let mask = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])?;
-        let params = self.effective_params(idx).clone();
-        let creative_lut = (!params.creative_lut.is_identity())
-            .then(|| {
-                self.creative_lut_library
-                    .get(params.creative_lut.id)
-                    .map(|lut| (lut, params.creative_lut.strength))
-            })
-            .flatten();
-        let ai = self.export_conceal_variant_ai(ctx, idx, &params);
-        let comic = self.export_conceal_variant_comic(idx);
-        Some(crate::export_dialog::ConcealVariantSource {
-            base,
-            mask: std::sync::Arc::new(mask),
-            params,
-            creative_lut,
-            ai,
-            comic,
-        })
-    }
-
-    /// 表示の final composite が実際に final AI を通っているときだけ、プリセット再合成へ
-    /// 同じ AI 段を持たせる。表示が AI 抜き (機能無効 / サイズ上限外 / 推論失敗) なら
-    /// `None` にして `_0` と絵を揃える。
-    fn export_conceal_variant_ai(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-        params: &crate::adjustment::AdjustParams,
-    ) -> Option<crate::export_dialog::ConcealVariantAi> {
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, params)?;
-        // 完成した final composite を掴んだ後にここへ来るので、failed でなければ
-        // 表示は AI 結果を使っている。
-        if self.final_ai_failed.contains(&ai_key) {
-            return None;
+    ) -> Result<crate::export_dialog::ExportPageComposite, String> {
+        // source と編集 snapshot だけを UI スレッドで固定する。decode と、選択された段までの
+        // 合成は worker が行う。注釈は共通 compositor が AI / 表示用補正の後に焼く。
+        let item = self
+            .items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // 再生中の表示フレームは source file の decode からは復元できない。worker に
+        // file だけを渡すと第 1 フレームを黙って保存するため、表示フレームを snapshot
+        // できるようになるまでは従来どおり入口で拒否する。
+        if self.fs_entry_is_animated(idx) {
+            return Err("アニメーション画像はエクスポートできません".to_string());
         }
-        self.ensure_ai_runtime();
-        let runtime = self.ai_runtime.clone()?;
-        Some(crate::export_dialog::ConcealVariantAi {
-            runtime,
-            manager: std::sync::Arc::clone(&self.ai_model_manager),
-            feature_mode: self.settings.ai_feature_mode,
-            upscale_limit: self.settings.ai_upscale_limit(),
-            denoise_limit: self.settings.ai_denoise_limit(),
-            // 表示側が分類済みならその答えを渡す。auto upscale のモデル選択が
-            // `_0` と `_1`〜`_4` で食い違わないようにする。
-            category: self.ai_classify_cache.get(&idx).copied(),
-            transparent_bg_mode: self.fs_transparent_bg_mode,
-        })
-    }
-
-    /// プリセット再合成の最後に焼く注釈。`comic_composited_pixels_for_export` と同じ
-    /// 材料を、製本の headless compositor と同じ形 (`BookComicSnapshot`) で渡す。
-    fn export_conceal_variant_comic(
-        &mut self,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantComic> {
-        if !self.comic_has_objects(idx) {
-            return None;
-        }
-        let key = self.page_path_key(idx)?;
-        self.ensure_comic_doc_loaded(&key);
-        let objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
-        if objects.is_empty() {
-            return None; // デモ有効でも永続注釈が無ければ export には焼かない
-        }
-        let fonts = self.ensure_comic_fonts_for(&objects)?;
-        let source_dims = self
-            .source_dims_for_idx(idx)
-            .map(|(width, height)| [width.round() as usize, height.round() as usize]);
-        Some(crate::export_dialog::ConcealVariantComic {
-            snapshot: crate::books::BookComicSnapshot {
-                objects,
-                fonts,
-                stamp_cache: self.comic_stamp_cache.clone(),
+        let source = match item {
+            GridItem::Image(path) => crate::books::CompositeSource::File { path },
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => crate::books::CompositeSource::ZipEntry {
+                zip_path,
+                entry_name,
             },
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => crate::books::CompositeSource::PdfPage {
+                pdf_path,
+                page_num,
+                password: self.pdf_current_password.clone(),
+            },
+            _ => return Err("このアイテムはエクスポートできません".to_string()),
+        };
+        // プリセット出力 (_1〜_4) も同じ snapshot を使い、隠蔽 preset だけを worker 側で
+        // 差し替える。`_0` は override を付けず、snapshot が持つ現在値を 1 回だけ適用する。
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // crop は表示には反映しないので、worker 合成の幾何最終段で切り出す。
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let stage = self.settings.bake_stage_export;
+        let mut source_dims = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| [width.round() as usize, height.round() as usize])
+            .ok_or_else(|| "画像の読み込み完了後にエクスポートしてください".to_string())?;
+        const PDF_RENDER_LONG_EDGE: u32 = 4096;
+        if matches!(source, crate::books::CompositeSource::PdfPage { .. }) {
+            source_dims =
+                crate::books::predicted_pdf_render_size(source_dims, PDF_RENDER_LONG_EDGE);
+        }
+        let ai_will_run = crate::books::stage_will_run_ai(
+            stage,
+            &params,
+            self.book_ai_materials().policy,
             source_dims,
+        );
+        let display_dims = if ai_will_run {
+            self.ensure_final_composite_pixels(ctx, idx)
+                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?
+                .size
+        } else {
+            source_dims
+        };
+        let predicted_size =
+            crate::books::predicted_composed_size(source_dims, display_dims, ai_will_run);
+        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation, stage)?;
+        // Shape が保存されていても、画像外や 0 面積なら 1 画素も塗られない。
+        // プリセット欄は実際の合成マスクが非空のときだけ有効にする。
+        let has_conceal_mask = edits
+            .conceal
+            .as_ref()
+            .map(|conceal| crate::books::book_mask_has_covered_pixel(&conceal.mask, source_dims))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(crate::export_dialog::ExportPageComposite {
+            source,
+            edits,
+            pdf_render_long_edge: PDF_RENDER_LONG_EDGE,
+            predicted_size,
+            has_conceal_mask,
         })
     }
 
@@ -35767,8 +39656,15 @@ impl App {
         let basename_ok = !crate::capture::basename_from_text(&state.basename)
             .trim()
             .is_empty();
-        let can_start =
-            selected_count > 0 && basename_ok && !state.output_dir_text.trim().is_empty();
+        let render_size = state.render_size();
+        if let Err(error) = &render_size {
+            state.error.get_or_insert_with(|| error.clone());
+        }
+        let base_size = render_size.unwrap_or([1, 1]);
+        let can_start = selected_count > 0
+            && basename_ok
+            && !state.output_dir_text.trim().is_empty()
+            && state.render_size().is_ok();
         let mut open = true;
         let mut canceled = false;
         let mut start = false;
@@ -35878,7 +39774,6 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
-                let base_size = state.render_size();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for scale in crate::export_dialog::ExportScale::FIXED {
@@ -36015,11 +39910,16 @@ impl App {
             start = true;
         }
         if start {
-            match self.start_export_from_dialog(ctx, state.clone()) {
+            let mut state_slot = Some(state);
+            match self.start_export_from_dialog(ctx, &mut state_slot) {
                 Ok(()) => return,
                 Err(err) => {
-                    state.error = Some(err);
-                    self.export_dialog = Some(state);
+                    if let Some(mut state) = state_slot {
+                        state.error = Some(err);
+                        self.export_dialog = Some(state);
+                    } else {
+                        self.show_feedback_toast(err);
+                    }
                     return;
                 }
             }
@@ -36204,8 +40104,11 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state: crate::export_dialog::ExportDialogState,
+        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
     ) -> Result<(), String> {
+        let state = state_slot
+            .as_ref()
+            .expect("export dialog state must exist while validating");
         if self.export_pending.is_some() {
             return Err("エクスポート中です".to_string());
         }
@@ -36220,16 +40123,13 @@ impl App {
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
-        // ダイアログを開いた瞬間に snapshot した pixels / conceal mask を使う。
-        // ここで再 resolve すると animated GIF の current_frame が進んで違うフレーム
-        // が export される (Codex review CONFIRMED)。
-        let pixels = state.pixels.clone();
-        let has_conceal_mask = pixels.has_conceal_mask();
-        // プリセット再合成が final AI を回すなら、worker 終端までローカル AI 利用中に見せる。
-        let needs_ai_lease = pixels.conceal_variant_uses_ai();
+        let has_conceal_mask = state.composite.has_conceal_mask();
+        // 段が AI へ届くなら、worker 終端までローカル AI 利用中に見せる。
+        let needs_ai_lease = state.composite.includes_ai_stage();
         let sns_split_export = !state.sns_split_frames.is_empty();
         let entries = crate::export_dialog::plan_export_entries(
             &state.sns_split_frames,
+            state.sns_split_source_size,
             &state.selection,
             has_conceal_mask,
             &self.settings.conceal_presets,
@@ -36274,7 +40174,7 @@ impl App {
         if let Some(next_selection) = selection_update {
             self.settings.export_batch_selection = next_selection;
         }
-        // SNS はモード固有の既定値として毎回 Full で開く。その強制初期値を通常
+        // SNS はモード固有の既定値として毎回 長辺 2048px で開く。その強制初期値を通常
         // エクスポートの既定倍率へ逆流させない。
         if !sns_split_export {
             self.settings.export_default_scale = state.scale;
@@ -36292,13 +40192,16 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
+        let state = state_slot
+            .take()
+            .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {
             source: state.source,
             original_format: state.original_format,
             output_format: state.output_format,
             output_dir,
             basename: resolved_basename,
-            pixels,
+            composite: state.composite,
             scale: state.scale,
             entries,
             include_metadata: effective_include_metadata,
@@ -36389,48 +40292,6 @@ impl App {
                 ))
             }
             _ => Err("このアイテムはエクスポートできません".to_string()),
-        }
-    }
-
-    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
-    fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
-        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
-            return Ok(pixels);
-        }
-        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
-            return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
-        }
-        if self.has_active_local_adjust_layers(idx) {
-            return Err("補正レイヤーの反映完了後にエクスポートしてください".to_string());
-        }
-
-        if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            return Ok(pixels);
-        }
-        if !self.post_filter_bypassed
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(idx)
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Ok(Arc::clone(pixels)),
-            Some(FsCacheEntry::Animated {
-                frame_pixels,
-                current_frame,
-                ..
-            }) => frame_pixels
-                .get(*current_frame)
-                .cloned()
-                .ok_or_else(|| "アニメーションフレームを取得できません".to_string()),
-            _ => Err("画像の読み込み完了後にエクスポートしてください".to_string()),
         }
     }
 
@@ -37765,7 +41626,506 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    mod still_seek_rotation;
     use super::*;
+
+    #[test]
+    fn nav_indices_cache_reuses_the_same_allocation() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..6).map(|_| GridItem::Image(PathBuf::new())).collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.viewer_navigation_caches.invalidate();
+
+        reset_nav_indices_build_count_for_test();
+        let first = app.get_nav_indices();
+        let second = app.get_nav_indices();
+
+        assert_eq!(nav_indices_build_count_for_test(), 1);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    fn cached_and_uncached_navigation_lists_are_identical() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        app.visible_indices = vec![2, 1, 0];
+        let uncached_nav = build_nav_indices(&app.items, &app.visible_indices);
+        let uncached_still =
+            crate::ui_helpers::still_image_display_indices(&app.items, &app.visible_indices);
+
+        app.viewer_navigation_caches.invalidate();
+        assert_eq!(app.get_nav_indices().as_ref(), &uncached_nav);
+        assert_eq!(app.get_still_image_indices().as_ref(), &uncached_still);
+    }
+
+    #[test]
+    fn viewer_navigation_cache_invalidate_clears_all_three_entries() {
+        let mut caches = ViewerNavigationCaches::default();
+        caches.ensure_source(7, ReadingFlow::Paged);
+        caches.install_nav_indices(vec![0, 1]);
+        caches.install_still_image_indices(vec![0]);
+        caches.install_fs_seek_info(
+            0,
+            FsSeekInfo {
+                image_indices: Arc::new(vec![0]),
+                current_pos: 0,
+                media_count: 2,
+                video_count: 1,
+                other_count: 0,
+            },
+        );
+
+        caches.invalidate();
+
+        assert!(caches.nav_indices().is_none());
+        assert!(caches.still_image_indices().is_none());
+        assert!(caches.fs_seek_info(0).is_none());
+    }
+
+    #[test]
+    fn fs_render_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
+        let clock_called = std::cell::Cell::new(false);
+        let cycles_called = std::cell::Cell::new(false);
+        let mut recorder = fs_render_perf_start_with(
+            false,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut navigation = recorder
+            .as_ref()
+            .map(|_| FsNavigationPerfRecorder::default());
+        let navigation_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_span_with(
+            &mut navigation,
+            FsNavigationPerfSpan::Page,
+            navigation_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let open_other_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_span_with(
+            &mut navigation,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            open_other_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut page_turn_decision = recorder
+            .as_ref()
+            .map(|_| FsPageTurnDecisionPerfRecorder::default());
+        let page_turn_span = start_fs_page_turn_decision_perf_span_with(
+            &page_turn_decision,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_page_turn_decision_perf_span_with(
+            &mut page_turn_decision,
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+            page_turn_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
+        let open_span = crate::app::start_fs_open_perf_span_with(
+            &open_perf,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        crate::app::finish_fs_open_perf_span_with(
+            &mut open_perf,
+            FsOpenPerfSpan::RecordReadingHistory,
+            open_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_with(
+            &mut navigation,
+            &mut recorder,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        for stage in FsRenderPerfStage::ALL {
+            mark_fs_render_perf(&mut recorder, stage);
+        }
+        finish_fs_render_perf(&mut recorder, 0, 0, None);
+
+        assert!(recorder.is_none());
+        assert!(!clock_called.get());
+        assert!(!cycles_called.get());
+    }
+
+    #[test]
+    fn fs_render_perf_stages_plus_unaccounted_equal_total() {
+        let started_at = std::time::Instant::now();
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut cycles = started_cycles;
+        for (index, stage) in FsRenderPerfStage::ALL.into_iter().enumerate() {
+            elapsed += std::time::Duration::from_millis(index as u64 + 1);
+            cycles += (index as u64 + 1) * 100;
+            recorder.mark_at(stage, started_at + elapsed, cycles);
+        }
+        let expected_unaccounted = std::time::Duration::from_millis(7);
+        let expected_unaccounted_cycles = 700;
+        let breakdown = recorder.finish_at(
+            started_at + elapsed + expected_unaccounted,
+            cycles + expected_unaccounted_cycles,
+        );
+        let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
+
+        assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+        assert!(
+            (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
+        );
+    }
+
+    #[test]
+    fn fs_navigation_perf_children_partition_the_navigation_interval() {
+        let started_at = std::time::Instant::now();
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
+        let mut marked_at = started_at;
+        let mut marked_cycles = started_cycles;
+        for stage in FsRenderPerfStage::ALL {
+            if stage == FsRenderPerfStage::FsNavigationClose {
+                break;
+            }
+            marked_at += std::time::Duration::from_millis(1);
+            marked_cycles += 100;
+            recorder.mark_at(stage, marked_at, marked_cycles);
+        }
+        let mut open_fullscreen = FsOpenPerfRecorder::default();
+        for (span, ms) in [
+            (FsOpenPerfSpan::Total, 25),
+            (FsOpenPerfSpan::RecordReadingHistory, 2),
+            (FsOpenPerfSpan::RecordBookResume, 3),
+            (FsOpenPerfSpan::StartMetadataLoad, 1),
+            (FsOpenPerfSpan::StartFsLoad, 2),
+            (FsOpenPerfSpan::UpdatePrefetchWindow, 4),
+            (FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache, 1),
+            (FsOpenPerfSpan::RefreshFullscreenPdfPromotion, 2),
+            (FsOpenPerfSpan::ResetFileRuntime, 2),
+            (FsOpenPerfSpan::ViewerPresentation, 3),
+        ] {
+            open_fullscreen.add(span, std::time::Duration::from_millis(ms), ms * 100);
+        }
+        let navigation = FsNavigationPerfRecorder {
+            close: std::time::Duration::from_millis(2),
+            ctrl_sibling_mouse: std::time::Duration::from_millis(3),
+            page: std::time::Duration::from_millis(83),
+            begin_sequence: std::time::Duration::from_millis(4),
+            land_target: std::time::Duration::from_millis(68),
+            land_seek_continuous: std::time::Duration::ZERO,
+            land_open: std::time::Duration::from_millis(67),
+            land_open_other_should_block_detached_independent_still_navigation_to_video:
+                std::time::Duration::from_millis(1),
+            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(25),
+            land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder {
+                original_preview_active_for_frame: std::time::Duration::from_millis(1),
+                resolve_navigation_sequence_target: std::time::Duration::from_millis(17),
+                resolve_fs_display_tex: std::time::Duration::from_millis(2),
+                ensure_passthrough_rendition: std::time::Duration::from_millis(8),
+                passthrough_rendition: PassthroughRenditionPerfRecorder {
+                    source_lookup: std::time::Duration::from_millis(1),
+                    cache_lookup: std::time::Duration::from_millis(1),
+                    build_pixels: std::time::Duration::from_millis(2),
+                    load_texture: std::time::Duration::from_millis(2),
+                    cache_insert: std::time::Duration::from_millis(1),
+                    cycles: [100, 100, 200, 200, 100],
+                    calls: Vec::new(),
+                },
+                resolve_original_preview_tex: std::time::Duration::from_millis(1),
+                ensure_navigation_target_thumbnail_requests: std::time::Duration::from_millis(2),
+                cache_lookup: std::time::Duration::from_millis(1),
+                cycles: [100, 1_700, 200, 800, 100, 200, 100],
+                cache_hit: Some(true),
+            },
+            land_open_other_defer_page_turn_full_resolution_work: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_video_audio_vst: std::time::Duration::from_millis(1),
+            land_open_other_try_start_video_tile_fast_swap: std::time::Duration::from_millis(1),
+            land_open_other_try_start_native_video_fast_swap: std::time::Duration::from_millis(3),
+            land_open_other_cancel_stale_video_tile_reopen: std::time::Duration::from_millis(1),
+            land_open_other_fullscreen_cursor_state: std::time::Duration::from_millis(2),
+            open_fullscreen,
+            slideshow: std::time::Duration::from_millis(7),
+            slideshow_advance: std::time::Duration::from_millis(6),
+            cycles: [
+                200, 300, 8_300, 400, 6_800, 0, 6_700, 100, 2_500, 100, 100, 100, 100, 300, 100,
+                200, 700, 600,
+            ],
+        };
+        marked_at += std::time::Duration::from_millis(103);
+        marked_cycles += 10_300;
+        recorder.mark_navigation_at(navigation, marked_at, marked_cycles);
+
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationPageOther as usize],
+            11.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationSlideshowOther as usize],
+            1.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationRemainder as usize],
+            8.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap as usize],
+            3.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState as usize],
+            2.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize],
+            6.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize],
+            4.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize],
+            6.0
+        );
+        assert_eq!(recorder.navigation_page_turn_decision_cache_hit, Some(true));
+        let passthrough_rendition_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(passthrough_rendition_ms, 8.0);
+        let passthrough_rendition_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(passthrough_rendition_cycles, 800);
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            1.0
+        );
+        assert_eq!(
+            recorder.stage_cycles
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            100
+        );
+        let page_turn_decision_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(page_turn_decision_ms, 25.0);
+        let page_turn_decision_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(page_turn_decision_cycles, 2_500);
+        let resolve_sequence_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(resolve_sequence_ms, 17.0);
+        let resolve_sequence_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(resolve_sequence_cycles, 1_700);
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
+            5.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandRemainder as usize],
+            1.0
+        );
+        let open_other_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo
+            as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(open_other_ms, 42.0);
+        let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
+            as usize
+            ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(land_ms, 68.0);
+        let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+            ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(navigation_ms, 103.0);
+        let navigation_cycles =
+            FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+                ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+                .iter()
+                .copied()
+                .map(|stage| recorder.stage_cycles[stage as usize])
+                .sum::<u64>();
+        assert_eq!(navigation_cycles, 10_300);
+        assert_eq!(
+            FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
+            Some(FsRenderPerfStage::FsBoundaryHint)
+        );
+        while recorder.next_stage < FS_RENDER_PERF_STAGE_COUNT {
+            marked_at += std::time::Duration::from_millis(1);
+            marked_cycles += 100;
+            let stage = FsRenderPerfStage::ALL[recorder.next_stage];
+            recorder.mark_at(stage, marked_at, marked_cycles);
+        }
+        let finished_at = marked_at + std::time::Duration::from_millis(7);
+        let breakdown = recorder.finish_at(finished_at, marked_cycles + 700);
+        let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
+        assert!(
+            (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, 700);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
+        );
+    }
+
+    #[test]
+    fn fs_render_perf_event_fields_follow_stage_order() {
+        let event_stages = FsRenderPerfBreakdown::EVENT_FIELDS.map(|(_, stage)| stage);
+        assert_eq!(event_stages, FsRenderPerfStage::ALL);
+        assert!(
+            FsRenderPerfBreakdown::EVENT_FIELDS
+                .iter()
+                .all(|(field, _)| {
+                    field
+                        .strip_suffix("_ms")
+                        .is_some_and(|prefix| !prefix.is_empty())
+                })
+        );
+    }
 
     /// 全画面まわりで「いま居る場所」を聞く側が、復元先の矩形を読んでいないこと。
     ///
@@ -37873,7 +42233,7 @@ mod tests {
         };
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&[frame], [100, 50], [400, 100]).unwrap();
+            crate::books::scale_export_crop_overrides(&[frame], [100, 50], [400, 100]).unwrap();
 
         assert_eq!(
             scaled,
@@ -37896,7 +42256,7 @@ mod tests {
         .with_seam_permille(0, [832, 1216]);
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&layout.frames(), [832, 1216], [832, 1216])
+            crate::books::scale_export_crop_overrides(&layout.frames(), [832, 1216], [832, 1216])
                 .unwrap();
         let bounds = scaled
             .iter()
@@ -37940,7 +42300,7 @@ mod tests {
         ];
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&frames, [130, 60], [173, 77]).unwrap();
+            crate::books::scale_export_crop_overrides(&frames, [130, 60], [173, 77]).unwrap();
         let bounds = scaled
             .iter()
             .map(|frame| {
@@ -37988,7 +42348,7 @@ mod tests {
             },
         ];
 
-        let scaled = scale_sns_split_frames_to_export_pixels(&frames, [10, 5], [11, 6]).unwrap();
+        let scaled = crate::books::scale_export_crop_overrides(&frames, [10, 5], [11, 6]).unwrap();
         let first = scaled[0].pixel_bounds(11, 6);
         let second = scaled[1].pixel_bounds(11, 6);
 
@@ -37998,7 +42358,7 @@ mod tests {
     }
 
     #[test]
-    fn sns_split_frames_reject_a_snapshot_too_narrow_for_distinct_entries() {
+    fn sns_split_frames_reject_a_composite_too_narrow_for_distinct_entries() {
         let frames = [
             crate::export_crop::CropRect {
                 min_x: 0.0,
@@ -38014,7 +42374,7 @@ mod tests {
             },
         ];
 
-        let err = scale_sns_split_frames_to_export_pixels(&frames, [2, 1000], [1, 500])
+        let err = crate::books::scale_export_crop_overrides(&frames, [2, 1000], [1, 500])
             .expect_err("1px 幅へ 2 枠は配置できない");
 
         assert!(err.contains("解像度が小さすぎ"));
@@ -41259,7 +45619,7 @@ mod tests {
             .unwrap();
         }
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         assert!(matches!(app.thumbnails[1], ThumbnailState::Pending));
         assert!(app.fs_cache.contains_key(&0));
@@ -41355,7 +45715,7 @@ mod tests {
             30,
             crate::app::FsLoadPurpose::for_page(false),
         ));
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(!app.fs_cache.contains_key(&0));
         assert_eq!(app.fs_upload_backlog.len(), 1);
     }
@@ -41438,7 +45798,7 @@ mod tests {
         assert!(app.fs_cache.contains_key(&1));
         assert!(!app.fs_cache.contains_key(&0));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
 
         assert!(
             app.fs_cache.contains_key(&0),
@@ -41491,7 +45851,7 @@ mod tests {
         assert!(app.fs_nav_locked_gen.is_none());
 
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(app.fs_upload_backlog.is_empty());
         assert!(app.fs_cache.contains_key(&2));
     }
@@ -41869,7 +46229,7 @@ mod tests {
                 app.items = (0..7).map(|_| GridItem::Image(PathBuf::new())).collect();
                 app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
                 app.visible_indices = (0..app.items.len()).collect();
-                app.cached_nav_indices = None;
+                app.viewer_navigation_caches.invalidate();
                 app.spread_mode = mode;
                 app.fullscreen_idx = Some(2);
                 for idx in 0..app.items.len() {
@@ -43020,7 +47380,7 @@ mod tests {
             egui::Color32::LIGHT_GREEN,
         );
         app.visible_indices = vec![left, right];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.fullscreen_idx = Some(left);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
@@ -48986,6 +53346,10 @@ mod tests {
         );
     }
 
+    fn loaded_still_seek_thumbnail(size: egui::Vec2) -> StillSeekStripThumbnail {
+        StillSeekStripThumbnail::Loaded(size, crate::rotation_db::Rotation::None)
+    }
+
     #[test]
     fn spread_seek_maps_two_units_to_discrete_endpoints() {
         assert_eq!(spread_seek_unit_fraction(0, 2), 0.0);
@@ -49004,6 +53368,1776 @@ mod tests {
         assert_eq!(spread_seek_unit_from_fraction(0.0, 0), 0);
         assert_eq!(spread_seek_unit_fraction(0, 1), 0.0);
         assert_eq!(spread_seek_unit_from_fraction(0.0, 1), 0);
+    }
+
+    #[test]
+    fn still_seek_strip_requests_are_bounded_by_view_width_for_fifty_thousand_pages() {
+        let images = (0..50_000).collect::<Vec<_>>();
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_920.0, cell_height));
+        let rotation_candidates =
+            still_seek_strip_rotation_candidates(&images, 25_000, row.width(), cell_height);
+        assert!(rotation_candidates.len() <= 64);
+        let layout = still_seek_strip_layout(&images, 25_000, row, cell_height, false, |idx| {
+            assert!(rotation_candidates.contains(&idx));
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 100.0))
+        });
+        let min_cell_width = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT;
+        let visible_bound = ((row.width() + STILL_SEEK_STRIP_CELL_GAP)
+            / (min_cell_width + STILL_SEEK_STRIP_CELL_GAP))
+            .floor() as usize;
+        assert!(layout.cells.len() <= visible_bound);
+        assert!(
+            layout.request_end - layout.request_start
+                <= layout.cells.len() + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2
+        );
+        assert!(layout.cells.iter().any(|cell| cell.source_pos == 25_000));
+    }
+
+    #[test]
+    fn still_seek_cells_use_each_pages_own_aspect_with_a_lower_bound() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(3.0, 2.0)),
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 10.0)),
+        ];
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 2, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
+        };
+        assert_f32_close(width(1), cell_height * 2.0 / 3.0);
+        assert_f32_close(width(3), cell_height * 3.0 / 2.0);
+        assert_f32_close(width(4), cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT);
+    }
+
+    #[test]
+    fn still_seek_layout_swaps_width_and_height_for_quarter_turns() {
+        let images = [0, 1, 2];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(
+                egui::vec2(2.0, 3.0),
+                crate::rotation_db::Rotation::Cw90,
+            ),
+        ];
+        let cell_height = 90.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 1, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
+        };
+        assert_f32_close(width(0), 60.0);
+        assert_f32_close(width(2), 135.0);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 2)
+                .unwrap()
+                .rotation,
+            crate::rotation_db::Rotation::Cw90
+        );
+    }
+
+    #[test]
+    fn still_seek_unavailable_pages_stop_growth_but_remain_in_overscan_requests() {
+        let images = [0, 1, 2, 3, 4, 5, 6];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 3, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(layout.request_start, 1);
+        assert_eq!(layout.request_end, 7);
+
+        let current_unavailable = still_seek_strip_layout(&images, 3, row, 94.0, false, |_| {
+            StillSeekStripThumbnail::Unavailable
+        });
+        assert!(current_unavailable.cells.is_empty());
+        assert_eq!(current_unavailable.request_start, 1);
+        assert_eq!(current_unavailable.request_end, 6);
+    }
+
+    #[test]
+    fn still_seek_failed_pages_are_square_and_do_not_stop_growth() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Failed,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 2, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_f32_close(
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 3)
+                .unwrap()
+                .rect
+                .width(),
+            94.0,
+        );
+    }
+
+    #[test]
+    fn still_seek_placed_cells_do_not_move_when_outer_pages_load() {
+        let images = (0..9).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let initial = still_seek_strip_layout(&images, 4, row, 94.0, false, |idx| {
+            if (2..=6).contains(&idx) {
+                loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+            } else {
+                StillSeekStripThumbnail::Unavailable
+            }
+        });
+        let grown = still_seek_strip_layout(&images, 4, row, 94.0, false, |_| {
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+        });
+        for original in &initial.cells {
+            let after = grown
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == original.source_pos)
+                .unwrap();
+            assert_eq!(after.rect, original.rect);
+        }
+        assert!(grown.cells.len() > initial.cells.len());
+    }
+
+    #[test]
+    fn still_seek_strip_and_bar_resolve_their_two_direction_axes_independently() {
+        let images = [10, 11, 12, 13];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 40.0));
+        let loaded = |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0));
+        let cases = [
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::LeftToRight,
+                true,
+                false,
+            ),
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                true,
+                true,
+            ),
+            (
+                ReadingDirection::Ltr,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                false,
+                false,
+            ),
+        ];
+        for (reading, bar_setting, expected_strip_rtl, expected_bar_rtl) in cases {
+            assert_eq!(
+                resolve_still_seek_directions(reading, bar_setting),
+                StillSeekDirections {
+                    strip_rtl: expected_strip_rtl,
+                    bar_rtl: expected_bar_rtl,
+                }
+            );
+        }
+
+        let ltr = still_seek_strip_layout(&images, 1, row, 40.0, false, loaded);
+        let rtl = still_seek_strip_layout(&images, 1, row, 40.0, true, loaded);
+        assert_eq!(
+            ltr.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            rtl.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1, 0]
+        );
+        for layout in [&ltr, &rtl] {
+            for cell in &layout.cells {
+                assert_eq!(
+                    still_seek_source_position_at_pointer(layout, cell.rect.center()),
+                    Some(cell.source_pos)
+                );
+            }
+            let gap_x = (layout.cells[0].rect.right() + layout.cells[1].rect.left()) * 0.5;
+            assert_eq!(
+                still_seek_source_position_at_pointer(
+                    layout,
+                    egui::pos2(gap_x, layout.cells[0].rect.center().y),
+                ),
+                None
+            );
+        }
+
+        let track = egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(110.0, 8.0));
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, false), 0.0);
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, true), 1.0);
+    }
+
+    /// **送る向きは並びの向きに従う。**
+    ///
+    /// 右→左で読む本では、画面上のセルが元ページ順の逆に並ぶ。動画の
+    /// `center_index_after_drag` は常に左→右前提なので、画面上の移動量をそのまま
+    /// 渡すと指と逆へ動く (2026-09-06 利用者報告)。既存の RTL テストは「確定済みの
+    /// 中心が両方向のレイアウトで使われること」しか見ておらず、**送る向きは見ていなかった**。
+    #[test]
+    fn still_seek_strip_pan_follows_the_finger_in_both_reading_directions() {
+        let cell_width = 64.0_f32;
+        let start = 5_usize;
+        let drag_right = 128.0_f32;
+
+        let ltr =
+            crate::video::seek_strip::center_index_after_drag(start as f64, drag_right, cell_width)
+                .unwrap();
+        let rtl = crate::video::seek_strip::center_index_after_drag(
+            start as f64,
+            -drag_right,
+            cell_width,
+        )
+        .unwrap();
+
+        // 右へ引いたとき、左→右の本は前のページへ、右→左の本は後のページへ寄る。
+        assert!(
+            ltr < start as f64,
+            "LTR: dragging right must go back, got {ltr}"
+        );
+        assert!(
+            rtl > start as f64,
+            "RTL: dragging right must go forward, got {rtl}"
+        );
+        assert_eq!(
+            (start as f64 - ltr).abs(),
+            (rtl - start as f64).abs(),
+            "both directions must move the same distance"
+        );
+    }
+
+    #[test]
+    fn still_seek_strip_committed_center_is_used_for_ltr_and_rtl_layouts() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+        let expected_center = crate::video::seek_strip::center_index_after_drag(5.0, 128.0, 64.0)
+            .unwrap()
+            .round() as usize;
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos: expected_center,
+                page_pos_at_commit: 5,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(5),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let centered = layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == expected_center)
+                .expect("the committed center must be present")
+                .rect
+                .center();
+            assert_eq!(centered, row.center(), "rtl={rtl}");
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_recenters_when_the_actual_page_changes() {
+        let mut gesture = StillSeekGesture::StripCommitted {
+            layout_center_pos: 2,
+            page_pos_at_commit: 5,
+        };
+        gesture.recenter_if_page_changed(5);
+        assert_eq!(gesture.strip_layout_center(5), 2);
+
+        gesture.recenter_if_page_changed(6);
+        assert_eq!(gesture, StillSeekGesture::Idle);
+        assert_eq!(gesture.strip_layout_center(6), 6);
+    }
+
+    #[test]
+    fn still_seek_strip_latched_layout_keeps_actual_current_page_highlighted() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+        let current_pos = 7;
+        let highlighted_pages = HashSet::from([images[current_pos]]);
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos: 5,
+                page_pos_at_commit: current_pos,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(current_pos),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let selected = layout
+                .cells
+                .iter()
+                .filter(|cell| highlighted_pages.contains(&cell.idx))
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>();
+            assert_eq!(selected, vec![current_pos], "rtl={rtl}");
+            assert_ne!(
+                layout
+                    .cells
+                    .iter()
+                    .find(|cell| cell.source_pos == current_pos)
+                    .unwrap()
+                    .rect
+                    .center(),
+                row.center(),
+                "the highlight must move while the latched layout stays fixed"
+            );
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_has_no_highlight_when_current_page_is_outside_the_moved_window() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 60.0));
+        let highlighted_pages = HashSet::from([images[11]]);
+
+        for rtl in [false, true] {
+            let layout = still_seek_strip_layout(&images, 0, row, 60.0, rtl, |_| {
+                loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0))
+            });
+            assert!(
+                layout
+                    .cells
+                    .iter()
+                    .all(|cell| !highlighted_pages.contains(&cell.idx)),
+                "rtl={rtl}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_lock_stays_outside_cell_hit_testing() {
+        let strip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 72.0));
+        let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+        let row = egui::Rect::from_min_max(
+            strip.min + egui::vec2(6.0, 5.0),
+            egui::pos2(lock.left() - 6.0, strip.bottom() - 5.0),
+        );
+        let images = [0, 1, 2, 3, 4, 5];
+        let layout = still_seek_strip_layout(&images, 2, row, 62.0, false, |_| {
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+        });
+        assert!(
+            layout
+                .cells
+                .iter()
+                .all(|cell| cell.rect.right() <= row.right())
+        );
+        assert_eq!(
+            still_seek_source_position_at_pointer(&layout, lock.center()),
+            None
+        );
+    }
+
+    #[test]
+    fn still_seek_bar_and_strip_share_video_gesture_decisions() {
+        let mut horizontal =
+            crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            horizontal.update(egui::pos2(130.0, 104.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub
+        );
+
+        let mut upward = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            upward.update(egui::pos2(104.0, 70.0)),
+            crate::video::seek_strip::SeekRowDecision::OpenStrip
+        );
+
+        assert!(crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(104.0, 100.0),
+            94.0,
+        ));
+        assert!(!crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(140.0, 100.0),
+            94.0,
+        ));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StillSeekStripResponseObservation {
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        interaction: StillSeekStripInteraction,
+        gesture: StillSeekGesture,
+    }
+
+    struct StillSeekStripHarnessState {
+        gesture: StillSeekGesture,
+        page: usize,
+        observations: Vec<StillSeekStripResponseObservation>,
+    }
+
+    impl Default for StillSeekStripHarnessState {
+        fn default() -> Self {
+            Self {
+                gesture: StillSeekGesture::Idle,
+                page: 5,
+                observations: Vec::new(),
+            }
+        }
+    }
+
+    fn still_seek_strip_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekStripHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekStripHarnessState| {
+                    let row =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        row,
+                        ui.make_persistent_id(0x57A1_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    state.gesture.recenter_if_page_changed(state.page);
+                    let layout_center_pos = state.gesture.strip_layout_center(state.page);
+                    let interaction = handle_still_seek_strip_response(
+                        &response,
+                        layout_center_pos,
+                        state.page,
+                        10,
+                        40.0,
+                        row.bottom(),
+                        false,
+                        &mut state.gesture,
+                    );
+                    if response.clicked()
+                        && let Some(pointer) = response.interact_pointer_pos()
+                    {
+                        state.page = (((pointer.x - row.left()) / row.width()) * 9.0)
+                            .round()
+                            .clamp(0.0, 9.0) as usize;
+                    }
+                    state.observations.push(StillSeekStripResponseObservation {
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        interaction,
+                        gesture: state.gesture,
+                    });
+                },
+                StillSeekStripHarnessState::default(),
+            )
+    }
+
+    fn still_seek_strip_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekStripHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_strip_drag_uses_video_formula_and_commits_on_release() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let drag = harness.state().observations.last().unwrap();
+        assert!(drag.drag_started);
+        assert!(drag.dragged);
+        assert!(!drag.drag_stopped);
+        assert!(!drag.clicked);
+        assert!(drag.interaction.note_seek_activity);
+        assert!(!drag.interaction.closed_by_drag);
+        assert_eq!(
+            drag.gesture,
+            StillSeekGesture::Strip {
+                origin_center_pos: 5,
+                origin_pointer: origin,
+                layout_center_pos: crate::video::seek_strip::center_index_after_drag(
+                    5.0,
+                    destination.x - origin.x,
+                    40.0,
+                )
+                .unwrap()
+                .round() as usize,
+                page_pos_at_origin: 5,
+            }
+        );
+        assert_eq!(harness.state().page, 5, "strip drag must not seek");
+
+        still_seek_strip_pointer_button(&mut harness, destination, false);
+        let release = harness.state().observations.last().unwrap();
+        assert!(release.drag_stopped);
+        assert_eq!(
+            release.gesture,
+            StillSeekGesture::StripCommitted {
+                layout_center_pos: 3,
+                page_pos_at_commit: 5,
+            }
+        );
+        assert_eq!(release.gesture.strip_layout_center(5), 3);
+    }
+
+    #[test]
+    fn still_seek_strip_click_does_not_create_a_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let pos = egui::pos2(320.0, 96.0);
+        harness.hover_at(pos);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, pos, true);
+        still_seek_strip_pointer_button(&mut harness, pos, false);
+
+        let click = harness.state().observations.last().unwrap();
+        assert!(click.clicked);
+        assert_eq!(click.gesture, StillSeekGesture::Idle);
+        assert_eq!(harness.state().page, 7, "strip click must still seek");
+    }
+
+    #[test]
+    fn still_seek_strip_downward_close_ends_the_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(164.0, 132.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let close = harness.state().observations.last().unwrap();
+        assert!(close.drag_started);
+        assert!(close.dragged);
+        assert!(close.interaction.closed_by_drag);
+        assert_eq!(close.gesture, StillSeekGesture::Idle);
+        assert_eq!(
+            harness.state().page,
+            5,
+            "downward close must not pan or seek"
+        );
+        assert_eq!(close.gesture.strip_layout_center(5), 5);
+    }
+
+    #[test]
+    fn still_seek_strip_center_clamps_at_both_ends() {
+        let drag_to = |origin: egui::Pos2, destination: egui::Pos2| {
+            let mut harness = still_seek_strip_handler_harness();
+            harness.run();
+            harness.hover_at(origin);
+            harness.step();
+            still_seek_strip_pointer_button(&mut harness, origin, true);
+            harness.hover_at(destination);
+            harness.step();
+            harness.state().gesture.strip_layout_center(5)
+        };
+
+        assert_eq!(drag_to(egui::pos2(160.0, 96.0), egui::pos2(370.0, 96.0)), 0);
+        assert_eq!(drag_to(egui::pos2(260.0, 96.0), egui::pos2(40.0, 96.0)), 9);
+    }
+
+    #[test]
+    fn still_seek_strip_click_after_pan_seeks_then_recenters() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let dragged = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(dragged);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, dragged, false);
+        assert_eq!(harness.state().gesture.strip_layout_center(5), 3);
+
+        let click = egui::pos2(320.0, 96.0);
+        harness.hover_at(click);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, click, true);
+        still_seek_strip_pointer_button(&mut harness, click, false);
+        assert_eq!(harness.state().page, 7);
+        harness.step();
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+        assert_eq!(harness.state().gesture.strip_layout_center(7), 7);
+    }
+
+    #[test]
+    fn fullscreen_teardown_forces_still_seek_strip_latch_idle() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_seek_gesture = StillSeekGesture::Strip {
+            origin_center_pos: 5,
+            origin_pointer: egui::pos2(160.0, 96.0),
+            layout_center_pos: 5,
+            page_pos_at_origin: 5,
+        };
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StillSeekTrackResponseObservation {
+        primary_down: bool,
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        pointer: Option<egui::Pos2>,
+        action: StillSeekTrackAction,
+    }
+
+    #[derive(Default)]
+    struct StillSeekTrackHarnessState {
+        gesture: StillSeekGesture,
+        page: usize,
+        strip_open: bool,
+        seek_activity_frames: usize,
+        observations: Vec<StillSeekTrackResponseObservation>,
+    }
+
+    fn still_seek_track_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekTrackHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekTrackHarnessState| {
+                    let track =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        track,
+                        ui.make_persistent_id(0x5EE4_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let pointer = response
+                        .interact_pointer_pos()
+                        .or_else(|| response.hover_pos());
+                    let interaction =
+                        handle_still_seek_track_response(&response, &mut state.gesture);
+                    if interaction.note_seek_activity {
+                        state.seek_activity_frames += 1;
+                    }
+                    match interaction.action {
+                        StillSeekTrackAction::Seek => {
+                            if let Some(pointer) = pointer {
+                                state.page = (((pointer.x - track.left()) / track.width()) * 9.0)
+                                    .round()
+                                    .clamp(0.0, 9.0)
+                                    as usize;
+                            }
+                        }
+                        StillSeekTrackAction::OpenStrip => state.strip_open = true,
+                        StillSeekTrackAction::None => {}
+                    }
+                    state.observations.push(StillSeekTrackResponseObservation {
+                        primary_down: ui.input(|input| input.pointer.primary_down()),
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        pointer,
+                        action: interaction.action,
+                    });
+                },
+                StillSeekTrackHarnessState::default(),
+            )
+    }
+
+    fn still_seek_track_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekTrackHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_track_horizontal_drag_seeks_on_first_drag_frame() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(
+            harness.state().page,
+            7,
+            "first horizontal drag frame must seek: {:?}",
+            harness.state().observations
+        );
+        assert_eq!(harness.state().seek_activity_frames, 1);
+
+        let drag_frame = harness.state().observations.last().unwrap();
+        assert!(drag_frame.primary_down);
+        assert!(drag_frame.drag_started);
+        assert!(drag_frame.dragged);
+        assert!(!drag_frame.drag_stopped);
+        assert!(!drag_frame.clicked);
+        assert_eq!(drag_frame.pointer, Some(destination));
+        assert_eq!(drag_frame.action, StillSeekTrackAction::Seek);
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+        let release_frame = harness.state().observations.last().unwrap();
+        assert!(!release_frame.primary_down);
+        assert!(release_frame.drag_stopped);
+        assert_eq!(release_frame.action, StillSeekTrackAction::Seek);
+    }
+
+    /// The first scrub frame lands through fullscreen page navigation. That page switch must not
+    /// end the gesture, because later held frames have `dragged=true, drag_started=false`.
+    #[test]
+    fn still_seek_drag_survives_the_page_navigation_it_triggers() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.image_metas = vec![None; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.details_order = vec![0, 1, 2];
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+
+        let mut gesture = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(80.0, 96.0));
+        gesture.update(egui::pos2(160.0, 96.0));
+        app.fs_seek_gesture = StillSeekGesture::Track(gesture);
+        app.fs_seek_drag_active = true;
+
+        let mut perf = None;
+        app.land_still_page_navigation_target(
+            &ctx,
+            0,
+            1,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            &mut perf,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.fs_seek_gesture.is_active());
+        assert!(app.fs_seek_drag_active);
+
+        // Neither render-suppression return may become a second gesture owner. Both can happen
+        // transiently between the first landing frame and the next held-pointer frame.
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        app.analysis_mode = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+        assert!(app.fs_seek_gesture.is_active());
+
+        app.analysis_mode = false;
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarOnly);
+        app.visible_indices = vec![0, 2];
+        app.viewer_navigation_caches.invalidate();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+
+        let StillSeekGesture::Track(gesture) = &mut app.fs_seek_gesture else {
+            panic!("the first scrub frame's page switch must preserve the track gesture");
+        };
+        assert_eq!(
+            gesture.update(egui::pos2(240.0, 96.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub,
+            "the held second frame must continue the same scrub"
+        );
+    }
+
+    // Exercise the production overlay, enqueue, landing and worker checkpoint together.
+    // The queue has no consumer thread, so we can deterministically pause a real request
+    // across the landing instead of depending on ZIP/PDF I/O timing.
+    fn prepare_still_seek_request_lifetime_app(app: &mut crate::app::App, kind: &str) {
+        app.items = (0..6_000)
+            .map(|idx| match kind {
+                "zip" => GridItem::ZipImage {
+                    zip_path: PathBuf::from("c:/seek/book.zip"),
+                    entry_name: format!("page-{idx}.png"),
+                },
+                "pdf" => GridItem::PdfPage {
+                    pdf_path: PathBuf::from("c:/seek/book.pdf"),
+                    page_num: idx as u32,
+                    content_type: None,
+                },
+                _ => GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))),
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![Some((0, 0)); app.items.len()];
+        // This fixture exercises thumbnail request lifetime with known metadata.
+        // Cold rotation reads now have their own asynchronous regression fixture.
+        app.rotation_cache = (0..app.items.len())
+            .map(|idx| (idx, crate::rotation_db::Rotation::None))
+            .collect::<std::collections::HashMap<_, _>>()
+            .into();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.fullscreen_idx = Some(3);
+        app.selected = Some(3);
+        app.keep_range = (2, 8);
+        app.keep_start_shared
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        app.keep_end_shared
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        app.reload_queue = Some(std::sync::Arc::new((
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::Condvar::new(),
+        )));
+        app.settings.set_still_seek_strip_visible(true);
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Always;
+    }
+
+    fn still_seek_request_overlay_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        land: bool,
+    ) -> Option<usize> {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut target = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let current = app.fullscreen_idx.unwrap();
+                    target = app.draw_fullscreen_seek_overlay(ui, ctx, rect, current, false, false);
+                    if land && let Some(target) = target {
+                        app.land_still_page_navigation_target(
+                            ctx,
+                            current,
+                            target,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                            &mut None,
+                        );
+                    }
+                });
+            },
+        );
+        target
+    }
+
+    fn assert_still_seek_overlay_landing_request_lifetime(
+        kind: &str,
+        flow: ReadingFlow,
+        spread: SpreadMode,
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, kind);
+        app.reading_flow = flow;
+        app.spread_mode = spread;
+        let pointer = egui::pos2(480.0, 581.0);
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pointer)],
+            false,
+        );
+        let before = app.still_seek_thumbnail_pages.clone();
+        assert!(
+            before.iter().any(|idx| *idx < 8),
+            "the production strip must request nearby pages"
+        );
+        let remote = *before
+            .iter()
+            .filter(|idx| **idx > 1000)
+            .max()
+            .expect("production hover preview must request a remote page");
+        let queue = app.reload_queue.as_ref().unwrap().clone();
+        let request = {
+            let mut requests = queue.0.lock().unwrap();
+            let position = requests.iter().position(|req| req.idx == remote).unwrap();
+            requests.remove(position)
+        };
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        let worker_accepts = || {
+            crate::thumb_loader::thumbnail_request_in_current_keep(&request, Some(&shared), 2, 8)
+        };
+        assert!(worker_accepts());
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        let landed = still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        )
+        .expect("the production track click must return a landing target");
+        assert_eq!(app.fullscreen_idx, Some(landed));
+        assert_eq!(
+            app.still_seek_thumbnail_pages, before,
+            "landing must retain this frame's strip and preview requests"
+        );
+        assert!(
+            worker_accepts(),
+            "the same in-flight request must survive a post-I/O checkpoint"
+        );
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            worker_accepts(),
+            "next overlay frame must keep the current preview"
+        );
+        // Moving the pointer replaces the projection, ending only the obsolete preview.
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(250.0, 581.0))],
+            false,
+        );
+        // Hide also removes the strip pages, including the page we just landed on.
+        app.analysis_mode = true;
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            !worker_accepts(),
+            "the overlay owns the end of its requirements"
+        );
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_paged_landing() {
+        for kind in ["image", "zip", "pdf"] {
+            for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                assert_still_seek_overlay_landing_request_lifetime(
+                    kind,
+                    ReadingFlow::Paged,
+                    spread,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_continuous_landing() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for kind in ["image", "zip", "pdf"] {
+                for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                    assert_still_seek_overlay_landing_request_lifetime(kind, flow, spread);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_items_generation_change() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(480.0, 581.0))],
+            false,
+        );
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        app.bump_items_generation();
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(shared.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_container_replacement() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        app.current_folder = Some(PathBuf::from("c:/another-book"));
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/another-book/1.png"))],
+            vec![None],
+        );
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(
+            app.still_seek_thumbnail_pages_shared
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// **ドラッグを続けている間ずっとシークできること。**
+    ///
+    /// 実機では「1 ページだけ進んで、その後は動かない」という形で壊れていた
+    /// (2026-09-06)。最初の 1 フレームだけを見るテストは通り続けていたので、
+    /// 継続するフレームを跨いで観測する。ジェスチャは一度 `Scrub` に決まったら
+    /// 離すまでその状態で居続けるのが契約で、途中で誰かが捨てたらここが落ちる。
+    #[test]
+    fn still_seek_track_horizontal_drag_keeps_seeking_across_frames() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+
+        let mut pages = Vec::new();
+        for x in [160.0_f32, 240.0, 320.0, 400.0] {
+            harness.hover_at(egui::pos2(x, 96.0));
+            harness.step();
+            let frame = harness.state().observations.last().unwrap();
+            assert_eq!(
+                frame.action,
+                StillSeekTrackAction::Seek,
+                "drag frame at x={x} stopped seeking: {:?}",
+                harness.state().observations
+            );
+            pages.push(harness.state().page);
+        }
+
+        still_seek_track_pointer_button(&mut harness, egui::pos2(400.0, 96.0), false);
+
+        let mut sorted = pages.clone();
+        sorted.dedup();
+        assert_eq!(
+            sorted, pages,
+            "each drag frame must land on its own page, got {pages:?}"
+        );
+        assert!(
+            pages.windows(2).all(|w| w[1] > w[0]),
+            "dragging right must keep advancing, got {pages:?}"
+        );
+    }
+
+    #[test]
+    fn still_seek_track_upward_drag_opens_strip_without_seeking() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(200.0, 96.0);
+        let destination = egui::pos2(204.0, 71.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert!(harness.state().strip_open);
+        assert_eq!(harness.state().page, 0);
+        assert_eq!(harness.state().seek_activity_frames, 1);
+        assert_eq!(
+            harness.state().observations.last().unwrap().action,
+            StillSeekTrackAction::OpenStrip
+        );
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_track_click_still_seeks_without_drag_activity() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(destination);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, destination, true);
+        still_seek_track_pointer_button(&mut harness, destination, false);
+
+        assert_eq!(harness.state().page, 7);
+        assert_eq!(harness.state().seek_activity_frames, 0);
+        assert!(!harness.state().strip_open);
+        let click_frame = harness.state().observations.last().unwrap();
+        assert!(click_frame.clicked);
+        assert!(!click_frame.dragged);
+        assert!(!click_frame.drag_stopped);
+        assert_eq!(click_frame.action, StillSeekTrackAction::Seek);
+    }
+
+    #[test]
+    fn still_seek_strip_horizontal_drag_does_not_move_page() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(harness.state().page, 5);
+        assert!(matches!(
+            harness.state().gesture,
+            StillSeekGesture::Strip {
+                layout_center_pos: 3,
+                ..
+            }
+        ));
+
+        still_seek_strip_pointer_button(&mut harness, destination, false);
+    }
+
+    #[test]
+    fn still_seek_track_and_source_cells_share_spread_landing_resolution() {
+        let images = [4, 5, 6, 7];
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6, 7],
+            },
+        ];
+        let track = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::TrackFraction(1.0),
+        )
+        .unwrap();
+        let cell = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::SourcePosition(3),
+        )
+        .unwrap();
+        assert_eq!(track.landing_idx, 6);
+        assert_eq!(cell.landing_idx, track.landing_idx);
+        // **プレビューは着地後に見えるページと同じ枚数にする。** 7 を指しても、
+        // 開けば 6 と 7 の見開きになるので 2 枚を出す (2026-09-05 利用者報告)。
+        assert_eq!(cell.preview_pages, vec![6, 7]);
+        assert_eq!(track.preview_pages, cell.preview_pages);
+    }
+
+    #[test]
+    fn still_seek_continuous_spread_highlight_and_preview_use_the_same_display_unit() {
+        let images = [4, 5, 6, 7];
+        let preview_units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6, 7],
+            },
+        ];
+        let highlighted = pages_on_screen_with(6, Some(&preview_units));
+        let resolved = resolve_still_seek_target(
+            &images,
+            None,
+            Some(&preview_units),
+            StillSeekPosition::SourcePosition(2),
+        )
+        .unwrap();
+        assert_eq!(highlighted, vec![6, 7]);
+        assert_eq!(highlighted, resolved.preview_pages);
+    }
+
+    #[test]
+    fn single_page_reading_previews_exactly_the_page_under_the_pointer() {
+        let images = [4, 5, 6, 7];
+        let resolved =
+            resolve_still_seek_target(&images, None, None, StillSeekPosition::SourcePosition(2))
+                .unwrap();
+        assert_eq!(resolved.preview_pages, vec![6]);
+        assert_eq!(resolved.landing_idx, 6);
+    }
+
+    /// 見開きの片側だけが残る末尾ユニットでも、プレビュー枚数は着地後と一致する。
+    #[test]
+    fn a_trailing_single_page_spread_unit_previews_one_page() {
+        let images = [4, 5, 6];
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6],
+            },
+        ];
+        let resolved = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::SourcePosition(2),
+        )
+        .unwrap();
+        assert_eq!(resolved.preview_pages, vec![6]);
+        assert_eq!(resolved.landing_idx, 6);
+    }
+
+    fn still_seek_edge_test_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))))
+            .collect();
+        // Failed thumbnails still have real cells; no decoder or file I/O is needed.
+        app.thumbnails = vec![ThumbnailState::Failed; app.items.len()];
+        app.image_metas = vec![Some((600, 900)); app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        for idx in 0..app.items.len() {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.fullscreen_idx = Some(3);
+        app.settings.set_still_seek_strip_visible(true);
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        app.settings.fullscreen_page_number_overlay = true;
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Never;
+        app
+    }
+
+    struct StillSeekOverlayTestFrame {
+        target: Option<usize>,
+        track: Option<egui::Response>,
+        strip: Option<egui::Response>,
+    }
+
+    fn still_seek_edge_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        full: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> StillSeekOverlayTestFrame {
+        let mut frame = StillSeekOverlayTestFrame {
+            target: None,
+            track: None,
+            strip: None,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(full),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    frame.target = app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                    frame.track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
+                    frame.strip =
+                        ctx.read_response(ui.make_persistent_id("fullscreen_still_seek_strip_row"));
+                });
+            },
+        );
+        frame
+    }
+
+    fn still_seek_pointer_button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn still_seek_f3_scrub_uses_final_move_on_release_in_real_overlay() {
+        let mut app = still_seek_edge_test_app();
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let track = still_seek_edge_frame(&mut app, &ctx, full, vec![])
+            .track
+            .unwrap()
+            .rect;
+        let origin = egui::pos2(track.left() + 10.0, track.center().y);
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![egui::Event::PointerMoved(origin)],
+        );
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![still_seek_pointer_button_event(origin, true)],
+        );
+        let moved = egui::pos2(track.center().x, origin.y);
+        let drag =
+            still_seek_edge_frame(&mut app, &ctx, full, vec![egui::Event::PointerMoved(moved)]);
+        assert!(drag.track.unwrap().dragged());
+        assert!(matches!(
+            app.fs_seek_gesture,
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Scrub { .. })
+        ));
+        let released = egui::pos2(track.right(), origin.y);
+        assert_ne!(moved, released);
+        let release = still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![
+                egui::Event::PointerMoved(released),
+                still_seek_pointer_button_event(released, false),
+            ],
+        );
+        let response = release.track.unwrap();
+        assert!(response.drag_stopped());
+        assert!(!response.dragged());
+        assert_eq!(
+            release.target,
+            Some(9),
+            "release must resolve the final pointer position"
+        );
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_f3_downward_close_uses_final_move_on_release_in_real_overlay() {
+        let mut app = still_seek_edge_test_app();
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let row = still_seek_edge_frame(&mut app, &ctx, full, vec![])
+            .strip
+            .unwrap()
+            .rect;
+        let bottom = app
+            .still_seek_geometry_for_idx(3, false)
+            .strip_rect(full)
+            .unwrap()
+            .bottom();
+        let origin = row.center();
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![egui::Event::PointerMoved(origin)],
+        );
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![still_seek_pointer_button_event(origin, true)],
+        );
+        let moved = egui::pos2(origin.x, bottom - 2.0);
+        still_seek_edge_frame(&mut app, &ctx, full, vec![egui::Event::PointerMoved(moved)]);
+        assert!(app.settings.still_seek_strip_visible);
+        let released = egui::pos2(origin.x, bottom + 1.0);
+        assert_ne!(moved, released);
+        let release = still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![
+                egui::Event::PointerMoved(released),
+                still_seek_pointer_button_event(released, false),
+            ],
+        );
+        let response = release.strip.unwrap();
+        assert!(response.drag_stopped());
+        assert!(!response.dragged());
+        assert!(
+            !app.settings.still_seek_strip_visible,
+            "final crossing must close the strip"
+        );
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+        assert_eq!(
+            app.settings.still_bottom_lock(),
+            crate::settings::BottomBarLock::BarOnly
+        );
+    }
+
+    #[test]
+    fn still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry() {
+        use crate::settings::{BottomBarLock, StillSeekBarWithStrip};
+        use crate::video::seek_strip_layout::SeekStripHeight;
+        for bar in [StillSeekBarWithStrip::Hide, StillSeekBarWithStrip::Show] {
+            for height in [
+                SeekStripHeight::Large,
+                SeekStripHeight::Medium,
+                SeekStripHeight::Small,
+                SeekStripHeight::Smallest,
+            ] {
+                for lock in [
+                    BottomBarLock::None,
+                    BottomBarLock::BarOnly,
+                    BottomBarLock::BarAndStrip,
+                ] {
+                    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                        for ppp in [1.0, 1.5, 2.0] {
+                            let mut app = still_seek_edge_test_app();
+                            app.settings.still_seek_bar_with_strip = bar;
+                            app.settings.still_seek_strip_height = height;
+                            app.settings.set_still_bottom_lock(lock);
+                            app.reading_direction = direction;
+                            let ctx = egui::Context::default();
+                            ctx.set_pixels_per_point(ppp);
+                            let full = egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1920.0, 1080.0) / ppp,
+                            );
+                            let strip = app
+                                .still_seek_geometry_for_idx(3, false)
+                                .strip_rect(full)
+                                .unwrap();
+                            // Start inside the cell near its top so even Smallest permits
+                            // the shared >24pt downward gesture before reaching the last pixel.
+                            let origin = egui::pos2(strip.center().x, strip.top() + 6.0);
+                            still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![egui::Event::PointerMoved(origin)],
+                            );
+                            still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![still_seek_pointer_button_event(origin, true)],
+                            );
+                            let last_pixel = egui::pos2(origin.x, full.bottom() - 1.0 / ppp);
+                            let drag = still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![egui::Event::PointerMoved(last_pixel)],
+                            );
+                            assert!(drag.strip.unwrap().dragged());
+                            assert!(
+                                !app.settings.still_seek_strip_visible,
+                                "last pixel must close: {bar:?} {height:?} {lock:?} {direction:?} {ppp}"
+                            );
+                            assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_f7_mixed_media_reserves_only_the_content_it_draws() {
+        use crate::settings::StillSeekBarWithStrip;
+        for mixed in [true, false] {
+            for bar in [StillSeekBarWithStrip::Show, StillSeekBarWithStrip::Hide] {
+                let mut app = still_seek_edge_test_app();
+                app.settings.still_seek_bar_with_strip = bar;
+                if mixed {
+                    app.items[9] = GridItem::Video(PathBuf::from("c:/seek/movie.mp4"));
+                }
+                let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+                // Query real fit geometry before the first overlay frame (cold navigation cache).
+                let media = app.fullscreen_media_rect(full, 3, false);
+                let geometry = app.still_seek_geometry_for_idx(3, false);
+                let expected_strip = if mixed {
+                    0.0
+                } else {
+                    app.settings.still_seek_strip_height.points()
+                };
+                let expected_bar = if mixed || bar == StillSeekBarWithStrip::Show {
+                    FS_SEEK_BAR_HEIGHT
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    geometry.strip_height, expected_strip,
+                    "mixed={mixed}, bar={bar:?}"
+                );
+                assert_eq!(geometry.reserved_height, expected_strip + expected_bar);
+                assert_eq!(
+                    media.bottom(),
+                    full.bottom() - expected_strip - expected_bar
+                );
+                let frame =
+                    still_seek_edge_frame(&mut app, &egui::Context::default(), full, vec![]);
+                assert_eq!(frame.strip.is_some(), !mixed);
+                assert_eq!(frame.track.is_some(), !mixed && expected_bar > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_f8_page_number_is_painted_when_locked_bar_is_hidden() {
+        use crate::settings::{BottomBarLock, StillSeekBarWithStrip};
+        for bar in [StillSeekBarWithStrip::Hide, StillSeekBarWithStrip::Show] {
+            for lock in [BottomBarLock::BarOnly, BottomBarLock::BarAndStrip] {
+                let mut app = still_seek_edge_test_app();
+                app.settings.still_seek_bar_with_strip = bar;
+                app.settings.set_still_bottom_lock(lock);
+                let ctx = egui::Context::default();
+                let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+                still_seek_edge_frame(&mut app, &ctx, full, vec![]);
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(full),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                        });
+                    },
+                );
+                let labels: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    labels.contains(&"4 / 10"),
+                    bar == StillSeekBarWithStrip::Hide,
+                    "bar={bar:?}, lock={lock:?}, labels={labels:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_real_overlay_snapshots() {
+        use crate::settings::StillSeekBarWithStrip;
+        let mut snapshots = egui_kittest::SnapshotResults::new();
+        for (name, mixed, bar) in [
+            (
+                "still_seek_real_overlay_mixed_media",
+                true,
+                StillSeekBarWithStrip::Hide,
+            ),
+            (
+                "still_seek_real_overlay_hidden_bar_page_number",
+                false,
+                StillSeekBarWithStrip::Hide,
+            ),
+            (
+                "still_seek_real_overlay_visible_bar_page_number",
+                false,
+                StillSeekBarWithStrip::Show,
+            ),
+        ] {
+            let mut app = still_seek_edge_test_app();
+            app.settings.still_seek_bar_with_strip = bar;
+            if mixed {
+                app.items[9] = GridItem::Video(PathBuf::from("c:/seek/movie.mp4"));
+            }
+            let mut texture: Option<egui::TextureHandle> = None;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(640.0, 360.0))
+                .build(|ctx| {
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if texture.is_none() {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        let mut image = egui::ColorImage::filled(
+                            [120, 180],
+                            egui::Color32::from_rgb(220, 215, 195),
+                        );
+                        for y in 12..168 {
+                            for x in 12..108 {
+                                image[(x, y)] =
+                                    egui::Color32::from_rgb(70 + x as u8, 85 + y as u8 / 2, 135);
+                            }
+                        }
+                        let tex =
+                            ctx.load_texture("seek-test-page", image, egui::TextureOptions::LINEAR);
+                        app.thumbnails = vec![
+                            ThumbnailState::Loaded {
+                                tex: tex.clone(),
+                                from_cache: false,
+                                from_edit_preview: false,
+                                rendered_at_px: 180,
+                                source_dims: Some((120, 180)),
+                                layout_dims: None,
+                            };
+                            app.items.len()
+                        ];
+                        texture = Some(tex);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let full = ctx.content_rect();
+                            let media = app.fullscreen_media_rect(full, 3, false);
+                            let tex = texture.as_ref().unwrap();
+                            ui.painter().image(
+                                tex.id(),
+                                fit_texture_rect(tex.size_vec2(), media),
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                        });
+                });
+            harness.run();
+            harness.snapshot(name);
+            snapshots.extend_harness(&mut harness);
+        }
+        snapshots.unwrap();
+    }
+
+    #[test]
+    fn resolved_still_seek_height_drives_fixed_media_and_side_panel_bottoms() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let geometry = StillSeekGeometry::resolve(
+            true,
+            crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarAndStrip,
+        );
+        let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
+            full,
+            false,
+            geometry.reserved_height > 0.0,
+            geometry.reserved_height,
+            0,
+            0.0,
+        );
+        let left = adjustment_panel_rect_with_seek_height(full, geometry.total_height);
+        let right = metadata_panel_rect_with_seek_height(full, geometry.total_height);
+        assert_eq!(geometry.total_height, 110.0);
+        assert_eq!(geometry.reserved_height, 110.0);
+        assert_eq!(media.bottom(), geometry.panel_rect(full).top());
+        assert_eq!(left.bottom(), media.bottom());
+        assert_eq!(right.bottom(), media.bottom());
+    }
+
+    #[test]
+    fn still_seek_bar_only_is_reachable_and_does_not_reserve_the_visible_strip() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for (lock, expected_reserved) in [
+            (crate::settings::BottomBarLock::None, 0.0),
+            (crate::settings::BottomBarLock::BarOnly, FS_SEEK_BAR_HEIGHT),
+            (crate::settings::BottomBarLock::BarAndStrip, 110.0),
+        ] {
+            let geometry = StillSeekGeometry::resolve(
+                true,
+                crate::video::seek_strip_layout::SeekStripHeight::Medium,
+                crate::settings::StillSeekBarWithStrip::Show,
+                lock,
+            );
+            assert_eq!(geometry.total_height, 110.0);
+            assert_eq!(geometry.reserved_height, expected_reserved);
+            let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
+                full,
+                false,
+                geometry.reserved_height > 0.0,
+                geometry.reserved_height,
+                0,
+                0.0,
+            );
+            assert_eq!(media.bottom(), full.bottom() - expected_reserved);
+        }
     }
 
     #[test]

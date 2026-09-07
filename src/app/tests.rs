@@ -8,6 +8,151 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[cfg(windows)]
+#[path = "tests/detached_binding_identity.rs"]
+mod detached_binding_identity;
+
+#[test]
+fn collect_image_indices_builds_the_still_list_once_for_repeated_calls() {
+    let mut app = setup_app_for_test();
+    app.items = vec![
+        GridItem::Image(PathBuf::new()),
+        GridItem::Video(PathBuf::new()),
+        GridItem::Image(PathBuf::new()),
+    ];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.viewer_navigation_caches.invalidate();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        1
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    let added = app.push_grid_item_pending(GridItem::Image(PathBuf::new()));
+    app.visible_indices.push(added);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 1]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_generation_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    let next_generation = app.items_generation.wrapping_add(1);
+    app.set_items_generation(next_generation);
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_filter_change() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3).map(|_| GridItem::Image(PathBuf::new())).collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.search_filter = Some(std::collections::HashSet::from([0, 2]));
+    app.rebuild_visible_indices();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_details_order_change() {
+    let mut app = setup_app_for_test();
+    app.items = ['b', 'a', 'c']
+        .into_iter()
+        .map(|name| GridItem::Image(PathBuf::from(name.to_string())))
+        .collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+    app.settings.details_sort_ascending = true;
+    app.rebuild_details_order();
+    assert_eq!(app.collect_image_indices().as_ref(), &[1, 0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_continuous_reading_toggle() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.reading_flow = crate::settings::ReadingFlow::Vertical;
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn navigation_cache_is_owned_by_each_viewer_context() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        detached.visible_indices = (0..detached.items.len()).collect();
+        detached.bump_items_generation();
+        assert_eq!(detached.collect_image_indices().as_ref(), &[0, 2]);
+    });
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[cfg(windows)]
 fn test_detached_host_lease(
     window_id: u64,
     hwnd: Option<u64>,
@@ -37,14 +182,14 @@ fn begin_test_video_presentation_transition(
             let window_id = app
                 .active_detached_session
                 .map(|session| session.window_id)
-                .or(app.detached_viewer_window_id)
+                .or(app.detached_viewer_window_id())
                 .unwrap_or(0xA056);
             test_detached_host_lease(window_id, Some(0xA057), 1)
         });
     let target_detached = (target == ViewerPresentation::DetachedWindow).then(|| {
         let window_id = current_detached
             .map(|lease| lease.session.window_id)
-            .or(app.detached_viewer_window_id)
+            .or(app.detached_viewer_window_id())
             .unwrap_or(0xD370);
         test_detached_host_lease(window_id, Some(0xD371), 2)
     });
@@ -77,7 +222,7 @@ fn hidden_detached_host_builder_does_not_request_maximize() {
     app.fullscreen_idx = Some(0);
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-    app.detached_viewer_window_id = Some(12);
+    app.set_detached_window_binding_for_test(Some(12));
     app.begin_active_detached_session(12, DetachedSource::Image);
     app.set_detached_window_runtime_placement(
         12,
@@ -107,7 +252,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     let mut app = phase_c_support::setup_app();
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-    app.detached_viewer_window_id = Some(12);
+    app.set_detached_window_binding_for_test(Some(12));
     app.begin_active_detached_session(12, DetachedSource::Video);
     app.set_detached_window_runtime_placement(
         12,
@@ -224,7 +369,7 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.settings.detached_viewer_enabled = true;
-    app.detached_viewer_window_id = Some(OLD_WINDOW);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW));
     app.begin_active_detached_session(OLD_WINDOW, DetachedSource::Image);
     app.set_detached_window_runtime_placement(OLD_WINDOW, restore, "test_borderless_observation");
     app.write_detached_viewer_borderless_state(
@@ -252,7 +397,7 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     assert!(app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, Some(restore));
     let recreated_window = app
-        .detached_viewer_window_id
+        .detached_viewer_window_id()
         .expect("F12 ON must allocate a detached viewport identity");
     assert_ne!(
         recreated_window, OLD_WINDOW,
@@ -307,7 +452,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.fs_viewport_shown = true;
-    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Image);
 
     app.toggle_detached_viewer_mode();
@@ -318,7 +463,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
 
     app.toggle_detached_viewer_mode();
     let current_window_j = app
-        .detached_viewer_window_id
+        .detached_viewer_window_id()
         .expect("immediate F12 ON must create J");
     assert_ne!(current_window_j, OLD_WINDOW_H);
     assert_ne!(
@@ -330,7 +475,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
 
     // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
     app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
-    assert_eq!(app.detached_viewer_window_id, Some(current_window_j));
+    assert_eq!(app.detached_viewer_window_id(), Some(current_window_j));
     assert_eq!(
         app.active_detached_session.map(|session| session.window_id),
         Some(current_window_j)
@@ -348,7 +493,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     // The real close for current J stays unconditional and retires that exact lease.
     app.handle_fullscreen_close_request();
     assert_eq!(app.fullscreen_idx, None);
-    assert_eq!(app.detached_viewer_window_id, None);
+    assert_eq!(app.detached_viewer_window_id(), None);
     assert!(app.active_detached_session.is_none());
     assert!(
         app.detached_window_manager
@@ -367,7 +512,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let old_viewport_h = App::detached_image_window_viewport_id(OLD_WINDOW_H);
-    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Video);
 
     app.begin_active_detached_session_close("test_late_registration_closing");
@@ -448,7 +593,7 @@ fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
     media.settings.detached_viewer_open_images_in_window = true;
     media.settings.detached_viewer_enabled = false;
     media.settings.video_in_window_mode = true;
-    media.detached_viewer_window_id = Some(21);
+    media.set_detached_window_binding_for_test(Some(21));
     media.begin_active_detached_session(21, DetachedSource::Audio);
     media.write_detached_viewer_borderless_state(
         true,
@@ -870,21 +1015,22 @@ fn fullscreen_fs_cache_does_not_cross_install_new_items_generation() {
     app.fs_early_dims.insert(0, [1200, 1800]);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_tx, rx) = std::sync::mpsc::channel();
-    app.fs_pending.insert(
-        0,
-        FsPendingValue::new(
-            std::sync::Arc::clone(&cancel),
-            rx,
-            9,
-            FsLoadPurpose::for_page(true),
-        ),
-    );
-    app.fs_upload_backlog.push(FsUploadResult::new(
-        0,
-        FsLoadResult::Failed,
+    let animation_started_at = std::time::Instant::now();
+    let mut pending = FsPendingValue::new(
+        std::sync::Arc::clone(&cancel),
+        rx,
         9,
         FsLoadPurpose::for_page(true),
-    ));
+    );
+    pending.animation_expansion_started_at = Some(animation_started_at);
+    app.fs_pending.insert(0, pending);
+    let mut upload = FsUploadResult::new(0, FsLoadResult::Failed, 9, FsLoadPurpose::for_page(true));
+    upload.animation_expansion_started_at = Some(animation_started_at);
+    app.fs_upload_backlog.push(upload);
+    assert_eq!(
+        app.current_animation_expansion_started_at(),
+        Some(animation_started_at)
+    );
 
     app.install_new_items(
         vec![GridItem::Image(PathBuf::from("C:/new/book/page.png"))],
@@ -911,6 +1057,7 @@ fn stale_fullscreen_load_completion_is_not_enqueued_for_new_items() {
         FsLoadResult::Failed,
         17,
         FsLoadPurpose::for_page(true),
+        None,
     );
 
     assert!(!accepted);
@@ -997,7 +1144,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
 }
 
 #[test]
-fn spread_units_rebuild_after_saved_rotation_changes() {
+fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     app.items = (0..5)
@@ -1021,9 +1168,14 @@ fn spread_units_rebuild_after_saved_rotation_changes() {
         .collect();
     let nav = (0..app.items.len()).collect::<Vec<_>>();
 
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
     assert_eq!(
         app.spread_display_unit_pages_for_test(&nav),
         vec![vec![0, 1], vec![2, 3], vec![4]]
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
     );
 
     app.rotate_image_cw(0);
@@ -1032,12 +1184,191 @@ fn spread_units_rebuild_after_saved_rotation_changes() {
         vec![vec![0], vec![1, 2], vec![3, 4]],
         "R 回転後は更新済み rotation_cache から同じフレームの再構築へ反映する"
     );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
 
-    app.rotate_image_ccw(0);
+    let _ = app.set_image_rotation(0, crate::rotation_db::Rotation::Cw270);
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0], vec![1, 2], vec![3, 4]]
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "90° から 270° は横長性が変わらないため再構築しない"
+    );
+
+    let _ = app.set_image_rotation(0, crate::rotation_db::Rotation::Cw180);
     assert_eq!(
         app.spread_display_unit_pages_for_test(&nav),
         vec![vec![0, 1], vec![2, 3], vec![4]],
-        "L 回転で縦長へ戻した後も固定した表示ユニットを再利用しない"
+        "回転で縦長へ戻した後は表示単位を再構築する"
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3
+    );
+}
+
+#[test]
+fn spread_display_units_are_built_once_for_repeated_pair_resolution() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.viewer_navigation_caches.invalidate();
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    for _ in 0..3 {
+        assert_eq!(
+            app.resolve_spread_pair(2),
+            crate::ui_fullscreen::SpreadPair::Double { left: 2, right: 3 }
+        );
+    }
+
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1,
+        "同じ token では表示単位列を一度だけ構築する"
+    );
+}
+
+#[test]
+fn spread_dimension_discovery_rebuilds_only_for_landscape() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.spread_mode = crate::settings::SpreadMode::LtrCover;
+    let nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    let initial = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        initial,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
+    );
+
+    app.record_page_dims_for_spread(1, (900, 1600));
+    let after_portrait = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_portrait,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(after_portrait, initial);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1,
+        "寸法不明から縦長の判明は仮定どおりなので再構築しない"
+    );
+
+    app.record_page_dims_for_spread(3, (1600, 900));
+    let after_landscape = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_landscape,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_ne!(after_landscape, initial);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "寸法不明から横長の判明は同じフレーム内でも再構築する"
+    );
+
+    app.record_page_dims_for_spread(3, (1600, 900));
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        after_landscape
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "同じ横長寸法の再記録では epoch を進めない"
+    );
+
+    let ctx = egui::Context::default();
+    app.fs_cache.insert(
+        5,
+        FsCacheEntry::Static {
+            tex: ctx.load_texture(
+                "spread_cache_fs_landscape",
+                egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+            pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
+            source_dims: Some([1600, 900]),
+            load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.harvest_page_dims();
+    let after_fs_landscape = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_fs_landscape,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3,
+        "fs_cache で横長寸法が確定した場合も次の参照で再構築する"
+    );
+}
+
+#[test]
+fn spread_cache_token_tracks_every_pairing_input() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    app.spread_display_unit_pages_for_test(&nav);
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
+    );
+
+    app.spread_mode = crate::settings::SpreadMode::Rtl;
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
+
+    app.spread_shift_anchor_idx = Some(2);
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3
+    );
+
+    app.bump_items_generation();
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        4
+    );
+
+    let reordered_nav = vec![0, 2, 1, 3, 4, 5];
+    app.spread_display_unit_pages_for_test(&reordered_nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        5,
+        "items_generation が同じでも nav index 列が違えば再構築する"
     );
 }
 
@@ -1069,6 +1400,62 @@ fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
         assert_eq!(detached.page_dims_cache.get(5, 0), Some((900, 1400)));
     })
     .expect("detached bundle remains parked");
+}
+
+#[test]
+#[cfg(windows)]
+fn spread_cache_does_not_cross_viewer_bundles() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..4)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/main/{page}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.viewer_navigation_caches.invalidate();
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let main_nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&main_nav),
+        vec![vec![0, 1], vec![2, 3]]
+    );
+
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = (0..3)
+            .map(|page| GridItem::Image(PathBuf::from(format!("C:/detached/{page}.png"))))
+            .collect();
+        detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
+        detached.visible_indices = (0..detached.items.len()).collect();
+        detached.viewer_navigation_caches.invalidate();
+        detached.spread_mode = crate::settings::SpreadMode::LtrCover;
+        assert_eq!(
+            detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
+            vec![vec![0], vec![1, 2]]
+        );
+    });
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
+
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&main_nav),
+        vec![vec![0, 1], vec![2, 3]],
+        "detached 構築後も main の cache を再構築しない"
+    );
+    app.with_active_viewer_context(|detached| {
+        assert_eq!(
+            detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
+            vec![vec![0], vec![1, 2]]
+        );
+    })
+    .expect("detached bundle remains parked");
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "main と detached はそれぞれの viewer context cache を再利用する"
+    );
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
@@ -1282,7 +1669,7 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
             active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
             active.viewer_presentation = ViewerPresentation::DetachedWindow;
             active.detached_viewer_independent_active = true;
-            active.detached_viewer_window_id = Some(active_window_id);
+            active.set_detached_window_binding_for_test(Some(active_window_id));
         },
     );
 
@@ -1297,7 +1684,7 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
         parked.items_generation = parked_generation;
         parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         parked.viewer_presentation = ViewerPresentation::DetachedWindow;
-        parked.detached_viewer_window_id = Some(window_id);
+        parked.set_detached_window_binding_for_test(Some(window_id));
     });
 
     let mut main = metadata_context_result(main_id, main_generation, 0);
@@ -2286,14 +2673,14 @@ fn vst3_production_traversal_survives_removing_a_later_paused_window() {
             context.fullscreen_idx = Some(0);
             context.vst3_deferred_media_open = Some(0);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
     }
 
     let mut consumed = Vec::new();
     app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
         let window_id = mounted
-            .detached_viewer_window_id
+            .detached_viewer_window_id()
             .expect("parked VST3 callback must run in the owning context");
         consumed.push((
             window_id,
@@ -2346,7 +2733,7 @@ fn parked_vst3_consume_panic_restores_marker_bundle_and_main_projection() {
         parked.fullscreen_idx = Some(0);
         parked.vst3_deferred_media_open = Some(0);
         parked.viewer_presentation = ViewerPresentation::DetachedWindow;
-        parked.detached_viewer_window_id = Some(window_id);
+        parked.set_detached_window_binding_for_test(Some(window_id));
     });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2417,6 +2804,226 @@ fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
 
     assert!(recorder.is_none());
     assert!(!clock_called.get());
+}
+
+#[test]
+fn update_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
+    let clock_called = Cell::new(false);
+    let cycles_called = Cell::new(false);
+    let mut recorder = update_perf_start_with(
+        false,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || {
+            cycles_called.set(true);
+            1
+        },
+    );
+    for stage in UpdatePerfStage::ALL {
+        mark_update_perf(&mut recorder, stage);
+    }
+    finish_update_perf(&mut recorder, 0);
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
+    let cycle_fields = UpdatePerfBreakdown::EVENT_FIELDS.map(|(field, _)| {
+        format!(
+            "{}_cycles",
+            field
+                .strip_suffix("_ms")
+                .expect("wall-clock field must end in _ms")
+        )
+    });
+
+    assert_eq!(cycle_fields.len(), UPDATE_PERF_STAGE_COUNT);
+    assert!(cycle_fields.iter().all(|field| field.ends_with("_cycles")));
+}
+
+#[test]
+fn update_perf_stages_plus_unaccounted_equal_total() {
+    let started_at = std::time::Instant::now();
+    let started_cycles = 1_000;
+    let mut recorder = UpdatePerfRecorder::new(started_at, started_cycles);
+    let mut elapsed = std::time::Duration::ZERO;
+    let mut cycles = started_cycles;
+    for (index, stage) in UpdatePerfStage::ALL.into_iter().enumerate() {
+        elapsed += std::time::Duration::from_millis(index as u64 + 1);
+        cycles += (index as u64 + 1) * 100;
+        recorder.mark_at(stage, started_at + elapsed, cycles);
+    }
+    let expected_unaccounted = std::time::Duration::from_millis(7);
+    let expected_unaccounted_cycles = 700;
+    let breakdown = recorder.finish_at(
+        started_at + elapsed + expected_unaccounted,
+        cycles + expected_unaccounted_cycles,
+    );
+    let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+    let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
+
+    assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+    assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+    assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+    assert_eq!(
+        accounted_cycles + breakdown.unaccounted_cycles,
+        breakdown.total_cycles
+    );
+}
+
+#[test]
+fn poll_prefetch_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = poll_prefetch_perf_start_with(false, PollPrefetchOrigin::TopLevel, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in PollPrefetchPerfStage::ALL {
+        mark_poll_prefetch_perf(&mut recorder, stage);
+    }
+    finish_poll_prefetch_perf(&mut recorder, 0, 0);
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+}
+
+#[test]
+fn passthrough_rendition_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
+    let clock_called = Cell::new(false);
+    let cycles_called = Cell::new(false);
+    let mut recorder: Option<PassthroughRenditionPerfRecorder> = None;
+    for span in [
+        PassthroughRenditionPerfSpan::SourceLookup,
+        PassthroughRenditionPerfSpan::CacheLookup,
+        PassthroughRenditionPerfSpan::BuildPixels,
+        PassthroughRenditionPerfSpan::LoadTexture,
+        PassthroughRenditionPerfSpan::CacheInsert,
+    ] {
+        let started_at = start_passthrough_rendition_perf_span_with(
+            recorder.as_ref(),
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_passthrough_rendition_perf_span_with(
+            recorder.as_mut(),
+            span,
+            started_at,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn passthrough_rendition_perf_spans_plus_remainder_equal_total_cycles() {
+    let mut recorder = PassthroughRenditionPerfRecorder::default();
+    for (span, cycles) in [
+        (PassthroughRenditionPerfSpan::SourceLookup, 11),
+        (PassthroughRenditionPerfSpan::CacheLookup, 13),
+        (PassthroughRenditionPerfSpan::BuildPixels, 17),
+        (PassthroughRenditionPerfSpan::LoadTexture, 19),
+        (PassthroughRenditionPerfSpan::CacheInsert, 23),
+    ] {
+        recorder.add(span, std::time::Duration::ZERO, cycles);
+    }
+    let total_cycles = 100;
+    let remainder_cycles = recorder.remainder_cycles(total_cycles);
+
+    assert_eq!(recorder.categorized_cycles(), 83);
+    assert_eq!(
+        recorder.categorized_cycles() + remainder_cycles,
+        total_cycles
+    );
+}
+
+#[test]
+fn poll_prefetch_perf_stages_plus_unaccounted_equal_total() {
+    let started_at = std::time::Instant::now();
+    let mut recorder = PollPrefetchPerfRecorder::new(PollPrefetchOrigin::TopLevel, started_at);
+    let mut elapsed = std::time::Duration::ZERO;
+    for (index, stage) in PollPrefetchPerfStage::ALL.into_iter().enumerate() {
+        elapsed += std::time::Duration::from_millis(index as u64 + 1);
+        recorder.mark_at(stage, started_at + elapsed);
+    }
+    let expected_unaccounted = std::time::Duration::from_millis(7);
+    let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+    let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+
+    assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+    assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+}
+
+#[test]
+fn nav_helper_perf_does_not_read_clock_outside_an_enabled_ui_frame() {
+    begin_nav_helper_perf_frame(false);
+    let clock_called = Cell::new(false);
+    let result = measure_nav_helper_with(
+        NavHelperPerfKind::StillImageDisplayIndices,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || 42,
+    );
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(result, 42);
+    assert!(!clock_called.get());
+    assert_eq!(metrics, NavHelperPerfMetrics::default());
+}
+
+#[test]
+fn nav_helper_perf_accumulates_calls_and_time_then_resets_at_frame_boundary() {
+    let started_at = std::time::Instant::now();
+    let clock_values = [
+        started_at,
+        started_at + std::time::Duration::from_millis(2),
+        started_at + std::time::Duration::from_millis(3),
+        started_at + std::time::Duration::from_millis(8),
+    ];
+    let clock_index = Cell::new(0usize);
+    let now = || {
+        let index = clock_index.get();
+        clock_index.set(index + 1);
+        clock_values[index]
+    };
+
+    begin_nav_helper_perf_frame(true);
+    measure_nav_helper_with(NavHelperPerfKind::StillImageDisplayIndices, now, || ());
+    measure_nav_helper_with(NavHelperPerfKind::GetNavIndices, now, || ());
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(metrics.still_image_display_indices_calls, 1);
+    assert!((metrics.still_image_display_indices_ms - 2.0).abs() < f64::EPSILON);
+    assert_eq!(metrics.get_nav_indices_calls, 1);
+    assert!((metrics.get_nav_indices_ms - 5.0).abs() < f64::EPSILON);
+
+    begin_nav_helper_perf_frame(true);
+    assert_eq!(
+        finish_nav_helper_perf_frame(),
+        NavHelperPerfMetrics::default()
+    );
 }
 
 #[test]
@@ -2499,7 +3106,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
         detached.visible_indices.clear();
         detached.details_order.clear();
-        detached.detached_viewer_window_id = Some(detached_window_id);
+        detached.set_detached_window_binding_for_test(Some(detached_window_id));
     });
     app.last_active_detached_window_id = Some(detached_window_id);
 
@@ -3131,7 +3738,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
     let active_window_id = app.allocate_detached_viewer_window_id();
     let active_id = app.build_window_context_for_test(active_window_id, |active| {
         configure_context(active, r"C:\Pictures\Child");
-        active.detached_viewer_window_id = Some(active_window_id);
+        active.set_detached_window_binding_for_test(Some(active_window_id));
     });
     app.last_active_detached_window_id = Some(active_window_id);
     let paused_id = app.push_window_context_for_test(&ctx, 73, |paused| {
@@ -3801,14 +4408,16 @@ fn fullscreen_pdf_interrupted_render_is_cancel_like() {
 }
 
 #[test]
-fn scan_directory_can_ignore_convertible_archives() {
+fn folder_scan_can_ignore_convertible_archives() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
     std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false).unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
@@ -3818,6 +4427,91 @@ fn scan_directory_can_ignore_convertible_archives() {
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
     );
+    assert_eq!(
+        scan.omitted.ignored_archive, 3,
+        "RAR / 7z / LZH は設定で無視した書庫として数える"
+    );
+    assert_eq!(
+        scan.omitted.unsupported, 0,
+        "設定で無視した書庫を対象外へ二重計上しない"
+    );
+    assert_eq!(
+        scan.omitted.primary_count(),
+        3,
+        "旧 unsupported 3 件だった主数字を維持する"
+    );
+}
+
+#[test]
+fn folder_scan_lists_convertible_archives_for_ask_and_convert() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
+    std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
+    std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
+
+    for handling in [
+        crate::settings::ArchiveFileHandling::Ask,
+        crate::settings::ArchiveFileHandling::Convert,
+    ] {
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(handling);
+        let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+        let archive_count = scan
+            .folders
+            .iter()
+            .filter(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. }))
+            .count();
+
+        assert_eq!(
+            archive_count, 3,
+            "{handling:?} では変換対象書庫を一覧へ出す"
+        );
+        assert_eq!(
+            scan.omitted,
+            crate::app::folder_scan::OmittedFolderEntryCounts::default(),
+            "{handling:?} では内訳を増やさない"
+        );
+    }
+}
+
+#[test]
+fn folder_scan_keeps_unsupported_files_out_of_ignored_archive_bucket() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), b"text").unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.unsupported, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.primary_count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn folder_scan_classifies_hidden_archive_before_ignore_setting() {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let tmp = TempDir::new().expect("tempdir");
+    let mut archive = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN)
+        .open(tmp.path().join("hidden.rar"))
+        .unwrap();
+    archive.write_all(b"rar").unwrap();
+    drop(archive);
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.hidden, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.unsupported, 0);
 }
 
 #[test]
@@ -4470,7 +5164,7 @@ fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detach
                 ViewerNavigationScope::DetachedPhysical
             );
             (
-                active.detached_viewer_window_id,
+                active.detached_viewer_window_id(),
                 active.fs_open_intent_from_grid,
             )
         })
@@ -5283,6 +5977,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
         same_name: 3,
         hidden: 2,
+        ignored_archive: 4,
         unsupported: 5,
         system: 1,
     };
@@ -7529,6 +8224,53 @@ mod animated_playback_only_pipeline_tests {
             !app.final_composite_cache
                 .iter()
                 .any(|(key, _)| key.edit_key.idx == 0)
+        );
+    }
+
+    #[test]
+    fn ctrl_e_rejects_animated_images_instead_of_exporting_the_first_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.items
+            .push(crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "c:/p/animated.gif",
+            )));
+        app.visible_indices = vec![0];
+        app.thumbnails
+            .push(crate::grid_item::ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+
+        let frame0 = egui::ColorImage::filled([2, 1], egui::Color32::RED);
+        let frame1 = egui::ColorImage::filled([2, 1], egui::Color32::GREEN);
+        let tex0 = ctx.load_texture(
+            "export_animation_frame_0",
+            frame0.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex1 = ctx.load_texture(
+            "export_animation_frame_1",
+            frame1.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Animated {
+                frames: vec![(tex0, 0.1), (tex1, 0.1)],
+                frame_pixels: vec![Arc::new(frame0), Arc::new(frame1)],
+                current_frame: 1,
+                playback: crate::fs_animation::AnimationPlayback::Paused,
+                load_seq: 0,
+            },
+        );
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        assert!(app.export_dialog.is_none());
+        assert_eq!(
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(message, _, _)| message.as_str()),
+            Some("アニメーション画像はエクスポートできません")
         );
     }
 }
@@ -10445,7 +11187,7 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::{App, FacetField, subfolder_expansion_synthetic_path};
+    use crate::app::{App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path};
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
     use std::path::PathBuf;
@@ -11577,6 +12319,104 @@ mod phase_c_drill_nav_tests {
             app.grid_edit_badges(7).mask,
             "内側アーカイブとして表示される ZipDir はその本全体を示す"
         );
+    }
+
+    #[test]
+    fn crop_grid_badge_tracks_pages_and_one_level_parent_containers() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let root = PathBuf::from("c:/pics");
+        let image = root.join("cropped.jpg");
+        let folder = root.join("folder");
+        let zip = root.join("book.zip");
+        app.items = vec![
+            GridItem::Image(image.clone()),
+            GridItem::Folder(folder.clone()),
+            GridItem::ZipFile(zip.clone()),
+        ];
+
+        assert!(
+            (0..app.items.len()).all(|idx| !app.grid_edit_badges(idx).crop),
+            "crop が無いページと親コンテナには「切」を出さない"
+        );
+
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(&image));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &folder.join("page.jpg"),
+            ));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "page.jpg"));
+
+        assert!(app.grid_edit_badges(0).crop, "crop 済みページ自身に出す");
+        assert!(
+            app.grid_edit_badges(1).crop,
+            "直下の crop 済みページをフォルダへ 1 段だけ集約する"
+        );
+        assert!(
+            app.grid_edit_badges(2).crop,
+            "crop 済みページを持つ ZIP へ集約する"
+        );
+    }
+
+    #[test]
+    fn crop_only_page_requests_edit_preview_through_grid_badges() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let image = PathBuf::from("c:/pics/crop-preview.jpg");
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.items = vec![GridItem::Image(image)];
+        app.export_crop_pages.clear();
+        app.export_crop_page_keys.insert(key.clone());
+        assert_eq!(
+            app.grid_edit_badges(0),
+            GridEditBadges {
+                crop: true,
+                ..GridEditBadges::default()
+            }
+        );
+
+        let mut request = crate::thumb_loader::LoadRequest {
+            idx: 0,
+            ..Default::default()
+        };
+        app.attach_edit_preview_to_request(&mut request);
+
+        assert_eq!(request.edit_preview_key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn export_crop_key_set_tracks_persistent_add_and_remove() {
+        use crate::export_crop::{CropAspectMode, CropRect, CropSettings};
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.settings.sidecar_backup_enabled = false;
+        let image = app.tmp.path().join("crop-key.jpg");
+        std::fs::write(&image, b"test").unwrap();
+        app.items = vec![GridItem::Image(image.clone())];
+        let key = crate::adjustment_db::normalize_path(&image);
+        let crop = CropSettings::authored(
+            CropRect {
+                min_x: 10.0,
+                min_y: 10.0,
+                max_x: 90.0,
+                max_y: 80.0,
+            },
+            CropAspectMode::Free,
+            [100, 100],
+        );
+
+        app.set_export_crop_for_idx(0, Some(crop), [100, 100]);
+        assert!(app.export_crop_page_keys.contains(&key));
+        assert!(app.grid_edit_badges(0).crop);
+
+        app.set_export_crop_for_idx(0, None, [100, 100]);
+        assert!(!app.export_crop_page_keys.contains(&key));
+        assert!(!app.grid_edit_badges(0).crop);
     }
 
     #[test]
@@ -14884,7 +15724,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         media.items = vec![GridItem::Video(video.clone())];
         media.fullscreen_idx = Some(0);
         media.viewer_presentation = super::ViewerPresentation::DetachedWindow;
-        media.detached_viewer_window_id = Some(window_id);
+        media.set_detached_window_binding_for_test(Some(window_id));
         media.detached_viewer_independent_active = true;
     });
 
@@ -15088,6 +15928,26 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Image(PathBuf::from(path)));
         app.thumbnails.push(ThumbnailState::Pending);
         app.items.len() - 1
+    }
+
+    fn insert_export_static_source(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        size: [usize; 2],
+        label: &str,
+    ) {
+        let pixels = egui::ColorImage::filled(size, egui::Color32::WHITE);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
     }
 
     fn mask_2x2() -> Vec<bool> {
@@ -18658,7 +19518,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
@@ -18685,7 +19545,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
 
@@ -18916,7 +19776,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
@@ -18936,7 +19796,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 3];
         app.visible_indices = vec![0, 1, 2];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         for idx in 0..3 {
@@ -18956,7 +19816,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 2];
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         let expected = SpreadPair::Double { left: 0, right: 1 };
@@ -19001,9 +19861,10 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-resync-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
         assert_eq!(
             app.resolve_spread_pair(1),
@@ -19018,6 +19879,11 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             app.resolve_spread_pair(5),
             SpreadPair::Double { left: 4, right: 5 }
+        );
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            1,
+            "表紙・横長を含む同一 token の相方解決でも表示単位列を再利用する"
         );
     }
 
@@ -19058,7 +19924,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-nav-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
         app.fullscreen_idx = Some(4);
@@ -19179,7 +20045,7 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         app.visible_indices = (0..4).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19283,9 +20149,10 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("split-nav-{k}"), dims));
         }
         app.visible_indices = (0..3).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         // 縦長 -> 横長の左半分。
         app.fullscreen_idx = Some(0);
         app.fullscreen_page_slice = PageSlice::Full;
@@ -19344,6 +20211,11 @@ mod favorite_adjustment_defaults_tests {
                 slice: PageSlice::Right
             })
         );
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            0,
+            "分割モードは従来どおり presentation step 経路を使う"
+        );
     }
 
     /// 右→左では右半分から読む。左右の順序だけが変わり、元ページの順序は変わらない。
@@ -19375,7 +20247,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitRtl;
 
         app.fullscreen_idx = Some(0);
@@ -19428,7 +20300,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
         app.fullscreen_idx = Some(0);
         app.fullscreen_page_slice = PageSlice::Left;
@@ -19464,7 +20336,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..4).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
 
             app.fullscreen_idx = Some(2);
@@ -19520,7 +20392,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..5).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
             app.spread_shift_anchor_idx = anchor;
             app.fullscreen_idx = Some(final_unit_start);
@@ -19569,7 +20441,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19621,7 +20493,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3, 4, 5];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
         app.fullscreen_idx = Some(3);
 
@@ -19687,7 +20559,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover; // pair_start=1 で [1,2] を表示中
         app.fullscreen_idx = Some(1);
         assert_eq!(
@@ -19721,7 +20593,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Rtl;
         app.fullscreen_idx = Some(0);
         assert_eq!(
@@ -19756,7 +20628,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -20132,7 +21004,11 @@ mod favorite_adjustment_defaults_tests {
         use crate::settings::{Settings, SortOrder};
 
         let mut settings = Settings::default();
-        settings.sort_order = SortOrder::DateDesc;
+        settings.remember_favorite_view_state = true;
+        settings.sort_order = SortOrder::FileName;
+        let mut favorite_state = crate::settings::FavoriteViewState::from_settings(&settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        settings.apply_favorite_view_overlay(uuid::Uuid::new_v4(), &favorite_state);
         let display_order = settings.grid_display_order.clone();
         let names_and_mtimes = [
             ("10.jpg", 100),
@@ -20167,6 +21043,40 @@ mod favorite_adjustment_defaults_tests {
             .collect();
         assert_eq!(archive_names, ["1.jpg", "2.jpg", "10.jpg", "p03.png"]);
 
+        let mut pdf_pages = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 9,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        let mut pdf_metas = vec![Some((10, 0)), Some((20, 0))];
+        crate::grid_item::arrange_grid_items(
+            &mut pdf_pages,
+            &mut pdf_metas,
+            &display_order,
+            Some(BOOK_READING_PAGE_ORDER),
+        );
+        let pdf_page_numbers: Vec<u32> = pdf_pages
+            .iter()
+            .map(|item| match item {
+                GridItem::PdfPage { page_num, .. } => *page_num,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(pdf_page_numbers, [1, 9]);
+
+        assert_eq!(
+            folder_media_sort_order(settings.sort_order, false, true, true, true),
+            BOOK_READING_PAGE_ORDER,
+            "画像のみの本もお気に入りの一覧ソートよりページ順を優先する"
+        );
+
         let mut normal_pages: Vec<GridItem> = names_and_mtimes
             .iter()
             .map(|(name, _)| GridItem::Image(PathBuf::from(name)))
@@ -20189,6 +21099,11 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         assert_eq!(normal_names, ["2.jpg", "1.jpg", "p03.png", "10.jpg"]);
+        assert_eq!(
+            settings.sort_order,
+            SortOrder::DateDesc,
+            "通常フォルダではお気に入りの一覧ソートが有効"
+        );
     }
 
     #[test]
@@ -22325,6 +23240,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             None,
             None,
+            None,
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
@@ -22365,6 +23281,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -23604,6 +24521,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -25116,9 +26034,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.export_crop_mode);
     }
 
-    /// 見開き表示中の Ctrl+E は左右ページを 1 つの export snapshot として開く。
+    /// 見開き表示中の Ctrl+E は左右ページを 1 つの worker 合成要求として開く。
     #[test]
-    fn open_export_dialog_uses_spread_pixels_when_spread_is_visible() {
+    fn open_export_dialog_uses_spread_sources_when_spread_is_visible() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
         let ctx = egui::Context::default();
@@ -25176,15 +26094,23 @@ mod favorite_adjustment_defaults_tests {
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other("spread".to_string())
         );
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.size, [1, 2]);
-                assert_eq!(right.base_pixels.size, [1, 2]);
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert_eq!(left.predicted_size, [1, 2]);
+                assert_eq!(right.predicted_size, [1, 2]);
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("spread export should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("spread export should prepare both page sources")
             }
         }
 
@@ -25198,15 +26124,307 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("right-page entry should still snapshot the visible spread")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("right-page entry should still prepare the visible spread")
             }
         }
+    }
+
+    #[test]
+    fn export_dialog_plans_current_and_all_four_conceal_presets_from_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("conceal-presets.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        insert_export_static_source(&mut app, &ctx, idx, [4, 4], "export_conceal_presets");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let mut bitmap = vec![false; 16];
+        bitmap[5] = true;
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &bitmap, &[], 4, 4)
+            .expect("save conceal mask");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+        app.settings.conceal_presets = std::array::from_fn(|slot| {
+            Some(crate::conceal::ConcealPreset {
+                name: format!("preset {}", slot + 1),
+                ..Default::default()
+            })
+        });
+        app.settings.export_batch_selection = [true; 5];
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(state.has_conceal_mask);
+        match &state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+        assert_eq!(state.selection, [true; 5]);
+        let entries = crate::export_dialog::plan_export_entries(
+            &state.sns_split_frames,
+            state.sns_split_source_size,
+            &state.selection,
+            state.has_conceal_mask,
+            &app.settings.conceal_presets,
+        )
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn export_dialog_ignores_shapes_that_cover_no_pixel_after_mask_resize() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("outside-conceal-shape.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        // 保存時 4x4 の図形を 8x8 の source へ拡大しても、画像外のままで 1 px も塗られない。
+        insert_export_static_source(&mut app, &ctx, idx, [8, 8], "export_empty_conceal_shape");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let shape = crate::mask_db::Shape::Rect {
+            op: crate::mask_db::ShapeOp::Add,
+            center: (100.0, 100.0),
+            half_w: 1.0,
+            half_h: 1.0,
+            rotation_rad: 0.0,
+        };
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &[false; 16], &[shape], 4, 4)
+            .expect("save conceal shape");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(!state.has_conceal_mask);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(!page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+    }
+
+    #[test]
+    fn close_fullscreen_keeps_running_export_and_closes_prestart_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("export-source.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([40, 80, 120, 255]))
+            .save(&source)
+            .expect("write export source");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        insert_export_static_source(&mut app, &ctx, idx, [2, 1], "running_export_source");
+        app.open_export_dialog_for_current(&ctx, idx);
+        assert!(
+            app.export_dialog.is_some(),
+            "pre-start dialog should be open"
+        );
+
+        // 2 件目の合成を止め、worker が _0 を保存した後に fullscreen teardown が
+        // 割り込む状況を決定的に作る。worker が所有する source / snapshot だけで
+        // 残り 4 件まで継続できることを App の close 経路と一緒に固定する。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = std::sync::Arc::clone(&calls);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut edits = crate::books::BakedEditSnapshot {
+            params: crate::adjustment::AdjustParams::default(),
+            rotation: crate::rotation_db::Rotation::None,
+            conceal: None,
+            erase: None,
+            local_adjust: None,
+            comic: None,
+            comic_source_dims: None,
+            export_crop: None,
+            crop_legacy_writeback: None,
+            format: crate::capture::CaptureFormat::Png,
+            jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::Ai,
+            creative_lut: None,
+            ai: None,
+        };
+        edits.params.upscale_model = Some("test-upscale".to_string());
+        edits.ai = Some(crate::books::BookAiSnapshot {
+            run: Box::new(move |image, _| {
+                if worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    entered_tx.send(()).expect("signal second entry");
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .expect("release second entry");
+                }
+                Ok(crate::books::BookAiResult {
+                    image: image.clone(),
+                    used_upscale: false,
+                })
+            }),
+        });
+        let entries = (0..5)
+            .map(|suffix| crate::export_dialog::ExportEntry {
+                label: format!("preset {suffix}"),
+                suffix,
+                conceal_preset: None,
+                crop_override: None,
+            })
+            .collect();
+        let pending =
+            crate::export_dialog::spawn_export_worker(crate::export_dialog::ExportRequest {
+                source: crate::export_dialog::ExportSource::File {
+                    path: source.clone(),
+                },
+                original_format: crate::save_with_metadata::SrcFormat::Png,
+                output_format: crate::export_dialog::ExportFormat::Png,
+                output_dir: app.tmp.path().to_path_buf(),
+                basename: "continued-export".to_string(),
+                composite: crate::export_dialog::ExportComposite::Single(
+                    crate::export_dialog::ExportPageComposite {
+                        source: crate::books::CompositeSource::File {
+                            path: source.clone(),
+                        },
+                        edits,
+                        pdf_render_long_edge: 4096,
+                        predicted_size: [2, 1],
+                        has_conceal_mask: false,
+                    },
+                ),
+                scale: crate::export_dialog::ExportScale::Full,
+                entries,
+                include_metadata: false,
+                local_ai_activity: None,
+            })
+            .expect("start export worker");
+        let cancel = std::sync::Arc::clone(&pending.cancel);
+        app.export_pending = Some(pending);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("worker should reach second entry after saving _0");
+        assert!(app.tmp.path().join("continued-export_0.png").exists());
+
+        app.close_fullscreen();
+
+        assert!(app.export_dialog.is_none(), "pre-start dialog must close");
+        assert!(
+            app.export_pending.is_some(),
+            "running export must remain owned"
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            app.main_window_should_draw_export_dialogs(),
+            "the main window must take over progress and cancel controls"
+        );
+        release_tx.send(()).expect("resume export worker");
+
+        let mut completed = 0;
+        loop {
+            let event = app
+                .export_pending
+                .as_ref()
+                .expect("running export should remain")
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("worker event");
+            match event {
+                crate::export_dialog::ExportEvent::Completed(_) => completed += 1,
+                crate::export_dialog::ExportEvent::Cancelled => {
+                    panic!("fullscreen teardown must not cancel the export")
+                }
+                crate::export_dialog::ExportEvent::AllDone => break,
+                crate::export_dialog::ExportEvent::Started { .. }
+                | crate::export_dialog::ExportEvent::Failed(_) => {}
+            }
+        }
+        assert_eq!(completed, 5);
+        for suffix in 0..5 {
+            assert!(
+                app.tmp
+                    .path()
+                    .join(format!("continued-export_{suffix}.png"))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_export_refresh_is_consumed_after_returning_to_grid() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("images");
+        std::fs::create_dir_all(&folder).expect("create image folder");
+        app.settings.book_root = Some(app.tmp.path().join("books"));
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        let output = folder.join("finished_0.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&output)
+            .expect("write completed export");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.export_pending = Some(crate::export_dialog::ExportPending {
+            cancel,
+            rx,
+            total: 1,
+            done: 0,
+            last_message: "準備中".to_string(),
+            successes: Vec::new(),
+            errors: Vec::new(),
+            finished: false,
+            cancel_requested: false,
+        });
+        tx.send(crate::export_dialog::ExportEvent::Completed(
+            crate::export_dialog::ExportSuccess {
+                label: "current".to_string(),
+                path: output.clone(),
+            },
+        ))
+        .unwrap();
+        tx.send(crate::export_dialog::ExportEvent::AllDone).unwrap();
+
+        app.poll_export_pending(&ctx);
+
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        app.consume_folder_refresh_pending();
+        assert!(app.folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(|item| {
+            matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
+        }));
     }
 
     /// GitHub issue #1 (app 配線): native は AI 範囲内なのに 4096px レンダで現行が native
@@ -25490,7 +26708,7 @@ mod favorite_adjustment_defaults_tests {
             layout_dims: None,
         };
         app.visible_indices = vec![first, second];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
 
         for (mode, expected_indices, expected_textures) in [
             (
@@ -25697,13 +26915,21 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("visible spread layout should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("visible spread layout should prepare both page sources")
             }
         }
     }
@@ -30454,7 +31680,7 @@ mod pipeline_cache_refactor_tests {
             FsLoadPurpose::for_page(true),
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_holdover_tex
@@ -34142,7 +35368,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [2, 2],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_page_load_state(idx),
@@ -34744,6 +35970,7 @@ mod pipeline_cache_refactor_tests {
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fullscreen_idx = Some(left);
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         // 通常 (ページ送り) では動画も並びに入るので、左の相方は動画側。
         app.reading_flow = crate::settings::ReadingFlow::Paged;
         assert_ne!(
@@ -34758,6 +35985,39 @@ mod pipeline_cache_refactor_tests {
             app.displayed_spread_partner(left),
             Some(right),
             "連結読みなのに動画を含む並びで相方を解いている"
+        );
+        assert_eq!(app.displayed_spread_partner(left), Some(right));
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            2,
+            "通常 nav と連結読みの静止画 nav は別 token だが、各列は再利用する"
+        );
+    }
+
+    /// `poll_prefetch` の二つのループは、相方を要素ごとに解き直さない。
+    #[test]
+    fn poll_prefetch_resolves_the_displayed_spread_once_before_its_loops() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source =
+            std::fs::read_to_string(manifest_dir.join("src/app.rs")).expect("read app.rs as UTF-8");
+        let body = source
+            .split_once("pub(crate) fn poll_prefetch(")
+            .expect("poll_prefetch start")
+            .1
+            .split_once("    fn update_reading_history_media_progress(")
+            .expect("function after poll_prefetch")
+            .0;
+
+        assert_eq!(body.matches("displayed_spread_partner(").count(), 1);
+        assert_eq!(
+            body.matches("page_is_displayed_now(").count(),
+            0,
+            "ループ内で相方解決を含むラッパーを呼ばない"
+        );
+        assert_eq!(
+            body.matches("Self::page_is_displayed(").count(),
+            3,
+            "pending drain / 完了 / 切断の全経路が唯一の共有述語を使う"
         );
     }
 
@@ -34838,15 +36098,10 @@ mod pipeline_cache_refactor_tests {
                 .animation_policy(),
             crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly
         );
-        let started_at = app
-            .current_animation_expansion_started_at()
-            .expect("the current Display request must expose its in-flight animation expansion");
-        assert!(
-            animation_expansion_progress_visible(
-                Some(started_at),
-                started_at + std::time::Duration::from_millis(150),
-            ),
-            "Display expansion must reach the shared visible predicate"
+        assert_eq!(
+            app.current_animation_expansion_started_at(),
+            None,
+            "Display alone must not claim animation expansion before worker confirmation"
         );
     }
 
@@ -34934,7 +36189,7 @@ mod pipeline_cache_refactor_tests {
                 started_at,
             },
         ));
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(app.fs_upload_backlog.is_empty());
         assert!(matches!(
@@ -34970,7 +36225,7 @@ mod pipeline_cache_refactor_tests {
             },
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(matches!(
             app.fs_cache.get(&idx),
@@ -35006,12 +36261,143 @@ mod pipeline_cache_refactor_tests {
     #[test]
     fn static_display_request_does_not_claim_animation_expansion_progress() {
         let mut app = setup_app();
-        let idx = push_image(&mut app, r"C:\missing\still.jpg");
+        let idx = push_image(&mut app, r"C:\missing\still.png");
         app.fullscreen_idx = Some(idx);
 
         app.start_fs_load(idx);
 
         assert!(app.fs_pending.contains_key(&idx));
+        assert_eq!(app.current_animation_expansion_started_at(), None);
+    }
+
+    #[test]
+    fn animation_confirmation_message_enables_progress_without_completing_the_request() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\animated.png");
+        app.fullscreen_idx = Some(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            idx,
+            FsPendingValue::new(cancel, rx, input_seq, FsLoadPurpose::for_page(true)),
+        );
+        let started_at = std::time::Instant::now();
+        tx.send(FsLoadResult::AnimationExpansionStarted { started_at })
+            .unwrap();
+
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+
+        assert!(
+            app.fs_pending.contains_key(&idx),
+            "animation confirmation is non-terminal"
+        );
+        assert_eq!(
+            app.current_animation_expansion_started_at(),
+            Some(started_at)
+        );
+        assert!(animation_expansion_progress_visible(
+            app.current_animation_expansion_started_at(),
+            started_at + std::time::Duration::from_millis(150),
+        ));
+    }
+
+    #[test]
+    fn leaving_display_discards_confirmation_but_keeps_prefetch_work() {
+        let mut app = setup_app();
+        let old_pending = push_image(&mut app, r"C:\missing\old.png");
+        let current = push_image(&mut app, r"C:\missing\current.jpg");
+        let old_backlog = push_image(&mut app, r"C:\missing\ready.webp");
+        let started_at = std::time::Instant::now();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut pending =
+            FsPendingValue::new(cancel, rx, app.input_seq, FsLoadPurpose::for_page(true));
+        pending.animation_expansion_started_at = Some(started_at);
+        app.fs_pending.insert(old_pending, pending);
+        let mut upload = FsUploadResult::new(
+            old_backlog,
+            FsLoadResult::Failed,
+            app.input_seq,
+            FsLoadPurpose::for_page(true),
+        );
+        upload.animation_expansion_started_at = Some(started_at);
+        app.fs_upload_backlog.push(upload);
+
+        app.discard_animation_expansion_confirmation_outside_display(current, None);
+
+        assert!(app.fs_pending.contains_key(&old_pending));
+        assert!(
+            app.fs_pending
+                .get(&old_pending)
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+        assert_eq!(app.fs_upload_backlog.len(), 1);
+        assert!(
+            app.fs_upload_backlog
+                .iter()
+                .next()
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn late_confirmation_after_leaving_page_is_discarded() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let old = push_image(&mut app, r"C:\missing\old.png");
+        let current = push_image(&mut app, r"C:\missing\current.jpg");
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.fullscreen_idx = Some(current);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            old,
+            FsPendingValue::new(cancel, rx, input_seq, FsLoadPurpose::for_page(true)),
+        );
+        tx.send(FsLoadResult::AnimationExpansionStarted {
+            started_at: std::time::Instant::now(),
+        })
+        .unwrap();
+
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+
+        assert!(app.fs_pending.contains_key(&old));
+        assert!(
+            app.fs_pending
+                .get(&old)
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelling_display_request_discards_animation_confirmation() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\animated.webp");
+        app.fullscreen_idx = Some(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut pending = FsPendingValue::new(
+            Arc::clone(&cancel),
+            rx,
+            app.input_seq,
+            FsLoadPurpose::for_page(true),
+        );
+        pending.animation_expansion_started_at = Some(std::time::Instant::now());
+        app.fs_pending.insert(idx, pending);
+
+        app.defer_page_turn_full_resolution_work();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.fs_pending.contains_key(&idx));
         assert_eq!(app.current_animation_expansion_started_at(), None);
     }
 
@@ -35070,7 +36456,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [4, 4],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(
             app.ensure_final_composite_texture(&ctx, left).is_some(),
@@ -35503,10 +36889,83 @@ mod pipeline_cache_refactor_tests {
         phase_c_support::wait_for_external_rescan(&mut app);
 
         assert!(
+            app.folder_refresh_pending.is_none(),
+            "grid-visible rescans must still apply immediately"
+        );
+        assert!(
             app.items
                 .iter()
                 .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
             "worker の結果で差し替わる"
+        );
+    }
+
+    /// 監視由来の再走査も、Ctrl+E 完了と同じ folder refresh pending を使う。
+    /// viewer を閉じる load は走らせず、一覧へ戻って consumer が動くまで mtime / signature
+    /// と一覧を古いまま保つ。consumer はその時点のディスクを 1 回だけ読み直す。
+    #[test]
+    fn a_watch_rescan_during_main_viewer_is_deferred_and_consumed_once_after_close() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("viewer_deferred_rescan");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&first_image)
+            .unwrap();
+        let initial_mtime = std::time::SystemTime::UNIX_EPOCH;
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(initial_mtime);
+        app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.items = vec![GridItem::Image(first_image)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(app.viewer_session_blocks_main_window());
+
+        let added_image = folder.join("b.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([40, 50, 60, 255]))
+            .save(&added_image)
+            .unwrap();
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "rescan must not close the viewer"
+        );
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        assert_eq!(
+            app.current_folder_last_mtime,
+            Some(initial_mtime),
+            "deferred scan must not acknowledge the mtime before reload"
+        );
+        assert!(
+            !app.items.iter().any(
+                |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+            ),
+            "the grid intentionally remains stale while the viewer is open"
+        );
+
+        app.close_fullscreen();
+        assert!(!app.viewer_session_blocks_main_window());
+        app.consume_folder_refresh_pending();
+
+        assert!(app.folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+        ));
+        assert_ne!(app.current_folder_last_mtime, Some(initial_mtime));
+        let generation_after_reload = app.items_generation;
+
+        app.consume_folder_refresh_pending();
+        assert_eq!(
+            app.items_generation, generation_after_reload,
+            "an empty pending slot must not reload the folder a second time"
         );
     }
 
@@ -38192,7 +39651,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(image);
         app.selected = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(image_window_id);
+        app.set_detached_window_binding_for_test(Some(image_window_id));
         insert_static_fs_entry(app, ctx, image, "linked_still_before_media");
         app.begin_mounted_detached_session_for_test(image_window_id, DetachedSource::Image);
         app.update_detached_window_runtime_flags(image_window_id, true, "test_linked_still");
@@ -38213,7 +39672,7 @@ mod still_window_mode_key_tests {
             media_context.items = items;
             media_context.fullscreen_idx = Some(media);
             media_context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            media_context.detached_viewer_window_id = Some(media_window_id);
+            media_context.set_detached_window_binding_for_test(Some(media_window_id));
             media_context.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(
@@ -38240,7 +39699,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.selected = Some(idx);
         app.fs_open_intent_from_grid = false;
-        app.detached_viewer_window_id
+        app.detached_viewer_window_id()
             .expect("detached grid open window id")
     }
 
@@ -38381,7 +39840,7 @@ mod still_window_mode_key_tests {
     }
 
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
-        app.detached_viewer_window_id = Some(window_id);
+        app.last_active_detached_window_id = Some(window_id);
         app.detached_window_hwnd_set(window_id, hwnd);
         let live_hwnds = if live { vec![hwnd] } else { Vec::new() };
         app.set_detached_window_live_hwnds_for_test(live_hwnds);
@@ -38413,7 +39872,7 @@ mod still_window_mode_key_tests {
             context.fs_cache.insert(0, FsCacheEntry::Failed);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -38442,7 +39901,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = None;
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(window_id);
+            app.set_detached_window_binding_for_test(Some(window_id));
             configure(app);
         });
         let viewport_id = app
@@ -38523,7 +39982,7 @@ mod still_window_mode_key_tests {
             context.items_generation = 4;
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
 
         app.with_active_viewer_context(|mounted| {
@@ -39570,7 +41029,7 @@ mod still_window_mode_key_tests {
                 .mark_right_drag_pending_execution(51, dispatch.command.unwrap())
         );
         app.begin_active_detached_session(52, DetachedSource::Image);
-        app.detached_viewer_window_id = Some(52);
+        app.set_detached_window_binding_for_test(Some(52));
 
         assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
         assert!(app.rotation_cache.is_empty());
@@ -39595,7 +41054,7 @@ mod still_window_mode_key_tests {
         app.queue_recognized_detached_right_drag_command(61, passive_rotate_command(), "test");
 
         app.begin_active_detached_session(61, DetachedSource::Book);
-        app.detached_viewer_window_id = Some(61);
+        app.set_detached_window_binding_for_test(Some(61));
         app.fullscreen_idx = None;
         let dispatch = app
             .take_pending_deferred_detached_window_activation()
@@ -39714,7 +41173,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(12);
+            context.set_detached_window_binding_for_test(Some(12));
         });
         app.transition_detached_window_state(12, DetachedWindowState::ParkedLive, "test_setup");
         set_detached_host_for_test(&mut app, 12, 0x1200, false);
@@ -39750,7 +41209,7 @@ mod still_window_mode_key_tests {
 
         app.finish_active_detached_session_handoff("test");
         app.transition_detached_window_state(42, DetachedWindowState::Parked, "test_handoff");
-        app.detached_viewer_window_id = None;
+        app.set_detached_window_binding_for_test(None);
         assert_eq!(
             app.detached_window_hwnd_alive_for_window_id(42),
             Some(0x4200)
@@ -39831,7 +41290,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_to_passive_handoff_preserves_live_registered_hwnd() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(42);
+        app.set_detached_window_binding_for_test(Some(42));
         app.detached_window_hwnd_set(42, 0x4200);
         app.detached_window_hwnd_set(77, 0x7700);
         app.set_detached_window_live_hwnds_for_test([0x4200, 0x7700]);
@@ -40707,7 +42166,7 @@ mod still_window_mode_key_tests {
         // メディア窓セッション (bundle 化前) は folder nav を consume する。
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(601);
+        app.set_detached_window_binding_for_test(Some(601));
         app.begin_mounted_detached_session_for_test(601, DetachedSource::Video);
         assert!(
             app.detached_independent_session_blocks_folder_nav(),
@@ -40819,7 +42278,7 @@ mod still_window_mode_key_tests {
         app.sync_detached_viewer_to_selected(&ctx);
 
         assert_eq!(app.fullscreen_idx, Some(image));
-        assert_eq!(app.detached_viewer_window_id, Some(61));
+        assert_eq!(app.detached_viewer_window_id(), Some(61));
         assert_eq!(app.last_viewer_sync_stamp, stamp_before);
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 62);
@@ -40922,7 +42381,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.transition_detached_window_state(123, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(123);
+        app.set_detached_window_binding_for_test(Some(123));
 
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
 
@@ -40994,16 +42453,23 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn at_rest_session_finish_precedes_later_context_retire() {
         let mut app = setup_app();
+        let main_window = app.ensure_detached_viewer_window_id();
         let window_id = 125;
         let context_id =
             app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
                 context.viewer_presentation = ViewerPresentation::DetachedWindow;
             });
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
         app.begin_active_detached_session_close("test_session_first");
         app.finish_active_detached_session_close("test_session_first");
 
         assert!(app.active_detached_session.is_none());
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_eq!(app.detached_viewer_window_id(), Some(main_window));
         assert_eq!(
             app.locate_window_context(window_id),
             Some((context_id, ContextResidence::AtRest)),
@@ -41036,7 +42502,7 @@ mod still_window_mode_key_tests {
         let video = push_video(app, r"C:\clips\placement-switch.mp4");
         app.fullscreen_idx = Some(video);
         app.transition_detached_window_state(window_id, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
 
@@ -42241,7 +43707,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
             context.detached_viewer_open_next_still_detached_once = false;
-            context.detached_viewer_window_id = Some(77);
+            context.set_detached_window_binding_for_test(Some(77));
         });
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, a_virtual_idx));
@@ -44311,7 +45777,7 @@ mod still_window_mode_key_tests {
             );
             app.with_active_viewer_context(|active| {
                 assert_eq!(
-                    active.detached_viewer_window_id,
+                    active.detached_viewer_window_id(),
                     Some(window_id),
                     "frame {frame}: the bundle must retain the same window identity"
                 );
@@ -45158,7 +46624,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.selected = Some(first);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
         app.fs_viewport_shown = true;
@@ -45189,7 +46655,7 @@ mod still_window_mode_key_tests {
         );
         app.with_active_viewer_context(|active| {
             assert_eq!(active.fullscreen_idx, Some(first));
-            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert_eq!(active.detached_viewer_window_id(), Some(window_id));
             assert!(active.detached_viewer_independent_active);
             assert!(matches!(
                 active.items.get(first),
@@ -45222,7 +46688,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = false;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.selected = Some(first);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
         app.fs_viewport_shown = true;
@@ -45245,7 +46711,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, None);
         app.with_active_viewer_context(|active| {
             assert_eq!(active.fullscreen_idx, Some(first));
-            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert_eq!(active.detached_viewer_window_id(), Some(window_id));
             assert!(
                 active.detached_viewer_independent_active,
                 "after the main context changes, the preserved video must stop following main selection"
@@ -45405,7 +46871,7 @@ mod still_window_mode_key_tests {
             app.selected = Some(video);
             app.viewer_presentation = presentation;
             if matches!(presentation, ViewerPresentation::DetachedWindow) {
-                app.detached_viewer_window_id = Some(200);
+                app.set_detached_window_binding_for_test(Some(200));
             }
             install_playing_test_media(&mut app, video, path.clone(), 30.0);
 
@@ -46020,7 +47486,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.transition_detached_window_state(120, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(120);
+        app.set_detached_window_binding_for_test(Some(120));
         app.bind_mounted_context_for_test(120);
         begin_test_video_presentation_transition(
             &mut app,
@@ -46072,7 +47538,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.detached_viewer_window_id = Some(121);
+        app.set_detached_window_binding_for_test(Some(121));
         begin_test_detached_host_wait(&mut app);
         app.fs_cache.insert(
             video,
@@ -46118,7 +47584,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.video_audio_mode = Some(video);
-        app.detached_viewer_window_id = Some(122);
+        app.set_detached_window_binding_for_test(Some(122));
         app.fs_cache.insert(
             video,
             FsCacheEntry::Video {
@@ -46342,7 +47808,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\bookkeeping.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(88);
+        app.set_detached_window_binding_for_test(Some(88));
         app.begin_active_detached_session(88, DetachedSource::Video);
         app.requested.insert(video, false);
         app.pending_finalize.insert(video);
@@ -46479,7 +47945,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(109);
+        app.set_detached_window_binding_for_test(Some(109));
         app.begin_mounted_detached_session_for_test(109, DetachedSource::Video);
         app.fs_cache.insert(
             video,
@@ -46514,7 +47980,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.vst3_deferred_media_open = Some(video);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
 
@@ -46536,7 +48002,7 @@ mod still_window_mode_key_tests {
         let mut consumed = Vec::new();
         app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
             consumed.push((
-                mounted.detached_viewer_window_id,
+                mounted.detached_viewer_window_id(),
                 mounted.native_video_parked_live_input_window_id,
                 idx,
             ));
@@ -46766,12 +48232,17 @@ mod still_window_mode_key_tests {
             });
         app.build_window_context_for_test(7, |_| {});
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
-        app.detached_viewer_window_id = Some(7);
+        assert_eq!(app.detached_viewer_window_id(), None);
+        let main = app.projected_viewer_context_id();
+        assert!(matches!(
+            app.bind_window(main, 7),
+            Err(viewer_context_registry::BindError::WindowOwnedBy(_))
+        ));
         app.last_active_detached_window_id = Some(7);
 
         let id = app.ensure_detached_viewer_window_id();
         assert_ne!(id, 7, "parked/passive 窓の id を新セッションに再利用しない");
-        assert_eq!(app.detached_viewer_window_id, Some(id));
+        assert_eq!(app.detached_viewer_window_id(), Some(id));
 
         // 衝突が無ければ従来どおり直参照を再利用する (フォルダナビの窓安定性を壊さない)。
         let id2 = app.ensure_detached_viewer_window_id();
@@ -46810,7 +48281,7 @@ mod still_window_mode_key_tests {
         };
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(70);
+        app.set_detached_window_binding_for_test(Some(70));
         app.begin_mounted_detached_session_for_test(70, DetachedSource::Image);
 
         // ParkedLive のメディア窓 (61)。
@@ -46848,7 +48319,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -46875,7 +48346,11 @@ mod still_window_mode_key_tests {
             ViewerPresentation::DetachedWindow,
             "main の presentation が DetachedWindow のまま残らない"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(61));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(61))
+        );
     }
 
     #[test]
@@ -47070,7 +48545,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -47241,6 +48716,8 @@ mod still_window_mode_key_tests {
         app.adjusted_page_keys.insert(format!("{old_k}2/other.jpg"));
         app.mask_page_keys.insert(old_k.clone());
         app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
+        app.export_crop_page_keys
+            .insert(format!("{old_k}/cropped.jpg"));
         app.settings
             .video_resume_positions
             .insert(format!("{old_k}/v.mp4"), 12.0);
@@ -47264,6 +48741,14 @@ mod still_window_mode_key_tests {
         assert!(app.mask_page_keys.contains(&new_k), "exact キーも移る");
         assert!(app.comic_page_keys.contains(&format!("{new_k}::p1.jpg")));
         assert!(!app.comic_page_keys.contains(&format!("{old_k}::p1.jpg")));
+        assert!(
+            app.export_crop_page_keys
+                .contains(&format!("{new_k}/cropped.jpg"))
+        );
+        assert!(
+            !app.export_crop_page_keys
+                .contains(&format!("{old_k}/cropped.jpg"))
+        );
         assert_eq!(
             app.settings
                 .video_resume_positions
@@ -47837,13 +49322,18 @@ mod still_window_mode_key_tests {
             context.detached_viewer_independent_active = true;
         });
         // main 側の stale コピー (実機の再現条件)。
-        app.detached_viewer_window_id = Some(window_id);
+        assert_eq!(app.detached_viewer_window_id(), None);
+        let main = app.projected_viewer_context_id();
+        assert!(matches!(
+            app.bind_window(main, 53),
+            Err(viewer_context_registry::BindError::WindowOwnedBy(_))
+        ));
         app.last_active_detached_window_id = Some(window_id);
 
         assert!(app.park_active_detached_context_as_live_media(&ctx, "test_park_stale_id"));
 
         assert_ne!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(window_id),
             "park 後の main 文脈に parked 窓 id の stale コピーが残らない"
         );
@@ -47899,7 +49389,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(95);
+            context.set_detached_window_binding_for_test(Some(95));
         });
         app.transition_detached_window_state(95, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -48239,7 +49729,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(97);
+            context.set_detached_window_binding_for_test(Some(97));
         });
         app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
         app.music_analysis_path = Some(path.clone());
@@ -48310,7 +49800,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(93);
+            context.set_detached_window_binding_for_test(Some(93));
         });
         app.transition_detached_window_state(93, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -48360,7 +49850,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(image);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(94);
+            context.set_detached_window_binding_for_test(Some(94));
         });
         app.transition_detached_window_state(94, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -48436,7 +49926,7 @@ mod still_window_mode_key_tests {
             Some(false),
             "always-new passive snapshots must be independent; linked snapshots are forbidden after CUT"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(2));
+        assert_eq!(app.detached_viewer_window_id(), Some(2));
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(!app.fs_viewport_shown);
         assert_eq!(app.locate_window_context(first_window_id), None);
@@ -48462,7 +49952,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(existing);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(41);
+        app.set_detached_window_binding_for_test(Some(41));
         app.begin_mounted_detached_session_for_test(41, DetachedSource::Image);
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -48493,7 +49983,7 @@ mod still_window_mode_key_tests {
                     ViewerNavigationScope::DetachedPhysical
                 );
                 (
-                    active.detached_viewer_window_id,
+                    active.detached_viewer_window_id(),
                     active.fs_open_intent_from_grid,
                 )
             })
@@ -48648,7 +50138,7 @@ mod still_window_mode_key_tests {
             "opening the follow-up window should still reset foreground panorama mode"
         );
         let second_window_id = app
-            .detached_viewer_window_id
+            .detached_viewer_window_id()
             .expect("second detached window should be active");
         assert_ne!(first_window_id, second_window_id);
         app.detached_window_hwnd_set(second_window_id, 0x2222);
@@ -48663,7 +50153,7 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.fullscreen_idx, Some(first));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert_eq!(app.detached_viewer_window_id, Some(first_window_id));
+        assert_eq!(app.detached_viewer_window_id(), Some(first_window_id));
         assert!(
             app.detached_viewer_independent_active,
             "always-new detached image windows remain independent after reactivation"
@@ -48733,7 +50223,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(7);
+        app.set_detached_window_binding_for_test(Some(7));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(7, DetachedSource::Image);
@@ -49336,7 +50826,7 @@ mod still_window_mode_key_tests {
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
         let first_window_id = app
-            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .with_active_viewer_context(|active| active.detached_viewer_window_id())
             .flatten()
             .expect("first detached book context should have a window id");
         let first_placement = app
@@ -49346,7 +50836,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(1);
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
         let second_window_id = app
-            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .with_active_viewer_context(|active| active.detached_viewer_window_id())
             .flatten()
             .expect("second detached book context should have a window id");
 
@@ -49578,7 +51068,7 @@ mod still_window_mode_key_tests {
         assert!(matches!(app.items[0], GridItem::PdfFile(_)));
         app.with_active_viewer_context(|active| {
             assert_eq!(
-                active.detached_viewer_window_id,
+                active.detached_viewer_window_id(),
                 Some(WINDOW_ID),
                 "the resumed active context must retain the original window identity"
             );
@@ -49748,7 +51238,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(0);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             app.fs_viewport_generation = 101;
             app.fs_viewport_shown = true;
             app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -49785,7 +51275,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(0);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(20);
+            app.set_detached_window_binding_for_test(Some(20));
             app.fs_viewport_generation = 202;
             app.fs_viewport_shown = true;
             app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -49803,7 +51293,7 @@ mod still_window_mode_key_tests {
             "the previously active window should be paused, not closed"
         );
         app.with_active_viewer_context(|active| {
-            assert_eq!(active.detached_viewer_window_id, Some(10));
+            assert_eq!(active.detached_viewer_window_id(), Some(10));
         })
         .unwrap();
         assert!(app.fs_viewport_shown);
@@ -49902,7 +51392,7 @@ mod still_window_mode_key_tests {
             parked_context.fullscreen_idx = Some(0);
             parked_context.viewer_presentation = ViewerPresentation::DetachedWindow;
             parked_context.native_video_in_window_active = false;
-            parked_context.detached_viewer_window_id = Some(1);
+            parked_context.set_detached_window_binding_for_test(Some(1));
             parked_context.detached_viewer_independent_active = true;
             parked_context.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
             parked_context.address = r"C:\books\pinned.pdf".to_string();
@@ -50071,7 +51561,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(10);
+        app.set_detached_window_binding_for_test(Some(10));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
@@ -50110,7 +51600,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(20);
+        app.set_detached_window_binding_for_test(Some(20));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.fs_transparent_bg_mode = 1;
         app.settings.detached_viewer_window_placement =
@@ -50159,7 +51649,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(76);
+        app.set_detached_window_binding_for_test(Some(76));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.spread_mode = crate::settings::SpreadMode::Single;
         app.settings.detached_viewer_window_placement =
@@ -50229,7 +51719,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(11);
+        app.set_detached_window_binding_for_test(Some(11));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
@@ -50289,7 +51779,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(70);
+        app.set_detached_window_binding_for_test(Some(70));
         app.begin_active_detached_session(70, DetachedSource::Image);
         let idx = push_image(&mut app, r"C:\pics\single-fit.jpg");
         insert_static_fs_entry(&mut app, &ctx, idx, "single_fit_rect");
@@ -50323,7 +51813,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(71);
+        app.set_detached_window_binding_for_test(Some(71));
         app.begin_active_detached_session(71, DetachedSource::Image);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         let left = push_image(&mut app, r"C:\pics\spread-fit-left.jpg");
@@ -50376,7 +51866,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(72);
+        app.set_detached_window_binding_for_test(Some(72));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fs_transparent_bg_mode = 1;
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
@@ -50477,7 +51967,7 @@ mod still_window_mode_key_tests {
                 app.settings.detached_viewer_window_placement = Some(placement);
                 app.viewer_presentation = ViewerPresentation::DetachedWindow;
                 app.detached_viewer_independent_active = true;
-                app.detached_viewer_window_id = Some(74);
+                app.set_detached_window_binding_for_test(Some(74));
                 app.spread_mode = crate::settings::SpreadMode::Ltr;
                 let left = push_image(&mut app, r"C:\pics\seam-left.png");
                 let right = push_image(&mut app, r"C:\pics\seam-right.png");
@@ -50541,7 +52031,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
-        app.detached_viewer_window_id = Some(73);
+        app.set_detached_window_binding_for_test(Some(73));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
         let left = push_image(&mut app, r"C:\pics\auto-trim-left.png");
@@ -50635,7 +52125,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(detached_idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(74);
+        app.set_detached_window_binding_for_test(Some(74));
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
@@ -50690,7 +52180,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.spread_mode = crate::settings::SpreadMode::Single;
         let first = push_image(&mut app, r"C:\pics\single-a.jpg");
         let second = push_image(&mut app, r"C:\pics\single-b.jpg");
@@ -50720,7 +52210,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             insert_static_fs_entry(app, &ctx, idx, "pause_cancel_ai_page");
             let key = FinalAiKey {
                 edit_key: EditResultKey {
@@ -50774,7 +52264,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             insert_static_fs_entry(app, &ctx, idx, "pause_handoff_to_passive");
         });
         app.fs_viewport_shown = true;
@@ -50818,7 +52308,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(42);
+            app.set_detached_window_binding_for_test(Some(42));
             app.panorama_state = Some(crate::panorama::PanoramaState::new(
                 1.0,
                 -0.5,
@@ -51174,7 +52664,7 @@ mod still_window_mode_key_tests {
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.detached_viewer_window_id = Some(77);
+        app.set_detached_window_binding_for_test(Some(77));
         let _ = begin_test_video_presentation_transition(
             &mut app,
             ViewerPresentation::DetachedWindow,
@@ -51214,7 +52704,7 @@ mod still_window_mode_key_tests {
         // 失敗後: presentation は非 detached へ戻り、pending も消えている。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         clear_test_video_presentation_transition(&mut app);
-        app.detached_viewer_window_id = Some(88);
+        app.set_detached_window_binding_for_test(Some(88));
         // だが detached host は実際に表示済み。
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -51550,7 +53040,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         set_detached_host_for_test(&mut app, 12, 0x1234, true);
         app.set_detached_window_runtime_placement(
             12,
@@ -51586,7 +53076,7 @@ mod still_window_mode_key_tests {
             Some(ViewerPresentation::DetachedWindow)
         );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(12), 0x1234);
-        assert_eq!(app.detached_viewer_window_id, Some(12));
+        assert_eq!(app.detached_viewer_window_id(), Some(12));
         assert_eq!(
             app.fullscreen_viewport_id(),
             viewport_id_before,
@@ -51628,7 +53118,7 @@ mod still_window_mode_key_tests {
         app.detached_viewer_independent_active = true;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.next_detached_image_window_id = 13;
         app.set_detached_window_runtime_placement(
             12,
@@ -51650,7 +53140,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(12),
             "folder-nav reopen must not allocate a new detached window id"
         );
@@ -51676,7 +53166,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.fs_viewport_generation = 7;
         // 解放済み等で IsWindow=false になる stale hwnd を模す。
         set_detached_host_for_test(&mut app, 12, 0x1234, false);
@@ -51721,7 +53211,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
         // host 未捕捉 (== 0) = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.detached_window_hwnd_clear(12);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
@@ -51762,7 +53252,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
 
         // 未捕捉 (== 0) → seed。
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.detached_window_hwnd_clear(12);
         assert!(app.detached_viewer_should_seed_placement());
 
@@ -51794,7 +53284,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(42);
+        app.set_detached_window_binding_for_test(Some(42));
         app.detached_viewer_folder_nav_reuse_window_once = true;
         app.settings.detached_viewer_open_images_in_window = true;
         app.fs_nav_locked_gen = Some(app.items_generation);
@@ -51810,7 +53300,7 @@ mod still_window_mode_key_tests {
 
         app.prepare_viewer_presentation_close();
         assert_eq!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(42),
             "folder-nav reopen must keep the detached window_id so the same OS window is reused"
         );
@@ -51827,7 +53317,8 @@ mod still_window_mode_key_tests {
         app.detached_viewer_folder_nav_reuse_window_once = false;
         app.prepare_viewer_presentation_close();
         assert_eq!(
-            app.detached_viewer_window_id, None,
+            app.detached_viewer_window_id(),
+            None,
             "a normal (non-folder-nav) close still tears down the detached identity"
         );
     }
@@ -51843,7 +53334,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(7);
+        app.set_detached_window_binding_for_test(Some(7));
         let restore_placement = app.active_detached_viewer_current_placement();
         app.write_detached_viewer_borderless_state(
             true,
@@ -51887,11 +53378,12 @@ mod still_window_mode_key_tests {
         // 初回 (grid から): 新規 allocate。
         app.fs_open_intent_from_grid = true;
         let first = app.ensure_detached_viewer_window_id();
+        app.begin_active_detached_session(first, DetachedSource::Image);
         let vid_first = app.fullscreen_viewport_id();
         assert_eq!(app.last_active_detached_window_id, Some(first));
 
         // フォルダナビの close 相当で window_id が None になる。
-        app.detached_viewer_window_id = None;
+        app.prepare_viewer_presentation_close();
 
         // folder-nav reopen (grid 由来でない) は同じ window_id を再利用 → ViewportId 不変。
         app.fs_open_intent_from_grid = false;
@@ -51907,7 +53399,7 @@ mod still_window_mode_key_tests {
         );
 
         // grid からの新規オープンは別ウィンドウを作る (= 新しい id を allocate)。
-        app.detached_viewer_window_id = None;
+        app.finish_active_detached_session_close("test_new_grid_open");
         app.fs_open_intent_from_grid = true;
         let fresh = app.ensure_detached_viewer_window_id();
         assert_ne!(
@@ -52266,7 +53758,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_runtime_placement(43, second, "test_passive_move");
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, 43));
-        assert_eq!(app.detached_viewer_window_id, Some(43));
+        assert_eq!(app.detached_viewer_window_id(), Some(43));
         assert_eq!(
             app.active_detached_viewer_current_placement(),
             second,
@@ -52293,7 +53785,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
         // review-v2.3.0 Codex huntfix P2: ロード複合体 (worker queue / cancel token) は
         // park 後もグリッドを駆動する main 側に残ることを検証するための現物。
@@ -52387,7 +53879,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(62);
+            context.set_detached_window_binding_for_test(Some(62));
         });
         app.transition_detached_window_state(62, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -52409,7 +53901,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.video_audio_mode = Some(video);
         app.video_audio_vst = None;
         app.begin_active_detached_session(window_id, DetachedSource::Video);
@@ -52458,7 +53950,7 @@ mod still_window_mode_key_tests {
         let image = push_image(&mut app, r"C:\pics\active.jpg");
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(101);
+        app.set_detached_window_binding_for_test(Some(101));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(101, DetachedSource::Image);
@@ -52523,7 +54015,7 @@ mod still_window_mode_key_tests {
             live.items = live_items;
             live.fullscreen_idx = Some(live_audio);
             live.viewer_presentation = ViewerPresentation::DetachedWindow;
-            live.detached_viewer_window_id = Some(103);
+            live.set_detached_window_binding_for_test(Some(103));
             live.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
@@ -52545,7 +54037,7 @@ mod still_window_mode_key_tests {
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_window_manager.is_empty());
-        assert_eq!(app.detached_viewer_window_id, None);
+        assert_eq!(app.detached_viewer_window_id(), None);
         assert_eq!(app.last_active_detached_window_id, None);
         assert!(!app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
@@ -52617,7 +54109,7 @@ mod still_window_mode_key_tests {
         app.scroll_offset_y = 123.0;
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_linked_live_park"));
@@ -52669,7 +54161,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
         app.auto_aspect.items_generation = 77;
         app.auto_aspect.samples.insert(0, 1.5);
@@ -52707,7 +54199,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
 
         assert!(
@@ -52772,7 +54264,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -52796,7 +54288,7 @@ mod still_window_mode_key_tests {
         );
         app.with_active_viewer_context(|active| {
             assert_eq!(active.address, "parked-live://sentinel");
-            assert_eq!(active.detached_viewer_window_id, Some(61));
+            assert_eq!(active.detached_viewer_window_id(), Some(61));
             assert_eq!(active.fullscreen_idx, Some(video));
         })
         .expect("parked live bundle should become the active context");
@@ -53017,7 +54509,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = false;
         app.fullscreen_idx = Some(linked);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(71);
+        app.set_detached_window_binding_for_test(Some(71));
         app.begin_mounted_detached_session_for_test(71, DetachedSource::Image);
         app.update_detached_window_runtime_flags(71, true, "test_linked_active");
 
@@ -53054,7 +54546,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(72);
+            context.set_detached_window_binding_for_test(Some(72));
             context.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
@@ -53067,7 +54559,11 @@ mod still_window_mode_key_tests {
             "OFF-mode linked active window must close rather than become a passive snapshot"
         );
         assert_eq!(app.fullscreen_idx, None);
-        assert_eq!(app.detached_viewer_window_id, Some(72));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(72))
+        );
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
             Some(72)
@@ -53870,7 +55366,9 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.iter().any(|w| w.id == 71));
         app.prepare_viewer_presentation_open(second_video, true);
 
-        let new_id = app.detached_viewer_window_id.expect("new media window id");
+        let new_id = app
+            .detached_viewer_window_id()
+            .expect("new media window id");
         assert_ne!(new_id, 71);
         assert_ne!(new_id, 72);
         assert_eq!(app.detached_image_windows.len(), 1);
@@ -53941,7 +55439,7 @@ mod still_window_mode_key_tests {
             !app.activate_detached_image_window_snapshot(&ctx, 111),
             "the consumed one-shot snapshot cannot later close/swap the active still window"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(111));
+        assert_eq!(app.detached_viewer_window_id(), Some(111));
     }
 
     #[test]
@@ -54025,7 +55523,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(72);
+            bundle.set_detached_window_binding_for_test(Some(72));
         });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -54088,7 +55586,11 @@ mod still_window_mode_key_tests {
             app.detached_window_state(82),
             Some(DetachedWindowState::Active)
         );
-        assert_eq!(app.detached_viewer_window_id, Some(82));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(82))
+        );
         assert!(app.active_viewer_context_id().is_some());
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
@@ -54109,7 +55611,7 @@ mod still_window_mode_key_tests {
         app.settings.fullfeature_media_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(91);
+        app.set_detached_window_binding_for_test(Some(91));
         insert_static_fs_entry(&mut app, &ctx, first, "linked_still_reuse");
         app.begin_active_detached_session(91, DetachedSource::Image);
         app.update_detached_window_runtime_flags(91, true, "test_linked_reuse");
@@ -54118,7 +55620,7 @@ mod still_window_mode_key_tests {
         app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.detached_viewer_window_id, Some(91));
+        assert_eq!(app.detached_viewer_window_id(), Some(91));
         assert!(app.detached_image_windows.is_empty());
     }
 
@@ -54134,7 +55636,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(101);
+        app.set_detached_window_binding_for_test(Some(101));
         insert_static_fs_entry(&mut app, &ctx, image, "multi_still_before_media");
         app.begin_mounted_detached_session_for_test(101, DetachedSource::Image);
         app.update_detached_window_runtime_flags(101, false, "test_multi_still");
@@ -54163,7 +55665,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(74);
+            bundle.set_detached_window_binding_for_test(Some(74));
         });
         app.transition_detached_window_state(74, DetachedWindowState::ParkedLive, "test_setup");
         let input_seq_before = app.input_seq;
@@ -54245,7 +55747,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(old_video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(71);
+            bundle.set_detached_window_binding_for_test(Some(71));
         });
         app.transition_detached_window_state(71, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -54304,7 +55806,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(81);
+            bundle.set_detached_window_binding_for_test(Some(81));
         });
         app.transition_detached_window_state(81, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -55189,7 +56691,7 @@ mod still_window_mode_key_tests {
         app.spread_shift_anchor_idx = Some(excluded);
         app.fs_zoom_pdf_rerender_idx = Some(video);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
-        app.cached_nav_indices = Some(vec![before, video, last]);
+        let _ = app.collect_image_indices();
         app.fs_vertical_cache_keep_set.insert(video);
         app.fs_context_menu_idx = Some(video);
         app.adjust_scope_selection_idx = Some(video);
@@ -55209,7 +56711,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.spread_shift_anchor_idx, None);
         assert_eq!(app.fs_zoom_pdf_rerender_idx, Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
-        assert!(app.cached_nav_indices.is_none());
+        assert!(!app.viewer_navigation_caches.has_entries_for_test());
         assert!(app.fs_vertical_cache_keep_set.is_empty());
         assert!(app.fs_context_menu_idx.is_none());
         assert!(app.adjust_scope_selection_idx.is_none());
@@ -55304,7 +56806,7 @@ mod still_window_mode_key_tests {
             bundle.items.push(GridItem::Video(path_for_context));
             bundle.fullscreen_idx = Some(0);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(108);
+            bundle.set_detached_window_binding_for_test(Some(108));
         });
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
         let now = std::time::Instant::now();
@@ -56036,7 +57538,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(82);
+            bundle.set_detached_window_binding_for_test(Some(82));
         });
         app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
         app.native_video_parked_live_activation_requests.push(82);
@@ -56733,7 +58235,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_placement_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
@@ -56770,7 +58272,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now());
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
@@ -56805,7 +58307,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
@@ -56848,7 +58350,7 @@ mod still_window_mode_key_tests {
             false,
         );
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Video);
         app.set_detached_window_runtime_placement(12, previous, "test_switch_default_reject");
 
@@ -56876,7 +58378,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
@@ -57032,7 +58534,7 @@ mod still_window_mode_key_tests {
         insert_static_fs_entry(&mut app, &ctx, idx, "live_placement_snapshot");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(9);
+        app.set_detached_window_binding_for_test(Some(9));
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
                 x: 80.0,
@@ -57953,7 +59455,7 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.active_detached_session.unwrap().window_id, 7);
         assert_eq!(app.fullscreen_idx, Some(0));
-        assert_eq!(app.detached_viewer_window_id, Some(7));
+        assert_eq!(app.detached_viewer_window_id(), Some(7));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
     }
 
@@ -58045,7 +59547,7 @@ mod still_window_mode_key_tests {
             maximized: false,
         };
         app.settings.detached_viewer_window_placement = Some(seed);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, seed, "test_maximized");
 
@@ -58453,11 +59955,11 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_keep_delete_targets_real_only() {
+    fn checked_file_operation_paths_include_real_files_and_folders_only() {
         let mut app = setup_app();
 
-        // collect_checked_paths は Shell メニュー用の従来 helper なのでフォルダを除外する。
-        // 削除ターゲット helper は Del キーと同じく実フォルダも受け付ける。
+        // Shell クリップボードと削除が共有する正本 helper は、実ファイルと
+        // Space でチェック可能な実フォルダを含み、仮想ページだけを除外する。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -58496,19 +59998,6 @@ mod file_operation_selection_tests {
             app.checked.insert(idx);
         }
 
-        let mut paths = app.collect_checked_paths();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(r"C:\books\a.7z"),
-                PathBuf::from(r"C:\books\a.jpg"),
-                PathBuf::from(r"C:\books\a.mp4"),
-                PathBuf::from(r"C:\books\a.pdf"),
-                PathBuf::from(r"C:\books\a.zip"),
-            ]
-        );
-
         let targets = app.collect_checked_indexed_paths();
         assert_eq!(
             targets,
@@ -58520,7 +60009,7 @@ mod file_operation_selection_tests {
                 (image, PathBuf::from(r"C:\books\a.jpg")),
                 (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and include real folders while excluding virtual pages",
+            "shared targets are sorted by descending index and include real folders while excluding virtual pages",
         );
     }
 
@@ -58636,6 +60125,42 @@ mod file_operation_selection_tests {
             ))),
             "a selected virtual item should produce the same visible rejection path",
         );
+    }
+
+    #[test]
+    fn shell_clipboard_semantic_copy_event_respects_keymap_unbinding() {
+        let mut app = setup_app();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        app.selected = Some(image);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCopyFiles = none\nGridCutFiles = none\n",
+        );
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
+        );
+
+        app.keymap = crate::keymap::Keymap::from_ini_str("");
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast
+                .0
+                .contains("OSクリップボード操作を開始できませんでした")
+        }));
     }
 
     #[test]
@@ -59276,6 +60801,124 @@ mod ctrl_f_structural_filter_tests {
         }
     }
 
+    fn png_with_xmp_tweet_id(tweet_id: &str) -> Vec<u8> {
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'>
+<xtw:TweetId>{tweet_id}</xtw:TweetId>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut payload = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        payload.extend_from_slice(xml.as_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"iTXt");
+        png.extend_from_slice(&payload);
+        png.extend_from_slice(&[0_u8; 4]);
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0_u8; 4]);
+        png
+    }
+
+    #[test]
+    fn metadata_search_parallel_pass2_deduplicates_xmp_additions_by_normalized_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("duplicate.png");
+        std::fs::write(&path, png_with_xmp_tweet_id("dedup-123")).unwrap();
+        let items = vec![GridItem::Image(path.clone()), GridItem::Image(path.clone())];
+        let tokens = crate::search_query::parse("dedup-123");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+
+        let SearchThreadResult::Done {
+            matches,
+            xmp_additions,
+        } = run_metadata_search(
+            &tokens,
+            &items,
+            &xmp,
+            None,
+            &passwords,
+            &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::XmpTweet]),
+            crate::search_query::MatchMode::And,
+            &cancel,
+            Some(&progress),
+        );
+
+        assert_eq!(matches, std::collections::HashSet::from([0, 1]));
+        assert_eq!(
+            xmp_additions.len(),
+            1,
+            "duplicate normalized path must publish only one XMP addition"
+        );
+        assert_eq!(
+            xmp_additions[0].0,
+            crate::adjustment_db::normalize_path(&path)
+        );
+        assert_eq!(
+            progress.snapshot(),
+            SearchProgressSnapshot {
+                done: 2,
+                total: 2,
+                matched: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_search_cancel_returns_completed_parallel_matches() {
+        let items: Vec<GridItem> = (0..100_000)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("C:\\\\g\\\\hit-{idx}.jpg"))))
+            .collect();
+        let tokens = crate::search_query::parse("hit-");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_metadata_search(
+                    &tokens,
+                    &items,
+                    &xmp,
+                    None,
+                    &passwords,
+                    &target,
+                    crate::search_query::MatchMode::And,
+                    &cancel,
+                    Some(&progress),
+                )
+            });
+            while progress.snapshot().done == 0 && !worker.is_finished() {
+                std::thread::yield_now();
+            }
+            cancel.store(true, Ordering::Relaxed);
+            worker.join().unwrap()
+        });
+
+        let SearchThreadResult::Done { matches, .. } = result;
+        let snapshot = progress.snapshot();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            !matches.is_empty(),
+            "matches completed before cancellation must not be discarded"
+        );
+        assert_eq!(
+            matches.len(),
+            snapshot.done,
+            "every completed filename-only item matched and must be returned"
+        );
+        assert!(snapshot.done <= snapshot.total);
+    }
+
     #[test]
     fn structural_items_filtered_by_name() {
         // §4.1: フォルダ / ZIP / 変換対象アーカイブもファイル名で一貫して絞り込む。
@@ -59458,6 +61101,7 @@ mod ctrl_f_structural_filter_tests {
 #[cfg(test)]
 mod prefetch_gate_tests {
     use super::*;
+    use crate::app::tests::phase_c_support::setup_app;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -59488,6 +61132,55 @@ mod prefetch_gate_tests {
                 reason: BlockReason::VisibleStillLoading { pending: 5 },
             }
         );
+    }
+
+    /// A seek-bar drag has to reach this gate, or thumbnail prefetch never pauses.
+    ///
+    /// The gate itself was already right; nothing was telling it that a drag had happened,
+    /// because a pointer drag is not a wheel, a key, or a grid touch. Without this the
+    /// decision below is `Allow`, and prefetch floods while the user drags - measured at
+    /// 1,410 prefetch enqueues in twelve seconds on 2026-09-04.
+    ///
+    /// This covers the contract, not the wiring: it calls the helper directly, so it would
+    /// still pass if the seek bar stopped calling it. Driving the drag itself needs the UI
+    /// harness; until then that half is checked on a real machine.
+    #[test]
+    fn a_fullscreen_seek_drag_counts_as_scroll_for_the_prefetch_gate() {
+        let mut app = setup_app();
+        assert!(
+            app.last_prefetch_scroll_at.is_none(),
+            "precondition: nothing has scrolled yet, so the gate would allow"
+        );
+        assert!(matches!(
+            decide_prefetch_allowed(Instant::now(), app.last_prefetch_scroll_at, 0),
+            PrefetchDecision::Allow { .. }
+        ));
+
+        app.note_fullscreen_seek_activity();
+
+        let marked = app
+            .last_prefetch_scroll_at
+            .expect("the drag must reach the prefetch gate's clock");
+        assert!(matches!(
+            decide_prefetch_allowed(marked, Some(marked), 0),
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { .. }
+            }
+        ));
+    }
+
+    /// The drag must not reset the grid's own scroll bookkeeping, which the grid owns.
+    #[test]
+    fn a_fullscreen_seek_drag_leaves_grid_scroll_state_alone() {
+        let mut app = setup_app();
+        app.scroll_settle_state = None;
+        let before_offset = app.last_scroll_offset_y_tracked;
+        let before_event = app.last_scroll_event_at;
+
+        app.note_fullscreen_seek_activity();
+
+        assert_eq!(app.last_scroll_offset_y_tracked, before_offset);
+        assert_eq!(app.last_scroll_event_at, before_event);
     }
 
     #[test]
@@ -59896,6 +61589,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     app.conceal_page_keys.insert(key.clone());
     app.comic_page_keys.insert(key.clone());
     app.rotation_page_keys.insert(key.clone());
+    app.export_crop_page_keys.insert(key.clone());
     app.tags_cache.insert(key.clone(), vec!["old".into()]);
 
     app.apply_metadata_cleanup_result(&crate::metadata_cleanup::DeleteReport {
@@ -59910,6 +61604,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     assert!(!app.conceal_page_keys.contains(&key));
     assert!(!app.comic_page_keys.contains(&key));
     assert!(!app.rotation_page_keys.contains(&key));
+    assert!(!app.export_crop_page_keys.contains(&key));
     assert!(!app.tags_cache.contains_key(&key));
 }
 
@@ -64001,6 +65696,51 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
 }
 
 #[test]
+fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    app.fullscreen_idx = Some(idx);
+    app.settings.still_seek_strip_visible = false;
+    let ctx = egui::Context::default();
+
+    let press = |app: &mut App, key: egui::Key, modifiers: egui::Modifiers| {
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = ctx.end_pass();
+    };
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+
+    press(&mut app, egui::Key::S, shift);
+    assert!(app.settings.still_seek_strip_visible);
+    press(&mut app, egui::Key::S, shift);
+    assert!(!app.settings.still_seek_strip_visible);
+
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = F13\n");
+    press(&mut app, egui::Key::S, shift);
+    assert!(!app.settings.still_seek_strip_visible);
+    press(&mut app, egui::Key::F13, egui::Modifiers::NONE);
+    assert!(app.settings.still_seek_strip_visible);
+
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = none\n");
+    press(&mut app, egui::Key::S, shift);
+    assert!(app.settings.still_seek_strip_visible);
+}
+
+#[test]
 fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
@@ -67315,7 +69055,7 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
     let context_id = app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
     assert_eq!(app.active_viewer_context_id(), Some(context_id));
     assert!(
         app.active_detached_context_is_at_rest(),
@@ -67361,7 +69101,7 @@ fn the_gamepad_goes_to_the_main_window_when_that_is_the_surface() {
     let context_id = app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
     assert_eq!(app.active_viewer_context_id(), Some(context_id));
     assert!(
         app.active_detached_context_is_at_rest(),
@@ -67397,7 +69137,7 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
     app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
 
     for (surface, goes_to_context) in [
         (crate::app::ActionSurface::MainWindow, false),
@@ -67489,7 +69229,7 @@ fn what_the_detached_window_holds_decides_which_dpad_branch_runs() {
             bundle.items = vec![item];
             bundle.fullscreen_idx = Some(0);
         });
-        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
         // 前面が別ウィンドウ = 直近に配った面がビューア。前面 HWND はテストから触れない。
         app.detached_window_manager
             .note_input_surface(crate::app::ActionSurface::Viewer);
@@ -67661,7 +69401,7 @@ fn stale_prepare_claim_returns_to_awaiting_host_instead_of_rerouting_to_global_s
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.detached_window_hwnd_set(ACTIVE_WINDOW, ACTIVE_HOST);
     app.begin_active_detached_session(ACTIVE_WINDOW, DetachedSource::Video);
-    app.detached_viewer_window_id = Some(WINDOW_ID);
+    app.set_detached_window_binding_for_test(Some(WINDOW_ID));
     app.detached_window_hwnd_set(WINDOW_ID, HOST_H);
     app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_H]);
     let lease = DetachedSessionLease {
@@ -67824,7 +69564,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
         app.active_detached_session.map(|session| session.window_id),
         Some(SIBLING_WINDOW)
     );
-    assert_eq!(app.detached_viewer_window_id, Some(SIBLING_WINDOW));
+    assert_eq!(app.detached_viewer_window_id(), Some(SIBLING_WINDOW));
     assert_eq!(
         app.locate_window_context(SIBLING_WINDOW)
             .expect("sibling binding after stale cleanup")
@@ -68035,7 +69775,7 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     let (ctx, requests) = repaint_request_probe();
     app.push_window_context_for_test(&ctx, 99, |sibling| {
         sibling.fullscreen_idx = Some(23);
-        sibling.detached_viewer_window_id = Some(99);
+        sibling.set_detached_window_binding_for_test(Some(99));
     });
     app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
     app.pending_detached_video_host_resync = true;
@@ -68047,7 +69787,7 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     }));
     app.with_window_viewer_context(99, |sibling| {
         assert_eq!(sibling.fullscreen_idx, Some(23));
-        assert_eq!(sibling.detached_viewer_window_id, Some(99));
+        assert_eq!(sibling.detached_viewer_window_id(), Some(99));
     })
     .unwrap();
 }
@@ -68465,9 +70205,11 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
     fn the_presenter_config_carries_the_requested_lock() {
         let requested = crate::video::NativeBarLockState {
             top_locked: true,
-            bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
+            bottom_lock: crate::settings::BottomBarLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
         assert_eq!(config_for(requested).bar_lock, requested);
     }
@@ -68477,9 +70219,11 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
     fn the_gap_is_clamped_the_same_way_it_is_after_a_later_change() {
         let requested = crate::video::NativeBarLockState {
             top_locked: false,
-            bottom_lock: crate::settings::VideoBottomLock::BarOnly,
+            bottom_lock: crate::settings::BottomBarLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
             config_for(requested).bar_lock.fixed_bar_gap_px,
@@ -68494,7 +70238,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         let mut app = setup_app();
         app.settings.video_top_bar_locked = true;
         app.settings
-            .set_video_bottom_lock(crate::settings::VideoBottomLock::BarAndStrip);
+            .set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
         app.settings.fullscreen_fixed_bar_gap_px = 6;
 
         let state = app.native_bar_lock_state();
@@ -68502,7 +70246,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         assert!(state.top_locked);
         assert_eq!(
             state.bottom_lock,
-            crate::settings::VideoBottomLock::BarAndStrip
+            crate::settings::BottomBarLock::BarAndStrip
         );
         assert_eq!(state.fixed_bar_gap_px, 6);
     }

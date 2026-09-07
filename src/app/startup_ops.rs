@@ -818,7 +818,7 @@ impl App {
                 if !opened_target {
                     let session_window_id =
                         app.active_detached_session.map(|session| session.window_id);
-                    let closing_window_id = session_window_id.or(app.detached_viewer_window_id);
+                    let closing_window_id = session_window_id.or(app.detached_viewer_window_id());
                     app.begin_active_detached_session_close("bookmark_media_detached_open_failed");
                     app.finish_active_detached_session_close("bookmark_media_detached_open_failed");
                     app.close_fullscreen();
@@ -835,7 +835,7 @@ impl App {
                 let window_id = app
                     .active_detached_session
                     .map(|session| session.window_id)
-                    .or(app.detached_viewer_window_id)
+                    .or(app.detached_viewer_window_id())
                     .expect("opened detached bookmark media must own a window");
                 app.reserve_window_binding_for_build(window_id);
                 BuildOutcome::Commit

@@ -11,6 +11,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
 
 サブコマンド:
     summary             全イベントの件数とカテゴリ別 breakdown を表示
+    metadata-search     Ctrl+F メタ検索の Pass 1 / Pass 2 時間・読取量を表示
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
     page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
                         --check でページ送りの不変条件を検査
@@ -47,6 +48,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+from statistics import median
 
 
 # -----------------------------------------------------------------------
@@ -117,6 +119,57 @@ def cmd_summary(events: list[dict]) -> None:
         duration = t_max - t_min
         fps = frame_count / duration if duration > 0 else 0.0
         print(f"フレーム数           : {frame_count} (平均 {fps:.1f} fps)")
+
+
+def cmd_metadata_search(events: list[dict]) -> None:
+    rows = [
+        e
+        for e in events
+        if e.get("cat") == "search" and e.get("kind") == "metadata_filter_done"
+    ]
+    if not rows:
+        print("(search.metadata_filter_done 0 件)")
+        return
+
+    print(
+        f"{'t':>9} {'pass1':>9} {'pass2':>9} {'total':>9} "
+        f"{'scan':>11} {'reads':>7} {'MiB':>9} {'hits':>6} {'cancel':>7}"
+    )
+    print("-" * 91)
+    for event in rows:
+        print(
+            f"{event.get('t', 0.0):9.3f} "
+            f"{event.get('pass1_ms', 0.0):9.1f} "
+            f"{event.get('pass2_ms', 0.0):9.1f} "
+            f"{event.get('total_ms', 0.0):9.1f} "
+            f"{event.get('items_scanned', 0):>5}/{event.get('items_total', 0):<5} "
+            f"{event.get('pass2_file_reads', 0):7d} "
+            f"{event.get('bytes_read', 0) / (1024 * 1024):9.3f} "
+            f"{event.get('matches', 0):6d} "
+            f"{str(bool(event.get('cancelled', False))):>7}"
+        )
+
+    totals = [float(event.get("total_ms", 0.0)) for event in rows]
+    pass2 = [float(event.get("pass2_ms", 0.0)) for event in rows]
+    bytes_read = [int(event.get("bytes_read", 0)) for event in rows]
+    print()
+    print(
+        f"total ms: n={len(rows)} min={min(totals):.1f} "
+        f"median={median(totals):.1f} max={max(totals):.1f}"
+    )
+    print(
+        f"pass2 ms: min={min(pass2):.1f} median={median(pass2):.1f} max={max(pass2):.1f}"
+    )
+    print(
+        f"bytes: total={sum(bytes_read) / (1024 * 1024):.3f} MiB "
+        f"median/search={median(bytes_read) / (1024 * 1024):.3f} MiB"
+    )
+    unmeasured = sum(int(event.get("unmeasured_video_reads", 0)) for event in rows)
+    if unmeasured:
+        print(
+            f"note: FFmpeg 内部の実 read byte 数を取得できない動画 read {unmeasured} 件は "
+            "bytes に含まれません"
+        )
 
 
 # -----------------------------------------------------------------------
@@ -2902,6 +2955,7 @@ def main() -> None:
     parser.add_argument("jsonl", type=Path, help="perf_events.jsonl のパス")
     subs = parser.add_subparsers(dest="cmd", required=True)
     subs.add_parser("summary")
+    subs.add_parser("metadata-search")
     subs.add_parser("latency")
     p_page_turn = subs.add_parser("page-turn")
     p_page_turn.add_argument(
@@ -2991,6 +3045,8 @@ def main() -> None:
 
     if args.cmd == "summary":
         cmd_summary(events)
+    elif args.cmd == "metadata-search":
+        cmd_metadata_search(events)
     elif args.cmd == "latency":
         cmd_latency(events)
     elif args.cmd == "page-turn":

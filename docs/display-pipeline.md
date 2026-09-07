@@ -278,6 +278,38 @@ ZipFile / PdfFile / ConvertibleArchive の代表サムネには適用しない (
 
 ---
 
+### 1.6 静止画シーク列・プレビューの保存回転
+
+列と hover preview は `RotationCache` の確定値だけを読み、未読値は
+`start_still_seek_rotations` → `still-seek-rotations` worker → `poll_still_seek_rotations`
+で取得する。通常画像・ZIP・PDF・変換アーカイブとも本体と同じ `page_path_key` を使う。
+DB の read-only open / SELECT は worker 内に閉じ、UI は要求のキー作成・`try_recv`・
+メモリへの merge だけを行う。回転キャッシュが全件ヒットした一括取得も DB ハンドルへ進まない。
+
+回転が未取得の Loaded サムネイルは列では `Unavailable` とする。現在ページから外へ育つ
+既存レイアウトがその側で止まり、0°で一度置いてから回転後のセル幅へ動くことを防ぐ。
+サムネイルの `Failed` は従来の正方形セルのまま。DB open / SELECT 失敗は worker で診断し、
+従来の回転取得と同じく `Rotation::None` を確定値にする。回転は付加情報であり、読み出し失敗で
+列を永久に止めず、そのセッションでの閲覧を継続するためである。再取得は通常の失効境界で行う。
+
+見開きの組み合わせとページ番号も回転に依存する。overlay はこの間接経路も同期 SELECT へ
+進めず、nav の未読回転を 1 worker 最大 256 キーで順次準備する。初回で表示単位がまだ無い場合は
+読み込み表示とし、見開きの組み合わせを推測しない。既に同じ nav / items 世代 / 見開きモード /
+ずらし位置の表示単位がある場合は、その snapshot を再取得中も使って入力とラベルを維持する。
+これにより回転失効を挟んだドラッグの release を欠落させない。セルとプレビューの向きは引き続き
+確定値だけを使い、未取得セルの側で止める。確定済み nav の確認は同じ immutable `Arc` のメモで省略し、
+idle frame で本全体を再走査しない。本体側の見開き解決規則・入力・着地の仕様は変えない。
+
+プレビューの 1 枚は `StillSeekPreviewPage { texture, rotation }` として渡す。吹き出し・画像枠は
+`rotated_display_size` で 90° / 270° の縦横を入れ替えてから決め、描画は本体・列と共通の
+`draw_rotated_image` を使う。見開きも画面上の左右順を保ち、2 枚それぞれの回転と寸法を使う。
+テクスチャまたは回転が未取得のプレビュー枠は「読み込み中…」とする。
+
+回帰は `src/ui_fullscreen/tests/still_seek_rotation.rs`。実 overlay を実行したスレッドの
+RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の
+向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
+`still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
+
 ## 2. フルスクリーン表示パイプライン
 
 ### 2.1 エントリポイント
@@ -1249,7 +1281,8 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 生成元となった source pixel 領域の x / y / width / height を記録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
-`FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
+実表示と固定状態から解決した `StillSeekGeometry::reserved_height`、上部情報バー固定時は
+`TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
 両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
 固定領域の予約は各バーの描画可否と同じ述語を使う。特に編集／注釈・範囲キャプチャ・音楽ビューで
 上部バーを抑止するときは `TOP_BAR_HEIGHT` も予約せず、非表示バー由来の黒帯を残さない。
@@ -1286,6 +1319,45 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
 クリック先が逆になるような独立判定を置かない。
+列を描画できるナビゲーションかどうかは、キャッシュ済み `FsSeekInfo` の
+`has_page_strip_content()` が一元判定する。geometry と内容描画は同じ述語を読み、
+画像・動画などの混在時は列高を予約せず、通常バーの件数サマリーだけを表示する。
+この判定は初回の画像フィット計算でもキャッシュを解決して使うため、描画後の情報に依存しない。
+通常バー非表示時の右下ページ番号は固定状態でも表示し、固定された通常バーが実際に表示される
+フレームだけ重複を抑止する。
+
+サムネイル列は現在ページを帯の中央へ置き、左右へ交互に 1 ページずつ広げる。各セル幅は
+そのページ自身のロード済み `ThumbnailState::Loaded` texture の縦横比 × セル高で決め、
+セル高の 35% を下限とする（横長側の上限は設けない）。`Pending` / `Evicted` へ当たった側は
+セルを置かずに成長を止め、`Failed` は結果確定済みとしてセル高と同じ正方形を置いて先へ進む。
+配置済みセルの source 範囲から両端へ `STILL_SEEK_STRIP_OVERSCAN_CELLS` だけ広げた範囲を
+priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
+セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
+同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
+列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer の X/Y を
+保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ押下時点からの総 x 移動量と
+同じ高さ preset の `window_cell_width_points()` を渡し、整数 source position へ丸めて先頭 / 末尾で
+clamp する。右へ引くと中央 source position は小さくなる。判定順序も動画と同じく、まず
+`strip_drag_closes_downward` で下ドラッグ close を決め、close でない場合だけ中央を動かす。
+静止画側の呼び出し境界は `min(strip_rect.bottom(), full_rect.bottom() - 1 / pixels_per_point)`
+とし、通常バーを隠して列下端が画面下端になる場合も、最後の物理ピクセルで close できる。
+共有関数の既存条件（押下原点から 24pt 超、下方向の移動量が横方向を上回る）は維持する。
+release フレームも最終 pointer を使って close / 中央確定を判定し、通常バーの横シークも
+`Track(Scrub)` の release で最終位置へ着地する。egui の `total_drag_delta()` は release 時に
+取得できないため、close の方向はジェスチャが保持した押下原点から計算する。
+横ドラッグ中はページを移動せず、release は `StripCommitted` としてその中央を保持する。セルの
+click だけが従来のページ着地を行う。実際の現在ページが変わった次の描画では committed center を
+破棄して新しい `current_pos` へ戻す一方、現在ページの強調は帯の中央とは独立して常に実際の
+`fs_idx` を指すため、帯の表示範囲外なら強調セルは出ない。ページシーク行の上ドラッグは動画と
+共有する `SeekRowGesture` を引き続き使い、通常バー本体の横ドラッグによるページシークは変えない。
+
+`StillSeekGesture` 全体（進行中の操作と `StripCommitted` の確定中心）は
+`ViewerContextBundle` に属する。App 上の field は mount 中の context の投影で、
+context の交換・復帰は同じ値を退避・復元する。main grid と viewer の分割では viewer 側へ移す。
+context の pause は進行中の Track / Strip だけを中断し、確定中心を残す。
+fullscreen の close はその context の状態を Idle にし、retire は bundle ごと破棄する。
+別窓の現在ページや close によって他の context の中心を消してはならない。
+
 通常の左右カーソルキーによるページ移動は
 `fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
@@ -1492,6 +1564,25 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 横長ページの次の縦長ページから通常の見開きペアリングを再開する。
 2 ページのペア化対象は `GridItem::Image` / `ZipImage` / `PdfPage` だけである。
 `Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
+
+組んだ `Vec<SpreadDisplayUnit>` は viewer context ごとの `SpreadDisplayUnitsCache` で再利用する。
+token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`landscape_epoch` と、
+**nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
+ページ読みと連結読みの列切替を混同しない。
+
+nav index 列自体は `ViewerNavigationCaches` が `Arc<Vec<usize>>` で保持する。動画を含む
+ページ単位列、動画を除く連結読み・先読み列、seek 情報の 3 つを 1 owner にまとめ、
+表示集合 / 詳細 sort / snapshot の index 空間変更では `invalidate` 1 回で同時に破棄する。
+items 世代と連結方式は owner の source key でも照合する。owner は
+`ViewerContextBundle` と一緒に交換し、main / detached 間で共有しない。
+
+未知寸法は従来どおり縦長と同じ `false` に分類する。`fs_cache`、thumbnail の source / layout 寸法、
+`page_dims_cache` への記録で cached nav 上の実効的な横長性が反転した場合だけ
+`landscape_epoch` を進める。したがって未知→縦長では再構築せず、未知 / 縦長→横長では
+同じ frame の後続参照から再構築する。訂正寸法や保存回転により横長→縦長となる場合も反転として
+失効する。回転 cache の一括破棄 / 部分破棄は、次の参照で対象 nav の回転を一括再取得してから
+同じ分類を照合する。cache と epoch は main / detached 間で共有しない。
+
 前後移動も同じ表示ユニット列を使い、`FsPageNav::Target(index)` または
 `FsPageNav::Boundary` として解決する。見開き末尾から次へ進む入力を raw page delta に戻さないため、
 内部 index が同じ見開きの片側へ移ることはなく、最初の入力で末尾ヒントを表示する。キー、ホイール、
@@ -2254,21 +2345,18 @@ upload だけを速くすることではない。
 通常表示では範囲外を暗転するだけで、capture / export の最終段で初めて切り出す。
 そのためアップスケール ON/OFF や補正スライダー変更で編集マスクの解像度は変わらない。
 
-製本追加は表示 cache を読まず、UI thread で固定した `BakedEditSnapshot` を book worker の
-headless compositor が復元する。順序は raw → erase → local_adjust → conceal → adjustment →
-comic → rotation → export crop。表示専用の global AI upscale / denoise / smart sharpen /
-colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fullscreen / stack の
-どこから追加しても原寸の edit composite になる。編集が 1 つも無い File / ZIP entry は
+製本、単枚 / 一括 Ctrl+E、外部ツールは表示 cache を完成画素の入力にせず、
+`CompositeSource` と `BakedEditSnapshot` から worker の headless compositor が復元する。
+順序は raw → erase → local_adjust → conceal → adjustment → AI → smart sharpen → colorize →
+Creative LUT → post-filter → comic → rotation → export crop。各機能の `BakeStage` はこの順序を
+変えず、どこまで進むかだけを決める。製本で編集が 1 つも無い File / ZIP entry は従来どおり
 この経路へ入れず byte copy を維持する。
 
-Ctrl+E の隠蔽プリセット出力 (`_1`〜`_4`) は逆に、表示専用段を **落とさない**。`_0` は
-表示スナップショット (= 上の 12 段を通った final composite + 注釈) をそのまま書き出し、
-`_1`〜`_4` は 4 (隠蔽) の入力まで戻って隠蔽のパラメータだけを差し替え、そこから先を同じ順で
-流し直す (`export_dialog::compose_conceal_variant`)。final AI も掛け直すので、プリセット
-1 枚につき推論が 1 回走る。段を落とすと `_0` と `_1`〜`_4` が別物 (AI 拡大の有無で寸法まで
-違う) になるため、製本の「表示専用段を飛ばす」規則をここへ持ち込まない。逆に、隠蔽が
-焼き込み済みの final composite へマスクを重ねると隠蔽が二重に掛かる。v1.1.0 はこれを
-避けるために `conceal_mask: None` を固定し、結果としてプリセット出力ごと無効化していた。
+Ctrl+E の隠蔽プリセット出力 (`_1`〜`_4`) も、`_0` と同じ source・編集 snapshot・選択段を
+`books::compose_export_entry` へ渡す。`_0` は override を付けず snapshot の現在の隠蔽 preset を
+1 回だけ適用し、`_1`〜`_4` はその preset だけを差し替える。隠蔽以外の入力と段は同一なので、
+AI を含む段では各エントリの合成中に AI も実行する。焼き込み済み画素へマスクを重ねないため、
+隠蔽が二重に掛からない。
 
 ### 3.1 詳細
 
@@ -2414,10 +2502,12 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 昇格 worker / upload backlog は load purpose、items generation、target idx を保持する。別ページへ
 移動した昇格は cancel し、完了が遅れても target idx が現在ページでなければ適用しない。昇格失敗は
 `Failed` entry にせず第1フレームを `PromotionFailed` の static として残す。進行表示は、現ページの
-全フレーム展開を所有する typed load purpose から導く。一覧から直接開いた初回 `Display` と、
-先読み第1フレームからの `AnimationPromotion` のどちらも同じ述語で扱い、150ms 以上続いたときだけ
-右上3段目へ表示する。この150msは競合を吸収する時間窓ではなく、短時間処理を提示するかどうかだけの
-UI ゲートである。
+全フレーム展開を所有する状態から導く。一覧から直接開いた初回 `Display` はそれだけでは表示条件に
+せず、worker が GIF の2枚目、APNG の `is_apng()`、Animated WebP の `has_animation()` で複数
+フレーム形式を確認した非終端信号が届いた後だけ対象にする。先読み第1フレームからの
+`AnimationPromotion` は既に形式確認済みなので、従来どおり typed purpose の開始時刻を使う。
+どちらも確認 / 開始から150ms以上続いたときだけ右上3段目へ表示する。この150msは競合を吸収する
+時間窓ではなく、短時間処理を提示するかどうかだけの UI ゲートである。
 
 ### 4.2 サムネイル / フルスクリーンの整合性
 

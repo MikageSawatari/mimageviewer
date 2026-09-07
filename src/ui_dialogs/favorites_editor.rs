@@ -136,6 +136,7 @@ impl App {
         let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
         let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
+        let mut favorite_view_resets: Vec<uuid::Uuid> = Vec::new();
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
@@ -429,7 +430,7 @@ impl App {
                     let n = self.settings.favorites.len();
                     egui::Grid::new("fav_edit_grid")
                         .striped(true)
-                        .num_columns(7)
+                        .num_columns(8)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                                     // ── ヘッダ (状態は各索引列にインライン) ──
@@ -445,6 +446,8 @@ impl App {
                                     .on_hover_text(
                                         "このお気に入り専用の標準設定を持たせます",
                                     );
+                                    ui.label(egui::RichText::new("表示状態").strong())
+                                        .on_hover_text("このお気に入りに自動記憶した表示状態");
                                     ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
                                         .on_hover_text(
                                             "フォルダ / ZIP / PDF を名前で横断検索\n\
@@ -513,6 +516,14 @@ impl App {
                                         standard_resp.on_hover_text(format!(
                                             "お気に入り「{favorite_name}」に、このお気に入り専用の標準設定を持たせます"
                                         ));
+
+                                        if self.favorite_view_states.contains_key(&fav_id) {
+                                            if ui.button("リセット").clicked() {
+                                                favorite_view_resets.push(fav_id);
+                                            }
+                                        } else {
+                                            ui.weak("未記憶");
+                                        }
 
                                         // 名前索引: チェック + 状態インライン
                                         ui.horizontal(|ui| {
@@ -778,6 +789,9 @@ impl App {
                 self.request_favorite_specific_default_clear(favorite_id, favorite_name, fallback);
             }
         }
+        for favorite_id in favorite_view_resets {
+            self.reset_favorite_view_state(favorite_id);
+        }
 
         // ── 削除確認 ────────────────────────────────────────────────
         if let Some(fav_id) = self.favorite_delete_confirm {
@@ -805,7 +819,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(
-                                "コンテナ索引・アイテム索引・お気に入り標準設定も解除されます。",
+                                "コンテナ索引・アイテム索引・お気に入り標準設定・記憶した表示状態も解除されます。",
                             )
                             .weak(),
                         );
@@ -858,6 +872,7 @@ impl App {
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
             // 効いたまま、という不整合を避ける。
             self.clear_favorite_default(removed.id);
+            self.remove_favorite_view_state(removed.id);
             any_setting_dirty = true;
         }
 

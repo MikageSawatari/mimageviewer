@@ -1485,6 +1485,8 @@ pub enum KeyAction {
     ExternalToolForContainer,
     GridSelectAll,
     GridDeselect,
+    GridCutFiles,
+    GridCopyFiles,
     GridToggleCheck,
     GridDelete,
     GridRename,
@@ -1582,6 +1584,7 @@ pub enum KeyAction {
     FsSpreadShiftPrev,
     FsSpreadShiftNext,
     FsSlideshow,
+    FsSeekStripToggle,
     FsSpaceCheck,
     FsCapture,
     FsAddToActiveBook,
@@ -1972,6 +1975,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ExternalToolForContainer,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
+    KeyAction::GridCutFiles,
+    KeyAction::GridCopyFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridRename,
@@ -2069,6 +2074,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
     KeyAction::FsSlideshow,
+    KeyAction::FsSeekStripToggle,
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
     KeyAction::FsAddToActiveBook,
@@ -3564,6 +3570,8 @@ impl KeyAction {
             ExternalToolForContainer => "ExternalToolForContainer",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
+            GridCutFiles => "GridCutFiles",
+            GridCopyFiles => "GridCopyFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridRename => "GridRename",
@@ -3661,6 +3669,7 @@ impl KeyAction {
             FsSpreadShiftPrev => "FsSpreadShiftPrev",
             FsSpreadShiftNext => "FsSpreadShiftNext",
             FsSlideshow => "FsSlideshow",
+            FsSeekStripToggle => "FsSeekStripToggle",
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
             FsAddToActiveBook => "FsAddToActiveBook",
@@ -4158,6 +4167,8 @@ impl KeyAction {
             ExternalToolForContainer => "現在のフォルダー / 本を外部ツールで開く",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
+            GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
+            GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridRename => "選択中の実ファイル/実フォルダの名前を変更する",
@@ -4259,6 +4270,7 @@ impl KeyAction {
             FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
             FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
+            FsSeekStripToggle => "画像フルスクリーンのサムネイル列表示を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
@@ -4271,7 +4283,7 @@ impl KeyAction {
             FsRotateCcw => "現在の画像を左に90度回転する",
             FsImageAnalysis => "画像分析モードを開く",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
-            FsPanorama => "360度パノラマモードを切り替える",
+            FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
@@ -4630,6 +4642,8 @@ impl KeyAction {
             | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
+            | GridCutFiles
+            | GridCopyFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -4712,6 +4726,7 @@ impl KeyAction {
             | FsStackJumpPrev
             | FsStackJumpNext
             | FsSlideshow
+            | FsSeekStripToggle
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
@@ -5046,6 +5061,8 @@ impl KeyAction {
             | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
+            | GridCutFiles
+            | GridCopyFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -5143,6 +5160,7 @@ impl KeyAction {
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
             | FsSlideshow
+            | FsSeekStripToggle
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
@@ -5516,6 +5534,8 @@ impl KeyAction {
             | ExternalToolForContainer => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
+            GridCutFiles => ChordList::one(Chord::ctrl(X)),
+            GridCopyFiles => ChordList::one(Chord::ctrl(C)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridRename | GridReload => ChordList::EMPTY,
@@ -5611,6 +5631,7 @@ impl KeyAction {
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
             FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
+            FsSeekStripToggle => ChordList::one(Chord::shift(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
@@ -7387,9 +7408,7 @@ impl Keymap {
             "# - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、\n",
         );
         out.push_str("#   OS が予約しているショートカットは keymap.ini では上書きできません。\n");
-        out.push_str(
-            "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
-        );
+        out.push_str("# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui の貼り付け、\n");
         out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーション、\n");
         out.push_str("#   サムネイル一覧の Shift+矢印範囲選択は固定です。\n");
         out.push_str("#\n");
@@ -9443,6 +9462,54 @@ mod tests {
                 action.ini_name()
             );
         }
+    }
+
+    #[test]
+    fn still_seek_strip_toggle_has_fs_image_shift_s_contract_without_video_conflict() {
+        let action = KeyAction::FsSeekStripToggle;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::S)]
+        );
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            KeyAction::VideoSeekStripCycle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(!command_scopes_overlap(
+            action.context(),
+            KeyAction::VideoSeekStripCycle.context()
+        ));
+
+        let rebound = Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = F13\n");
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F13)]
+        );
+        let disabled = Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
+
+        let same_chord_in_disjoint_contexts = Keymap::from_ini_str(
+            "[FsImage]\nFsSeekStripToggle = Shift+S\n\
+             [FsVideo]\nVideoSeekStripCycle = Shift+S\n",
+        );
+        assert!(
+            !same_chord_in_disjoint_contexts
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| {
+                    (conflict.action == action
+                        && conflict.other_action == Some(KeyAction::VideoSeekStripCycle))
+                        || (conflict.action == KeyAction::VideoSeekStripCycle
+                            && conflict.other_action == Some(action))
+                })
+        );
     }
 
     #[test]

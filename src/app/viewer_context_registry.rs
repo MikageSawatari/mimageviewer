@@ -217,6 +217,16 @@ impl<P> ContextTable<P> {
         self.window_of.get(&id).copied()
     }
 
+    /// Private reservation for the builder, published ownership for a mounted payload.
+    /// The reservation stays invisible to locate_window_context until commit (I8).
+    fn projected_window(&self) -> Option<u64> {
+        assert!(self.pending.is_none());
+        match self.projection {
+            Projection::Mounted(id) => self.window_for_context(id),
+            Projection::Building { pending_bind, .. } => pending_bind,
+        }
+    }
+
     fn ids(&self) -> Vec<ViewerContextId> {
         assert!(self.pending.is_none());
         let mut ids = Vec::with_capacity(self.slots.len() + 1);
@@ -704,6 +714,7 @@ pub(in crate::app) enum RetireContextError {
 pub(in crate::app) struct ViewerContextBundle {
     address: String,
     current_folder: Option<PathBuf>,
+    favorite_view_context: FavoriteViewContextState,
     navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
@@ -737,6 +748,8 @@ pub(in crate::app) struct ViewerContextBundle {
     idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages_shared: Arc<std::sync::RwLock<std::collections::HashSet<usize>>>,
     thumbnail_eviction_generation: Option<u64>,
     details_thumb_suppression_applied: bool,
     details_hover_thumb_idx: Option<usize>,
@@ -795,8 +808,9 @@ pub(in crate::app) struct ViewerContextBundle {
     search_filter: Option<std::collections::HashSet<usize>>,
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
-    rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    rotation_cache: crate::rotation_cache::RotationCache,
     page_dims_cache: crate::page_dims::PageDimsCache,
+    spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
     /// 現在の viewer context だけに効く評価 filter の一時解除 anchor。
     ///
@@ -839,6 +853,9 @@ pub(in crate::app) struct ViewerContextBundle {
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
     panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
+    /// context を mount した間だけ App field へ投影する。
+    video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 で見ているという意図 (+ 選んだ投影方式)。フルスクリーンを閉じても残る
     /// ので、App グローバルに置くと別ウィンドウの 360 が混ざる (backlog §1.145)。
     panorama_intent: crate::panorama::PanoramaSessionIntent,
@@ -914,6 +931,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     fs_vertical_scroll: f32,
     fs_seek_drag_active: bool,
+    fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
     fs_seek_overlay_visible: bool,
     fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
@@ -954,8 +972,7 @@ pub(in crate::app) struct ViewerContextBundle {
     pending_auto_fs_open: bool,
     pending_return_to_parent: bool,
     pdf_placeholder_count: Option<u32>,
-    cached_nav_indices: Option<Vec<usize>>,
-    cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
     fs_nav_locked_gen: Option<u64>,
     fs_nav_dropped_block_signature: Option<String>,
     fs_nav_dropped_block_count: u32,
@@ -1068,13 +1085,6 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => app.last_viewer_sync_stamp.as_ref(),
             ContextRefSource::AtRest(bundle) => bundle.viewer_session.last_sync_stamp.as_ref(),
-        }
-    }
-
-    pub(in crate::app) fn viewer_session_detached_window_id(self) -> Option<u64> {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.detached_viewer_window_id,
-            ContextRefSource::AtRest(bundle) => bundle.viewer_session.detached_window_id,
         }
     }
 
@@ -1280,6 +1290,12 @@ const _: () = {
 #[cfg(windows)]
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
+        if self.items_generation != items_generation {
+            self.still_seek_thumbnail_pages.clear();
+            if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+                shared.clear();
+            }
+        }
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
@@ -1301,6 +1317,7 @@ impl ViewerContextBundle {
         Self {
             address: String::new(),
             current_folder: None,
+            favorite_view_context: FavoriteViewContextState::default(),
             navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
             zip_nav: None,
@@ -1330,6 +1347,10 @@ impl ViewerContextBundle {
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages_shared: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
@@ -1373,8 +1394,9 @@ impl ViewerContextBundle {
             search_filter: None,
             search_filter_origin_folder: None,
             checked: std::collections::HashSet::new(),
-            rotation_cache: std::collections::HashMap::new(),
+            rotation_cache: crate::rotation_cache::RotationCache::default(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
+            spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
             rating_session_write_seen_generation: 0,
@@ -1398,6 +1420,7 @@ impl ViewerContextBundle {
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
             panorama_state: None,
+            video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
@@ -1452,6 +1475,7 @@ impl ViewerContextBundle {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
+            fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             continuous_page_transitions: std::collections::HashMap::new(),
@@ -1481,8 +1505,7 @@ impl ViewerContextBundle {
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
-            cached_nav_indices: None,
-            cached_fs_seek_info: None,
+            viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
             fs_nav_locked_gen: None,
             fs_nav_dropped_block_signature: None,
             fs_nav_dropped_block_count: 0,
@@ -1542,6 +1565,7 @@ impl App {
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_gesture.interrupt();
         self.fs_seek_overlay_visible = false;
         self.pending_auto_fs_open = false;
         self.pending_return_to_parent = false;
@@ -1583,7 +1607,7 @@ impl App {
     #[cfg(windows)]
     pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
         self.viewer_presentation = ViewerPresentation::DetachedWindow;
-        self.detached_viewer_window_id = Some(window_id);
+        self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
         self.detached_viewer_open_next_still_detached_once = false;
         self.last_viewer_sync_stamp = None;
@@ -1617,6 +1641,11 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices_preserving_facet_scope();
         }
+        let favorite_view_now = std::time::Instant::now();
+        self.capture_active_favorite_view_change_at(favorite_view_now);
+        let favorite_view_inherited =
+            crate::settings::FavoriteViewState::from_settings(&self.settings);
+        self.settings.clear_favorite_view_overlay();
         #[cfg(test)]
         panic_at_viewer_context_swap_interior_for_test();
         macro_rules! swap_field {
@@ -1628,6 +1657,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            favorite_view_context,
             navigation_scope,
             archive_source_override,
             zip_nav,
@@ -1657,6 +1687,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -1702,6 +1734,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,
@@ -1725,6 +1758,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -1779,6 +1813,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -1808,8 +1843,7 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -1862,6 +1896,7 @@ impl App {
 
         swap_field!(address);
         swap_field!(current_folder);
+        swap_field!(favorite_view_context);
         swap_field!(navigation_scope);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
@@ -1891,6 +1926,8 @@ impl App {
         swap_field!(idle_upgrade_cache_bypass_ineligible);
         swap_field!(keep_range);
         swap_field!(keep_set);
+        swap_field!(still_seek_thumbnail_pages);
+        swap_field!(still_seek_thumbnail_pages_shared);
         swap_field!(thumbnail_eviction_generation);
         swap_field!(details_thumb_suppression_applied);
         swap_field!(details_hover_thumb_idx);
@@ -1939,6 +1976,7 @@ impl App {
         swap_field!(checked);
         swap_field!(rotation_cache);
         swap_field!(page_dims_cache);
+        swap_field!(spread_display_units_cache);
         swap_field!(rating_cache);
         swap_field!(rating_session_write_seen_generation);
         swap_field!(metadata_import_refresh_index);
@@ -1962,7 +2000,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
         swap_field!(native_video_in_window_active);
         swap_field!(video_audio_mode);
@@ -1970,6 +2007,7 @@ impl App {
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
+        swap_field!(video_zoom_state);
         swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
@@ -2025,6 +2063,7 @@ impl App {
         swap_field!(fs_pan_drag_start);
         swap_field!(fs_vertical_scroll);
         swap_field!(fs_seek_drag_active);
+        swap_field!(fs_seek_gesture);
         swap_field!(fs_seek_overlay_visible);
         swap_field!(fs_vertical_cache_keep_set);
         swap_field!(continuous_page_transitions);
@@ -2054,8 +2093,7 @@ impl App {
         swap_field!(pending_auto_fs_open);
         swap_field!(pending_return_to_parent);
         swap_field!(pdf_placeholder_count);
-        swap_field!(cached_nav_indices);
-        swap_field!(cached_fs_seek_info);
+        swap_field!(viewer_navigation_caches);
         swap_field!(fs_nav_locked_gen);
         swap_field!(fs_nav_dropped_block_signature);
         swap_field!(fs_nav_dropped_block_count);
@@ -2114,6 +2152,12 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices_preserving_facet_scope();
         }
+        let favorite_path = self.effective_folder();
+        self.transition_favorite_view_for_path_with_inherited_at(
+            favorite_path.as_deref(),
+            favorite_view_now,
+            Some(favorite_view_inherited),
+        );
     }
 
     /// legacy/unbundled viewer 用に、現在 context を main と独立 viewer に分割する。
@@ -2149,6 +2193,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            favorite_view_context,
             navigation_scope,
             archive_source_override,
             zip_nav,
@@ -2179,6 +2224,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -2224,6 +2271,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,
@@ -2246,6 +2294,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2300,6 +2349,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -2329,8 +2379,7 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -2382,9 +2431,16 @@ impl App {
         } = parked.as_mut();
 
         // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
+        // A fork copies the requirement values, never the mutable worker projection.
+        // Otherwise the new overlay (or its generation invalidation) cancels main's work.
+        *still_seek_thumbnail_pages_shared = Arc::new(std::sync::RwLock::new(
+            self.still_seek_thumbnail_pages.clone(),
+        ));
+
         duplicate_for_parked!(
             address,
             current_folder,
+            favorite_view_context,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -2409,6 +2465,7 @@ impl App {
             pending_grid_scroll,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
             thumbnail_eviction_generation,
             details_order,
             details_order_revision,
@@ -2418,6 +2475,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,
@@ -2452,6 +2510,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、
             // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
             panorama_intent,
@@ -2485,6 +2544,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -2501,7 +2561,7 @@ impl App {
             slideshow_anchor_idx,
             continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -2524,7 +2584,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
 
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
@@ -2597,7 +2656,6 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
@@ -2708,8 +2766,7 @@ impl App {
         detached.favsearch_subfolder_restore = None;
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
-        detached.cached_nav_indices = None;
-        detached.cached_fs_seek_info = None;
+        detached.viewer_navigation_caches.invalidate();
         detached.selected = Some(idx);
 
         detached
@@ -2857,6 +2914,23 @@ impl App {
     /// Identity of the payload currently projected onto `App`, including a context being built.
     pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
         self.viewer_contexts.table.projected_id()
+    }
+
+    pub(crate) fn detached_viewer_window_id(&self) -> Option<u64> {
+        self.viewer_contexts.table.projected_window()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn set_detached_window_binding_for_test(&mut self, window_id: Option<u64>) {
+        if self.viewer_context_residence(self.projected_viewer_context_id())
+            == ContextResidence::Building
+        {
+            self.reserve_window_binding_for_build(window_id.expect("build fixture window"));
+        } else if let Some(window_id) = window_id {
+            self.ensure_mounted_detached_session_binding(window_id);
+        } else if let Some(window_id) = self.detached_viewer_window_id() {
+            self.unbind_window(window_id);
+        }
     }
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
@@ -3196,7 +3270,6 @@ impl App {
             self.bind_window(mounted, window_id)
                 .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
         }
-        self.detached_viewer_window_id = Some(window_id);
         self.begin_active_detached_session(window_id, source);
     }
 
@@ -3266,7 +3339,6 @@ impl App {
         let id = self
             .build_viewer_context("test_build_active_context", |app, _reserved| {
                 configure(app);
-                app.detached_viewer_window_id = Some(window_id);
                 app.reserve_window_binding_for_build(window_id);
                 BuildOutcome::Commit
             })
@@ -3313,6 +3385,357 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn still_seek_committed_center(center: usize) -> crate::ui_fullscreen::StillSeekGesture {
+        crate::ui_fullscreen::StillSeekGesture::StripCommitted {
+            layout_center_pos: center,
+            page_pos_at_commit: 3,
+        }
+    }
+
+    #[cfg(windows)]
+    fn video_zoom_state(
+        wheel_notches: f32,
+        drag: [f32; 2],
+    ) -> crate::video::zoom_view::VideoZoomState {
+        let source = crate::video::zoom_view::VideoZoomSourceGeometry::new(
+            1920,
+            1080,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+        );
+        let region = [1920.0, 1080.0];
+        let mut state = crate::video::zoom_view::VideoZoomState::new();
+        assert!(state.apply_wheel(
+            wheel_notches * 120.0,
+            [region[0] * 0.5, region[1] * 0.5],
+            region,
+            source,
+        ));
+        assert!(state.apply_drag(drag, region, source));
+        state
+    }
+
+    #[cfg(windows)]
+    fn two_video_zoom_contexts() -> (
+        crate::app::AppTestEnvForTest,
+        ViewerContextId,
+        ViewerContextId,
+        crate::video::zoom_view::VideoZoomState,
+        crate::video::zoom_view::VideoZoomState,
+    ) {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_b = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(711, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let b = app.build_window_context_for_test(712, |app| {
+            app.fullscreen_idx = Some(7);
+            app.video_zoom_state = Some(state_b);
+        });
+        (app, a, b, state_a, state_b)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_fresh_context_starts_empty() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let _a = app.build_window_context_for_test(710, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let _b = app.build_window_context_for_test(711, |app| {
+            assert_eq!(
+                app.video_zoom_state, None,
+                "a fresh context must not inherit A's video zoom"
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_survives_exchange_and_return() {
+        let (mut app, a, b, state_a, state_b) = two_video_zoom_contexts();
+
+        for _ in 0..2 {
+            app.with_viewer_context(a, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_a));
+            })
+            .unwrap();
+            app.with_viewer_context(b, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_b));
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_item_reset_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.with_viewer_context(b, |app| {
+            app.video_zoom_state = None;
+        })
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "B's item-change reset must not clear A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_close_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.close_and_retire_context(
+            b,
+            "video_zoom_test_close",
+            |app| {
+                app.close_fullscreen();
+            },
+            |_| (),
+        )
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "closing B must not reset A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_split_moves_an_independent_value() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_main = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(3);
+        app.video_zoom_state = Some(state_a);
+
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(app.video_zoom_state, None);
+        app.video_zoom_state = Some(state_main);
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_a));
+        app.video_zoom_state = None;
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_main));
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_centers_survive_mount_and_close() {
+        use crate::ui_fullscreen::StillSeekGesture;
+        for b_page in [3, 7] {
+            let mut app = crate::app::setup_app_for_test();
+            let a = app.build_window_context_for_test(701, |app| {
+                app.fullscreen_idx = Some(3);
+                app.fs_seek_gesture = still_seek_committed_center(120);
+            });
+            let b = app.build_window_context_for_test(702, |app| {
+                app.fullscreen_idx = Some(b_page);
+                assert_eq!(
+                    app.fs_seek_gesture,
+                    StillSeekGesture::Idle,
+                    "a fresh context must not inherit A's center"
+                );
+                app.fs_seek_gesture = StillSeekGesture::StripCommitted {
+                    layout_center_pos: 440,
+                    page_pos_at_commit: b_page,
+                };
+            });
+            for _ in 0..2 {
+                app.with_viewer_context(a, |app| {
+                    assert_eq!(app.fs_seek_gesture, still_seek_committed_center(120));
+                })
+                .unwrap();
+                app.with_viewer_context(b, |app| {
+                    assert_eq!(
+                        app.fs_seek_gesture,
+                        StillSeekGesture::StripCommitted {
+                            layout_center_pos: 440,
+                            page_pos_at_commit: b_page
+                        }
+                    );
+                })
+                .unwrap();
+            }
+            app.close_and_retire_context(
+                b,
+                "still_seek_test_close",
+                |app| {
+                    app.close_fullscreen();
+                },
+                |_| (),
+            )
+            .unwrap();
+            app.with_viewer_context(a, |app| {
+                assert_eq!(
+                    app.fs_seek_gesture,
+                    still_seek_committed_center(120),
+                    "closing B must not reset A"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_pause_ends_only_its_active_gesture() {
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(703, |app| {
+            app.fs_seek_gesture = still_seek_committed_center(120);
+        });
+        let b = app.build_window_context_for_test(704, |app| {
+            app.fs_seek_gesture = crate::ui_fullscreen::StillSeekGesture::Strip {
+                origin_center_pos: 3,
+                origin_pointer: egui::pos2(100.0, 80.0),
+                layout_center_pos: 440,
+                page_pos_at_origin: 3,
+            };
+            app.fs_seek_drag_active = true;
+            app.pause_mounted_background_work_keep_current_frame();
+            assert_eq!(
+                app.fs_seek_gesture,
+                crate::ui_fullscreen::StillSeekGesture::Idle
+            );
+            assert!(!app.fs_seek_drag_active);
+        });
+        app.with_viewer_context(a, |app| {
+            app.pause_mounted_background_work_keep_current_frame();
+            assert_eq!(app.fs_seek_gesture, still_seek_committed_center(120));
+        })
+        .unwrap();
+        app.retire_context(b, "still_seek_test_retire", |_| ())
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_split_moves_gesture_and_isolates_request_projection() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/{idx}.png"))))
+            .collect();
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[2, 3]);
+        app.fs_seek_gesture = still_seek_committed_center(7);
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(
+            app.fs_seek_gesture,
+            crate::ui_fullscreen::StillSeekGesture::Idle,
+            "the viewer gesture must move out of the main grid"
+        );
+        let main_projection = app.still_seek_thumbnail_pages_shared.clone();
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.fs_seek_gesture, still_seek_committed_center(7));
+        assert!(!Arc::ptr_eq(
+            &main_projection,
+            &app.still_seek_thumbnail_pages_shared
+        ));
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[8, 9]);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+        app.bump_items_generation();
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(
+            app.still_seek_thumbnail_pages_shared
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_fork_request_projection_is_independent() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/{idx}.png"))))
+            .collect();
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[2, 3]);
+        let mut fork = app.split_current_context_preserving_main_grid();
+        let main_projection = app.still_seek_thumbnail_pages_shared.clone();
+        app.swap_viewer_context_bundle(&mut fork);
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[8, 9]);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn favorite_view_state_is_isolated_by_bundle_swap() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_cols = 3;
+        let a = crate::settings::FavoriteEntry::new(
+            "a".to_owned(),
+            std::path::PathBuf::from(r"C:\favorite-a"),
+        );
+        let b = crate::settings::FavoriteEntry::new(
+            "b".to_owned(),
+            std::path::PathBuf::from(r"C:\favorite-b"),
+        );
+        let mut a_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
+        a_state.grid_cols = 4;
+        let mut b_state = a_state.clone();
+        b_state.grid_cols = 7;
+        app.favorite_view_states.insert(a.id, a_state);
+        app.favorite_view_states.insert(b.id, b_state);
+        app.settings.favorites.extend([a.clone(), b.clone()]);
+        app.current_folder = Some(a.path.clone());
+        app.transition_favorite_view_for_path(Some(&a.path));
+        app.settings.grid_cols = 9;
+
+        let mut parked = ViewerContextBundle::empty();
+        parked.current_folder = Some(b.path.clone());
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.settings.grid_cols, 7);
+        assert_eq!(app.favorite_view_states[&a.id].grid_cols, 9);
+
+        app.settings.grid_cols = 10;
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.settings.grid_cols, 9);
+        assert_eq!(app.favorite_view_states[&b.id].grid_cols, 10);
+
+        app.transition_favorite_view_for_path(Some(std::path::Path::new(r"C:\outside")));
+        assert_eq!(
+            app.settings.grid_cols, 3,
+            "共通状態はどちらの窓にも上書きされない"
+        );
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Event {
@@ -3481,7 +3904,6 @@ mod tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_independent_active = false;
         app.detached_viewer_open_next_still_detached_once = true;
-        app.detached_viewer_window_id = None;
         app.last_viewer_sync_stamp = Some(ViewerSyncStamp {
             idx: 1,
             item_key: "stale".to_owned(),
@@ -3493,7 +3915,7 @@ mod tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
-        assert_eq!(app.detached_viewer_window_id, Some(37));
+        assert_eq!(app.detached_viewer_window_id(), Some(37));
         assert_eq!(app.last_viewer_sync_stamp, None);
         assert!(!app.fs_open_intent_from_grid);
         assert!(!app.pending_auto_fs_open);

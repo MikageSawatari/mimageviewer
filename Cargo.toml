@@ -33,7 +33,7 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "3.5.0"
+version = "3.6.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
@@ -106,6 +106,13 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "bench_zip_seek"
 path = "src/bin/bench_zip_seek.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_seek_decode"
+path = "src/bin/bench_seek_decode.rs"
 test = false
 bench = false
 required-features = ["dev-tools"]
@@ -413,6 +420,7 @@ rhai = "1"
 # (ReDoS 不可) なのでユーザー入力パターンでも安全。tantivy 等が間接依存しているが
 # スクリプトヘルパーで直接使うため明示依存にする。
 regex = "1"
+mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

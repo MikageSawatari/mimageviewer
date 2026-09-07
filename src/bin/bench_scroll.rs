@@ -574,6 +574,8 @@ fn run_bench(
                             Some(&cancel_w),
                             &ks_w,
                             &ke_w,
+                            // 静止画 seek UI はベンチ対象外。
+                            None,
                             // ベンチでは folder_thumb_pin DB を使わない (pin-aware
                             // auto-pick 無し = 純粋 auto-pick で計測)
                             None,

@@ -235,6 +235,37 @@ pub(super) fn bar_button_bg(hovered: bool, active: bool) -> egui::Color32 {
     }
 }
 
+/// 動画・静止画のサムネイルストリップ右上で共有する鍵ボタンの見た目。
+/// 明るいサムネイル上でも沈まない下敷き・縁・active 色をここで一度だけ決める。
+pub(crate) fn draw_seek_strip_lock_button_visual(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hovered: bool,
+    locked: bool,
+) {
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    let overlay = if locked {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 190)
+    } else if hovered {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, overlay);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(46)),
+        egui::StrokeKind::Inside,
+    );
+    draw_seek_lock_icon(
+        painter,
+        rect.center(),
+        rect.width().min(rect.height()) * 0.28,
+        locked,
+    );
+}
+
 /// 「その他の機能」ボタン。font glyph に頼らず、3 点を vector で描く。
 pub(super) fn draw_more_icon(painter: &egui::Painter, center: egui::Pos2, _r: f32) {
     for offset in [-7.0, 0.0, 7.0] {

@@ -5,7 +5,7 @@
 //! before calling [`build_context_menu`].
 
 use crate::external_tool::ExternalToolId;
-use crate::grid_item::GridItem;
+use crate::grid_item::{GridItem, checked_virtual_selection_message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuNode {
@@ -27,6 +27,8 @@ pub enum MenuCommand {
     NewFolder,
     Paste,
     Rename,
+    CutFiles,
+    CopyFiles,
     CopyPath,
     CopyFileName,
     CopyPageName,
@@ -60,6 +62,15 @@ pub enum MenuCommand {
 pub enum ContextMenuSurface {
     Grid,
     Fullscreen,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckedFileOperationSelection {
+    #[default]
+    Empty,
+    RealOnly,
+    VirtualOnly,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +195,7 @@ pub struct ContextMenuInput {
     pub is_folder_context: bool,
     pub has_checked: bool,
     pub checked_count: usize,
+    pub checked_file_operation_selection: CheckedFileOperationSelection,
     pub can_use_folder_commands: bool,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
@@ -203,6 +215,8 @@ pub struct ContextMenuInput {
 /// `None` は「そのキーは割り当てられていない」= 併記しない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextMenuShortcutLabels {
+    pub cut: Option<String>,
+    pub copy: Option<String>,
     pub rotate_left: Option<String>,
     pub rotate_right: Option<String>,
     pub deselect: Option<String>,
@@ -297,6 +311,32 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     let mut nodes = Vec::new();
 
     if input.has_checked {
+        let file_clipboard_enabled =
+            input.checked_file_operation_selection == CheckedFileOperationSelection::RealOnly;
+        let cut_label = format!("切り取り [{}件]", input.checked_count);
+        let copy_label = format!("コピー [{}件]", input.checked_count);
+        let file_clipboard_disabled_reason = if file_clipboard_enabled {
+            None
+        } else {
+            Some(checked_virtual_selection_message("コピー / カット"))
+        };
+        push_group(
+            &mut nodes,
+            [
+                MenuNode::Item {
+                    command: MenuCommand::CutFiles,
+                    label: with_key(&cut_label, input.shortcuts.cut.as_ref()),
+                    enabled: file_clipboard_enabled,
+                    disabled_reason: file_clipboard_disabled_reason.clone(),
+                },
+                MenuNode::Item {
+                    command: MenuCommand::CopyFiles,
+                    label: with_key(&copy_label, input.shortcuts.copy.as_ref()),
+                    enabled: file_clipboard_enabled,
+                    disabled_reason: file_clipboard_disabled_reason,
+                },
+            ],
+        );
         push_group(
             &mut nodes,
             [item(
@@ -375,6 +415,22 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             );
         }
         return normalize_menu(nodes);
+    }
+
+    if !input.is_folder_context && input.kind.is_real_item() {
+        push_group(
+            &mut nodes,
+            [
+                item(
+                    MenuCommand::CutFiles,
+                    with_key("切り取り", input.shortcuts.cut.as_ref()),
+                ),
+                item(
+                    MenuCommand::CopyFiles,
+                    with_key("コピー", input.shortcuts.copy.as_ref()),
+                ),
+            ],
+        );
     }
 
     if input.is_folder_context && input.can_use_folder_commands {
@@ -617,6 +673,7 @@ mod tests {
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
+            checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             can_use_folder_commands: false,
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
@@ -626,6 +683,8 @@ mod tests {
             associated_apps: Vec::new(),
             // 既存の期待値と揃うよう、既定の割り当てを解決した結果を渡す。
             shortcuts: ContextMenuShortcutLabels {
+                cut: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+X".to_string()),
+                copy: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+C".to_string()),
                 rotate_left: Some("L".to_string()),
                 rotate_right: Some("R".to_string()),
                 deselect: Some("Ctrl+D".to_string()),
@@ -651,6 +710,31 @@ mod tests {
         out
     }
 
+    fn command_state(
+        nodes: &[MenuNode],
+        expected: MenuCommand,
+    ) -> Option<(String, bool, Option<String>)> {
+        for node in nodes {
+            match node {
+                MenuNode::Item {
+                    command,
+                    label,
+                    enabled,
+                    disabled_reason,
+                } if *command == expected => {
+                    return Some((label.clone(), *enabled, disabled_reason.clone()));
+                }
+                MenuNode::Submenu { children, .. } => {
+                    if let Some(found) = command_state(children, expected.clone()) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// キー併記は snapshot が渡した**実際の割り当て**をそのまま出す。
     ///
     /// 既定キーをモデル内へ書いていたので、操作カスタマイズで割り当てを変えても
@@ -660,7 +744,10 @@ mod tests {
         let mut input = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
         input.has_checked = true;
         input.checked_count = 2;
+        input.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
         input.shortcuts = ContextMenuShortcutLabels {
+            cut: Some("Alt+X".to_string()),
+            copy: Some("Alt+C".to_string()),
             rotate_left: Some("Shift+F1".to_string()),
             rotate_right: Some("Shift+F2".to_string()),
             deselect: Some("Alt+Q".to_string()),
@@ -678,6 +765,14 @@ mod tests {
         );
         assert!(shown.contains(&"選択解除 (Alt+Q)".to_string()), "{shown:?}");
         assert!(
+            shown.contains(&"切り取り [2件] (Alt+X)".to_string()),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"コピー [2件] (Alt+C)".to_string()),
+            "{shown:?}"
+        );
+        assert!(
             !shown.iter().any(|label| label.contains("(L)")
                 || label.contains("(R)")
                 || label.contains("(Ctrl+D)")),
@@ -691,6 +786,7 @@ mod tests {
         let mut input = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
         input.has_checked = true;
         input.checked_count = 2;
+        input.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
         input.shortcuts = ContextMenuShortcutLabels::default();
 
         let shown = labels(&build_context_menu(&input));
@@ -698,6 +794,8 @@ mod tests {
         assert!(shown.contains(&"左に回転".to_string()), "{shown:?}");
         assert!(shown.contains(&"右に回転".to_string()), "{shown:?}");
         assert!(shown.contains(&"選択解除".to_string()), "{shown:?}");
+        assert!(shown.contains(&"切り取り [2件]".to_string()), "{shown:?}");
+        assert!(shown.contains(&"コピー [2件]".to_string()), "{shown:?}");
     }
 
     fn assert_labels(input: ContextMenuInput, expected: &[&str]) {
@@ -720,6 +818,8 @@ mod tests {
             (
                 ContextMenuItemKind::Image,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -737,6 +837,8 @@ mod tests {
             (
                 ContextMenuItemKind::Video,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -750,6 +852,8 @@ mod tests {
             (
                 ContextMenuItemKind::Audio,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -763,6 +867,8 @@ mod tests {
             (
                 ContextMenuItemKind::Folder,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -772,6 +878,8 @@ mod tests {
             (
                 ContextMenuItemKind::ZipFile,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -785,6 +893,8 @@ mod tests {
             (
                 ContextMenuItemKind::PdfFile,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -798,6 +908,8 @@ mod tests {
             (
                 ContextMenuItemKind::ConvertibleArchive,
                 &[
+                    "切り取り (Ctrl+X)",
+                    "コピー (Ctrl+C)",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -885,6 +997,8 @@ mod tests {
                     let mut checked = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
                     checked.has_checked = true;
                     checked.checked_count = 3;
+                    checked.checked_file_operation_selection =
+                        CheckedFileOperationSelection::RealOnly;
                     checked
                 },
                 "編集内容をまとめて貼り付け [3件]",
@@ -947,6 +1061,7 @@ mod tests {
         let mut checked = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
         checked.has_checked = true;
         checked.checked_count = 4;
+        checked.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
         assert!(
             labels(&build_context_menu(&checked))
                 .contains(&"編集内容をリセット… [4件]".to_string())
@@ -958,9 +1073,12 @@ mod tests {
         let mut mixed = input(ContextMenuItemKind::ZipImage, ContextMenuSurface::Grid);
         mixed.has_checked = true;
         mixed.checked_count = 5;
+        mixed.checked_file_operation_selection = CheckedFileOperationSelection::Mixed;
         assert_labels(
             mixed,
             &[
+                "切り取り [5件] (Ctrl+X)",
+                "コピー [5件] (Ctrl+C)",
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
@@ -972,6 +1090,102 @@ mod tests {
                 "選択解除 (Ctrl+D)",
             ],
         );
+    }
+
+    #[test]
+    fn real_single_items_offer_file_cut_and_copy_first_on_both_surfaces() {
+        let real_kinds = [
+            ContextMenuItemKind::Image,
+            ContextMenuItemKind::Video,
+            ContextMenuItemKind::Audio,
+            ContextMenuItemKind::Folder,
+            ContextMenuItemKind::ZipFile,
+            ContextMenuItemKind::PdfFile,
+            ContextMenuItemKind::ConvertibleArchive,
+        ];
+        for kind in real_kinds {
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                let nodes = build_context_menu(&input(kind, surface));
+                let expected_labels = if surface == ContextMenuSurface::Grid {
+                    ["切り取り (Ctrl+X)", "コピー (Ctrl+C)"]
+                } else {
+                    ["切り取り", "コピー"]
+                };
+                for (index, (command, label)) in [
+                    (MenuCommand::CutFiles, expected_labels[0]),
+                    (MenuCommand::CopyFiles, expected_labels[1]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        nodes.get(index),
+                        Some(&MenuNode::Item {
+                            command,
+                            label: label.to_string(),
+                            enabled: true,
+                            disabled_reason: None,
+                        }),
+                        "kind={kind:?}, surface={surface:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_cut_and_copy_use_count_and_real_virtual_classification() {
+        let mut real = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        real.has_checked = true;
+        real.checked_count = 3;
+        real.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
+        for (command, expected_label) in [
+            (MenuCommand::CutFiles, "切り取り [3件] (Ctrl+X)"),
+            (MenuCommand::CopyFiles, "コピー [3件] (Ctrl+C)"),
+        ] {
+            assert_eq!(
+                command_state(&build_context_menu(&real), command),
+                Some((expected_label.to_string(), true, None))
+            );
+        }
+
+        let reason = checked_virtual_selection_message("コピー / カット");
+        for selection in [
+            CheckedFileOperationSelection::Mixed,
+            CheckedFileOperationSelection::VirtualOnly,
+        ] {
+            let mut unavailable = real.clone();
+            unavailable.checked_file_operation_selection = selection;
+            for command in [MenuCommand::CutFiles, MenuCommand::CopyFiles] {
+                let (_, enabled, disabled_reason) =
+                    command_state(&build_context_menu(&unavailable), command).unwrap();
+                assert!(!enabled, "selection={selection:?}");
+                assert_eq!(disabled_reason.as_deref(), Some(reason.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_single_items_and_folder_background_hide_file_cut_and_copy() {
+        for kind in [
+            ContextMenuItemKind::ZipImage,
+            ContextMenuItemKind::PdfPage,
+            ContextMenuItemKind::ZipDir,
+            ContextMenuItemKind::Stack,
+            ContextMenuItemKind::SearchContainer,
+        ] {
+            let nodes = build_context_menu(&input(kind, ContextMenuSurface::Grid));
+            assert!(command_state(&nodes, MenuCommand::CutFiles).is_none());
+            assert!(command_state(&nodes, MenuCommand::CopyFiles).is_none());
+        }
+
+        let mut background = input(ContextMenuItemKind::Folder, ContextMenuSurface::Grid);
+        background.is_folder_context = true;
+        background.can_use_folder_commands = true;
+        let nodes = build_context_menu(&background);
+        assert!(command_state(&nodes, MenuCommand::CutFiles).is_none());
+        assert!(command_state(&nodes, MenuCommand::CopyFiles).is_none());
+        assert!(command_state(&nodes, MenuCommand::Paste).is_some());
     }
 
     #[test]
@@ -1038,6 +1252,13 @@ mod tests {
                     let mut case = input(kind, surface);
                     case.has_checked = has_checked;
                     case.checked_count = usize::from(has_checked) * 3;
+                    if has_checked {
+                        case.checked_file_operation_selection = if kind.is_real_item() {
+                            CheckedFileOperationSelection::RealOnly
+                        } else {
+                            CheckedFileOperationSelection::VirtualOnly
+                        };
+                    }
                     let nodes = build_context_menu(&case);
                     assert_eq!(nodes, normalize_menu(nodes.clone()));
                     let actual = labels(&nodes);

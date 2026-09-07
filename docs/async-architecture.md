@@ -66,13 +66,15 @@
 | RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmarkも同じ規約で古いworkerとlate resultを無効化する。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
+| 物理フォルダ open 事前走査 | `std::thread` + mpsc | viewer context ごとに最大 1 | フォルダペイン / detached open と、お気に入り表示状態の OFF・リセットでカテゴリ順または一覧ソートが変わった通常フォルダの再構築に使う。`FolderOpenScanPurpose` が用途を型で所有し、後者は path と並び設定 snapshot が現在値に一致するときだけ pre-scan 付きロードへ戻す。別 navigation / 後続要求は同じ pending を cancel するため、UI スレッドで `read_dir` / metadata scan を追加しない |
 | メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + mpsc | 音楽ビューを開くごとに最大 1 本 | `run_music_analysis` が FFmpeg 全尺 decode + `analyze_stereo_timeline` を**全て UI スレッド外**で行う (Inc 3b)。**永続 DB (`audio_analysis.db`) はやめ in-memory LRU に置換 (2026-07-03)**: 結果は UI スレッドが `music_analysis_lru` (直近 N 曲、path+size+mtime キー) に保持し、`ensure_music_analysis` が `image_metas` の (mtime,size) で LRU を楽観的に lookup (UI スレッド stat しない) してヒットならタイムラインを即セット + ワーカーを `want_analysis=false` で起動、miss なら `want_analysis=true`。ワーカーは DB は触らないが背景で実ファイルを **fresh stat** し、ヒットに使った `hit_meta` と食い違えば (外部更新) 解析し直す + LRU 挿入キーに検証済み (mtime,size) を返す (`TimelineComplete{analysis,meta}`、image_metas スナップショットが stale でも正しい key)。**Inc 4**: 同ワーカーが spectrum 用に全尺 PCM も**1 回だけ**デコードし (timeline と共有)、`MusicAnalysisMsg::{Timeline(progressive 部分), TimelineComplete(全尺確定=LRU 挿入), Pcm, Probe}` を送る。`poll_music_analysis` が届いた分を Disconnected まで drain (pending は取り出して末尾で戻す)、pending 中は `request_repaint_after(50ms)`。新ファイル / `close_fullscreen` で cancel。decode ループは cancel を確認するが post-decode の解析パスは単一 pass で cancel 不可 (支配的コストの decode はキャンセル可)。**progressive spectrum PCM (2026-07-07)**: `Pcm` は**デコード開始前**に空の共有バッファ (`Arc<MusicPcm>` = `RwLock<Vec<f32>>` 追記式) として送り、デコードは新 API `audio_decode::decode_audio_file_progressive` (差分 `on_delta` を渡す) で回して差分を `append` (write)。timeline partial / 最終確定は同じ共有バッファのプレフィックス (`with_prefix` = read ロック下解析) から作る。これで下段スペクトラムが全尺デコード完了を待たず出る (§5.6)。**`RwLock`** なのは、長い解析 read (`with_prefix`) と spectrum の窓コピー read (`copy_window`) を並行させて spectrum を固まらせないため (`Mutex` だと解析中フリーズの実機 FB → RwLock で解消)。共通セットアップ `open_audio_decode` / partial スケジュール `PartialEmitSchedule` は既存 streaming decode と共有 |
 | 音楽ビュー row raster | `std::thread` (`miv-music-timeline-raster`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`TimelineTextureCache`) | `TimelineAnalysis` から DJ 風波形タイムラインを **1 行 (row) ずつ** `egui::ColorImage` にラスタライズ。UI は request に `Arc<TimelineAnalysis>` を渡すだけ (行ウィンドウ切り出しは worker 側で zero-copy) で、結果は generation / row_version / key が現要求と一致するものだけを 1 フレーム 1 枚 `load_texture` する。旧 key / generation の結果は採用側で破棄。`ensure` (key 変更) / `clear` (ファイル変更・close) で worker を作り直す。詳細は [`src/ui_music_timeline.rs`](../src/ui_music_timeline.rs) |
 | 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` (E0-C#10 の MIDI 半音バー、多解像度 FFT) を所有し、UI から `Arc<MusicPcm>` + `center_secs` を受けて再生位置周辺 **±1 秒**の窓を worker 側でスライス (`copy_window`、lock 下で ~1MB 未満コピー) → `analyze_moving_window`。cpal ring buffer は約 100ms 分しか無く ±1s 窓に足りないため、ラボと同じく展開済み PCM をスライスする (案A、[music-integration-plan.md](music-integration-plan.md) §11)。**`MusicPcm` は追記式共有バッファ (`RwLock<Vec<f32>>` + `complete: AtomicBool`)**: 解析ワーカーがデコード進行に合わせて末尾 `append` (write) し、spectrum worker は現デコード済み範囲から窓を read で取る (未デコード領域が中心なら `None`)。`RwLock` = 長い解析 read と spectrum 窓コピー read を並行させ spectrum を固まらせない。高々 1 リクエスト in-flight + 溜まった分は最新へ coalesce。UI (`update`) は playing / 位置変化時に throttle (16ms) 付きで送り、pending / 再生中は `request_repaint_after(16ms)`。窓がまだ取れない間は空バンド = 鍵盤ベースライン + 「解析中…」表示 (`source_complete` で抑制)。新ファイル / close で `clear`。詳細は [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
-| メタ索引 supervisor (Ctrl+F/G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
+| Ctrl+F メタデータフィルター | `std::thread` (`metadata-search`) + request 専用 `rayon::ThreadPool` | 外側 1 本 + Pass 2 最大 8 本 | Pass 1 の構造項目は逐次、画像 / 動画の on-demand メタ読みだけ 8 並列。前面検索なので `ActivityGate` は使わない。cancel 後は未開始 item を止め、開始済み item の結果までを部分結果として返す。XMP cache miss は正規化 path ごとの `OnceLock` で重複排除 |
+| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
 | メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
 | メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
@@ -138,7 +140,7 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
 | `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, `ThumbLoadOrigin`, source_dims, canceled, finalized)。origin は `Source` / `UpgradeableCache` / `FinalCache` の 3 状態で、最後は編集 preview・drive-list・再帰 pin WebP など元ソースへ idle upgrade しない完成済み派生 cache。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
-| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。pending は `fs_cache` / `fs_early_dims` / `fs_upload_backlog` と同じ viewer-context-owned `items_generation` を保持する。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は同世代だけ `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。終端結果も upload backlog と final cache の各着地点で同世代だけ採用し、不一致は通常ログへ記録して破棄する。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
+| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly / AnimationExpansionStarted (ともに非終端) / Static / Animated / Failed**。pending は `fs_cache` / `fs_early_dims` / `fs_upload_backlog` と同じ viewer-context-owned `items_generation` を保持する。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は同世代だけ `fs_early_dims` に積み fs_pending は維持する。`AnimationExpansionStarted` は GIF / APNG / Animated WebP と decoder が確認した時刻で、pending が保持して終端結果と一緒に upload backlog へ渡す。ページ離脱、cancel、世代変更では確認時刻を捨てる。終端結果も upload backlog と final cache の各着地点で同世代だけ採用し、不一致は通常ログへ記録して破棄する。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | 共有 executor の `FinalCompositeResult::Ready { pixels, elapsed_ms, timing }` / `Cancelled`。`timing` は色調補正、smart sharpen、カラー化判定／適用、Creative LUT、post filter の段階別時間を保持する。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
 | `local_adjust_pending[idx].rx` | local / conceal materialization worker → UI | `EditMaterializeResult`。request は `items_generation`、`input_seq` と、local なら `LocalAdjustResultKey`、conceal なら `EditResultKey` を持つ。pending map は `ViewerContextBundle` 所有で context の swap / park とともに移動し、bundle drop / clear では cancel token を立てる。受信時は pending request identity と現在の generation key の両方を検証してから cache へ公開する |
@@ -218,6 +220,11 @@ scope だけは更新する。worker は UI state を直接変更せず、候補
 実装は `Mutex + Condvar` で自前 (`try_lock + sleep` 禁止、§5.5 参照)。permit の
 drop で自動 release + `notify_all` で起床。spurious wakeup 耐性のため条件は
 `while` ループで再確認。
+
+cancel token を所有する worker は、permit 待ちにも `acquire_cancellable` を使う。
+50ms の timeout は cancel 観測点であり、優先度順序と起床は通常の `acquire` と同じ
+Condvar を使う。`None` は失敗ではなく取消終端として扱い、Item / Progress / Finished
+などの成功・失敗イベントを送らず、型付きの取消理由を perf / log に残して終了する。
 
 **飢餓ポリシー (明示)**: High が連続投入される間 Low は無制限に待つ。これは
 UI 応答性最優先という方針の意図的な選択。アイドル 数秒で High キューが空き、
@@ -545,6 +552,22 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 - 3 箇所とも `canceled=true` を送信して `requested` cleanup する。`continue` だけでは
   `requested` に残って「再エンキューされない idx=Pending」状態で固まる。
 
+静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
+要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
+を `keep_set` へ合流する。要求は priority とし、worker は同 set の read-only shared
+projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
+間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
+
+この集合の更新者は overlay で、各描画フレームに列と preview の要求を置換する。
+同じ items 世代内のページ着地は集合を終了しない。単ページ / 見開きの通常着地と
+縦 / 横連結読みは同じ寿命を持つ。全消去は overlay の非表示、fullscreen 終了、
+idx 空間の無効化、および `set_items_generation` での世代変更に限定する。
+コンテナ差し替えも `install_new_items` の世代更新で旧集合を失効させる。
+通常 worker の pop 後、heavy I/O 後、PDF レンダ前は、いずれも
+`thumbnail_request_in_current_keep` で実要求と現在の共有集合を照合する。
+集合と worker 可視 projection は viewer context ごとに所有し、mount では一緒に交換、
+fork では独立した `RwLock` へ複製する。別 context の置換・失効・close は兄弟の集合に届かない。
+
 **なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
 DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
 cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、
@@ -597,6 +620,9 @@ std::thread::spawn(move || {
 ```
 
 送信失敗 (受信側 drop) は無視する。フォルダ切替で既に捨てられているだけ。
+`GlobalIoSemaphore` を使う cancel 可能 worker では、処理本体だけでなく permit 待ちも
+`acquire_cancellable` で token を観測する。取消時は cache 書き戻しや結果送信へ進まず、
+通常完了 / 処理失敗とは別の typed outcome にする。
 
 ---
 
@@ -618,8 +644,10 @@ mImageViewer は 2 つのリストを使い分ける:
 
 具体像:
 
-- **`App::keep_range: (usize, usize)`** — `keep_set` の bounding box。worker 側で
-  atomic に読める `keep_start_shared` / `keep_end_shared` の値を供給する。
+- **`App::keep_range: (usize, usize)`** — グリッド保持帯（または明示的なナビゲーション
+  対象）の bounding box。worker 側で atomic に読める
+  `keep_start_shared` / `keep_end_shared` の値を供給する。静止画シークの遠隔 exact set
+  はここへ合流せず、上記の shared projection で別に判定する。
   疎な keep_set に対しては「広め」の判定になるので、worker が稀に非可視 idx を
   掴んでしまうが、main thread 側で enqueue しなければほぼ発生しない。
 - **`App::keep_set: HashSet<usize>`** — 実際に prefetch / 保持したい idx 集合。

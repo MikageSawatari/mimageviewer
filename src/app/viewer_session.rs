@@ -4,14 +4,14 @@ use super::{ViewerPresentation, ViewerSyncStamp};
 ///
 /// 現段階では、表示中のセッションは `App` の既存フィールドへマウントされ、退避中の
 /// セッションだけがこの型を直接所有する。`swap_with_mounted` を唯一の交換境界にすることで、
-/// 表示先・同期 stamp・detached window ID などの交換漏れを防ぐ。
+/// 表示先・同期 stamp などの交換漏れを防ぐ。窓 ID は session に保存せず、
+/// ViewerContextRegistry の予約 / binding から導出する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ViewerSession {
     pub(super) presentation: ViewerPresentation,
     pub(super) last_sync_stamp: Option<ViewerSyncStamp>,
     pub(super) independent_active: bool,
     pub(super) open_next_still_detached_once: bool,
-    pub(super) detached_window_id: Option<u64>,
 }
 
 impl Default for ViewerSession {
@@ -21,7 +21,6 @@ impl Default for ViewerSession {
             last_sync_stamp: None,
             independent_active: false,
             open_next_still_detached_once: false,
-            detached_window_id: None,
         }
     }
 }
@@ -34,7 +33,6 @@ impl ViewerSession {
         last_sync_stamp: &mut Option<ViewerSyncStamp>,
         independent_active: &mut bool,
         open_next_still_detached_once: &mut bool,
-        detached_window_id: &mut Option<u64>,
     ) {
         std::mem::swap(&mut self.presentation, presentation);
         std::mem::swap(&mut self.last_sync_stamp, last_sync_stamp);
@@ -43,7 +41,6 @@ impl ViewerSession {
             &mut self.open_next_still_detached_once,
             open_next_still_detached_once,
         );
-        std::mem::swap(&mut self.detached_window_id, detached_window_id);
     }
 }
 
@@ -67,7 +64,6 @@ mod tests {
         assert_eq!(session.last_sync_stamp, None);
         assert!(!session.independent_active);
         assert!(!session.open_next_still_detached_once);
-        assert_eq!(session.detached_window_id, None);
     }
 
     #[test]
@@ -79,40 +75,34 @@ mod tests {
             last_sync_stamp: Some(detached_stamp.clone()),
             independent_active: true,
             open_next_still_detached_once: true,
-            detached_window_id: Some(91),
         };
         let mut stored = detached.clone();
         let mut presentation = ViewerPresentation::MainWindow;
         let mut last_sync_stamp = Some(main_stamp.clone());
         let mut independent_active = false;
         let mut open_next_still_detached_once = false;
-        let mut detached_window_id = None;
 
         stored.swap_with_mounted(
             &mut presentation,
             &mut last_sync_stamp,
             &mut independent_active,
             &mut open_next_still_detached_once,
-            &mut detached_window_id,
         );
 
         assert_eq!(presentation, detached.presentation);
         assert_eq!(last_sync_stamp, Some(detached_stamp));
         assert!(independent_active);
         assert!(open_next_still_detached_once);
-        assert_eq!(detached_window_id, Some(91));
         assert_eq!(stored.presentation, ViewerPresentation::MainWindow);
         assert_eq!(stored.last_sync_stamp, Some(main_stamp));
         assert!(!stored.independent_active);
         assert!(!stored.open_next_still_detached_once);
-        assert_eq!(stored.detached_window_id, None);
 
         stored.swap_with_mounted(
             &mut presentation,
             &mut last_sync_stamp,
             &mut independent_active,
             &mut open_next_still_detached_once,
-            &mut detached_window_id,
         );
 
         assert_eq!(stored, detached);
@@ -120,7 +110,6 @@ mod tests {
         assert_eq!(last_sync_stamp, Some(stamp(2, "main", 20)));
         assert!(!independent_active);
         assert!(!open_next_still_detached_once);
-        assert_eq!(detached_window_id, None);
     }
 
     #[test]
@@ -130,26 +119,22 @@ mod tests {
             last_sync_stamp: Some(stamp(1, "keep", 10)),
             independent_active: true,
             open_next_still_detached_once: false,
-            detached_window_id: Some(37),
         };
         let mut presentation = ViewerPresentation::Fullscreen;
         let mut last_sync_stamp = None;
         let mut independent_active = false;
         let mut open_next_still_detached_once = true;
-        let mut detached_window_id = None;
 
         session.swap_with_mounted(
             &mut presentation,
             &mut last_sync_stamp,
             &mut independent_active,
             &mut open_next_still_detached_once,
-            &mut detached_window_id,
         );
 
         assert_eq!(presentation, ViewerPresentation::DetachedWindow);
         assert!(independent_active);
         assert!(!open_next_still_detached_once);
-        assert_eq!(detached_window_id, Some(37));
         assert_eq!(last_sync_stamp, Some(stamp(1, "keep", 10)));
     }
 }

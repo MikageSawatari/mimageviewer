@@ -788,6 +788,7 @@ fn load_palette_for_request(
         Some(cancel),
         keep_start,
         keep_end,
+        None,
         pin_db,
         None,
         None,

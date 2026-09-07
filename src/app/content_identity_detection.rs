@@ -417,6 +417,7 @@ impl App {
             &self.conceal_page_keys,
             &self.local_adjust_page_keys,
             &self.comic_page_keys,
+            &self.export_crop_page_keys,
         ]
         .into_iter()
         .any(|set| set_has_key_or_prefix(set, &key, include_page_prefix))

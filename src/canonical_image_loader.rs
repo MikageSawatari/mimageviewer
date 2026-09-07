@@ -44,22 +44,25 @@ pub struct CanonicalDecodeOptions<'a> {
     pub susie_cancel: Option<&'a Arc<AtomicBool>>,
     pub cancel: Option<&'a Arc<AtomicBool>>,
     pub animation_policy: AnimationPolicy,
+    /// 複数フレーム形式だと decoder が確認した直後に高々 1 回呼ぶ。
+    pub on_animation_confirmed: Option<&'a dyn Fn()>,
 }
 
-impl CanonicalDecodeOptions<'_> {
+impl<'a> CanonicalDecodeOptions<'a> {
     pub const fn fullscreen(animation_policy: AnimationPolicy) -> Self {
         Self {
             susie_priority: true,
             susie_cancel: None,
             cancel: None,
             animation_policy,
+            on_animation_confirmed: None,
         }
     }
 
     pub fn fullscreen_cancellable(
         animation_policy: AnimationPolicy,
-        cancel: &'_ Arc<AtomicBool>,
-    ) -> CanonicalDecodeOptions<'_> {
+        cancel: &'a Arc<AtomicBool>,
+    ) -> CanonicalDecodeOptions<'a> {
         CanonicalDecodeOptions {
             susie_priority: true,
             // Susie IPC cannot be interrupted safely. Once entered, it must keep
@@ -67,7 +70,13 @@ impl CanonicalDecodeOptions<'_> {
             susie_cancel: None,
             cancel: Some(cancel),
             animation_policy,
+            on_animation_confirmed: None,
         }
+    }
+
+    pub fn with_animation_confirmation(mut self, callback: &'a dyn Fn()) -> Self {
+        self.on_animation_confirmed = Some(callback);
+        self
     }
 }
 
@@ -358,8 +367,14 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "gif" {
         let frames = match bytes {
-            Some(bytes) => decode_gif_frames_from_bytes_cancellable(bytes, cancel),
-            None => decode_gif_frames_cancellable(source.path, cancel),
+            Some(bytes) => decode_gif_frames_from_bytes_cancellable(
+                bytes,
+                cancel,
+                options.on_animation_confirmed,
+            ),
+            None => {
+                decode_gif_frames_cancellable(source.path, cancel, options.on_animation_confirmed)
+            }
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -379,8 +394,14 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "png" {
         let frames = match bytes {
-            Some(bytes) => decode_apng_frames_from_bytes_cancellable(bytes, cancel),
-            None => decode_apng_frames_cancellable(source.path, cancel),
+            Some(bytes) => decode_apng_frames_from_bytes_cancellable(
+                bytes,
+                cancel,
+                options.on_animation_confirmed,
+            ),
+            None => {
+                decode_apng_frames_cancellable(source.path, cancel, options.on_animation_confirmed)
+            }
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -400,8 +421,14 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "webp" {
         let frames = match bytes {
-            Some(bytes) => decode_webp_frames_from_bytes_cancellable(bytes, cancel),
-            None => decode_webp_frames_cancellable(source.path, cancel),
+            Some(bytes) => decode_webp_frames_from_bytes_cancellable(
+                bytes,
+                cancel,
+                options.on_animation_confirmed,
+            ),
+            None => {
+                decode_webp_frames_cancellable(source.path, cancel, options.on_animation_confirmed)
+            }
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -655,7 +682,7 @@ mod tests {
     use super::*;
     use image::GenericImageView;
     use std::io::{Cursor, Write};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::AtomicUsize};
 
     fn rgba_fixture(width: u32, height: u32) -> image::RgbaImage {
         image::RgbaImage::from_fn(width, height, |x, y| {
@@ -880,6 +907,14 @@ mod tests {
         panic!("lossless WebP fixture should contain an image chunk");
     }
 
+    fn static_webp_bytes(rgba: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(&rgba, 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
     fn animated_webp_bytes() -> Vec<u8> {
         let mut chunks = Vec::new();
         let mut vp8x = vec![0b0000_0010, 0, 0, 0];
@@ -905,6 +940,66 @@ mod tests {
         webp.extend_from_slice(b"WEBP");
         webp.extend_from_slice(&chunks);
         webp
+    }
+
+    #[test]
+    fn static_formats_do_not_emit_animation_confirmation() {
+        for (filename, bytes) in [
+            ("still.png", png_bytes(2, 2)),
+            ("still.webp", static_webp_bytes([10, 20, 30, 255])),
+            ("still.jpg", jpeg_with_orientation(1)),
+        ] {
+            let confirmations = AtomicUsize::new(0);
+            let on_animation_confirmed = || {
+                confirmations.fetch_add(1, Ordering::Relaxed);
+            };
+            let decoded = decode_canonical_image(
+                CanonicalImageSource::File {
+                    path: Path::new(filename),
+                    verified_bytes: Some(&bytes),
+                },
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames)
+                    .with_animation_confirmation(&on_animation_confirmed),
+            )
+            .unwrap();
+
+            assert!(matches!(decoded, CanonicalImageDecode::Static(_)));
+            assert_eq!(
+                confirmations.load(Ordering::Relaxed),
+                0,
+                "static {filename} must not claim animation expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn animated_formats_emit_confirmation_exactly_once() {
+        for (filename, bytes) in [
+            ("animated.gif", animated_gif_bytes()),
+            ("animated.png", animated_apng_bytes()),
+            ("animated.webp", animated_webp_bytes()),
+        ] {
+            let confirmations = AtomicUsize::new(0);
+            let on_animation_confirmed = || {
+                confirmations.fetch_add(1, Ordering::Relaxed);
+            };
+            let decoded = decode_canonical_image(
+                CanonicalImageSource::File {
+                    path: Path::new(filename),
+                    verified_bytes: Some(&bytes),
+                },
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames)
+                    .with_animation_confirmation(&on_animation_confirmed),
+            )
+            .unwrap();
+
+            assert!(matches!(decoded, CanonicalImageDecode::Animated { .. }));
+            assert_eq!(
+                confirmations.load(Ordering::Relaxed),
+                1,
+                "animated {filename} must confirm exactly once"
+            );
+        }
     }
 
     #[test]
@@ -1187,6 +1282,7 @@ mod tests {
                 susie_cancel: None,
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
+                on_animation_confirmed: None,
             },
         );
 
@@ -1215,6 +1311,7 @@ mod tests {
                 susie_cancel: None,
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
+                on_animation_confirmed: None,
             },
         );
 

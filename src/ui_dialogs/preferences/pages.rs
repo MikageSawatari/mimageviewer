@@ -581,7 +581,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("実行ファイルを選んで追加").clicked() {
+            if ui.button("プログラム / スクリプトを選んで追加").clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Executable);
             }
             let selected_index = state.external_tool_selected.and_then(|id| {
@@ -672,7 +672,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
             ui.end_row();
 
-            ui.label("実行ファイル");
+            ui.label("プログラム / スクリプト");
             if tool.launch.uses_process_options() {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
@@ -727,6 +727,24 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     state.external_tool_working_directory_status = ExternalToolPathStatus::Checking;
                 }
             });
+            ui.end_row();
+
+            ui.label("");
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
+                ui.checkbox(&mut tool.show_console, "コンソール窓を表示する");
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "スクリプトの出力を読みたいときに使います。GUI を自分で開くツールには関係しません。",
+                    )
+                    .weak(),
+                )
+                .wrap(),
+            );
             ui.end_row();
 
             ui.label("渡すもの");
@@ -962,7 +980,11 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         state.schedule_external_tool_path_check(std::time::Duration::from_millis(300));
     }
 
-    draw_external_tool_path_status(ui, "実行ファイル", &state.external_tool_executable_status);
+    draw_external_tool_path_status(
+        ui,
+        "プログラム / スクリプト",
+        &state.external_tool_executable_status,
+    );
     draw_external_tool_path_status(
         ui,
         "作業フォルダー",
@@ -1324,7 +1346,76 @@ fn refresh_send_to_status(state: &mut PreferencesState) {
     state.send_to_status = Some(crate::explorer_integration::send_to_shortcut_status());
 }
 
+fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState) {
+    if state.favorite_view_state_active {
+        ui.small("ここでは標準の設定を変えます。現在地は独自の表示状態を記憶中です。");
+    }
+}
+
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.remember_favorite_view_state,
+            "お気に入りごとに表示状態を記憶する",
+        );
+        ui.small(
+            "お気に入り配下で、サムネイル／詳細、サムネイルサイズと比率、一覧の並べ方とソート、単ページ／見開き、連結方式を自動で記憶します。",
+        );
+        ui.small(
+            "ツールチップの表示項目と、詳細一覧の列設定・選択列はすべての場所で共通です。OFF にしても保存済みの状態は残ります。",
+        );
+        favorite_standard_settings_notice(ui, state);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    state.favorite_view_state_entry_count > 0,
+                    egui::Button::new("保存済みの表示状態をすべてクリア…"),
+                )
+                .clicked()
+            {
+                state.favorite_view_state_clear_confirm_open = true;
+            }
+            ui.weak(format!(
+                "保存済み: {} 件",
+                state.favorite_view_state_entry_count
+            ));
+        });
+        if let Some(message) = state.favorite_view_state_clear_result.as_deref() {
+            ui.small(message);
+        }
+    });
+
+    if state.favorite_view_state_clear_confirm_open {
+        let mut clear = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("favorite_view_state_clear_confirm")).show(
+            ui.ctx(),
+            |ui| {
+                ui.set_min_width(420.0);
+                ui.heading("お気に入りの表示状態をすべてクリアしますか？");
+                ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("すべてクリア").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if clear {
+            state.favorite_view_state_clear_requested = true;
+            state.favorite_view_state_clear_confirm_open = false;
+        } else if cancel || response.should_close() {
+            state.favorite_view_state_clear_confirm_open = false;
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/category-order", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());
@@ -1603,6 +1694,29 @@ pub(super) fn page_bake_stage(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "bake-stage/matrix", page_bake_stage_body);
 }
 
+type BakeStageField = fn(&mut crate::settings::Settings) -> &mut crate::bake_stage::BakeStage;
+
+fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 4] {
+    [
+        ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
+        (
+            "エクスポート (1 枚)",
+            |s| &mut s.bake_stage_export,
+            "フルスクリーンの Ctrl+E",
+        ),
+        (
+            "エクスポート (まとめて)",
+            |s| &mut s.bake_stage_export_batch,
+            "一覧で選んでの Ctrl+E",
+        ),
+        (
+            "外部ツール",
+            |s| &mut s.bake_stage_external_tool,
+            "別のアプリへ渡す一時ファイル",
+        ),
+    ]
+}
+
 fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::bake_stage::BakeStage;
 
@@ -1616,38 +1730,7 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
 
-    /// その行の段を**誰が決めるか**。
-    ///
-    /// 「選べない出力を、選べる見た目で並べない」ため。単枚 Ctrl+E は表示済みの画素を
-    /// そのまま書き出すので段を読まない (バックログ §1.171)。効かない checkbox を
-    /// 押せる状態で出すと、下の注記を読むまで嘘をつくことになる。
-    enum StageSource {
-        Chosen(fn(&mut crate::settings::Settings) -> &mut BakeStage),
-        AlwaysDisplayedResult,
-    }
-
-    let rows: [(&str, StageSource, &str); 4] = [
-        (
-            "製本",
-            StageSource::Chosen(|s| &mut s.bake_stage_book),
-            "本棚へ追加するページ",
-        ),
-        (
-            "エクスポート (1 枚)",
-            StageSource::AlwaysDisplayedResult,
-            "フルスクリーンの Ctrl+E。表示している結果をそのまま書き出すので、段は選べません",
-        ),
-        (
-            "エクスポート (まとめて)",
-            StageSource::Chosen(|s| &mut s.bake_stage_export_batch),
-            "一覧で選んでの Ctrl+E",
-        ),
-        (
-            "外部ツール",
-            StageSource::Chosen(|s| &mut s.bake_stage_external_tool),
-            "別のアプリへ渡す一時ファイル",
-        ),
-    ];
+    let rows = bake_stage_rows();
 
     egui::Grid::new("bake_stage_matrix")
         .num_columns(4)
@@ -1660,30 +1743,15 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
             ui.end_row();
 
-            for (name, source, hint) in rows {
+            for (name, field, hint) in rows {
                 ui.label(name).on_hover_text(hint);
-                match source {
-                    StageSource::Chosen(field) => {
-                        let current = *field(&mut state.settings);
-                        for stage in BakeStage::ALL {
-                            // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
-                            let included = stage <= current;
-                            let mut selected = included;
-                            if ui.checkbox(&mut selected, "").clicked() {
-                                *field(&mut state.settings) = stage;
-                            }
-                        }
-                    }
-                    StageSource::AlwaysDisplayedResult => {
-                        // 全部入りだが、選べる訳ではない。押せない状態で全段を塗り、
-                        // 理由は hover と下の注記で言う。
-                        for _ in BakeStage::ALL {
-                            let mut always = true;
-                            ui.add_enabled(false, egui::Checkbox::without_text(&mut always))
-                                .on_disabled_hover_text(
-                                    "表示している結果をそのまま書き出すので、段は選べません",
-                                );
-                        }
+                let current = *field(&mut state.settings);
+                for stage in BakeStage::ALL {
+                    // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
+                    let included = stage <= current;
+                    let mut selected = included;
+                    if ui.checkbox(&mut selected, "").clicked() {
+                        *field(&mut state.settings) = stage;
                     }
                 }
                 ui.end_row();
@@ -1697,17 +1765,6 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 "編集 = 補正・回転・注釈・消しゴム・隠蔽・切り取り。",
                 "AI 処理 = AI アップスケールとノイズ除去。",
                 "表示用補正 = スマートシャープ・カラー化・LUT・ポストフィルタ。",
-            ))
-            .weak(),
-        )
-        .wrap(),
-    );
-    ui.add_space(6.0);
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(concat!(
-                "外部ツールへ見開きを 1 枚に合成して渡す場合も、",
-                "その行の段にかかわらず表示している結果をそのまま書き出します。",
             ))
             .weak(),
         )
@@ -6980,6 +7037,25 @@ pub(super) fn draw_video_bar_visibility_settings(
     }
     ui.small("ON にするとストリップを開いたままにし、下部シークバーも固定して、ストリップの領域を映像から除外します。ストリップ右上の鍵アイコンからも切り替えできます。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
+    ui.add_space(6.0);
+    egui::ComboBox::from_label("マウスオーバーのサムネイル")
+        .selected_text(settings.video_seek_hover_preview_mode.label())
+        .show_ui(ui, |ui| {
+            for mode in crate::settings::VideoSeekHoverPreviewMode::ALL {
+                ui.selectable_value(
+                    &mut settings.video_seek_hover_preview_mode,
+                    mode,
+                    mode.label(),
+                );
+            }
+        });
+    egui::ComboBox::from_label("サムネイルストリップ表示中の通常シークバー")
+        .selected_text(settings.video_seek_bar_with_strip.label())
+        .show_ui(ui, |ui| {
+            for mode in crate::settings::VideoSeekBarWithStrip::ALL {
+                ui.selectable_value(&mut settings.video_seek_bar_with_strip, mode, mode.label());
+            }
+        });
 }
 
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -8416,6 +8492,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.label(
         "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向、0 でズーム/フィットを切り替えできます。",
     );
+    favorite_standard_settings_notice(ui, state);
     ui.add_space(4.0);
     anchored(ui, state, "spread/page-layout", |ui, state| {
         let s = &mut state.settings;
@@ -8491,11 +8568,69 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.add_space(8.0);
     anchored(ui, state, "spread/seek-bar", |ui, state| {
         let s = &mut state.settings;
-        ui.checkbox(
-            &mut s.fullscreen_seek_bar_locked,
-            "下部ページシークバーを固定表示",
-        );
+        let bottom_lock = s.still_bottom_lock();
+        let mut bar_locked = bottom_lock.bar_locked();
+        if ui
+            .checkbox(&mut bar_locked, "下部ページシークバーを固定表示")
+            .changed()
+        {
+            s.set_still_bottom_lock(bottom_lock.with_bar(bar_locked));
+        }
         ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    });
+    anchored(ui, state, "spread/seek-strip", |ui, state| {
+        let s = &mut state.settings;
+        let mut strip_visible = s.still_seek_strip_visible;
+        if ui
+            .checkbox(&mut strip_visible, "ページシークバーにサムネイル列を表示")
+            .changed()
+        {
+            s.set_still_seek_strip_visible(strip_visible);
+        }
+        let mut strip_locked = s.still_bottom_lock().strip_locked();
+        if ui
+            .checkbox(&mut strip_locked, "サムネイル列を固定表示")
+            .changed()
+        {
+            s.set_still_seek_strip_locked(strip_locked);
+        }
+        ui.horizontal(|ui| {
+            ui.label("サムネイル列の高さ");
+            ui.add_enabled_ui(s.still_seek_strip_visible, |ui| {
+                egui::ComboBox::from_id_salt("still_seek_strip_height")
+                    .selected_text(s.still_seek_strip_height.label())
+                    .show_ui(ui, |ui| {
+                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+                            ui.selectable_value(
+                                &mut s.still_seek_strip_height,
+                                preset,
+                                preset.label(),
+                            );
+                        }
+                    });
+            });
+        });
+        ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
+    });
+    anchored(ui, state, "spread/seek-preview", |ui, state| {
+        let s = &mut state.settings;
+        egui::ComboBox::from_label("マウスオーバーのサムネイル")
+            .selected_text(s.still_seek_hover_preview_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::StillSeekHoverPreviewMode::ALL {
+                    ui.selectable_value(&mut s.still_seek_hover_preview_mode, mode, mode.label());
+                }
+            });
+    });
+    anchored(ui, state, "spread/seek-bar-with-strip", |ui, state| {
+        let s = &mut state.settings;
+        egui::ComboBox::from_label("サムネイル列表示中の通常シークバー")
+            .selected_text(s.still_seek_bar_with_strip.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::StillSeekBarWithStrip::ALL {
+                    ui.selectable_value(&mut s.still_seek_bar_with_strip, mode, mode.label());
+                }
+            });
     });
     anchored(ui, state, "spread/seek-direction", |ui, state| {
         let s = &mut state.settings;
@@ -9061,7 +9196,7 @@ fn open_in_explorer(path: &std::path::Path) {
 mod tests {
     use super::{
         AI_SIZE_LIMIT_OPTIONS, KeyboardPickerCell, OperationAssignmentTab,
-        OperationAssignmentTarget, PreferencesState, apply_command_editor,
+        OperationAssignmentTarget, PreferencesState, apply_command_editor, bake_stage_rows,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
         compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
         external_tool_batch_behavior_note, external_tool_key_slot_label,
@@ -9072,6 +9207,22 @@ mod tests {
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, KeyName, ModKind};
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+
+    #[test]
+    fn single_export_bake_stage_row_updates_its_setting() {
+        let mut settings = crate::settings::Settings::default();
+        let (_, field, _) = bake_stage_rows()
+            .into_iter()
+            .find(|(label, _, _)| *label == "エクスポート (1 枚)")
+            .expect("single export row");
+        *field(&mut settings) = crate::bake_stage::BakeStage::Edits;
+
+        assert_eq!(
+            settings.bake_stage_export,
+            crate::bake_stage::BakeStage::Edits
+        );
+        assert_eq!(bake_stage_rows().len(), 4);
+    }
 
     #[test]
     fn external_tool_key_slot_labels_mark_the_ten_slot_boundary() {

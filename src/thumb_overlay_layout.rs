@@ -58,6 +58,7 @@ pub enum EditBadgeKind {
     Mask,
     Conceal,
     Comic,
+    Crop,
     Pin,
 }
 
@@ -69,6 +70,7 @@ impl EditBadgeKind {
             Self::Mask => "消",
             Self::Conceal => "隠",
             Self::Comic => "文",
+            Self::Crop => "切",
             Self::Pin => "📌",
         }
     }
@@ -184,6 +186,7 @@ pub struct EditBadgeFlags {
     pub mask: bool,
     pub conceal: bool,
     pub comic: bool,
+    pub crop: bool,
     pub pin: bool,
 }
 
@@ -195,6 +198,7 @@ impl EditBadgeFlags {
             (self.mask, EditBadgeKind::Mask),
             (self.conceal, EditBadgeKind::Conceal),
             (self.comic, EditBadgeKind::Comic),
+            (self.crop, EditBadgeKind::Crop),
             (self.pin, EditBadgeKind::Pin),
         ]
         .into_iter()
@@ -602,6 +606,20 @@ mod tests {
     }
 
     #[test]
+    fn crop_badge_uses_the_existing_edit_lane_before_pin() {
+        let kinds = EditBadgeFlags {
+            crop: true,
+            pin: true,
+            ..Default::default()
+        }
+        .active()
+        .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec![EditBadgeKind::Crop, EditBadgeKind::Pin]);
+        assert_eq!(EditBadgeKind::Crop.text(), "切");
+    }
+
+    #[test]
     fn lane_rectangles_do_not_intersect() {
         let (cell, inner) = cell(360.0);
         let tags = tags(&["#風景", "旅行"]);
@@ -715,6 +733,7 @@ mod tests {
                     mask: true,
                     conceal: true,
                     comic: true,
+                    crop: true,
                     pin: true,
                 },
                 tags: &tags,

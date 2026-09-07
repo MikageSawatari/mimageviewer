@@ -47,6 +47,22 @@ impl App {
         }
     }
 
+    /// Records a fullscreen seek-bar drag as scroll-like intent.
+    ///
+    /// Dragging the seek bar sweeps the keep range across the book exactly the way
+    /// scrolling sweeps it across the grid, but it arrives as a pointer drag, so none of
+    /// the conditions above see it and thumbnail prefetch is never held back. Measured on
+    /// 2026-09-04: during a drag, 1,410 of 1,968 thumbnail enqueues in twelve seconds were
+    /// prefetch, and every fullscreen frame over 100ms had that work in flight. Paging with
+    /// the keyboard did not have the problem because arrow and page keys are already
+    /// counted here - which is why the report was specific to the seek bar.
+    ///
+    /// Only the prefetch gate's clock is touched. The grid's own scroll bookkeeping
+    /// (offset tracking, settle state) belongs to the grid and is not ours to reset.
+    pub(crate) fn note_fullscreen_seek_activity(&mut self) {
+        self.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    }
+
     /// Records grid touch-scroll activity even when only the fractional
     /// drawing remainder moved and the canonical row anchor stayed unchanged.
     /// Keeping all scroll/idle clocks on this explicit boundary prevents
@@ -352,6 +368,8 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        // 最後の UI 差分と debounce 中の書き込みを、settings の終了保存より先に確定する。
+        self.flush_favorite_view_writes_for_exit();
         // 一括編集が中央DBへcommit済みなら、成功 outcome をsidecarへ反映してから
         // 後段の終了時flushへ渡す。未着手の次itemはcancelで開始しない。
         self.finish_bulk_page_edit_for_exit();

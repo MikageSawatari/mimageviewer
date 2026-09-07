@@ -1264,6 +1264,7 @@ pub fn draw_overlay_edit_badge(
         EditBadgeKind::Mask => (egui::Color32::from_rgb(200, 80, 40), egui::Color32::WHITE),
         EditBadgeKind::Conceal => (egui::Color32::from_rgb(153, 102, 204), egui::Color32::WHITE),
         EditBadgeKind::Comic => (egui::Color32::from_rgb(210, 90, 160), egui::Color32::WHITE),
+        EditBadgeKind::Crop => (egui::Color32::from_rgb(35, 145, 180), egui::Color32::WHITE),
         EditBadgeKind::Pin => (
             egui::Color32::from_rgb(230, 180, 90),
             egui::Color32::from_rgb(60, 40, 10),
@@ -1430,21 +1431,48 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 /// 呼び出し側で raw item index 順を組み直さず、フィルタ・詳細ソート適用後の
 /// `display_order` をそのまま共有すること。
 pub fn still_image_display_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
-    display_order
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect()
+    crate::app::measure_nav_helper(
+        crate::app::NavHelperPerfKind::StillImageDisplayIndices,
+        || {
+            #[cfg(test)]
+            STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT
+                .set(STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get() + 1);
+            display_order
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    matches!(
+                        items.get(i),
+                        Some(GridItem::Image(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                    )
+                })
+                .collect()
+        },
+    )
 }
 
-fn adjacent_idx_in_order(nav_indices: &[usize], current: usize, delta: i32) -> Option<usize> {
+#[cfg(test)]
+std::thread_local! {
+    static STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_still_image_display_indices_build_count_for_test() {
+    STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn still_image_display_indices_build_count_for_test() -> usize {
+    STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get()
+}
+
+pub(crate) fn adjacent_idx_in_order(
+    nav_indices: &[usize],
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
     if nav_indices.is_empty() {
         return None;
     }
@@ -1583,6 +1611,26 @@ pub fn large_jump_page_idx(
     forward: bool,
 ) -> Option<usize> {
     let nav_indices = page_jump_nav_indices(items, display_order);
+    large_jump_page_idx_from_nav_indices(
+        &nav_indices,
+        current,
+        mode,
+        percent,
+        fixed_count,
+        min_step,
+        forward,
+    )
+}
+
+pub(crate) fn large_jump_page_idx_from_nav_indices(
+    nav_indices: &[usize],
+    current: usize,
+    mode: crate::settings::FullscreenJumpMode,
+    percent: u32,
+    fixed_count: usize,
+    min_step: usize,
+    forward: bool,
+) -> Option<usize> {
     let step = match mode {
         crate::settings::FullscreenJumpMode::Percent => {
             percent_jump_page_step(nav_indices.len(), percent)

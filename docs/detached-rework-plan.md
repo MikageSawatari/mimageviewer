@@ -1459,6 +1459,196 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-07 PDF 初回 open の binding 衝突: 窓 ID の正本を registry へ一本化
+（ClaudeCode の依頼が指定する構造修正として実施。Codex は §2 を読み、production 経路の
+修正前再現で BA-7 と確認。実装後の ClaudeCode 検収・実機確認は未実施）:**
+
+**確認した原因**: `start_active_detached_book_context_with_start` が予約した窓 1 を App field にも
+保存した後、`load_pdf_as_folder → try_apply_pdf_meta_cache → start_loading_items_inner →
+close_fullscreen → close_fullscreen_now → prepare_viewer_presentation_close` が走る。
+計測で `field=Some(1), residence=Building, session=None` を確認した。session は I8 に従い commit 後に
+始めるため、この表示終了処理は field を `None` にする。予約は消えず commit で窓 1 の binding が
+公開される。mount 後の `ensure` 到達値は `field=None, binding=Some(1), grid_intent=true,
+last=Some(1)`。旧 resolver は binding を見ずに窓 2 を割り当て、実機と同じ
+`ContextOwnedBy(1)` で落ちた。提示された 6 箇所だけでなく、本体には `None` 代入が計 9 箇所あり、
+今回の直接の書き手は元 `app.rs:53756` だった。調査ログは
+`target/detached-binding-investigation/red.log` に保存（非配布のローカル検証成果物）。
+
+**触った範囲**: `App.detached_viewer_window_id` と `ViewerSession.detached_window_id` を撤去し、
+bundle の交換・分割対象からも削除。`ContextTable::projected_window` と App の
+`detached_viewer_window_id()` accessor は、
+Mounted なら双方向 binding、Building なら既存の非公開 `pending_bind` から導出する。
+`ensure_detached_viewer_window_id` は未所有の context だけに割り当て、同じ registry で即座に
+bind / reserve する。旧 stale guard と `last_active_detached_window_id` による再利用補正は撤去した。
+`last_active_detached_window_id` は active 選択・終了処理の履歴として残るが、窓の割当権限を持たない。
+App・fullscreen・view trim・startup の参照先も accessor に変更。session からの窓 ID 読み取り API を
+削り、唯一の at-rest consumer は既知の context ID から registry を読む。監査の API 表もこの削除と
+導出 accessor に合わせる。frozen snapshot の再採用は既存の bind 関数を明示的に通し、active session
+の終了は session と所有 binding が読める間に viewport runtime を終了し、その後に session、
+main の binding を解放する（at-rest の binding は context retire まで保持）。
+
+**判断理由**: 表示終了や payload 交換に窓の所有権を書き換える権限があったことが BA-7 の違反。
+clear 点へ条件を足すのではなく、書き換え可能な第 2 の所有者そのものを削除する。同じ context の
+reload・close・mount では binding が正本のままで、所有の移動・解放は既存の bind / unbind / fork /
+retire transaction に限定する。新しい bool / Option、guard、retry、delay、repaint は追加しない。
+Building の予約を公開する時点は変更せず I8 を維持し、独立窓・linked still・ParkedLive の機能を保つ。
+この構造判断は依頼者 ClaudeCode が指定した方向と一致する。完成 diff の検収を済んだとは扱わない。
+
+**旧版の判定**: `git show v3.5.0:...`（tag の commit は `4f394aaaa`）で、予約からキャッシュ適用・
+表示終了・commit・mount・列挙
+完了・deferred open までを照合した。この事故は **v3.5.0 のコードでも成立する**。特に
+`try_apply_pdf_meta_cache`、`poll_pdf_enumerate`、deferred open、book build の処理は同一で、
+`start_loading_items_inner` の差分はここでの close 条件を変えていない。キャッシュ適用時の
+field 消失は列挙完了を待つ前に確定する。さらに旧版も load 時に `from_explicit_open=true` を保存し、
+deferred open が `fs_open_intent_from_grid=true` を再設定するため、旧 resolver の履歴 ID 再利用には
+入らない。同一 frame への前倒しは成立条件ではない。v3.5.0 バイナリの実機再現や版ごとの
+発生頻度の比較は未実施で、v3.6.0 の最適化によって発生頻度が増えたかは未判定。
+
+**回帰確認**: book 開始直後の窓 ID 解決と、PDF load → worker 応答 channel → 本番 poll →
+open_fullscreen の 2 本を実装変更前に実行し、それぞれ `2 != 1` と実機と同じ panic で失敗した。
+外部 worker の応答だけをテストで供給し、build / commit / mount、placeholder、deferred request、
+poll handler は本番処理を通す。追加で ZIP、走査済み通常フォルダの build 内 open、build abort、
+terminal・mode close・legacy still park・live media fork / park・main と sibling の所有境界を検証する。
+既存テストの保存 field への直接代入は registry の予約 / binding または明示的な active 選択へ移し、
+同じ窓を main と at-rest context が同時所有する fixture を許さない。
+追加した 10 ケースを修正前ソースでも対照実行した（元の field を読むための構文差分だけを吸収し、
+実行後は修正済み source をバイト単位で復元）。7 件が失敗、3 件が元から成功した。修正後は 10 件
+すべて成功。失敗しなかった比較対照を「修正前に落ちた」とは扱わない。
+
+| 検証ケース（`src/app/tests/detached_binding_identity.rs`） | 修正前 | 検証する境界 |
+| --- | --- | --- |
+| `book_start_resolves_published_window` | 失敗 `2 != 1` | warm PDF の book build / commit / mount 直後の ID 決定 |
+| `pdf_load_poll_open_uses_published_window` | 失敗 `ContextOwnedBy(1)` | PDF placeholder → 本番列挙 poll → deferred open → fullscreen |
+| `scanned_folder_opens_inside_build_with_reserved_window` | 失敗 `2 != 1` | 通常フォルダの build 内 open と非公開予約 |
+| `build_close_abort_and_mount_do_not_copy_window_ownership` | 失敗 `1 != 81` | 表示終了で build 予約を消さない、I8、abort、往復 mount / retire |
+| `terminal_retirement_then_release_uses_binding` | 失敗 `None != Some(31)` | 元 2400 の runtime retire と binding 解放の別の寿命 |
+| `mounted_live_media_park_transfers_binding` | 失敗 `2 != 1` | 元 43147 の fork / park 後の mount。元 39420 の passive 衝突 guard も binding を誤棄却する |
+| `at_rest_live_media_park_preserves_sibling_binding` | 失敗 `2 != 1` | 元 43276 の park が、元に戻した main context の所有窓を消していた経路 |
+| `zip_load_poll_open_uses_published_window` | 成功（比較対照） | ZIP の本番 load / 列挙 poll / fullscreen |
+| `mode_close_releases_all_contexts` | 成功（比較対照） | 元 39843 の mode 終了後の binding 整合 |
+| `legacy_still_park_releases_only_main_binding` | 成功（比較対照） | 元 41664 の frozen snapshot への handoff と main binding 解放 |
+
+上表のテスト名には共通 prefix `detached_binding_identity_` が付く。元 43502 の promote と元 45336 の
+non-detached open についても既存の media promotion / main open / sibling session テストを維持する。
+既存 `at_rest_session_finish_precedes_later_context_retire` に、main が別の窓を所有する条件と
+viewport 出力の終了を追加した。session の `take` が runtime 終了に先行すると、閉じる窓の所有者を
+判別できず `fs_viewport_shown` が残ることを失敗で確認し、上記の解放順序へ揃えた。
+この追加点検の失敗ログは `target/detached-binding-investigation/terminal-order-red.log`。
+**最終検証**: `cargo check -p mimageviewer --bin mimageviewer-core` 成功、lib の `detached` 251 件、
+`viewer_context` 52 件、追加で強化した終了順序テスト 1 件成功。絞り込みなしの
+`cargo test -p mimageviewer --lib` は 7,493 件成功・失敗 0・ignored 34。
+`cargo test --test ui_snapshot` は 45 件成功、`cargo run --locked -p viewer_context_audit` 成功。
+`scripts/test-full.ps1` は workspace・統合テスト・vendor の両ゲートまで PASS。
+引数なし `cargo fmt` 実施後の `cargo fmt --check` 成功、UI glyph 検査は危険文字 0。
+全チェック後に `scripts/build-dev.ps1` 成功。通常 feature の core / remote を
+`target/dev-runtime` に生成した（portable feature 無効）。agent による起動は行っていない。
+実機ではキャッシュ済み PDF の初回 open、2 冊目、窓切替・終了・再 open、ZIP / 通常フォルダ、
+live media の park / 復帰を確認する。完成 diff の ClaudeCode 検収と実機確認は未実施。
+作業中に別セッションで加わった `7083da664` は文書と panic 棚卸し script のみで、本体 source の
+差分はない。追加の棚卸しも `-AckFile` / `-LogDir` を明示して成功した。引数省略ではこの実行環境の
+PowerShell が既定値内の `$PSScriptRoot` を空文字として扱い、`Join-Path` で失敗したためで、
+script と disposition 表は変更していない（今回の PDF panic は既に `filed` として登録済み）。
+
+**2026-09-07 v3.6.0 レビュー G1: 通常動画ズームを既存 viewer context 所有境界へ接続した
+（本 brief の指定する構造修正として実施。Codex は着手前に §2 を読み、静止画シークと同型の
+bundle 欠落を埋める BA-7 修正と判断。実装後の ClaudeCode 検収・実機確認は未実施）:**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `video_zoom_state: Option<VideoZoomState>` を追加。`None` 初期化、完全
+destructure、既存 mount / swap、main grid を残す分割の move 対象へ載せた。項目変更と close は
+mount 中の context の state だけを reset し、別 context の値は bundle に残る。
+[src/app.rs](../src/app.rs) の同名 field は mount 中の投影であり、独立した global owner ではない。
+
+**判断理由**: 通常動画の倍率・中心は項目固有なのに、定期更新が各 context を一時 mount して
+`poll_video` / presenter 同期を行う境界の外にあった。新しい窓種別 guard、detached 述語、待ち時間、
+repaint、bool を足さず、既に fullscreen item / player / panorama state を交換している単一の owner へ
+載せる。state と presenter command は値 snapshot であり `Arc` projection を持たないため、分割した
+context 同士も同じ可変 projection を共有しない。A/B の往復 mount、片方の項目 reset / close、元
+context の復元、分割後の値独立を production registry の回帰テストで固定する。
+
+**2026-09-06〜07 v3.6.0 レビュー F1 / F2: 静止画シークの要求とジェスチャを既存 context
+所有境界へ接続した（本 brief の指定する構造修正として実施。Codex は着手前に §2 を読み、
+隣接する交換対象からの欠落を埋める BA-7 修正と判断。実装後の ClaudeCode 検収・実機確認は未実施）:**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `fs_seek_gesture: StillSeekGesture` を追加。Idle 初期化、完全 destructure、
+既存 mount / swap、main grid を残す分割の move 対象へ載せた。pause は進行中の Track / Strip
+だけを中断し、StripCommitted は保持する。close は既存の mounted teardown、retire / build abort
+は bundle の寿命で完結する。App の field は mount 中の投影であり、独立した global owner ではない。
+
+F1 は [src/app.rs](../src/app.rs) の通常ページ着地から exact 要求の全消しを撤去し、
+App / bundle の items 世代変更時に集合と worker projection を失効させる。既存の overlay 置換、
+idx 無効化、fullscreen 終了時の clear は維持する。分割で projection の Arc を共有していた点も、
+同じ値を独立 RwLock へ複製する形へ直した。[src/thumb_loader.rs](../src/thumb_loader.rs) の
+共通 checkpoint は worker の pop 後・I/O 後・PDF レンダ前で同じ実要求と共有集合を読む。
+
+**判断理由**: ページ着地と overlay の二重終了、および context 間で 1 個のジェスチャ / 可変集合を
+共有する所有境界の欠落を取り除く。別窓判定、identity guard、待ち時間、repaint、bool は追加しない。
+detached 述語、viewport lifecycle、window binding、placement、session 遷移は変更していない。
+要求寿命は単ページ / 見開き・縦 / 横連結で同一とし、確定中心は各 context の復帰時に復元する。
+
+**回帰確認**: 修正前に通常 overlay → キュー要求 → 実着地で exact set が空になること、items 世代 /
+コンテナ差し替えで集合が残ること、fork した窓の要求置換が main の共有集合を上書きすること、
+新 context への中心漏れ・pause 中断漏れ・分割時のジェスチャ移動漏れを確認した。
+連結読みは修正前から通る比較対照。A/B の同位置・異位置、往復 mount、片方の close と他方の復元を
+production registry で検証する。F3〜F8 および動画側シークストリップは対象外。
+
+自動検証は core の `cargo check`、`still_seek` 42 件、`viewer_context` 47 件、絞り込みなしの
+lib（7,444 件成功・既定 ignore 32 件）、UI snapshot 45 件、`cargo fmt --check`、
+`scripts/test-full.ps1`（workspace / egui-wgpu / eframe）すべて成功。
+
+**2026-09-05 バックログ §1.184 で、お気に入り別表示状態の現在地 owner を
+`ViewerContextBundle` に載せた (本依頼の決定事項として ClaudeCode 側から「既存の所有境界に
+載せ、detached 述語を足さない」構造が指定され、Codex も §2 の症状パッチではないと判定):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `FavoriteViewContextState` を追加し、既存 `swap_viewer_context_bundle`
+の前で旧 context の差分を確定して共通値へ戻し、既存 field swap 後に新 context の保存値を
+適用する。[src/app.rs](../src/app.rs) の表示状態 map / DB debounce は App-global、現在地の
+最近祖先 UUID だけが context owner である。detached 述語、viewport lifecycle、window binding、
+placement、session 遷移、snapshot DTO は変更していない。
+
+**判断理由**: `Settings` の 232 箇所の直接読みを維持するため、その対象 field は現在マウント中
+context の有効値になる。一方、共通値は非永続 overlay に退避し、context swap で旧値を外してから
+新値を載せる必要がある。新しい窓種別判定や sibling guard を足すのではなく、既に全 per-context
+状態を交換している単一 ownership 境界へ 1 個の型付き owner を追加した。A/B の context を交換し、
+各 UUID の変更と共通値が相互に上書きされない回帰テストを追加した。
+
+**2026-09-05 バックログ §1.183 で、既存の fullscreen viewport 段別計装へ
+UI thread の実行サイクル数を追加した (本依頼で ClaudeCode が計装のみ・既存境界維持を指定し、
+Codex も症状パッチではない read-only 診断追加と判定):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`FsRenderPerfRecorder` と既存 navigation / open / page-decision / passthrough span、
+[src/app.rs](../src/app.rs) の `UpdatePerfRecorder` と
+`PassthroughRenditionPerfRecorder`。既存の各 wall-clock 境界で
+`App::thread_cycles_now()` を併記し、`ui.update_breakdown` /
+`ui.fs_render_breakdown` に `*_cycles`、`total_cycles`、`unaccounted_cycles` を出す。
+detached 述語、viewport ID / lifecycle / registry、runtime / host ownership、geometry /
+placement / focus、描画 source と処理順は変更していない。
+
+**判断理由**: 遅い frame ほど cycles/ms が低い実測から、UI thread が待っている段を
+特定するための計装だけを追加した。新しい guard / delay / retry / repaint / fallback /
+状態 field は無く、perf 無効時は wall clock と cycle counter の双方を読まない。
+したがって detached の症状を隠す変更ではなく、§2 に適合する診断追加である。
+
+**2026-09-04 バックログ §1.183 で、nav / 静止画 / seek の導出キャッシュを viewer context
+単位の owner へ集約した (本依頼で ClaudeCode が単一 owner と context ごとの所有を指定し、
+Codex も症状パッチではなく構造的修正と判定):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) に
+`ViewerNavigationCaches` を置き、[src/app.rs](../src/app.rs) の別々だった nav / seek field と
+新しい静止画一覧 cache を 1 field へまとめた。
+[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) は、その owner を既存の
+`ViewerContextBundle` の mount / swap / detached physical fork に載せた。
+detached 述語、viewport lifecycle、window binding、placement、session 遷移には触れていない。
+
+**判断理由**: nav cache のヒット時 `Vec` 複製と、静止画一覧の毎回再構築を止める性能修正。
+3 field を同じ場所で消す約束にはせず、単一 `invalidate` と items 世代 / 連結方式の
+source key で同時失効させる。cache owner 自体が bundle 所有なので、同じ generation 番号でも
+main の一覧を detached が参照しない。context 切替で別 owner が構築され、元 context へ戻ると
+その context の cache だけが残ることを回帰テストで固定した。
+
 **2026-09-04 バックログ §1.174 (書庫の高速ページ送りが詰まる) で、フルスクリーンの
 ページ読み込みにプロセス共通の受付上限を入れた (正本:
 [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md)。実装 = Codex、

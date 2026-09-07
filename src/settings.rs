@@ -3479,6 +3479,60 @@ impl PostFilterDowngradeStash {
     }
 }
 
+/// お気に入り単位で記憶する表示状態。
+///
+/// ここに含める項目は利用者仕様で固定されている。詳細一覧の列構成やツールチップなど、
+/// 全場所で共有する設定を追加してはならない。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FavoriteViewState {
+    pub grid_view_mode: GridViewMode,
+    /// 画面上の列数。利用者から見た「サムネイルサイズ」はこれで決まる。
+    /// デコード解像度 (`Settings::thumb_px`) は画質の設定なので、全場所で共通のまま。
+    pub grid_cols: usize,
+    pub thumb_aspect: ThumbAspect,
+    pub thumb_aspect_auto: bool,
+    pub grid_display_order: GridDisplayOrder,
+    pub sort_order: SortOrder,
+    pub default_spread_mode: SpreadMode,
+    pub default_reading_flow: ReadingFlow,
+}
+
+impl FavoriteViewState {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            grid_view_mode: settings.grid_view_mode,
+            grid_cols: settings.grid_cols,
+            thumb_aspect: settings.thumb_aspect,
+            thumb_aspect_auto: settings.thumb_aspect_auto,
+            grid_display_order: settings.grid_display_order.clone(),
+            sort_order: settings.sort_order,
+            default_spread_mode: settings.default_spread_mode,
+            default_reading_flow: settings.default_reading_flow,
+        }
+    }
+
+    pub(crate) fn apply_to_settings(&self, settings: &mut Settings) {
+        settings.grid_view_mode = self.grid_view_mode;
+        settings.grid_cols = self.grid_cols;
+        settings.thumb_aspect = self.thumb_aspect;
+        settings.thumb_aspect_auto = self.thumb_aspect_auto;
+        settings.grid_display_order = self.grid_display_order.clone();
+        settings.sort_order = self.sort_order;
+        settings.default_spread_mode = self.default_spread_mode;
+        settings.default_reading_flow = self.default_reading_flow;
+    }
+}
+
+/// 現在 `Settings` の表示フィールドへ適用しているお気に入り overlay。
+///
+/// `common` が永続化すべき共通値の正本であり、`Settings::save_internal` は必ずこちらを
+/// 書き出す。viewer context の切替時はいったん共通値へ戻してから次の overlay を適用する。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FavoriteViewOverlay {
+    pub(crate) favorite_id: Uuid,
+    pub(crate) common: FavoriteViewState,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -3628,6 +3682,14 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
+    /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
+    #[serde(default)]
+    pub remember_favorite_view_state: bool,
+    /// 現在適用中のお気に入りと、永続化すべき共通表示状態。
+    /// DB / JSON には出さず、実行時の overlay としてだけ保持する。
+    #[serde(skip)]
+    pub(crate) favorite_view_overlay: Option<FavoriteViewOverlay>,
     /// 任意の複数実フォルダを横断して本コンテナを表示する保存済みビュー。
     #[serde(default)]
     pub smart_folders: Vec<SmartFolderDefinition>,
@@ -4244,6 +4306,22 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
+    /// 静止画のサムネイル列が表示中なら、その領域も画像から除外する。
+    /// 下部バー固定との到達可能な組み合わせは `BottomBarLock` が所有する。
+    #[serde(default)]
+    pub still_seek_strip_locked: bool,
+    /// 静止画ページシークバーに source page 単位のサムネイル列を表示する。
+    #[serde(default = "default_still_seek_strip_visible")]
+    pub still_seek_strip_visible: bool,
+    /// 静止画ページシークストリップの高さ (大 / 中 / 小 / 最小)。
+    #[serde(default = "default_still_seek_strip_height")]
+    pub still_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 静止画ページシークのマウスオーバープレビュー表示方針。
+    #[serde(default = "default_still_seek_hover_preview_mode")]
+    pub still_seek_hover_preview_mode: StillSeekHoverPreviewMode,
+    /// 静止画サムネイル列表示中の通常ページシークバー表示方針。
+    #[serde(default = "default_still_seek_bar_with_strip")]
+    pub still_seek_bar_with_strip: StillSeekBarWithStrip,
     /// 静止画フルスクリーン上部 HUD を常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_top_bar_locked: bool,
@@ -4713,9 +4791,15 @@ pub struct Settings {
     #[serde(default)]
     pub video_seek_bar_locked: bool,
     /// シークストリップが表示中なら、その領域も常時確保して映像から除外する。
-    /// 下部バー固定との到達可能な組み合わせは `VideoBottomLock` が所有する。
+    /// 下部バー固定との到達可能な組み合わせは `BottomBarLock` が所有する。
     #[serde(default)]
     pub video_seek_strip_locked: bool,
+    /// 動画シークのマウスオーバープレビュー表示方針。
+    #[serde(default = "default_video_seek_hover_preview_mode")]
+    pub video_seek_hover_preview_mode: VideoSeekHoverPreviewMode,
+    /// 動画サムネイルストリップ表示中の通常シークバー表示方針。
+    #[serde(default = "default_video_seek_bar_with_strip")]
+    pub video_seek_bar_with_strip: VideoSeekBarWithStrip,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -5397,18 +5481,18 @@ fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
 }
 
-/// 動画下部の固定状態。
+/// 下部バーと、その上に表示するストリップの固定状態。
 ///
 /// 到達できるのはこの 3 つだけで、「バー非固定 + ストリップ固定」は表現できない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VideoBottomLock {
+pub enum BottomBarLock {
     #[default]
     None,
     BarOnly,
     BarAndStrip,
 }
 
-impl VideoBottomLock {
+impl BottomBarLock {
     /// 永続化用の 2 つの bool から実行時の固定状態を復元する。
     ///
     /// `(false, true)` はストリップ固定の前提となるバー固定がない無効値なので、
@@ -5534,6 +5618,138 @@ impl VideoSeekStripState {
             Self::Thumbnails | Self::Waveform => Self::None,
         }
     }
+}
+
+/// 静止画シーク位置へ追従するサムネイルプレビューの表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekHoverPreviewMode {
+    #[default]
+    Always,
+    HideWithThumbnailStrip,
+    Never,
+}
+
+impl StillSeekHoverPreviewMode {
+    pub const ALL: [Self; 3] = [Self::Always, Self::HideWithThumbnailStrip, Self::Never];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::HideWithThumbnailStrip => !thumbnail_strip_visible,
+            Self::Never => false,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Always => "常に表示する",
+            Self::HideWithThumbnailStrip => "サムネイルストリップ表示中は表示しない",
+            Self::Never => "常に表示しない",
+        }
+    }
+}
+
+/// 静止画サムネイル列表示中の通常ページシークバー表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekBarWithStrip {
+    #[default]
+    Show,
+    Hide,
+}
+
+impl StillSeekBarWithStrip {
+    pub const ALL: [Self; 2] = [Self::Show, Self::Hide];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        !thumbnail_strip_visible || matches!(self, Self::Show)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Show => "表示する",
+            Self::Hide => "表示しない",
+        }
+    }
+}
+
+/// 動画シーク位置へ追従するサムネイルプレビューの表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekHoverPreviewMode {
+    #[default]
+    Always,
+    HideWithThumbnailStrip,
+    Never,
+}
+
+impl VideoSeekHoverPreviewMode {
+    pub const ALL: [Self; 3] = [Self::Always, Self::HideWithThumbnailStrip, Self::Never];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::HideWithThumbnailStrip => !thumbnail_strip_visible,
+            Self::Never => false,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Always => "常に表示する",
+            Self::HideWithThumbnailStrip => "サムネイルストリップ表示中は表示しない",
+            Self::Never => "常に表示しない",
+        }
+    }
+}
+
+/// 動画シークストリップ表示中の通常シークバー表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekBarWithStrip {
+    #[default]
+    Show,
+    Hide,
+}
+
+impl VideoSeekBarWithStrip {
+    pub const ALL: [Self; 2] = [Self::Show, Self::Hide];
+
+    pub const fn is_visible(self, seek_strip_visible: bool) -> bool {
+        !seek_strip_visible || matches!(self, Self::Show)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Show => "表示する",
+            Self::Hide => "表示しない",
+        }
+    }
+}
+
+fn default_still_seek_strip_visible() -> bool {
+    false
+}
+
+fn default_still_seek_strip_height() -> crate::video::seek_strip_layout::SeekStripHeight {
+    crate::video::seek_strip_layout::SeekStripHeight::Large
+}
+
+fn default_still_seek_hover_preview_mode() -> StillSeekHoverPreviewMode {
+    StillSeekHoverPreviewMode::Always
+}
+
+fn default_still_seek_bar_with_strip() -> StillSeekBarWithStrip {
+    StillSeekBarWithStrip::Show
+}
+
+fn default_video_seek_hover_preview_mode() -> VideoSeekHoverPreviewMode {
+    VideoSeekHoverPreviewMode::Always
+}
+
+fn default_video_seek_bar_with_strip() -> VideoSeekBarWithStrip {
+    VideoSeekBarWithStrip::Show
 }
 
 fn default_video_seek_strip_min_interval_secs() -> f64 {
@@ -5964,6 +6180,8 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            remember_favorite_view_state: false,
+            favorite_view_overlay: None,
             smart_folders: Vec::new(),
             last_folder: None,
             restore_last_cursor: true,
@@ -6074,6 +6292,11 @@ impl Default for Settings {
             panorama_projection: crate::panorama::PanoProjection::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
+            still_seek_strip_locked: false,
+            still_seek_strip_visible: default_still_seek_strip_visible(),
+            still_seek_strip_height: default_still_seek_strip_height(),
+            still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
+            still_seek_bar_with_strip: default_still_seek_bar_with_strip(),
             fullscreen_top_bar_locked: false,
             touch_still_chrome_learned: false,
             touch_video_chrome_learned: false,
@@ -6226,6 +6449,8 @@ impl Default for Settings {
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_seek_strip_locked: false,
+            video_seek_hover_preview_mode: default_video_seek_hover_preview_mode(),
+            video_seek_bar_with_strip: default_video_seek_bar_with_strip(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -7027,13 +7252,122 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    /// 現在の表示フィールドを共通値として退避し、お気に入り専用値を有効値へ載せる。
+    pub(crate) fn apply_favorite_view_overlay(
+        &mut self,
+        favorite_id: Uuid,
+        state: &FavoriteViewState,
+    ) {
+        self.clear_favorite_view_overlay();
+        let common = FavoriteViewState::from_settings(self);
+        state.apply_to_settings(self);
+        self.favorite_view_overlay = Some(FavoriteViewOverlay {
+            favorite_id,
+            common,
+        });
+    }
+
+    /// お気に入り専用値を外し、overlay が保持する共通値へ戻す。
+    pub(crate) fn clear_favorite_view_overlay(&mut self) {
+        let Some(overlay) = self.favorite_view_overlay.take() else {
+            return;
+        };
+        overlay.common.apply_to_settings(self);
+    }
+
+    /// 環境設定ダイアログへ渡す snapshot を作る。
+    ///
+    /// 有効値へお気に入り専用の表示状態が載っていても、環境設定が表示・編集するのは
+    /// 常に標準の値とする。対象項目は [`FavoriteViewState`] の変換だけから導く。
+    pub(crate) fn preferences_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.clear_favorite_view_overlay();
+        snapshot
+    }
+
+    /// 環境設定で編集した表示状態を標準値へ route する。
+    ///
+    /// お気に入り専用値が有効な間は、その有効値を `Settings` のフィールドへ残したまま、
+    /// ダイアログの値だけを標準値へ反映する。お気に入り外ではダイアログの値をそのまま
+    /// 有効値 (= 標準値) にする。
+    pub(crate) fn route_preferences_view_state(
+        &mut self,
+        standard: FavoriteViewState,
+        active: FavoriteViewState,
+    ) {
+        let Some(overlay) = self.favorite_view_overlay.as_mut() else {
+            standard.apply_to_settings(self);
+            return;
+        };
+        overlay.common = standard;
+        active.apply_to_settings(self);
+    }
+
+    pub(crate) fn active_favorite_view_id(&self) -> Option<Uuid> {
+        self.favorite_view_overlay
+            .as_ref()
+            .map(|overlay| overlay.favorite_id)
+    }
+
+    /// お気に入り配下の fullscreen 操作を、次に開く本へ継承する既定へ反映する。
+    /// 共通表示中は従来どおり本単位の `spread.db` だけを更新する。
+    pub(crate) fn update_active_favorite_spread_mode(&mut self, mode: SpreadMode) {
+        if self.favorite_view_overlay.is_some() {
+            self.default_spread_mode = mode;
+        }
+    }
+
+    /// [`Self::update_active_favorite_spread_mode`] の連結方式版。
+    pub(crate) fn update_active_favorite_reading_flow(&mut self, flow: ReadingFlow) {
+        if self.favorite_view_overlay.is_some() {
+            self.default_reading_flow = flow;
+        }
+    }
+
+    /// 永続化用 bool から、到達可能な静止画下部固定状態だけを復元する。
+    pub const fn still_bottom_lock(&self) -> BottomBarLock {
+        BottomBarLock::from_settings(
+            self.fullscreen_seek_bar_locked,
+            self.still_seek_strip_locked,
+        )
+    }
+
+    /// 静止画下部の固定状態を唯一の遷移 owner から永続化用 bool へ反映する。
+    pub fn set_still_bottom_lock(&mut self, lock: BottomBarLock) {
+        let (bar_locked, strip_locked) = lock.to_settings();
+        self.fullscreen_seek_bar_locked = bar_locked;
+        self.still_seek_strip_locked = strip_locked;
+    }
+
+    /// 静止画の下部バー固定を切り替える。OFF は列固定も同時に外す。
+    pub fn set_still_seek_bar_locked(&mut self, locked: bool) {
+        self.set_still_bottom_lock(self.still_bottom_lock().with_bar(locked));
+    }
+
+    /// 静止画のサムネイル列固定を切り替える。ON はバー固定と列表示も含意する。
+    pub fn set_still_seek_strip_locked(&mut self, locked: bool) {
+        let lock = self.still_bottom_lock().with_strip(locked);
+        self.set_still_bottom_lock(lock);
+        if lock.strip_locked() {
+            self.still_seek_strip_visible = true;
+        }
+    }
+
+    /// 静止画のサムネイル列を開閉する。閉じる操作は列固定も解除する。
+    pub fn set_still_seek_strip_visible(&mut self, visible: bool) {
+        if !visible {
+            self.set_still_seek_strip_locked(false);
+        }
+        self.still_seek_strip_visible = visible;
+    }
+
     /// 永続化用 bool から、到達可能な動画下部固定状態だけを復元する。
-    pub const fn video_bottom_lock(&self) -> VideoBottomLock {
-        VideoBottomLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
+    pub const fn video_bottom_lock(&self) -> BottomBarLock {
+        BottomBarLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
     }
 
     /// 動画下部の固定状態を唯一の遷移 owner から永続化用 bool へ反映する。
-    pub fn set_video_bottom_lock(&mut self, lock: VideoBottomLock) {
+    pub fn set_video_bottom_lock(&mut self, lock: BottomBarLock) {
         let (bar_locked, strip_locked) = lock.to_settings();
         self.video_seek_bar_locked = bar_locked;
         self.video_seek_strip_locked = strip_locked;
@@ -7801,6 +8135,10 @@ impl Settings {
             } else {
                 VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
             };
+        // 永続化は互換性のため 2 bool だが、実行時に無効な
+        // 「バー非固定 + ストリップ固定」を持ち回らない。
+        self.set_still_bottom_lock(self.still_bottom_lock());
+        self.set_video_bottom_lock(self.video_bottom_lock());
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
             .last_choice(self.video_seek_strip_last_choice);
@@ -8156,6 +8494,7 @@ impl Settings {
         self.details_selection_bar_show_video_codec = src.details_selection_bar_show_video_codec;
         self.facet_filter = src.facet_filter.clone();
         self.thumb_aspect = src.thumb_aspect;
+        self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
@@ -8275,6 +8614,9 @@ impl Settings {
         self.window_maximized = src.window_maximized;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
+        // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
+        self.favorite_view_overlay = src.favorite_view_overlay.clone();
         // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);
         self.smart_folders = std::mem::take(&mut src.smart_folders);
@@ -8387,6 +8729,10 @@ impl Settings {
         // self は &self なので clone してから書き換える。
         let snapshot = {
             let mut s = self.clone();
+            // お気に入り配下では対象フィールドに現在の専用値が入っている。永続化だけは
+            // overlay が保持する共通値へ戻し、専用値が共通設定へ漏れる経路をここで塞ぐ。
+            // 全ての Settings::save() はこの choke point を通る。
+            s.clear_favorite_view_overlay();
             s.grid_display_order.normalize();
             s.video_loop = !matches!(s.video_loop_mode, VideoLoopMode::Off);
             let archive_handling = s.archive_file_handling_resolved();
@@ -8642,6 +8988,63 @@ mod tests {
         assert!(!SpreadMode::SplitLtr.advances_right_to_left());
         // ペア並び順は分割を含まない。2 つの問いを取り違えない。
         assert!(!SpreadMode::SplitRtl.is_rtl());
+    }
+
+    #[test]
+    fn still_and_video_seek_display_settings_have_compatible_defaults_and_round_trip() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.still_seek_strip_locked);
+        assert!(!loaded.still_seek_strip_visible);
+        assert_eq!(
+            loaded.still_seek_strip_height,
+            crate::video::seek_strip_layout::SeekStripHeight::Large
+        );
+        assert_eq!(
+            loaded.still_seek_hover_preview_mode,
+            StillSeekHoverPreviewMode::Always
+        );
+        assert_eq!(
+            loaded.still_seek_bar_with_strip,
+            StillSeekBarWithStrip::Show
+        );
+        assert_eq!(
+            loaded.video_seek_hover_preview_mode,
+            VideoSeekHoverPreviewMode::Always
+        );
+        assert_eq!(
+            loaded.video_seek_bar_with_strip,
+            VideoSeekBarWithStrip::Show
+        );
+
+        let mut settings = Settings::default();
+        settings.still_seek_strip_visible = true;
+        settings.still_seek_hover_preview_mode = StillSeekHoverPreviewMode::Never;
+        settings.video_seek_bar_with_strip = VideoSeekBarWithStrip::Hide;
+        let stored = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&stored).unwrap();
+        assert!(restored.still_seek_strip_visible);
+        assert_eq!(
+            restored.still_seek_hover_preview_mode,
+            StillSeekHoverPreviewMode::Never
+        );
+        assert_eq!(
+            restored.video_seek_bar_with_strip,
+            VideoSeekBarWithStrip::Hide
+        );
+    }
+
+    #[test]
+    fn seek_display_policies_treat_only_thumbnail_strips_as_suppression_input() {
+        assert!(StillSeekHoverPreviewMode::Always.is_visible(true));
+        assert!(!StillSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(true));
+        assert!(StillSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(false));
+        assert!(!StillSeekHoverPreviewMode::Never.is_visible(false));
+        assert!(!StillSeekBarWithStrip::Hide.is_visible(true));
+        assert!(StillSeekBarWithStrip::Hide.is_visible(false));
+        assert!(!VideoSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(true));
+        assert!(VideoSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(false));
+        assert!(!VideoSeekBarWithStrip::Hide.is_visible(true));
+        assert!(VideoSeekBarWithStrip::Hide.is_visible(false));
     }
 
     #[test]
@@ -9657,7 +10060,7 @@ mod tests {
         assert!(!defaults.video_top_bar_locked);
         assert!(!defaults.video_seek_bar_locked);
         assert!(!defaults.video_seek_strip_locked);
-        assert_eq!(defaults.video_bottom_lock(), VideoBottomLock::None);
+        assert_eq!(defaults.video_bottom_lock(), BottomBarLock::None);
 
         let loaded: Settings =
             serde_json::from_str(r#"{"video_top_bar_locked":true,"video_seek_bar_locked":false}"#)
@@ -9668,14 +10071,78 @@ mod tests {
     }
 
     #[test]
+    fn bottom_lock_three_states_round_trip_through_the_persisted_bools() {
+        for lock in [
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
+        ] {
+            let (bar_locked, strip_locked) = lock.to_settings();
+            assert_eq!(BottomBarLock::from_settings(bar_locked, strip_locked), lock);
+        }
+    }
+
+    #[test]
+    fn still_bottom_lock_defaults_off_and_normalizes_strip_without_bar_on_load() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.still_bottom_lock(), BottomBarLock::None);
+        assert!(!defaults.fullscreen_seek_bar_locked);
+        assert!(!defaults.still_seek_strip_locked);
+
+        let mut loaded: Settings = serde_json::from_str(
+            r#"{"fullscreen_seek_bar_locked":false,"still_seek_strip_locked":true}"#,
+        )
+        .unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.still_bottom_lock(), BottomBarLock::None);
+        assert_eq!(
+            (
+                loaded.fullscreen_seek_bar_locked,
+                loaded.still_seek_strip_locked
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn still_bottom_lock_bar_and_strip_transitions_share_the_invariant() {
+        let mut settings = Settings::default();
+        settings.set_still_seek_bar_locked(true);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarOnly);
+
+        settings.set_still_seek_strip_locked(true);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarAndStrip);
+        assert!(settings.still_seek_strip_visible);
+
+        settings.set_still_seek_bar_locked(false);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::None);
+        assert_eq!(
+            (
+                settings.fullscreen_seek_bar_locked,
+                settings.still_seek_strip_locked
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn still_seek_closing_the_strip_unlocks_only_the_strip() {
+        let mut settings = Settings::default();
+        settings.set_still_seek_strip_locked(true);
+        settings.set_still_seek_strip_visible(false);
+        assert!(!settings.still_seek_strip_visible);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarOnly);
+    }
+
+    #[test]
     fn video_bottom_lock_with_strip_always_locks_the_bar() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             let updated = lock.with_strip(true);
-            assert_eq!(updated, VideoBottomLock::BarAndStrip);
+            assert_eq!(updated, BottomBarLock::BarAndStrip);
             assert!(updated.bar_locked());
             assert!(updated.strip_locked());
         }
@@ -9684,12 +10151,12 @@ mod tests {
     #[test]
     fn video_bottom_lock_unlocking_the_bar_always_unlocks_the_strip() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             let updated = lock.with_bar(false);
-            assert_eq!(updated, VideoBottomLock::None);
+            assert_eq!(updated, BottomBarLock::None);
             assert!(!updated.bar_locked());
             assert!(!updated.strip_locked());
         }
@@ -9698,9 +10165,9 @@ mod tests {
     #[test]
     fn video_bottom_lock_never_serializes_the_unreachable_bool_pair() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             assert_ne!(lock.to_settings(), (false, true));
         }
@@ -9714,7 +10181,7 @@ mod tests {
             ..Settings::default()
         };
         settings.set_video_seek_strip_locked(true);
-        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarAndStrip);
+        assert_eq!(settings.video_bottom_lock(), BottomBarLock::BarAndStrip);
         assert_eq!(
             settings.video_seek_strip_state,
             VideoSeekStripState::Waveform,
@@ -9745,7 +10212,7 @@ mod tests {
         };
         settings.set_video_seek_strip_locked(true);
         settings.set_video_seek_strip_locked(false);
-        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarOnly);
+        assert_eq!(settings.video_bottom_lock(), BottomBarLock::BarOnly);
         assert_eq!(
             settings.video_seek_strip_state,
             VideoSeekStripState::Thumbnails,
@@ -9756,8 +10223,8 @@ mod tests {
     #[test]
     fn video_bottom_lock_normalizes_strip_without_bar_to_none() {
         assert_eq!(
-            VideoBottomLock::from_settings(false, true),
-            VideoBottomLock::None
+            BottomBarLock::from_settings(false, true),
+            BottomBarLock::None
         );
     }
 
@@ -11164,6 +11631,7 @@ mod tests {
             DOWNSCALE_SMOOTHING_PERCENT_MIN
         );
         assert!(!s.fullscreen_seek_bar_locked);
+        assert!(!s.still_seek_strip_locked);
         assert!(!s.fullscreen_top_bar_locked);
         assert_eq!(s.fullscreen_fixed_bar_gap_px, 0);
         assert_eq!(
@@ -13794,6 +14262,49 @@ mod tests {
                 loaded.last_seen_version.as_deref(),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+        }
+
+        #[test]
+        fn favorite_view_overlay_save_persists_common_values_only() {
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.remember_favorite_view_state = true;
+            settings.grid_view_mode = GridViewMode::Thumbnail;
+            settings.grid_cols = 3;
+            settings.thumb_aspect = ThumbAspect::Landscape16x9;
+            settings.thumb_aspect_auto = false;
+            settings.sort_order = SortOrder::FileName;
+            settings.default_spread_mode = SpreadMode::Single;
+            settings.default_reading_flow = ReadingFlow::Paged;
+            let common = FavoriteViewState::from_settings(&settings);
+
+            let mut favorite = common.clone();
+            favorite.grid_view_mode = GridViewMode::Details;
+            favorite.grid_cols = 7;
+            favorite.thumb_aspect = ThumbAspect::Portrait2x3;
+            favorite.thumb_aspect_auto = true;
+            favorite
+                .grid_display_order
+                .assign(GridItemDisplayKind::VideoAudio, 3);
+            favorite.sort_order = SortOrder::DateDesc;
+            favorite.default_spread_mode = SpreadMode::RtlCover;
+            favorite.default_reading_flow = ReadingFlow::Vertical;
+            settings.apply_favorite_view_overlay(Uuid::new_v4(), &favorite);
+
+            // お気に入り内の連続操作後を模す。save 後も実行中の有効値は変えない。
+            settings.grid_cols = 9;
+            assert!(settings.save_checked());
+            assert_eq!(settings.grid_cols, 9);
+            assert_eq!(settings.grid_view_mode, GridViewMode::Details);
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(FavoriteViewState::from_settings(&loaded), common);
+            assert!(loaded.remember_favorite_view_state);
+            assert!(loaded.favorite_view_overlay.is_none());
         }
 
         #[test]
