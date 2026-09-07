@@ -122,10 +122,6 @@ pub enum EditorCommand {
         layer: LayerId,
         lines: Vec<LyricLine>,
     },
-    ReplaceLyricsText {
-        layer: LayerId,
-        text: String,
-    },
     SetLyricTime {
         layer: LayerId,
         line_index: usize,
@@ -150,9 +146,7 @@ impl EditorCommand {
             | Self::DeleteKey { layer, .. }
             | Self::SetInterpolation { layer, .. }
             | Self::CollapseToConst { layer, .. } => layer,
-            Self::ReplaceLyrics { layer, .. }
-            | Self::ReplaceLyricsText { layer, .. }
-            | Self::SetLyricTime { layer, .. } => layer,
+            Self::ReplaceLyrics { layer, .. } | Self::SetLyricTime { layer, .. } => layer,
         }
     }
 
@@ -179,7 +173,6 @@ impl EditorCommand {
             Self::DeleteLayer { .. }
             | Self::MoveLayer { .. }
             | Self::ReplaceLyrics { .. }
-            | Self::ReplaceLyricsText { .. }
             | Self::SetLyricTime { .. } => None,
         }
     }
@@ -404,9 +397,6 @@ pub fn apply_editor_command(
         EditorCommand::ReplaceLyrics { layer, ref lines } => {
             return replace_lyrics(project, layer, lines.clone());
         }
-        EditorCommand::ReplaceLyricsText { layer, ref text } => {
-            return replace_lyrics_text(project, layer, text);
-        }
         EditorCommand::SetLyricTime {
             layer,
             line_index,
@@ -492,43 +482,6 @@ fn replace_lyrics(
     let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
         return Err(EditorCommandError::PropertyDoesNotBelongToLayer);
     };
-    let changed = lyrics.lines != lines;
-    lyrics.lines = lines;
-    Ok(CommandResult {
-        changed,
-        selected_key: None,
-        clear_selection: true,
-    })
-}
-
-fn replace_lyrics_text(
-    project: &mut Project,
-    layer_id: LayerId,
-    text: &str,
-) -> Result<CommandResult, EditorCommandError> {
-    let layer = project
-        .layers
-        .iter_mut()
-        .find(|layer| layer.id == layer_id)
-        .ok_or(EditorCommandError::MissingLayer)?;
-    let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
-        return Err(EditorCommandError::PropertyDoesNotBelongToLayer);
-    };
-    let texts = if text.is_empty() {
-        Vec::new()
-    } else {
-        text.split('\n')
-            .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
-            .collect::<Vec<_>>()
-    };
-    let lines = texts
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| LyricLine {
-            text,
-            time_secs: lyrics.lines.get(index).and_then(|line| line.time_secs),
-        })
-        .collect::<Vec<_>>();
     let changed = lyrics.lines != lines;
     lyrics.lines = lines;
     Ok(CommandResult {
@@ -811,7 +764,6 @@ fn apply_typed<T: AnimationValueType>(
         EditorCommand::DeleteLayer { .. }
         | EditorCommand::MoveLayer { .. }
         | EditorCommand::ReplaceLyrics { .. }
-        | EditorCommand::ReplaceLyricsText { .. }
         | EditorCommand::SetLyricTime { .. } => unreachable!(),
     }
 }
@@ -944,9 +896,22 @@ mod tests {
 
         apply_editor_command(
             &mut project,
-            &EditorCommand::ReplaceLyricsText {
+            &EditorCommand::ReplaceLyrics {
                 layer,
-                text: "一行目\n\n三行目".to_owned(),
+                lines: vec![
+                    LyricLine {
+                        text: "一行目".to_owned(),
+                        time_secs: None,
+                    },
+                    LyricLine {
+                        text: String::new(),
+                        time_secs: None,
+                    },
+                    LyricLine {
+                        text: "三行目".to_owned(),
+                        time_secs: None,
+                    },
+                ],
             },
         )
         .unwrap();
@@ -981,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_lyric_text_preserves_times_by_line_and_trailing_empty_line() {
+    fn replacing_lyrics_uses_only_the_explicit_line_times() {
         let mut project = default_project(10.0);
         let lyrics = new_lyrics_layer(&project);
         let layer = lyrics.id;
@@ -1005,9 +970,22 @@ mod tests {
         .unwrap();
         apply_editor_command(
             &mut project,
-            &EditorCommand::ReplaceLyricsText {
+            &EditorCommand::ReplaceLyrics {
                 layer,
-                text: "新一\n新二\n".to_owned(),
+                lines: vec![
+                    LyricLine {
+                        text: "新一".into(),
+                        time_secs: None,
+                    },
+                    LyricLine {
+                        text: "新二".into(),
+                        time_secs: Some(7.0),
+                    },
+                    LyricLine {
+                        text: String::new(),
+                        time_secs: None,
+                    },
+                ],
             },
         )
         .unwrap();
@@ -1028,7 +1006,7 @@ mod tests {
                 .iter()
                 .map(|line| line.time_secs)
                 .collect::<Vec<_>>(),
-            [Some(1.0), Some(2.0), None]
+            [None, Some(7.0), None]
         );
     }
 

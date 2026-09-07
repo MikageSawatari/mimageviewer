@@ -2,11 +2,13 @@
 //!
 //! ウィンドウ、ファイル I/O、音声再生、書き出しは呼び出し側が所有する。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod document;
 mod history;
 mod keyframes;
+mod lyrics_editing;
 mod modulators;
 mod resources;
 mod timeline;
@@ -21,15 +23,19 @@ pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use egui::TextureHandle;
 use musicvideo_core::{
-    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricsLayer,
-    MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8,
-    SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat,
+    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricLine,
+    LyricsLayer, MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project,
+    Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat,
     TimeTextLayer, new_linear_spectrum_layer, new_lyrics_layer, new_miv_spectrum_keyboard_layers,
     new_miv_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
     new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
 
 use history::{EditSurface, UndoHistory};
+use lyrics_editing::{
+    EmptyTextMeaning, LyricsEditConflict, LyricsEditConflictKind, LyricsIdentitySnapshot,
+    LyricsPassResult, LyricsResolutionChoice, LyricsTextBuffer, PendingLyricsInvalidation,
+};
 use modulators::ModulatorEditorState;
 use resources::EditTargetLifetimes;
 
@@ -48,6 +54,7 @@ enum DetailSelection {
 struct EditorSnapshot {
     project: Project,
     resources: ResourceManifest,
+    lyrics_identities: HashMap<LayerId, LyricsIdentitySnapshot>,
     selected_layer: Option<LayerId>,
     selected_detail: Option<DetailSelection>,
 }
@@ -60,7 +67,6 @@ struct EditorSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditCheckpoint(EditorSnapshot);
 
-#[derive(Debug, Clone, PartialEq)]
 pub struct EditorState {
     selected_layer: Option<LayerId>,
     selected_detail: Option<DetailSelection>,
@@ -68,6 +74,8 @@ pub struct EditorState {
     resources: ResourceManifest,
     target_lifetimes: EditTargetLifetimes,
     lyrics_notice: Option<(LayerId, String)>,
+    lyrics_editors: HashMap<LayerId, LyricsTextBuffer>,
+    pending_text_edit_restores: Vec<(egui::Id, PendingLyricsInvalidation)>,
     pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
     history: UndoHistory,
@@ -82,6 +90,8 @@ impl Default for EditorState {
             resources: ResourceManifest::default(),
             target_lifetimes: EditTargetLifetimes::default(),
             lyrics_notice: None,
+            lyrics_editors: HashMap::new(),
+            pending_text_edit_restores: Vec::new(),
             pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
             history: UndoHistory::default(),
@@ -124,13 +134,30 @@ impl EditorState {
             .map(|layer| layer.id);
         self.clear_detail_selection();
         self.lyrics_notice = None;
+        self.lyrics_editors.clear();
+        self.pending_text_edit_restores.clear();
+        for layer in &project.layers {
+            if let LayerKind::Lyrics(lyrics) = &layer.kind {
+                self.lyrics_editors
+                    .insert(layer.id, LyricsTextBuffer::new_session(&lyrics.lines));
+            }
+        }
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
         self.history.clear();
     }
 
+    /// Reconciles state after a caller may have changed the Project without an
+    /// egui Context. Native lyrics history is treated conservatively because
+    /// this entry point cannot observe TextEdit's current undo graph.
     pub fn reconcile(&mut self, project: &Project) {
+        self.forget_native_lyrics_history_reachability();
+        self.reconcile_preserving_native_reachability(project);
+    }
+
+    fn reconcile_preserving_native_reachability(&mut self, project: &Project) {
         self.target_lifetimes.reconcile(project);
+        self.reconcile_lyrics_editors(project);
         if self
             .selected_layer
             .is_none_or(|selected| !project.layers.iter().any(|layer| layer.id == selected))
@@ -168,6 +195,67 @@ impl EditorState {
             .is_some_and(|id| !project.layers.iter().any(|layer| layer.id == id))
         {
             self.pending_layer_delete = None;
+        }
+    }
+
+    fn reconcile_lyrics_editors(&mut self, project: &Project) {
+        let removed = self
+            .lyrics_editors
+            .keys()
+            .copied()
+            .filter(|id| {
+                !project
+                    .layers
+                    .iter()
+                    .any(|layer| layer.id == *id && matches!(&layer.kind, LayerKind::Lyrics(_)))
+            })
+            .collect::<Vec<_>>();
+        for id in removed {
+            if let Some(mut editor) = self.lyrics_editors.remove(&id) {
+                let widget_id = editor.widget_id(id);
+                if let Some(invalidation) = editor.cancel_pending() {
+                    self.pending_text_edit_restores
+                        .push((widget_id, invalidation));
+                }
+            }
+        }
+
+        for layer in &project.layers {
+            let LayerKind::Lyrics(lyrics) = &layer.kind else {
+                continue;
+            };
+            let invalidation = match self.lyrics_editors.get_mut(&layer.id) {
+                Some(editor) => {
+                    if editor.sync_times(&lyrics.lines).is_err() {
+                        let widget_id = editor.widget_id(layer.id);
+                        editor
+                            .replace_external(&lyrics.lines)
+                            .map(|invalidation| (widget_id, invalidation))
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    self.lyrics_editors
+                        .insert(layer.id, LyricsTextBuffer::new_session(&lyrics.lines));
+                    None
+                }
+            };
+            if let Some(invalidation) = invalidation {
+                self.pending_text_edit_restores.push(invalidation);
+            }
+        }
+    }
+
+    fn restore_pending_text_edit_states(&mut self, context: &egui::Context) {
+        for (id, invalidation) in self.pending_text_edit_restores.drain(..) {
+            invalidation.restore_text_edit(context, id);
+        }
+    }
+
+    fn refresh_native_lyrics_history(&mut self, context: &egui::Context) {
+        for (layer, editor) in &mut self.lyrics_editors {
+            editor.refresh_native_history_reachability(context, editor.widget_id(*layer));
         }
     }
 
@@ -225,16 +313,89 @@ impl EditorState {
         EditorSnapshot {
             project: project.clone(),
             resources: self.resources.clone(),
+            lyrics_identities: self
+                .lyrics_editors
+                .iter()
+                .filter(|(id, _)| {
+                    project.layers.iter().any(|layer| {
+                        layer.id == **id && matches!(&layer.kind, LayerKind::Lyrics(_))
+                    })
+                })
+                .map(|(id, editor)| (*id, editor.identity_snapshot()))
+                .collect(),
             selected_layer: self.selected_layer,
             selected_detail: self.selected_detail,
         }
     }
 
     fn restore_snapshot(&mut self, project: &mut Project, snapshot: EditorSnapshot) {
-        *project = snapshot.project;
-        self.resources = snapshot.resources;
-        self.selected_layer = snapshot
-            .selected_layer
+        let EditorSnapshot {
+            project: restored_project,
+            resources,
+            lyrics_identities,
+            selected_layer,
+            selected_detail,
+        } = snapshot;
+        *project = restored_project;
+        self.resources = resources;
+
+        let restored_lyrics = project
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.kind {
+                LayerKind::Lyrics(lyrics) => Some((layer.id, lyrics.lines.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let restored_ids = restored_lyrics
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::HashSet<_>>();
+        let removed = self
+            .lyrics_editors
+            .keys()
+            .copied()
+            .filter(|id| !restored_ids.contains(id))
+            .collect::<Vec<_>>();
+        for id in removed {
+            if let Some(mut editor) = self.lyrics_editors.remove(&id) {
+                let widget_id = editor.widget_id(id);
+                if let Some(invalidation) = editor.cancel_pending() {
+                    self.pending_text_edit_restores
+                        .push((widget_id, invalidation));
+                }
+            }
+        }
+        for (id, lines) in restored_lyrics {
+            let identity = lyrics_identities.get(&id);
+            let invalidation = match self.lyrics_editors.get_mut(&id) {
+                Some(editor) => {
+                    let widget_id = editor.widget_id(id);
+                    let invalidation = match identity {
+                        Some(identity) => editor
+                            .restore_global_snapshot(&lines, identity)
+                            .ok()
+                            .flatten(),
+                        None => editor.replace_external(&lines),
+                    };
+                    invalidation.map(|invalidation| (widget_id, invalidation))
+                }
+                None => {
+                    let editor = identity
+                        .and_then(|identity| {
+                            LyricsTextBuffer::from_identity_snapshot_session(&lines, identity).ok()
+                        })
+                        .unwrap_or_else(|| LyricsTextBuffer::new_session(&lines));
+                    self.lyrics_editors.insert(id, editor);
+                    None
+                }
+            };
+            if let Some(invalidation) = invalidation {
+                self.pending_text_edit_restores.push(invalidation);
+            }
+        }
+
+        self.selected_layer = selected_layer
             .filter(|id| project.layers.iter().any(|layer| layer.id == *id))
             .or_else(|| {
                 project
@@ -243,11 +404,11 @@ impl EditorState {
                     .or_else(|| project.layers.first())
                     .map(|layer| layer.id)
             });
-        self.selected_detail = snapshot.selected_detail;
+        self.selected_detail = selected_detail;
         self.dragging_detail = None;
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
-        self.reconcile(project);
+        self.reconcile_preserving_native_reachability(project);
     }
 
     pub fn can_undo(&self) -> bool {
@@ -262,7 +423,25 @@ impl EditorState {
         (self.history.undo_len(), self.history.redo_len())
     }
 
+    pub fn has_pending_lyrics_edit(&self) -> bool {
+        self.lyrics_editors
+            .values()
+            .any(LyricsTextBuffer::has_pending_resolution)
+    }
+
+    pub fn layer_has_pending_lyrics_edit(&self, layer: LayerId) -> bool {
+        self.lyrics_editors
+            .get(&layer)
+            .is_some_and(LyricsTextBuffer::has_pending_resolution)
+    }
+
     pub fn undo(&mut self, project: &mut Project) -> bool {
+        self.forget_native_lyrics_history_reachability();
+        self.undo_preserving_native_reachability(project)
+    }
+
+    fn undo_preserving_native_reachability(&mut self, project: &mut Project) -> bool {
+        self.reconcile_preserving_native_reachability(project);
         let current = self.snapshot(project);
         let Some(snapshot) = self.history.undo(current) else {
             return false;
@@ -272,6 +451,12 @@ impl EditorState {
     }
 
     pub fn redo(&mut self, project: &mut Project) -> bool {
+        self.forget_native_lyrics_history_reachability();
+        self.redo_preserving_native_reachability(project)
+    }
+
+    fn redo_preserving_native_reachability(&mut self, project: &mut Project) -> bool {
+        self.reconcile_preserving_native_reachability(project);
         let current = self.snapshot(project);
         let Some(snapshot) = self.history.redo(current) else {
             return false;
@@ -280,12 +465,39 @@ impl EditorState {
         true
     }
 
-    pub fn begin_external_edit(&self, project: &Project) -> EditCheckpoint {
+    fn undo_in_context(&mut self, context: &egui::Context, project: &mut Project) -> bool {
+        self.refresh_native_lyrics_history(context);
+        let changed = self.undo_preserving_native_reachability(project);
+        self.restore_pending_text_edit_states(context);
+        changed
+    }
+
+    fn redo_in_context(&mut self, context: &egui::Context, project: &mut Project) -> bool {
+        self.refresh_native_lyrics_history(context);
+        let changed = self.redo_preserving_native_reachability(project);
+        self.restore_pending_text_edit_states(context);
+        changed
+    }
+
+    pub fn begin_external_edit(&mut self, project: &Project) -> EditCheckpoint {
+        self.reconcile_preserving_native_reachability(project);
         EditCheckpoint(self.snapshot(project))
     }
 
     pub fn finish_external_edit(&mut self, project: &Project, checkpoint: EditCheckpoint) -> bool {
-        self.target_lifetimes.reconcile(project);
+        // This entry point cannot inspect egui's current native TextEdit undo
+        // graph. Do not let reconcile treat an older reachability observation
+        // as authoritative if the external edit changed lyrics.
+        self.forget_native_lyrics_history_reachability();
+        self.finish_external_edit_preserving_native_reachability(project, checkpoint)
+    }
+
+    fn finish_external_edit_preserving_native_reachability(
+        &mut self,
+        project: &Project,
+        checkpoint: EditCheckpoint,
+    ) -> bool {
+        self.reconcile_preserving_native_reachability(project);
         self.resources.retain_project_resources(project);
         let after = self.snapshot(project);
         let changed = checkpoint.0 != after;
@@ -299,13 +511,22 @@ impl EditorState {
         checkpoint: EditCheckpoint,
         mut resources: ResourceManifest,
     ) -> bool {
-        self.target_lifetimes.reconcile(project);
+        // See finish_external_edit: no Context means native reachability must
+        // become conservative before an authoritative Project reconciliation.
+        self.forget_native_lyrics_history_reachability();
+        self.reconcile_preserving_native_reachability(project);
         resources.retain_project_resources(project);
         self.resources = resources;
         let after = self.snapshot(project);
         let changed = checkpoint.0 != after;
         self.history.record_atomic(checkpoint.0, &after);
         changed
+    }
+
+    fn forget_native_lyrics_history_reachability(&mut self) {
+        for editor in self.lyrics_editors.values_mut() {
+            editor.forget_native_history_reachability();
+        }
     }
 
     pub fn resource_manifest(&self) -> &ResourceManifest {
@@ -334,10 +555,43 @@ impl EditorState {
         project: &mut Project,
         command: &EditorCommand,
     ) -> Result<bool, EditorCommandError> {
+        self.try_apply_external_command_inner(None, project, command)
+    }
+
+    pub fn try_apply_external_command_with_context(
+        &mut self,
+        context: &egui::Context,
+        project: &mut Project,
+        command: &EditorCommand,
+    ) -> Result<bool, EditorCommandError> {
+        self.try_apply_external_command_inner(Some(context), project, command)
+    }
+
+    fn try_apply_external_command_inner(
+        &mut self,
+        context: Option<&egui::Context>,
+        project: &mut Project,
+        command: &EditorCommand,
+    ) -> Result<bool, EditorCommandError> {
         let checkpoint = self.begin_external_edit(project);
+        if matches!(command, EditorCommand::ReplaceLyrics { .. }) {
+            if let Some(context) = context {
+                self.restore_pending_text_edit_states(context);
+                self.refresh_native_lyrics_history(context);
+            } else {
+                self.forget_native_lyrics_history_reachability();
+            }
+        }
         let changed = self.try_apply_command(project, command)?;
         if changed {
-            self.finish_external_edit(project, checkpoint);
+            if context.is_some() {
+                self.finish_external_edit_preserving_native_reachability(project, checkpoint);
+            } else {
+                self.finish_external_edit(project, checkpoint);
+            }
+        }
+        if let Some(context) = context {
+            self.restore_pending_text_edit_states(context);
         }
         Ok(changed)
     }
@@ -379,6 +633,24 @@ impl EditorState {
         let animation_target = command.animation_target();
         let result = apply_editor_command(project, command)?;
         self.resources.retain_project_resources(project);
+        if let EditorCommand::ReplaceLyrics { layer, lines } = command {
+            let invalidation = match self.lyrics_editors.get_mut(layer) {
+                Some(editor) => {
+                    let widget_id = editor.widget_id(*layer);
+                    editor
+                        .replace_external(lines)
+                        .map(|invalidation| (widget_id, invalidation))
+                }
+                None => {
+                    self.lyrics_editors
+                        .insert(*layer, LyricsTextBuffer::new_session(lines));
+                    None
+                }
+            };
+            if let Some(invalidation) = invalidation {
+                self.pending_text_edit_restores.push(invalidation);
+            }
+        }
         if let Some((layer, property)) = animation_target {
             self.select_layer_id(project, layer);
             if result.clear_selection
@@ -407,12 +679,10 @@ impl EditorState {
             if let Some(selected_layer) = selected_layer {
                 self.select_layer_id(project, selected_layer);
             }
-            self.reconcile(project);
+            self.reconcile_preserving_native_reachability(project);
         }
-        if matches!(
-            command,
-            EditorCommand::ReplaceLyrics { .. } | EditorCommand::ReplaceLyricsText { .. }
-        ) && matches!(self.selected_detail, Some(DetailSelection::Lyric { .. }))
+        if matches!(command, EditorCommand::ReplaceLyrics { .. })
+            && matches!(self.selected_detail, Some(DetailSelection::Lyric { .. }))
         {
             self.clear_detail_selection();
         }
@@ -482,7 +752,8 @@ pub fn draw_editor(
     modulator_values: &[ModulatorValue],
     calibrations: &[ModulatorCalibration],
 ) -> EditorResponse {
-    state.reconcile(project);
+    state.restore_pending_text_edit_states(ui.ctx());
+    state.reconcile_preserving_native_reachability(project);
     let context = ui.ctx().clone();
     let mut history_changed = apply_history_shortcut(&context, project, state);
     ui.horizontal(|ui| {
@@ -492,14 +763,14 @@ pub fn draw_editor(
             .on_hover_text("Ctrl+Z")
             .clicked()
         {
-            history_changed |= state.undo(project);
+            history_changed |= state.undo_in_context(&context, project);
         }
         if ui
             .add_enabled(state.can_redo(), egui::Button::new("やり直す"))
             .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
             .clicked()
         {
-            history_changed |= state.redo(project);
+            history_changed |= state.redo_in_context(&context, project);
         }
     });
     ui.separator();
@@ -782,8 +1053,8 @@ fn apply_history_shortcut(
         input.consume_key(modifiers, key);
     });
     match action {
-        HistoryAction::Undo => state.undo(project),
-        HistoryAction::Redo => state.redo(project),
+        HistoryAction::Undo => state.undo_in_context(context, project),
+        HistoryAction::Redo => state.redo_in_context(context, project),
     }
 }
 
@@ -1083,6 +1354,151 @@ struct LyricsEditResult {
     export_requested: bool,
 }
 
+enum LyricsConflictAction {
+    Resolve(LyricsResolutionChoice),
+    Cancel,
+}
+
+fn draw_lyrics_resolution(
+    ui: &mut egui::Ui,
+    conflict: &LyricsEditConflict,
+) -> Option<LyricsConflictAction> {
+    let mut action = None;
+    ui.group(|ui| {
+        ui.set_max_width(ui.available_width());
+        ui.colored_label(egui::Color32::YELLOW, "歌詞の行と時刻を確認してください");
+        egui::Grid::new("lyrics-edit-comparison")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("変更前");
+                ui.strong("変更後");
+                ui.end_row();
+                lyrics_preview(ui, "lyrics-before", &format_lyrics_lines(&conflict.before));
+                lyrics_preview(
+                    ui,
+                    "lyrics-after",
+                    &format_lyrics_text(&conflict.after_text),
+                );
+                ui.end_row();
+            });
+
+        match &conflict.kind {
+            LyricsEditConflictKind::TimedLineMerge { choices } => {
+                ui.label("複数の時刻付き行が1行になります。どの行の時刻を残すか選んでください。");
+                for choice in choices {
+                    let text = if choice.source_text.is_empty() {
+                        "（空行）"
+                    } else {
+                        &choice.source_text
+                    };
+                    if ui
+                        .button(format!("{:.3} 秒 — {text}", choice.time_secs))
+                        .clicked()
+                    {
+                        action = Some(LyricsConflictAction::Resolve(
+                            LyricsResolutionChoice::KeepTimedLine(choice.line_id),
+                        ));
+                    }
+                }
+            }
+            LyricsEditConflictKind::AmbiguousNativeHistory { choices } => {
+                ui.label("以前の行との対応が複数あります。残す時刻を見比べて選んでください。");
+                egui::ScrollArea::vertical()
+                    .id_salt("lyrics-native-candidates")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for (index, choice) in choices.iter().enumerate() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "候補 {}: {}",
+                                    index + 1,
+                                    format_lyrics_lines(&choice.lines)
+                                ));
+                                if ui.small_button("この対応を使う").clicked() {
+                                    action = Some(LyricsConflictAction::Resolve(
+                                        LyricsResolutionChoice::UseNativeCandidate(
+                                            choice.candidate_id,
+                                        ),
+                                    ));
+                                }
+                            });
+                        }
+                    });
+            }
+            LyricsEditConflictKind::UnrecordedNativeHistory { target_is_empty } => {
+                ui.label(
+                    "以前の行との対応を確定できません。反映する場合は時刻が未設定になります。",
+                );
+                if *target_is_empty {
+                    if ui.button("行なしとして反映（時刻は未設定）").clicked() {
+                        action = Some(LyricsConflictAction::Resolve(
+                            LyricsResolutionChoice::ApplyAsNewUntimed(EmptyTextMeaning::NoLines),
+                        ));
+                    }
+                    if ui.button("空の1行として反映（時刻は未設定）").clicked() {
+                        action = Some(LyricsConflictAction::Resolve(
+                            LyricsResolutionChoice::ApplyAsNewUntimed(
+                                EmptyTextMeaning::OneUntimedLine,
+                            ),
+                        ));
+                    }
+                } else if ui.button("新規歌詞として反映（時刻は未設定）").clicked()
+                {
+                    action = Some(LyricsConflictAction::Resolve(
+                        LyricsResolutionChoice::ApplyAsNewUntimed(EmptyTextMeaning::OneUntimedLine),
+                    ));
+                }
+            }
+        }
+        if ui.button("変更を取り消す").clicked() {
+            action = Some(LyricsConflictAction::Cancel);
+        }
+    });
+    action
+}
+
+fn lyrics_preview(ui: &mut egui::Ui, salt: &str, text: &str) {
+    egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .max_height(100.0)
+        .show(ui, |ui| {
+            ui.set_max_width((ui.available_width() / 2.0).max(80.0));
+            ui.add(egui::Label::new(text).wrap());
+        });
+}
+
+fn format_lyrics_text(text: &str) -> String {
+    if text.is_empty() {
+        "（空の本文）".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn format_lyrics_lines(lines: &[LyricLine]) -> String {
+    if lines.is_empty() {
+        return "（行なし）".to_owned();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = if line.text.is_empty() {
+                "（空行）"
+            } else {
+                &line.text
+            };
+            let time = line
+                .time_secs
+                .map(|time| format!("{time:.3} 秒"))
+                .unwrap_or_else(|| "未設定".to_owned());
+            format!("{}: {text} [{time}]", index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn edit_lyrics(
     ui: &mut egui::Ui,
     layer_id: LayerId,
@@ -1097,25 +1513,87 @@ fn edit_lyrics(
         "1 行ずつ貼り付け、再生しながら「次の行へ」で時刻を付けます。空行は歌詞を消す区間です。",
     );
 
-    let mut block = lyrics
-        .lines
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if ui
-        .add(
-            egui::TextEdit::multiline(&mut block)
+    let mut invalidation = None;
+    let (widget_id, pass_result) = {
+        let editor = state
+            .lyrics_editors
+            .entry(layer_id)
+            .or_insert_with(|| LyricsTextBuffer::new_session(&lyrics.lines));
+        let widget_id = editor.widget_id(layer_id);
+        if editor.sync_times(&lyrics.lines).is_err() {
+            invalidation = editor
+                .replace_external(&lyrics.lines)
+                .map(|invalidation| (widget_id, invalidation));
+        }
+        let rollback = editor.capture_text_edit_rollback_if_needed(ui.ctx(), widget_id);
+        let may_mutate = rollback.is_some();
+        editor
+            .begin_pass(&lyrics.lines, rollback)
+            .expect("lyrics editor was synchronized before the text pass");
+        ui.add(
+            egui::TextEdit::multiline(editor)
+                .id(widget_id)
                 .desired_rows(7)
                 .desired_width(f32::INFINITY)
                 .hint_text("ここに歌詞をまとめて貼り付け"),
-        )
-        .changed()
+        );
+        if may_mutate {
+            editor.refresh_native_history_reachability(ui.ctx(), widget_id);
+        }
+        let mut pass_result = editor.finish_pass();
+        if editor.has_pending_resolution()
+            && let Ok(refreshed) = editor.refresh_pending(&lyrics.lines)
+        {
+            pass_result = refreshed;
+        }
+        (widget_id, pass_result)
+    };
+    if let Some(invalidation) = invalidation {
+        state.pending_text_edit_restores.push(invalidation);
+    }
+    match pass_result {
+        LyricsPassResult::Unchanged => {}
+        LyricsPassResult::Applied(lines) => {
+            lyrics.lines = lines;
+            result.changed = true;
+            if matches!(state.selected_detail, Some(DetailSelection::Lyric { .. })) {
+                state.clear_detail_selection();
+            }
+        }
+        LyricsPassResult::NeedsResolution(_) => {}
+    }
+
+    if let Some(conflict) = state
+        .lyrics_editors
+        .get(&layer_id)
+        .and_then(LyricsTextBuffer::pending_conflict)
+        && let Some(action) = draw_lyrics_resolution(ui, &conflict)
     {
-        commands.push(EditorCommand::ReplaceLyricsText {
-            layer: layer_id,
-            text: block,
-        });
+        match action {
+            LyricsConflictAction::Resolve(choice) => {
+                let resolution = state
+                    .lyrics_editors
+                    .get_mut(&layer_id)
+                    .expect("pending lyrics editor exists")
+                    .resolve_pending(&lyrics.lines, choice);
+                if let Ok(LyricsPassResult::Applied(lines)) = resolution {
+                    lyrics.lines = lines;
+                    result.changed = true;
+                    if matches!(state.selected_detail, Some(DetailSelection::Lyric { .. })) {
+                        state.clear_detail_selection();
+                    }
+                }
+            }
+            LyricsConflictAction::Cancel => {
+                if let Some(invalidation) = state
+                    .lyrics_editors
+                    .get_mut(&layer_id)
+                    .and_then(LyricsTextBuffer::cancel_pending)
+                {
+                    invalidation.restore_text_edit(ui.ctx(), widget_id);
+                }
+            }
+        }
     }
 
     let next_unset = lyrics
@@ -1614,6 +2092,9 @@ fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::TextBuffer;
+    use egui::text::{CCursor, CCursorRange};
+    use egui::text_edit::TextEditState;
     use musicvideo_core::{
         Animatable, AudioRef, ImageRef, Interp, Keyframe, LyricLine, ModulationBinding,
         ModulationCurve, ModulationTarget, Track, default_project, new_band_energy_modulator,
@@ -1641,6 +2122,530 @@ mod tests {
         let checkpoint = state.begin_external_edit(project);
         edit(project);
         assert!(state.finish_external_edit(project, checkpoint));
+    }
+
+    fn project_with_lyrics(lines: Vec<LyricLine>) -> (Project, LayerId) {
+        let mut project = default_project(10.0);
+        let mut layer = new_lyrics_layer(&project);
+        let layer_id = layer.id;
+        let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+            unreachable!()
+        };
+        lyrics.lines = lines;
+        project.layers.push(layer);
+        (project, layer_id)
+    }
+
+    fn lyric_line(text: &str, time_secs: Option<f64>) -> LyricLine {
+        LyricLine {
+            text: text.to_owned(),
+            time_secs,
+        }
+    }
+
+    fn lyrics_lines(project: &Project, layer_id: LayerId) -> &[LyricLine] {
+        let layer = project
+            .layers
+            .iter()
+            .find(|layer| layer.id == layer_id)
+            .unwrap();
+        let LayerKind::Lyrics(lyrics) = &layer.kind else {
+            unreachable!()
+        };
+        &lyrics.lines
+    }
+
+    fn run_editor_frame(
+        context: &egui::Context,
+        project: &mut Project,
+        state: &mut EditorState,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) {
+        let _ = context.run(
+            egui::RawInput {
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    draw_editor(ui, project, state, 0.0, &[], &[]);
+                });
+            },
+        );
+    }
+
+    fn set_text_cursor(context: &egui::Context, id: egui::Id, range: CCursorRange) {
+        let mut text_state = TextEditState::load(context, id).unwrap_or_default();
+        text_state.cursor.set_char_range(Some(range));
+        text_state.store(context, id);
+        context.memory_mut(|memory| memory.request_focus(id));
+    }
+
+    #[test]
+    fn draw_editor_leading_paste_keeps_existing_lyric_times() {
+        let (mut project, layer_id) = project_with_lyrics(vec![
+            lyric_line("一行目", Some(1.0)),
+            lyric_line("二行目", Some(2.0)),
+        ]);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        set_text_cursor(&context, text_id, CCursorRange::one(CCursor::new(0)));
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.1,
+            vec![egui::Event::Text("先頭\n".to_owned())],
+        );
+
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [
+                lyric_line("先頭", None),
+                lyric_line("一行目", Some(1.0)),
+                lyric_line("二行目", Some(2.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_editor_ime_replacement_keeps_the_timed_line_identity() {
+        let (mut project, layer_id) = project_with_lyrics(vec![lyric_line("旧歌詞", Some(3.0))]);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        let selection = CCursorRange::two(CCursor::new(0), CCursor::new(3));
+        set_text_cursor(&context, text_id, selection);
+        assert_eq!(
+            TextEditState::load(&context, text_id)
+                .unwrap()
+                .cursor
+                .char_range(),
+            Some(selection)
+        );
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+        assert_eq!(
+            TextEditState::load(&context, text_id)
+                .unwrap()
+                .cursor
+                .char_range(),
+            Some(selection)
+        );
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        );
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.03,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit("新歌詞".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Commit("新歌詞".to_owned())),
+            ],
+        );
+
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [lyric_line("新歌詞", Some(3.0))]
+        );
+    }
+
+    #[test]
+    fn draw_editor_native_undo_reaches_the_initial_checkpoint_after_many_input_passes() {
+        let original = (0..180)
+            .map(|index| lyric_line(&format!("歌詞 {index}"), Some(index as f64 * 0.5)))
+            .collect::<Vec<_>>();
+        let (mut project, layer_id) = project_with_lyrics(original.clone());
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        let initial_char_count = state.lyrics_editors[&layer_id].as_str().chars().count();
+        set_text_cursor(
+            &context,
+            text_id,
+            CCursorRange::one(CCursor::new(initial_char_count)),
+        );
+        run_editor_frame(&context, &mut project, &mut state, 0.001, Vec::new());
+
+        for index in 0..320 {
+            run_editor_frame(
+                &context,
+                &mut project,
+                &mut state,
+                0.002 + index as f64 * 0.001,
+                vec![egui::Event::Text("あ".to_owned())],
+            );
+        }
+        assert_eq!(lyrics_lines(&project, layer_id).len(), original.len());
+        assert!(
+            lyrics_lines(&project, layer_id)
+                .iter()
+                .zip(&original)
+                .all(|(current, original)| current.time_secs == original.time_secs)
+        );
+        let native_state = TextEditState::load(&context, text_id).unwrap();
+        let native_cursor = native_state.cursor.char_range().unwrap();
+        let current_text = state.lyrics_editors[&layer_id].as_str().to_owned();
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(text_id),
+            "lyrics TextEdit must still own Ctrl+Z"
+        );
+        assert!(
+            native_state
+                .undoer()
+                .has_undo(&(native_cursor, current_text))
+        );
+
+        // Idle passes should not deep-clone the native undoer. Keep drawing a
+        // typical song long enough for egui's default stable-state checkpoint.
+        for index in 0..200 {
+            run_editor_frame(
+                &context,
+                &mut project,
+                &mut state,
+                0.5 + index as f64 * 0.01,
+                Vec::new(),
+            );
+        }
+
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            2.6,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+        );
+
+        assert_eq!(lyrics_lines(&project, layer_id), original);
+    }
+
+    #[test]
+    fn cancelling_a_draw_editor_merge_restores_the_text_cursor_and_project() {
+        let original = vec![lyric_line("A", Some(1.0)), lyric_line("B", Some(2.0))];
+        let (mut project, layer_id) = project_with_lyrics(original.clone());
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        let selection = CCursorRange::two(CCursor::new(1), CCursor::new(2));
+        set_text_cursor(&context, text_id, selection);
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Cut],
+        );
+        assert_eq!(lyrics_lines(&project, layer_id), original);
+        assert!(state.lyrics_editors[&layer_id].has_pending_resolution());
+        assert!(state.has_pending_lyrics_edit());
+        assert!(state.layer_has_pending_lyrics_edit(layer_id));
+        assert!(!state.layer_has_pending_lyrics_edit(project.layers[0].id));
+
+        let invalidation = state
+            .lyrics_editors
+            .get_mut(&layer_id)
+            .unwrap()
+            .cancel_pending()
+            .unwrap();
+        invalidation.restore_text_edit(&context, text_id);
+        let restored = TextEditState::load(&context, text_id).unwrap();
+        assert_eq!(restored.cursor.char_range(), Some(selection));
+        assert_eq!(state.lyrics_editors[&layer_id].as_str(), "A\nB");
+        assert_eq!(lyrics_lines(&project, layer_id), original);
+        assert!(!state.has_pending_lyrics_edit());
+        assert!(!state.layer_has_pending_lyrics_edit(layer_id));
+
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.03,
+            vec![egui::Event::Cut],
+        );
+        let keep = match state.lyrics_editors[&layer_id]
+            .pending_conflict()
+            .unwrap()
+            .kind
+        {
+            LyricsEditConflictKind::TimedLineMerge { choices } => choices[0].line_id,
+            _ => unreachable!(),
+        };
+        let resolved = state
+            .lyrics_editors
+            .get_mut(&layer_id)
+            .unwrap()
+            .resolve_pending(&original, LyricsResolutionChoice::KeepTimedLine(keep))
+            .unwrap();
+        let LyricsPassResult::Applied(lines) = resolved else {
+            unreachable!()
+        };
+        let layer = project
+            .layers
+            .iter_mut()
+            .find(|layer| layer.id == layer_id)
+            .unwrap();
+        let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+            unreachable!()
+        };
+        lyrics.lines = lines;
+        assert!(!state.has_pending_lyrics_edit());
+        assert!(!state.layer_has_pending_lyrics_edit(layer_id));
+    }
+
+    #[test]
+    fn native_text_undo_after_global_undo_keeps_the_line_time() {
+        let (mut project, layer_id) = project_with_lyrics(vec![lyric_line("A", Some(6.0))]);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        set_text_cursor(
+            &context,
+            text_id,
+            CCursorRange::two(CCursor::new(0), CCursor::new(1)),
+        );
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Text("B".to_owned())],
+        );
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [lyric_line("B", Some(6.0))]
+        );
+        run_editor_frame(&context, &mut project, &mut state, 2.0, Vec::new());
+        context.memory_mut(|memory| memory.surrender_focus(text_id));
+        run_editor_frame(&context, &mut project, &mut state, 2.1, Vec::new());
+
+        assert!(state.undo_in_context(&context, &mut project));
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [lyric_line("A", Some(6.0))]
+        );
+
+        set_text_cursor(&context, text_id, CCursorRange::one(CCursor::new(1)));
+        run_editor_frame(&context, &mut project, &mut state, 2.2, Vec::new());
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            2.3,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+        );
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [lyric_line("B", Some(6.0))]
+        );
+    }
+
+    #[test]
+    fn global_undo_redo_restores_lyrics_text_and_line_identity_together() {
+        let original = vec![
+            lyric_line("一行目", Some(1.0)),
+            lyric_line("二行目", Some(2.0)),
+        ];
+        let (mut project, layer_id) = project_with_lyrics(original.clone());
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let original_identity = state.lyrics_editors[&layer_id].identity_snapshot();
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        set_text_cursor(&context, text_id, CCursorRange::one(CCursor::new(0)));
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Text("先頭\n".to_owned())],
+        );
+        let inserted_identity = state.lyrics_editors[&layer_id].identity_snapshot();
+        assert_ne!(inserted_identity, original_identity);
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [
+                lyric_line("先頭", None),
+                lyric_line("一行目", Some(1.0)),
+                lyric_line("二行目", Some(2.0)),
+            ]
+        );
+
+        assert!(state.undo_in_context(&context, &mut project));
+        assert_eq!(lyrics_lines(&project, layer_id), original);
+        assert_eq!(
+            state.lyrics_editors[&layer_id].identity_snapshot(),
+            original_identity
+        );
+
+        assert!(state.redo_in_context(&context, &mut project));
+        assert_eq!(
+            lyrics_lines(&project, layer_id),
+            [
+                lyric_line("先頭", None),
+                lyric_line("一行目", Some(1.0)),
+                lyric_line("二行目", Some(2.0)),
+            ]
+        );
+        assert_eq!(
+            state.lyrics_editors[&layer_id].identity_snapshot(),
+            inserted_identity
+        );
+    }
+
+    #[test]
+    fn authoritative_same_lyrics_cancel_a_pending_draft_and_restore_native_state() {
+        let original = vec![lyric_line("A", Some(1.0)), lyric_line("B", Some(2.0))];
+        let (mut project, layer_id) = project_with_lyrics(original.clone());
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        state.select_layer_id(&project, layer_id);
+        let context = egui::Context::default();
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
+        let selection = CCursorRange::two(CCursor::new(1), CCursor::new(2));
+        set_text_cursor(&context, text_id, selection);
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Cut],
+        );
+        assert!(state.layer_has_pending_lyrics_edit(layer_id));
+
+        let changed = state
+            .try_apply_external_command_with_context(
+                &context,
+                &mut project,
+                &EditorCommand::ReplaceLyrics {
+                    layer: layer_id,
+                    lines: original.clone(),
+                },
+            )
+            .unwrap();
+
+        assert!(!changed);
+        assert!(!state.layer_has_pending_lyrics_edit(layer_id));
+        assert_eq!(lyrics_lines(&project, layer_id), original);
+        assert_eq!(state.lyrics_editors[&layer_id].as_str(), "A\nB");
+        assert_eq!(
+            TextEditState::load(&context, text_id)
+                .unwrap()
+                .cursor
+                .char_range(),
+            Some(selection)
+        );
+    }
+
+    #[test]
+    fn draw_editor_layer_switch_keeps_each_lyrics_identity_separate() {
+        let (mut project, first_id) = project_with_lyrics(vec![lyric_line("一", Some(1.0))]);
+        let mut second = new_lyrics_layer(&project);
+        let second_id = second.id;
+        let LayerKind::Lyrics(second_lyrics) = &mut second.kind else {
+            unreachable!()
+        };
+        second_lyrics.lines = vec![lyric_line("二", Some(2.0))];
+        project.layers.push(second);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let context = egui::Context::default();
+
+        state.select_layer_id(&project, first_id);
+        run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
+        let first_text_id = state.lyrics_editors[&first_id].widget_id(first_id);
+        set_text_cursor(&context, first_text_id, CCursorRange::one(CCursor::new(1)));
+        run_editor_frame(&context, &mut project, &mut state, 0.01, Vec::new());
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.02,
+            vec![egui::Event::Text("甲".to_owned())],
+        );
+
+        state.select_layer_id(&project, second_id);
+        run_editor_frame(&context, &mut project, &mut state, 0.03, Vec::new());
+        let second_text_id = state.lyrics_editors[&second_id].widget_id(second_id);
+        set_text_cursor(&context, second_text_id, CCursorRange::one(CCursor::new(1)));
+        run_editor_frame(&context, &mut project, &mut state, 0.04, Vec::new());
+        run_editor_frame(
+            &context,
+            &mut project,
+            &mut state,
+            0.05,
+            vec![egui::Event::Text("乙".to_owned())],
+        );
+
+        assert_eq!(
+            lyrics_lines(&project, first_id),
+            [lyric_line("一甲", Some(1.0))]
+        );
+        assert_eq!(
+            lyrics_lines(&project, second_id),
+            [lyric_line("二乙", Some(2.0))]
+        );
+        assert_ne!(first_text_id, second_text_id);
+    }
+
+    #[test]
+    fn resetting_the_project_changes_lyrics_widget_lifetime() {
+        let (project, layer_id) = project_with_lyrics(vec![lyric_line("A", Some(1.0))]);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let first = state.lyrics_editors[&layer_id].widget_id(layer_id);
+
+        state.reset_for_project(&project);
+        let second = state.lyrics_editors[&layer_id].widget_id(layer_id);
+
+        assert_ne!(first, second);
     }
 
     #[test]

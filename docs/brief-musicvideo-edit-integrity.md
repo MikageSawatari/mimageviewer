@@ -1,7 +1,7 @@
 # 音楽ビデオ: 編集の整合性修正
 
 開始: 2026-09-08、`musicvideo` / `849c5a9d2`。
-Status: 実装中。保存所有・選択の先行修正は完了、素材・読込切替・歌詞は作業中。
+Status: 対象修正の実装・独立レビュー・全体テスト完了。確認用ビルドを準備中。
 実装・自動検証・実機確認の結果は別々に記録する。
 
 正本: [music-video-export-plan.md](music-video-export-plan.md)。
@@ -167,6 +167,9 @@ mutex の所有範囲に置く。独立 store、別 session、同一 blob 並行
 - LRC 読込は対象歌詞の要求時 baseline を保持する。同じレイヤーの本文・時刻が変わった場合は
   読込結果を Ready として保持し、反映または現在の歌詞を維持する選択を求める。
   他レイヤーや無関係な property の編集では確認を要求しない。
+- Project/LRC の完了採否は、その frame の editor/timeline 入力と既存 Ready 選択の処理後に行う。
+  完了と入力が同じ frame に届いても、入力を編集世代/pending に反映してから切替を判断する。
+  新しい Ready の確認表示は repaint を要求して次の frame に表示する。
 
 ### 歌詞の行対応（独立調査後の設計方針）
 
@@ -194,6 +197,9 @@ widget ID と sidecar は session / layer の寿命に所属させ、別 Project
 
 確認待ちでも、存続する行への最新の時刻修正を resolve で上書きしない。
 本文の外部置換・全体 Undo・session 切替では待機中の提案を失効または再評価する。
+ただし、非同期 Project/LRC 読込の完了は、それより後に入力した確認待ちの草稿を
+無確認で破棄しない。Project は旧値のままでも、EditorState の実 pending から導出した
+query を host が参照し、既存の Ready 選択へ送る。LRC は対象レイヤーだけを確認する。
 取消は本文/identity だけでなく native TextEdit の cursor と undoer も操作前へ戻す。
 `TextEditState::clone()` は undoer を Arc 共有するため、必要な pass で独立した undoer コピーを保持する。
 全体 Undo は current identity を復元し、残存する native 履歴から到達する既知対応は有界に保持する。
@@ -204,6 +210,12 @@ native Undoer の独立コピーから到達可能な本文を観測し、対応
 保持・回収する。長い入力 session の後にすべての本文 Undo が恒久的に確認待ちになる方式は採らない。
 native の内容を観測できない場合は安全側の確認に留める。UI には内部の履歴機構名を出さず、
 変更前後の歌詞と保持する時刻を比較できる候補・取消を当該歌詞欄に表示する。
+
+pass 中の意味対応と native 保存点の保持は別の寿命として扱う。同じ pass の途中に現れた
+本文も Undo/Redo の候補として扱い、実際に到達できる保存点を入力回数の FIFO だけで捨てない。
+post-pass の到達情報による回収は編集の確定後に行う。確認待ち/取消では pre-pass の候補・
+不確実性・tombstone を保持し、native rollback だけで古い Redo を復活させない。
+LRC の外部置換も context-aware な共通入口で直前の native 履歴を観測し、pending rollback を処理する。
 
 ## 5. 実装・検証記録
 
@@ -242,6 +254,7 @@ Sol 実行: `cargo test -p musicvideo-core` 72 passed、`cargo test -p musicvide
 
 ### lab の素材・読込接続
 
+コミット: `0c24a453e`。
 Sol 実行: `cargo test -p musicvideo_lab -- --nocapture` 44 passed / 0 failed、
 `cargo fmt -p musicvideo_lab --check` exit 0。独立レビューの初回指摘を修正した後の再実行である。
 独立 Astra の最終再レビューで新たな blocking 指摘なし。
@@ -255,6 +268,59 @@ Sol 実行: `cargo test -p musicvideo_lab -- --nocapture` 44 passed / 0 failed�
 - receiver owner と大きな decoded 内容の cleanup worker への移譲を追加。
   復元 worker の切断後は再生成して再試行し、再生成失敗は未解決状態として通知する。
 - この結果は headless の自動確認であり、Windows 実音出力・実 IME・目視の検収とは分ける。
+
+### 描画 snapshot の追加回帰
+
+コミット: `c80326788`。
+`assets::tests::replacing_an_image_in_a_fork_does_not_change_a_pinned_render_snapshot` を追加。
+無変調の 2×2 Project と明示 RGBA の画像を使い、`evaluate` / `render_frame` の出力で検査する。
+新 bundle で同じ ImageId の画像を交換しても、処理中の旧 bundle の RGBA は完全一致し、
+新 bundle の RGBA は異なること、両方に未解決素材がないことを確認した。
+Sol の narrow test は 1 passed、core fmt check は exit 0。最終 gate の core は 73 passed。
+
+これは今回定義した fixture の回帰であり、過去報告 `077ad307e7676c3b` の入力・コマンドを
+再現した結果ではない。旧ハッシュの再取得は未確認のまま区別する。
+
+### 歌詞の行対応と入力・読込境界
+
+旧 `ReplaceLyricsText` の行番号による時刻再付与を撤去し、Unicode の編集範囲と行 identity に
+基づく `LyricsTextBuffer` へ移行した。Project JSON の `LyricLine` schema は変更していない。
+共通 snapshot には Project と行 identity を同時に格納する。本文訂正・挿入・削除・空行 cue・
+IME・native TextEdit Undo/Redo と共通 Undo の境界を別々に検証した。
+
+行の結合で時刻が競合する場合や、過去本文との対応が確定できない場合は、変更前後と候補を
+歌詞欄に表示する。明示確定までは Project を維持し、取消で native cursor/undoer も復元する。
+他レイヤー・再生・共通 Undo は続けられる。非同期読込はこの未確定草稿も保護する。
+
+- Sol 実行: `musicvideo-ui` 87 passed、統合後 `musicvideo_lab` 45 passed。
+- 実 `draw_editor` / TextEdit のイベント回帰は、先頭貼付、IME 置換、長入力後 Ctrl+Z、
+  pending の取消・確定と query、共通 Undo 後の本文 Undo、identity の同時復元、
+  layer/session 分離、同本文 LRC の pending 取消と cursor 復元を含む。
+- 180 行・320 回の変異入力＋200 idle frame の handler は debug/headless で約 1.58 秒
+  （全 draw 込み平均約 3 ms/frame）。通常曲を模した局所的な入力負荷確認であり、
+  実ウィンドウ/GPU/音声付きの性能測定や実 IME の検収ではない。
+- 最終段階で `reconcile` の非公開化による lab の E0624 を検出。公開 wrapper は観測不能な
+  native 履歴を Unknown と扱い、内部/context 付き経路は fresh な観測を保持する形へ修正。
+  再度 UI 87 / lab 45 件と fmt を確認してから全体 gate へ進んだ。
+- 独立 Astra の最終再レビューで、H1/H2・歌詞 identity/時刻・選択の今回の freeze 範囲に
+  未解決の blocking 指摘なし。実機確認、H3 の解析一致、P4 は承認の対象外。
+
+### 最終検証（進行中）
+
+ログ保存先: `target/musicvideo-edit-integrity-verification/`。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、12.29 秒。`cargo-check-mimageviewer-core.log` |
+| `cargo check -p mimageviewer --features dev-tools --bin mvexport_cli` | exit 0、11.41 秒。`cargo-check-mvexport-cli.log` |
+| `cargo test -p musicvideo-ui` | 87 passed。`cargo-test-musicvideo-ui.log` |
+| `cargo test -p musicvideo_lab -- --nocapture` | 45 passed。`cargo-test-musicvideo-lab.log` |
+| `cargo fmt --check` | exit 0。`cargo-fmt-check.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphs なし。`check-ui-glyphs.log` |
+| `.\scripts\test-full.ps1` | exit 0 / PASS。本体 lib 7,498 passed / 33 ignored、UI snapshot 45 passed、core 73 / UI 87 / lab 45 passed、vendor egui-wgpu 9 / eframe 15 passed。`test-full.log` |
+
+本体の既存 warning は残るが、上記 check に error はない。歌詞 UI に依存しない両対象を先行確認した。
+依存ソースが変わらなければ同じ check を繰り返さず、検証済み HEAD から確認用ビルドへ進む。
 
 ## 6. 修正後の短い実機確認
 

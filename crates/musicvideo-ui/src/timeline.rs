@@ -56,7 +56,7 @@ pub fn draw_timeline(
     position_secs: f64,
     waveform: Option<&TimelineWaveform>,
 ) -> TimelineResponse {
-    state.reconcile(project);
+    state.reconcile_preserving_native_reachability(project);
     let checkpoint = state.begin_external_edit(project);
     let context = ui.ctx().clone();
     let duration = project.duration_secs.max(0.001);

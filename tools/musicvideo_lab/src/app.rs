@@ -1596,13 +1596,16 @@ impl MusicVideoLabApp {
                 if let Some(next_path) = pending.queued {
                     self.defer_loaded_project(loaded);
                     self.spawn_project_load(next_path, ctx);
-                } else if self.document.edit_generation() != pending.started_at
-                    || self.pending_project_edit_in_progress()
-                {
+                } else if project_load_requires_choice(
+                    pending.started_at,
+                    self.document.edit_generation(),
+                    self.pending_project_edit_in_progress(),
+                ) {
                     self.status =
                         "読込中に現在のプロジェクトが変更されました。切替方法を選んでください"
                             .to_owned();
                     self.project_load = ProjectLoadState::Ready(loaded);
+                    ctx.request_repaint();
                 } else {
                     self.apply_loaded_project(loaded);
                 }
@@ -1665,7 +1668,10 @@ impl MusicVideoLabApp {
     }
 
     fn pending_project_edit_in_progress(&self) -> bool {
-        self.audio_pending.is_some() || self.image_pending.is_some() || self.lrc_load.is_active()
+        self.audio_pending.is_some()
+            || self.image_pending.is_some()
+            || self.lrc_load.is_active()
+            || self.editor_state.has_pending_lyrics_edit()
     }
 
     fn apply_loaded_project(&mut self, loaded: LoadedProject) {
@@ -1834,7 +1840,13 @@ impl MusicVideoLabApp {
             })
     }
 
-    fn apply_lrc_result(&mut self, owner: LrcLoadOwner, path: PathBuf, report: LrcParseReport) {
+    fn apply_lrc_result(
+        &mut self,
+        owner: LrcLoadOwner,
+        path: PathBuf,
+        report: LrcParseReport,
+        ctx: &egui::Context,
+    ) {
         if !self.document.is_current(owner.session)
             || self.editor_state.layer_target_lifetime(owner.layer) != Some(owner.target_lifetime)
         {
@@ -1855,10 +1867,11 @@ impl MusicVideoLabApp {
             layer: owner.layer,
             lines: report.lines,
         };
-        match self
-            .editor_state
-            .try_apply_external_command(&mut self.project, &command)
-        {
+        match self.editor_state.try_apply_external_command_with_context(
+            ctx,
+            &mut self.project,
+            &command,
+        ) {
             Ok(true) => {
                 self.document.note_edit();
                 self.editor_state
@@ -1873,7 +1886,7 @@ impl MusicVideoLabApp {
         }
     }
 
-    fn poll_lrc(&mut self) {
+    fn poll_lrc(&mut self, ctx: &egui::Context) {
         let load_result = match &self.lrc_load {
             LrcLoadState::Loading { rx, .. } => Some(rx.try_recv()),
             LrcLoadState::Idle | LrcLoadState::Ready { .. } => None,
@@ -1892,8 +1905,10 @@ impl MusicVideoLabApp {
                         .to_owned();
                     return;
                 }
-                if self.current_lyrics(owner.layer).as_ref() == Some(&owner.baseline) {
-                    self.apply_lrc_result(owner, path, report);
+                if self.current_lyrics(owner.layer).as_ref() == Some(&owner.baseline)
+                    && !self.editor_state.layer_has_pending_lyrics_edit(owner.layer)
+                {
+                    self.apply_lrc_result(owner, path, report, ctx);
                 } else {
                     self.status =
                         "LRC 読込中に対象の歌詞が変更されました。反映方法を選んでください"
@@ -1903,6 +1918,7 @@ impl MusicVideoLabApp {
                         path,
                         report,
                     };
+                    ctx.request_repaint();
                 }
             }
             Some(Ok(Err(error))) => {
@@ -2092,8 +2108,6 @@ impl eframe::App for MusicVideoLabApp {
         self.poll_calibration();
         let mut displayed_perf = self.poll_preview(ctx);
         self.poll_export();
-        self.poll_projects(ctx);
-        self.poll_lrc();
 
         let audio_sync_started = Instant::now();
         let playback = playback_snapshot_for_ui(
@@ -2417,7 +2431,7 @@ impl eframe::App for MusicVideoLabApp {
                 report,
             } = std::mem::take(&mut self.lrc_load)
         {
-            self.apply_lrc_result(owner, path, report);
+            self.apply_lrc_result(owner, path, report, ctx);
         } else if discard_ready_lrc
             && matches!(
                 std::mem::take(&mut self.lrc_load),
@@ -2499,6 +2513,11 @@ impl eframe::App for MusicVideoLabApp {
             self.schedule_project_edit_preview();
         }
 
+        // Project/LRC completion can replace the document or lyrics. Apply the current frame's
+        // editor and timeline input first so that an asynchronous completion cannot skip its
+        // generation/pending-edit conflict check.
+        self.poll_projects(ctx);
+        self.poll_lrc(ctx);
         self.sync_runtime_resources(ctx);
 
         egui::CentralPanel::default()
@@ -2586,6 +2605,14 @@ fn playback_snapshot_for_ui(
             playing: false,
         }
     }
+}
+
+fn project_load_requires_choice(
+    started_at: EditGeneration,
+    current: EditGeneration,
+    has_pending_edit: bool,
+) -> bool {
+    current != started_at || has_pending_edit
 }
 
 fn format_clock(seconds: f64) -> String {
@@ -2882,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn project_load_waits_for_a_choice_when_the_current_document_changed() {
+    fn project_load_completion_after_same_frame_input_waits_for_a_choice() {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let started_at = app.document.edit_generation();
         let (tx, rx) = mpsc::channel();
@@ -2929,6 +2956,18 @@ mod tests {
 
         assert_eq!(app.project.duration_secs, 18.0);
         assert!(matches!(app.project_load, ProjectLoadState::Idle));
+    }
+
+    #[test]
+    fn project_load_requires_a_choice_for_a_pending_lyrics_draft() {
+        let app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let unchanged_generation = app.document.edit_generation();
+
+        assert!(project_load_requires_choice(
+            unchanged_generation,
+            unchanged_generation,
+            true,
+        ));
     }
 
     #[test]
@@ -3326,7 +3365,8 @@ mod tests {
     }
 
     #[test]
-    fn lrc_completion_requires_a_choice_only_when_target_lyrics_changed() {
+    fn lrc_completion_after_same_frame_input_waits_for_a_choice() {
+        let context = egui::Context::default();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let mut layer = musicvideo_core::new_lyrics_layer(&app.project);
         let layer_id = layer.id;
@@ -3361,7 +3401,7 @@ mod tests {
         lyrics.lines[0].text = "edited while loading".to_owned();
         tx.send(Ok((PathBuf::from("loaded.lrc"), report))).unwrap();
 
-        app.poll_lrc();
+        app.poll_lrc(&context);
 
         assert_eq!(
             app.current_lyrics(layer_id).unwrap()[0].text,
@@ -3375,7 +3415,7 @@ mod tests {
         else {
             panic!("lyrics conflict must wait for an explicit choice");
         };
-        app.apply_lrc_result(owner, path, report);
+        app.apply_lrc_result(owner, path, report, &context);
         assert_eq!(app.current_lyrics(layer_id).unwrap()[0].text, "loaded");
     }
 
