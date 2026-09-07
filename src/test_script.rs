@@ -1,9 +1,9 @@
 //! Opt-in Rhai runner for isolated in-process application tests.
 //!
-//! The worker evaluates scripts and sends typed commands only. Synthetic input
-//! is materialized by `key_input`'s ROOT plugin, while App/UI state publication,
-//! direct `KeyAction` delivery, failure classification, and shutdown stay on
-//! the UI thread.
+//! The worker evaluates scripts. App/UI access stays behind typed commands;
+//! synthetic key input is materialized by `key_input`'s ROOT plugin, while the
+//! opt-in native mouse diagnostic calls its OS driver on the worker. App state
+//! publication, direct `KeyAction` delivery, and shutdown stay on the UI thread.
 
 #![cfg_attr(all(test, not(feature = "test-script")), allow(dead_code))]
 
@@ -536,6 +536,10 @@ enum UiCommand {
         selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
     },
+    ValidateSelectedOwner {
+        expected_identity: TestScriptWindowIdentity,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Log(String),
     Precondition(PreconditionTrace),
     Finished(ScriptOutcome),
@@ -750,6 +754,183 @@ impl RunnerBridge {
         }
         Ok(selected)
     }
+
+    fn selected_detached_identity(&self) -> Result<TestScriptWindowIdentity, String> {
+        match self.action_selection()? {
+            TestScriptActionSelection::Targeted(
+                identity @ TestScriptWindowIdentity::Detached { .. },
+            ) => Ok(identity),
+            TestScriptActionSelection::Targeted(identity) => Err(format!(
+                "native mouse input requires a detached target; selected {}",
+                identity.describe()
+            )),
+            TestScriptActionSelection::LegacyImplicit => {
+                Err("native mouse input requires select_window first".to_string())
+            }
+        }
+    }
+
+    fn validate_selected_owner_cached(
+        &self,
+        expected: &TestScriptWindowIdentity,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("native mouse deadline expired while validating the selected owner".into());
+        }
+        self.interrupt.check()?;
+        match self.action_selection()? {
+            TestScriptActionSelection::Targeted(identity) if identity == *expected => {}
+            _ => {
+                return Err(format!(
+                    "native mouse selected owner changed: expected {}",
+                    expected.describe()
+                ));
+            }
+        }
+        if !self
+            .latest_snapshot()?
+            .windows
+            .iter()
+            .any(|window| window.identity.as_ref() == Some(expected))
+        {
+            return Err(format!(
+                "native mouse selected owner is absent from the published snapshot: {}",
+                expected.describe()
+            ));
+        }
+        let backend_is_current = eframe::miv_test_script_window_witness::is_current(
+            expected.viewport_id(),
+            expected.hwnd(),
+            expected.backend_token(),
+        )
+        .map_err(|error| {
+            let message = format!("native window witness validation failed: {error}");
+            self.interrupt.fail(message.clone());
+            message
+        })?;
+        if !backend_is_current {
+            return Err(format!(
+                "native mouse backend allocation is no longer current: {}",
+                expected.describe()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_selected_owner_fresh(
+        &self,
+        expected: &TestScriptWindowIdentity,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.validate_selected_owner_cached(expected, deadline)?;
+        let (reply, acknowledgement) = mpsc::sync_channel(1);
+        let command = UiCommand::ValidateSelectedOwner {
+            expected_identity: expected.clone(),
+            reply,
+        };
+        if self.tx.send(command).is_err() {
+            let message = "selected-owner validation channel disconnected before dispatch";
+            self.interrupt.fail(message);
+            return Err(message.to_string());
+        }
+        (self.wake)();
+
+        loop {
+            self.interrupt.check()?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out waiting for fresh selected-owner validation: {}",
+                    expected.describe()
+                ));
+            }
+            let wait = WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+            match acknowledgement.recv_timeout(wait) {
+                Ok(result) => {
+                    result?;
+                    return self.validate_selected_owner_cached(expected, deadline);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let message = "selected-owner validation acknowledgement channel disconnected";
+                    self.interrupt.fail(message);
+                    return Err(message.to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    fn move_native_canvas(&self, normalized: [f32; 2], timeout: Duration) -> Result<Map, String> {
+        if timeout.is_zero() {
+            return Err("move_native_canvas timeout_ms must be greater than zero".to_string());
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "move_native_canvas timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        let owner_hwnd = identity.hwnd();
+        let prepared = crate::video::native_ui_smoke::prepare_real_mouse_in_canvas(
+            owner_hwnd,
+            normalized,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let receipt = crate::video::native_ui_smoke::send_prepared_real_mouse_move(
+            prepared,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        Ok(native_mouse_receipt_to_rhai_map(receipt))
+    }
+}
+
+#[cfg(feature = "test-script")]
+fn native_mouse_environment_error(bridge: &RunnerBridge, message: String) -> Box<EvalAltResult> {
+    bridge.interrupt.fail(message.clone());
+    rhai_error(message)
+}
+
+#[cfg(feature = "test-script")]
+fn native_mouse_receipt_to_rhai_map(
+    receipt: crate::video::native_ui_smoke::NativeUiSmokeMoveReceipt,
+) -> Map {
+    let mut map = Map::new();
+    map.insert("token".into(), saturating_rhai_int(receipt.token).into());
+    map.insert(
+        "owner_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.owner_hwnd)),
+    );
+    map.insert(
+        "presenter_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.presenter_hwnd)),
+    );
+    map.insert(
+        "source_epoch".into(),
+        saturating_rhai_int(receipt.source_epoch).into(),
+    );
+    map.insert(
+        "generation".into(),
+        saturating_rhai_int(receipt.generation).into(),
+    );
+    map.insert(
+        "requested_client_x".into(),
+        rhai::INT::from(receipt.requested_client_x).into(),
+    );
+    map.insert(
+        "requested_client_y".into(),
+        rhai::INT::from(receipt.requested_client_y).into(),
+    );
+    map.insert(
+        "actual_client_x".into(),
+        rhai::INT::from(receipt.actual_client_x).into(),
+    );
+    map.insert(
+        "actual_client_y".into(),
+        rhai::INT::from(receipt.actual_client_y).into(),
+    );
+    map
 }
 
 fn emit_perf_step(message: &str) {
@@ -988,6 +1169,41 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             selected_target_bridge.selected_target().map_err(rhai_error)
         },
     );
+
+    #[cfg(feature = "test-script")]
+    {
+        let native_mouse_bridge = bridge.clone();
+        engine.register_fn(
+            "move_native_canvas",
+            move |normalized_x: rhai::FLOAT,
+                  normalized_y: rhai::FLOAT,
+                  timeout_ms: rhai::INT|
+                  -> Result<Map, Box<EvalAltResult>> {
+                if !normalized_x.is_finite()
+                    || !normalized_y.is_finite()
+                    || normalized_x <= 0.0
+                    || normalized_x >= 1.0
+                    || normalized_y <= 0.0
+                    || normalized_y >= 1.0
+                {
+                    return Err(rhai_error(
+                        "move_native_canvas coordinates must be finite and between zero and one",
+                    ));
+                }
+                let timeout = checked_duration(timeout_ms, "move_native_canvas timeout_ms")?;
+                if timeout.is_zero() {
+                    return Err(rhai_error(
+                        "move_native_canvas timeout_ms must be greater than zero",
+                    ));
+                }
+                native_mouse_bridge
+                    .move_native_canvas([normalized_x as f32, normalized_y as f32], timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_mouse_bridge, message)
+                    })
+            },
+        );
+    }
 
     let hold_bridge = bridge.clone();
     engine.register_fn(
@@ -1450,6 +1666,37 @@ impl UiRuntime {
             .write()
             .map(|mut published| published.windows = joined)
             .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn validate_selected_owner(&self, expected: &TestScriptWindowIdentity) -> Result<(), String> {
+        if self.finish.is_some() {
+            return Err("script is already finishing".to_string());
+        }
+        if self.cancel_requested {
+            return Err("script input cancellation is already active".to_string());
+        }
+        if !self
+            .authoritative_windows
+            .iter()
+            .any(|window| window.identity.as_ref() == Some(expected))
+        {
+            return Err(format!(
+                "selected owner is no longer authoritative: {}",
+                expected.describe()
+            ));
+        }
+        match eframe::miv_test_script_window_witness::is_current(
+            expected.viewport_id(),
+            expected.hwnd(),
+            expected.backend_token(),
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "selected owner backend allocation is no longer current: {}",
+                expected.describe()
+            )),
+            Err(error) => Err(format!("native window witness validation failed: {error}")),
+        }
     }
 
     fn publish_window_frame(
@@ -2134,6 +2381,16 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     }
                 }
             }
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => {
+                let result = runtime.validate_selected_owner(&expected_identity);
+                if let Err(message) = result.as_ref() {
+                    runtime.fail_environment(message.clone(), frame);
+                }
+                let _ = reply.send(result);
+            }
             UiCommand::Log(message) => {
                 crate::logger::log(format!("[test-script] {message}"));
                 emit_perf_step(&message);
@@ -2714,6 +2971,36 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn invalid_native_mouse_arguments_are_script_failures() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_native_canvas(0.0, 0.5, 1000);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("coordinates")
+        ));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_mouse_runtime_failures_are_environment_failures() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_native_canvas(0.5, 0.5, 1000);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::EnvironmentFailure,
+                message,
+            })) if message.contains("requires select_window")
+        ));
+    }
+
     #[test]
     fn wait_until_reads_published_snapshot_across_thread_boundary() {
         let (bridge, rx, _) = runner_bridge(TestScriptSnapshot::default());
@@ -2789,6 +3076,21 @@ mod tests {
         }
     }
 
+    fn detached_identity_from_witness(
+        witness: eframe::miv_test_script_window_witness::WindowWitness,
+        context_serial: u64,
+        host_incarnation: u64,
+    ) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Detached {
+            window_id: 7,
+            context_serial,
+            viewport_id: witness.viewport_id(),
+            host_incarnation,
+            hwnd: witness.hwnd(),
+            backend_token: witness.token(),
+        }
+    }
+
     fn local_runtime() -> UiRuntime {
         let (_tx, rx) = mpsc::channel();
         UiRuntime::new(
@@ -2796,6 +3098,162 @@ mod tests {
             Arc::new(RwLock::new(TestScriptSnapshot::default())),
             Arc::new(InterruptState::default()),
         )
+    }
+
+    #[test]
+    fn fresh_owner_barrier_accepts_the_exact_live_ui_and_backend_identity() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-current");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x500);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = detached_identity_from_witness(witness, 11, 13);
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 17, 0, "video::current")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(owner.clone());
+        let worker = {
+            let bridge = bridge.clone();
+            let owner = owner.clone();
+            std::thread::spawn(move || {
+                bridge
+                    .validate_selected_owner_fresh(&owner, Instant::now() + Duration::from_secs(1))
+            })
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                0,
+                "video::current",
+            )])
+            .unwrap();
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => {
+                assert_eq!(expected_identity, owner);
+                reply
+                    .send(runtime.validate_selected_owner(&expected_identity))
+                    .unwrap();
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn fresh_owner_barrier_rejects_a_logical_replacement_despite_a_cached_snapshot() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-replaced");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x501);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let old_owner = detached_identity_from_witness(witness, 11, 13);
+        let replacement = detached_identity_from_witness(witness, 12, 14);
+        let mut cached = ready_snapshot();
+        cached.windows = vec![window_snapshot(old_owner.clone(), 17, 0, "video::old")];
+        let (bridge, rx, _) = runner_bridge(cached);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(old_owner.clone());
+        let worker = {
+            let bridge = bridge.clone();
+            let old_owner = old_owner.clone();
+            std::thread::spawn(move || {
+                bridge.validate_selected_owner_fresh(
+                    &old_owner,
+                    Instant::now() + Duration::from_secs(1),
+                )
+            })
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                replacement,
+                18,
+                0,
+                "video::replacement",
+            )])
+            .unwrap();
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => reply
+                .send(runtime.validate_selected_owner(&expected_identity))
+                .unwrap(),
+            command => panic!("unexpected command: {command:?}"),
+        }
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("no longer authoritative"));
+    }
+
+    #[test]
+    fn owner_barrier_disconnect_is_an_environment_failure() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-disconnect");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x502);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = detached_identity_from_witness(witness, 11, 13);
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 17, 0, "video::current")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(owner.clone());
+        drop(rx);
+
+        let error = bridge
+            .validate_selected_owner_fresh(&owner, Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.contains("disconnected before dispatch"));
+        assert_eq!(
+            bridge.interrupt.failure_message().as_deref(),
+            Some(error.as_str())
+        );
+    }
+
+    #[test]
+    fn owner_barrier_rejects_finishing_or_cancelled_ui_runtime() {
+        let context = egui::Context::default();
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, egui::ViewportId::ROOT, 0x503);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 11,
+            hwnd: witness.hwnd(),
+            backend_token: witness.token(),
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 0, "root::current")])
+            .unwrap();
+        runtime.cancel_requested = true;
+        assert!(
+            runtime
+                .validate_selected_owner(&owner)
+                .unwrap_err()
+                .contains("cancellation")
+        );
+        runtime.cancel_requested = false;
+        runtime.begin_finish(ScriptOutcome::success(), 1);
+        assert!(
+            runtime
+                .validate_selected_owner(&owner)
+                .unwrap_err()
+                .contains("already finishing")
+        );
     }
 
     #[test]

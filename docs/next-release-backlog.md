@@ -1802,6 +1802,20 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 規模 / 優先度: 小 / P2。
 
 
+### 1.199 native 動画の同一batchで領域を跨ぐと、先のwheel操作が失われる可能性 (2026-09-07)
+
+- **コード上の候補、実行再現は未実施。調査優先度 P2。** §1.197の独立Astra調査と親の照合で発見。
+- strip wheelはegui MouseWheelへ積まれるが、その後のcanvas wheel/moveでpointer_posが変わると、
+  draw_native_seek_stripは最後のpointerだけを使い、先のstrip wheelを消費しない可能性がある。
+  panelにも最終hoverへの集約が及ぶ。Zoom固有ではなく、既存360/通常navigationにもある境界。
+- GPU不要の既存strip描画ハーネスへ、`PointerMoved(strip), MouseWheel, PointerMoved(canvas)`と
+  逆順を与え、Window spanのStepSeekStripRangeが各1回出るか確認できる。先にこの再現を取る。
+  panelは実ScrollAreaを通す別確認が必要で、booleanの領域分類だけをスクロール成功と扱わない。
+- 正しい修正はeventごとの位置/領域所有と一括egui入力の統合を要する。§1.197で調査中の
+  VideoZoomWheel commandからraw wheelへの二重転送とは別の根因であり、variant追加では直らない。
+- §1.197の自動化は一入力ごとにreceiptを待つ範囲を先に完成させ、混在batch保全まで成功と表明しない。
+  詳細: [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) S3b。
+
 ### 1.198 横長画像がアイドル高画質化の無限ループに入り、CPU を焼き続ける (2026-09-07)
 
 - **実装修正済み (`052bd6339`)・自動検証済み、元の静止条件での実アプリ確認は未実施。**

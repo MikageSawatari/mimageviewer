@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120
@@ -113,7 +113,7 @@ if ($TimeoutSeconds -le 0) {
     throw '[ui-smoke] TimeoutSeconds must be greater than zero'
 }
 
-$implementedScenarios = @('MultiWindowPdf')
+$implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove')
 if ($implementedScenarios -notcontains $Scenario) {
     throw "[ui-smoke] scenario $Scenario is not implemented"
 }
@@ -196,6 +196,45 @@ switch ($Scenario) {
             throw "[ui-smoke] scenario script not found: $scriptPath"
         }
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
+        [System.IO.File]::WriteAllText($settingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    'NativeMouseMove' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\native-mouse-move'
+        $scriptPath = Join-Path $PSScriptRoot 'ui-smoke\native-mouse-move.rhai'
+        $fixtureDir = Join-Path $scenarioRoot 'fixture'
+        $settingsPath = Join-Path $dataDir 'settings-override.json'
+
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\native-mouse-move') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+        $ffmpegCommand = Get-Command -Name 'ffmpeg.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        if ($null -eq $ffmpegCommand -or -not (Test-Path -LiteralPath $ffmpegCommand.Source -PathType Leaf)) {
+            throw '[ui-smoke] ffmpeg.exe was not found on PATH'
+        }
+        $videoPath = Join-Path $fixtureDir 'native-mouse-move.mp4'
+        $ffmpegArgs = @(
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10',
+            '-t', '120', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart', $videoPath
+        )
+        & $ffmpegCommand.Source $ffmpegArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] video fixture generator failed with exit $LASTEXITCODE"
+        }
+        if (@(Get-ChildItem -LiteralPath $fixtureDir -Filter '*.mp4' -File).Count -ne 1 -or
+            -not (Test-Path -LiteralPath $videoPath -PathType Leaf) -or
+            (Get-Item -LiteralPath $videoPath).Length -le 0) {
+            throw '[ui-smoke] video fixture must contain exactly one non-empty MP4'
+        }
+        if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+            throw "[ui-smoke] scenario script not found: $scriptPath"
+        }
+        $settingsJson = '{"detached_viewer_open_images_in_window":true}'
         [System.IO.File]::WriteAllText($settingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
 }

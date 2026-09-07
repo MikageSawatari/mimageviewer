@@ -1475,6 +1475,13 @@ Appとの共通接続は既存選択context/hostの再検証へ限定し、App s
 共通native envelopeの影響先はpump/render全consumerだが、通常eventは同じ処理を保つ。
 metadata保持・世代/geometry不一致・publisher退去・render error・欠落を回帰/独立レビューする。
 
+S3a接続の追加合意: callback-local witnessをworkerから読む案はTLS制約で不成立。
+process-unique token/viewport/HWNDのread-only照合を追加し、registry掃除・Windowのstrong保持を
+workerへ移さない。同じallocationで論理ownerが変わる際のsnapshot遅延は既存UiCommand上の
+fresh validationで検査する。App由来一覧のpublish直後・command drain時にexact ownerを
+照合してreplyを返し、UI側の待機や新しいactivation/pending fieldは追加しない。
+準備前・receipt後とnative target再照合を一つの期限に揃える設計を親/独立AstraとSolが確認した。
+
 **2026-09-07 §1.197 S1b: 明示した窓への診断action配送（実装前の構造合意）:**
 
 親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の

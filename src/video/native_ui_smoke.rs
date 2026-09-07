@@ -649,15 +649,12 @@ fn record_render_failure_in(
 pub(crate) fn prepare_real_mouse_in_canvas(
     owner_hwnd: u64,
     normalized: [f32; 2],
-    timeout: Duration,
+    deadline: Instant,
     mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
 ) -> Result<NativeUiSmokePreparedMove, String> {
     validate_disposable_runtime()?;
-    if timeout.is_zero() {
-        return Err("native mouse timeout must be greater than zero".into());
-    }
+    require_unexpired_deadline(deadline, "preparing native mouse input")?;
     validate_owner_and_interrupt()?;
-    let deadline = Instant::now() + timeout;
     let broker = broker();
     let target = wait_for_target(
         broker,
@@ -668,6 +665,7 @@ pub(crate) fn prepare_real_mouse_in_canvas(
     )?;
     validate_os_target(&target)?;
     validate_owner_and_interrupt()?;
+    require_unexpired_deadline(deadline, "returning the prepared native mouse target")?;
     Ok(NativeUiSmokePreparedMove {
         target,
         normalized,
@@ -677,15 +675,12 @@ pub(crate) fn prepare_real_mouse_in_canvas(
 
 pub(crate) fn send_prepared_real_mouse_move(
     prepared: NativeUiSmokePreparedMove,
-    timeout: Duration,
+    deadline: Instant,
     mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
 ) -> Result<NativeUiSmokeMoveReceipt, String> {
     validate_disposable_runtime()?;
-    if timeout.is_zero() {
-        return Err("native mouse timeout must be greater than zero".into());
-    }
+    require_unexpired_deadline(deadline, "sending native mouse input")?;
     validate_owner_and_interrupt()?;
-    let deadline = Instant::now() + timeout;
     let broker = broker();
     validate_prepared_target(broker, &prepared)?;
     validate_os_target(&prepared.target)?;
@@ -725,6 +720,7 @@ pub(crate) fn send_prepared_real_mouse_move(
         validate_owner_and_interrupt()?;
         validate_prepared_target(broker, &prepared)?;
         validate_os_target(&prepared.target)?;
+        require_unexpired_deadline(deadline, "calling SendInput")?;
         send_absolute_mouse_move(&prepared.target, token)?;
         let actual_point = wait_for_receipts(
             broker,
@@ -745,6 +741,14 @@ pub(crate) fn send_prepared_real_mouse_move(
             actual_client_y: actual_point[1],
         })
     })
+}
+
+fn require_unexpired_deadline(deadline: Instant, phase: &str) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        Err(format!("native mouse deadline expired while {phase}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn run_pending_step<T>(
@@ -795,15 +799,11 @@ fn wait_for_target(
             }
         };
         validate_owner_and_interrupt()?;
+        require_unexpired_deadline(deadline, "waiting for the native mouse target")?;
         if let Some(candidate) = candidate {
             return Ok(candidate);
         }
         let now = Instant::now();
-        if now >= deadline {
-            return Err(format!(
-                "native mouse target was not ready for owner 0x{owner_hwnd:x}"
-            ));
-        }
         let wait = TARGET_WAIT_POLL.min(deadline.saturating_duration_since(now));
         let state = lock_broker_state(broker)?;
         let waited = broker.changed.wait_timeout(state, wait);
@@ -891,13 +891,17 @@ fn wait_for_receipts(
         };
         validate_owner_and_interrupt()?;
         if complete {
+            require_unexpired_deadline(deadline, "validating native mouse receipts")?;
             validate_os_target(&prepared.target)?;
             validate_prepared_target(broker, prepared)?;
             validate_owner_and_interrupt()?;
             let state = lock_broker_state(broker)?;
-            return completed_actual_point(&state, token, prepared)?.ok_or_else(|| {
-                "native mouse receipt completion was revoked during final validation".into()
-            });
+            let point = completed_actual_point(&state, token, prepared)?.ok_or_else(|| {
+                "native mouse receipt completion was revoked during final validation".to_string()
+            })?;
+            drop(state);
+            require_unexpired_deadline(deadline, "returning native mouse receipts")?;
+            return Ok(point);
         }
         let now = Instant::now();
         if now >= deadline {
@@ -1721,6 +1725,46 @@ mod tests {
                 .pending
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ready_target_cannot_be_returned_after_the_absolute_deadline() {
+        let fixture = ReceiptFixture::new();
+        let result = wait_for_target(
+            &fixture.broker,
+            0x100,
+            [0.5, 0.5],
+            Instant::now() + Duration::from_millis(1),
+            &mut || {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("a ready candidate must still respect the shared deadline"),
+            Err(error) => error,
+        };
+        assert!(error.contains("deadline expired"));
+    }
+
+    #[test]
+    fn complete_receipts_cannot_be_returned_after_the_absolute_deadline() {
+        let fixture = ReceiptFixture::new();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        let error = wait_for_receipts(
+            &fixture.broker,
+            fixture.metadata.token,
+            &fixture.prepared,
+            Instant::now() + Duration::from_millis(1),
+            &mut || {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            },
+        )
+        .expect_err("complete receipts must still respect the shared deadline");
+        assert!(error.contains("deadline expired"));
     }
 
     #[test]

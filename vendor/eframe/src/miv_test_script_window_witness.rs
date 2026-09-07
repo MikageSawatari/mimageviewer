@@ -230,6 +230,29 @@ pub fn active() -> Option<WindowWitness> {
     ACTIVE_WINDOW.with(|active| active.borrow().as_ref().map(|active| active.witness))
 }
 
+/// Check an exact process-unique allocation witness without relying on the
+/// callback-local [`active`] / [`latest`] scope.
+///
+/// This lookup is deliberately read-only. A worker must not prune dead records
+/// (which would drop their `egui::Context` on that worker) or upgrade the weak
+/// allocation (which could move the final `Window` drop off the event-loop
+/// thread).
+pub fn is_current(
+    viewport_id: egui::ViewportId,
+    hwnd: u64,
+    token: u64,
+) -> Result<bool, &'static str> {
+    let records = records()
+        .lock()
+        .map_err(|_| "window witness registry poisoned")?;
+    Ok(records.iter().any(|record| {
+        record.witness.viewport_id == viewport_id
+            && record.witness.hwnd == hwnd
+            && record.witness.token == token
+            && record.allocation.is_alive()
+    }))
+}
+
 /// Feature-only fixture for application-side ownership tests. It follows the
 /// same Context/viewport registry and nested TLS rules without constructing an
 /// operating-system window.
@@ -342,5 +365,81 @@ mod tests {
         }
         assert_eq!(active(), parent);
         assert_eq!(latest(viewport), parent);
+    }
+
+    #[test]
+    fn exact_liveness_is_available_outside_callback_tls_without_retargeting() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("worker-liveness");
+        let first = WindowWitnessFixture::new();
+        let first_witness = {
+            let _scope = first.enter(&context, viewport, 0x401);
+            active().unwrap()
+        };
+        assert_eq!(active(), None);
+        assert_eq!(
+            is_current(
+                first_witness.viewport_id(),
+                first_witness.hwnd(),
+                first_witness.token()
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            is_current(
+                egui::ViewportId::from_hash_of("wrong-viewport"),
+                first_witness.hwnd(),
+                first_witness.token()
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            is_current(
+                first_witness.viewport_id(),
+                first_witness.hwnd() + 1,
+                first_witness.token()
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            is_current(
+                first_witness.viewport_id(),
+                first_witness.hwnd(),
+                first_witness.token() + 1
+            ),
+            Ok(false)
+        );
+
+        let replacement = WindowWitnessFixture::new();
+        let replacement_witness = {
+            let _scope = replacement.enter(&context, viewport, 0x401);
+            active().unwrap()
+        };
+        assert_eq!(
+            is_current(
+                first_witness.viewport_id(),
+                first_witness.hwnd(),
+                first_witness.token()
+            ),
+            Ok(false),
+            "the old token must not retarget to a replacement with the same HWND"
+        );
+        assert_eq!(
+            is_current(
+                replacement_witness.viewport_id(),
+                replacement_witness.hwnd(),
+                replacement_witness.token()
+            ),
+            Ok(true)
+        );
+        drop(replacement);
+        assert_eq!(
+            is_current(
+                replacement_witness.viewport_id(),
+                replacement_witness.hwnd(),
+                replacement_witness.token()
+            ),
+            Ok(false)
+        );
     }
 }

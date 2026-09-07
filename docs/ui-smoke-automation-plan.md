@@ -238,9 +238,19 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
 - activeのnavigation処理はshow_viewport_immediate復帰後にある。widgetが捕捉したstep ID・
   child witness・handler結果をframe-local値で運び、navigation後の実App ownerとjoinしてackする。
   その時点のactive witnessはROOTへ復元済みなので、child証拠の代用にしない。
-- eguiの同じrunは複数passを回せる。callbackの各passで一時receiptをclearして実処理で置換し、
-  最終passを採用する。次stepへの移行はshow復帰/navigation後とし、pass番号の増加だけで
-  pressとmoveを別frameと扱わない。既存ROOT materialization frame/time/run境界を使う。
+- eguiの同じrunは複数passを回せる。初期案の「各passでreceiptをclearし最終passだけ採用」は
+  Solの実egui probeで反証された。request_discardで2passを強制すると、releaseの
+  Moved(final)→Upはpass1だけdrag_stopped=true/interact_posあり、pass2はfalse/Noneとなる。
+  既存key再注入を変更せず、owner/viewport/prepared frame/time/step IDが同じrunに限った
+  typed accumulatorで有効なhandler proofを保持する設計へ修正し、独立レビューで妥当と確認した。
+  show復帰/navigation後に一度だけfinalizeし、別runへ持ち越さない。最終描画のlayout/paintは
+  handler proofとは別に記録する。pass番号の増加だけでpressとmoveを別frameと扱わない。
+  実測ログ: `target/v370-work/s2-multipass-probe-run.log`。これはeguiの応答特性の確認であり、
+  S2のアプリhandler連携や実portable操作を実行した結果ではない。
+- accumulatorは1回のshow invocationのlexical scopeに限定する。同じraw timeでも別showへ
+  合流せず、同stepの証拠を回数として加算しない。別owner/payload/widgetによる実消費は矛盾として
+  失敗を維持する。outer ROOTのdiscardでchild showを再度呼ぶ場合も、完了済みstepをprepared
+  cacheから再注入しない。gesture/navigationのRust側状態はegui discardで巻き戻らない。
 - Rhai pointerとnative wrapperは別child moduleへ置ける。親test_script.rsのmod/登録接点は
   一人ずつ統合し、同じファイルの同時編集を避ける。
 
@@ -358,15 +368,44 @@ ClickToShowへ切り替え、端moveで描画されるcalloutをクリックす�
 panは動かせる倍率へ上げてdown→move→upを通し、center変化、scale不変、再生toggleなし、
 drag state解放を確認する。Appへの送信成功とsource epoch検査後の実適用receiptを区別する。
 
+buttonを使う段階は、SendInputがDownを1件挿入した時点で同じtyped transactionがUpの
+後始末を所有する。Down receiptを待ってから所有を開始しない。期限/owner変更/元HWND退去でも
+この義務を捨てず、通常操作とは別の短いcleanup期限で移動なしのglobal LeftUpを試みる。
+cleanupで元の失敗を成功へ変換せず、AppのZoomPanを診断コードで直接resetしない。
+正常完了は実Up配送・pump側のcapture解放・UI handler後のZoomPan解放を揃える。
+workerのGetCapture/ReleaseCaptureは別threadのcapture確認/解放の代用にならない。
+
+開始時は既存mouse buttonとmodifierの非押下を確認し、実modifierを補正するkey-upは送らない。
+観測した介入や前提不一致は環境不成立とする。ただしOSのglobal button状態に「テスト分だけ」を
+差し引くAPIはなく、短時間の他アプリ向け実入力までポーリングで完全監視できるとは表明しない。
+今回の実入力確認は前面windowとmouseを使用する対話的テストとして扱う。
+根拠: [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)、
+[GetCapture](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getcapture)、
+[ReleaseCapture](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-releasecapture)、
+[GetAsyncKeyState](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getasynckeystate)。
+
 独立Astraのコード調査で、canvas wheelから`VideoZoomWheel`を生成する一方、
 `render_if_dirty`の`consumed_wheel`判定に同variantがなく、raw wheelもAppへ送られる
 二重適用の可能性を発見した。親も両App handlerへの経路を確認したが、まだ実行による
 再現結果ではない。S3a観測実装へ無検証で混ぜず、実handler回帰とliveの1段確認で根因を
 検証してから独立した修正単位にする。frame単位のwheel消費が複数eventに与える影響も調べる。
-調査時点ではzoom/audio modeが同batch内で変わらず、canvasの各wheelは各zoom command、
-strip/panel/modalのwheelは各領域が所有するため、Zoom commandを含むbatchのraw wheel抑止は
-整合する。回帰ではcanvas+canvasの2命令、canvas+strip/panelの両順序と領域操作の維持を確認する。
-ただしframe全体のany-commandは個々のtokenの処理理由ではなく、receiptに流用しない。
+当初はzoom/audio modeが同batch内で変わらないため混在時も領域操作を維持できると推定したが、
+追加の独立調査で反証された。strip wheelをeguiへ積んだ後にcanvas wheelがpointer_posを
+更新すると、draw_native_seek_stripは最後のpointerだけを使うため、先のstrip wheelを
+消費できない可能性がある。panelにも最終hoverへの集約が及ぶ。親もコード経路を照合した。
+これは既存360/通常navigationにも及ぶ別の根因であり、Zoom variant追加で解消するものではない。
+S3の各stepは一入力ごとにreceiptを待つ。混在batchの領域操作を保証したとは表明せず、
+追加調査を [next-release-backlog.md](next-release-backlog.md) §1.199へ分離する。
+frame全体のany-commandは個々のtokenの処理理由ではなく、
+receiptに流用しない。
+また既存seek_strip_wheel_is_consumed_and_becomes_one_range_stepには#[test]がなく、
+直前の別テストに#[test]が重複していた。既存テスト名の存在を実行済み証拠にしない。
+
+二重zoomの回帰はproductionのwheel dispatchとcommand→routing組立を通して
+should_forward_to_ui(original wheel)を判定し、手作業でconsumed_wheel=trueを与えない。
+App commandは既存disconnected player/OverlayInputRouting fixtureでsource gate後の
+1.0→1.2とstale epoch不変を確認できる。raw wheel側の座標変換は実HWNDを要求するため、
+その全経路はportableの実1notch→1.2で補完する。GPU必須のoverlayを不正初期化しない。
 
 strip/panel/modalの負例は、実領域内で指定tokenが処理された証拠、hit-testの理由、
 zoom/raw-wheel/navigationの非発行、Appの同context/source/zoom不変を揃える。
@@ -380,7 +419,9 @@ S1aは実装・焦点23テスト・feature有無のcore check・独立レビュ�
 S1bは対象配送とbackend host観測を実装し、独立source reviewを完了。
 最終検証はfeatureあり対象37件、featureなしlib test対象29件、manager関連7件、
 backend witness 3件が成功。通常/診断core checkと通常dependencyへのfeature非混入も確認。
-S2は設計段階。S3aのnative観測と実入力driverは独立source review、featureありcore check、
-broker回帰12件、coalescing回帰1件を完了。Rhai接続と実portable入力は未実施である。
+S2は実egui probeでmultipass前提を修正し、実装前の設計段階。
+S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
+通常/feature core check、owner/classification/期限/worker token回帰を完了。
+実portable入力は未実施である。
 複数窓PDF・列drag・動画zoomを自動化済みとは扱わない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。

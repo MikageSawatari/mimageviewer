@@ -9,6 +9,7 @@
 | --- | --- | --- |
 | 型・借用・依存関係だけ早く確認 | `cargo check -p mimageviewer --bin mimageviewer-core` | 本体 core |
 | 変更したモジュールのテスト | `cargo test -p mimageviewer --lib <filter>` | 本体の指定テストだけ実行 |
+| 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin |
@@ -19,6 +20,12 @@
 本体の全モジュールとアプリ固有テストは `--lib`、`tests/<name>.rs` は
 `--test <name>` を使う。`mimageviewer-core` bin は `mimageviewer::run()` を呼ぶだけなので、
 通常は bin 単独のテストを選ぶ必要はない。
+
+`test-script`のApp連携やnative診断の回帰はfeatureなしの全体gateだけでは実行されない。
+この領域を変更した場合は、対象テストを上記feature付きで追加実行する。backendの実Window
+witnessは`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu,miv-test-script-window-witness --lib`
+で確認する。これらは通常coreの代わりにはせず、featureなしのcore checkと全体gateを維持する。
+実アプリを使う検証範囲は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) を参照。
 
 ## 軽量化している範囲
 
