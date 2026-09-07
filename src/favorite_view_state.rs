@@ -201,7 +201,7 @@ mod tests {
         let mut state = FavoriteViewState::from_settings(&Settings::default());
 
         for offset_ms in [0, 100, 200] {
-            state.thumb_px += 1;
+            state.grid_cols += 1;
             debounce.note_at(id, state.clone(), start + Duration::from_millis(offset_ms));
         }
 
@@ -213,7 +213,7 @@ mod tests {
         let writes = debounce.take_due_at(start + Duration::from_millis(700));
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, id);
-        assert_eq!(writes[0].1.thumb_px, state.thumb_px);
+        assert_eq!(writes[0].1.grid_cols, state.grid_cols);
         let temp = tempfile::tempdir().unwrap();
         let db = crate::adjustment_db::AdjustmentDb::open_at(&temp.path().join("adjustment.db"))
             .unwrap();
@@ -231,7 +231,7 @@ mod tests {
         let path = temp.path().join("adjustment.db");
         let id = Uuid::new_v4();
         let mut state = FavoriteViewState::from_settings(&Settings::default());
-        state.thumb_px = 123;
+        state.grid_cols = 5;
 
         let writer = FavoriteViewStoreWriter::spawn(path.clone()).unwrap();
         writer

@@ -1343,7 +1343,7 @@ impl App {
         // state. A passive snapshot with the same id means the window has already been handed
         // off and therefore is not the active context.
         let window_id = self
-            .detached_viewer_window_id
+            .detached_viewer_window_id()
             .or(self.last_active_detached_window_id)?;
         if self
             .detached_image_windows
@@ -2302,7 +2302,7 @@ impl App {
         let Some(window_id) = active_id else {
             return false;
         };
-        if self.detached_viewer_window_id != Some(window_id) {
+        if self.detached_viewer_window_id() != Some(window_id) {
             self.discard_detached_right_drag_command(
                 window_id,
                 "pending_execution_mounted_window_mismatch",
@@ -2351,7 +2351,7 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "right_drag_command_execute id={window_id} fs_idx={fs_idx} \
              mounted_window_id={:?}",
-            self.detached_viewer_window_id
+            self.detached_viewer_window_id()
         ));
         if let Some(nav) = self.execute_right_drag_command(ctx, command) {
             self.mouse_ring_nav = Some(nav);
@@ -2432,14 +2432,13 @@ impl App {
         let active_session_window_id = self
             .active_detached_session
             .map(|session| session.window_id);
-        let owns_active_output = self.detached_viewer_window_id == Some(window_id)
+        let owns_active_output = self.detached_viewer_window_id() == Some(window_id)
             || active_session_window_id == Some(window_id)
             || (active_session_window_id.is_none()
-                && self.detached_viewer_window_id.is_none()
+                && self.detached_viewer_window_id().is_none()
                 && self.last_active_detached_window_id == Some(window_id)
                 && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow));
         if owns_active_output {
-            self.detached_viewer_window_id = None;
             self.fs_viewport_shown = false;
             self.fs_viewport_presentation = None;
             self.fs_viewport_recreate_after_hide = false;
@@ -4445,6 +4444,26 @@ pub(crate) struct FolderPaneOpenPending {
     purpose: FolderOpenScanPurpose,
 }
 
+#[derive(Clone)]
+pub(crate) struct CurrentViewOrderSnapshot {
+    sort_order: crate::settings::SortOrder,
+    grid_display_order: crate::settings::GridDisplayOrder,
+}
+
+impl CurrentViewOrderSnapshot {
+    fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            sort_order: settings.sort_order,
+            grid_display_order: settings.grid_display_order.clone(),
+        }
+    }
+
+    fn matches(&self, settings: &crate::settings::Settings) -> bool {
+        self.sort_order == settings.sort_order
+            && self.grid_display_order == settings.grid_display_order
+    }
+}
+
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
     /// A grid `Folder` requested while always-new mode is active. The main context
@@ -4455,6 +4474,17 @@ pub(crate) enum FolderOpenScanPurpose {
     DetachedImage {
         image_path: PathBuf,
     },
+    /// 現在の物理フォルダを、変更済みの表示順設定で再構築するための事前走査。
+    /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
+    CurrentViewOrderRefresh {
+        order: CurrentViewOrderSnapshot,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PhysicalFolderSortReload {
+    Immediate,
+    WorkerScan,
 }
 
 /// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
@@ -11054,12 +11084,6 @@ pub struct App {
     /// grid-originated "open in a new detached window" request.
     #[cfg(windows)]
     pub(crate) detached_viewer_folder_nav_reuse_window_once: bool,
-    /// detached viewer context が使う安定した OS window id。
-    ///
-    /// active / paused を切り替えても同じ ViewportId を使い続け、ウィンドウの
-    /// close/create を避けるために context bundle と一緒に swap する。
-    #[cfg(windows)]
-    pub(crate) detached_viewer_window_id: Option<u64>,
     /// active viewer から退避した静止画像の passive detached windows。
     /// 操作系・先読み・編集・AI は持たず、最後に表示したテクスチャだけを保持する。
     #[cfg(windows)]
@@ -11091,12 +11115,9 @@ pub struct App {
     pub(crate) parked_live_media_close_after_poll: Vec<(u64, &'static str)>,
     #[cfg(windows)]
     pub(crate) next_detached_image_window_id: u64,
-    /// 直近にアクティブだった detached ウィンドウの window_id。`detached_viewer_window_id`
-    /// が close で None になっても保持し、フォルダナビ (Ctrl+↑↓) の reopen で同じ window_id を
-    /// 再利用して `fullscreen_viewport_id` (= detached では window_id 由来) を安定させる。
-    /// これにより、次フォルダへ移るたびに ViewportId が変わって OS ウィンドウが破棄→再生成
-    /// される (= 小窓カスケード / DWM フェード) のを防ぐ。bundle には入れない (context swap を
-    /// 跨いで持続させる必要があるため)。
+    /// 直近に選択した detached 窓。active session 終了から context retire までの検索にも使う。
+    /// context を跨ぐ選択履歴であり、窓の割当・再利用の正本ではない。
+    /// 各 context の所有窓は registry の予約 / binding だけから導出する。
     #[cfg(windows)]
     pub(crate) last_active_detached_window_id: Option<u64>,
     /// keep-alive 設計 (docs/detached-viewer-keepalive-design.md §3.1) の active identity。
@@ -11762,8 +11783,8 @@ pub struct App {
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
     pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
-    /// 通常動画の拡大・パン。360 と違いセッション意図は持たず、項目や表示コンテキストが
-    /// 変わるたびに `None` へ戻す。
+    /// mount 中の viewer context が所有する通常動画の拡大・パン state の投影。
+    /// 360 と違いセッション意図は持たず、項目が変わるたびに `None` へ戻す。
     pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
@@ -12033,7 +12054,7 @@ pub struct App {
     /// 回転情報 DB (全体で 1 ファイル)
     pub(crate) rotation_db: Option<crate::rotation_db::RotationDb>,
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
-    pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    pub(crate) rotation_cache: crate::rotation_cache::RotationCache,
     /// 一度判明したページ寸法をテクスチャの退去後も保持する per-context cache。
     pub(crate) page_dims_cache: crate::page_dims::PageDimsCache,
     /// 見開き表示単位列と、nav・横長性・回転の context-local invalidation 状態。
@@ -14868,8 +14889,6 @@ impl App {
             #[cfg(windows)]
             detached_viewer_folder_nav_reuse_window_once: false,
             #[cfg(windows)]
-            detached_viewer_window_id: None,
-            #[cfg(windows)]
             detached_image_windows: Vec::new(),
             #[cfg(windows)]
             deferred_detached_image_window_views: HashMap::new(),
@@ -15238,7 +15257,7 @@ impl App {
             search_target: crate::fts_index::SearchTarget::All,
             search_or_mode: false,
             rotation_db,
-            rotation_cache: std::collections::HashMap::new(),
+            rotation_cache: crate::rotation_cache::RotationCache::default(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
             spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             audio_normalize_db,
@@ -17119,7 +17138,7 @@ impl App {
     ///
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
-    fn common_modal_dialog_open(&self) -> bool {
+    pub(crate) fn common_modal_dialog_open(&self) -> bool {
         self.modal_dialog_block_reason().is_some()
     }
 
@@ -19344,6 +19363,17 @@ impl App {
     /// - **Ctrl+G 検索結果ビュー**: 検索結果の並べ替えに反映 (実フォルダを再ロードしない)。
     /// - **通常フォルダ**: スクロール履歴を捨てて先頭から再ロード。
     pub(crate) fn apply_sort_change_reload(&mut self) {
+        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::Immediate);
+    }
+
+    fn apply_sort_change_reload_without_ui_io(&mut self) {
+        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::WorkerScan);
+    }
+
+    fn apply_sort_change_reload_with_physical_mode(
+        &mut self,
+        physical_mode: PhysicalFolderSortReload,
+    ) {
         if self.zip_nav.is_some() {
             self.zip_nav_show_current_level();
             return;
@@ -19411,7 +19441,30 @@ impl App {
         }
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
-            self.load_folder(path);
+            match physical_mode {
+                PhysicalFolderSortReload::Immediate => self.load_folder(path),
+                PhysicalFolderSortReload::WorkerScan => {
+                    // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
+                    // sort / category order のどちらも materialize 結果を変えない。
+                    // ファイル path を directory scan worker へ渡してエラーにしない。
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                        && self
+                            .items
+                            .iter()
+                            .all(|item| matches!(item, GridItem::PdfPage { .. }))
+                    {
+                        return;
+                    }
+                    let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+                    self.start_folder_open_scan(
+                        path,
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order },
+                    );
+                }
+            }
         }
     }
 
@@ -29626,7 +29679,7 @@ impl App {
             self.mask_pages = page.mask_pages;
             self.conceal_pages = page.conceal_pages;
             self.comic_pages = page.comic_pages;
-            self.rotation_cache = page.rotation_cache;
+            self.rotation_cache = page.rotation_cache.into();
             self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
             self.thumb_adjust_tex.clear();
@@ -34148,6 +34201,7 @@ impl App {
     /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
     /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
     fn clear_still_seek_thumbnail_requests(&mut self) {
+        self.rotation_cache.cancel_still_seek_rotations();
         self.still_seek_thumbnail_pages.clear();
         if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
             shared.clear();
@@ -34159,6 +34213,9 @@ impl App {
         ctx: &egui::Context,
         pages: &[usize],
     ) {
+        if pages.is_empty() {
+            self.rotation_cache.cancel_still_seek_rotations();
+        }
         let next = pages
             .iter()
             .copied()
@@ -37000,6 +37057,9 @@ impl App {
                         FolderOpenScanPurpose::GridFolderCandidate => "grid-folder-candidate",
                         FolderOpenScanPurpose::DetachedFolder => "detached-folder",
                         FolderOpenScanPurpose::DetachedImage { .. } => "detached-image",
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. } => {
+                            "current-view-order-refresh"
+                        }
                     }
                 ));
                 self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
@@ -37058,7 +37118,30 @@ impl App {
                 ));
                 None
             }
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                self.apply_current_view_order_refresh(ready.path, scan, order);
+                None
+            }
         }
+    }
+
+    fn apply_current_view_order_refresh(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        order: CurrentViewOrderSnapshot,
+    ) -> bool {
+        if !self
+            .current_folder
+            .as_deref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
+            || !order.matches(&self.settings)
+        {
+            return false;
+        }
+        self.preserve_cursor_hint_for_reload();
+        self.load_folder_with_scan(path, Some(scan));
+        true
     }
 
     /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
@@ -37140,6 +37223,13 @@ impl App {
                     ready.path.display()
                 ));
                 DetachedPhysicalFolderOpenPoll::Failed
+            }
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                if self.apply_current_view_order_refresh(ready.path, scan, order) {
+                    DetachedPhysicalFolderOpenPoll::Applied
+                } else {
+                    DetachedPhysicalFolderOpenPoll::Failed
+                }
             }
         }
     }
@@ -39256,13 +39346,21 @@ impl App {
     #[track_caller]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
         let previous = self.active_detached_session;
+        // Retire output while the session and binding still identify its owner. The
+        // mounted context may be a sibling of the active at-rest context being closed.
+        let action = if let Some(session) = previous {
+            self.log_detached_image_window_debug(format!(
+                "session_finish window_id={} reason={reason}",
+                session.window_id
+            ));
+            self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+            "clear"
+        } else {
+            "clear_none"
+        };
         let taken = self.active_detached_session.take();
         self.record_active_detached_session_write(
-            if taken.is_some() {
-                "clear"
-            } else {
-                "clear_none"
-            },
+            action,
             reason,
             "App::finish_active_detached_session_close",
             previous,
@@ -39278,11 +39376,6 @@ impl App {
         {
             assert_eq!(self.unbind_window(session.window_id), Some(owner));
         }
-        self.log_detached_image_window_debug(format!(
-            "session_finish window_id={} reason={reason}",
-            session.window_id
-        ));
-        self.retire_terminal_detached_viewport_identity(session.window_id, reason);
     }
 
     /// Close exactly the detached session named by an effect-owned lease.
@@ -39424,67 +39517,19 @@ impl App {
 
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
-        if let Some(id) = self.detached_viewer_window_id {
-            // この id が passive / ParkedLive 窓として detached_image_windows に居るなら
-            // stale なコピー (直前の park で窓は手放したのに main 文脈側の参照が残った)。
-            // 再利用すると parked 窓と新セッションが同一 window_id・同一 HWND を取り合い、
-            // parked live メディア窓に画像が表示されて点滅・操作不能になる
-            // (2026-07-09 実機、review-v2.3.0 checklist 中に発生。BA-7)。下の
-            // last_active_detached_window_id 再利用と同じ衝突ガードを直参照側にも適用する。
-            // terminal teardown 済みで runtime lease が無い/Closing の id も stale なので、
-            // 必ず捨てて fresh identity の allocate へ落とす。
-            if !self.detached_image_windows.iter().any(|w| w.id == id)
-                && self.detached_window_manager.reusable_session_lease(id)
-            {
-                self.last_active_detached_window_id = Some(id);
-                return id;
-            }
-            self.log_detached_image_window_debug(format!(
-                "stale_window_id_dropped reason=ensure_detached_viewer_window_id id={id} \
-                 passive_collision={} reusable_lease={}",
-                self.detached_image_windows.iter().any(|w| w.id == id),
-                self.detached_window_manager.reusable_session_lease(id)
-            ));
-            self.detached_viewer_window_id = None;
-        }
-        // フォルダナビ (Ctrl+↑↓) の reopen は同じ detached ウィンドウの中で内容を差し替える
-        // 継続操作。grid からの新規オープンでない (= !fs_open_intent_from_grid) 場合は、直前に
-        // この detached セッションで使っていた window_id を再利用する。`fullscreen_viewport_id`
-        // は detached では window_id 由来なので、毎回新しい id を allocate すると ViewportId が
-        // 変わり、egui が OS ウィンドウを破棄→再生成してしまう (= 次フォルダへ移るたびに
-        // ウィンドウ再表示 + 既定サイズ 822x656 の小窓がカスケード)。PDF/ZIP の非同期 enumerate
-        // を跨いで window_id が一旦クリアされても、ここで同じ id を復元して安定させる。
-        // 既に passive window として残っている id、または terminal close 済みで runtime lease
-        // が失われた id は再利用しない。後者は H の遅延 close event を fresh J から分離する。
-        if !self.fs_open_intent_from_grid
-            && let Some(prev) = self.last_active_detached_window_id
-            && !self.detached_image_windows.iter().any(|w| w.id == prev)
-            && self.detached_window_manager.reusable_session_lease(prev)
-        {
-            self.log_detached_image_window_debug(format!(
-                "reuse_active_window_id reason=ensure_detached_viewer_window_id id={prev} \
-                 fs_idx={:?} grid_intent={} folder_nav_reuse_once={}",
-                self.fullscreen_idx,
-                self.fs_open_intent_from_grid,
-                self.detached_viewer_folder_nav_reuse_window_once
-            ));
-            self.detached_viewer_window_id = Some(prev);
-            self.transition_detached_window_state(
-                prev,
-                DetachedWindowState::Opening,
-                "ensure_detached_viewer_window_id_reuse",
-            );
-            return prev;
+        // The registry owns both the private build reservation and the published binding.
+        // Content reload/close and context swaps cannot erase or replace this identity.
+        if let Some(id) = self.detached_viewer_window_id() {
+            return id;
         }
         let id = self.allocate_detached_viewer_window_id();
-        self.log_detached_image_window_debug(format!(
-            "allocate_window_id reason=ensure_detached_viewer_window_id id={id} \
-             fs_idx={:?} grid_intent={} folder_nav_reuse_once={}",
-            self.fullscreen_idx,
-            self.fs_open_intent_from_grid,
-            self.detached_viewer_folder_nav_reuse_window_once
-        ));
-        self.detached_viewer_window_id = Some(id);
+        if self.viewer_context_residence(self.projected_viewer_context_id())
+            == ContextResidence::Building
+        {
+            self.reserve_window_binding_for_build(id);
+        } else {
+            self.ensure_mounted_detached_session_binding(id);
+        }
         self.last_active_detached_window_id = Some(id);
         self.transition_detached_window_state(
             id,
@@ -39789,7 +39834,7 @@ impl App {
         let active_window_id = self
             .active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id)
+            .or(self.detached_viewer_window_id())
             .or(self.last_active_detached_window_id);
         if self.viewer_session_is_detached_or_switching()
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
@@ -39868,7 +39913,6 @@ impl App {
         self.video_presentation_transition
             .sync_stable(self.viewer_presentation);
         self.pending_detached_video_host_resync = false;
-        self.detached_viewer_window_id = None;
         self.last_active_detached_window_id = None;
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
@@ -39977,7 +40021,7 @@ impl App {
                 self.active_detached_session
                     .map(|session| session.window_id)
             })
-            .or(self.detached_viewer_window_id)
+            .or(self.detached_viewer_window_id())
             .or_else(|| {
                 (self.viewer_session_is_detached_or_switching()
                     || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
@@ -40010,7 +40054,7 @@ impl App {
         let window_id = self
             .active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id)?;
+            .or(self.detached_viewer_window_id())?;
         Some(self.detached_host_lease_for_window_id(window_id))
     }
 
@@ -40019,7 +40063,7 @@ impl App {
         &self,
         lease: DetachedSessionLease,
     ) -> Option<DetachedHostClaim> {
-        if self.detached_viewer_window_id != Some(lease.window_id) {
+        if self.detached_viewer_window_id() != Some(lease.window_id) {
             return None;
         }
         let claim = self
@@ -40031,7 +40075,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_host_claim_is_current(&self, claim: DetachedHostClaim) -> bool {
-        self.detached_viewer_window_id == Some(claim.lease.window_id)
+        self.detached_viewer_window_id() == Some(claim.lease.window_id)
             && self.detached_window_manager.host_claim_is_alive(claim)
             && self.detached_host_claim_has_client_rect(claim)
     }
@@ -40116,7 +40160,7 @@ impl App {
         } else if let Some(window_id) = self
             .active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id)
+            .or(self.detached_viewer_window_id())
             .filter(|window_id| Self::detached_image_window_viewport_id(*window_id) == viewport_id)
         {
             (
@@ -41433,7 +41477,6 @@ impl App {
         // 引き継ぐ。regular open は ViewerContextId owner のまま mount を追跡する。
         // (review-v2.3.0 追補2 BA-7: activation pending ownership)
         self.rebind_native_video_pending_owners(Some(id), None, "parked_live_activate_commit");
-        self.detached_viewer_window_id = Some(id);
         self.update_detached_window_runtime_flags(id, false, "parked_live_activate_commit");
         self.transition_detached_window_state(
             id,
@@ -41585,7 +41628,7 @@ impl App {
         let closing_window_id = self
             .active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id);
+            .or(self.detached_viewer_window_id());
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
         // terminal close が明示的に宣言され、session が finish 済みまたは Closing のとき
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
@@ -41689,7 +41732,6 @@ impl App {
                 self.fullscreen_idx = None;
                 self.viewer_presentation = self.non_detached_viewer_presentation();
                 self.detached_viewer_independent_active = false;
-                self.detached_viewer_window_id = None;
                 self.last_viewer_sync_stamp = None;
                 self.log_detached_image_window_debug(format!(
                     "park_current_active_detached result=parked_legacy_detached fs_idx={:?} \
@@ -41711,7 +41753,7 @@ impl App {
             let session_window_id = self
                 .active_detached_session
                 .map(|session| session.window_id);
-            let closing_window_id = session_window_id.or(self.detached_viewer_window_id);
+            let closing_window_id = session_window_id.or(self.detached_viewer_window_id());
             self.begin_active_detached_session_close("park_close_legacy_detached");
             self.finish_active_detached_session_close("park_close_legacy_detached");
             if session_window_id.is_none()
@@ -41836,7 +41878,6 @@ impl App {
                     resume_window_id.is_some(),
                     app.detached_viewer_folder_nav_reuse_window_once
                 ));
-                app.detached_viewer_window_id = Some(window_id);
                 app.last_active_detached_window_id = Some(window_id);
                 if resume_window_id.is_some() {
                     app.adopt_active_detached_viewport_runtime_from_passive(
@@ -42345,7 +42386,6 @@ impl App {
             };
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
-            self.detached_viewer_window_id = Some(snapshot.id);
             self.last_active_detached_window_id = Some(snapshot.id);
             self.begin_active_detached_session(snapshot.id, source);
             self.log_detached_image_window_debug(format!(
@@ -42410,7 +42450,7 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            self.detached_viewer_window_id = Some(activate_window_id);
+            self.ensure_mounted_detached_session_binding(activate_window_id);
             self.detached_viewer_independent_active = true;
             self.detached_viewer_open_next_still_detached_once = true;
             self.fs_open_intent_from_grid = false;
@@ -42608,7 +42648,7 @@ impl App {
                          current_pending={} pending={} cache={} pdf_enum={} zip_enum={} \
                          nav_wait={} passive_windows={}",
                         app.frame_counter,
-                        app.detached_viewer_window_id,
+                        app.detached_viewer_window_id(),
                         app.fullscreen_idx,
                         app.detached_viewer_independent_active,
                         app.active_detached_session,
@@ -42909,7 +42949,7 @@ impl App {
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=no_fullscreen_idx \
                  window_id={:?} pending={} cache={}",
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.fs_pending.len(),
                 self.fs_cache.len()
             ));
@@ -42922,7 +42962,7 @@ impl App {
                  presentation={:?} pending={} cache={}",
                 self.viewer_session_is_detached(),
                 self.viewer_item_supports_detached_still(idx),
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.viewer_presentation,
                 self.fs_pending.len(),
                 self.fs_cache.len()
@@ -42934,7 +42974,7 @@ impl App {
                 "build_active_snapshot_failed reason=no_display_texture idx={idx} \
                  window_id={:?} current_pending={} pending={} \
                  cache={} thumb_loaded={} descriptor={} stamp={}",
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.fs_pending.contains_key(&idx),
                 self.fs_pending.len(),
                 self.fs_cache.len(),
@@ -43172,7 +43212,6 @@ impl App {
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
-        self.detached_viewer_window_id = None;
         self.last_viewer_sync_stamp = None;
         self.log_detached_image_window_debug(format!(
             "parked_live_media_committed id={snapshot_id} reason={reason} passive_windows={}",
@@ -43245,7 +43284,7 @@ impl App {
                 detached
                     .active_detached_session
                     .map(|session| session.window_id)
-                    .or(detached.detached_viewer_window_id)
+                    .or(detached.detached_viewer_window_id())
                     .expect("materialized still open must allocate a detached window")
             })
             .expect("materialized physical context must remain present while opening");
@@ -43301,7 +43340,6 @@ impl App {
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
-        self.detached_viewer_window_id = None;
         self.last_viewer_sync_stamp = None;
         self.log_detached_image_window_debug(format!(
             "parked_live_media_committed id={snapshot_id} reason={reason} passive_windows={}",
@@ -43412,13 +43450,13 @@ impl App {
                 self.viewer_session_is_detached(),
                 self.detached_viewer_independent_active,
                 self.active_detached_context_debug_state(),
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.detached_image_windows.len(),
                 self.fs_nav_is_locked()
             ));
             return false;
         }
-        let parked_window_id = self.detached_viewer_window_id;
+        let parked_window_id = self.detached_viewer_window_id();
         let parked_as_fullfeature_linked_still =
             preserve_fullfeature_linked_still && self.fullfeature_linked_still_media_window_mode();
         let parked = self.park_active_detached_image_window();
@@ -43427,7 +43465,7 @@ impl App {
              fs_idx={:?} window_id={:?} passive_windows={} active_context={} \
              session_before_handoff={:?}",
             self.fullscreen_idx,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_image_windows.len(),
             self.active_detached_context_debug_state(),
             self.active_detached_session
@@ -43477,7 +43515,7 @@ impl App {
         };
         self.active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id)
+            .or(self.detached_viewer_window_id())
             .is_some_and(|window_id| {
             self.locate_window_context(window_id)
                 .is_some_and(|(_, residence)| residence == ContextResidence::Mounted)
@@ -43527,7 +43565,6 @@ impl App {
         self.detached_viewer_open_next_still_detached_once = false;
         self.detached_viewer_focus_requested = false;
         self.last_viewer_sync_stamp = None;
-        self.detached_viewer_window_id = None;
         self.log_detached_image_window_debug(format!(
             "promote_detached_video_for_main_context_change window_id={window_id} idx={idx}"
         ));
@@ -43553,7 +43590,7 @@ impl App {
         let parked_window_id = self
             .active_detached_session
             .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id);
+            .or(self.detached_viewer_window_id());
         let parked = if should_park_active {
             self.park_active_detached_image_window()
         } else {
@@ -43600,7 +43637,6 @@ impl App {
                  base_placement={base_placement:?}",
                 self.fs_open_intent_from_grid, self.detached_viewer_folder_nav_reuse_window_once
             ));
-            self.detached_viewer_window_id = Some(window_id);
             self.transition_detached_window_state(
                 window_id,
                 DetachedWindowState::Opening,
@@ -44104,7 +44140,7 @@ impl App {
             self.viewer_presentation,
             self.fs_viewport_presentation,
             self.fs_viewport_generation,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             window_id,
             captured_hwnd,
             self.detached_viewer_host_debug_state(),
@@ -44891,9 +44927,6 @@ impl App {
         let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
-        let session_window_id = self
-            .active_detached_session
-            .map(|session| session.window_id);
         let Some((window_id, presenter_target, z_order_permitted)) = self
             .with_viewer_context_ref(active_id, |context| {
                 if !viewer_context_bundle_displays_media_path(context, target_path) {
@@ -44919,9 +44952,7 @@ impl App {
                     player.request_presenter_raise();
                 }
                 Some((
-                    context
-                        .viewer_session_detached_window_id()
-                        .or(session_window_id),
+                    self.viewer_context_window(active_id),
                     presenter_target,
                     z_order_permitted,
                 ))
@@ -45083,7 +45114,7 @@ impl App {
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
@@ -45236,7 +45267,7 @@ impl App {
             || !self.viewer_item_supports_detached_still(idx)
             || !self.fullfeature_linked_still_media_window_mode()
             || self.active_detached_session.is_some()
-            || self.detached_viewer_window_id.is_some()
+            || self.detached_viewer_window_id().is_some()
         {
             return None;
         }
@@ -45265,7 +45296,7 @@ impl App {
         let window_id = *window_id;
         let snapshot = self.detached_image_windows.remove(pos);
         self.deferred_detached_image_window_views.remove(&window_id);
-        self.detached_viewer_window_id = Some(window_id);
+        self.ensure_mounted_detached_session_binding(window_id);
         self.last_active_detached_window_id = Some(window_id);
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
@@ -45315,7 +45346,7 @@ impl App {
             self.fs_open_intent_from_grid,
             self.active_detached_context_debug_state(),
             self.active_detached_session,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
@@ -45361,11 +45392,10 @@ impl App {
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
             }
-            self.detached_viewer_window_id = None;
         }
         self.detached_viewer_independent_active = independent_detached_still;
         if matches!(presentation, ViewerPresentation::DetachedWindow)
-            && let Some(window_id) = self.detached_viewer_window_id
+            && let Some(window_id) = self.detached_viewer_window_id()
         {
             self.update_detached_window_runtime_flags(
                 window_id,
@@ -45408,7 +45438,7 @@ impl App {
             self.viewer_presentation,
             self.fullscreen_idx,
             self.active_detached_session,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_viewer_independent_active,
             self.detached_viewer_focus_requested,
             self.last_viewer_sync_stamp.is_some(),
@@ -45454,20 +45484,21 @@ impl App {
         let presentation = self.effective_viewer_presentation_for_open(idx);
         let reuse = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx)
-            && self.detached_viewer_window_id.is_some();
+            && self.detached_viewer_window_id().is_some();
         self.detached_viewer_folder_nav_reuse_window_once = false;
         if reuse {
             self.fs_open_intent_from_grid = false;
             self.log_detached_image_window_debug(format!(
                 "folder_nav_reuse_window_open idx={idx} window_id={:?} \
                  generation={} presentation={presentation:?}",
-                self.detached_viewer_window_id, self.fs_viewport_generation
+                self.detached_viewer_window_id(),
+                self.fs_viewport_generation
             ));
         } else {
             self.log_detached_image_window_debug(format!(
                 "folder_nav_reuse_window_skip idx={idx} window_id={:?} \
                  presentation={presentation:?} supports_still={} grid_intent={}",
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.viewer_item_supports_detached_still(idx),
                 self.fs_open_intent_from_grid
             ));
@@ -48736,6 +48767,11 @@ impl App {
             return;
         }
         self.settings.grid_view_mode = mode;
+        self.apply_grid_view_mode_runtime(mode);
+        self.settings.save();
+    }
+
+    fn apply_grid_view_mode_runtime(&mut self, mode: crate::settings::GridViewMode) {
         self.details_thumb_suppression_applied = false;
         match mode {
             crate::settings::GridViewMode::Details => {
@@ -48754,7 +48790,6 @@ impl App {
             }
         }
         self.scroll_to_selected = true;
-        self.settings.save();
     }
 
     pub(crate) fn toggle_grid_details_view(&mut self) {
@@ -49517,6 +49552,38 @@ impl App {
         }
     }
 
+    pub(crate) fn poll_still_seek_rotations(&mut self) {
+        let updated = self
+            .rotation_cache
+            .poll_still_seek_rotations(self.items_generation);
+        for idx in updated {
+            self.reconcile_spread_landscape_for_idx(idx);
+        }
+    }
+
+    /// Snapshot only keys; SQLite open/SELECT belongs to the cache-owned worker.
+    /// Even a whole-book spread dependency submits at most 256 keys per batch.
+    pub(crate) fn start_still_seek_rotations(&mut self, ctx: &egui::Context, indices: &[usize]) {
+        let requests = indices
+            .iter()
+            .copied()
+            .filter(|idx| !self.rotation_cache.contains_key(idx))
+            .filter_map(|idx| self.rotation_key_for_idx(idx).map(|key| (idx, key)))
+            .take(256)
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            self.rotation_cache.cancel_still_seek_rotations();
+            return;
+        }
+        let path = self
+            .rotation_db
+            .as_ref()
+            .and_then(crate::rotation_db::RotationDb::file_path)
+            .unwrap_or_else(crate::rotation_db::RotationDb::db_path);
+        self.rotation_cache
+            .start_still_seek_rotations(self.items_generation, requests, path, ctx);
+    }
+
     /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
     pub(crate) fn get_rotation(&mut self, idx: usize) -> crate::rotation_db::Rotation {
         if let Some(&rot) = self.rotation_cache.get(&idx) {
@@ -49570,6 +49637,9 @@ impl App {
             }
         }
 
+        if missing.is_empty() {
+            return rotations;
+        }
         let loaded = self
             .rotation_db
             .as_ref()
@@ -53680,29 +53750,11 @@ impl App {
 
     #[cfg(windows)]
     fn prepare_viewer_presentation_close(&mut self) {
-        // フォルダナビ (Ctrl+↑↓) の reopen 中は detached セッションの identity を保つ。
-        // load_folder → start_loading_items が new items 導入前に close_fullscreen を呼ぶため、
-        // ここで detached_viewer_window_id をクリアすると、reopen 側の
-        // ensure_detached_viewer_window_id が新しい window_id を allocate し、
-        // fullscreen_viewport_id (= detached では window_id 由来) が変わって egui が
-        // OS ウィンドウを破棄→再生成する。これが「次フォルダへ移るたびにウィンドウが
-        // 再表示される / 既定サイズ (822x656) の小窓が一瞬カスケード表示される」症状の
-        // 原因 (実機動画 2026-06-28 で確認)。ロック中は window_id / presentation /
-        // live placement を維持して、同じウィンドウの中で内容だけ差し替える。
-        // 判定は fs_nav ロックだけに頼らない。PDF/ZIP の非同期 enumerate 待ちでは
-        // load_pdf_as_folder / start_loading_items の close 時点で fs_nav ロックが
-        // 立っていないことがあり、その場合 presentation が non-detached に落ちて
-        // keep_fullscreen_viewport_alive が detached viewport を描画しなくなり、
-        // egui が detached の OS ウィンドウを破棄→reopen で再生成 (= 小窓) してしまう。
-        // wrapper (close_fullscreen_for_folder_nav_reopen) が立てる reuse 意図
-        // (detached_viewer_folder_nav_reuse_window_once) も条件に含めて、folder-nav
-        // reopen の間ずっと detached identity を維持する。
-        // 判定は session 状態 (`detached_active_window_alive_wanted`) を使う。close_fullscreen は
-        // 先に `fullscreen_idx=None` にしてから本関数を呼ぶことがあり、`viewer_session_is_detached()`
-        // (= fullscreen_idx.is_some() 必須) だと folder-nav 中でも false になって borderless 等を
-        // 誤クリアする (window_id は reuse フォールバックで救われていたが borderless は救われず、
-        // F11 仮想フルスクリーンが folder-nav で最大化に化けていた)。session が alive (=未 close)
-        // の間は detached identity を維持する。
+        // A content close does not release the context's window binding. The registry
+        // retains identity through initial book construction, reload and folder navigation.
+        // This method only resets presentation/content state; terminal close and context
+        // retire own the binding lifetime. An alive session also retains its presentation
+        // intent (including borderless state) through intermediate folder-nav closes.
         let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
         if !preserve_detached_for_folder_nav {
             self.viewer_presentation = self.non_detached_viewer_presentation();
@@ -53712,7 +53764,6 @@ impl App {
             self.detached_viewer_independent_active = false;
             self.detached_viewer_open_next_still_detached_once = false;
             self.detached_viewer_folder_nav_reuse_window_once = false;
-            self.detached_viewer_window_id = None;
             self.fs_viewport_virtual_desktop_synced_hwnd = 0;
             self.clear_detached_viewer_borderless_fullscreen_state(
                 "prepare_viewer_presentation_close_terminal",
@@ -53781,7 +53832,7 @@ impl App {
             if preserve_detached_viewport {
                 let viewer_presentation = self.viewer_presentation;
                 let fs_viewport_presentation = self.fs_viewport_presentation;
-                let detached_viewer_window_id = self.detached_viewer_window_id;
+                let detached_viewer_window_id = self.detached_viewer_window_id();
                 let detached_viewer_borderless_fullscreen =
                     self.detached_viewer_borderless_fullscreen;
                 let detached_viewer_restore_placement = self.detached_viewer_restore_placement;
@@ -53798,7 +53849,6 @@ impl App {
                 self.fs_viewport_shown = true;
                 self.viewer_presentation = viewer_presentation;
                 self.fs_viewport_presentation = fs_viewport_presentation;
-                self.detached_viewer_window_id = detached_viewer_window_id;
                 self.write_detached_viewer_borderless_state(
                     detached_viewer_borderless_fullscreen,
                     detached_viewer_restore_placement,
@@ -53818,7 +53868,7 @@ impl App {
                      generation={} window_id={:?} reuse_once={} host={}",
                     self.selected,
                     self.fs_viewport_generation,
-                    self.detached_viewer_window_id,
+                    self.detached_viewer_window_id(),
                     self.detached_viewer_folder_nav_reuse_window_once,
                     self.detached_viewer_host_debug_state()
                 ));
@@ -62910,7 +62960,7 @@ impl App {
             self.fullscreen_idx,
             self.viewer_presentation,
             self.active_detached_session,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
@@ -62927,7 +62977,7 @@ impl App {
             self.viewer_presentation,
             self.active_detached_context_debug_state(),
             self.active_detached_session,
-            self.detached_viewer_window_id,
+            self.detached_viewer_window_id(),
             self.detached_viewer_independent_active,
             self.detached_image_windows.len(),
             self.detached_viewer_open_next_still_detached_once,
@@ -63025,7 +63075,7 @@ impl App {
                 self.viewer_presentation,
                 self.active_detached_context_debug_state(),
                 self.active_detached_session,
-                self.detached_viewer_window_id,
+                self.detached_viewer_window_id(),
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
@@ -64146,29 +64196,78 @@ impl App {
         self.transition_favorite_view_for_path_at(path, std::time::Instant::now());
     }
 
+    /// overlay の値変更を、現在すでに materialize 済みの一覧へ反映する単一の所有者。
+    ///
+    /// 場所の通常ロード中は、そのロード自身が新しい設定で一覧を構築するため呼ばない。
+    /// リセット / OFF / 現在地に対する favorite owner の変更のように、後続ロードを伴わない
+    /// overlay 変更だけがここを通る。
+    fn reflect_favorite_view_change(
+        &mut self,
+        previous: &crate::settings::FavoriteViewState,
+        previous_effective_aspect: crate::settings::ThumbAspect,
+    ) {
+        let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
+
+        if previous.grid_view_mode != current.grid_view_mode {
+            self.apply_grid_view_mode_runtime(current.grid_view_mode);
+        }
+
+        // 列数はセルの大きさそのもので、グリッドは毎フレーム `settings.grid_cols` から
+        // 組み直す。通常の列数変更 (`change_grid_cols_by` / メニュー) も設定を書くだけ
+        // なので、ここでも再構築や scroll 補正は足さない。
+
+        if previous.thumb_aspect != current.thumb_aspect
+            || previous.thumb_aspect_auto != current.thumb_aspect_auto
+        {
+            if current.thumb_aspect_auto {
+                let was_off = !previous.thumb_aspect_auto;
+                self.auto_aspect.reset_decision_only();
+                if was_off {
+                    self.rebuild_auto_aspect_samples_from_loaded();
+                }
+                self.maybe_apply_auto_aspect(true);
+            }
+            let current_effective_aspect = self.effective_thumb_aspect();
+            if previous_effective_aspect != current_effective_aspect {
+                self.fixup_scroll_for_aspect_change(current_effective_aspect);
+            }
+        }
+
+        if previous.sort_order != current.sort_order
+            || previous.grid_display_order != current.grid_display_order
+        {
+            self.apply_sort_change_reload_without_ui_io();
+        }
+    }
+
     fn reapply_favorite_view_without_seed(&mut self) {
+        let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let previous_effective_aspect = self.effective_thumb_aspect();
         self.settings.clear_favorite_view_overlay();
-        if !self.settings.remember_favorite_view_state {
-            return;
+        if self.settings.remember_favorite_view_state {
+            let path = self.effective_folder();
+            let active_id = path
+                .as_deref()
+                .and_then(|path| self.stored_favorite_view_id_for_path(path));
+            if let Some((id, state)) = active_id.and_then(|id| {
+                self.favorite_view_states
+                    .get(&id)
+                    .cloned()
+                    .map(|state| (id, state))
+            }) {
+                self.settings.apply_favorite_view_overlay(id, &state);
+            }
         }
-        let path = self.effective_folder();
-        let active_id = path
-            .as_deref()
-            .and_then(|path| self.stored_favorite_view_id_for_path(path));
-        if let Some((id, state)) = active_id.and_then(|id| {
-            self.favorite_view_states
-                .get(&id)
-                .cloned()
-                .map(|state| (id, state))
-        }) {
-            self.settings.apply_favorite_view_overlay(id, &state);
-        }
+        self.reflect_favorite_view_change(&previous, previous_effective_aspect);
     }
 
     fn reconcile_favorite_view_for_current_context_at(&mut self, now: std::time::Instant) {
         if !self.settings.remember_favorite_view_state {
+            let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+            let previous_effective_aspect = self.effective_thumb_aspect();
             self.settings.clear_favorite_view_overlay();
             self.favorite_view_context.location_favorite_id = None;
+            self.reflect_favorite_view_change(&previous, previous_effective_aspect);
             return;
         }
         let path = self.effective_folder();
@@ -64181,7 +64280,10 @@ impl App {
         if owner != self.favorite_view_context.location_favorite_id
             || active_id != self.settings.active_favorite_view_id()
         {
+            let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+            let previous_effective_aspect = self.effective_thumb_aspect();
             self.transition_favorite_view_for_path_at(path.as_deref(), now);
+            self.reflect_favorite_view_change(&previous, previous_effective_aspect);
         } else {
             self.capture_active_favorite_view_change_at(now);
         }
@@ -71457,15 +71559,24 @@ impl App {
                 }
                 #[cfg(not(windows))]
                 {
-                    match ready.scan {
-                        Ok(scan) => {
-                            navigate_pre_scan = Some(scan);
-                            Some(ready.path)
+                    let FolderPaneOpenReady {
+                        path,
+                        scan,
+                        purpose,
+                    } = ready;
+                    match (purpose, scan) {
+                        (FolderOpenScanPurpose::CurrentViewOrderRefresh { order }, Ok(scan)) => {
+                            self.apply_current_view_order_refresh(path, scan, order);
+                            None
                         }
-                        Err(error) => {
+                        (_, Ok(scan)) => {
+                            navigate_pre_scan = Some(scan);
+                            Some(path)
+                        }
+                        (_, Err(error)) => {
                             crate::logger::log(format!(
-                                "folder pane scan failed path={} error={error}",
-                                ready.path.display()
+                                "folder open scan failed path={} error={error}",
+                                path.display()
                             ));
                             self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
                             None
@@ -73947,11 +74058,80 @@ pub(crate) use tests::phase_c_support::{
 #[cfg(test)]
 mod favorite_view_state_tests {
     use super::*;
-    use crate::settings::{FavoriteEntry, FavoriteViewState, GridViewMode, SortOrder};
+    use crate::settings::{
+        FavoriteEntry, FavoriteViewState, GridDisplayOrder, GridItemDisplayKind, GridViewMode,
+        SortOrder,
+    };
 
-    fn state(thumb_px: u32, sort_order: SortOrder) -> FavoriteViewState {
+    fn write_sort_fixture(folder: &Path) {
+        std::fs::create_dir_all(folder.join("folder")).unwrap();
+        for (name, modified_secs) in [("a.jpg", 1_600_000_000), ("b.jpg", 1_700_000_000)] {
+            let file = std::fs::File::create(folder.join(name)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs),
+            ))
+            .unwrap();
+        }
+    }
+
+    fn image_names(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn image_first_order() -> GridDisplayOrder {
+        GridDisplayOrder::from_rows([
+            vec![GridItemDisplayKind::Image],
+            vec![
+                GridItemDisplayKind::Folder,
+                GridItemDisplayKind::Archive,
+                GridItemDisplayKind::VideoAudio,
+            ],
+            Vec::new(),
+            Vec::new(),
+        ])
+    }
+
+    fn assert_common_actual_order(app: &App) {
+        assert!(matches!(app.items.first(), Some(GridItem::Folder(_))));
+        assert_eq!(image_names(app), ["a.jpg", "b.jpg"]);
+    }
+
+    fn finish_current_view_order_refresh(app: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..1_000 {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                #[cfg(windows)]
+                {
+                    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+                }
+                #[cfg(not(windows))]
+                {
+                    let scan = ready.scan.unwrap();
+                    match ready.purpose {
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                            assert!(app.apply_current_view_order_refresh(ready.path, scan, order));
+                        }
+                        _ => panic!("unexpected folder scan purpose"),
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("current view order refresh did not finish");
+    }
+
+    fn state(grid_cols: usize, sort_order: SortOrder) -> FavoriteViewState {
         let mut settings = crate::settings::Settings::default();
-        settings.thumb_px = thumb_px;
+        settings.grid_cols = grid_cols;
         settings.sort_order = sort_order;
         FavoriteViewState::from_settings(&settings)
     }
@@ -73960,38 +74140,38 @@ mod favorite_view_state_tests {
     fn resolves_siblings_outside_and_deepest_nested_favorite() {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\library"));
         let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\library\comic"));
         let video = FavoriteEntry::new("video".to_owned(), PathBuf::from(r"C:\video"));
         app.favorite_view_states
-            .insert(outer.id, state(160, SortOrder::DateAsc));
+            .insert(outer.id, state(4, SortOrder::DateAsc));
         app.favorite_view_states
-            .insert(inner.id, state(280, SortOrder::Numeric));
+            .insert(inner.id, state(8, SortOrder::Numeric));
         app.favorite_view_states
-            .insert(video.id, state(80, SortOrder::DateDesc));
+            .insert(video.id, state(2, SortOrder::DateDesc));
         app.settings.favorites.extend([outer, inner, video]);
 
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\photo")));
-        assert_eq!(app.settings.thumb_px, 160);
+        assert_eq!(app.settings.grid_cols, 4);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
-        assert_eq!(app.settings.thumb_px, 80);
+        assert_eq!(app.settings.grid_cols, 2);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\comic\book")));
-        assert_eq!(app.settings.thumb_px, 280);
+        assert_eq!(app.settings.grid_cols, 8);
         assert_eq!(app.settings.sort_order, SortOrder::Numeric);
 
         app.settings.favorites[2].name = "moved video".to_owned();
         app.settings.favorites[2].path = PathBuf::from(r"C:\moved-video");
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
         assert_eq!(
-            app.settings.thumb_px, 100,
+            app.settings.grid_cols, 3,
             "旧パスには UUID の記録を適用しない"
         );
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\moved-video\clips")));
         assert_eq!(
-            app.settings.thumb_px, 80,
+            app.settings.grid_cols, 2,
             "名称・パス変更後も UUID の記録を使う"
         );
     }
@@ -74001,7 +74181,7 @@ mod favorite_view_state_tests {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
         app.settings.grid_view_mode = GridViewMode::Details;
-        app.settings.thumb_px = 190;
+        app.settings.grid_cols = 5;
         app.settings.sort_order = SortOrder::DateAsc;
         let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
         let id = favorite.id;
@@ -74011,26 +74191,26 @@ mod favorite_view_state_tests {
             Some(Path::new(r"C:\fav\child")),
             std::time::Instant::now(),
         );
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 190);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 5);
         assert_eq!(
             app.favorite_view_states[&id].grid_view_mode,
             GridViewMode::Details
         );
 
-        app.settings.thumb_px = 240;
+        app.settings.grid_cols = 6;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 240);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 6);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
-        assert_eq!(app.settings.thumb_px, 190, "共通値へ戻る");
+        assert_eq!(app.settings.grid_cols, 5, "共通値へ戻る");
     }
 
     #[test]
     fn preferences_standard_update_does_not_feed_back_into_the_active_favorite() {
         let mut app = setup_app_for_test();
         let id = uuid::Uuid::new_v4();
-        let common = state(100, SortOrder::FileName);
-        let favorite = state(180, SortOrder::DateDesc);
-        let edited_standard = state(240, SortOrder::Numeric);
+        let common = state(3, SortOrder::FileName);
+        let favorite = state(5, SortOrder::DateDesc);
+        let edited_standard = state(6, SortOrder::Numeric);
 
         app.settings.remember_favorite_view_state = true;
         common.apply_to_settings(&mut app.settings);
@@ -74060,9 +74240,9 @@ mod favorite_view_state_tests {
                 .is_none()
         );
 
-        app.settings.thumb_px = 260;
+        app.settings.grid_cols = 7;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 260);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 7);
         assert!(
             app.favorite_view_writes
                 .next_due_in_at(std::time::Instant::now())
@@ -74076,48 +74256,203 @@ mod favorite_view_state_tests {
         let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
         let id = favorite.id;
         app.settings.favorites.push(favorite);
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         app.favorite_view_states
-            .insert(id, state(250, SortOrder::DateDesc));
+            .insert(id, state(10, SortOrder::DateDesc));
 
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\fav")));
-        assert_eq!(app.settings.thumb_px, 100);
-        app.settings.thumb_px = 120;
+        assert_eq!(app.settings.grid_cols, 3);
+        app.settings.grid_cols = 9;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 250);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 10);
     }
 
     #[test]
     fn reset_falls_back_to_outer_then_common_and_clear_removes_all_rows() {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\fav"));
         let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\fav\inner"));
         app.favorite_view_states
-            .insert(outer.id, state(160, SortOrder::DateAsc));
+            .insert(outer.id, state(4, SortOrder::DateAsc));
         app.favorite_view_states
-            .insert(inner.id, state(260, SortOrder::DateDesc));
+            .insert(inner.id, state(7, SortOrder::DateDesc));
         app.settings
             .favorites
             .extend([outer.clone(), inner.clone()]);
         app.current_folder = Some(PathBuf::from(r"C:\fav\inner"));
         let current = app.current_folder.clone();
         app.transition_favorite_view_for_path(current.as_deref());
-        assert_eq!(app.settings.thumb_px, 260);
+        assert_eq!(app.settings.grid_cols, 7);
 
         app.reset_favorite_view_state(inner.id);
-        assert_eq!(app.settings.thumb_px, 160);
+        assert_eq!(app.settings.grid_cols, 4);
         app.reset_favorite_view_state(outer.id);
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
 
         app.favorite_view_states
-            .insert(outer.id, state(170, SortOrder::Numeric));
+            .insert(outer.id, state(9, SortOrder::Numeric));
         app.favorite_view_states
-            .insert(inner.id, state(270, SortOrder::Numeric));
+            .insert(inner.id, state(10, SortOrder::Numeric));
         assert_eq!(app.clear_all_favorite_view_states(), 2);
         assert!(app.favorite_view_states.is_empty());
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
+    }
+
+    #[test]
+    fn reset_rebuilds_actual_items_with_common_view_order() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-reset");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+        app.settings.grid_display_order = GridDisplayOrder::default();
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        favorite_state.grid_display_order = image_first_order();
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.reset_favorite_view_state(id);
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_eq!(app.settings.grid_display_order, GridDisplayOrder::default());
+        assert_common_actual_order(&app);
+    }
+
+    #[test]
+    fn disabling_memory_rebuilds_actual_items_with_common_view_order() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-off");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+        app.settings.grid_display_order = GridDisplayOrder::default();
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        favorite_state.grid_display_order = image_first_order();
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.settings.remember_favorite_view_state = false;
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_common_actual_order(&app);
+        assert!(app.favorite_view_states.contains_key(&id));
+
+        app.settings.remember_favorite_view_state = true;
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+    }
+
+    #[test]
+    fn moving_between_favorites_and_common_context_keeps_actual_order_in_sync() {
+        let mut app = setup_app_for_test();
+        let favorite_a_path = app.tmp.path().join("favorite-a");
+        let favorite_b_path = app.tmp.path().join("favorite-b");
+        let common_path = app.tmp.path().join("common");
+        for folder in [&favorite_a_path, &favorite_b_path, &common_path] {
+            write_sort_fixture(folder);
+        }
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+
+        let favorite_a = FavoriteEntry::new("a".to_owned(), favorite_a_path.clone());
+        let favorite_b = FavoriteEntry::new("b".to_owned(), favorite_b_path.clone());
+        let mut state_a = FavoriteViewState::from_settings(&app.settings);
+        state_a.sort_order = SortOrder::DateDesc;
+        let mut state_b = FavoriteViewState::from_settings(&app.settings);
+        state_b.sort_order = SortOrder::DateAsc;
+        app.favorite_view_states.insert(favorite_a.id, state_a);
+        app.favorite_view_states.insert(favorite_b.id, state_b);
+        app.settings.favorites.extend([favorite_a, favorite_b]);
+
+        app.load_folder(favorite_a_path);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.load_folder(favorite_b_path);
+        assert_eq!(app.settings.sort_order, SortOrder::DateAsc);
+        assert_eq!(image_names(&app), ["a.jpg", "b.jpg"]);
+
+        app.load_folder(common_path);
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_common_actual_order(&app);
+    }
+
+    #[test]
+    fn reset_projects_layout_fields_and_leaves_the_common_quality_alone() {
+        use crate::settings::{ReadingFlow, SpreadMode, ThumbAspect};
+
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-layout");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_view_mode = GridViewMode::Thumbnail;
+        app.settings.grid_cols = 3;
+        // 画質は記憶項目ではないので、お気に入りの出入りで動いてはならない。
+        app.settings.thumb_px = 512;
+        app.settings.thumb_aspect = ThumbAspect::Square;
+        app.settings.thumb_aspect_auto = true;
+        app.settings.default_spread_mode = SpreadMode::Single;
+        app.settings.default_reading_flow = ReadingFlow::Paged;
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.grid_view_mode = GridViewMode::Details;
+        favorite_state.grid_cols = 7;
+        favorite_state.thumb_aspect = ThumbAspect::Portrait3x4;
+        favorite_state.thumb_aspect_auto = false;
+        favorite_state.default_spread_mode = SpreadMode::Rtl;
+        favorite_state.default_reading_flow = ReadingFlow::Vertical;
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert_eq!(app.settings.grid_view_mode, GridViewMode::Details);
+        assert_eq!(app.settings.grid_cols, 7, "列数はお気に入りの値になる");
+        assert_eq!(app.settings.thumb_px, 512, "画質は共通のまま");
+        assert!(!app.details_order.is_empty());
+        app.last_cell_size = 120.0;
+        app.last_cell_h = 160.0;
+        app.spread_mode = SpreadMode::Rtl;
+        app.reading_flow = ReadingFlow::Vertical;
+        let generation = app.items_generation;
+
+        app.reset_favorite_view_state(id);
+
+        assert_eq!(app.settings.grid_view_mode, GridViewMode::Thumbnail);
+        assert!(app.details_order.is_empty());
+        assert!(app.settings.thumb_aspect_auto);
+        assert_eq!(app.auto_aspect.current, None);
+        assert_eq!(app.last_cell_h, 120.0, "manual aspect must update layout");
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.settings.grid_cols, 3, "列数は共通の値へ戻る");
+        assert_eq!(app.settings.thumb_px, 512, "画質は一度も動かない");
+        assert_eq!(app.spread_mode, SpreadMode::Rtl);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
     }
 }
 

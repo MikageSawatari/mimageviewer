@@ -91,62 +91,78 @@ fn read_jpeg_prefix<R: Read + Seek>(
         return Ok(None);
     }
 
-    let prefix_end = loop {
-        let marker_start = reader.stream_position()?;
-        if marker_start > max_prefix_bytes {
-            return Ok(None);
-        }
-
-        let mut byte = [0_u8; 1];
-        reader.read_exact(&mut byte)?;
-        if reader.stream_position()? > max_prefix_bytes {
-            return Ok(None);
-        }
-        if byte[0] != 0xff {
-            return Ok(None);
-        }
-        // JPEG は marker 間に任意個の 0xff fill byte を許す。
+    // 走査が最後に「segment 境界まで健全だ」と確認できた位置。marker 破損・切り詰め・
+    // 上限到達のいずれで走査を打ち切っても、ここまでは正しい JPEG の前置きなので、
+    // 既に通り過ぎた APP1 (EXIF) を捨てずに rexif へ渡せる。
+    let mut last_good_end = 2_u64;
+    let clean_end = (|| -> std::io::Result<Option<u64>> {
         loop {
+            let marker_start = reader.stream_position()?;
+            if marker_start > max_prefix_bytes {
+                return Ok(None);
+            }
+
+            let mut byte = [0_u8; 1];
             reader.read_exact(&mut byte)?;
             if reader.stream_position()? > max_prefix_bytes {
                 return Ok(None);
             }
             if byte[0] != 0xff {
-                break;
+                return Ok(None);
             }
-        }
-        let marker = byte[0];
-        if marker == 0x00 {
-            return Ok(None);
-        }
-        match marker {
-            // Start of Scan / End of Image。EXIF は必ずこれらより前にある。
-            0xda | 0xd9 => break marker_start,
-            // SOI / restart marker / TEM は length field を持たない。
-            0xd8 | 0xd0..=0xd7 | 0x01 => continue,
-            _ => {}
-        }
+            // JPEG は marker 間に任意個の 0xff fill byte を許す。
+            loop {
+                reader.read_exact(&mut byte)?;
+                if reader.stream_position()? > max_prefix_bytes {
+                    return Ok(None);
+                }
+                if byte[0] != 0xff {
+                    break;
+                }
+            }
+            let marker = byte[0];
+            if marker == 0x00 {
+                return Ok(None);
+            }
+            match marker {
+                // Start of Scan / End of Image。EXIF は必ずこれらより前にある。
+                0xda | 0xd9 => return Ok(Some(marker_start)),
+                // SOI / restart marker / TEM は length field を持たない。
+                0xd8 | 0xd0..=0xd7 | 0x01 => {
+                    last_good_end = reader.stream_position()?;
+                    continue;
+                }
+                _ => {}
+            }
 
-        let mut length_bytes = [0_u8; 2];
-        reader.read_exact(&mut length_bytes)?;
-        if reader.stream_position()? > max_prefix_bytes {
-            return Ok(None);
+            let mut length_bytes = [0_u8; 2];
+            reader.read_exact(&mut length_bytes)?;
+            if reader.stream_position()? > max_prefix_bytes {
+                return Ok(None);
+            }
+            let length = u16::from_be_bytes(length_bytes);
+            if length < 2 {
+                return Ok(None);
+            }
+            let skip = u64::from(length - 2);
+            let Some(next_marker) = reader.stream_position()?.checked_add(skip) else {
+                return Ok(None);
+            };
+            if next_marker > max_prefix_bytes {
+                return Ok(None);
+            }
+            reader.seek(SeekFrom::Current(i64::from(length - 2)))?;
+            last_good_end = reader.stream_position()?;
         }
-        let length = u16::from_be_bytes(length_bytes);
-        if length < 2 {
-            return Ok(None);
-        }
-        let skip = u64::from(length - 2);
-        let Some(next_marker) = reader.stream_position()?.checked_add(skip) else {
-            return Ok(None);
-        };
-        if next_marker > max_prefix_bytes {
-            return Ok(None);
-        }
-        reader.seek(SeekFrom::Current(i64::from(length - 2)))?;
+    })();
+
+    // 途中で打ち切った場合は、健全だと確認できた最後の segment 境界までを渡す。
+    // 読み出し自体が失敗した (切り詰めファイル) 場合も同じ扱いにする。
+    let prefix_end = match clean_end {
+        Ok(Some(end)) => end,
+        Ok(None) | Err(_) => last_good_end,
     };
-
-    if prefix_end > max_prefix_bytes {
+    if prefix_end <= 2 || prefix_end > max_prefix_bytes {
         return Ok(None);
     }
     let prefix_len = usize::try_from(prefix_end).map_err(|_| {
@@ -1382,6 +1398,84 @@ mod tests {
             prefix.bytes_read < bytes.len() as u64,
             "fixture should prove that entropy-coded image data is not read"
         );
+    }
+
+    /// 先頭から最初の APP1 (Exif) segment の直後までのバイト長。
+    fn end_of_exif_app1(bytes: &[u8]) -> usize {
+        let mut pos = 2;
+        loop {
+            assert_eq!(bytes[pos], 0xff, "fixture uses no fill bytes");
+            let marker = bytes[pos + 1];
+            assert!(
+                marker != 0xda && marker != 0xd9,
+                "fixture must carry an APP1 before SOS"
+            );
+            let length = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            let end = pos + 2 + length;
+            if marker == 0xe1 && bytes[pos + 4..].starts_with(b"Exif  ") {
+                return end;
+            }
+            pos = end;
+        }
+    }
+
+    fn exif_from_prefix(bytes: &[u8], cap: u64) -> Option<rexif::ExifData> {
+        let mut reader = CountingReader::new(std::io::Cursor::new(bytes));
+        let prefix = read_jpeg_prefix(&mut reader, cap).unwrap()?;
+        rexif::parse_buffer(&prefix).ok()
+    }
+
+    #[test]
+    fn a_broken_marker_after_the_exif_does_not_discard_the_exif() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ai_metadata/jpeg_a1111_ascii.jpg");
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = rexif::parse_buffer(&bytes).ok();
+        assert!(expected.is_some(), "fixture must carry parsable EXIF");
+
+        let end = end_of_exif_app1(&bytes);
+        let mut broken = bytes[..end].to_vec();
+        // 0xff 0x00 は stuffed byte であって marker ではないので、走査はここで止まる。
+        broken.extend_from_slice(&[0xff, 0x00, 0x11, 0x22]);
+
+        assert_eq!(
+            exif_from_prefix(&broken, MAX_JPEG_EXIF_PREFIX_BYTES),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_file_truncated_after_the_exif_still_yields_the_exif() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ai_metadata/jpeg_a1111_ascii.jpg");
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = rexif::parse_buffer(&bytes).ok();
+
+        let end = end_of_exif_app1(&bytes);
+        let truncated = &bytes[..end];
+
+        assert_eq!(
+            exif_from_prefix(truncated, MAX_JPEG_EXIF_PREFIX_BYTES),
+            expected
+        );
+    }
+
+    #[test]
+    fn hitting_the_cap_after_the_exif_still_yields_the_exif() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ai_metadata/jpeg_a1111_ascii.jpg");
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = rexif::parse_buffer(&bytes).ok();
+
+        let end = end_of_exif_app1(&bytes);
+        // APP1 は読み切れるが、その次の segment は上限に収まらない位置で切る。
+        let cap = end as u64 + 4;
+        assert!(
+            cap < bytes.len() as u64,
+            "fixture must continue past the cap"
+        );
+
+        assert_eq!(exif_from_prefix(&bytes, cap), expected);
     }
 
     #[test]

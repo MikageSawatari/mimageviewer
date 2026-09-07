@@ -185,3 +185,37 @@ passive窓は保存された表示を描画しており、activeパネルとは�
 
 今回のレビューは重要経路の監査であり、全18,000行の網羅検証、全実データの検索精度保証、
 障害注入・多窓・IME・GPU・音声の実機検証を完了したものではない。
+
+## 7. v3.6.0 統合記録 (2026-09-07)
+
+§§1〜6 は `65d13e58f` を基準にした統合前レビューとして保持する。その後、引き継ぎ記録だけを
+`b8d46a71f` に独立して保存し、リリースタグ `v3.6.0` の commit
+`56d97632ce3eb20bb3cec0b61016a2b18b2b1dc4` を第2親として `--no-ff --no-commit` で統合した。
+リリース後の master の commit は取り込んでいない。自動mergeは競合0で、手動の競合解消もない。
+
+独立Astraレビューでは、release差分とstaged差分、およびfeature差分とrelease→統合結果の
+patch-idが一致し、交差したsource 5ファイルでも双方の変更が保持されていることを確認した。
+merge起因のP1/P2指摘はなかった。
+
+初回 `scripts/test-full.ps1` は次の2理由で終了コード101だった。
+
+- `app::metadata_ops::tests::every_pass2_read_is_preceded_by_a_cancel_check` は、作業treeの
+  `src/app/metadata_ops.rs` がCRLFである一方、Rustの複数行literalがLFとして解釈され、
+  `include_str!` のCRLF本文から関数終端を見つけられなかった。productコードは変えず、
+  テストhelperの入口でCRLFをLFへ正規化し、実sourceから作ったLF版とCRLF版の両方に、既存の
+  5 read存在検査とread間cancel検査を同じまま適用した。独立Astraレビューでテスト弱体化が
+  ないことを確認し、狭域テストは1件成功した。
+- `susie_integration` の3件は、このworktreeのignored `testdata` に実Susie pluginがなく
+  `loaded 0 plugins` となった実行前提不足だった。別worktreeの既存testdataから `ifpi.spi`、
+  `ifmag.spi` と対応するPI/MAG/BMP fixture 6ファイルを通常ファイルとしてローカルコピーし、
+  狭域8件がすべて成功した。このignored fixtureはcommitへ含めない。
+
+前提補完とtest-only修正後のfull gateは終了コード0で `PASS`。本体libは7,601件成功・失敗0・
+ignored 38件、UI snapshotは54件、Susie統合は8件、vendor egui-wgpuは9件、vendor eframeは
+15件すべて成功した。`cargo fmt --check`、UI glyph検査 (危険文字0) も成功した。
+`scripts/build-dev.ps1` は通常feature set (portableなし) で成功し、
+`target/dev-runtime/mimageviewer-core.exe` を生成した。エージェントはアプリを起動していない。
+検証ログは `target/merge-v3.6.0-20260907/` に保存した。
+
+この統合では、§3のR1〜R9および継続調査項目を修正していない。各指摘の優先順位、根拠、
+修正境界は統合前レビューの記録どおりであり、今後の実装単位として残る。

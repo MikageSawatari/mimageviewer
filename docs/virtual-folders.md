@@ -112,6 +112,9 @@ materialize してからページを解決するため、現在表示中とは�
 どちらからでも移動できる。`/` を含まない直下 entry の親は空 prefix (= ZIP root) とする。
 非空 prefix は `ZipTree` に存在することを確認してから `ZipNavState` を変更し、stale な保存 entry では
 現在階層と現在一覧を維持する。保存値に `\` が混在していても prefix 解決前に `/` へ正規化する。
+外側 ZIP の解析済み中央目次は `(path, mtime, size)` を identity とするプロセス共有 8 書庫 LRU に置く。
+フォルダ / 外側コンテナ移動で破棄するのは context が使った内側 ZIP bytes だけであり、変更されていない
+外側 ZIP の目次を別ウィンドウの移動から失効させない。
 
 ### 拡張子 → 扱いの対応 (comic-book 別名を含む)
 

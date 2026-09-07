@@ -1,0 +1,32 @@
+# Dispositions for the crashes recorded in panic.log.
+#
+# scripts/check-panic-log.ps1 fails while any recorded panic is missing from
+# this file, so every crash has to be fixed, filed, or explained before a
+# release. Seeded 2026-09-07, when the gate was added and found 15 kinds
+# recorded since April that nobody had looked at.
+#
+# Columns, tab separated:
+#   location <TAB> payload with digits normalized to # <TAB> disposition <TAB> note
+#
+# Disposition is one of:
+#   fixed     the defect is gone; the note names the commit
+#   filed     tracked in the backlog; the note names the section
+#   external  raised by a dependency, not our code path; the note says why
+#
+# Copy the suggested line from the script's output rather than typing it: the
+# payload column must match its normalization exactly.
+src\app.rs:39069:21	detached session binding failed for ViewerContextId(#): ContextOwnedBy(#)	filed	backlog 1.195; multi-window PDF open, fixed for v3.6.0
+src\ui_fullscreen.rs:13611:21	active detached backstop window # has no context binding	filed	backlog 1.195; same ownership family, seen 2026-08-28
+src\app\viewer_context_registry.rs:2935:32	window # has no viewer-context binding	filed	backlog 1.195; same ownership family, seen 2026-08-28
+src\ui_main.rs:1013:48	index out of bounds: the len is # but the index is #	filed	backlog 1.196; grid index, 2026-04
+src\ui_main.rs:1026:48	index out of bounds: the len is # but the index is #	filed	backlog 1.196; grid index, 2026-04
+src\video\dsp\gui.rs:221:33	RefCell already mutably borrowed	filed	backlog 1.196; VST editor, 2026-05
+src\video\gpu_renderer\d3d11_device.rs:759:31	RefCell already borrowed	filed	backlog 1.196; 2026-05
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ffmpeg-the-third-3.0.2+ffmpeg-7.1\src\software\resampling\context.rs:189:71	called `Option::unwrap()` on a `None` value	filed	backlog 1.196; audio resampler, 2026-05
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-27.0.1\src\backend\wgpu_core.rs:2015:22	wgpu error: Out of Memory	filed	backlog 1.196; 2026-05
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-27.0.1\src\backend\wgpu_core.rs:2568:18	wgpu error: Out of Memory	filed	backlog 1.196; 2026-05
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-27.0.1\src\backend\wgpu_core.rs:1970:22	wgpu error: Validation Error	filed	backlog 1.196; through 2026-08
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-27.0.1\src\backend\wgpu_core.rs:1588:26	wgpu error: Validation Error	filed	backlog 1.196; through 2026-08
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-wgpu-0.33.3\src\renderer.rs:615:17	assertion `left == right` failed: Mismatch between texture size and texel count	filed	backlog 1.196; 2026-05
+C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-0.33.3\src\ui.rs:2569:9	You can only indent vertical layouts, found Layout { main_dir: LeftToRight, main_wrap: false, main_align: Center, main_justify: false, cross_align: Min, cross_justify: false }	filed	backlog 1.196; 2026-04
+/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\num\f32.rs:1434:9	min > max, or either was NaN. min = #.#, max = -#.#	filed	backlog 1.196; clamp with inverted bounds, 2026-05

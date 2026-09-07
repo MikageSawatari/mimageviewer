@@ -278,6 +278,38 @@ ZipFile / PdfFile / ConvertibleArchive の代表サムネには適用しない (
 
 ---
 
+### 1.6 静止画シーク列・プレビューの保存回転
+
+列と hover preview は `RotationCache` の確定値だけを読み、未読値は
+`start_still_seek_rotations` → `still-seek-rotations` worker → `poll_still_seek_rotations`
+で取得する。通常画像・ZIP・PDF・変換アーカイブとも本体と同じ `page_path_key` を使う。
+DB の read-only open / SELECT は worker 内に閉じ、UI は要求のキー作成・`try_recv`・
+メモリへの merge だけを行う。回転キャッシュが全件ヒットした一括取得も DB ハンドルへ進まない。
+
+回転が未取得の Loaded サムネイルは列では `Unavailable` とする。現在ページから外へ育つ
+既存レイアウトがその側で止まり、0°で一度置いてから回転後のセル幅へ動くことを防ぐ。
+サムネイルの `Failed` は従来の正方形セルのまま。DB open / SELECT 失敗は worker で診断し、
+従来の回転取得と同じく `Rotation::None` を確定値にする。回転は付加情報であり、読み出し失敗で
+列を永久に止めず、そのセッションでの閲覧を継続するためである。再取得は通常の失効境界で行う。
+
+見開きの組み合わせとページ番号も回転に依存する。overlay はこの間接経路も同期 SELECT へ
+進めず、nav の未読回転を 1 worker 最大 256 キーで順次準備する。初回で表示単位がまだ無い場合は
+読み込み表示とし、見開きの組み合わせを推測しない。既に同じ nav / items 世代 / 見開きモード /
+ずらし位置の表示単位がある場合は、その snapshot を再取得中も使って入力とラベルを維持する。
+これにより回転失効を挟んだドラッグの release を欠落させない。セルとプレビューの向きは引き続き
+確定値だけを使い、未取得セルの側で止める。確定済み nav の確認は同じ immutable `Arc` のメモで省略し、
+idle frame で本全体を再走査しない。本体側の見開き解決規則・入力・着地の仕様は変えない。
+
+プレビューの 1 枚は `StillSeekPreviewPage { texture, rotation }` として渡す。吹き出し・画像枠は
+`rotated_display_size` で 90° / 270° の縦横を入れ替えてから決め、描画は本体・列と共通の
+`draw_rotated_image` を使う。見開きも画面上の左右順を保ち、2 枚それぞれの回転と寸法を使う。
+テクスチャまたは回転が未取得のプレビュー枠は「読み込み中…」とする。
+
+回帰は `src/ui_fullscreen/tests/still_seek_rotation.rs`。実 overlay を実行したスレッドの
+RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の
+向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
+`still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
+
 ## 2. フルスクリーン表示パイプライン
 
 ### 2.1 エントリポイント

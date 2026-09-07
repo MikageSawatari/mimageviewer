@@ -1781,7 +1781,7 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 残る確認は Windows 実機での D3D11 の見え方、特に回転 / 非正方 SAR / 各拡大方法の黒帯と
   ポインタ固定点である。自動テストとビルドの結果は正本に記録する。
 
-### 1.186 動画のシークとストリップ close が、離すフレームの最後の移動を取りこぼす (2026-09-07)
+### 1.192 動画のシークとストリップ close が、離すフレームの最後の移動を取りこぼす (2026-09-07)
 
 - 出典: v3.6.0 出荷前レビュー ([review-v3.6.0/seek-strip-findings.md](review-v3.6.0/seek-strip-findings.md) F3)
   で静止画側に見つかった問題。**同じ形が動画側にもある**ことを、その修正
@@ -1801,6 +1801,232 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   1 つの変更で 2 つの面を触ることになる。分けて扱う。
 - 規模 / 優先度: 小 / P2。
 
+
+### 1.198 横長画像がアイドル高画質化の無限ループに入り、CPU を焼き続ける (2026-09-07)
+
+- 発見: v3.6.0 出荷前の `check-idle-health.ps1`。**進捗バーが 112/116 と 113/116 を往復**し、
+  静止しているのに収束しない、という実機報告から。
+- 実測 (`perf_events.jsonl`、239 秒):
+
+| イベント | 件数 |
+| --- | ---: |
+| `thumb/idle_upgrade_enqueue` | **136,000** |
+| `thumb/decode_begin` / `decode_end` | 各 127,594 / 127,585 |
+| `thumb/ready` | **145** |
+
+  **4 ファイルが 33,972 回ずつ再投入**されている。1 回 3.5ms の decode が毎秒 170 回、
+  つまり **0.6 コア相当を静止中に焼き続ける**。`thumb/ready` は 1 度も出ない。
+- 対象ファイルはすべて **884x444 (2:1 の横長)**、`h:\home\mimageviewer_old	estimage`。
+  比率設定は「自動 (3:4)」、7 列。
+- 機構 (コードからの推定、実測で裏を取っていない部分を含む):
+  - 判定は `!from_edit_preview && (from_cache || rendered_at_px * 5 < target_px * 4)`
+    (`src/app.rs:35271` 付近)。`rendered_at_px` は**生成されたサムネイルの長辺**
+    (`src/app.rs:33720`)、`target_px = min(source_long_edge, current_display_px)`。
+  - **縦長のセルに横長画像を入れると、収まりは幅で決まる**ので、生成物の長辺は
+    セル幅までしか伸びない。一方 `display_px` はセルの長辺 (= 高さ) から来る。
+    3:4 のセルなら比は 0.75 で、**0.8 の閾値を永久に下回る**。
+  - 既存のガードは `source_long_edge` で頭打ちにするだけなので、
+    **「元画像は大きいが、このセル比率では長辺まで伸ばせない」場合を塞げていない**。
+  - `load_phases` は `should_save: false` / `cache_save_ms: 0.0` で、
+    再生成した結果が保存も反映もされずに捨てられている。ここは未解明。
+- **v3.6.0 の退行ではない。** アイドル高画質化の経路は v3.5.0 以降 1 コミットも変わっていない
+  (`source_long_edge` / `compute_display_px` / `rendered_at_px` の代入 / `poll_thumbnails`、
+  および `idle_upgrade` を含む全ソースで差分なし)。
+  これまで見つからなかったのは、idle-health を回すフォルダにこの形の画像が無かったため。
+- 直す方向: 頭打ちを **「この比率のセルに収めたときの長辺」** で行う。
+  `source_long_edge` だけでなく、セル比率で決まる実際の到達可能長辺を上限にする。
+  あわせて、`should_save: false` で結果が捨てられる条件も確かめる
+  (捨てられる限り `rendered_at_px` が更新されないので、閾値を直しても再投入は止まらない可能性がある)。
+- 回帰テスト: 縦長セルに横長画像 (2:1 / 4:3) を置き、**一定回数で再投入が止まる**ことを固定する。
+  `check-idle-health.ps1` の同一 thumbnail work 反復検査は、この形を検出できている。
+- 規模 / 優先度: 中 / **P1** (静止中に CPU を焼き続ける。利用者は気づきにくい)。
+
+### 1.197 実機確認を、アプリを起動して操作する自動テストへ置き換える (2026-09-07)
+
+- 動機: リリースごとの手作業確認が**リリース間隔を延ばす主因**になっている。
+  v3.6.0 では、レビュー指摘 1 件につき 1 項目という誤った単位で 15 項目まで膨らんだ。
+  正しい単位は「**自動テストが届かない経路の数**」で、そこまで絞ると 3 項目になる
+  (複数ウィンドウで PDF / 列のドラッグ / 動画のズーム)。**その 3 つも自動化したい。**
+
+#### 既にあるもの
+
+| 部品 | 実体 |
+| --- | --- |
+| スクリプトランナー | `src/test_script.rs` (1,751 行)。`--test-script <path>` で起動、Rhai |
+| 操作 / 待ち / 失敗 | `run_action` / `wait_until` / `hold_key` / `release_key` / `fail` |
+| 状態観測 | `TestScriptSnapshot` (`is_fullscreen` / `fs_idx` / `items_len` / `pending_thumbs` / `modal_open` ほか) |
+| 判定 | 成功 / 失敗 / **環境不成立** を区別した終了コード |
+| キー入力 | `src/key_input.rs`。egui の `Event::Key` と `GetAsyncKeyState` の**両方**へ同じ押下状態を答える (物理入力と同じ 2 表現) |
+| 隔離 | `--data-dir`、`scripts/prepare-portable-smoke.ps1` |
+| 前例 | `scripts/page-turn-smoke.ps1` |
+
+#### 足りないもの
+
+1. **egui 面のポインタ合成**。`SyntheticNavigationKey` は方向 / PageUp・Down / Home・End /
+   Enter / Esc の 10 個だけで、マウスが無い。`Event::PointerMoved` / `PointerButton` /
+   `MouseWheel` を、キーと同じ timeline へ載せる。
+   **これで一覧・ダイアログ・静止画フルスクリーン (シークバーとサムネイル列を含む) が回る。**
+   実機でしか出なかった列の不具合 (押下フレームで `drag_started` が立たない / 離すフレームは
+   `dragged=false` / `interact_pointer_pos` は押している間だけ / RTL で送る向きが反転) は
+   **すべて egui のイベント層**なので、ここで捕まる。
+
+2. **動画 (native presenter) は別の継ぎ目が要る。** ⚠️ **egui への注入は届かない。**
+   HUD・シークバー・ストリップ・ズームは Win32 + D3D11 の面で、入力は
+   `src/video/native_window.rs` の wndproc (`WM_MOUSEMOVE` / `WM_LBUTTONDOWN` /
+   `WM_MOUSEWHEEL`) から入り、`NativeVideoOutputEvent` として App へ渡る
+   (`src/app/native_video.rs` の `apply_native_video_zoom_wheel` / `_drag` は生の
+   `mouse.x` / `mouse.y` を物理 px で受け取っている)。
+   - `NativeVideoOutputEvent` へ直接注入すると**presenter 自身の当たり判定を飛ばす**。
+     「ストリップや左右パネルの上ではそれぞれの操作を優先する」という、まさに
+     確認したい部分が抜ける
+   - したがって **wndproc の入口へ合成するか、`SendInput` で実際に送る**かの選択になる。
+     どちらを採るかがこの項目の主要な設計判断
+
+3. **座標の指定方法**。座標直書きはレイアウト変更で総崩れになる。
+   `TestScriptSnapshot` は今は真偽値と数値だけなので、**名前付きの矩形**
+   (`seek_bar` / `strip_cell(i)` / `video_canvas` / `grid_cell(i)`) を載せ、
+   スクリプトは `drag("seek_bar", from: 0.2, to: 0.8)` のように**論理指定**する。
+
+4. **複数窓の指定と切替**。ホスト側は現在、対象 PID の「最大の可視窓」を前面にするだけで、
+   窓を選べない。registry が持つ窓 identity / host claim で指定できるようにする。
+   `TestScriptSnapshot` も現在は mount 中の投影中心なので、**窓ごとの context / ページ /
+   表示状態**を読む入口が要る。
+
+#### これで消える手作業
+
+| 手作業 | 必要なもの |
+| --- | --- |
+| 複数ウィンドウで PDF を開く | (4) だけ。**ポインタ無しで自動化できる** — `run_action` + `wait_until` で足りる |
+| 静止画の列をドラッグ | (1) + (3) |
+| 動画のズーム | (2) + (3) |
+
+#### 見積もりと注意
+
+- ポインタ無しの smoke 基盤: 2〜4 日。複数窓の指定・切替まで含めて約 1 週間 (Astra 見積)。
+  egui のポインタ合成と矩形公開で +1〜2 日。動画側の継ぎ目は設計次第。
+- `build-portable.ps1` は現在 `portable` feature だけなので、**smoke 専用に
+  `portable,test-script` を作る**必要がある。診断版を配布物へ混ぜない出力分離も要る。
+- `run_action` は**キー入力層を迂回する**。F12 の動作は `ToggleDetachedViewerMode` で
+  確認できるが、**物理 F12 の配送までは検証したことにならない**。
+- **自動化できないまま残るもの**: 実 HWND のフォーカス・重なり順、OS レベルの入力配送、
+  GPU の実出力、通常プロファイル固有の移行、launcher の展開。
+- **エージェントは通常データディレクトリでアプリを起動しない**。隔離コピー
+  (`target\portable-smoke\`) の起動だけが許される。
+- 出典: v3.6.0 出荷前の検討 (Codex Astra、読み取り専用)。
+  提案 3 (実アプリ smoke) をポインタ対応まで広げたもの。
+- 規模 / 優先度: 大 / **P1** (毎リリースの手作業を減らす投資。次版の頭で着手する)。
+
+### 1.195 detached の binding 不整合が、まだ 2 種残っている (2026-09-07)
+
+- 出典: `panic.log` の棚卸し (§1.196 で入れた `scripts/check-panic-log.ps1`)。
+- 記録されている 3 種のうち、複数ウィンドウで PDF を開く経路 (`src/app.rs:39069`
+  `detached session binding failed for ViewerContextId(N): ContextOwnedBy(N)`) は
+  v3.6.0 で修正した。**残る 2 種は原因未特定**:
+  - `src/ui_fullscreen.rs:13611` `active detached backstop window N has no context binding`
+    (2026-08-28 09:23)
+  - `src/app/viewer_context_registry.rs:2935` `window N has no viewer-context binding`
+    (2026-08-28 11:10)
+- どちらも **BA-7 (所有状態の分散)** の同族で、後者のスタックにも
+  `render_active_detached_viewport_backstop` が出る。**panic のスタックだけでは操作列を
+  特定できない**ので、再現手順を作るところから始める。
+- v3.6.0 の修正で消えたかどうかは**未確認**。修正後に同じ操作を踏んで確かめること。
+- detached リワークの凍結ルールが適用される。症状パッチを入れず、BA 番号に対応付けて扱う。
+- 規模 / 優先度: 中 / **P1** (クラッシュ)。
+
+### 1.196 panic.log に 5 か月ぶんの未処理クラッシュが 12 種たまっていた (2026-09-07)
+
+- 経緯: v3.6.0 の出荷直前に、複数ウィンドウで PDF を開くと必ず落ちる不具合が実機で出た。
+  そのとき `panic.log` を開いたら、**2026-04 以降のクラッシュが 15 種 52 件記録されていて、
+  どれもバックログにも既知の問題ページにも載っていなかった**。
+  出荷前チェックリストには R8「セッション終了後に `panic.log` を確認」が既にあり、
+  **手順の抜けではなく実行しなかったこと**が原因である。
+- 対策として `scripts/check-panic-log.ps1` を入れた。記録されたすべての panic に
+  `docs/panic-acknowledged.tsv` の disposition (fixed / filed / external) を要求し、
+  無いものがあれば exit 1 する。リリース手順 Phase 2 の先頭で回す。
+- **本項は、その seed で `filed` にした 12 種の棚卸しそのもの。** 1 種ずつ、
+  現行版で再現するか / 既に直っているか / 依存側の問題かを判定して処理する。
+
+| 種別 | 場所 | 最終 | 件数 |
+| --- | --- | --- | --- |
+| index out of bounds | `src/ui_main.rs:1013` | 2026-04-21 | 3 |
+| index out of bounds | `src/ui_main.rs:1026` | 2026-04-21 | 1 |
+| RefCell already mutably borrowed | `src/video/dsp/gui.rs:221` | 2026-05-03 | 7 |
+| RefCell already borrowed | `src/video/gpu_renderer/d3d11_device.rs:759` | 2026-05-14 | 1 |
+| `Option::unwrap()` on None | ffmpeg-the-third `resampling/context.rs:189` | 2026-05-14 | 14 |
+| wgpu Out of Memory | wgpu `wgpu_core.rs:2015` / `:2568` | 2026-05-15 | 各 1 |
+| min > max, or either was NaN | `core/num/f32.rs:1434` (clamp) | 2026-05-21 | 1 |
+| texture size と texel count の不一致 | egui-wgpu `renderer.rs:615` | 2026-05-27 | 1 |
+| wgpu Validation Error | wgpu `wgpu_core.rs:1970` | 2026-08-14 | 9 |
+| wgpu Validation Error | wgpu `wgpu_core.rs:1588` | 2026-08-27 | 8 |
+| egui layout indent | egui `ui.rs:2569` | 2026-04-14 | 1 |
+
+- **自前のコードのものを先に見る**: `ui_main.rs` の添字 2 件、`video/dsp/gui.rs` と
+  `d3d11_device.rs` の RefCell 2 件、clamp の NaN 1 件。
+- wgpu の Validation Error は **2026-08 まで続いている**ので、直近の版でも起きている可能性が高い。
+  同時刻の `mimageviewer.log` と突き合わせて操作を特定する。
+- disposition を `filed` から動かすときは `docs/panic-acknowledged.tsv` も更新する
+  (fingerprint 列は script の出力からコピーする。手で書くと正規化がずれる)。
+- 規模 / 優先度: 中 / P2 (1 種ずつ独立して進められる)。
+
+### 1.193 編集バッジがファイル名スタックへ集約されない (2026-09-07)
+
+- 出典: v3.6.0 リリース差分レビュー (Codex Astra) の指摘 7。**v3.6.0 の退行ではない。**
+- 症状: 非代表メンバーに保存済みの編集があっても、スタックの集約セルにバッジが出ない。
+  レビューは新しい「切」バッジについて報告したが、**確認したところ 6 種すべてが同じ**
+  (補 / レ / 消 / 隠 / 文 / 切)。
+- 機構: `App::item_has_one_level_edit_key` (`src/app.rs:48200` 付近) は Folder / ZipFile /
+  PdfFile / ConvertibleArchive / ZipDir / SearchContainer を扱い、
+  **`GridItem::Stack` は `_ => false` に落ちる**。フォルダと書庫への集約は実装済みなので、
+  スタックだけが抜けている。
+- **今回入れなかった理由**: 6 種すべてに関わるので、「スタックが編集済みページを含むとは
+  何か」を 1 つ決める話になる。出荷直前に広げる範囲ではないと判断した。
+- 判断が要る点: スタックは代表画像 1 枚を見せる集約セルなので、
+  **代表だけを見るか、畳んだ全メンバーを見るか**。フォルダ / 書庫の「1 つ上の見える親にだけ
+  表示し、さらに上位へは伝播しない」規則との整合も要る
+  (`htdocs/mimageviewer/manual/grid.html` の状態バッジの説明)。
+- 規模 / 優先度: 小〜中 / P3。
+**2026-09-07 に一度実装し、性能を測って取り下げた。**
+
+- 実装した形: `item_has_one_level_edit_key` に `GridItem::Stack` の腕を足し、
+  `StackView` へ「メンバーの正規化 page key → group index」の写像を持たせて、
+  **フォルダ配下の編集済み key 側を走査**してグループ所属を引いた
+  (メンバー数ではなく編集済みページ数に比例させる狙い)。
+  スクリプトで作った任意のグループでも正しく、修正前に落ちる回帰テストも付けた。
+- **測ったら破綻していた。** debug ビルド、50 セル × 7 バッジ × 100 フレームの 1 フレーム平均:
+
+| そのフォルダの編集済みページ数 | スタック | フォルダ (既存) |
+| ---: | ---: | ---: |
+| 0 | 1.66 ms | 1.43 ms |
+| 400 | 32.2 ms | 1.61 ms |
+| 2,000 | 127.3 ms | 1.48 ms |
+| 10,000 | 197.5 ms | 1.48 ms |
+
+- **フォルダ側は平ら**で、スタック側だけ線形に伸びる。理由は探索範囲:
+  フォルダは `sub000\` という prefix で範囲が絞れるのに対し、**スタックのキーは
+  範囲を狭めない**ので、フォルダ全体の編集済みキーを歩くことになる。
+  スクリプト由来のグループは prefix 関係とは限らないため、prefix で絞る手は使えない。
+- **したがって、素朴な走査では入れられない。** 必要なのは
+  **group → 「編集を含むか」の索引**で、7 つのキー集合それぞれの更新箇所で失効させる。
+  出荷直前の変更としては大きすぎたので v3.6.0 では見送った。
+- 実装と測定テスト (`measure_stack_badge_cost`) は commit していない。
+  作り直すときは、上の表を再現するところから始めると判断が早い。
+- **これは退行ではない。** リリース済みの版でもスタックへは集約していない。
+
+### 1.194 入れ子 ZIP のキャッシュヒットが、外側 ZIP の更新を検証しない (2026-09-07)
+
+- 出典: v3.6.0 リリース差分レビュー (Codex Astra) の指摘 8。
+  **レビュー自身が「v3.5.0 にも存在し、今回の退行ではない」と明記している。**
+- 症状: 内側 ZIP bytes のキー (`src/zip_loader.rs:510` 付近) は
+  **外側 path と内部 path だけ**で、mtime / サイズを持たない。キャッシュヒットの経路
+  (`src/zip_loader.rs:1113` 付近) は目次キャッシュにも到達しないため、
+  **外側 ZIP を同じ path で差し替えても、`clear_nested_cache()` が走るまで旧内容を返す。**
+- v3.6.0 で目次キャッシュ側は `(path, mtime, len)` で検証するようになった
+  (レビュー指摘 5 の修正、`436109a62`) が、**内側 bytes の identity は揃っていない**。
+  同じ修正で `clear_nested_cache()` の全消去も無くなっていないので、
+  ナビゲーションで消える現状の逃げ道は残っている。
+- 直す方向: 内側 bytes のキーも `ArchiveCacheKey` と同じ identity へ揃える。
+  そうすれば「外側を切り替えたら全部消す」に頼らずに済む。
+- 規模 / 優先度: 小 / P2 (差し替えは頻度が低いが、返る内容が古いのは静かな誤りである)。
 ### 1.180 外部ツールに登録できる拡張子を .exe だけに縛らない — 実装済み (2026-09-04)
 
 - **正本は [external-tool-launch-plan.md](external-tool-launch-plan.md)**。`.py` などの

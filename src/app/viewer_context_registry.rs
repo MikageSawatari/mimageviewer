@@ -217,6 +217,16 @@ impl<P> ContextTable<P> {
         self.window_of.get(&id).copied()
     }
 
+    /// Private reservation for the builder, published ownership for a mounted payload.
+    /// The reservation stays invisible to locate_window_context until commit (I8).
+    fn projected_window(&self) -> Option<u64> {
+        assert!(self.pending.is_none());
+        match self.projection {
+            Projection::Mounted(id) => self.window_for_context(id),
+            Projection::Building { pending_bind, .. } => pending_bind,
+        }
+    }
+
     fn ids(&self) -> Vec<ViewerContextId> {
         assert!(self.pending.is_none());
         let mut ids = Vec::with_capacity(self.slots.len() + 1);
@@ -798,7 +808,7 @@ pub(in crate::app) struct ViewerContextBundle {
     search_filter: Option<std::collections::HashSet<usize>>,
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
-    rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    rotation_cache: crate::rotation_cache::RotationCache,
     page_dims_cache: crate::page_dims::PageDimsCache,
     spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
@@ -843,6 +853,9 @@ pub(in crate::app) struct ViewerContextBundle {
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
     panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
+    /// context を mount した間だけ App field へ投影する。
+    video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 で見ているという意図 (+ 選んだ投影方式)。フルスクリーンを閉じても残る
     /// ので、App グローバルに置くと別ウィンドウの 360 が混ざる (backlog §1.145)。
     panorama_intent: crate::panorama::PanoramaSessionIntent,
@@ -1072,13 +1085,6 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => app.last_viewer_sync_stamp.as_ref(),
             ContextRefSource::AtRest(bundle) => bundle.viewer_session.last_sync_stamp.as_ref(),
-        }
-    }
-
-    pub(in crate::app) fn viewer_session_detached_window_id(self) -> Option<u64> {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.detached_viewer_window_id,
-            ContextRefSource::AtRest(bundle) => bundle.viewer_session.detached_window_id,
         }
     }
 
@@ -1388,7 +1394,7 @@ impl ViewerContextBundle {
             search_filter: None,
             search_filter_origin_folder: None,
             checked: std::collections::HashSet::new(),
-            rotation_cache: std::collections::HashMap::new(),
+            rotation_cache: crate::rotation_cache::RotationCache::default(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
             spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             rating_cache: std::collections::HashMap::new(),
@@ -1414,6 +1420,7 @@ impl ViewerContextBundle {
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
             panorama_state: None,
+            video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
@@ -1600,7 +1607,7 @@ impl App {
     #[cfg(windows)]
     pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
         self.viewer_presentation = ViewerPresentation::DetachedWindow;
-        self.detached_viewer_window_id = Some(window_id);
+        self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
         self.detached_viewer_open_next_still_detached_once = false;
         self.last_viewer_sync_stamp = None;
@@ -1751,6 +1758,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -1992,7 +2000,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
         swap_field!(native_video_in_window_active);
         swap_field!(video_audio_mode);
@@ -2000,6 +2007,7 @@ impl App {
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
+        swap_field!(video_zoom_state);
         swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
@@ -2286,6 +2294,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2501,6 +2510,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、
             // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
             panorama_intent,
@@ -2574,7 +2584,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
 
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
@@ -2905,6 +2914,23 @@ impl App {
     /// Identity of the payload currently projected onto `App`, including a context being built.
     pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
         self.viewer_contexts.table.projected_id()
+    }
+
+    pub(crate) fn detached_viewer_window_id(&self) -> Option<u64> {
+        self.viewer_contexts.table.projected_window()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn set_detached_window_binding_for_test(&mut self, window_id: Option<u64>) {
+        if self.viewer_context_residence(self.projected_viewer_context_id())
+            == ContextResidence::Building
+        {
+            self.reserve_window_binding_for_build(window_id.expect("build fixture window"));
+        } else if let Some(window_id) = window_id {
+            self.ensure_mounted_detached_session_binding(window_id);
+        } else if let Some(window_id) = self.detached_viewer_window_id() {
+            self.unbind_window(window_id);
+        }
     }
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
@@ -3244,7 +3270,6 @@ impl App {
             self.bind_window(mounted, window_id)
                 .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
         }
-        self.detached_viewer_window_id = Some(window_id);
         self.begin_active_detached_session(window_id, source);
     }
 
@@ -3314,7 +3339,6 @@ impl App {
         let id = self
             .build_viewer_context("test_build_active_context", |app, _reserved| {
                 configure(app);
-                app.detached_viewer_window_id = Some(window_id);
                 app.reserve_window_binding_for_build(window_id);
                 BuildOutcome::Commit
             })
@@ -3368,6 +3392,150 @@ mod tests {
             layout_center_pos: center,
             page_pos_at_commit: 3,
         }
+    }
+
+    #[cfg(windows)]
+    fn video_zoom_state(
+        wheel_notches: f32,
+        drag: [f32; 2],
+    ) -> crate::video::zoom_view::VideoZoomState {
+        let source = crate::video::zoom_view::VideoZoomSourceGeometry::new(
+            1920,
+            1080,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+        );
+        let region = [1920.0, 1080.0];
+        let mut state = crate::video::zoom_view::VideoZoomState::new();
+        assert!(state.apply_wheel(
+            wheel_notches * 120.0,
+            [region[0] * 0.5, region[1] * 0.5],
+            region,
+            source,
+        ));
+        assert!(state.apply_drag(drag, region, source));
+        state
+    }
+
+    #[cfg(windows)]
+    fn two_video_zoom_contexts() -> (
+        crate::app::AppTestEnvForTest,
+        ViewerContextId,
+        ViewerContextId,
+        crate::video::zoom_view::VideoZoomState,
+        crate::video::zoom_view::VideoZoomState,
+    ) {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_b = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(711, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let b = app.build_window_context_for_test(712, |app| {
+            app.fullscreen_idx = Some(7);
+            app.video_zoom_state = Some(state_b);
+        });
+        (app, a, b, state_a, state_b)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_fresh_context_starts_empty() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let _a = app.build_window_context_for_test(710, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let _b = app.build_window_context_for_test(711, |app| {
+            assert_eq!(
+                app.video_zoom_state, None,
+                "a fresh context must not inherit A's video zoom"
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_survives_exchange_and_return() {
+        let (mut app, a, b, state_a, state_b) = two_video_zoom_contexts();
+
+        for _ in 0..2 {
+            app.with_viewer_context(a, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_a));
+            })
+            .unwrap();
+            app.with_viewer_context(b, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_b));
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_item_reset_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.with_viewer_context(b, |app| {
+            app.video_zoom_state = None;
+        })
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "B's item-change reset must not clear A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_close_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.close_and_retire_context(
+            b,
+            "video_zoom_test_close",
+            |app| {
+                app.close_fullscreen();
+            },
+            |_| (),
+        )
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "closing B must not reset A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_split_moves_an_independent_value() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_main = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(3);
+        app.video_zoom_state = Some(state_a);
+
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(app.video_zoom_state, None);
+        app.video_zoom_state = Some(state_main);
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_a));
+        app.video_zoom_state = None;
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_main));
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, None);
     }
 
     #[cfg(windows)]
@@ -3531,7 +3699,7 @@ mod tests {
     fn favorite_view_state_is_isolated_by_bundle_swap() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let a = crate::settings::FavoriteEntry::new(
             "a".to_owned(),
             std::path::PathBuf::from(r"C:\favorite-a"),
@@ -3541,30 +3709,30 @@ mod tests {
             std::path::PathBuf::from(r"C:\favorite-b"),
         );
         let mut a_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
-        a_state.thumb_px = 160;
+        a_state.grid_cols = 4;
         let mut b_state = a_state.clone();
-        b_state.thumb_px = 260;
+        b_state.grid_cols = 7;
         app.favorite_view_states.insert(a.id, a_state);
         app.favorite_view_states.insert(b.id, b_state);
         app.settings.favorites.extend([a.clone(), b.clone()]);
         app.current_folder = Some(a.path.clone());
         app.transition_favorite_view_for_path(Some(&a.path));
-        app.settings.thumb_px = 170;
+        app.settings.grid_cols = 9;
 
         let mut parked = ViewerContextBundle::empty();
         parked.current_folder = Some(b.path.clone());
         app.swap_viewer_context_bundle(&mut parked);
-        assert_eq!(app.settings.thumb_px, 260);
-        assert_eq!(app.favorite_view_states[&a.id].thumb_px, 170);
+        assert_eq!(app.settings.grid_cols, 7);
+        assert_eq!(app.favorite_view_states[&a.id].grid_cols, 9);
 
-        app.settings.thumb_px = 270;
+        app.settings.grid_cols = 10;
         app.swap_viewer_context_bundle(&mut parked);
-        assert_eq!(app.settings.thumb_px, 170);
-        assert_eq!(app.favorite_view_states[&b.id].thumb_px, 270);
+        assert_eq!(app.settings.grid_cols, 9);
+        assert_eq!(app.favorite_view_states[&b.id].grid_cols, 10);
 
         app.transition_favorite_view_for_path(Some(std::path::Path::new(r"C:\outside")));
         assert_eq!(
-            app.settings.thumb_px, 100,
+            app.settings.grid_cols, 3,
             "共通状態はどちらの窓にも上書きされない"
         );
     }
@@ -3736,7 +3904,6 @@ mod tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_independent_active = false;
         app.detached_viewer_open_next_still_detached_once = true;
-        app.detached_viewer_window_id = None;
         app.last_viewer_sync_stamp = Some(ViewerSyncStamp {
             idx: 1,
             item_key: "stale".to_owned(),
@@ -3748,7 +3915,7 @@ mod tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
-        assert_eq!(app.detached_viewer_window_id, Some(37));
+        assert_eq!(app.detached_viewer_window_id(), Some(37));
         assert_eq!(app.last_viewer_sync_stamp, None);
         assert!(!app.fs_open_intent_from_grid);
         assert!(!app.pending_auto_fs_open);
