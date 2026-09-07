@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+mod document;
 mod history;
 mod keyframes;
 mod modulators;
@@ -29,24 +30,21 @@ use history::{EditSurface, UndoHistory};
 use modulators::ModulatorEditorState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KeySelection {
-    layer: LayerId,
-    property: AnimProperty,
-    key_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LyricSelection {
-    layer: LayerId,
-    line_index: usize,
+enum DetailSelection {
+    Key {
+        property: AnimProperty,
+        key_index: usize,
+    },
+    Lyric {
+        line_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct EditorSnapshot {
     project: Project,
     selected_layer: Option<LayerId>,
-    selected_key: Option<KeySelection>,
-    selected_lyric: Option<LyricSelection>,
+    selected_detail: Option<DetailSelection>,
 }
 
 /// Opaque pre-edit state used when a host-owned operation changes the project.
@@ -59,11 +57,9 @@ pub struct EditCheckpoint(EditorSnapshot);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditorState {
-    selected_layer: usize,
-    selected_key: Option<KeySelection>,
-    dragging_key: Option<KeySelection>,
-    selected_lyric: Option<LyricSelection>,
-    dragging_lyric: Option<LyricSelection>,
+    selected_layer: Option<LayerId>,
+    selected_detail: Option<DetailSelection>,
+    dragging_detail: Option<DetailSelection>,
     lyrics_notice: Option<(LayerId, String)>,
     pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
@@ -73,11 +69,9 @@ pub struct EditorState {
 impl Default for EditorState {
     fn default() -> Self {
         Self {
-            selected_layer: 1,
-            selected_key: None,
-            dragging_key: None,
-            selected_lyric: None,
-            dragging_lyric: None,
+            selected_layer: None,
+            selected_detail: None,
+            dragging_detail: None,
             lyrics_notice: None,
             pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
@@ -87,23 +81,28 @@ impl Default for EditorState {
 }
 
 impl EditorState {
-    pub fn selected_layer(&self) -> usize {
+    pub fn selected_layer(&self, project: &Project) -> usize {
         self.selected_layer
+            .and_then(|id| project.layers.iter().position(|layer| layer.id == id))
+            .unwrap_or_else(|| usize::from(project.layers.len() > 1))
     }
 
-    pub fn select_layer(&mut self, index: usize) {
-        self.selected_layer = index;
+    pub fn select_layer(&mut self, project: &Project, index: usize) {
+        let next = project.layers.get(index).map(|layer| layer.id);
+        if self.selected_layer != next {
+            self.clear_detail_selection();
+        }
+        self.selected_layer = next;
     }
 
     /// Clears selections and pending confirmations that belong to the previous project.
     pub fn reset_for_project(&mut self, project: &Project) {
-        self.selected_layer = self
-            .selected_layer
-            .min(project.layers.len().saturating_sub(1));
-        self.selected_key = None;
-        self.dragging_key = None;
-        self.selected_lyric = None;
-        self.dragging_lyric = None;
+        self.selected_layer = project
+            .layers
+            .get(1)
+            .or_else(|| project.layers.first())
+            .map(|layer| layer.id);
+        self.clear_detail_selection();
         self.lyrics_notice = None;
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
@@ -111,35 +110,37 @@ impl EditorState {
     }
 
     pub fn reconcile(&mut self, project: &Project) {
-        self.selected_layer = self
+        if self
             .selected_layer
-            .min(project.layers.len().saturating_sub(1));
-        let selection_exists = self.selected_key.is_some_and(|selection| {
-            project
+            .is_none_or(|selected| !project.layers.iter().any(|layer| layer.id == selected))
+        {
+            self.selected_layer = project
                 .layers
-                .iter()
-                .find(|layer| layer.id == selection.layer)
-                .and_then(|layer| keyframes::animation_keys(layer, selection.property))
-                .is_some_and(|keys| selection.key_index < keys.len())
-        });
-        if !selection_exists {
-            self.selected_key = None;
-            self.dragging_key = None;
+                .get(1)
+                .or_else(|| project.layers.first())
+                .map(|layer| layer.id);
+            self.clear_detail_selection();
         }
-        let lyric_exists = self.selected_lyric.is_some_and(|selection| {
-            project
-                .layers
-                .iter()
-                .find(|layer| layer.id == selection.layer)
-                .and_then(|layer| match &layer.kind {
-                    LayerKind::Lyrics(lyrics) => lyrics.lines.get(selection.line_index),
-                    _ => None,
-                })
-                .is_some()
-        });
-        if !lyric_exists {
-            self.selected_lyric = None;
-            self.dragging_lyric = None;
+        let active_layer = self
+            .selected_layer
+            .and_then(|id| project.layers.iter().find(|layer| layer.id == id));
+        let detail_exists = match (self.selected_detail, active_layer) {
+            (
+                Some(DetailSelection::Key {
+                    property,
+                    key_index,
+                }),
+                Some(layer),
+            ) => keyframes::animation_keys(layer, property)
+                .is_some_and(|keys| key_index < keys.len()),
+            (Some(DetailSelection::Lyric { line_index }), Some(layer)) => {
+                matches!(&layer.kind, LayerKind::Lyrics(lyrics) if line_index < lyrics.lines.len())
+            }
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if !detail_exists {
+            self.clear_detail_selection();
         }
         if self
             .pending_layer_delete
@@ -150,20 +151,60 @@ impl EditorState {
     }
 
     fn select_layer_id(&mut self, project: &Project, id: LayerId) {
-        if let Some(index) = project.layers.iter().position(|layer| layer.id == id) {
-            self.selected_layer = index;
+        if project.layers.iter().any(|layer| layer.id == id) {
+            if self.selected_layer != Some(id) {
+                self.clear_detail_selection();
+            }
+            self.selected_layer = Some(id);
         }
+    }
+
+    fn selected_key(&self) -> Option<(AnimProperty, usize)> {
+        match self.selected_detail {
+            Some(DetailSelection::Key {
+                property,
+                key_index,
+            }) => Some((property, key_index)),
+            _ => None,
+        }
+    }
+
+    fn selected_lyric(&self) -> Option<usize> {
+        match self.selected_detail {
+            Some(DetailSelection::Lyric { line_index }) => Some(line_index),
+            _ => None,
+        }
+    }
+
+    fn clear_detail_selection(&mut self) {
+        self.selected_detail = None;
+        self.dragging_detail = None;
+    }
+
+    fn select_key(
+        &mut self,
+        project: &Project,
+        layer: LayerId,
+        property: AnimProperty,
+        key_index: usize,
+    ) {
+        self.select_layer_id(project, layer);
+        self.selected_detail = Some(DetailSelection::Key {
+            property,
+            key_index,
+        });
+    }
+
+    fn select_lyric(&mut self, project: &Project, layer: LayerId, line_index: usize) {
+        self.select_layer_id(project, layer);
+        self.selected_detail = Some(DetailSelection::Lyric { line_index });
     }
 
     fn snapshot(&self, project: &Project) -> EditorSnapshot {
         EditorSnapshot {
             project: project.clone(),
-            selected_layer: project
-                .layers
-                .get(self.selected_layer)
-                .map(|layer| layer.id),
-            selected_key: self.selected_key,
-            selected_lyric: self.selected_lyric,
+            selected_layer: self.selected_layer,
+            selected_detail: self.selected_detail,
         }
     }
 
@@ -171,13 +212,16 @@ impl EditorState {
         *project = snapshot.project;
         self.selected_layer = snapshot
             .selected_layer
-            .and_then(|id| project.layers.iter().position(|layer| layer.id == id))
-            .unwrap_or(0)
-            .min(project.layers.len().saturating_sub(1));
-        self.selected_key = snapshot.selected_key;
-        self.selected_lyric = snapshot.selected_lyric;
-        self.dragging_key = None;
-        self.dragging_lyric = None;
+            .filter(|id| project.layers.iter().any(|layer| layer.id == *id))
+            .or_else(|| {
+                project
+                    .layers
+                    .get(1)
+                    .or_else(|| project.layers.first())
+                    .map(|layer| layer.id)
+            });
+        self.selected_detail = snapshot.selected_detail;
+        self.dragging_detail = None;
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
         self.reconcile(project);
@@ -277,31 +321,32 @@ impl EditorState {
     ) -> Result<bool, EditorCommandError> {
         let selected_layer = project
             .layers
-            .get(self.selected_layer)
+            .get(self.selected_layer(project))
             .map(|layer| layer.id);
         let animation_target = command.animation_target();
         let result = apply_editor_command(project, command)?;
         if let Some((layer, property)) = animation_target {
-            self.selected_lyric = None;
-            self.dragging_lyric = None;
+            self.select_layer_id(project, layer);
             if result.clear_selection
-                && self.selected_key.is_some_and(|selected| {
-                    selected.layer == layer && selected.property == property
-                })
+                && self
+                    .selected_key()
+                    .is_some_and(|(selected_property, _)| selected_property == property)
             {
-                self.selected_key = None;
-                self.dragging_key = None;
+                self.clear_detail_selection();
             } else if let Some(key_index) = result.selected_key {
-                let selection = KeySelection {
-                    layer,
+                let selection = DetailSelection::Key {
                     property,
                     key_index,
                 };
-                self.selected_key = Some(selection);
-                if self.dragging_key.is_some_and(|dragging| {
-                    dragging.layer == layer && dragging.property == property
-                }) {
-                    self.dragging_key = Some(selection);
+                self.selected_detail = Some(selection);
+                if matches!(
+                    self.dragging_detail,
+                    Some(DetailSelection::Key {
+                        property: dragging_property,
+                        ..
+                    }) if dragging_property == property
+                ) {
+                    self.dragging_detail = Some(selection);
                 }
             }
         } else {
@@ -313,9 +358,9 @@ impl EditorState {
         if matches!(
             command,
             EditorCommand::ReplaceLyrics { .. } | EditorCommand::ReplaceLyricsText { .. }
-        ) {
-            self.selected_lyric = None;
-            self.dragging_lyric = None;
+        ) && matches!(self.selected_detail, Some(DetailSelection::Lyric { .. }))
+        {
+            self.clear_detail_selection();
         }
         Ok(result.changed)
     }
@@ -441,28 +486,18 @@ pub fn draw_editor(
                     ui.small("一覧の上が奥、下が手前です");
                     for (index, layer) in project.layers.iter().enumerate() {
                         if ui
-                            .selectable_label(state.selected_layer == index, &layer.name)
+                            .selectable_label(state.selected_layer == Some(layer.id), &layer.name)
                             .clicked()
                         {
-                            state.selected_layer = index;
-                            if state
-                                .selected_key
-                                .is_some_and(|selected| selected.layer != layer.id)
-                            {
-                                state.selected_key = None;
-                                state.dragging_key = None;
-                            }
+                            state.select_layer(project, index);
                         }
                     }
 
-                    let selected_layer = project
-                        .layers
-                        .get(state.selected_layer)
-                        .map(|layer| layer.id);
+                    let selected_index = state.selected_layer(project);
+                    let selected_layer = project.layers.get(selected_index).map(|layer| layer.id);
                     let mut order_command = None;
                     ui.horizontal(|ui| {
-                        let can_move_toward_back =
-                            selected_layer.is_some() && state.selected_layer > 0;
+                        let can_move_toward_back = selected_layer.is_some() && selected_index > 0;
                         if ui
                             .add_enabled(
                                 can_move_toward_back,
@@ -477,8 +512,8 @@ pub fn draw_editor(
                                 direction: LayerMoveDirection::TowardBack,
                             });
                         }
-                        let can_move_toward_front = selected_layer.is_some()
-                            && state.selected_layer + 1 < project.layers.len();
+                        let can_move_toward_front =
+                            selected_layer.is_some() && selected_index + 1 < project.layers.len();
                         if ui
                             .add_enabled(
                                 can_move_toward_front,
@@ -550,8 +585,7 @@ pub fn draw_editor(
                             NewLayerPreset::Solid => vec![new_solid_layer(project)],
                         };
                         project.layers.extend(layers);
-                        state.selected_layer = project.layers.len() - 1;
-                        state.selected_key = None;
+                        state.select_layer(project, project.layers.len() - 1);
                         project_changed = true;
                     }
                     ui.separator();
@@ -560,7 +594,8 @@ pub fn draw_editor(
                     let mut export_lrc_requested = None;
                     let output = project.output;
                     let modulators = project.modulators.clone();
-                    if let Some(layer) = project.layers.get_mut(state.selected_layer) {
+                    let selected_index = state.selected_layer(project);
+                    if let Some(layer) = project.layers.get_mut(selected_index) {
                         let result = edit_layer_properties(
                             ui,
                             layer,
@@ -809,7 +844,7 @@ fn edit_layer_properties(
             ui,
             layer,
             property,
-            state.selected_key,
+            state.selected_key(),
             current_time_secs,
             output_width,
             output_height,
@@ -858,7 +893,7 @@ fn edit_animatable_property(
     ui: &mut egui::Ui,
     layer: &Layer,
     property: AnimProperty,
-    selected_key: Option<KeySelection>,
+    selected_key: Option<(AnimProperty, usize)>,
     current_time_secs: f64,
     output_width: u32,
     output_height: u32,
@@ -866,8 +901,8 @@ fn edit_animatable_property(
 ) {
     let keys = keyframes::animation_keys(layer, property).unwrap_or_default();
     let selected_index = selected_key
-        .filter(|selected| selected.layer == layer.id && selected.property == property)
-        .map(|selected| selected.key_index);
+        .filter(|(selected_property, _)| *selected_property == property)
+        .map(|(_, key_index)| key_index);
     let Some(mut value) =
         keyframes::animation_value(layer, property, current_time_secs, selected_index)
     else {
@@ -1037,17 +1072,13 @@ fn edit_lyrics(
             .clicked()
             && let Some(line_index) = next_unset
         {
-            let selection = LyricSelection {
-                layer: layer_id,
-                line_index,
-            };
             commands.push(EditorCommand::SetLyricTime {
                 layer: layer_id,
                 line_index,
                 time_secs: Some(current_time_secs),
             });
-            state.selected_lyric = Some(selection);
-            state.selected_key = None;
+            state.selected_detail = Some(DetailSelection::Lyric { line_index });
+            state.dragging_detail = None;
         }
     });
     ui.small("時刻付けを戻すときは、上の「元に戻す」または Ctrl+Z を使います。");
@@ -1077,20 +1108,13 @@ fn edit_lyrics(
     ui.collapsing("行ごとの時刻を修正", |ui| {
         for (line_index, line) in lyrics.lines.iter().enumerate() {
             ui.horizontal(|ui| {
-                let selected = state.selected_lyric
-                    == Some(LyricSelection {
-                        layer: layer_id,
-                        line_index,
-                    });
+                let selected = state.selected_lyric() == Some(line_index);
                 if ui
                     .selectable_label(selected, format!("{}", line_index + 1))
                     .clicked()
                 {
-                    state.selected_lyric = Some(LyricSelection {
-                        layer: layer_id,
-                        line_index,
-                    });
-                    state.selected_key = None;
+                    state.selected_detail = Some(DetailSelection::Lyric { line_index });
+                    state.dragging_detail = None;
                 }
                 if let Some(original_time) = line.time_secs {
                     let mut time = original_time;
@@ -1599,8 +1623,16 @@ mod tests {
     fn layer_order_command_keeps_the_same_layer_selected() {
         let mut project = default_project(10.0);
         let mut state = EditorState::default();
-        state.select_layer(1);
+        state.select_layer(&project, 1);
         let selected = project.layers[1].id;
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::AddKey {
+                layer: selected,
+                property: AnimProperty::Opacity,
+                t: 1.0,
+            },
+        ));
 
         assert!(state.apply_command(
             &mut project,
@@ -1610,8 +1642,95 @@ mod tests {
             },
         ));
 
-        assert_eq!(state.selected_layer(), 2);
-        assert_eq!(project.layers[state.selected_layer()].id, selected);
+        assert_eq!(state.selected_layer(&project), 2);
+        assert_eq!(project.layers[state.selected_layer(&project)].id, selected);
+        assert_eq!(state.selected_key(), Some((AnimProperty::Opacity, 0)));
+    }
+
+    #[test]
+    fn selecting_another_layer_clears_the_previous_layers_detail() {
+        let mut project = default_project(10.0);
+        let mut lyrics = new_lyrics_layer(&project);
+        let LayerKind::Lyrics(lyrics_body) = &mut lyrics.kind else {
+            unreachable!();
+        };
+        lyrics_body.lines.push(LyricLine {
+            text: "line".to_owned(),
+            time_secs: Some(1.0),
+        });
+        project.layers.push(lyrics);
+        let lyrics_index = project.layers.len() - 1;
+        let lyrics_id = project.layers[lyrics_index].id;
+        let mut state = EditorState::default();
+
+        state.select_lyric(&project, lyrics_id, 0);
+        assert_eq!(state.selected_layer(&project), lyrics_index);
+        assert_eq!(state.selected_lyric(), Some(0));
+
+        state.select_layer(&project, 0);
+        assert_eq!(state.selected_detail, None);
+        assert_eq!(state.dragging_detail, None);
+    }
+
+    #[test]
+    fn deleting_a_selected_layer_does_not_attach_its_detail_to_a_sibling() {
+        let mut project = default_project(10.0);
+        let mut first = new_lyrics_layer(&project);
+        let first_id = first.id;
+        let LayerKind::Lyrics(first_lyrics) = &mut first.kind else {
+            unreachable!();
+        };
+        first_lyrics.lines.push(LyricLine {
+            text: "same".to_owned(),
+            time_secs: Some(1.0),
+        });
+        project.layers.push(first);
+        let mut second = new_lyrics_layer(&project);
+        let LayerKind::Lyrics(second_lyrics) = &mut second.kind else {
+            unreachable!();
+        };
+        second_lyrics.lines.push(LyricLine {
+            text: "same".to_owned(),
+            time_secs: Some(2.0),
+        });
+        project.layers.push(second);
+        let mut state = EditorState::default();
+        state.select_lyric(&project, first_id, 0);
+
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteLayer { layer: first_id },
+        ));
+
+        assert_eq!(state.selected_detail, None);
+        assert_eq!(state.dragging_detail, None);
+    }
+
+    #[test]
+    fn detail_selection_is_restored_with_its_parent_layer_by_undo() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        let layer = project.layers[0].id;
+        state.select_layer(&project, 0);
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::AddKey {
+                layer,
+                property: AnimProperty::Opacity,
+                t: 1.0,
+            },
+        ));
+        assert_eq!(state.selected_key(), Some((AnimProperty::Opacity, 0)));
+
+        let checkpoint = state.begin_external_edit(&project);
+        state.select_layer(&project, 1);
+        project.layers[1].name.push_str(" edited");
+        assert!(state.finish_external_edit(&project, checkpoint));
+        assert!(state.undo(&mut project));
+
+        assert_eq!(project.layers[state.selected_layer(&project)].id, layer);
+        assert_eq!(state.selected_key(), Some((AnimProperty::Opacity, 0)));
+        assert_eq!(state.selected_lyric(), None);
     }
 
     #[test]
@@ -1630,7 +1749,7 @@ mod tests {
     fn key_add_move_and_delete_each_round_trip_through_undo_and_redo() {
         let mut project = default_project(10.0);
         let mut state = EditorState::default();
-        state.select_layer(0);
+        state.select_layer(&project, 0);
         let layer = project.layers[0].id;
 
         let before_add = project.clone();
@@ -1644,7 +1763,7 @@ mod tests {
         ));
         let after_add = project.clone();
         assert_undo_redo_round_trip(&mut state, &mut project, &before_add, &after_add);
-        assert_eq!(state.selected_key.unwrap().key_index, 0);
+        assert_eq!(state.selected_key(), Some((AnimProperty::Opacity, 0)));
 
         let before_move = project.clone();
         assert!(state.apply_external_command(
@@ -1683,11 +1802,11 @@ mod tests {
         let added_id = added.id;
         let checkpoint = state.begin_external_edit(&project);
         project.layers.push(added);
-        state.select_layer(project.layers.len() - 1);
+        state.select_layer(&project, project.layers.len() - 1);
         assert!(state.finish_external_edit(&project, checkpoint));
         let after_add = project.clone();
         assert_undo_redo_round_trip(&mut state, &mut project, &before_add, &after_add);
-        assert_eq!(project.layers[state.selected_layer()].id, added_id);
+        assert_eq!(project.layers[state.selected_layer(&project)].id, added_id);
 
         let before_move = project.clone();
         assert!(state.apply_external_command(
@@ -1730,9 +1849,9 @@ mod tests {
         let layer_id = layer.id;
         project.layers.push(layer);
         let mut state = EditorState::default();
-        state.select_layer(project.layers.len() - 1);
+        state.select_layer(&project, project.layers.len() - 1);
         state.reset_for_project(&project);
-        state.select_layer(project.layers.len() - 1);
+        state.select_layer(&project, project.layers.len() - 1);
         let before = project.clone();
 
         assert!(state.apply_external_command(
@@ -1752,7 +1871,7 @@ mod tests {
             .unwrap();
         assert_eq!(restored.modulations.len(), 1);
         assert!(project.images.iter().any(|reference| reference.id == image));
-        assert_eq!(project.layers[state.selected_layer()].id, layer_id);
+        assert_eq!(project.layers[state.selected_layer(&project)].id, layer_id);
         assert!(state.redo(&mut project));
         assert_eq!(project, deleted);
     }
@@ -2066,3 +2185,4 @@ mod tests {
         assert_eq!(state.history_depths(), (1, 0));
     }
 }
+pub use document::{DocumentSession, EditGeneration, SaveCheckpoint};

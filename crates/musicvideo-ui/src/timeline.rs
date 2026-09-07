@@ -5,7 +5,7 @@ use crate::history::EditSurface;
 use crate::keyframes::{
     AnimProperty, EditorCommand, KeyMeta, animation_keys, animation_properties,
 };
-use crate::{EditorState, KeySelection};
+use crate::{DetailSelection, EditorState};
 
 const LABEL_WIDTH: f32 = 190.0;
 const WAVEFORM_HEIGHT: f32 = 72.0;
@@ -264,9 +264,15 @@ fn draw_property_row(
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click_and_drag());
     let axis = timeline_axis(rect);
-    let selected = state
-        .selected_key
-        .is_some_and(|selected| selected.layer == row.layer && selected.property == row.property);
+    let selected = project
+        .layers
+        .get(state.selected_layer(project))
+        .is_some_and(|layer| {
+            layer.id == row.layer
+                && state
+                    .selected_key()
+                    .is_some_and(|(property, _)| property == row.property)
+        });
     let painter = ui.painter();
     painter.rect_filled(
         rect,
@@ -296,11 +302,16 @@ fn draw_property_row(
     });
     for (index, key) in row.keys.iter().enumerate() {
         let center = Pos2::new(time_to_x(axis, duration, key.t), rect.center().y);
-        let is_selected = state.selected_key
-            == Some(KeySelection {
-                layer: row.layer,
-                property: row.property,
-                key_index: index,
+        let is_selected = project
+            .layers
+            .get(state.selected_layer(project))
+            .is_some_and(|layer| {
+                layer.id == row.layer
+                    && state.selected_detail
+                        == Some(DetailSelection::Key {
+                            property: row.property,
+                            key_index: index,
+                        })
             });
         let radius = if is_selected { 6.0 } else { 4.5 };
         painter.add(egui::Shape::convex_polygon(
@@ -321,28 +332,19 @@ fn draw_property_row(
 
     if response.drag_started() {
         if let Some(index) = hovered_key {
-            let selection = KeySelection {
-                layer: row.layer,
+            let selection = DetailSelection::Key {
                 property: row.property,
                 key_index: index,
             };
-            state.selected_key = Some(selection);
-            state.selected_lyric = None;
-            state.dragging_key = Some(selection);
-            state.select_layer_id(project, row.layer);
+            state.select_key(project, row.layer, row.property, index);
+            state.dragging_detail = Some(selection);
         } else {
-            state.dragging_key = None;
+            state.dragging_detail = None;
         }
     }
     if response.clicked() {
         if let Some(index) = hovered_key {
-            state.selected_key = Some(KeySelection {
-                layer: row.layer,
-                property: row.property,
-                key_index: index,
-            });
-            state.selected_lyric = None;
-            state.select_layer_id(project, row.layer);
+            state.select_key(project, row.layer, row.property, index);
             output.seek_to = Some(row.keys[index].t);
         } else if let Some(pointer) = pointer.filter(|pointer| axis.contains(*pointer)) {
             output.seek_to = Some(x_to_time(axis, duration, pointer.x));
@@ -351,15 +353,22 @@ fn draw_property_row(
     if response.dragged()
         && let Some(pointer) = pointer
     {
-        if let Some(dragging) = state.dragging_key
-            && dragging.layer == row.layer
-            && dragging.property == row.property
+        if let Some(DetailSelection::Key {
+            property,
+            key_index,
+        }) = state.dragging_detail
+            && project
+                .layers
+                .get(state.selected_layer(project))
+                .map(|layer| layer.id)
+                == Some(row.layer)
+            && property == row.property
         {
             let t = x_to_time(axis, duration, pointer.x);
             let command = EditorCommand::MoveKey {
                 layer: row.layer,
                 property: row.property,
-                key_index: dragging.key_index,
+                key_index,
                 t,
             };
             output.project_changed |= state.apply_command(project, &command);
@@ -369,7 +378,7 @@ fn draw_property_row(
         }
     }
     if response.drag_stopped() {
-        state.dragging_key = None;
+        state.dragging_detail = None;
     }
 }
 
@@ -386,9 +395,10 @@ fn draw_lyric_row(
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click_and_drag());
     let axis = timeline_axis(rect);
-    let selected = state
-        .selected_lyric
-        .is_some_and(|selected| selected.layer == row.layer);
+    let selected = project
+        .layers
+        .get(state.selected_layer(project))
+        .is_some_and(|layer| layer.id == row.layer && state.selected_lyric().is_some());
     let painter = ui.painter();
     painter.rect_filled(
         rect,
@@ -418,10 +428,11 @@ fn draw_lyric_row(
     });
     for (line_index, time, text) in &row.markers {
         let center = Pos2::new(time_to_x(axis, duration, *time), rect.center().y);
-        let is_selected = state.selected_lyric
-            == Some(crate::LyricSelection {
-                layer: row.layer,
-                line_index: *line_index,
+        let is_selected = project
+            .layers
+            .get(state.selected_layer(project))
+            .is_some_and(|layer| {
+                layer.id == row.layer && state.selected_lyric() == Some(*line_index)
             });
         let radius = if is_selected { 6.0 } else { 4.5 };
         painter.add(egui::Shape::convex_polygon(
@@ -444,26 +455,18 @@ fn draw_lyric_row(
 
     if response.drag_started() {
         if let Some((line_index, _, _)) = hovered {
-            let selection = crate::LyricSelection {
-                layer: row.layer,
+            let selection = DetailSelection::Lyric {
                 line_index: *line_index,
             };
-            state.selected_lyric = Some(selection);
-            state.selected_key = None;
-            state.dragging_lyric = Some(selection);
-            state.select_layer_id(project, row.layer);
+            state.select_lyric(project, row.layer, *line_index);
+            state.dragging_detail = Some(selection);
         } else {
-            state.dragging_lyric = None;
+            state.dragging_detail = None;
         }
     }
     if response.clicked() {
         if let Some((line_index, time, _)) = hovered {
-            state.selected_lyric = Some(crate::LyricSelection {
-                layer: row.layer,
-                line_index: *line_index,
-            });
-            state.selected_key = None;
-            state.select_layer_id(project, row.layer);
+            state.select_lyric(project, row.layer, *line_index);
             output.seek_to = Some(*time);
         } else if let Some(pointer) = pointer.filter(|pointer| axis.contains(*pointer)) {
             output.seek_to = Some(x_to_time(axis, duration, pointer.x));
@@ -472,15 +475,19 @@ fn draw_lyric_row(
     if response.dragged()
         && let Some(pointer) = pointer
     {
-        if let Some(dragging) = state.dragging_lyric
-            && dragging.layer == row.layer
+        if let Some(DetailSelection::Lyric { line_index }) = state.dragging_detail
+            && project
+                .layers
+                .get(state.selected_layer(project))
+                .map(|layer| layer.id)
+                == Some(row.layer)
         {
             let time = x_to_time(axis, duration, pointer.x);
             output.project_changed |= state.apply_command(
                 project,
                 &EditorCommand::SetLyricTime {
                     layer: row.layer,
-                    line_index: dragging.line_index,
+                    line_index,
                     time_secs: Some(time),
                 },
             );
@@ -490,7 +497,7 @@ fn draw_lyric_row(
         }
     }
     if response.drag_stopped() {
-        state.dragging_lyric = None;
+        state.dragging_detail = None;
     }
 }
 
@@ -501,34 +508,39 @@ fn draw_key_inspector(
     duration: f64,
     output: &mut TimelineResponse,
 ) {
-    if let Some(selection) = state.selected_lyric {
-        draw_lyric_inspector(ui, project, state, selection, duration, output);
+    if let Some(line_index) = state.selected_lyric() {
+        draw_lyric_inspector(ui, project, state, line_index, duration, output);
         return;
     }
-    let Some(selection) = state.selected_key else {
+    let Some((property, key_index)) = state.selected_key() else {
         ui.small("◆を選ぶと、キーまたは歌詞の時刻を編集できます");
+        return;
+    };
+    let Some(layer) = project
+        .layers
+        .get(state.selected_layer(project))
+        .map(|layer| layer.id)
+    else {
+        state.clear_detail_selection();
         return;
     };
     let Some((layer_name, key)) = project
         .layers
         .iter()
-        .find(|layer| layer.id == selection.layer)
+        .find(|candidate| candidate.id == layer)
         .and_then(|layer| {
-            animation_keys(layer, selection.property)
-                .and_then(|keys| keys.get(selection.key_index).copied())
+            animation_keys(layer, property)
+                .and_then(|keys| keys.get(key_index).copied())
                 .map(|key| (layer.name.clone(), key))
         })
     else {
-        state.selected_key = None;
+        state.clear_detail_selection();
         return;
     };
 
     let mut command = None;
     ui.horizontal(|ui| {
-        ui.label(format!(
-            "選択: {layer_name} / {}",
-            selection.property.label()
-        ));
+        ui.label(format!("選択: {layer_name} / {}", property.label()));
         let mut time = key.t;
         if ui
             .add(
@@ -540,16 +552,16 @@ fn draw_key_inspector(
             .changed()
         {
             command = Some(EditorCommand::MoveKey {
-                layer: selection.layer,
-                property: selection.property,
-                key_index: selection.key_index,
+                layer,
+                property,
+                key_index,
                 t: time,
             });
             output.seek_to = Some(time);
         }
-        if selection.property.is_continuous() {
+        if property.is_continuous() {
             let mut interp = key.interp;
-            egui::ComboBox::from_id_salt(("key-interp", selection.layer.0, selection.property))
+            egui::ComboBox::from_id_salt(("key-interp", layer.0, property))
                 .selected_text(interp_label(interp))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut interp, Interp::Step, "ステップ");
@@ -560,9 +572,9 @@ fn draw_key_inspector(
                 });
             if interp != key.interp {
                 command = Some(EditorCommand::SetInterpolation {
-                    layer: selection.layer,
-                    property: selection.property,
-                    key_index: selection.key_index,
+                    layer,
+                    property,
+                    key_index,
                     interp,
                 });
             }
@@ -571,9 +583,9 @@ fn draw_key_inspector(
         }
         if ui.button("キーを削除").clicked() {
             command = Some(EditorCommand::DeleteKey {
-                layer: selection.layer,
-                property: selection.property,
-                key_index: selection.key_index,
+                layer,
+                property,
+                key_index,
             });
         }
     });
@@ -586,25 +598,24 @@ fn draw_lyric_inspector(
     ui: &mut egui::Ui,
     project: &mut Project,
     state: &mut EditorState,
-    selection: crate::LyricSelection,
+    line_index: usize,
     duration: f64,
     output: &mut TimelineResponse,
 ) {
-    let Some((layer_name, text, original_time)) = project
+    let Some((layer_id, layer_name, text, original_time)) = project
         .layers
-        .iter()
-        .find(|layer| layer.id == selection.layer)
+        .get(state.selected_layer(project))
         .and_then(|layer| match &layer.kind {
             musicvideo_core::LayerKind::Lyrics(lyrics) => {
-                lyrics.lines.get(selection.line_index).and_then(|line| {
+                lyrics.lines.get(line_index).and_then(|line| {
                     line.time_secs
-                        .map(|time| (layer.name.clone(), line.text.clone(), time))
+                        .map(|time| (layer.id, layer.name.clone(), line.text.clone(), time))
                 })
             }
             _ => None,
         })
     else {
-        state.selected_lyric = None;
+        state.clear_detail_selection();
         return;
     };
     let mut command = None;
@@ -616,7 +627,7 @@ fn draw_lyric_inspector(
         };
         ui.label(format!(
             "選択: {layer_name} / {} 行目 / {label}",
-            selection.line_index + 1
+            line_index + 1
         ));
         let mut time = original_time;
         if ui
@@ -629,16 +640,16 @@ fn draw_lyric_inspector(
             .changed()
         {
             command = Some(EditorCommand::SetLyricTime {
-                layer: selection.layer,
-                line_index: selection.line_index,
+                layer: layer_id,
+                line_index,
                 time_secs: Some(time),
             });
             output.seek_to = Some(time);
         }
         if ui.button("時刻を未設定に戻す").clicked() {
             command = Some(EditorCommand::SetLyricTime {
-                layer: selection.layer,
-                line_index: selection.line_index,
+                layer: layer_id,
+                line_index,
                 time_secs: None,
             });
         }

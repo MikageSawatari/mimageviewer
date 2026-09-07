@@ -13,8 +13,8 @@ use musicvideo_core::{
     modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
 };
 use musicvideo_ui::{
-    EditorCommand, EditorState, MissingImageNotice, TimelineWaveform, draw_editor,
-    draw_missing_images, draw_preview, draw_timeline,
+    DocumentSession, EditorCommand, EditorState, MissingImageNotice, SaveCheckpoint,
+    TimelineWaveform, draw_editor, draw_missing_images, draw_preview, draw_timeline,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -160,7 +160,8 @@ struct ProjectLoadPending {
 }
 
 struct ProjectSavePending {
-    rx: mpsc::Receiver<Result<PathBuf, String>>,
+    checkpoint: SaveCheckpoint,
+    rx: mpsc::Receiver<Result<(), String>>,
 }
 
 struct LrcLoadPending {
@@ -198,7 +199,7 @@ pub struct MusicVideoLabApp {
     waveform: Option<TimelineWaveform>,
     audio_player: Option<AudioPlayer>,
     audio_error: Option<String>,
-    project_path: Option<PathBuf>,
+    document: DocumentSession,
     image_errors: HashMap<ImageId, String>,
     status: String,
     audio_pending: Option<AudioPending>,
@@ -240,7 +241,7 @@ impl MusicVideoLabApp {
             waveform: None,
             audio_player: None,
             audio_error: None,
-            project_path: None,
+            document: DocumentSession::default(),
             image_errors: HashMap::new(),
             status,
             audio_pending: None,
@@ -507,6 +508,7 @@ impl MusicVideoLabApp {
                 };
                 self.audio = Some(audio);
                 self.waveform = Some(waveform);
+                self.document.note_edit();
                 self.invalidate_modulator_calibration();
                 if self.audio_player.is_some() {
                     self.status = "音声を読み込みました".to_owned();
@@ -540,6 +542,7 @@ impl MusicVideoLabApp {
                     });
                 }
                 self.image_errors.remove(&id);
+                self.document.note_edit();
                 self.status = "画像を読み込みました".to_owned();
                 self.mark_preview_dirty();
             }
@@ -833,21 +836,22 @@ impl MusicVideoLabApp {
         if self.project_save_pending.is_some() {
             return;
         }
-        let project = self.project.clone();
+        let checkpoint = self.document.begin_save(path.clone(), &self.project);
+        let project = checkpoint.project().clone();
         let worker_ctx = ctx.clone();
         let worker_path = path.clone();
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("musicvideo-project-save".to_owned())
             .spawn(move || {
-                let result = save_project(&worker_path, &project).map(|()| worker_path);
+                let result = save_project(&worker_path, &project);
                 let _ = tx.send(result);
                 worker_ctx.request_repaint();
             });
         match spawned {
             Ok(_) => {
                 self.status = format!("プロジェクトを保存しています: {}", path.display());
-                self.project_save_pending = Some(ProjectSavePending { rx });
+                self.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
             }
             Err(error) => {
                 self.status = format!("プロジェクト保存ワーカーを開始できません: {error}");
@@ -879,7 +883,8 @@ impl MusicVideoLabApp {
                     self.assets.insert_image(id, image);
                 }
                 self.project = loaded.project;
-                self.project_path = Some(loaded.path);
+                self.document
+                    .replace_with_loaded(loaded.path, &self.project);
                 self.position_secs = 0.0;
                 self.audio = loaded.audio;
                 self.waveform = loaded.waveform;
@@ -927,10 +932,20 @@ impl MusicVideoLabApp {
             .as_ref()
             .map(|pending| pending.rx.try_recv());
         match save_result {
-            Some(Ok(Ok(path))) => {
-                self.project_save_pending = None;
-                self.project_path = Some(path.clone());
-                self.status = format!("プロジェクトを保存しました: {}", path.display());
+            Some(Ok(Ok(()))) => {
+                let pending = self
+                    .project_save_pending
+                    .take()
+                    .expect("the completed save request still exists");
+                let path = pending.checkpoint.path().to_path_buf();
+                if self.document.complete_save(pending.checkpoint) {
+                    self.status = format!("プロジェクトを保存しました: {}", path.display());
+                } else {
+                    self.status = format!(
+                        "切替前のプロジェクトを保存しました（現在の保存先は変更していません）: {}",
+                        path.display()
+                    );
+                }
             }
             Some(Ok(Err(error))) => {
                 self.project_save_pending = None;
@@ -1054,6 +1069,7 @@ impl MusicVideoLabApp {
                     .try_apply_external_command(&mut self.project, &command)
                 {
                     Ok(true) => {
+                        self.document.note_edit();
                         self.editor_state.set_lyrics_notice(layer, notice.clone());
                         self.status =
                             format!("LRC を読み込みました ({}): {notice}", path.display());
@@ -1287,7 +1303,7 @@ impl eframe::App for MusicVideoLabApp {
                     )
                     .clicked()
                 {
-                    let path = self.project_path.clone().or_else(|| {
+                    let path = self.document.path().map(PathBuf::from).or_else(|| {
                         rfd::FileDialog::new()
                             .add_filter("mIV 音楽ビデオ", &["json"])
                             .set_file_name("project.mivmv.json")
@@ -1382,8 +1398,15 @@ impl eframe::App for MusicVideoLabApp {
                     }
                 }
             }
-            if let Some(path) = self.project_path.as_ref() {
-                ui.label(format!("プロジェクト: {}", path.display()));
+            let dirty_suffix = if self.document.is_dirty(&self.project) {
+                "（未保存）"
+            } else {
+                ""
+            };
+            if let Some(path) = self.document.path() {
+                ui.label(format!("プロジェクト: {}{dirty_suffix}", path.display()));
+            } else {
+                ui.label(format!("プロジェクト: 新規{dirty_suffix}"));
             }
             if let Some(audio) = &self.project.audio {
                 ui.label(format!("音声: {}", audio.path.display()));
@@ -1523,6 +1546,7 @@ impl eframe::App for MusicVideoLabApp {
                 import_lrc_requested = response.import_lrc_requested;
                 export_lrc_requested = response.export_lrc_requested;
                 if response.project_changed {
+                    self.document.note_edit();
                     self.schedule_project_edit_preview();
                 }
             });
@@ -1557,9 +1581,14 @@ impl eframe::App for MusicVideoLabApp {
                 path: path.clone(),
             });
             self.project.layers.insert(insertion_index, layer);
-            self.editor_state.select_layer(insertion_index);
             self.editor_state
-                .finish_external_edit(&self.project, checkpoint);
+                .select_layer(&self.project, insertion_index);
+            if self
+                .editor_state
+                .finish_external_edit(&self.project, checkpoint)
+            {
+                self.document.note_edit();
+            }
             self.mark_preview_dirty();
             self.start_image_load(image_id, path, ctx);
         }
@@ -1578,6 +1607,9 @@ impl eframe::App for MusicVideoLabApp {
                 )
             })
             .inner;
+        if timeline_response.project_changed {
+            self.document.note_edit();
+        }
         if let Some(position_secs) = timeline_response.seek_to {
             self.seek_to(position_secs);
         } else if timeline_response.project_changed {
@@ -1753,6 +1785,50 @@ mod tests {
         project.layers.insert(index, layer);
         assert_eq!(image_layer_insertion_index(&project), 2);
         assert!(matches!(&project.layers[2].kind, LayerKind::Spectrum(_)));
+    }
+
+    #[test]
+    fn delayed_save_completion_does_not_rebind_a_loaded_document() {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let checkpoint = app
+            .document
+            .begin_save(PathBuf::from("a.mivmv.json"), &app.project);
+        let (tx, rx) = mpsc::channel();
+        app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+
+        app.project = default_project(20.0);
+        app.document
+            .replace_with_loaded(PathBuf::from("b.mivmv.json"), &app.project);
+        tx.send(Ok(())).unwrap();
+        app.poll_projects();
+
+        assert_eq!(
+            app.document.path(),
+            Some(std::path::Path::new("b.mivmv.json"))
+        );
+        assert!(!app.document.is_dirty(&app.project));
+        assert!(app.status.contains("現在の保存先は変更していません"));
+    }
+
+    #[test]
+    fn save_completion_adopts_its_path_without_hiding_later_edits() {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let checkpoint = app
+            .document
+            .begin_save(PathBuf::from("a.mivmv.json"), &app.project);
+        let (tx, rx) = mpsc::channel();
+        app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+        app.project.display_gain_db = 6.0;
+        app.document.note_edit();
+
+        tx.send(Ok(())).unwrap();
+        app.poll_projects();
+
+        assert_eq!(
+            app.document.path(),
+            Some(std::path::Path::new("a.mivmv.json"))
+        );
+        assert!(app.document.is_dirty(&app.project));
     }
 
     #[test]
