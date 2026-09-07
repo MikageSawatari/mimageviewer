@@ -1459,6 +1459,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-07 別バージョン検索R3: パネル派生状態のviewer所有への移行
+（2026-09-08実装・独立レビュー完了。検証結果は[修正記録](duplicate-detection-review-fixes-20260907.md)を参照）:**
+
+利用者の明示した役割移行により、このタスクの双方レビューは親Astra/highと独立Astra/highが担当する。
+Sol/xhighの実装前調査で、`fs_info_panel` はbundle-ownedだが `similar_panel` はApp-globalであると確認した。
+類似パネルのorigin、last_ready、texture、要求、完了channelを同じ `ViewerContextBundle` へ移し、
+capture/swap/restore/dropを揃えることを、両AstraがBA-7に対応する構造修正と判断した。
+窓のgeometry、placement、viewport生成、時刻によるguardは変更しない。
+タブも永続・全窓共通設定ではないruntime状態として同じownerへ含める。
+park中の完了の帰属、別contextのdrop非干渉、既存contextテストを回帰対象とする。
+この所有移行とサムネイル要求の21件の回帰、binのcheck、fmtが成功し、独立Astra/highが承認した。
+全体gateとportable実機確認は後続で実施する。
+この役割移行を他ブランチの作業へ一括適用するものではない。
+
 **2026-09-07 PDF 初回 open の binding 衝突: 窓 ID の正本を registry へ一本化
 （ClaudeCode の依頼が指定する構造修正として実施。Codex は §2 を読み、production 経路の
 修正前再現で BA-7 と確認。実装後の ClaudeCode 検収・実機確認は未実施）:**

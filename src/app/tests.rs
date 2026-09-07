@@ -27825,6 +27825,79 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.fs_info_panel.locked);
     }
 
+    /// Similar-panel runtime state owns its worker channel together with the viewer. A completion
+    /// received while A is parked must wait for A, and retiring B must not cancel or drain A.
+    #[test]
+    fn similar_panel_runtime_and_completions_belong_to_one_viewer_context_each() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.similar_panel.set_context_marker_for_test("viewer-a");
+        app.similar_panel
+            .queue_failed_completion_for_test("viewer-a-completion");
+
+        let viewer_a = app.stash_mounted_and_start_fresh("test_similar_panel_viewer_a");
+        assert_eq!(
+            app.similar_panel.context_marker_for_test(),
+            (false, None, None),
+            "a fresh viewer must not inherit A's tab, origin, or last-ready query"
+        );
+
+        app.similar_panel.set_context_marker_for_test("viewer-b");
+        app.similar_panel
+            .queue_failed_completion_for_test("viewer-b-completion");
+        app.similar_panel.consume_completions_for_test(&ctx);
+        assert!(
+            app.similar_panel
+                .thumbnail_failed_for_test("viewer-b-completion")
+        );
+
+        app.with_viewer_context(viewer_a, |mounted| {
+            assert_eq!(
+                mounted.similar_panel.context_marker_for_test(),
+                (
+                    true,
+                    Some("viewer-a".to_owned()),
+                    Some("ready:viewer-a".to_owned())
+                )
+            );
+            mounted.similar_panel.consume_completions_for_test(&ctx);
+            assert!(
+                mounted
+                    .similar_panel
+                    .thumbnail_failed_for_test("viewer-a-completion"),
+                "A's parked completion is consumed only after A is mounted"
+            );
+            mounted
+                .similar_panel
+                .queue_failed_completion_for_test("viewer-a-after-b-drop");
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.similar_panel.context_marker_for_test(),
+            (
+                true,
+                Some("viewer-b".to_owned()),
+                Some("ready:viewer-b".to_owned())
+            ),
+            "mounting A must round-trip B's independent runtime state"
+        );
+        let viewer_b = app.stash_mounted_and_start_fresh("test_similar_panel_viewer_b");
+        app.retire_context(viewer_b, "test_drop_similar_panel_viewer_b", |_| ())
+            .expect("B is parked and can be retired");
+
+        app.with_viewer_context(viewer_a, |mounted| {
+            mounted.similar_panel.consume_completions_for_test(&ctx);
+            assert!(
+                mounted
+                    .similar_panel
+                    .thumbnail_failed_for_test("viewer-a-after-b-drop"),
+                "dropping B must not close or invalidate A's receiver"
+            );
+        })
+        .unwrap();
+    }
+
     /// ロック中は前後移動でパネルを閉じないが、**フルスクリーンを出たら解除する**。
     ///
     /// `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるので、「ロック中は reset を

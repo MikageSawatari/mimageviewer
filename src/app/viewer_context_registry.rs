@@ -862,6 +862,9 @@ pub(in crate::app) struct ViewerContextBundle {
     /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
     /// App-global に置くと別ウィンドウの操作で他方のパネルが開閉する (backlog §1.158)。
     fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
+    /// 情報パネルの runtime tab と類似画像サムネイル要求。worker/channel まで含めて
+    /// viewer ごとに所有し、park 中の完了を別 viewer が消費しない。
+    similar_panel: crate::ui_metadata_panel::SimilarPanelState,
     pano_toast_shown_for_current_fs: bool,
     analysis_mode: bool,
     analysis_hover_color: Option<[u8; 4]>,
@@ -1423,6 +1426,7 @@ impl ViewerContextBundle {
             video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
+            similar_panel: crate::ui_metadata_panel::SimilarPanelState::default(),
             pano_toast_shown_for_current_fs: false,
             analysis_mode: false,
             analysis_hover_color: None,
@@ -1761,6 +1765,7 @@ impl App {
             video_zoom_state,
             panorama_intent,
             fs_info_panel,
+            similar_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,
@@ -2010,6 +2015,7 @@ impl App {
         swap_field!(video_zoom_state);
         swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
+        swap_field!(similar_panel);
         swap_field!(pano_toast_shown_for_current_fs);
         swap_field!(analysis_mode);
         swap_field!(analysis_hover_color);
@@ -2297,6 +2303,7 @@ impl App {
             video_zoom_state,
             panorama_intent,
             fs_info_panel,
+            similar_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,
@@ -2515,6 +2522,7 @@ impl App {
             // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
             panorama_intent,
             fs_info_panel,
+            similar_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,

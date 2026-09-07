@@ -11755,7 +11755,8 @@ pub struct App {
     /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
     /// **正本は `ViewerContextBundle`**、ここはマウント中 context の投影である。
     pub(crate) fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
-    /// 情報パネルのタブと、類似行用の一時サムネイル。パネルを閉じてもタブだけは保持する。
+    /// 情報パネルのタブと、類似行用の一時サムネイル。
+    /// **正本は `ViewerContextBundle`**、ここはマウント中 context の投影である。
     pub(crate) similar_panel: crate::ui_metadata_panel::SimilarPanelState,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。

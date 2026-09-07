@@ -31,6 +31,10 @@ const SIMILAR_THUMB_SIZE: f32 = 72.0;
 /// パネルが抱えるサムネイルの上限。1 冊分の帯とその候補が丸ごと収まる程度にする。
 /// 越えた分は古い順に落とす。
 const SIMILAR_THUMB_CACHE_LIMIT: usize = 512;
+/// Similar-panel reads can include ZIP enumeration and PDF rendering. Keep both newly-started
+/// work and cancelled work that is still draining inside one fixed budget per viewer context.
+const SIMILAR_THUMB_WORKER_LIMIT: usize = 4;
+type SimilarThumbDemand = std::collections::HashMap<String, u64>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MetadataPanelTab {
@@ -40,6 +44,7 @@ enum MetadataPanelTab {
 }
 
 struct SimilarThumbResult {
+    request_id: u64,
     item_key: String,
     image: Option<egui::ColorImage>,
 }
@@ -51,12 +56,56 @@ enum SimilarThumbState {
     Failed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SimilarThumbStamp {
+    target: Option<crate::similar_index::SimilarItemTarget>,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+    /// Password changes must retry an otherwise unchanged PDF. This is a revision counter only;
+    /// password material is never part of the cache key.
+    pdf_credential_revision: u64,
+}
+
+struct SimilarThumbEntry {
+    request_id: u64,
+    stamp: SimilarThumbStamp,
+    state: SimilarThumbEntryState,
+}
+
+enum SimilarThumbEntryState {
+    Pending {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
+struct SimilarThumbJob {
+    request_id: u64,
+    item_key: String,
+    target: crate::similar_index::SimilarItemTarget,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    pdf_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub(crate) struct SimilarPanelState {
     tab: MetadataPanelTab,
     origin_key: Option<String>,
-    thumbnails: std::collections::HashMap<String, SimilarThumbState>,
-    /// 読み込んだ順。上限を超えた分をここから古い順に落とす。
+    thumbnails: std::collections::HashMap<String, SimilarThumbEntry>,
+    /// 受け付けた順。上限を超えた分をここから古い順に落とす。
     thumb_order: std::collections::VecDeque<String>,
+    thumb_jobs: std::collections::VecDeque<SimilarThumbJob>,
+    thumb_completions: std::collections::VecDeque<SimilarThumbResult>,
+    thumb_running: usize,
+    thumb_next_request_id: u64,
+    thumb_last_upload_frame: Option<u64>,
     /// 直前に出せた結果。次の照会が返るまでこれを出し続ける。**表示している面ごとに 1 つ**
     /// (見開きなら左右で 2 つ)。
     ///
@@ -76,6 +125,11 @@ impl Default for SimilarPanelState {
             origin_key: None,
             thumbnails: std::collections::HashMap::new(),
             thumb_order: std::collections::VecDeque::new(),
+            thumb_jobs: std::collections::VecDeque::new(),
+            thumb_completions: std::collections::VecDeque::new(),
+            thumb_running: 0,
+            thumb_next_request_id: 1,
+            thumb_last_upload_frame: None,
             last_ready: Vec::new(),
             thumb_tx,
             thumb_rx,
@@ -94,30 +148,144 @@ impl SimilarPanelState {
             return;
         }
         self.origin_key = origin_key;
-        while self.thumbnails.len() > SIMILAR_THUMB_CACHE_LIMIT {
-            let Some(oldest) = self.thumb_order.pop_front() else {
-                break;
-            };
-            self.thumbnails.remove(&oldest);
+    }
+
+    fn begin_thumbnail_frame(&mut self) {
+        self.collect_thumbnail_results();
+    }
+
+    fn finish_thumbnail_frame(&mut self, ctx: &egui::Context, demand: &SimilarThumbDemand) {
+        let changed = self.apply_thumbnail_completions(ctx, demand).1;
+        self.dispatch_thumbnail_jobs(ctx, demand);
+        if changed
+            || self
+                .thumb_completions
+                .iter()
+                .any(|result| demand.get(&result.item_key).copied() == Some(result.request_id))
+        {
+            ctx.request_repaint();
         }
     }
 
-    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+    fn collect_thumbnail_results(&mut self) {
         while let Ok(result) = self.thumb_rx.try_recv() {
-            let state = match result.image {
-                Some(image) => SimilarThumbState::Ready(ctx.load_texture(
-                    format!("similar-thumb:{}", result.item_key),
-                    image,
-                    egui::TextureOptions::LINEAR,
-                )),
-                None => SimilarThumbState::Failed,
+            self.thumb_running = self.thumb_running.saturating_sub(1);
+            self.thumb_completions.push_back(result);
+        }
+    }
+
+    /// Apply terminal worker results for the currently visible requests. Stale identities drain;
+    /// valid offscreen results stay on the CPU side until that card becomes visible again.
+    fn apply_thumbnail_completions(
+        &mut self,
+        ctx: &egui::Context,
+        demand: &SimilarThumbDemand,
+    ) -> (usize, bool) {
+        let frame_nr = ctx.cumulative_frame_nr();
+        let may_upload = self.thumb_last_upload_frame != Some(frame_nr);
+        let mut uploaded = 0;
+        let mut changed = false;
+        let mut deferred = std::collections::VecDeque::new();
+        while let Some(result) = self.thumb_completions.pop_front() {
+            let Some(entry) = self.thumbnails.get_mut(&result.item_key) else {
+                continue;
             };
-            if self
+            if entry.request_id != result.request_id {
+                continue;
+            }
+            if demand.get(&result.item_key).copied() != Some(result.request_id) {
+                deferred.push_back(result);
+                continue;
+            }
+            match result.image {
+                Some(image) if may_upload && uploaded == 0 => {
+                    entry.state = SimilarThumbEntryState::Ready(ctx.load_texture(
+                        format!("similar-thumb:{}:{}", result.item_key, result.request_id),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    uploaded = 1;
+                    changed = true;
+                    self.thumb_last_upload_frame = Some(frame_nr);
+                }
+                Some(image) => deferred.push_back(SimilarThumbResult {
+                    request_id: result.request_id,
+                    item_key: result.item_key,
+                    image: Some(image),
+                }),
+                None => {
+                    entry.state = SimilarThumbEntryState::Failed;
+                    changed = true;
+                }
+            }
+        }
+        self.thumb_completions = deferred;
+        (uploaded, changed)
+    }
+
+    fn dispatch_thumbnail_jobs(&mut self, ctx: &egui::Context, demand: &SimilarThumbDemand) {
+        for job in self.take_thumbnail_jobs_for_dispatch(demand) {
+            self.spawn_thumbnail_job(ctx, job);
+        }
+    }
+
+    fn take_thumbnail_jobs_for_dispatch(
+        &mut self,
+        demand: &SimilarThumbDemand,
+    ) -> Vec<SimilarThumbJob> {
+        use std::sync::atomic::Ordering;
+
+        let mut jobs = Vec::new();
+        let queued = self.thumb_jobs.len();
+        for _ in 0..queued {
+            let Some(job) = self.thumb_jobs.pop_front() else {
+                break;
+            };
+            let current = self
                 .thumbnails
-                .insert(result.item_key.clone(), state)
-                .is_none()
+                .get(&job.item_key)
+                .is_some_and(|entry| entry.request_id == job.request_id);
+            if !current || job.cancel.load(Ordering::Relaxed) {
+                continue;
+            }
+            let is_demanded = demand.get(&job.item_key).copied() == Some(job.request_id);
+            if is_demanded && self.thumb_running + jobs.len() < SIMILAR_THUMB_WORKER_LIMIT {
+                jobs.push(job);
+            } else {
+                self.thumb_jobs.push_back(job);
+            }
+        }
+        self.thumb_running += jobs.len();
+        jobs
+    }
+
+    fn spawn_thumbnail_job(&mut self, ctx: &egui::Context, job: SimilarThumbJob) {
+        let item_key = job.item_key.clone();
+        let request_id = job.request_id;
+        let failed_key = item_key.clone();
+        let result_tx = self.thumb_tx.clone();
+        let repaint = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("similar-panel-thumb".to_string())
+            .spawn(move || {
+                let image = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    load_similar_thumbnail(job)
+                }))
+                .ok()
+                .flatten();
+                let _ = result_tx.send(SimilarThumbResult {
+                    request_id,
+                    item_key,
+                    image,
+                });
+                repaint.request_repaint();
+            });
+        if spawned.is_err() {
+            self.thumb_running = self.thumb_running.saturating_sub(1);
+            if let Some(entry) = self.thumbnails.get_mut(&failed_key)
+                && entry.request_id == request_id
             {
-                self.thumb_order.push_back(result.item_key);
+                entry.state = SimilarThumbEntryState::Failed;
             }
         }
     }
@@ -161,110 +329,302 @@ impl SimilarPanelState {
         pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
         ctx: &egui::Context,
     ) {
-        if self.thumbnails.contains_key(key) {
+        use std::sync::atomic::AtomicBool;
+
+        let pdf_credential_revision = match target.as_ref() {
+            Some(crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, .. }) => {
+                pdf_passwords.map_or(0, |passwords| passwords.credential_revision(pdf_path))
+            }
+            _ => 0,
+        };
+        let stamp = SimilarThumbStamp {
+            target: target.clone(),
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+            pdf_credential_revision,
+        };
+        if self
+            .thumbnails
+            .get(key)
+            .is_some_and(|entry| entry.stamp == stamp)
+        {
             return;
         }
-        let Some(target) = target else {
-            self.thumbnails
-                .insert(key.to_owned(), SimilarThumbState::Failed);
-            return;
-        };
-        self.thumbnails
-            .insert(key.to_owned(), SimilarThumbState::Loading);
-        let item_key = key.to_owned();
-        let result_tx = self.thumb_tx.clone();
-        let repaint = ctx.clone();
-        let pdf_passwords = pdf_passwords.cloned();
-        let context_epoch = crate::pdf_loader::current_render_context_epoch();
-        let spawned = std::thread::Builder::new()
-            .name("similar-panel-thumb".to_string())
-            .spawn(move || {
-                let (path, zip_entry, pdf_page) = match target {
-                    crate::similar_index::SimilarItemTarget::File(path) => (path, None, None),
-                    crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
-                        (pdf_path, None, Some(page_num))
+
+        self.remove_thumbnail_request(key);
+        let request_id = self.thumb_next_request_id;
+        self.thumb_next_request_id = self.thumb_next_request_id.wrapping_add(1).max(1);
+        let cancel = target
+            .as_ref()
+            .map(|_| std::sync::Arc::new(AtomicBool::new(false)));
+        self.thumbnails.insert(
+            key.to_owned(),
+            SimilarThumbEntry {
+                request_id,
+                stamp,
+                state: if target.is_some() {
+                    SimilarThumbEntryState::Pending {
+                        cancel: cancel
+                            .as_ref()
+                            .expect("target requests always allocate cancellation ownership")
+                            .clone(),
                     }
-                    crate::similar_index::SimilarItemTarget::ZipPage {
-                        zip_path,
-                        entry_name: _,
-                    } => {
-                        // DB identity は小文字化済み。ZIP の実エントリ名は大文字小文字を
-                        // 区別するため、worker 上で列挙結果から元の表記へ戻す。
-                        let resolved =
-                            crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
-                                .ok()
-                                .and_then(|entries| {
-                                    entries.entries.into_iter().find(|entry| {
-                                        crate::similar_index::item_key_for_zip_page(
-                                            &zip_path,
-                                            &entry.entry_name,
-                                        ) == item_key
-                                    })
-                                })
-                                .map(|entry| entry.entry_name);
-                        let Some(entry_name) = resolved else {
-                            let _ = result_tx.send(SimilarThumbResult {
-                                item_key,
-                                image: None,
-                            });
-                            repaint.request_repaint();
-                            return;
-                        };
-                        (zip_path, Some(entry_name), None)
-                    }
-                };
-                let pdf_password = pdf_page.and_then(|_| {
-                    pdf_passwords
-                        .as_ref()
-                        .and_then(|passwords| passwords.get(&path))
-                });
-                let (tx, rx) = std::sync::mpsc::channel();
-                let request = crate::thumb_loader::LoadRequest {
-                    path,
-                    zip_entry,
-                    pdf_page,
-                    pdf_password,
-                    mtime,
-                    file_size,
-                    source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
-                    priority: true,
-                    context_epoch,
-                    ..Default::default()
-                };
-                let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
-                let generated = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let stats =
-                    std::sync::Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default()));
-                let keep_start = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let keep_end = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
-                crate::thumb_loader::process_load_request(
-                    &request,
-                    &cache_map,
-                    &tx,
-                    None,
-                    thumb_px,
-                    thumb_quality,
-                    thumb_px,
-                    cache_decision,
-                    &generated,
-                    &stats,
-                    None,
-                    &keep_start,
-                    &keep_end,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-                let image = rx.try_iter().find_map(|message| message.image);
-                let _ = result_tx.send(SimilarThumbResult { item_key, image });
-                repaint.request_repaint();
+                } else {
+                    SimilarThumbEntryState::Failed
+                },
+            },
+        );
+        self.thumb_order.push_back(key.to_owned());
+
+        if let (Some(target), Some(cancel)) = (target, cancel) {
+            self.thumb_jobs.push_back(SimilarThumbJob {
+                request_id,
+                item_key: key.to_owned(),
+                target,
+                mtime,
+                file_size,
+                thumb_px,
+                thumb_quality,
+                cache_decision,
+                pdf_passwords: pdf_passwords.cloned(),
+                cancel,
             });
-        if spawned.is_err() {
-            self.thumbnails
-                .insert(key.to_owned(), SimilarThumbState::Failed);
+        }
+
+        while self.thumbnails.len() > SIMILAR_THUMB_CACHE_LIMIT {
+            let Some(oldest) = self.thumb_order.front().cloned() else {
+                break;
+            };
+            self.remove_thumbnail_request(&oldest);
+        }
+        debug_assert!(self.thumb_order.len() <= SIMILAR_THUMB_CACHE_LIMIT);
+        debug_assert!(self.thumb_jobs.len() <= SIMILAR_THUMB_CACHE_LIMIT);
+        // `finish_thumbnail_frame` is the single per-frame dispatch/upload owner. Starting work
+        // here would let every row bypass the visible-demand and upload budgets.
+        ctx.request_repaint();
+    }
+
+    fn thumbnail_state(&self, key: &str) -> Option<SimilarThumbState> {
+        self.thumbnails.get(key).map(|entry| match &entry.state {
+            SimilarThumbEntryState::Pending { .. } => SimilarThumbState::Loading,
+            SimilarThumbEntryState::Ready(texture) => SimilarThumbState::Ready(texture.clone()),
+            SimilarThumbEntryState::Failed => SimilarThumbState::Failed,
+        })
+    }
+
+    fn mark_thumbnail_demand(&self, key: &str, demand: &mut SimilarThumbDemand) {
+        if let Some(entry) = self.thumbnails.get(key) {
+            demand.insert(key.to_owned(), entry.request_id);
         }
     }
+
+    /// Snapshot fixtures need stable placeholders without starting filesystem workers.
+    fn insert_failed_snapshot_thumbnail(
+        &mut self,
+        key: String,
+        target: Option<crate::similar_index::SimilarItemTarget>,
+        mtime: i64,
+        file_size: i64,
+        thumb_px: u32,
+        thumb_quality: u8,
+    ) {
+        self.thumbnails.insert(
+            key,
+            SimilarThumbEntry {
+                request_id: 0,
+                stamp: SimilarThumbStamp {
+                    target,
+                    mtime,
+                    file_size,
+                    thumb_px,
+                    thumb_quality,
+                    pdf_credential_revision: 0,
+                },
+                state: SimilarThumbEntryState::Failed,
+            },
+        );
+    }
+
+    fn remove_thumbnail_request(&mut self, key: &str) {
+        use std::sync::atomic::Ordering;
+
+        if let Some(entry) = self.thumbnails.remove(key)
+            && let SimilarThumbEntryState::Pending { cancel } = entry.state
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.thumb_order.retain(|queued| queued != key);
+        self.thumb_jobs.retain(|job| job.item_key != key);
+    }
+}
+
+impl Drop for SimilarPanelState {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        for entry in self.thumbnails.values() {
+            if let SimilarThumbEntryState::Pending { cancel } = &entry.state {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl SimilarPanelState {
+    pub(crate) fn set_context_marker_for_test(&mut self, marker: &str) {
+        self.tab = MetadataPanelTab::Similar;
+        self.origin_key = Some(marker.to_owned());
+        self.last_ready = vec![Some(std::sync::Arc::new(
+            crate::similar_index::ItemQuery::Failed(format!("ready:{marker}")),
+        ))];
+    }
+
+    pub(crate) fn context_marker_for_test(&self) -> (bool, Option<String>, Option<String>) {
+        let last_ready = self
+            .last_ready
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|query| match query.as_ref() {
+                crate::similar_index::ItemQuery::Failed(marker) => Some(marker.clone()),
+                _ => None,
+            });
+        (
+            self.tab == MetadataPanelTab::Similar,
+            self.origin_key.clone(),
+            last_ready,
+        )
+    }
+
+    /// Put one result on this state's own channel without starting a filesystem worker.
+    pub(crate) fn queue_failed_completion_for_test(&mut self, key: &str) {
+        let request_id = self.thumb_next_request_id;
+        self.thumb_next_request_id = self.thumb_next_request_id.wrapping_add(1).max(1);
+        self.thumbnails.insert(
+            key.to_owned(),
+            SimilarThumbEntry {
+                request_id,
+                stamp: SimilarThumbStamp {
+                    target: None,
+                    mtime: 0,
+                    file_size: 0,
+                    thumb_px: 1,
+                    thumb_quality: 1,
+                    pdf_credential_revision: 0,
+                },
+                state: SimilarThumbEntryState::Pending {
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            },
+        );
+        self.thumb_running += 1;
+        self.thumb_tx
+            .send(SimilarThumbResult {
+                request_id,
+                item_key: key.to_owned(),
+                image: None,
+            })
+            .expect("test completion receiver remains owned by this state");
+    }
+
+    pub(crate) fn consume_completions_for_test(&mut self, ctx: &egui::Context) {
+        self.collect_thumbnail_results();
+        let demand = self
+            .thumbnails
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.request_id))
+            .collect();
+        self.apply_thumbnail_completions(ctx, &demand);
+    }
+
+    pub(crate) fn thumbnail_failed_for_test(&self, key: &str) -> bool {
+        matches!(self.thumbnail_state(key), Some(SimilarThumbState::Failed))
+    }
+}
+
+fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
+    use std::sync::atomic::Ordering;
+
+    if job.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let item_key = job.item_key.clone();
+    let (path, zip_entry, pdf_page) = match job.target {
+        crate::similar_index::SimilarItemTarget::File(path) => (path, None, None),
+        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
+            (pdf_path, None, Some(page_num))
+        }
+        crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name: _,
+        } => {
+            // DB identity is normalized, while ZIP entry lookup is case-sensitive. Resolve the
+            // actual entry spelling once inside the bounded worker.
+            let resolved = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
+                .ok()
+                .and_then(|entries| {
+                    entries.entries.into_iter().find(|entry| {
+                        crate::similar_index::item_key_for_zip_page(&zip_path, &entry.entry_name)
+                            == item_key
+                    })
+                })
+                .map(|entry| entry.entry_name);
+            (zip_path, Some(resolved?), None)
+        }
+    };
+    if job.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let pdf_password = pdf_page.and_then(|_| {
+        job.pdf_passwords
+            .as_ref()
+            .and_then(|passwords| passwords.get(&path))
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let request = crate::thumb_loader::LoadRequest {
+        path,
+        zip_entry,
+        pdf_page,
+        pdf_password,
+        mtime: job.mtime,
+        file_size: job.file_size,
+        source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
+        priority: true,
+        // Similar-panel requests own their cancellation token. They are deliberately outside
+        // the App-global grid/PDF epoch, just like fullscreen per-viewer render work.
+        context_epoch: 0,
+        ..Default::default()
+    };
+    let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+    let generated = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stats = std::sync::Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default()));
+    let keep_start = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keep_end = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    crate::thumb_loader::process_load_request(
+        &request,
+        &cache_map,
+        &tx,
+        None,
+        job.thumb_px,
+        job.thumb_quality,
+        job.thumb_px,
+        job.cache_decision,
+        &generated,
+        &stats,
+        Some(&job.cancel),
+        &keep_start,
+        &keep_end,
+        None,
+        None,
+        None,
+        None,
+    );
+    if job.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    rx.try_iter().find_map(|message| message.image)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +672,9 @@ struct SimilarPanelActions {
     peek_held: Option<crate::similar_index::QueryHit>,
     /// ページ帯から選ばれた相手の本のページ。
     open_page: Option<(String, crate::similar_index::SimilarItemTarget)>,
+    /// このフレームで実際に clip 内へ描いたサムネイル request。worker dispatch と GPU
+    /// upload はこの需要を優先し、スクロール外の旧要求で新しい表示を待たせない。
+    thumbnail_demand: SimilarThumbDemand,
 }
 
 /// 比較スロットから見た 1 件の状態。ボタンの見え方を決める。
@@ -1214,7 +1577,9 @@ impl App {
         let tweet_info = self.get_current_tweet_info();
         let sidecar_info = self.get_current_sidecar();
         let current_palette = self.current_fullscreen_color_palette();
-        self.similar_panel.poll_thumbnails(ctx);
+        // Collect CPU completions before drawing. Which of them may upload, and which queued jobs
+        // may start, is decided after the frame has produced its visible-card demand set.
+        self.similar_panel.begin_thumbnail_frame();
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
         let tag_rows = self.collect_fullscreen_tag_panel_rows();
@@ -1550,6 +1915,9 @@ impl App {
                     draw_no_metadata(ui);
                 }
             });
+
+        self.similar_panel
+            .finish_thumbnail_frame(ctx, &similar_actions.thumbnail_demand);
 
         if let Some(hit) = similar_actions.pin_hit.take() {
             self.pin_similar_hit(ctx, &hit, full_rect);
@@ -2634,17 +3002,6 @@ fn draw_similar_page_results(
         SimilarPanelModel::Results(matches) => {
             let origin = &matches.origin;
             let origin_path = similar_path_parts(origin.target.as_ref(), &origin.item_key);
-            state.ensure_thumbnail_for(
-                &origin.item_key,
-                origin.target.clone(),
-                origin.mtime,
-                origin.file_size,
-                thumb_px,
-                thumb_quality,
-                cache_decision,
-                pdf_passwords,
-                ctx,
-            );
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("表示中")
@@ -2657,13 +3014,27 @@ fn draw_similar_page_results(
                 }
             });
             ui.add_space(4.0);
-            draw_similar_card(
+            let origin_response = draw_similar_card(
                 ui,
-                state.thumbnails.get(&origin.item_key).cloned(),
+                state.thumbnail_state(&origin.item_key),
                 &similar_origin_line(origin),
                 &origin_path,
                 None,
             );
+            if ui.is_rect_visible(origin_response.rect) {
+                state.ensure_thumbnail_for(
+                    &origin.item_key,
+                    origin.target.clone(),
+                    origin.mtime,
+                    origin.file_size,
+                    thumb_px,
+                    thumb_quality,
+                    cache_decision,
+                    pdf_passwords,
+                    ctx,
+                );
+                state.mark_thumbnail_demand(&origin.item_key, &mut actions.thumbnail_demand);
+            }
             ui.add_space(10.0);
 
             let mut previous_band = None;
@@ -2686,23 +3057,28 @@ fn draw_similar_page_results(
                     previous_band = Some(hit.band);
                 }
 
-                state.ensure_thumbnail(
-                    hit,
-                    thumb_px,
-                    thumb_quality,
-                    cache_decision,
-                    pdf_passwords,
-                    ctx,
-                );
-
                 let response = draw_similar_card(
                     ui,
-                    state.thumbnails.get(&hit.item_key).cloned(),
+                    state.thumbnail_state(&hit.item_key),
                     &similar_difference_line(hit, origin),
                     &similar_path_parts(hit.target.as_ref(), &hit.item_key),
                     Some(&origin_path),
                 )
                 .interact(egui::Sense::click());
+                // Query results can exceed the 512-entry cache. Admit only rows that can be
+                // painted; admitting every clipped row each frame would evict the whole previous
+                // frame before any worker completion could still match its request id.
+                if ui.is_rect_visible(response.rect) {
+                    state.ensure_thumbnail(
+                        hit,
+                        thumb_px,
+                        thumb_quality,
+                        cache_decision,
+                        pdf_passwords,
+                        ctx,
+                    );
+                    state.mark_thumbnail_demand(&hit.item_key, &mut actions.thumbnail_demand);
+                }
                 let response = response.on_hover_text("クリックでこの画像へ移動");
                 response.context_menu(|ui| {
                     if ui.button("パスをコピー").clicked() {
@@ -3109,7 +3485,8 @@ fn draw_page_strip(
         pdf_passwords,
         ctx,
     );
-    let thumb = state.thumbnails.get(&item_key).cloned();
+    state.mark_thumbnail_demand(&item_key, &mut actions.thumbnail_demand);
+    let thumb = state.thumbnail_state(&item_key);
     let caption = format!(
         "この本の {} ページ目 → 相手の {} ページ目",
         page + 1,
@@ -3474,13 +3851,23 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                         hits,
                     };
                     let mut state = SimilarPanelState::default();
-                    state
-                        .thumbnails
-                        .insert(matches.origin.item_key.clone(), SimilarThumbState::Failed);
+                    state.insert_failed_snapshot_thumbnail(
+                        matches.origin.item_key.clone(),
+                        matches.origin.target.clone(),
+                        matches.origin.mtime,
+                        matches.origin.file_size,
+                        72,
+                        85,
+                    );
                     for hit in &matches.hits {
-                        state
-                            .thumbnails
-                            .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+                        state.insert_failed_snapshot_thumbnail(
+                            hit.item_key.clone(),
+                            hit.target.clone(),
+                            hit.mtime,
+                            hit.file_size,
+                            72,
+                            85,
+                        );
                     }
                     let mut actions = SimilarPanelActions::default();
                     let ctx = ui.ctx().clone();
@@ -4360,10 +4747,13 @@ mod format_datetime_tests {
 #[cfg(test)]
 mod similar_panel_tests {
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     use super::{
-        SimilarPanelModel, SimilarPeekTransition, decide_similar_peek, similar_copy_path_text,
-        similar_difference_line, similar_location_line, similar_panel_model, summarize_page_strip,
+        SIMILAR_THUMB_CACHE_LIMIT, SIMILAR_THUMB_WORKER_LIMIT, SimilarPanelModel,
+        SimilarPanelState, SimilarPeekTransition, SimilarThumbResult, SimilarThumbState,
+        decide_similar_peek, similar_copy_path_text, similar_difference_line,
+        similar_location_line, similar_panel_model, summarize_page_strip,
     };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
@@ -4580,6 +4970,484 @@ mod similar_panel_tests {
             vec![4]
         );
         assert!(super::similar_shown_indices(None, SpreadPair::Single).is_empty());
+    }
+
+    fn request_test_thumbnail(
+        state: &mut SimilarPanelState,
+        key: &str,
+        target: crate::similar_index::SimilarItemTarget,
+        mtime: i64,
+        passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+        ctx: &egui::Context,
+    ) {
+        state.ensure_thumbnail_for(
+            key,
+            Some(target),
+            mtime,
+            200,
+            72,
+            85,
+            crate::thumb_loader::CacheDecision::without_thumbnail(),
+            passwords,
+            ctx,
+        );
+    }
+
+    fn one_pixel_image(color: egui::Color32) -> egui::ColorImage {
+        egui::ColorImage::new([1, 1], vec![color])
+    }
+
+    fn demand_for(state: &SimilarPanelState, keys: &[&str]) -> super::SimilarThumbDemand {
+        keys.iter()
+            .filter_map(|key| {
+                state
+                    .thumbnails
+                    .get(*key)
+                    .map(|entry| ((*key).to_owned(), entry.request_id))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thumbnail_admission_is_bounded_and_cancels_the_oldest_request() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        request_test_thumbnail(
+            &mut state,
+            "item-0",
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/item-0.png")),
+            1,
+            None,
+            &ctx,
+        );
+        let super::SimilarThumbEntryState::Pending {
+            cancel: oldest_cancel,
+        } = &state.thumbnails["item-0"].state
+        else {
+            panic!("file request has a cancellation owner")
+        };
+        let oldest_cancel = oldest_cancel.clone();
+        for index in 1..=SIMILAR_THUMB_CACHE_LIMIT {
+            request_test_thumbnail(
+                &mut state,
+                &format!("item-{index}"),
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from(format!(
+                    "c:/item-{index}.png"
+                ))),
+                1,
+                None,
+                &ctx,
+            );
+        }
+
+        assert_eq!(state.thumbnails.len(), SIMILAR_THUMB_CACHE_LIMIT);
+        assert_eq!(state.thumb_order.len(), SIMILAR_THUMB_CACHE_LIMIT);
+        assert_eq!(state.thumb_jobs.len(), SIMILAR_THUMB_CACHE_LIMIT);
+        assert!(!state.thumbnails.contains_key("item-0"));
+        assert!(oldest_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn same_source_is_reused_across_global_epoch_bumps_and_stale_completion_is_ignored() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        let first_target =
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/same.png"));
+        request_test_thumbnail(&mut state, "same", first_target.clone(), 1, None, &ctx);
+        let first_id = state.thumbnails["same"].request_id;
+        let super::SimilarThumbEntryState::Pending {
+            cancel: first_cancel,
+        } = &state.thumbnails["same"].state
+        else {
+            panic!("request has a cancellation owner")
+        };
+        let first_cancel = first_cancel.clone();
+
+        crate::pdf_loader::bump_render_context_epoch();
+        request_test_thumbnail(&mut state, "same", first_target, 1, None, &ctx);
+        assert_eq!(state.thumbnails["same"].request_id, first_id);
+        assert_eq!(
+            state.thumb_jobs.len(),
+            1,
+            "same source must reuse pending work"
+        );
+
+        request_test_thumbnail(
+            &mut state,
+            "same",
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/replacement.png")),
+            2,
+            None,
+            &ctx,
+        );
+        let replacement_id = state.thumbnails["same"].request_id;
+        assert_ne!(replacement_id, first_id);
+        assert!(first_cancel.load(Ordering::Relaxed));
+        state.thumb_completions.push_back(SimilarThumbResult {
+            request_id: first_id,
+            item_key: "same".to_owned(),
+            image: Some(one_pixel_image(egui::Color32::RED)),
+        });
+        state.thumb_completions.push_back(SimilarThumbResult {
+            request_id: replacement_id,
+            item_key: "same".to_owned(),
+            image: None,
+        });
+
+        let demand = demand_for(&state, &["same"]);
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 0);
+        assert!(matches!(
+            state.thumbnail_state("same"),
+            Some(SimilarThumbState::Failed)
+        ));
+    }
+
+    #[test]
+    fn pdf_password_revision_retries_only_that_unchanged_pdf() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        let pdf = PathBuf::from("c:/locked.pdf");
+        let target = crate::similar_index::SimilarItemTarget::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num: 3,
+        };
+        let mut passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        request_test_thumbnail(
+            &mut state,
+            "locked#3",
+            target.clone(),
+            1,
+            Some(&passwords),
+            &ctx,
+        );
+        let first_id = state.thumbnails["locked#3"].request_id;
+        passwords.bump_credential_revision_for_test(&pdf);
+        request_test_thumbnail(&mut state, "locked#3", target, 1, Some(&passwords), &ctx);
+        assert_ne!(state.thumbnails["locked#3"].request_id, first_id);
+    }
+
+    #[test]
+    fn completion_upload_is_limited_across_multiple_polls_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        for key in ["a", "b"] {
+            request_test_thumbnail(
+                &mut state,
+                key,
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from(format!(
+                    "c:/{key}.png"
+                ))),
+                1,
+                None,
+                &ctx,
+            );
+        }
+        let demand = demand_for(&state, &["a", "b"]);
+        let jobs = state.take_thumbnail_jobs_for_dispatch(&demand);
+        assert_eq!(jobs.len(), 2);
+        for (job, color) in jobs
+            .into_iter()
+            .zip([egui::Color32::RED, egui::Color32::BLUE])
+        {
+            state
+                .thumb_tx
+                .send(SimilarThumbResult {
+                    request_id: job.request_id,
+                    item_key: job.item_key,
+                    image: Some(one_pixel_image(color)),
+                })
+                .unwrap();
+        }
+        state.collect_thumbnail_results();
+
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 1);
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 0);
+        assert!(matches!(
+            state.thumbnail_state("a"),
+            Some(SimilarThumbState::Ready(_))
+        ));
+        assert!(matches!(
+            state.thumbnail_state("b"),
+            Some(SimilarThumbState::Loading)
+        ));
+
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 1);
+        assert!(matches!(
+            state.thumbnail_state("b"),
+            Some(SimilarThumbState::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn dispatcher_counts_cancelled_workers_until_their_terminal_result_drains() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        for index in 0..10 {
+            request_test_thumbnail(
+                &mut state,
+                &format!("queued-{index}"),
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from(format!(
+                    "c:/queued-{index}.png"
+                ))),
+                1,
+                None,
+                &ctx,
+            );
+        }
+
+        let all_keys = (0..10)
+            .map(|index| format!("queued-{index}"))
+            .collect::<Vec<_>>();
+        let demand = all_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let demand = demand_for(&state, &demand);
+        let dispatched = state.take_thumbnail_jobs_for_dispatch(&demand);
+        assert_eq!(dispatched.len(), SIMILAR_THUMB_WORKER_LIMIT);
+        assert_eq!(state.thumb_running, SIMILAR_THUMB_WORKER_LIMIT);
+        let cancelled = &dispatched[0];
+        let cancelled_flag = cancelled.cancel.clone();
+        state.remove_thumbnail_request(&cancelled.item_key);
+        assert!(cancelled_flag.load(Ordering::Relaxed));
+        assert_eq!(
+            state.thumb_running, SIMILAR_THUMB_WORKER_LIMIT,
+            "cancelled work remains part of the running budget until it reports terminal"
+        );
+        assert!(state.take_thumbnail_jobs_for_dispatch(&demand).is_empty());
+
+        state
+            .thumb_tx
+            .send(SimilarThumbResult {
+                request_id: cancelled.request_id,
+                item_key: cancelled.item_key.clone(),
+                image: None,
+            })
+            .unwrap();
+        state.collect_thumbnail_results();
+        state.apply_thumbnail_completions(&ctx, &demand);
+        assert_eq!(state.thumb_running, SIMILAR_THUMB_WORKER_LIMIT - 1);
+        assert_eq!(state.take_thumbnail_jobs_for_dispatch(&demand).len(), 1);
+        assert_eq!(state.thumb_running, SIMILAR_THUMB_WORKER_LIMIT);
+    }
+
+    #[test]
+    fn request_completion_eviction_and_late_results_share_one_identity_pipeline() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        request_test_thumbnail(
+            &mut state,
+            "first",
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/first.png")),
+            1,
+            None,
+            &ctx,
+        );
+        let first_demand = demand_for(&state, &["first"]);
+        let mut first_job = state.take_thumbnail_jobs_for_dispatch(&first_demand);
+        assert_eq!(first_job.len(), 1);
+        let first_job = first_job.pop().unwrap();
+        state
+            .thumb_tx
+            .send(SimilarThumbResult {
+                request_id: first_job.request_id,
+                item_key: first_job.item_key.clone(),
+                image: Some(one_pixel_image(egui::Color32::GREEN)),
+            })
+            .unwrap();
+        state.collect_thumbnail_results();
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &first_demand).0, 1);
+        assert!(matches!(
+            state.thumbnail_state("first"),
+            Some(SimilarThumbState::Ready(_))
+        ));
+
+        for index in 0..SIMILAR_THUMB_CACHE_LIMIT {
+            request_test_thumbnail(
+                &mut state,
+                &format!("later-{index}"),
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from(format!(
+                    "c:/later-{index}.png"
+                ))),
+                1,
+                None,
+                &ctx,
+            );
+        }
+        assert_eq!(state.thumbnails.len(), SIMILAR_THUMB_CACHE_LIMIT);
+        assert!(!state.thumbnails.contains_key("first"));
+
+        for image in [Some(one_pixel_image(egui::Color32::YELLOW)), None] {
+            state
+                .thumb_tx
+                .send(SimilarThumbResult {
+                    request_id: first_job.request_id,
+                    item_key: first_job.item_key.clone(),
+                    image,
+                })
+                .unwrap();
+        }
+        state.collect_thumbnail_results();
+        state.apply_thumbnail_completions(&ctx, &Default::default());
+        assert!(
+            !state.thumbnails.contains_key("first"),
+            "late success and failure must not resurrect an evicted request"
+        );
+    }
+
+    #[test]
+    fn current_visible_demand_overtakes_old_queued_and_completed_work() {
+        let ctx = egui::Context::default();
+        let mut state = SimilarPanelState::default();
+        for index in 0..100 {
+            request_test_thumbnail(
+                &mut state,
+                &format!("old-{index}"),
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from(format!(
+                    "c:/old-{index}.png"
+                ))),
+                1,
+                None,
+                &ctx,
+            );
+        }
+        request_test_thumbnail(
+            &mut state,
+            "new-visible",
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/new-visible.png")),
+            1,
+            None,
+            &ctx,
+        );
+        let demand = demand_for(&state, &["new-visible"]);
+        let jobs = state.take_thumbnail_jobs_for_dispatch(&demand);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].item_key, "new-visible");
+
+        for index in 0..100 {
+            let key = format!("old-{index}");
+            state
+                .thumb_tx
+                .send(SimilarThumbResult {
+                    request_id: state.thumbnails[&key].request_id,
+                    item_key: key,
+                    image: Some(one_pixel_image(egui::Color32::GRAY)),
+                })
+                .unwrap();
+        }
+        state
+            .thumb_tx
+            .send(SimilarThumbResult {
+                request_id: jobs[0].request_id,
+                item_key: jobs[0].item_key.clone(),
+                image: Some(one_pixel_image(egui::Color32::WHITE)),
+            })
+            .unwrap();
+        state.collect_thumbnail_results();
+
+        assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 1);
+        assert!(matches!(
+            state.thumbnail_state("new-visible"),
+            Some(SimilarThumbState::Ready(_))
+        ));
+        assert_eq!(
+            state.thumb_completions.len(),
+            100,
+            "offscreen CPU results stay cached without delaying the current visible result"
+        );
+    }
+
+    #[test]
+    fn clipped_large_results_admit_only_visible_cards_and_keep_request_ids_stable() {
+        let ctx = egui::Context::default();
+        let origin = crate::similar_index::OriginItem {
+            item_key: "c:/origin.png".to_owned(),
+            kind: ItemKind::Image,
+            mtime: 1,
+            file_size: 100,
+            width: 100,
+            height: 100,
+            format: SimilarImageFormat::Png,
+            target: Some(crate::similar_index::SimilarItemTarget::File(
+                PathBuf::from("c:/origin.png"),
+            )),
+        };
+        let hits = (0..600)
+            .map(|index| QueryHit {
+                item_id: index + 1,
+                item_key: format!("c:/hit-{index}.png"),
+                kind: ItemKind::Image,
+                container_key: None,
+                page_index: None,
+                distance: 1,
+                band: MatchBand::NearlyIdentical,
+                mtime: 1,
+                file_size: 100,
+                width: 100,
+                height: 100,
+                format: SimilarImageFormat::Png,
+                target: Some(crate::similar_index::SimilarItemTarget::File(
+                    PathBuf::from(format!("c:/hit-{index}.png")),
+                )),
+            })
+            .collect();
+        let matches = crate::similar_index::ItemMatches { origin, hits };
+        let mut state = SimilarPanelState::default();
+
+        let draw_frame = |state: &mut SimilarPanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(420.0, 420.0),
+                    ));
+                    let view = super::SimilarPageView {
+                        heading: None,
+                        item_key: Some(matches.origin.item_key.as_str()),
+                        model: SimilarPanelModel::Results(&matches),
+                        showing_previous: false,
+                    };
+                    let mut actions = super::SimilarPanelActions::default();
+                    super::draw_similar_page_results(
+                        ui,
+                        &view,
+                        state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        None,
+                        false,
+                        ctx,
+                        &mut actions,
+                    );
+                });
+            });
+        };
+        draw_frame(&mut state);
+        let first_frame = state
+            .thumb_order
+            .iter()
+            .map(|key| (key.clone(), state.thumbnails[key].request_id))
+            .collect::<Vec<_>>();
+        assert!(
+            first_frame.len() > 1,
+            "the clip should include at least one hit"
+        );
+        assert!(
+            first_frame.len() < SIMILAR_THUMB_CACHE_LIMIT,
+            "clipped rows must not enter the bounded cache: {}",
+            first_frame.len()
+        );
+
+        draw_frame(&mut state);
+        let second_frame = state
+            .thumb_order
+            .iter()
+            .map(|key| (key.clone(), state.thumbnails[key].request_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            second_frame, first_frame,
+            "a second frame must reuse visible requests instead of cycling all 600 rows"
+        );
     }
 
     /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を

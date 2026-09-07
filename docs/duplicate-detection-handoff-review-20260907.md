@@ -177,7 +177,13 @@ passive窓は保存された表示を描画しており、activeパネルとは�
    既存の不安定テストを無効化せず、発生時の状態を記録する。
 5. 実装変更後はfmt、関連test、UI文字変更時glyphチェックを通して `scripts/build-dev.ps1` を実行する。
    native/release依存の変更ならAGENTSの該当build規則を適用。利用者に渡すまでのbuild成功を実ログで確認する。
-6. 通常profileの起動は利用者のみ。installed/tray版を閉じてから
+6. 以下はレビュー時点の既定手順。**2026-09-07の利用者指示により、このdupeブランチの
+   検証用成果物は従来の `target/portable-dev` に変更する。**
+   `scripts/update-portable-dev.ps1` のdata保持経路を使い、`-Seed`は使わない。
+   既存の `data` / `data-remote` を初期化せず、実行中の検証アプリは更新時に利用者が終了する。
+   エージェント用の使い捨てsmokeと、利用者が蓄積したportable索引を混同しない。
+   他ブランチの通常profileビルド規則は変更しない。
+   通常profileを別途必要とする場合の起動は利用者のみ。installed/tray版を閉じてから
    `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
    `%APPDATA%\mimageviewer` の実設定・データを更新し得る旨と、修正内容ごとの具体的確認手順を必ず添える。
    エージェント実機UIは `prepare-portable-smoke.ps1` による使い捨て環境のみ。
