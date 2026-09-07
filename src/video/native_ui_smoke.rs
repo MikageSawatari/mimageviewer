@@ -840,8 +840,7 @@ fn coherent_targets(
             let Some(requested) = render.requested_source_epoch.upgrade() else {
                 continue;
             };
-            if render.actual_source_epoch == 0
-                || requested.load(Ordering::Acquire) != render.actual_source_epoch
+            if requested.load(Ordering::Acquire) != render.actual_source_epoch
                 || !render.geometry.valid()
             {
                 continue;
@@ -1212,8 +1211,12 @@ mod tests {
 
     impl ReceiptFixture {
         fn new() -> Self {
+            Self::with_source_epoch(7)
+        }
+
+        fn with_source_epoch(source_epoch: u64) -> Self {
             let broker = Broker::new();
-            let requested = Arc::new(AtomicU64::new(7));
+            let requested = Arc::new(AtomicU64::new(source_epoch));
             let output = NativeUiSmokeOutputId(91);
             let host_key = PublisherKey { output, nonce: 92 };
             let render_key = PublisherKey { output, nonce: 93 };
@@ -1236,7 +1239,7 @@ mod tests {
                     RenderSnapshot {
                         publisher: render_key,
                         requested_source_epoch: Arc::downgrade(&requested),
-                        actual_source_epoch: 7,
+                        actual_source_epoch: source_epoch,
                         generation: 4,
                         placement: NativeVideoPlacement::DetachedViewerChild,
                         owner_hwnd: 0x100,
@@ -1278,7 +1281,7 @@ mod tests {
                 },
                 render: NativeUiSmokeRenderReceipt {
                     output,
-                    actual_source_epoch: 7,
+                    actual_source_epoch: source_epoch,
                     generation: 4,
                     placement: NativeVideoPlacement::DetachedViewerChild,
                     owner_hwnd: 0x100,
@@ -1319,8 +1322,8 @@ mod tests {
     }
 
     #[test]
-    fn coherent_target_requires_requested_and_actual_source_to_match() {
-        let requested = Arc::new(AtomicU64::new(8));
+    fn coherent_target_accepts_initial_zero_and_rejects_one_sided_advance() {
+        let requested = Arc::new(AtomicU64::new(0));
         let output = NativeUiSmokeOutputId(1);
         let host_key = PublisherKey { output, nonce: 1 };
         let render_key = PublisherKey { output, nonce: 2 };
@@ -1341,7 +1344,7 @@ mod tests {
             RenderSnapshot {
                 publisher: render_key,
                 requested_source_epoch: Arc::downgrade(&requested),
-                actual_source_epoch: 7,
+                actual_source_epoch: 0,
                 generation: 4,
                 placement: NativeVideoPlacement::DetachedViewerChild,
                 owner_hwnd: 0x100,
@@ -1350,15 +1353,26 @@ mod tests {
                 geometry_version: 1,
             },
         );
+        assert_eq!(
+            coherent_targets(&state, 0x100, [0.5, 0.5]).unwrap().len(),
+            1
+        );
+        requested.store(1, Ordering::Release);
         assert!(
             coherent_targets(&state, 0x100, [0.5, 0.5])
                 .unwrap()
                 .is_empty()
         );
-        requested.store(7, Ordering::Release);
-        assert_eq!(
-            coherent_targets(&state, 0x100, [0.5, 0.5]).unwrap().len(),
-            1
+        requested.store(0, Ordering::Release);
+        state
+            .renders
+            .get_mut(&render_key)
+            .unwrap()
+            .actual_source_epoch = 1;
+        assert!(
+            coherent_targets(&state, 0x100, [0.5, 0.5])
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1461,24 +1475,49 @@ mod tests {
 
     #[test]
     fn both_receipt_orders_require_the_second_route_before_completion() {
+        for source_epoch in [0, 7] {
+            for render_first in [false, true] {
+                let fixture = ReceiptFixture::with_source_epoch(source_epoch);
+                fixture.begin();
+                if render_first {
+                    record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+                } else {
+                    record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+                }
+                assert_eq!(fixture.completion().unwrap(), None);
+
+                if render_first {
+                    record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+                } else {
+                    record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+                }
+                assert_eq!(
+                    fixture.completion().unwrap(),
+                    Some([fixture.pump.event_x, fixture.pump.event_y])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initial_zero_receipts_reject_a_requested_source_advance_mid_step() {
         for render_first in [false, true] {
-            let fixture = ReceiptFixture::new();
+            let fixture = ReceiptFixture::with_source_epoch(0);
             fixture.begin();
             if render_first {
                 record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
             } else {
                 record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
             }
-            assert_eq!(fixture.completion().unwrap(), None);
-
+            fixture.requested.store(1, Ordering::Release);
             if render_first {
                 record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
             } else {
                 record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
             }
-            assert_eq!(
-                fixture.completion().unwrap(),
-                Some([fixture.pump.event_x, fixture.pump.event_y])
+            assert!(
+                fixture.completion().is_err(),
+                "a one-sided source advance must invalidate zero-epoch completion"
             );
         }
     }

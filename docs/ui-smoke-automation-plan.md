@@ -31,6 +31,16 @@
 固定、build前後のsource fingerprint照合、gitから除外された埋込SVG等の明示列挙を
 追加した。準備不成立はexit 2、実行済みRhai assertionは1、timeoutは124として区別する。
 
+prepareは毎回smokeのdataを作り直すため、runnerは次回準備の前に消えないrun固有の
+証跡ディレクトリへ、使い捨てdataの実行ログ・build manifest・シナリオ識別・終了結果を保存する。
+成功だけでなくassertion失敗・環境不成立・timeoutも保持する。初回liveでは担当が同じ退避を
+行い、runnerへの保存処理の統合前に次シナリオのprepareでログを消さない。
+
+実UI試験では対話desktopへアクセスできる環境を使う。今回のdefault sandboxは
+GetForegroundWindowが0で、承認されたsandbox外の同じread-only呼出しでは非0だった。
+build/単体検証の成功と対話入力環境の成立を区別し、foreground不成立を通常handlerの
+guard弱化で迂回しない。sandbox外でも起動可能なアプリはexact disposable portableだけである。
+
 既存の`page-turn-smoke.ps1`はnormal coreを起動する経路があるため、その起動処理は流用しない。
 通常profileの設定・画像・DBをsmokeデータへコピーしない。
 現`lib.rs`は`--test-script`実行時にsingle-instance取得・既存instanceへのactivate/open-path
@@ -123,6 +133,11 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   単純なmappingは従来動作を変える。既存handler/guardを再実装せずLegacyの互換性を保つ。
   新S1/S2シナリオは必ず明示selectし、Targetedであることを記録・assertする。
   Legacyの成功を複数窓への固定配送の証明には使わない。
+- bootstrapはRootのexact hostと対象contentの準備を待ち、select_root後のTargeted actionが
+  通常Focusと実consumer ackを担当する。初期待機へLegacy foreground由来の
+  target_registered/focusedを要求しない。初回liveでRoot/items準備済みでもこの2値だけfalseと
+  なって停止し、Targeted Focusへ進めない順序の誤りを確認したため修正する。
+  通常handlerのfocus/owner guardとLegacy key APIの前提は維持する。
 - `Keymap`の5つのconsume/peek入口は既に`&egui::Context`を受け取るので、そこから
   test-script consumerへctxを伝える。`keyboard_owner_for_pass`の既存pass境界を使って
   実行中の論理ownerを公開し、Targetedのownerと一致するhandlerだけに渡す。
@@ -224,6 +239,11 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
   egui viewport破棄は別であり、同じviewportの新ownerへcleanup Upを送らない。
   元surfaceへの安全な解放を証明できない場合は環境不成立としてrunを終了し、
   使い捨てアプリの終了まで確認する。後続操作やPASSへ進めない。
+- 配送済みDownのhandler成功receiptが欠けても取消を停止させない。元showの処理終了と
+  操作成功を別の証拠にし、終了後は同じ生存ownerへのcleanupへ進める。
+  CleanupUpはdrag閾値到達を前提にせず、exact Up配送・primary level解除・同ownerの
+  処理終了で確認する。取消中も元stepとcleanup stepのobserverを有効にする。
+  Move/Upのheld_beforeはreducerが所有する最後の配送座標から生成し、callerへ委ねない。
 - seek track自身によるpage変更はgestureのhost変更ではない。同じwindow/context内の
   page着地を許し、actual landingをnavigation後に検証する。入力中の物理pointer混入は
   合成gestureの成功証明から除外し、通常入力を抑止する代わりに明示的な環境不成立とする。
@@ -238,6 +258,8 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
 - activeのnavigation処理はshow_viewport_immediate復帰後にある。widgetが捕捉したstep ID・
   child witness・handler結果をframe-local値で運び、navigation後の実App ownerとjoinしてackする。
   その時点のactive witnessはROOTへ復元済みなので、child証拠の代用にしない。
+- 入力前の初回region geometryにも実callbackのviewport/backend witnessを保持する。
+  show前のownerを描画証拠へ付け直さず、host登録後にexact joinしてから公開する。
 - eguiの同じrunは複数passを回せる。初期案の「各passでreceiptをclearし最終passだけ採用」は
   Solの実egui probeで反証された。request_discardで2passを強制すると、releaseの
   Moved(final)→Upはpass1だけdrag_stopped=true/interact_posあり、pass2はfalse/Noneとなる。
@@ -303,6 +325,9 @@ Button/capture/zoom/panel/modalを一度に実装せず、実WM→両route→ren
 - 実sourceの正本はrenderの`PresenterSourceState.source_epoch`。UI側のAtomicは
   `SwitchSource`送信前に進むため、実sourceの代わりにしない。ただし両者が不一致な
   切替途中はprepareを成立させない。一致条件としてのみUI値を利用する。
+- 初回source epochは0が正当である。publisherとtyped PresenterSourceStateが存在し、
+  requestedとactualが一致することを確認し、数値0を未準備sentinelにしない。
+  初回対話liveでこの診断側の設計誤りを発見した。世代値とseek serialを混同しない。
 - `NativeVideoInputRegion`・同layoutのeffective ppp・render width/heightを同時に保持する。
   同placement内のresize/DPI/予約panel変更もあるため、SendInput直前に実client extentと照合し、
   render消費時にもsource/placement/geometryを再検証する。geometry versionは内容の変更を
@@ -368,8 +393,25 @@ ClickToShowへ切り替え、端moveで描画されるcalloutをクリックす�
 panは動かせる倍率へ上げてdown→move→upを通し、center変化、scale不変、再生toggleなし、
 drag state解放を確認する。Appへの送信成功とsource epoch検査後の実適用receiptを区別する。
 
-buttonを使う段階は、SendInputがDownを1件挿入した時点で同じtyped transactionがUpの
-後始末を所有する。Down receiptを待ってから所有を開始しない。期限/owner変更/元HWND退去でも
+buttonを使う段階は、runner側の入力driverがDown/UpのSendInputとtyped transactionを
+単独所有する。アプリ側はprepared target・fresh owner検査・実配送receiptを提供する。
+SendInputがDownを1件挿入した時点でdriverがUpの後始末を所有し、Down receiptを待たない。
+アプリ内送信後に外部へ通知する案では、Down挿入直後・通知前にrunnerがアプリをKillする
+隙間が残るため採用しない。アプリ内RAIIと短いstep期限だけでは、既存runnerの強制終了経路を
+覆えないという独立レビューにより、当初のアプリ内所有案を修正した。
+runnerのtimeout/finallyはdriverのcleanupを先に行い、アプリの異常終了やIPC切断後も
+driverが自分の挿入済みDownを解放する。外部所有はbuttonに限定し、move/wheelは既存の
+アプリ側SendInputを維持する。専用の一時named pipeとrunner内C#処理threadを使い、
+current SIDのDACL・remote拒否・first-instance・双方のexact PID検査を行う。
+PS5.1/PS7互換のCreateNamedPipeW→SafePipeHandle→NamedPipeServerStreamを候補とする。
+要求は長さ制限付きのversion/session/gesture/step/固定target/point/tag/期限だけとし、
+同時1件・再送なし。アプリは実WMが返信より先着する場合に備えてreceiptを先に登録する。
+外部driverは直前のPID/HWND/foreground/cursorを確認するが、logical context/source世代は
+Windowsから認証できないため、アプリ側のfresh barrierとreceipt後照合を維持する。
+Down後・返信前のアプリ終了、EOF、runner timeoutとの競合、挿入0件、Up失敗、
+期限切れ・重複要求・異PID・解放後の重複cleanupを回帰対象とする。
+この構成は親と独立Astraの実装前レビュー済みで、実装・OS検証はまだ行っていない。
+期限/owner変更/元HWND退去でも
 この義務を捨てず、通常操作とは別の短いcleanup期限で移動なしのglobal LeftUpを試みる。
 cleanupで元の失敗を成功へ変換せず、AppのZoomPanを診断コードで直接resetしない。
 正常完了は実Up配送・pump側のcapture解放・UI handler後のZoomPan解放を揃える。
@@ -414,14 +456,16 @@ strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさ�
 
 ## 検証記録
 
-S0はscript実装・静的検証・独立レビューを完了。実artifactのbuild・起動は未実施。
+S0はscript実装・静的検証・独立レビューと実artifactのbuild/prepareを完了。
 S1aは実装・焦点23テスト・feature有無のcore check・独立レビューを完了。
 S1bは対象配送とbackend host観測を実装し、独立source reviewを完了。
 最終検証はfeatureあり対象37件、featureなしlib test対象29件、manager関連7件、
 backend witness 3件が成功。通常/診断core checkと通常dependencyへのfeature非混入も確認。
-S2は実egui probeでmultipass前提を修正し、実装前の設計段階。
+対話desktopでのMultiWindowPdf run4はexit 0。複数窓PDFの自動確認は成功した。
+S2は実egui probeでmultipass前提を修正し、ignoredコピー上の実装草案を準備中。
+standaloneのpointer reducer 11件、show/geometry reducer 11件成功はApp統合試験と区別する。
 S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
 通常/feature core check、owner/classification/期限/worker token回帰を完了。
-実portable入力は未実施である。
-複数窓PDF・列drag・動画zoomを自動化済みとは扱わない。
+S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch0誤判定で入力前に停止した。
+列drag・動画zoomを自動化済みとは扱わない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。

@@ -253,6 +253,7 @@ public static class MivUiSmokeWindow
 }
 
 $arguments = @(
+    '--perf-log',
     '--data-dir', $dataDir,
     '--test-script', $scriptPath,
     '--settings-override', $settingsPath,

@@ -19,6 +19,46 @@ fn root_host_ready(s) {
     false
 }
 
+fn log_bootstrap_snapshot(s) {
+    let root_count = 0;
+    let ready_root_count = 0;
+    for window in s.windows {
+        if window.role == "root" {
+            root_count += 1;
+            if window.host_ready {
+                ready_root_count += 1;
+            }
+        }
+        log("multi-window-pdf: bootstrap-window"
+            + " role=" + window.role
+            + " window_id=" + window.window_id
+            + " context_serial=" + window.context_serial
+            + " viewport=" + window.viewport
+            + " host_incarnation=" + window.host_incarnation
+            + " hwnd=" + window.hwnd
+            + " backend_token=" + window.backend_token
+            + " host_ready=" + window.host_ready
+            + " residence=" + window.residence
+            + " media_kind=" + window.media_kind
+            + " page_index=" + window.page_index
+            + " items_generation=" + window.items_generation);
+    }
+    log("multi-window-pdf: bootstrap"
+        + " is_fullscreen=" + s.is_fullscreen
+        + " target_registered=" + s.target_registered
+        + " focused=" + s.focused
+        + " items_len=" + s.items_len
+        + " pending_thumbs=" + s.pending_thumbs
+        + " target_viewport=" + s.target_viewport
+        + " target_rendered=" + s.target_rendered
+        + " root_count=" + root_count
+        + " ready_root_count=" + ready_root_count
+        + " check_not_fullscreen=" + !s.is_fullscreen
+        + " check_items_len_2=" + (s.items_len == 2)
+        + " check_pending_zero=" + (s.pending_thumbs == 0)
+        + " check_root_ready=" + (ready_root_count > 0));
+}
+
 fn same_identity(actual, expected) {
     actual.role == expected.role
         && actual.window_id == expected.window_id
@@ -72,15 +112,20 @@ fn sibling_unchanged(s, expected) {
 }
 
 log("multi-window-pdf: wait for the root grid and host identity");
-wait_until(|s|
-    !s.is_fullscreen
-        && s.target_registered
-        && s.focused
-        && s.items_len == 2
-        && s.pending_thumbs == 0
-        && root_host_ready(s),
-    30000
-);
+try {
+    wait_until(|s|
+        !s.is_fullscreen
+            && s.items_len == 2
+            && s.pending_thumbs == 0
+            && root_host_ready(s),
+        30000
+    );
+} catch (error) {
+    log_bootstrap_snapshot(snapshot());
+    throw;
+}
+log("multi-window-pdf: bootstrap wait satisfied");
+log_bootstrap_snapshot(snapshot());
 
 let root_target = select_root();
 if root_target.target_mode != "targeted" || !root_target.current {
