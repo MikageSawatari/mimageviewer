@@ -609,7 +609,8 @@ Microsoftの[MOUSEINPUT仕様](https://learn.microsoft.com/en-us/windows/win32/a
 はdwExtraInfoをULONG_PTRとしている。2026-09-08の隔離liveでは、送信値
 `0x4d49565300000001`に対し要求座標のWndProc入口・既存照合位置がともに`0x1`だった。
 受信値が送信値の下位32bitと一致したことは実測済みで、OS内部の変換箇所は未特定。
-32bit内に置く新しいprefixも保持されることは、修正後の2点moveで別途検証する。
+2026-09-08の修正後liveでは`0x4d490001`/`0x4d490002`の2点が、
+送信値との完全一致と要求/実座標一致でWM・pump・renderを通過した。
 送信token自体を32bit内の共通prefixとchecked単調serialへ収める。
 0・周回・失敗時の番号返却を禁止し、枯渇時は送信前に失敗させる。
 受信値のmask比較へ変更せず、実際の送信値との完全一致とowner/sourceの照合を維持する。
@@ -630,6 +631,7 @@ filter間には重複があるため件数を合算しない。static fixture/Rh
 S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
 通常/feature core check、owner/classification/期限/worker token回帰を完了。
 S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch0誤判定で入力前に停止した。
+その後のtoken幅修正とPowerShell間fingerprint修正を経て、2点moveの最終liveはexit 0。
 静止画列dragは上記S2の最終liveで自動確認済み。動画zoomは未完了であり、
 S3aのmove配送確認だけでzoom・button・panの完了を主張しない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。
