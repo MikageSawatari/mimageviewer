@@ -211,7 +211,20 @@ enum SimilarPanelModel<'a> {
 struct SimilarPanelActions {
     open_favorites: bool,
     open_hit: Option<crate::similar_index::QueryHit>,
-    hovered_hit: Option<crate::similar_index::QueryHit>,
+    pin_hit: Option<crate::similar_index::QueryHit>,
+    /// このフレームで「長押し表示」ボタンが押されたままの候補。押していないフレームは
+    /// `None` になり、消費側が覗き見の終了を判定する。
+    peek_held: Option<crate::similar_index::QueryHit>,
+}
+
+/// 比較スロットから見た 1 件の状態。ボタンの見え方を決める。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimilarCompareState {
+    /// この候補が比較画像として設定されている。
+    Pinned,
+    /// 比較画像を準備中 (この候補とは限らない)。
+    Preparing,
+    Idle,
 }
 
 fn similar_panel_model(query: &crate::similar_index::ItemQuery) -> SimilarPanelModel<'_> {
@@ -488,6 +501,102 @@ impl App {
         self.start_external_compare_pin_job(ctx, hit.item_key.clone(), move || {
             prepare_similar_compare_result(job_hit, pdf_passwords, viewport)
         });
+    }
+
+    /// 「長押し表示」の 1 フレームぶんの状態遷移。
+    ///
+    /// `held` はこのフレームでボタンが押されたままの候補。押している間は比較画像として
+    /// 表示し、離したら元の表示に戻す。比較画像がまだその候補でない場合はここで設定を始め、
+    /// 読み込めた次のフレームから表示へ切り替わる。押しっぱなしのまま設定が終わらなければ
+    /// 何も映らないが、そのときも設定は残るので 2 回目は即座に映る。
+    fn update_similar_peek(
+        &mut self,
+        ctx: &egui::Context,
+        held: Option<crate::similar_index::QueryHit>,
+        full_rect: egui::Rect,
+    ) {
+        let transition = decide_similar_peek(
+            self.similar_peek
+                .as_ref()
+                .map(|peek| peek.item_key.as_str()),
+            held.as_ref().map(|hit| hit.item_key.as_str()),
+        );
+        if matches!(transition, SimilarPeekTransition::Idle) {
+            return;
+        }
+        if matches!(
+            transition,
+            SimilarPeekTransition::Stop | SimilarPeekTransition::Switch
+        ) && let Some(peek) = self.similar_peek.take()
+        {
+            self.end_similar_peek(ctx, peek);
+        }
+        let Some(hit) = held else {
+            return;
+        };
+        if matches!(
+            transition,
+            SimilarPeekTransition::Start | SimilarPeekTransition::Switch
+        ) {
+            self.similar_peek = Some(crate::app::SimilarPeek {
+                item_key: hit.item_key.clone(),
+                restore_mode: self.compare_view_mode,
+            });
+        }
+        self.advance_similar_peek(ctx, &hit, full_rect);
+    }
+
+    /// 押されている間、毎フレーム呼ばれる。比較画像が揃っていなければ設定を始めるだけで、
+    /// 揃っていれば表示へ入る。どちらの場合も同じ経路を通るので、待ち時間の有無で分岐しない。
+    fn advance_similar_peek(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &crate::similar_index::QueryHit,
+        full_rect: egui::Rect,
+    ) {
+        let pinned = self
+            .pinned_compare_slot
+            .as_ref()
+            .and_then(|slot| slot.external_item_key.as_deref())
+            == Some(hit.item_key.as_str());
+        if !pinned {
+            if self.compare_pin_pending.is_none() {
+                self.pin_similar_hit(ctx, hit, full_rect);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+        if !matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::PinnedNormal
+        ) {
+            self.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
+            self.compare_wipe_dragging = false;
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_compare_gpu_pair();
+                self.ensure_compare_prepared_pair(ctx, fs_idx);
+            }
+        }
+    }
+
+    /// 覗き見の終了。押す前の表示状態へ戻す。
+    fn end_similar_peek(&mut self, ctx: &egui::Context, peek: crate::app::SimilarPeek) {
+        if !matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::PinnedNormal
+        ) {
+            return;
+        }
+        match peek.restore_mode {
+            crate::app::CompareViewMode::PinnedNormal => {}
+            crate::app::CompareViewMode::Off => self.hide_compare_pinned_view(),
+            other => {
+                self.compare_view_mode = other;
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.ensure_compare_prepared_pair(ctx, fs_idx);
+                }
+            }
+        }
     }
 
     /// Update the transient right-panel hover latch for the current fullscreen frame.
@@ -780,6 +889,11 @@ impl App {
         let mut searched_tag: Option<String> = None;
         let mut clicked_palette_rgb: Option<[u8; 3]> = None;
         let mut similar_actions = SimilarPanelActions::default();
+        let pinned_compare_item_key = self
+            .pinned_compare_slot
+            .as_ref()
+            .and_then(|slot| slot.external_item_key.clone());
+        let compare_pin_preparing = self.compare_pin_pending.is_some();
         // ★ レーティング (画像/動画/音声で統一。★ → タグ → 内容 の先頭)。レーティング可能な
         // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でページ★を出す。
         let rating_idx = self
@@ -846,6 +960,8 @@ impl App {
                         self.settings.thumb_quality,
                         crate::thumb_loader::CacheDecision::from_settings(&self.settings),
                         Some(&self.pdf_passwords),
+                        pinned_compare_item_key.as_deref(),
+                        compare_pin_preparing,
                         ctx,
                         &mut similar_actions,
                     );
@@ -1004,13 +1120,10 @@ impl App {
                 }
             });
 
-        if let Some(hit) = similar_actions.hovered_hit.take()
-            && self
-                .keymap
-                .consume_action(ctx, crate::keymap::KeyAction::FsCompareToggle)
-        {
+        if let Some(hit) = similar_actions.pin_hit.take() {
             self.pin_similar_hit(ctx, &hit, full_rect);
         }
+        self.update_similar_peek(ctx, similar_actions.peek_held.take(), full_rect);
         if similar_actions.open_favorites {
             self.show_favorites_editor = true;
         }
@@ -1944,9 +2057,20 @@ fn draw_similar_panel(
     thumb_quality: u8,
     cache_decision: crate::thumb_loader::CacheDecision,
     pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+    pinned_item_key: Option<&str>,
+    compare_pin_preparing: bool,
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
+    let compare_state = |hit: &crate::similar_index::QueryHit| {
+        if pinned_item_key == Some(hit.item_key.as_str()) {
+            SimilarCompareState::Pinned
+        } else if compare_pin_preparing {
+            SimilarCompareState::Preparing
+        } else {
+            SimilarCompareState::Idle
+        }
+    };
     if results_are_stale
         && !matches!(
             model,
@@ -2093,7 +2217,7 @@ fn draw_similar_panel(
                     })
                     .response
                     .interact(egui::Sense::click());
-                let response = response.on_hover_text("クリックで移動 / X で比較画像に設定");
+                let response = response.on_hover_text("クリックでこの画像へ移動");
                 response.context_menu(|ui| {
                     if ui.button("パスをコピー").clicked() {
                         ctx.copy_text(similar_copy_path_text(hit));
@@ -2103,13 +2227,82 @@ fn draw_similar_panel(
                 if response.clicked() {
                     actions.open_hit = Some(hit.clone());
                 }
-                if response.hovered() {
-                    actions.hovered_hit = Some(hit.clone());
-                }
-                ui.add_space(4.0);
+                draw_similar_hit_buttons(ui, hit, compare_state(hit), actions);
+                ui.add_space(6.0);
             }
         }
     }
+}
+
+/// 「長押し表示」が 1 フレームでどう動くか。押している対象は key で見分ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimilarPeekTransition {
+    /// 覗いておらず、押されてもいない。
+    Idle,
+    Start,
+    Continue,
+    Stop,
+    /// 押したまま別の候補へ移った。前の表示を戻してから新しい方を覗く。
+    Switch,
+}
+
+fn decide_similar_peek(current: Option<&str>, held: Option<&str>) -> SimilarPeekTransition {
+    match (current, held) {
+        (None, None) => SimilarPeekTransition::Idle,
+        (None, Some(_)) => SimilarPeekTransition::Start,
+        (Some(current), Some(held)) if current == held => SimilarPeekTransition::Continue,
+        (Some(_), Some(_)) => SimilarPeekTransition::Switch,
+        (Some(_), None) => SimilarPeekTransition::Stop,
+    }
+}
+
+/// 1 件ぶんの操作ボタン。
+///
+/// 以前はホバー中に X を押す設計だったが、mIV に「ホバーしたまま打鍵する」操作は他に無く、
+/// どの候補が対象なのか画面から読み取れなかった。押した対象が曖昧にならないボタンにする。
+fn draw_similar_hit_buttons(
+    ui: &mut egui::Ui,
+    hit: &crate::similar_index::QueryHit,
+    state: SimilarCompareState,
+    actions: &mut SimilarPanelActions,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if ui
+            .small_button("移動")
+            .on_hover_text("この画像を開く")
+            .clicked()
+        {
+            actions.open_hit = Some(hit.clone());
+        }
+
+        let (label, hover) = match state {
+            SimilarCompareState::Pinned => (
+                "比較解除",
+                "比較画像の設定を解除する".to_owned(),
+            ),
+            SimilarCompareState::Preparing => ("準備中", "比較画像を準備しています".to_owned()),
+            SimilarCompareState::Idle => (
+                "比較に設定",
+                "比較画像に設定する。設定後は C で表示、Shift+C でワイプ、Alt+C で差分".to_owned(),
+            ),
+        };
+        let pin = ui.add_enabled(
+            !matches!(state, SimilarCompareState::Preparing),
+            egui::Button::new(label).small(),
+        );
+        if pin.on_hover_text(hover).clicked() {
+            actions.pin_hit = Some(hit.clone());
+        }
+
+        let peek = ui
+            .add(egui::Button::new("長押し表示").small())
+            .on_hover_text("押している間だけこの画像を表示する。まだ比較画像でない場合は、読み込めた時点で表示に切り替わる");
+        if peek.is_pointer_button_down_on() {
+            actions.peek_held = Some(hit.clone());
+        }
+    });
 }
 
 /// Visual fixture for the production metadata-panel tabs and similar-result rows.
@@ -2203,6 +2396,8 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                 85,
                 crate::thumb_loader::CacheDecision::without_thumbnail(),
                 None,
+                Some(hits[0].item_key.as_str()),
+                false,
                 &ctx,
                 &mut actions,
             );
@@ -3060,12 +3255,36 @@ mod similar_panel_tests {
     use std::path::PathBuf;
 
     use super::{
-        SimilarPanelModel, similar_copy_path_text, similar_difference_line, similar_location_line,
-        similar_panel_model,
+        SimilarPanelModel, SimilarPeekTransition, decide_similar_peek, similar_copy_path_text,
+        similar_difference_line, similar_location_line, similar_panel_model,
     };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
     use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
+
+    /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を
+    /// 戻してから新しい方へ移る。ここで Switch を Continue と同じに扱うと、離しても
+    /// 最初の候補の restore_mode が残り、元の表示へ戻れなくなる。
+    #[test]
+    fn holding_a_peek_button_starts_continues_and_stops() {
+        assert_eq!(decide_similar_peek(None, None), SimilarPeekTransition::Idle);
+        assert_eq!(
+            decide_similar_peek(None, Some("a")),
+            SimilarPeekTransition::Start
+        );
+        assert_eq!(
+            decide_similar_peek(Some("a"), Some("a")),
+            SimilarPeekTransition::Continue
+        );
+        assert_eq!(
+            decide_similar_peek(Some("a"), Some("b")),
+            SimilarPeekTransition::Switch
+        );
+        assert_eq!(
+            decide_similar_peek(Some("a"), None),
+            SimilarPeekTransition::Stop
+        );
+    }
 
     fn hit(kind: ItemKind, format: SimilarImageFormat) -> QueryHit {
         QueryHit {

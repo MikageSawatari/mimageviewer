@@ -32450,7 +32450,11 @@ impl App {
         }
     }
 
-    fn ensure_compare_prepared_pair(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+    pub(crate) fn ensure_compare_prepared_pair(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
         let Some(slot) = self.pinned_compare_slot.as_ref() else {
             return false;
         };

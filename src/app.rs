@@ -3313,6 +3313,12 @@ pub(crate) struct PinnedCompareSlot {
     pub(crate) source_size: [usize; 2],
 }
 
+/// 類似パネルの「長押し表示」で覗き見している対象と、離したときに戻す表示状態。
+pub(crate) struct SimilarPeek {
+    pub(crate) item_key: String,
+    pub(crate) restore_mode: CompareViewMode,
+}
+
 pub(crate) struct ComparePinResult {
     pub(crate) basename: String,
     pub(crate) width: u32,
@@ -11596,6 +11602,8 @@ pub struct App {
     /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
+    /// 類似パネルの「長押し表示」で覗き見している最中の状態。押している間だけ Some。
+    pub(crate) similar_peek: Option<SimilarPeek>,
     pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
     pub(crate) compare_preparation: ComparePreparationState,
@@ -15055,6 +15063,7 @@ impl App {
             folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
+            similar_peek: None,
             compare_pin_load_pending: None,
             compare_pin_pending: None,
             compare_preparation: ComparePreparationState::Unprepared,
