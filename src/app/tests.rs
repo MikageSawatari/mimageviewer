@@ -7,6 +7,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(windows)]
+#[path = "tests/detached_binding_identity.rs"]
+mod detached_binding_identity;
+
 #[test]
 fn collect_image_indices_builds_the_still_list_once_for_repeated_calls() {
     let mut app = setup_app_for_test();
@@ -178,14 +182,14 @@ fn begin_test_video_presentation_transition(
             let window_id = app
                 .active_detached_session
                 .map(|session| session.window_id)
-                .or(app.detached_viewer_window_id)
+                .or(app.detached_viewer_window_id())
                 .unwrap_or(0xA056);
             test_detached_host_lease(window_id, Some(0xA057), 1)
         });
     let target_detached = (target == ViewerPresentation::DetachedWindow).then(|| {
         let window_id = current_detached
             .map(|lease| lease.session.window_id)
-            .or(app.detached_viewer_window_id)
+            .or(app.detached_viewer_window_id())
             .unwrap_or(0xD370);
         test_detached_host_lease(window_id, Some(0xD371), 2)
     });
@@ -218,7 +222,7 @@ fn hidden_detached_host_builder_does_not_request_maximize() {
     app.fullscreen_idx = Some(0);
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-    app.detached_viewer_window_id = Some(12);
+    app.set_detached_window_binding_for_test(Some(12));
     app.begin_active_detached_session(12, DetachedSource::Image);
     app.set_detached_window_runtime_placement(
         12,
@@ -248,7 +252,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     let mut app = phase_c_support::setup_app();
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-    app.detached_viewer_window_id = Some(12);
+    app.set_detached_window_binding_for_test(Some(12));
     app.begin_active_detached_session(12, DetachedSource::Video);
     app.set_detached_window_runtime_placement(
         12,
@@ -365,7 +369,7 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.settings.detached_viewer_enabled = true;
-    app.detached_viewer_window_id = Some(OLD_WINDOW);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW));
     app.begin_active_detached_session(OLD_WINDOW, DetachedSource::Image);
     app.set_detached_window_runtime_placement(OLD_WINDOW, restore, "test_borderless_observation");
     app.write_detached_viewer_borderless_state(
@@ -393,7 +397,7 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     assert!(app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, Some(restore));
     let recreated_window = app
-        .detached_viewer_window_id
+        .detached_viewer_window_id()
         .expect("F12 ON must allocate a detached viewport identity");
     assert_ne!(
         recreated_window, OLD_WINDOW,
@@ -448,7 +452,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.fs_viewport_shown = true;
-    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Image);
 
     app.toggle_detached_viewer_mode();
@@ -459,7 +463,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
 
     app.toggle_detached_viewer_mode();
     let current_window_j = app
-        .detached_viewer_window_id
+        .detached_viewer_window_id()
         .expect("immediate F12 ON must create J");
     assert_ne!(current_window_j, OLD_WINDOW_H);
     assert_ne!(
@@ -471,7 +475,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
 
     // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
     app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
-    assert_eq!(app.detached_viewer_window_id, Some(current_window_j));
+    assert_eq!(app.detached_viewer_window_id(), Some(current_window_j));
     assert_eq!(
         app.active_detached_session.map(|session| session.window_id),
         Some(current_window_j)
@@ -489,7 +493,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     // The real close for current J stays unconditional and retires that exact lease.
     app.handle_fullscreen_close_request();
     assert_eq!(app.fullscreen_idx, None);
-    assert_eq!(app.detached_viewer_window_id, None);
+    assert_eq!(app.detached_viewer_window_id(), None);
     assert!(app.active_detached_session.is_none());
     assert!(
         app.detached_window_manager
@@ -508,7 +512,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let old_viewport_h = App::detached_image_window_viewport_id(OLD_WINDOW_H);
-    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Video);
 
     app.begin_active_detached_session_close("test_late_registration_closing");
@@ -589,7 +593,7 @@ fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
     media.settings.detached_viewer_open_images_in_window = true;
     media.settings.detached_viewer_enabled = false;
     media.settings.video_in_window_mode = true;
-    media.detached_viewer_window_id = Some(21);
+    media.set_detached_window_binding_for_test(Some(21));
     media.begin_active_detached_session(21, DetachedSource::Audio);
     media.write_detached_viewer_borderless_state(
         true,
@@ -1665,7 +1669,7 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
             active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
             active.viewer_presentation = ViewerPresentation::DetachedWindow;
             active.detached_viewer_independent_active = true;
-            active.detached_viewer_window_id = Some(active_window_id);
+            active.set_detached_window_binding_for_test(Some(active_window_id));
         },
     );
 
@@ -1680,7 +1684,7 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
         parked.items_generation = parked_generation;
         parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         parked.viewer_presentation = ViewerPresentation::DetachedWindow;
-        parked.detached_viewer_window_id = Some(window_id);
+        parked.set_detached_window_binding_for_test(Some(window_id));
     });
 
     let mut main = metadata_context_result(main_id, main_generation, 0);
@@ -2669,14 +2673,14 @@ fn vst3_production_traversal_survives_removing_a_later_paused_window() {
             context.fullscreen_idx = Some(0);
             context.vst3_deferred_media_open = Some(0);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
     }
 
     let mut consumed = Vec::new();
     app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
         let window_id = mounted
-            .detached_viewer_window_id
+            .detached_viewer_window_id()
             .expect("parked VST3 callback must run in the owning context");
         consumed.push((
             window_id,
@@ -2729,7 +2733,7 @@ fn parked_vst3_consume_panic_restores_marker_bundle_and_main_projection() {
         parked.fullscreen_idx = Some(0);
         parked.vst3_deferred_media_open = Some(0);
         parked.viewer_presentation = ViewerPresentation::DetachedWindow;
-        parked.detached_viewer_window_id = Some(window_id);
+        parked.set_detached_window_binding_for_test(Some(window_id));
     });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3102,7 +3106,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
         detached.visible_indices.clear();
         detached.details_order.clear();
-        detached.detached_viewer_window_id = Some(detached_window_id);
+        detached.set_detached_window_binding_for_test(Some(detached_window_id));
     });
     app.last_active_detached_window_id = Some(detached_window_id);
 
@@ -3734,7 +3738,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
     let active_window_id = app.allocate_detached_viewer_window_id();
     let active_id = app.build_window_context_for_test(active_window_id, |active| {
         configure_context(active, r"C:\Pictures\Child");
-        active.detached_viewer_window_id = Some(active_window_id);
+        active.set_detached_window_binding_for_test(Some(active_window_id));
     });
     app.last_active_detached_window_id = Some(active_window_id);
     let paused_id = app.push_window_context_for_test(&ctx, 73, |paused| {
@@ -5160,7 +5164,7 @@ fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detach
                 ViewerNavigationScope::DetachedPhysical
             );
             (
-                active.detached_viewer_window_id,
+                active.detached_viewer_window_id(),
                 active.fs_open_intent_from_grid,
             )
         })
@@ -15720,7 +15724,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         media.items = vec![GridItem::Video(video.clone())];
         media.fullscreen_idx = Some(0);
         media.viewer_presentation = super::ViewerPresentation::DetachedWindow;
-        media.detached_viewer_window_id = Some(window_id);
+        media.set_detached_window_binding_for_test(Some(window_id));
         media.detached_viewer_independent_active = true;
     });
 
@@ -39647,7 +39651,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(image);
         app.selected = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(image_window_id);
+        app.set_detached_window_binding_for_test(Some(image_window_id));
         insert_static_fs_entry(app, ctx, image, "linked_still_before_media");
         app.begin_mounted_detached_session_for_test(image_window_id, DetachedSource::Image);
         app.update_detached_window_runtime_flags(image_window_id, true, "test_linked_still");
@@ -39668,7 +39672,7 @@ mod still_window_mode_key_tests {
             media_context.items = items;
             media_context.fullscreen_idx = Some(media);
             media_context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            media_context.detached_viewer_window_id = Some(media_window_id);
+            media_context.set_detached_window_binding_for_test(Some(media_window_id));
             media_context.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(
@@ -39695,7 +39699,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.selected = Some(idx);
         app.fs_open_intent_from_grid = false;
-        app.detached_viewer_window_id
+        app.detached_viewer_window_id()
             .expect("detached grid open window id")
     }
 
@@ -39836,7 +39840,7 @@ mod still_window_mode_key_tests {
     }
 
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
-        app.detached_viewer_window_id = Some(window_id);
+        app.last_active_detached_window_id = Some(window_id);
         app.detached_window_hwnd_set(window_id, hwnd);
         let live_hwnds = if live { vec![hwnd] } else { Vec::new() };
         app.set_detached_window_live_hwnds_for_test(live_hwnds);
@@ -39868,7 +39872,7 @@ mod still_window_mode_key_tests {
             context.fs_cache.insert(0, FsCacheEntry::Failed);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -39897,7 +39901,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = None;
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(window_id);
+            app.set_detached_window_binding_for_test(Some(window_id));
             configure(app);
         });
         let viewport_id = app
@@ -39978,7 +39982,7 @@ mod still_window_mode_key_tests {
             context.items_generation = 4;
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(window_id);
+            context.set_detached_window_binding_for_test(Some(window_id));
         });
 
         app.with_active_viewer_context(|mounted| {
@@ -41025,7 +41029,7 @@ mod still_window_mode_key_tests {
                 .mark_right_drag_pending_execution(51, dispatch.command.unwrap())
         );
         app.begin_active_detached_session(52, DetachedSource::Image);
-        app.detached_viewer_window_id = Some(52);
+        app.set_detached_window_binding_for_test(Some(52));
 
         assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
         assert!(app.rotation_cache.is_empty());
@@ -41050,7 +41054,7 @@ mod still_window_mode_key_tests {
         app.queue_recognized_detached_right_drag_command(61, passive_rotate_command(), "test");
 
         app.begin_active_detached_session(61, DetachedSource::Book);
-        app.detached_viewer_window_id = Some(61);
+        app.set_detached_window_binding_for_test(Some(61));
         app.fullscreen_idx = None;
         let dispatch = app
             .take_pending_deferred_detached_window_activation()
@@ -41169,7 +41173,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(12);
+            context.set_detached_window_binding_for_test(Some(12));
         });
         app.transition_detached_window_state(12, DetachedWindowState::ParkedLive, "test_setup");
         set_detached_host_for_test(&mut app, 12, 0x1200, false);
@@ -41205,7 +41209,7 @@ mod still_window_mode_key_tests {
 
         app.finish_active_detached_session_handoff("test");
         app.transition_detached_window_state(42, DetachedWindowState::Parked, "test_handoff");
-        app.detached_viewer_window_id = None;
+        app.set_detached_window_binding_for_test(None);
         assert_eq!(
             app.detached_window_hwnd_alive_for_window_id(42),
             Some(0x4200)
@@ -41286,7 +41290,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_to_passive_handoff_preserves_live_registered_hwnd() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(42);
+        app.set_detached_window_binding_for_test(Some(42));
         app.detached_window_hwnd_set(42, 0x4200);
         app.detached_window_hwnd_set(77, 0x7700);
         app.set_detached_window_live_hwnds_for_test([0x4200, 0x7700]);
@@ -42162,7 +42166,7 @@ mod still_window_mode_key_tests {
         // メディア窓セッション (bundle 化前) は folder nav を consume する。
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(601);
+        app.set_detached_window_binding_for_test(Some(601));
         app.begin_mounted_detached_session_for_test(601, DetachedSource::Video);
         assert!(
             app.detached_independent_session_blocks_folder_nav(),
@@ -42274,7 +42278,7 @@ mod still_window_mode_key_tests {
         app.sync_detached_viewer_to_selected(&ctx);
 
         assert_eq!(app.fullscreen_idx, Some(image));
-        assert_eq!(app.detached_viewer_window_id, Some(61));
+        assert_eq!(app.detached_viewer_window_id(), Some(61));
         assert_eq!(app.last_viewer_sync_stamp, stamp_before);
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 62);
@@ -42377,7 +42381,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.transition_detached_window_state(123, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(123);
+        app.set_detached_window_binding_for_test(Some(123));
 
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
 
@@ -42449,16 +42453,23 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn at_rest_session_finish_precedes_later_context_retire() {
         let mut app = setup_app();
+        let main_window = app.ensure_detached_viewer_window_id();
         let window_id = 125;
         let context_id =
             app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
                 context.viewer_presentation = ViewerPresentation::DetachedWindow;
             });
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
         app.begin_active_detached_session_close("test_session_first");
         app.finish_active_detached_session_close("test_session_first");
 
         assert!(app.active_detached_session.is_none());
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_eq!(app.detached_viewer_window_id(), Some(main_window));
         assert_eq!(
             app.locate_window_context(window_id),
             Some((context_id, ContextResidence::AtRest)),
@@ -42491,7 +42502,7 @@ mod still_window_mode_key_tests {
         let video = push_video(app, r"C:\clips\placement-switch.mp4");
         app.fullscreen_idx = Some(video);
         app.transition_detached_window_state(window_id, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
 
@@ -43696,7 +43707,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
             context.detached_viewer_open_next_still_detached_once = false;
-            context.detached_viewer_window_id = Some(77);
+            context.set_detached_window_binding_for_test(Some(77));
         });
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, a_virtual_idx));
@@ -45766,7 +45777,7 @@ mod still_window_mode_key_tests {
             );
             app.with_active_viewer_context(|active| {
                 assert_eq!(
-                    active.detached_viewer_window_id,
+                    active.detached_viewer_window_id(),
                     Some(window_id),
                     "frame {frame}: the bundle must retain the same window identity"
                 );
@@ -46613,7 +46624,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.selected = Some(first);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
         app.fs_viewport_shown = true;
@@ -46644,7 +46655,7 @@ mod still_window_mode_key_tests {
         );
         app.with_active_viewer_context(|active| {
             assert_eq!(active.fullscreen_idx, Some(first));
-            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert_eq!(active.detached_viewer_window_id(), Some(window_id));
             assert!(active.detached_viewer_independent_active);
             assert!(matches!(
                 active.items.get(first),
@@ -46677,7 +46688,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = false;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.selected = Some(first);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
         app.fs_viewport_shown = true;
@@ -46700,7 +46711,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, None);
         app.with_active_viewer_context(|active| {
             assert_eq!(active.fullscreen_idx, Some(first));
-            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert_eq!(active.detached_viewer_window_id(), Some(window_id));
             assert!(
                 active.detached_viewer_independent_active,
                 "after the main context changes, the preserved video must stop following main selection"
@@ -46860,7 +46871,7 @@ mod still_window_mode_key_tests {
             app.selected = Some(video);
             app.viewer_presentation = presentation;
             if matches!(presentation, ViewerPresentation::DetachedWindow) {
-                app.detached_viewer_window_id = Some(200);
+                app.set_detached_window_binding_for_test(Some(200));
             }
             install_playing_test_media(&mut app, video, path.clone(), 30.0);
 
@@ -47475,7 +47486,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.transition_detached_window_state(120, DetachedWindowState::Opening, "test");
-        app.detached_viewer_window_id = Some(120);
+        app.set_detached_window_binding_for_test(Some(120));
         app.bind_mounted_context_for_test(120);
         begin_test_video_presentation_transition(
             &mut app,
@@ -47527,7 +47538,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.detached_viewer_window_id = Some(121);
+        app.set_detached_window_binding_for_test(Some(121));
         begin_test_detached_host_wait(&mut app);
         app.fs_cache.insert(
             video,
@@ -47573,7 +47584,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.video_audio_mode = Some(video);
-        app.detached_viewer_window_id = Some(122);
+        app.set_detached_window_binding_for_test(Some(122));
         app.fs_cache.insert(
             video,
             FsCacheEntry::Video {
@@ -47797,7 +47808,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\bookkeeping.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(88);
+        app.set_detached_window_binding_for_test(Some(88));
         app.begin_active_detached_session(88, DetachedSource::Video);
         app.requested.insert(video, false);
         app.pending_finalize.insert(video);
@@ -47934,7 +47945,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(109);
+        app.set_detached_window_binding_for_test(Some(109));
         app.begin_mounted_detached_session_for_test(109, DetachedSource::Video);
         app.fs_cache.insert(
             video,
@@ -47969,7 +47980,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.vst3_deferred_media_open = Some(video);
         app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
 
@@ -47991,7 +48002,7 @@ mod still_window_mode_key_tests {
         let mut consumed = Vec::new();
         app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
             consumed.push((
-                mounted.detached_viewer_window_id,
+                mounted.detached_viewer_window_id(),
                 mounted.native_video_parked_live_input_window_id,
                 idx,
             ));
@@ -48221,12 +48232,17 @@ mod still_window_mode_key_tests {
             });
         app.build_window_context_for_test(7, |_| {});
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
-        app.detached_viewer_window_id = Some(7);
+        assert_eq!(app.detached_viewer_window_id(), None);
+        let main = app.projected_viewer_context_id();
+        assert!(matches!(
+            app.bind_window(main, 7),
+            Err(viewer_context_registry::BindError::WindowOwnedBy(_))
+        ));
         app.last_active_detached_window_id = Some(7);
 
         let id = app.ensure_detached_viewer_window_id();
         assert_ne!(id, 7, "parked/passive 窓の id を新セッションに再利用しない");
-        assert_eq!(app.detached_viewer_window_id, Some(id));
+        assert_eq!(app.detached_viewer_window_id(), Some(id));
 
         // 衝突が無ければ従来どおり直参照を再利用する (フォルダナビの窓安定性を壊さない)。
         let id2 = app.ensure_detached_viewer_window_id();
@@ -48265,7 +48281,7 @@ mod still_window_mode_key_tests {
         };
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(70);
+        app.set_detached_window_binding_for_test(Some(70));
         app.begin_mounted_detached_session_for_test(70, DetachedSource::Image);
 
         // ParkedLive のメディア窓 (61)。
@@ -48303,7 +48319,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -48330,7 +48346,11 @@ mod still_window_mode_key_tests {
             ViewerPresentation::DetachedWindow,
             "main の presentation が DetachedWindow のまま残らない"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(61));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(61))
+        );
     }
 
     #[test]
@@ -48525,7 +48545,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -49302,13 +49322,18 @@ mod still_window_mode_key_tests {
             context.detached_viewer_independent_active = true;
         });
         // main 側の stale コピー (実機の再現条件)。
-        app.detached_viewer_window_id = Some(window_id);
+        assert_eq!(app.detached_viewer_window_id(), None);
+        let main = app.projected_viewer_context_id();
+        assert!(matches!(
+            app.bind_window(main, 53),
+            Err(viewer_context_registry::BindError::WindowOwnedBy(_))
+        ));
         app.last_active_detached_window_id = Some(window_id);
 
         assert!(app.park_active_detached_context_as_live_media(&ctx, "test_park_stale_id"));
 
         assert_ne!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(window_id),
             "park 後の main 文脈に parked 窓 id の stale コピーが残らない"
         );
@@ -49364,7 +49389,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(95);
+            context.set_detached_window_binding_for_test(Some(95));
         });
         app.transition_detached_window_state(95, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -49704,7 +49729,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(97);
+            context.set_detached_window_binding_for_test(Some(97));
         });
         app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
         app.music_analysis_path = Some(path.clone());
@@ -49775,7 +49800,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(93);
+            context.set_detached_window_binding_for_test(Some(93));
         });
         app.transition_detached_window_state(93, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -49825,7 +49850,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(image);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(94);
+            context.set_detached_window_binding_for_test(Some(94));
         });
         app.transition_detached_window_state(94, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -49901,7 +49926,7 @@ mod still_window_mode_key_tests {
             Some(false),
             "always-new passive snapshots must be independent; linked snapshots are forbidden after CUT"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(2));
+        assert_eq!(app.detached_viewer_window_id(), Some(2));
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(!app.fs_viewport_shown);
         assert_eq!(app.locate_window_context(first_window_id), None);
@@ -49927,7 +49952,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(existing);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(41);
+        app.set_detached_window_binding_for_test(Some(41));
         app.begin_mounted_detached_session_for_test(41, DetachedSource::Image);
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -49958,7 +49983,7 @@ mod still_window_mode_key_tests {
                     ViewerNavigationScope::DetachedPhysical
                 );
                 (
-                    active.detached_viewer_window_id,
+                    active.detached_viewer_window_id(),
                     active.fs_open_intent_from_grid,
                 )
             })
@@ -50113,7 +50138,7 @@ mod still_window_mode_key_tests {
             "opening the follow-up window should still reset foreground panorama mode"
         );
         let second_window_id = app
-            .detached_viewer_window_id
+            .detached_viewer_window_id()
             .expect("second detached window should be active");
         assert_ne!(first_window_id, second_window_id);
         app.detached_window_hwnd_set(second_window_id, 0x2222);
@@ -50128,7 +50153,7 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.fullscreen_idx, Some(first));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert_eq!(app.detached_viewer_window_id, Some(first_window_id));
+        assert_eq!(app.detached_viewer_window_id(), Some(first_window_id));
         assert!(
             app.detached_viewer_independent_active,
             "always-new detached image windows remain independent after reactivation"
@@ -50198,7 +50223,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(7);
+        app.set_detached_window_binding_for_test(Some(7));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(7, DetachedSource::Image);
@@ -50801,7 +50826,7 @@ mod still_window_mode_key_tests {
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
         let first_window_id = app
-            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .with_active_viewer_context(|active| active.detached_viewer_window_id())
             .flatten()
             .expect("first detached book context should have a window id");
         let first_placement = app
@@ -50811,7 +50836,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(1);
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
         let second_window_id = app
-            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .with_active_viewer_context(|active| active.detached_viewer_window_id())
             .flatten()
             .expect("second detached book context should have a window id");
 
@@ -51043,7 +51068,7 @@ mod still_window_mode_key_tests {
         assert!(matches!(app.items[0], GridItem::PdfFile(_)));
         app.with_active_viewer_context(|active| {
             assert_eq!(
-                active.detached_viewer_window_id,
+                active.detached_viewer_window_id(),
                 Some(WINDOW_ID),
                 "the resumed active context must retain the original window identity"
             );
@@ -51213,7 +51238,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(0);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             app.fs_viewport_generation = 101;
             app.fs_viewport_shown = true;
             app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -51250,7 +51275,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(0);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(20);
+            app.set_detached_window_binding_for_test(Some(20));
             app.fs_viewport_generation = 202;
             app.fs_viewport_shown = true;
             app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -51268,7 +51293,7 @@ mod still_window_mode_key_tests {
             "the previously active window should be paused, not closed"
         );
         app.with_active_viewer_context(|active| {
-            assert_eq!(active.detached_viewer_window_id, Some(10));
+            assert_eq!(active.detached_viewer_window_id(), Some(10));
         })
         .unwrap();
         assert!(app.fs_viewport_shown);
@@ -51367,7 +51392,7 @@ mod still_window_mode_key_tests {
             parked_context.fullscreen_idx = Some(0);
             parked_context.viewer_presentation = ViewerPresentation::DetachedWindow;
             parked_context.native_video_in_window_active = false;
-            parked_context.detached_viewer_window_id = Some(1);
+            parked_context.set_detached_window_binding_for_test(Some(1));
             parked_context.detached_viewer_independent_active = true;
             parked_context.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
             parked_context.address = r"C:\books\pinned.pdf".to_string();
@@ -51536,7 +51561,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(10);
+        app.set_detached_window_binding_for_test(Some(10));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
@@ -51575,7 +51600,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(20);
+        app.set_detached_window_binding_for_test(Some(20));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.fs_transparent_bg_mode = 1;
         app.settings.detached_viewer_window_placement =
@@ -51624,7 +51649,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(76);
+        app.set_detached_window_binding_for_test(Some(76));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.spread_mode = crate::settings::SpreadMode::Single;
         app.settings.detached_viewer_window_placement =
@@ -51694,7 +51719,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(11);
+        app.set_detached_window_binding_for_test(Some(11));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
@@ -51754,7 +51779,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(70);
+        app.set_detached_window_binding_for_test(Some(70));
         app.begin_active_detached_session(70, DetachedSource::Image);
         let idx = push_image(&mut app, r"C:\pics\single-fit.jpg");
         insert_static_fs_entry(&mut app, &ctx, idx, "single_fit_rect");
@@ -51788,7 +51813,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(71);
+        app.set_detached_window_binding_for_test(Some(71));
         app.begin_active_detached_session(71, DetachedSource::Image);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         let left = push_image(&mut app, r"C:\pics\spread-fit-left.jpg");
@@ -51841,7 +51866,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(72);
+        app.set_detached_window_binding_for_test(Some(72));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fs_transparent_bg_mode = 1;
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
@@ -51942,7 +51967,7 @@ mod still_window_mode_key_tests {
                 app.settings.detached_viewer_window_placement = Some(placement);
                 app.viewer_presentation = ViewerPresentation::DetachedWindow;
                 app.detached_viewer_independent_active = true;
-                app.detached_viewer_window_id = Some(74);
+                app.set_detached_window_binding_for_test(Some(74));
                 app.spread_mode = crate::settings::SpreadMode::Ltr;
                 let left = push_image(&mut app, r"C:\pics\seam-left.png");
                 let right = push_image(&mut app, r"C:\pics\seam-right.png");
@@ -52006,7 +52031,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
-        app.detached_viewer_window_id = Some(73);
+        app.set_detached_window_binding_for_test(Some(73));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
         let left = push_image(&mut app, r"C:\pics\auto-trim-left.png");
@@ -52100,7 +52125,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(detached_idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(74);
+        app.set_detached_window_binding_for_test(Some(74));
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
@@ -52155,7 +52180,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.spread_mode = crate::settings::SpreadMode::Single;
         let first = push_image(&mut app, r"C:\pics\single-a.jpg");
         let second = push_image(&mut app, r"C:\pics\single-b.jpg");
@@ -52185,7 +52210,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             insert_static_fs_entry(app, &ctx, idx, "pause_cancel_ai_page");
             let key = FinalAiKey {
                 edit_key: EditResultKey {
@@ -52239,7 +52264,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(10);
+            app.set_detached_window_binding_for_test(Some(10));
             insert_static_fs_entry(app, &ctx, idx, "pause_handoff_to_passive");
         });
         app.fs_viewport_shown = true;
@@ -52283,7 +52308,7 @@ mod still_window_mode_key_tests {
             app.fullscreen_idx = Some(idx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
-            app.detached_viewer_window_id = Some(42);
+            app.set_detached_window_binding_for_test(Some(42));
             app.panorama_state = Some(crate::panorama::PanoramaState::new(
                 1.0,
                 -0.5,
@@ -52639,7 +52664,7 @@ mod still_window_mode_key_tests {
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.detached_viewer_window_id = Some(77);
+        app.set_detached_window_binding_for_test(Some(77));
         let _ = begin_test_video_presentation_transition(
             &mut app,
             ViewerPresentation::DetachedWindow,
@@ -52679,7 +52704,7 @@ mod still_window_mode_key_tests {
         // 失敗後: presentation は非 detached へ戻り、pending も消えている。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         clear_test_video_presentation_transition(&mut app);
-        app.detached_viewer_window_id = Some(88);
+        app.set_detached_window_binding_for_test(Some(88));
         // だが detached host は実際に表示済み。
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -53015,7 +53040,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         set_detached_host_for_test(&mut app, 12, 0x1234, true);
         app.set_detached_window_runtime_placement(
             12,
@@ -53051,7 +53076,7 @@ mod still_window_mode_key_tests {
             Some(ViewerPresentation::DetachedWindow)
         );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(12), 0x1234);
-        assert_eq!(app.detached_viewer_window_id, Some(12));
+        assert_eq!(app.detached_viewer_window_id(), Some(12));
         assert_eq!(
             app.fullscreen_viewport_id(),
             viewport_id_before,
@@ -53093,7 +53118,7 @@ mod still_window_mode_key_tests {
         app.detached_viewer_independent_active = true;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.next_detached_image_window_id = 13;
         app.set_detached_window_runtime_placement(
             12,
@@ -53115,7 +53140,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(12),
             "folder-nav reopen must not allocate a new detached window id"
         );
@@ -53141,7 +53166,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.fs_viewport_generation = 7;
         // 解放済み等で IsWindow=false になる stale hwnd を模す。
         set_detached_host_for_test(&mut app, 12, 0x1234, false);
@@ -53186,7 +53211,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
         // host 未捕捉 (== 0) = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.detached_window_hwnd_clear(12);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
@@ -53227,7 +53252,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
 
         // 未捕捉 (== 0) → seed。
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.detached_window_hwnd_clear(12);
         assert!(app.detached_viewer_should_seed_placement());
 
@@ -53259,7 +53284,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(42);
+        app.set_detached_window_binding_for_test(Some(42));
         app.detached_viewer_folder_nav_reuse_window_once = true;
         app.settings.detached_viewer_open_images_in_window = true;
         app.fs_nav_locked_gen = Some(app.items_generation);
@@ -53275,7 +53300,7 @@ mod still_window_mode_key_tests {
 
         app.prepare_viewer_presentation_close();
         assert_eq!(
-            app.detached_viewer_window_id,
+            app.detached_viewer_window_id(),
             Some(42),
             "folder-nav reopen must keep the detached window_id so the same OS window is reused"
         );
@@ -53292,7 +53317,8 @@ mod still_window_mode_key_tests {
         app.detached_viewer_folder_nav_reuse_window_once = false;
         app.prepare_viewer_presentation_close();
         assert_eq!(
-            app.detached_viewer_window_id, None,
+            app.detached_viewer_window_id(),
+            None,
             "a normal (non-folder-nav) close still tears down the detached identity"
         );
     }
@@ -53308,7 +53334,7 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(7);
+        app.set_detached_window_binding_for_test(Some(7));
         let restore_placement = app.active_detached_viewer_current_placement();
         app.write_detached_viewer_borderless_state(
             true,
@@ -53352,11 +53378,12 @@ mod still_window_mode_key_tests {
         // 初回 (grid から): 新規 allocate。
         app.fs_open_intent_from_grid = true;
         let first = app.ensure_detached_viewer_window_id();
+        app.begin_active_detached_session(first, DetachedSource::Image);
         let vid_first = app.fullscreen_viewport_id();
         assert_eq!(app.last_active_detached_window_id, Some(first));
 
         // フォルダナビの close 相当で window_id が None になる。
-        app.detached_viewer_window_id = None;
+        app.prepare_viewer_presentation_close();
 
         // folder-nav reopen (grid 由来でない) は同じ window_id を再利用 → ViewportId 不変。
         app.fs_open_intent_from_grid = false;
@@ -53372,7 +53399,7 @@ mod still_window_mode_key_tests {
         );
 
         // grid からの新規オープンは別ウィンドウを作る (= 新しい id を allocate)。
-        app.detached_viewer_window_id = None;
+        app.finish_active_detached_session_close("test_new_grid_open");
         app.fs_open_intent_from_grid = true;
         let fresh = app.ensure_detached_viewer_window_id();
         assert_ne!(
@@ -53731,7 +53758,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_runtime_placement(43, second, "test_passive_move");
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, 43));
-        assert_eq!(app.detached_viewer_window_id, Some(43));
+        assert_eq!(app.detached_viewer_window_id(), Some(43));
         assert_eq!(
             app.active_detached_viewer_current_placement(),
             second,
@@ -53758,7 +53785,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
         // review-v2.3.0 Codex huntfix P2: ロード複合体 (worker queue / cancel token) は
         // park 後もグリッドを駆動する main 側に残ることを検証するための現物。
@@ -53852,7 +53879,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(audio);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(62);
+            context.set_detached_window_binding_for_test(Some(62));
         });
         app.transition_detached_window_state(62, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -53874,7 +53901,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.video_audio_mode = Some(video);
         app.video_audio_vst = None;
         app.begin_active_detached_session(window_id, DetachedSource::Video);
@@ -53923,7 +53950,7 @@ mod still_window_mode_key_tests {
         let image = push_image(&mut app, r"C:\pics\active.jpg");
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(101);
+        app.set_detached_window_binding_for_test(Some(101));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(101, DetachedSource::Image);
@@ -53988,7 +54015,7 @@ mod still_window_mode_key_tests {
             live.items = live_items;
             live.fullscreen_idx = Some(live_audio);
             live.viewer_presentation = ViewerPresentation::DetachedWindow;
-            live.detached_viewer_window_id = Some(103);
+            live.set_detached_window_binding_for_test(Some(103));
             live.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
@@ -54010,7 +54037,7 @@ mod still_window_mode_key_tests {
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_window_manager.is_empty());
-        assert_eq!(app.detached_viewer_window_id, None);
+        assert_eq!(app.detached_viewer_window_id(), None);
         assert_eq!(app.last_active_detached_window_id, None);
         assert!(!app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
@@ -54082,7 +54109,7 @@ mod still_window_mode_key_tests {
         app.scroll_offset_y = 123.0;
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_linked_live_park"));
@@ -54134,7 +54161,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
         app.auto_aspect.items_generation = 77;
         app.auto_aspect.samples.insert(0, 1.5);
@@ -54172,7 +54199,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(window_id);
+        app.set_detached_window_binding_for_test(Some(window_id));
         app.begin_active_detached_session(window_id, DetachedSource::Video);
 
         assert!(
@@ -54237,7 +54264,7 @@ mod still_window_mode_key_tests {
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
-            context.detached_viewer_window_id = Some(61);
+            context.set_detached_window_binding_for_test(Some(61));
         });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -54261,7 +54288,7 @@ mod still_window_mode_key_tests {
         );
         app.with_active_viewer_context(|active| {
             assert_eq!(active.address, "parked-live://sentinel");
-            assert_eq!(active.detached_viewer_window_id, Some(61));
+            assert_eq!(active.detached_viewer_window_id(), Some(61));
             assert_eq!(active.fullscreen_idx, Some(video));
         })
         .expect("parked live bundle should become the active context");
@@ -54482,7 +54509,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = false;
         app.fullscreen_idx = Some(linked);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(71);
+        app.set_detached_window_binding_for_test(Some(71));
         app.begin_mounted_detached_session_for_test(71, DetachedSource::Image);
         app.update_detached_window_runtime_flags(71, true, "test_linked_active");
 
@@ -54519,7 +54546,7 @@ mod still_window_mode_key_tests {
             context.items = items;
             context.fullscreen_idx = Some(video);
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_window_id = Some(72);
+            context.set_detached_window_binding_for_test(Some(72));
             context.detached_viewer_independent_active = true;
         });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
@@ -54532,7 +54559,11 @@ mod still_window_mode_key_tests {
             "OFF-mode linked active window must close rather than become a passive snapshot"
         );
         assert_eq!(app.fullscreen_idx, None);
-        assert_eq!(app.detached_viewer_window_id, Some(72));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(72))
+        );
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
             Some(72)
@@ -55335,7 +55366,9 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.iter().any(|w| w.id == 71));
         app.prepare_viewer_presentation_open(second_video, true);
 
-        let new_id = app.detached_viewer_window_id.expect("new media window id");
+        let new_id = app
+            .detached_viewer_window_id()
+            .expect("new media window id");
         assert_ne!(new_id, 71);
         assert_ne!(new_id, 72);
         assert_eq!(app.detached_image_windows.len(), 1);
@@ -55406,7 +55439,7 @@ mod still_window_mode_key_tests {
             !app.activate_detached_image_window_snapshot(&ctx, 111),
             "the consumed one-shot snapshot cannot later close/swap the active still window"
         );
-        assert_eq!(app.detached_viewer_window_id, Some(111));
+        assert_eq!(app.detached_viewer_window_id(), Some(111));
     }
 
     #[test]
@@ -55490,7 +55523,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(72);
+            bundle.set_detached_window_binding_for_test(Some(72));
         });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -55553,7 +55586,11 @@ mod still_window_mode_key_tests {
             app.detached_window_state(82),
             Some(DetachedWindowState::Active)
         );
-        assert_eq!(app.detached_viewer_window_id, Some(82));
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert_eq!(
+            app.with_active_viewer_context(|active| active.detached_viewer_window_id()),
+            Some(Some(82))
+        );
         assert!(app.active_viewer_context_id().is_some());
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
@@ -55574,7 +55611,7 @@ mod still_window_mode_key_tests {
         app.settings.fullfeature_media_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(91);
+        app.set_detached_window_binding_for_test(Some(91));
         insert_static_fs_entry(&mut app, &ctx, first, "linked_still_reuse");
         app.begin_active_detached_session(91, DetachedSource::Image);
         app.update_detached_window_runtime_flags(91, true, "test_linked_reuse");
@@ -55583,7 +55620,7 @@ mod still_window_mode_key_tests {
         app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.detached_viewer_window_id, Some(91));
+        assert_eq!(app.detached_viewer_window_id(), Some(91));
         assert!(app.detached_image_windows.is_empty());
     }
 
@@ -55599,7 +55636,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_window_id = Some(101);
+        app.set_detached_window_binding_for_test(Some(101));
         insert_static_fs_entry(&mut app, &ctx, image, "multi_still_before_media");
         app.begin_mounted_detached_session_for_test(101, DetachedSource::Image);
         app.update_detached_window_runtime_flags(101, false, "test_multi_still");
@@ -55628,7 +55665,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(74);
+            bundle.set_detached_window_binding_for_test(Some(74));
         });
         app.transition_detached_window_state(74, DetachedWindowState::ParkedLive, "test_setup");
         let input_seq_before = app.input_seq;
@@ -55710,7 +55747,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(old_video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(71);
+            bundle.set_detached_window_binding_for_test(Some(71));
         });
         app.transition_detached_window_state(71, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -55769,7 +55806,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(81);
+            bundle.set_detached_window_binding_for_test(Some(81));
         });
         app.transition_detached_window_state(81, DetachedWindowState::ParkedLive, "test_setup");
 
@@ -56769,7 +56806,7 @@ mod still_window_mode_key_tests {
             bundle.items.push(GridItem::Video(path_for_context));
             bundle.fullscreen_idx = Some(0);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(108);
+            bundle.set_detached_window_binding_for_test(Some(108));
         });
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
         let now = std::time::Instant::now();
@@ -57501,7 +57538,7 @@ mod still_window_mode_key_tests {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-            bundle.detached_viewer_window_id = Some(82);
+            bundle.set_detached_window_binding_for_test(Some(82));
         });
         app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
         app.native_video_parked_live_activation_requests.push(82);
@@ -58198,7 +58235,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_placement_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
@@ -58235,7 +58272,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now());
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
@@ -58270,7 +58307,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
@@ -58313,7 +58350,7 @@ mod still_window_mode_key_tests {
             false,
         );
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Video);
         app.set_detached_window_runtime_placement(12, previous, "test_switch_default_reject");
 
@@ -58341,7 +58378,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
@@ -58497,7 +58534,7 @@ mod still_window_mode_key_tests {
         insert_static_fs_entry(&mut app, &ctx, idx, "live_placement_snapshot");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(9);
+        app.set_detached_window_binding_for_test(Some(9));
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
                 x: 80.0,
@@ -59418,7 +59455,7 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.active_detached_session.unwrap().window_id, 7);
         assert_eq!(app.fullscreen_idx, Some(0));
-        assert_eq!(app.detached_viewer_window_id, Some(7));
+        assert_eq!(app.detached_viewer_window_id(), Some(7));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
     }
 
@@ -59510,7 +59547,7 @@ mod still_window_mode_key_tests {
             maximized: false,
         };
         app.settings.detached_viewer_window_placement = Some(seed);
-        app.detached_viewer_window_id = Some(12);
+        app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, seed, "test_maximized");
 
@@ -69018,7 +69055,7 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
     let context_id = app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
     assert_eq!(app.active_viewer_context_id(), Some(context_id));
     assert!(
         app.active_detached_context_is_at_rest(),
@@ -69064,7 +69101,7 @@ fn the_gamepad_goes_to_the_main_window_when_that_is_the_surface() {
     let context_id = app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
     assert_eq!(app.active_viewer_context_id(), Some(context_id));
     assert!(
         app.active_detached_context_is_at_rest(),
@@ -69100,7 +69137,7 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
     app.build_window_context_for_test(window_id, |bundle| {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
-    app.detached_viewer_window_id = Some(window_id);
+    app.begin_active_detached_session(window_id, DetachedSource::Image);
 
     for (surface, goes_to_context) in [
         (crate::app::ActionSurface::MainWindow, false),
@@ -69192,7 +69229,7 @@ fn what_the_detached_window_holds_decides_which_dpad_branch_runs() {
             bundle.items = vec![item];
             bundle.fullscreen_idx = Some(0);
         });
-        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
         // 前面が別ウィンドウ = 直近に配った面がビューア。前面 HWND はテストから触れない。
         app.detached_window_manager
             .note_input_surface(crate::app::ActionSurface::Viewer);
@@ -69364,7 +69401,7 @@ fn stale_prepare_claim_returns_to_awaiting_host_instead_of_rerouting_to_global_s
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.detached_window_hwnd_set(ACTIVE_WINDOW, ACTIVE_HOST);
     app.begin_active_detached_session(ACTIVE_WINDOW, DetachedSource::Video);
-    app.detached_viewer_window_id = Some(WINDOW_ID);
+    app.set_detached_window_binding_for_test(Some(WINDOW_ID));
     app.detached_window_hwnd_set(WINDOW_ID, HOST_H);
     app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_H]);
     let lease = DetachedSessionLease {
@@ -69527,7 +69564,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
         app.active_detached_session.map(|session| session.window_id),
         Some(SIBLING_WINDOW)
     );
-    assert_eq!(app.detached_viewer_window_id, Some(SIBLING_WINDOW));
+    assert_eq!(app.detached_viewer_window_id(), Some(SIBLING_WINDOW));
     assert_eq!(
         app.locate_window_context(SIBLING_WINDOW)
             .expect("sibling binding after stale cleanup")
@@ -69738,7 +69775,7 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     let (ctx, requests) = repaint_request_probe();
     app.push_window_context_for_test(&ctx, 99, |sibling| {
         sibling.fullscreen_idx = Some(23);
-        sibling.detached_viewer_window_id = Some(99);
+        sibling.set_detached_window_binding_for_test(Some(99));
     });
     app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
     app.pending_detached_video_host_resync = true;
@@ -69750,7 +69787,7 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     }));
     app.with_window_viewer_context(99, |sibling| {
         assert_eq!(sibling.fullscreen_idx, Some(23));
-        assert_eq!(sibling.detached_viewer_window_id, Some(99));
+        assert_eq!(sibling.detached_viewer_window_id(), Some(99));
     })
     .unwrap();
 }

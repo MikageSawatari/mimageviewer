@@ -13894,7 +13894,7 @@ impl App {
         // 維持される内部遷移を含む)。fullscreen_idx に依存しない判定なのでこの分岐は残す。
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
-            && let Some(window_id) = self.detached_viewer_window_id
+            && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -13909,7 +13909,7 @@ impl App {
         // detached ID を返すことで OS 窓の作り直しを無くす。
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
-            && let Some(window_id) = self.detached_viewer_window_id
+            && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -13924,7 +13924,7 @@ impl App {
         if matches!(
             self.fs_viewport_presentation,
             Some(ViewerPresentation::DetachedWindow)
-        ) && let Some(window_id) = self.detached_viewer_window_id
+        ) && let Some(window_id) = self.detached_viewer_window_id()
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -24466,7 +24466,7 @@ impl App {
                      key_z_event={} key_v_raw={} key_z_raw={} key_v_final={} key_z_final={} \
                      pano_active={} continuous={} spread_double={} detect_pano={}",
                     fs_idx,
-                    self.detached_viewer_window_id,
+                    self.detached_viewer_window_id(),
                     focused,
                     current_foreground_hwnd(),
                     self.detached_viewer_host_debug_state(),
@@ -28919,7 +28919,8 @@ impl App {
             self.log_detached_image_window_debug(format!(
                 "blocked_independent_still_video_navigation target_idx={idx} \
                  current_idx={:?} window_id={:?}",
-                self.fullscreen_idx, self.detached_viewer_window_id
+                self.fullscreen_idx,
+                self.detached_viewer_window_id()
             ));
             ctx.request_repaint();
             return;

@@ -217,6 +217,16 @@ impl<P> ContextTable<P> {
         self.window_of.get(&id).copied()
     }
 
+    /// Private reservation for the builder, published ownership for a mounted payload.
+    /// The reservation stays invisible to locate_window_context until commit (I8).
+    fn projected_window(&self) -> Option<u64> {
+        assert!(self.pending.is_none());
+        match self.projection {
+            Projection::Mounted(id) => self.window_for_context(id),
+            Projection::Building { pending_bind, .. } => pending_bind,
+        }
+    }
+
     fn ids(&self) -> Vec<ViewerContextId> {
         assert!(self.pending.is_none());
         let mut ids = Vec::with_capacity(self.slots.len() + 1);
@@ -1078,13 +1088,6 @@ impl<'a> ContextRef<'a> {
         }
     }
 
-    pub(in crate::app) fn viewer_session_detached_window_id(self) -> Option<u64> {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.detached_viewer_window_id,
-            ContextRefSource::AtRest(bundle) => bundle.viewer_session.detached_window_id,
-        }
-    }
-
     pub(in crate::app) fn pdf_password_request(self) -> Option<&'a PdfPasswordRequest> {
         match self.source {
             ContextRefSource::Mounted(app) => app.pdf_password_request.as_ref(),
@@ -1604,7 +1607,7 @@ impl App {
     #[cfg(windows)]
     pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
         self.viewer_presentation = ViewerPresentation::DetachedWindow;
-        self.detached_viewer_window_id = Some(window_id);
+        self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
         self.detached_viewer_open_next_still_detached_once = false;
         self.last_viewer_sync_stamp = None;
@@ -1997,7 +2000,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
         swap_field!(native_video_in_window_active);
         swap_field!(video_audio_mode);
@@ -2582,7 +2584,6 @@ impl App {
             &mut self.last_viewer_sync_stamp,
             &mut self.detached_viewer_independent_active,
             &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
         );
 
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
@@ -2913,6 +2914,23 @@ impl App {
     /// Identity of the payload currently projected onto `App`, including a context being built.
     pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
         self.viewer_contexts.table.projected_id()
+    }
+
+    pub(crate) fn detached_viewer_window_id(&self) -> Option<u64> {
+        self.viewer_contexts.table.projected_window()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn set_detached_window_binding_for_test(&mut self, window_id: Option<u64>) {
+        if self.viewer_context_residence(self.projected_viewer_context_id())
+            == ContextResidence::Building
+        {
+            self.reserve_window_binding_for_build(window_id.expect("build fixture window"));
+        } else if let Some(window_id) = window_id {
+            self.ensure_mounted_detached_session_binding(window_id);
+        } else if let Some(window_id) = self.detached_viewer_window_id() {
+            self.unbind_window(window_id);
+        }
     }
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
@@ -3252,7 +3270,6 @@ impl App {
             self.bind_window(mounted, window_id)
                 .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
         }
-        self.detached_viewer_window_id = Some(window_id);
         self.begin_active_detached_session(window_id, source);
     }
 
@@ -3322,7 +3339,6 @@ impl App {
         let id = self
             .build_viewer_context("test_build_active_context", |app, _reserved| {
                 configure(app);
-                app.detached_viewer_window_id = Some(window_id);
                 app.reserve_window_binding_for_build(window_id);
                 BuildOutcome::Commit
             })
@@ -3888,7 +3904,6 @@ mod tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_independent_active = false;
         app.detached_viewer_open_next_still_detached_once = true;
-        app.detached_viewer_window_id = None;
         app.last_viewer_sync_stamp = Some(ViewerSyncStamp {
             idx: 1,
             item_key: "stale".to_owned(),
@@ -3900,7 +3915,7 @@ mod tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
-        assert_eq!(app.detached_viewer_window_id, Some(37));
+        assert_eq!(app.detached_viewer_window_id(), Some(37));
         assert_eq!(app.last_viewer_sync_stamp, None);
         assert!(!app.fs_open_intent_from_grid);
         assert!(!app.pending_auto_fs_open);
