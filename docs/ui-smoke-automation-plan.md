@@ -47,6 +47,22 @@ guard弱化で迂回しない。sandbox外でも起動可能なアプリはexact
 配送・listener起動を省略する。runnerはこの既存経路と明示的な使い捨てdata-dirを維持し、
 利用者の別portableへfixtureを転送しない。新しいinstance名前空間は追加しない。
 
+runnerの証跡保存は実装・独立レビュー済み。初期のlive証跡は担当が実行ごとに
+`target/v370-work/`へ保存した。2026-09-08のnative再liveではAppの失敗（exit 2）を
+prepare成功・archive成功と分け、12ファイルの保存とSHA一致を確認した。
+自動保存では、prepare前に一意のrun directoryを
+`target/ui-smoke-runs/`へ作成し、準備段階・検証済みartifact・起動PID・終了値を区別する。
+fixture/script/runner/settings overrideの実ファイルとSHA、build manifest、marker、
+使い捨てdataのlog/perfを保存し、例外・期限切れ・準備失敗でもmetadataを残す。
+準備失敗時の既存dataを今回のrun証跡へ混ぜない。未検証pathやreparse pointはコピーせず、
+収集失敗は隠さず記録する。環境変数全体や通常profileのDBは収集しない。
+同時runは共通portable/dataを共有できないためrunner間で排他し、別runを停止しない。
+準備子processのstdout/stderrはrawで別々に保存し、PowerShell 5.1の
+`ErrorActionPreference=Stop`とnative stderrのstream変換を避ける。
+scenarioの期限はアプリ起動時のmonotonic clockから一度決め、focus待ちも同予算に含める。
+prepare・App・runnerの終了値は分ける。cleanupとarchiveに例外があっても外側finallyで
+排他を解放する。fixtureも新しく作成できた領域だけを今回の証跡の対象にする。
+
 ## S1: 窓snapshotとtargetの所有
 
 App投影だけでなくregistryのread-only参照から、window ID・context serial・residence・
@@ -292,6 +308,12 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
   items generation・press前page/item・widget ID・rect・pppが同じ間は維持し、
   自然な再描画だけで失効させない。内容/幾何の変更やcatalog失効後は古いtokenを復活させない。
   Downの実Responseと準備矩形/pppを再照合し、Move/Upはpress時の座標系を維持する。
+  stripのResponse rectは、描いた先頭/末尾cellのunionをstrip_contentで切った範囲であり、
+  centerや画像比率により変わり得る。Move/Upで現在のrow rectをpress rectと同一要求しない。
+  実layoutの安定したcoordinate frame（strip_content、trackの実座標frame）も別に保持し、
+  DownではResponse rectと共に照合する。以後はwidget/mode/ppp/coordinate frameを照合し、
+  normalized座標の変換は最初のpress rectを使う。通常dragによるrow境界変化と
+  resize/layout変更を混同しない。実layout・handlerを使う混在比率の回帰で前提を確認する。
 - ROOTのprepared frame/timeは輸送の証拠であり、childの時刻と一致すると仮定しない。
   eframeはROOTとimmediate childでそれぞれelapsedを採る。child input_hookの実RawInput.timeを
   配送証拠へ保持し、callbackの実InputState.timeとはそのchild時刻のbitsを照合する。
@@ -299,6 +321,20 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
   終端失敗はUiRuntimeに確定してからtimelineをidleへ解放し、同frameのSuccessを優先させない。
 
 ## S3: native入力の継ぎ目
+
+実装・レビューは次のまとまりで進める。部品の成功を後段の実OS成功へ読み替えない。
+
+1. 通常wheel command分類の回帰（VideoZoomWheelのraw二重配送候補）と、
+   actual wheelからrender・同output bus・App handlerへつながるreceiptを分けて実装する。
+   source/placement/owner gate、latest-slot、overflowは維持する。
+2. 外部button helperの入力解放とIPCを検証し、top hoverとpanorama buttonの通常clickを
+   接続する。その操作でflat videoのzoom modeへ入り、実1notchの倍率を確認する。
+   setupのためにApp状態を書き換えたり診断専用KeyActionを作ったりしない。
+3. 同helperのcanvas dragでpanとreleaseを確認し、パネル・modal・stripの負の入力確認へ
+   名前付き対象を広げる。既存操作の各効果ownerでreceiptを照合する。
+
+wheel部分が単体成功しても、通常clickによるzoom開始と実wheelが通るまでは
+「動画zoomの自動確認済み」とは扱わない。混在batchの§1.199は別の未完了項目として維持する。
 
 **利用者選択 (2026-09-07): 実マウス入力を採用。テスト中に前面ウィンドウとマウスを使用し、
 既存のWindows入力経路を通す。** 対象はS0の使い捨てportableに限定する。

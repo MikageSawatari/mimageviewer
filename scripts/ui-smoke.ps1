@@ -15,11 +15,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-trap {
-    Write-Host "[ui-smoke] environment failure: $($_.Exception.Message)"
-    $host.SetShouldExit(2)
-    exit 2
-}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $targetRoot = Join-Path $repoRoot 'target'
 $smokeRoot = Join-Path $targetRoot 'portable-smoke'
@@ -109,29 +104,377 @@ function Join-NativeArguments {
     return (($Values | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
 }
 
-if ($TimeoutSeconds -le 0) {
-    throw '[ui-smoke] TimeoutSeconds must be greater than zero'
+function Write-UiSmokeJson {
+    param(
+        [string] $Path,
+        [object] $Value
+    )
+    $json = $Value | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-$implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove')
-if ($implementedScenarios -notcontains $Scenario) {
-    throw "[ui-smoke] scenario $Scenario is not implemented"
-}
-
-$prepareArgs = @{ TestScript = $true }
-if ($SkipBuild) { $prepareArgs.SkipBuild = $true }
-Push-Location $repoRoot
-try {
-    & (Join-Path $PSScriptRoot 'prepare-portable-smoke.ps1') @prepareArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "[ui-smoke] portable preparation failed with exit $LASTEXITCODE"
+function Write-UiSmokeEvent {
+    param([string] $Message)
+    $line = "{0} {1}" -f [DateTime]::UtcNow.ToString('o'), $Message
+    Write-Host "[ui-smoke] $Message"
+    if ($script:runnerEventLog) {
+        Add-Content -LiteralPath $script:runnerEventLog -Encoding ASCII -Value $line
     }
 }
-finally {
-    Pop-Location
+
+function Add-UiSmokeEvidenceFile {
+    param(
+        [string] $Source,
+        [string] $RelativeDestination,
+        [string] $Kind
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "[$Kind] evidence source is not a file: $Source"
+    }
+    Assert-NoReparsePath $Source $repoRoot $Kind
+    $sourceItem = Get-Item -LiteralPath $Source -Force
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "[$Kind] refusing reparse point: $($sourceItem.FullName)"
+    }
+
+    $destination = Get-NormalizedPath (Join-Path $script:runDir $RelativeDestination)
+    $runRoot = Get-NormalizedPath $script:runDir
+    if (-not $destination.StartsWith(($runRoot + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[$Kind] evidence destination escaped the run directory: $destination"
+    }
+    $evidencePath = $RelativeDestination.Replace('\', '/')
+    foreach ($entry in $script:evidenceEntries) {
+        if ($entry.path -eq $evidencePath) { return }
+    }
+    if (Test-Path -LiteralPath $destination) {
+        throw "[$Kind] refusing to overwrite unregistered evidence: $destination"
+    }
+    Assert-NoReparsePath $destination $repoRoot $Kind
+    $destinationParent = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $destinationParent)) {
+        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+    }
+    Assert-NoReparsePath $destinationParent $repoRoot $Kind
+    Copy-Item -LiteralPath $Source -Destination $destination -Force
+    $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    [void]$script:evidenceEntries.Add([ordered]@{
+        kind = $Kind
+        path = $evidencePath
+        bytes = (Get-Item -LiteralPath $destination).Length
+        sha256 = $hash
+    })
 }
 
-$exe = Assert-ExactPath $exe (Join-Path $repoRoot 'target\portable-smoke\mimageviewer.exe') 'ui-smoke-exe'
+function Register-UiSmokeEvidenceFile {
+    param(
+        [string] $Path,
+        [string] $RelativePath,
+        [string] $Kind
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $expected = Get-NormalizedPath (Join-Path $script:runDir $RelativePath)
+    $actual = Get-NormalizedPath $Path
+    if (-not $actual.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[$Kind] run evidence path mismatch: $actual (expected $expected)"
+    }
+    Assert-NoReparsePath $actual $repoRoot $Kind
+    $evidencePath = $RelativePath.Replace('\', '/')
+    foreach ($entry in $script:evidenceEntries) {
+        if ($entry.path -eq $evidencePath) { return }
+    }
+    [void]$script:evidenceEntries.Add([ordered]@{
+        kind = $Kind
+        path = $evidencePath
+        bytes = (Get-Item -LiteralPath $actual).Length
+        sha256 = (Get-FileHash -LiteralPath $actual -Algorithm SHA256).Hash.ToLowerInvariant()
+    })
+}
+
+function Add-UiSmokeEvidenceDirectory {
+    param(
+        [string] $SourceRoot,
+        [string] $RelativeDestination,
+        [string] $Kind
+    )
+    if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) { return }
+    Assert-NoReparsePath $SourceRoot $repoRoot $Kind
+    Assert-NoReparseTree $SourceRoot $Kind
+    $sourceFull = Get-NormalizedPath $SourceRoot
+    foreach ($file in (Get-ChildItem -LiteralPath $sourceFull -File -Recurse)) {
+        $relative = $file.FullName.Substring($sourceFull.Length).TrimStart('\')
+        Add-UiSmokeEvidenceFile $file.FullName (Join-Path $RelativeDestination $relative) $Kind
+    }
+}
+
+function Try-AddUiSmokeEvidenceFile {
+    param(
+        [string] $Source,
+        [string] $RelativeDestination,
+        [string] $Kind
+    )
+    try {
+        Add-UiSmokeEvidenceFile $Source $RelativeDestination $Kind
+    }
+    catch {
+        [void]$script:archiveErrors.Add("${Kind}: $($_.Exception.Message)")
+    }
+}
+
+function Try-AddUiSmokeEvidenceDirectory {
+    param(
+        [string] $SourceRoot,
+        [string] $RelativeDestination,
+        [string] $Kind
+    )
+    try {
+        Add-UiSmokeEvidenceDirectory $SourceRoot $RelativeDestination $Kind
+    }
+    catch {
+        [void]$script:archiveErrors.Add("${Kind}: $($_.Exception.Message)")
+    }
+}
+
+function Stop-ExactUiSmokeProcess {
+    if ($null -eq $script:process) { return }
+    try {
+        $script:process.Refresh()
+        if (-not $script:process.HasExited) {
+            # Future button-helper cleanup must complete before this exact kill.
+            $script:process.Kill()
+            $script:process.WaitForExit()
+        }
+        $script:process.Refresh()
+        if ($script:process.HasExited -and $script:process.ExitCode -is [int]) {
+            $script:appExitCode = $script:process.ExitCode
+        }
+    }
+    catch {
+        [void]$script:archiveErrors.Add("process cleanup: $($_.Exception.Message)")
+    }
+}
+
+function Open-UiSmokeRunnerLock {
+    param([string] $Path)
+    try {
+        return [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+    }
+    catch [System.IO.IOException] {
+        throw '[ui-smoke] another UI smoke runner owns the portable workspace'
+    }
+}
+
+function Test-UiSmokeDeadlineReached {
+    param(
+        [long] $ElapsedMilliseconds,
+        [long] $DeadlineMilliseconds
+    )
+    return $ElapsedMilliseconds -ge $DeadlineMilliseconds
+}
+
+function Invoke-UiSmokeCapturedProcess {
+    param(
+        [string] $FilePath,
+        [string[]] $ArgumentValues,
+        [string] $WorkingDirectory,
+        [string] $StandardOutputPath,
+        [string] $StandardErrorPath
+    )
+    return Start-Process `
+        -FilePath $FilePath `
+        -ArgumentList (Join-NativeArguments $ArgumentValues) `
+        -WorkingDirectory $WorkingDirectory `
+        -RedirectStandardOutput $StandardOutputPath `
+        -RedirectStandardError $StandardErrorPath `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+}
+
+function Save-UiSmokeEvidence {
+    if (-not $script:runDir -or -not (Test-Path -LiteralPath $script:runDir -PathType Container)) {
+        return
+    }
+    try {
+        Register-UiSmokeEvidenceFile (Join-Path $script:runDir 'prepare.stdout.log') 'prepare.stdout.log' 'prepare-stdout'
+        Register-UiSmokeEvidenceFile (Join-Path $script:runDir 'prepare.stderr.log') 'prepare.stderr.log' 'prepare-stderr'
+        Register-UiSmokeEvidenceFile $script:runnerEventLog 'runner-events.log' 'runner-events'
+    }
+    catch {
+        [void]$script:archiveErrors.Add("runner-log: $($_.Exception.Message)")
+    }
+    if ($script:portableValidatedForRun) {
+        Try-AddUiSmokeEvidenceFile $buildManifest 'artifact/test-script-build.json' 'build-manifest'
+        Try-AddUiSmokeEvidenceFile $marker 'artifact/disposable-smoke-data.txt' 'data-marker'
+        if ($script:scriptPath) {
+            Try-AddUiSmokeEvidenceFile $script:scriptPath 'inputs/scenario.rhai' 'scenario-script'
+        }
+        if ($script:settingsPath -and (Test-Path -LiteralPath $script:settingsPath -PathType Leaf)) {
+            Try-AddUiSmokeEvidenceFile $script:settingsPath 'inputs/settings-override.json' 'settings-override'
+        }
+        if ($script:fixtureDir) {
+            Try-AddUiSmokeEvidenceDirectory $script:fixtureDir 'inputs/fixture' 'fixture'
+        }
+        Try-AddUiSmokeEvidenceDirectory (Join-Path $dataDir 'logs') 'logs' 'application-log'
+    }
+
+    if ($script:archiveErrors.Count -gt 0) {
+        $script:runExitCode = 2
+        if (-not $script:failureMessage) {
+            $script:failureMessage = 'one or more evidence files could not be collected'
+        }
+    }
+    $evidenceIndexPath = Join-Path $script:runDir 'evidence-index.json'
+    try {
+        Write-UiSmokeJson $evidenceIndexPath @($script:evidenceEntries)
+    }
+    catch {
+        [void]$script:archiveErrors.Add("evidence-index: $($_.Exception.Message)")
+        $script:runExitCode = 2
+    }
+
+    $metadata = [ordered]@{
+        schema_version = 1
+        scenario = $Scenario
+        phase = $script:runPhase
+        started_utc = $script:runStartedUtc
+        finished_utc = [DateTime]::UtcNow.ToString('o')
+        runner_pid = $PID
+        prepare_pid = $script:preparePid
+        prepare_exit_code = $script:prepareExitCode
+        app_pid = $script:startedPid
+        app_exit_code = $script:appExitCode
+        runner_exit_code = $script:runExitCode
+        exit_code = $script:runExitCode
+        timed_out = $script:timedOut
+        skip_build = [bool]$SkipBuild
+        portable_validated_for_run = $script:portableValidatedForRun
+        executable = $exe
+        data_directory = $dataDir
+        executable_sha256 = $script:validatedExeHash
+        failure = $script:failureMessage
+        archive_errors = @($script:archiveErrors)
+    }
+    try {
+        Write-UiSmokeJson (Join-Path $script:runDir 'run-metadata.json') $metadata
+    }
+    catch {
+        Write-Host "[ui-smoke] could not write run metadata: $($_.Exception.Message)"
+        $script:runExitCode = 2
+    }
+}
+
+function Complete-UiSmokeRun {
+    try {
+        try {
+            Stop-ExactUiSmokeProcess
+        }
+        catch {
+            [void]$script:archiveErrors.Add("process finalization: $($_.Exception.Message)")
+            $script:runExitCode = 2
+        }
+        try {
+            Save-UiSmokeEvidence
+        }
+        catch {
+            $script:runExitCode = 2
+            Write-Host "[ui-smoke] evidence finalization failed: $($_.Exception.Message)"
+        }
+    }
+    finally {
+        if ($null -ne $script:runnerLock) {
+            $script:runnerLock.Dispose()
+            $script:runnerLock = $null
+        }
+    }
+}
+
+function Initialize-UiSmokeEvidence {
+    $runsRoot = Assert-ExactPath (Join-Path $targetRoot 'ui-smoke-runs') (Join-Path $repoRoot 'target\ui-smoke-runs') 'ui-smoke-runs'
+    Assert-NoReparsePath $runsRoot $repoRoot 'ui-smoke-runs'
+    if (-not (Test-Path -LiteralPath $runsRoot)) {
+        New-Item -ItemType Directory -Path $runsRoot -Force | Out-Null
+    }
+    Assert-NoReparsePath $runsRoot $repoRoot 'ui-smoke-runs'
+
+    $runName = '{0}-{1}-{2}-{3}' -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), $PID, $Scenario, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $script:runDir = Join-Path $runsRoot $runName
+    Assert-NoReparsePath $script:runDir $repoRoot 'ui-smoke-run'
+    New-Item -ItemType Directory -Path $script:runDir | Out-Null
+    Assert-NoReparsePath $script:runDir $repoRoot 'ui-smoke-run'
+    $script:runnerEventLog = Join-Path $script:runDir 'runner-events.log'
+    Add-UiSmokeEvidenceFile $PSCommandPath 'inputs/ui-smoke.ps1' 'runner-script'
+    Write-UiSmokeEvent "run evidence: $($script:runDir)"
+
+    $lockPath = Join-Path $runsRoot '.ui-smoke-runner.lock'
+    Assert-NoReparsePath $lockPath $repoRoot 'ui-smoke-lock'
+    $script:runnerLock = Open-UiSmokeRunnerLock $lockPath
+}
+
+$script:runDir = $null
+$script:runnerEventLog = $null
+$script:runnerLock = $null
+$script:evidenceEntries = New-Object System.Collections.ArrayList
+$script:archiveErrors = New-Object System.Collections.ArrayList
+$script:runStartedUtc = [DateTime]::UtcNow.ToString('o')
+$script:runPhase = 'initializing'
+$script:runExitCode = 2
+$script:failureMessage = $null
+$script:portableValidatedForRun = $false
+$script:validatedExeHash = $null
+$script:process = $null
+$script:preparePid = $null
+$script:prepareExitCode = $null
+$script:startedPid = $null
+$script:appExitCode = $null
+$script:timedOut = $false
+$script:scriptPath = $null
+$script:settingsPath = $null
+$script:fixtureDir = $null
+
+try {
+    Initialize-UiSmokeEvidence
+
+    if ($TimeoutSeconds -le 0) {
+        throw '[ui-smoke] TimeoutSeconds must be greater than zero'
+    }
+
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove')
+    if ($implementedScenarios -notcontains $Scenario) {
+        throw "[ui-smoke] scenario $Scenario is not implemented"
+    }
+
+    $script:runPhase = 'preparing-portable'
+    $prepareScript = Join-Path $PSScriptRoot 'prepare-portable-smoke.ps1'
+    $prepareArguments = @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $prepareScript,
+        '-TestScript'
+    )
+    if ($SkipBuild) { $prepareArguments += '-SkipBuild' }
+    $hostExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $prepareStdout = Join-Path $script:runDir 'prepare.stdout.log'
+    $prepareStderr = Join-Path $script:runDir 'prepare.stderr.log'
+    $prepareProcess = Invoke-UiSmokeCapturedProcess `
+        $hostExecutable `
+        $prepareArguments `
+        $repoRoot `
+        $prepareStdout `
+        $prepareStderr
+    $script:preparePid = $prepareProcess.Id
+    $script:prepareExitCode = $prepareProcess.ExitCode
+    Write-UiSmokeEvent "prepare PID $($script:preparePid) exit: $($script:prepareExitCode)"
+    if ($script:prepareExitCode -ne 0) {
+        throw "[ui-smoke] portable preparation failed with exit $($script:prepareExitCode)"
+    }
+
+    $script:runPhase = 'validating-portable'
+    $exe = Assert-ExactPath $exe (Join-Path $repoRoot 'target\portable-smoke\mimageviewer.exe') 'ui-smoke-exe'
 $dataDir = Assert-ExactPath $dataDir (Join-Path $repoRoot 'target\portable-smoke\data') 'ui-smoke-data'
 Assert-NoReparsePath $exe $repoRoot 'ui-smoke-exe'
 Assert-NoReparsePath $dataDir $repoRoot 'ui-smoke-data'
@@ -170,13 +513,22 @@ $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvari
 if ($manifest.core_sha256 -ne $exeHash) {
     throw '[ui-smoke] executable hash does not match the diagnostic build manifest'
 }
+$script:validatedExeHash = $exeHash
+$script:portableValidatedForRun = $true
+$script:runPhase = 'preserving-artifact'
+Try-AddUiSmokeEvidenceFile $buildManifest 'artifact/test-script-build.json' 'build-manifest'
+Try-AddUiSmokeEvidenceFile $marker 'artifact/disposable-smoke-data.txt' 'data-marker'
+if ($script:archiveErrors.Count -gt 0) {
+    throw '[ui-smoke] diagnostic artifact evidence could not be preserved before launch'
+}
+$script:runPhase = 'building-fixture'
 
 switch ($Scenario) {
     'MultiWindowPdf' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\multi-window-pdf'
-        $scriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-pdf.rhai'
-        $fixtureDir = Join-Path $scenarioRoot 'fixture'
-        $settingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-pdf.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
 
         $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\multi-window-pdf') 'ui-smoke-scenario'
         Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
@@ -184,25 +536,25 @@ switch ($Scenario) {
             Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
         }
-        New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
-        & python (Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py') $fixtureDir --docs 2 --pages 2
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        & python (Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py') $candidateFixtureDir --docs 2 --pages 2
         if ($LASTEXITCODE -ne 0) {
             throw "[ui-smoke] PDF fixture generator failed with exit $LASTEXITCODE"
         }
-        if (@(Get-ChildItem -LiteralPath $fixtureDir -Filter '*.pdf' -File).Count -ne 2) {
+        if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -Filter '*.pdf' -File).Count -ne 2) {
             throw '[ui-smoke] PDF fixture must contain exactly two documents'
         }
-        if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
-            throw "[ui-smoke] scenario script not found: $scriptPath"
+        if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw "[ui-smoke] scenario script not found: $candidateScriptPath"
         }
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
-        [System.IO.File]::WriteAllText($settingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
     'NativeMouseMove' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\native-mouse-move'
-        $scriptPath = Join-Path $PSScriptRoot 'ui-smoke\native-mouse-move.rhai'
-        $fixtureDir = Join-Path $scenarioRoot 'fixture'
-        $settingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\native-mouse-move.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
 
         $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\native-mouse-move') 'ui-smoke-scenario'
         Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
@@ -210,12 +562,12 @@ switch ($Scenario) {
             Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
         }
-        New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
         $ffmpegCommand = Get-Command -Name 'ffmpeg.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
         if ($null -eq $ffmpegCommand -or -not (Test-Path -LiteralPath $ffmpegCommand.Source -PathType Leaf)) {
             throw '[ui-smoke] ffmpeg.exe was not found on PATH'
         }
-        $videoPath = Join-Path $fixtureDir 'native-mouse-move.mp4'
+        $videoPath = Join-Path $candidateFixtureDir 'native-mouse-move.mp4'
         $ffmpegArgs = @(
             '-hide_banner', '-loglevel', 'error', '-y',
             '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10',
@@ -226,18 +578,22 @@ switch ($Scenario) {
         if ($LASTEXITCODE -ne 0) {
             throw "[ui-smoke] video fixture generator failed with exit $LASTEXITCODE"
         }
-        if (@(Get-ChildItem -LiteralPath $fixtureDir -Filter '*.mp4' -File).Count -ne 1 -or
+        if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -Filter '*.mp4' -File).Count -ne 1 -or
             -not (Test-Path -LiteralPath $videoPath -PathType Leaf) -or
             (Get-Item -LiteralPath $videoPath).Length -le 0) {
             throw '[ui-smoke] video fixture must contain exactly one non-empty MP4'
         }
-        if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
-            throw "[ui-smoke] scenario script not found: $scriptPath"
+        if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw "[ui-smoke] scenario script not found: $candidateScriptPath"
         }
         $settingsJson = '{"detached_viewer_open_images_in_window":true}'
-        [System.IO.File]::WriteAllText($settingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
 }
+
+$script:scriptPath = $candidateScriptPath
+$script:fixtureDir = $candidateFixtureDir
+$script:settingsPath = $candidateSettingsPath
 
 if (-not ('MivUiSmokeWindow' -as [type])) {
     Add-Type @'
@@ -259,42 +615,80 @@ $arguments = @(
     '--settings-override', $settingsPath,
     $fixtureDir
 )
-Write-Host "[ui-smoke] scenario: $Scenario"
-Write-Host "[ui-smoke] executable: $exe"
-Write-Host "[ui-smoke] data: $dataDir"
-$process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
-$focusDeadline = (Get-Date).AddSeconds(20)
-while ((Get-Date) -lt $focusDeadline) {
-    $process.Refresh()
-    if ($process.HasExited) { break }
-    if ($process.MainWindowHandle -ne 0) {
-        $null = [MivUiSmokeWindow]::SetForegroundWindow($process.MainWindowHandle)
-        break
+    Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
+    Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'
+    Try-AddUiSmokeEvidenceDirectory $fixtureDir 'inputs/fixture' 'fixture'
+    if ($script:archiveErrors.Count -gt 0) {
+        throw '[ui-smoke] scenario inputs could not be preserved before launch'
     }
-    Start-Sleep -Milliseconds 100
+
+    Write-UiSmokeEvent "scenario: $Scenario"
+    Write-UiSmokeEvent "executable: $exe"
+    Write-UiSmokeEvent "data: $dataDir"
+    $script:runPhase = 'running'
+    $scenarioClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $timeoutMilliseconds = [long]$TimeoutSeconds * 1000L
+    $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
+    $script:startedPid = $script:process.Id
+    Write-UiSmokeEvent "started PID: $($script:startedPid)"
+
+    $focusStartMilliseconds = $scenarioClock.ElapsedMilliseconds
+    while (-not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds) -and
+        ($scenarioClock.ElapsedMilliseconds - $focusStartMilliseconds) -lt 20000L) {
+        $script:process.Refresh()
+        if ($script:process.HasExited) { break }
+        if ($script:process.MainWindowHandle -ne 0) {
+            $null = [MivUiSmokeWindow]::SetForegroundWindow($script:process.MainWindowHandle)
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    while (-not $script:process.HasExited -and
+        -not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds)) {
+        Start-Sleep -Milliseconds 100
+        $script:process.Refresh()
+    }
+    if (-not $script:process.HasExited) {
+        $script:timedOut = $true
+        $script:runPhase = 'timed-out'
+        $script:runExitCode = 124
+        $script:failureMessage = "scenario exceeded the ${TimeoutSeconds}s launch-to-exit deadline"
+        Write-UiSmokeEvent 'scenario timed out; stopping the exact process started by this runner'
+    }
+    else {
+        $script:process.WaitForExit()
+        $script:process.Refresh()
+        $processExitCode = $script:process.ExitCode
+        if ($null -eq $processExitCode -or -not ($processExitCode -is [int])) {
+            throw '[ui-smoke] process exited without an integer exit code'
+        }
+        $script:appExitCode = $processExitCode
+
+        $actualMarker = (Get-Content -LiteralPath $marker -Raw -Encoding ASCII).Trim()
+        if ($actualMarker -ne $expectedMarker) {
+            throw '[ui-smoke] disposable marker changed during the run'
+        }
+        $script:runExitCode = $processExitCode
+        $script:runPhase = if ($processExitCode -eq 0) { 'completed' } else { 'application-failed' }
+        if ($processExitCode -ne 0) {
+            $script:failureMessage = "application exited with code $processExitCode"
+        }
+        Write-UiSmokeEvent "exit: $processExitCode"
+    }
+}
+catch {
+    $script:runExitCode = 2
+    $script:runPhase = 'environment-failed'
+    $script:failureMessage = $_.Exception.Message
+    Write-UiSmokeEvent "environment failure: $($script:failureMessage)"
+}
+finally {
+    Complete-UiSmokeRun
 }
 
-$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 100
-    $process.Refresh()
+if ($script:runDir) {
+    Write-Host "[ui-smoke] evidence: $($script:runDir)"
 }
-if (-not $process.HasExited) {
-    Write-Host '[ui-smoke] scenario timed out; stopping the exact process started by this runner'
-    $process.Kill()
-    $process.WaitForExit()
-    exit 124
-}
-$process.WaitForExit()
-$process.Refresh()
-$processExitCode = $process.ExitCode
-if ($null -eq $processExitCode -or -not ($processExitCode -is [int])) {
-    throw '[ui-smoke] process exited without an integer exit code'
-}
-
-$actualMarker = (Get-Content -LiteralPath $marker -Raw -Encoding ASCII).Trim()
-if ($actualMarker -ne $expectedMarker) {
-    throw '[ui-smoke] disposable marker changed during the run'
-}
-Write-Host "[ui-smoke] exit: $processExitCode"
-exit $processExitCode
+$host.SetShouldExit($script:runExitCode)
+exit $script:runExitCode
