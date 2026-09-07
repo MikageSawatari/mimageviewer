@@ -17131,6 +17131,16 @@ impl App {
                 ui.make_persistent_id("fullscreen_still_seek_strip_row"),
                 egui::Sense::click_and_drag(),
             );
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::pointer_input::record_region(
+                crate::test_script::pointer_input::RegionId::StillSeekStripRow,
+                &strip_response,
+                strip_content,
+                Some(crate::test_script::pointer_input::PaintedStripLayout {
+                    center_pos: strip_layout_center,
+                    cell_indices: layout.cells.iter().map(|cell| cell.idx).collect(),
+                }),
+            );
             if strip_response.hovered() || strip_response.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -17160,6 +17170,24 @@ impl App {
                 &mut self.fs_seek_gesture,
             );
             let strip_closed_by_drag = strip_interaction.closed_by_drag;
+            #[cfg(all(windows, feature = "test-script"))]
+            {
+                let effect_after = (!strip_closed_by_drag).then(|| {
+                    let center = self.fs_seek_gesture.strip_layout_center(info.current_pos);
+                    if strip_response.drag_stopped() {
+                        crate::test_script::pointer_input::HandlerEffect::ReleasedStripCenter(
+                            center,
+                        )
+                    } else {
+                        crate::test_script::pointer_input::HandlerEffect::StripCenter(center)
+                    }
+                });
+                crate::test_script::pointer_input::observe_region_handler(
+                    &strip_response,
+                    crate::test_script::pointer_input::RegionId::StillSeekStripRow,
+                    effect_after,
+                );
+            }
             if strip_closed_by_drag {
                 self.set_still_seek_strip_visible(ctx, false);
             }
@@ -17317,6 +17345,13 @@ impl App {
                     ui.make_persistent_id("fullscreen_seek_track"),
                     egui::Sense::click_and_drag(),
                 );
+                #[cfg(all(windows, feature = "test-script"))]
+                crate::test_script::pointer_input::record_region(
+                    crate::test_script::pointer_input::RegionId::StillSeekTrack,
+                    &response,
+                    track_rect,
+                    None,
+                );
                 if response.hovered() || response.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
@@ -17369,6 +17404,24 @@ impl App {
                         self.set_still_seek_strip_visible(ctx, true);
                     }
                     StillSeekTrackAction::None => {}
+                }
+                #[cfg(all(windows, feature = "test-script"))]
+                {
+                    let effect_after = (interaction.action == StillSeekTrackAction::Seek).then(|| {
+                        let target = resolved_at_pointer.as_ref().map(|resolved| resolved.landing_idx);
+                        if response.drag_stopped() || response.clicked() {
+                            crate::test_script::pointer_input::HandlerEffect::ReleasedTrackTarget(
+                                target,
+                            )
+                        } else {
+                            crate::test_script::pointer_input::HandlerEffect::TrackTarget(target)
+                        }
+                    });
+                    crate::test_script::pointer_input::observe_region_handler(
+                        &response,
+                        crate::test_script::pointer_input::RegionId::StillSeekTrack,
+                        effect_after,
+                    );
                 }
 
                 painter.rect_filled(
@@ -18529,9 +18582,39 @@ impl App {
         }
         #[cfg(all(windows, feature = "test-script"))]
         let mut test_script_current_item_paint = None;
+        #[cfg(all(windows, feature = "test-script"))]
+        let mut test_script_pointer_show_output = None;
+        #[cfg(all(windows, feature = "test-script"))]
+        let test_script_pointer_show_owner = active_render_window_id
+            .and_then(|window_id| self.test_script_pointer_show_owner(window_id, fs_id));
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
+                #[cfg(all(windows, feature = "test-script"))]
+                if !embedded {
+                    let directions = resolve_still_seek_directions(
+                        self.reading_direction,
+                        self.settings.fullscreen_seek_direction,
+                    );
+                    crate::test_script::pointer_input::begin_pass(
+                        ctx,
+                        self.items_generation,
+                        fs_idx,
+                        self.items
+                            .get(fs_idx)
+                            .map(GridItem::perf_key)
+                            .unwrap_or_default(),
+                        crate::test_script::pointer_input::FullscreenModeProof {
+                            spread_mode: format!("{:?}", self.spread_mode),
+                            reading_flow: format!("{:?}", self.reading_flow),
+                            strip_rtl: directions.strip_rtl,
+                            seek_bar_rtl: directions.bar_rtl,
+                            strip_visible: self.settings.still_seek_strip_visible,
+                            strip_locked: self.settings.still_bottom_lock().strip_locked(),
+                            bar_locked: self.settings.still_bottom_lock().bar_locked(),
+                        },
+                    );
+                }
                 let closure_t0 = std::time::Instant::now();
                 let closure_cycles_t0 = Self::thread_cycles_now();
                 let setup_t0 = std::time::Instant::now();
@@ -20419,6 +20502,11 @@ impl App {
                 self.show_external_tool_modals(ctx);
                 self.authorize_external_tool_launch_boundaries_after_ui();
 
+                #[cfg(all(windows, feature = "test-script"))]
+                if !embedded {
+                    crate::test_script::pointer_input::finish_pass(ctx);
+                }
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
                 fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
@@ -20446,9 +20534,16 @@ impl App {
                 }
             } else {
                 // 従来: 専用フルスクリーン viewport を出してそこに描画する。
+                #[cfg(all(windows, feature = "test-script"))]
+                let test_script_pointer_show =
+                    crate::test_script::pointer_input::enter_show(test_script_pointer_show_owner);
                 main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _class| {
                     render_fs_body(vp_ctx, false);
                 });
+                #[cfg(all(windows, feature = "test-script"))]
+                {
+                    test_script_pointer_show_output = Some(test_script_pointer_show.finish());
+                }
                 // keep-alive marker: 描いた fs_id が現セッションの detached id と一致するときだけ
                 // marker を立てる (§3.6/§3.7)。backstop の二重描画/描き漏れ防止。
                 #[cfg(windows)]
@@ -20647,6 +20742,12 @@ impl App {
             fs_idx,
             &mut fs_render_perf,
         );
+        #[cfg(all(windows, feature = "test-script"))]
+        if let (Some(window_id), Some(output)) =
+            (active_render_window_id, test_script_pointer_show_output)
+        {
+            self.test_script_finish_pointer_show(ctx, window_id, fs_id, output);
+        }
 
         // hint_start_before と一致 = このフレームで再設定されていない
         // (= 境界でない方向への移動、別キー入力、等)。操作があれば即消去。
@@ -54041,6 +54142,166 @@ mod tests {
             }
         );
         assert_eq!(release.gesture.strip_layout_center(5), 3);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct MixedAspectStripObservation {
+        row_rect: egui::Rect,
+        coordinate_frame: egui::Rect,
+        layout_center: usize,
+        page: usize,
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        gesture: StillSeekGesture,
+    }
+
+    struct MixedAspectStripHarnessState {
+        gesture: StillSeekGesture,
+        page: usize,
+        observations: Vec<MixedAspectStripObservation>,
+    }
+
+    impl Default for MixedAspectStripHarnessState {
+        fn default() -> Self {
+            Self {
+                gesture: StillSeekGesture::Idle,
+                page: 20,
+                observations: Vec::new(),
+            }
+        }
+    }
+
+    fn mixed_aspect_strip_thumbnail(index: usize) -> StillSeekStripThumbnail {
+        let size = match index % 5 {
+            0 => egui::vec2(64.0, 96.0),
+            1 => egui::vec2(160.0, 90.0),
+            2 => egui::vec2(90.0, 90.0),
+            3 => egui::vec2(40.0, 160.0),
+            _ => egui::vec2(120.0, 80.0),
+        };
+        loaded_still_seek_thumbnail(size)
+    }
+
+    fn mixed_aspect_strip_handler_harness()
+    -> egui_kittest::Harness<'static, MixedAspectStripHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut MixedAspectStripHarnessState| {
+                    let coordinate_frame =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    state.gesture.recenter_if_page_changed(state.page);
+                    let layout_center = state.gesture.strip_layout_center(state.page);
+                    let images = (0..40).collect::<Vec<_>>();
+                    let layout = still_seek_strip_layout(
+                        &images,
+                        layout_center,
+                        coordinate_frame,
+                        coordinate_frame.height(),
+                        false,
+                        mixed_aspect_strip_thumbnail,
+                    );
+                    let row_rect = layout
+                        .cells
+                        .first()
+                        .zip(layout.cells.last())
+                        .map(|(first, last)| {
+                            egui::Rect::from_min_max(
+                                egui::pos2(first.rect.left(), coordinate_frame.top()),
+                                egui::pos2(last.rect.right(), coordinate_frame.bottom()),
+                            )
+                            .intersect(coordinate_frame)
+                        })
+                        .expect("the mixed-aspect current page must produce a strip row");
+                    let response = ui.interact(
+                        row_rect,
+                        ui.make_persistent_id("mixed_aspect_still_seek_strip_row"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let interaction = handle_still_seek_strip_response(
+                        &response,
+                        layout_center,
+                        state.page,
+                        images.len(),
+                        40.0,
+                        coordinate_frame.bottom(),
+                        false,
+                        &mut state.gesture,
+                    );
+                    assert!(!interaction.closed_by_drag);
+                    state.observations.push(MixedAspectStripObservation {
+                        row_rect,
+                        coordinate_frame,
+                        layout_center,
+                        page: state.page,
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        gesture: state.gesture,
+                    });
+                },
+                MixedAspectStripHarnessState::default(),
+            )
+    }
+
+    fn mixed_aspect_strip_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, MixedAspectStripHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn mixed_aspect_layout_moves_the_real_row_while_the_normal_handler_finishes_the_drag() {
+        let mut harness = mixed_aspect_strip_handler_harness();
+        harness.run();
+        let initial = *harness.state().observations.last().unwrap();
+        assert_eq!(initial.layout_center, 20);
+        let origin = initial.coordinate_frame.center();
+        assert!(initial.row_rect.contains(origin));
+
+        harness.hover_at(origin);
+        harness.step();
+        mixed_aspect_strip_pointer_button(&mut harness, origin, true);
+        let moved = egui::pos2(origin.x + 80.0, origin.y);
+        harness.hover_at(moved);
+        harness.step();
+        let drag = *harness.state().observations.last().unwrap();
+        assert!(drag.drag_started);
+        assert!(drag.dragged);
+        assert_eq!(drag.page, 20, "strip drag must not navigate");
+        assert_eq!(drag.gesture.strip_layout_center(20), 18);
+
+        // Render once at the handler-updated center. Mixed page aspects change the union of the
+        // actual visible cells, so the response rect moves while the coordinate frame stays put.
+        harness.step();
+        let moved_layout = *harness.state().observations.last().unwrap();
+        assert_eq!(moved_layout.layout_center, 18);
+        assert_ne!(moved_layout.row_rect, initial.row_rect);
+        assert_eq!(moved_layout.coordinate_frame, initial.coordinate_frame);
+
+        let released = egui::pos2(origin.x + 120.0, origin.y);
+        harness.hover_at(released);
+        // Keep the distinct final move and Up in one input frame, matching the S2 transport.
+        mixed_aspect_strip_pointer_button(&mut harness, released, false);
+        let release = *harness.state().observations.last().unwrap();
+        assert!(release.drag_stopped);
+        assert_eq!(release.page, 20, "strip release must not navigate");
+        assert_eq!(
+            release.gesture,
+            StillSeekGesture::StripCommitted {
+                layout_center_pos: 17,
+                page_pos_at_commit: 20,
+            }
+        );
     }
 
     #[test]

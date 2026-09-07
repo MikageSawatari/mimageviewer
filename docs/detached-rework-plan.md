@@ -1459,6 +1459,30 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-08 §1.197 S2: 診断pointerのexact owner配送（実装前の構造合意）:**
+
+今回の利用者指定による担当移行の下で、親Astraの設計・Solの実装前提検証・独立Astraの
+source-copy再レビューを実施し、現設計は症状パッチではないと確認した。
+実compile・回帰・portable liveはこの合意後の工程であり、完了を意味しない。
+
+対象は明示選択したactive detachedの静止画strip/track。既存synthetic timelineを唯一の
+transaction ownerとし、exact window/context/backend incarnation/items generationへ配送する。
+共通input hookのpointerは一度だけ渡し、Legacy key replayは維持する。ROOT preparationと
+child RawInputのframe/timeを同一視せず、実child配送・show-local handler・最終passのtailを結ぶ。
+通常のmount/activation、viewport生成・配置・描画入口を変更して検査を通す方法は採らない。
+
+通常Close/F12や未使用pointerのsibling showを診断失敗にしない。取消後の古いtransportに
+後続窓を失敗させる権限はなく、残るcleanup義務は元のtyped transactionだけが所有する。
+terminal failureはUiRuntimeで環境失敗を確定してからexact ackでidleへ移し、同frameの
+Successが勝たないよう実接続の回帰を行う。Downは実page/item/mode/lock/Response/pppを照合し、
+Move/Upは正当なpage・strip row変化を許してpress座標基準と実coordinate frameを保持する。
+
+共有機構の影響先は`key_input`の診断入力、`test_script`の終了処理、fullscreenの共通strip/track
+handlerとactive detached show境界。新しい観測・操作は診断feature内に限定し、普通の入力・
+兄弟contextのcache/queue/worker・既存keymapを保持する。実装と検証の正本は
+[ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) S2と
+[v3.7.0-priority-work.md](v3.7.0-priority-work.md)。
+
 **2026-09-07 §1.197 S3a: 実MouseMoveのnative経路観測（実装前の構造合意）:**
 
 親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の

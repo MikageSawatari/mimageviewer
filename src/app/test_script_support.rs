@@ -48,6 +48,73 @@ fn test_script_active_paint_owner(
 }
 
 impl App {
+    pub(crate) fn test_script_pointer_show_owner(
+        &self,
+        window_id: u64,
+        viewport_id: egui::ViewportId,
+    ) -> Option<crate::test_script::pointer_input::ShowOwner> {
+        let mounted_context = self.mounted_viewer_context_id()?;
+        if self.active_detached_window_id() != Some(window_id) {
+            return None;
+        }
+        let identity = self.test_script_window_identity(window_id, viewport_id)?;
+        if identity.context_serial() != mounted_context.serial() {
+            return None;
+        }
+        let items_generation =
+            self.with_viewer_context_ref(mounted_context, |context| context.items_generation())?;
+        Some(crate::test_script::pointer_input::ShowOwner {
+            identity,
+            items_generation,
+        })
+    }
+
+    pub(crate) fn test_script_finish_pointer_show(
+        &self,
+        ctx: &egui::Context,
+        window_id: u64,
+        viewport_id: egui::ViewportId,
+        output: crate::test_script::pointer_input::ShowOutput,
+    ) {
+        // The immediate viewport registers/refreshes its HWND only after the callback. Join the
+        // callback-carried witness to that authoritative host before publishing geometry or
+        // acknowledging its delivered step.
+        self.test_script_publish_window_snapshots();
+        let current = self
+            .test_script_window_identity(window_id, viewport_id)
+            .and_then(|identity| {
+                let context_id = self.locate_window_context(window_id)?.0;
+                (identity.context_serial() == context_id.serial()).then_some((identity, context_id))
+            })
+            .and_then(|(identity, context_id)| {
+                self.with_viewer_context_ref(context_id, |context| {
+                    Some((
+                        identity,
+                        context.items_generation(),
+                        context.fullscreen_idx()?,
+                    ))
+                })?
+            });
+        match current {
+            Some((identity, items_generation, page_after_navigation)) => {
+                crate::test_script::publish_pointer_show(
+                    ctx,
+                    output,
+                    identity,
+                    items_generation,
+                    page_after_navigation,
+                );
+            }
+            None => crate::test_script::reject_pointer_show(
+                ctx,
+                output,
+                format!(
+                    "pointer show host is no longer current: window={window_id} viewport={viewport_id:?}"
+                ),
+            ),
+        }
+    }
+
     pub(crate) fn test_script_window_snapshots(
         &self,
     ) -> Vec<crate::test_script::TestScriptWindowSnapshot> {

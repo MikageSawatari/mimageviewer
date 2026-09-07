@@ -314,6 +314,13 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
   DownではResponse rectと共に照合する。以後はwidget/mode/ppp/coordinate frameを照合し、
   normalized座標の変換は最初のpress rectを使う。通常dragによるrow境界変化と
   resize/layout変更を混同しない。実layout・handlerを使う混在比率の回帰で前提を確認する。
+  Heldの領域検索もpage/item一致を要求するDown用検索から分離する。trackの同showで
+  pageが移動しても、owner/genが同じ最新frameの座標系を参照できる。
+  navigationがmode/layoutを変える可能性は残るため、次の実handlerでもmode/frame/pppを照合する。
+  同showのgeometryをpublishして実revisionを確定し、catalog lock解放後にtimelineの
+  completionへ`after_revision`を渡す。これはそのshowの最終passの描画revisionであり、
+  handler後の効果が描かれた証明ではない。次paintはこれより大きいrevisionを要求する。
+  公開失敗時にrevisionを捏造せず、環境失敗を確定してからexact terminal ackへ進む。
 - ROOTのprepared frame/timeは輸送の証拠であり、childの時刻と一致すると仮定しない。
   eframeはROOTとimmediate childでそれぞれelapsedを採る。child input_hookの実RawInput.timeを
   配送証拠へ保持し、callbackの実InputState.timeとはそのchild時刻のbitsを照合する。

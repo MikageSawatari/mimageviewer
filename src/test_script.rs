@@ -22,6 +22,8 @@ use crate::key_input::{
 };
 use crate::keymap::{KeyAction, KeyTrigger};
 
+pub(crate) mod pointer_input;
+
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const EXIT_NOT_SET: i32 = -1;
@@ -612,6 +614,7 @@ struct RunnerBridge {
     wake: Arc<dyn Fn() + Send + Sync>,
     next_hold_id: Arc<AtomicU64>,
     action_selection: Arc<Mutex<TestScriptActionSelection>>,
+    pointer_regions: pointer_input::SharedRegionCatalog,
 }
 
 impl RunnerBridge {
@@ -1424,6 +1427,11 @@ fn build_engine(bridge: RunnerBridge) -> Engine {
             None
         }
     });
+    pointer_input::register(
+        &mut engine,
+        bridge.clone(),
+        Arc::clone(&bridge.pointer_regions),
+    );
     register_runner_api(&mut engine, bridge);
     engine
 }
@@ -1578,6 +1586,7 @@ struct UiRuntime {
     viewport_observations: HashMap<TestScriptWindowIdentity, u64>,
     paint_observations: HashMap<TestScriptPaintEvidenceKey, u64>,
     next_observation_revision: u64,
+    pointer_regions: pointer_input::SharedRegionCatalog,
 }
 
 impl UiRuntime {
@@ -1585,6 +1594,7 @@ impl UiRuntime {
         rx: mpsc::Receiver<UiCommand>,
         snapshot: Arc<RwLock<TestScriptSnapshot>>,
         interrupt: Arc<InterruptState>,
+        pointer_regions: pointer_input::SharedRegionCatalog,
     ) -> Self {
         Self {
             rx,
@@ -1598,11 +1608,18 @@ impl UiRuntime {
             viewport_observations: HashMap::new(),
             paint_observations: HashMap::new(),
             next_observation_revision: 0,
+            pointer_regions,
         }
     }
 
     fn replace_authoritative_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) {
         self.authoritative_windows = windows;
+        if let Ok(mut regions) = self.pointer_regions.write() {
+            regions.retain_authoritative(&self.authoritative_windows);
+        } else {
+            self.interrupt
+                .fail("test-script pointer region catalog is poisoned");
+        }
         let mut retained_actions = VecDeque::with_capacity(self.pending_actions.len());
         while let Some(mut pending) = self.pending_actions.pop_front() {
             let stale_owner = match &pending.dispatch {
@@ -2016,6 +2033,26 @@ fn describe_issue(issue: &SyntheticInputIssue) -> String {
         } => format!(
             "synthetic target viewport was not rendered in its outer frame: viewport={viewport:?} raw_input_time={raw_input_time:?} event_count={event_count}"
         ),
+        SyntheticInputIssue::PointerOwnerMismatch { handle, detail } => {
+            format!(
+                "synthetic pointer owner mismatch: step={} detail={detail}",
+                handle.step_id
+            )
+        }
+        SyntheticInputIssue::PointerPhysicalInputMixed { handle } => {
+            format!(
+                "physical pointer input mixed with synthetic transaction: step={}",
+                handle.step_id
+            )
+        }
+        SyntheticInputIssue::PointerViewportNotRendered { handle, viewport } => format!(
+            "synthetic pointer viewport was not rendered: step={} viewport={viewport:?}",
+            handle.step_id
+        ),
+        SyntheticInputIssue::MissingPointerShowTail { handle, viewport } => format!(
+            "synthetic pointer show ended without callback tail: step={} viewport={viewport:?}",
+            handle.step_id
+        ),
     }
 }
 
@@ -2051,6 +2088,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
     let interrupt = Arc::new(InterruptState::default());
+    let pointer_regions = Arc::new(RwLock::new(pointer_input::RegionCatalog::default()));
     let wake_ctx = ctx.clone();
     let bridge = RunnerBridge {
         tx,
@@ -2061,6 +2099,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         }),
         next_hold_id: Arc::new(AtomicU64::new(0)),
         action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+        pointer_regions: Arc::clone(&pointer_regions),
     };
 
     let mut guard = runtime()
@@ -2070,7 +2109,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         crate::key_input::disarm_synthetic_input();
         return Err("a test-script runtime is already active".to_string());
     }
-    *guard = Some(UiRuntime::new(rx, snapshot, interrupt));
+    *guard = Some(UiRuntime::new(rx, snapshot, interrupt, pointer_regions));
     drop(guard);
 
     if let Err(error) = spawn_script_path(path, bridge) {
@@ -2334,7 +2373,19 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     }
 
     for issue in issues {
+        let terminal_pointer_step = match &issue {
+            SyntheticInputIssue::PointerOwnerMismatch { handle, .. }
+            | SyntheticInputIssue::PointerPhysicalInputMixed { handle }
+            | SyntheticInputIssue::PointerViewportNotRendered { handle, .. }
+            | SyntheticInputIssue::MissingPointerShowTail { handle, .. } => Some(handle.clone()),
+            _ => None,
+        };
         runtime.fail_environment(describe_issue(&issue), frame);
+        if let Some(handle) = terminal_pointer_step {
+            // EnvironmentFailure is committed before the typed terminal pointer phase releases
+            // to Idle, so a nominal Finished in this same frame cannot mask missing cleanup proof.
+            let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+        }
     }
 
     while let Ok(command) = runtime.rx.try_recv() {
@@ -2466,6 +2517,164 @@ pub(crate) fn publish_window_frame(
         return;
     };
     let _ = runtime.publish_window_frame(owner, content);
+}
+
+pub(crate) fn publish_pointer_show(
+    ctx: &egui::Context,
+    output: pointer_input::ShowOutput,
+    current_identity: TestScriptWindowIdentity,
+    current_items_generation: u64,
+    page_after_navigation: usize,
+) {
+    let frame_key = frame_key(ctx);
+    let delivered_handle = output.delivered_cancel_handle();
+    let pointer_owner = output.pointer_owner();
+    let catalog_owner = output.catalog_owner();
+    let has_pointer_obligation = output.has_pointer_obligation();
+    let result = pointer_input::join_show_output(
+        output,
+        &current_identity,
+        current_items_generation,
+        page_after_navigation,
+    );
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    match result {
+        Ok(joined) => {
+            let published_revision = runtime
+                .pointer_regions
+                .write()
+                .map(|mut catalog| catalog.publish(joined.frame.clone()))
+                // A PoisonError owns the failed guard. Erase it before mutably borrowing runtime
+                // for the environment failure path below.
+                .map_err(|_| ());
+            let published_revision = match published_revision {
+                Ok(revision) => revision,
+                Err(_) => {
+                    let error = "test-script pointer region catalog is poisoned".to_string();
+                    runtime.fail_environment(error.clone(), frame_key);
+                    let terminal_handle = if let Some(handle) = delivered_handle {
+                        crate::key_input::fail_synthetic_pointer_delivered(&handle, error)
+                            .then_some(handle)
+                    } else {
+                        pointer_owner.as_ref().and_then(|owner| {
+                            crate::key_input::fail_synthetic_pointer_owner_lost(owner)
+                        })
+                    };
+                    if let Some(handle) = terminal_handle {
+                        let _ =
+                            crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+                    }
+                    return;
+                }
+            };
+            // Drop the catalog write guard before the timeline can wake the Rhai worker. Its
+            // completion now carries this exact published revision as the next-paint barrier.
+            if let Err(error) = joined.finish(published_revision) {
+                let catalog_invalidated = runtime
+                    .pointer_regions
+                    .write()
+                    .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+                    .is_ok();
+                if !catalog_invalidated {
+                    runtime.fail_environment(
+                        "test-script pointer region catalog is poisoned".to_string(),
+                        frame_key,
+                    );
+                }
+                if !has_pointer_obligation {
+                    return;
+                }
+                runtime.fail_environment(error.clone(), frame_key);
+                let terminal_handle = if let Some(handle) = delivered_handle {
+                    crate::key_input::fail_synthetic_pointer_delivered(&handle, error)
+                        .then_some(handle)
+                } else {
+                    pointer_owner.as_ref().and_then(|owner| {
+                        crate::key_input::fail_synthetic_pointer_owner_lost(owner)
+                    })
+                };
+                if let Some(handle) = terminal_handle {
+                    let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+                }
+            }
+        }
+        Err(error) => {
+            let catalog_invalidated = runtime
+                .pointer_regions
+                .write()
+                .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+                .is_ok();
+            if !catalog_invalidated {
+                runtime.fail_environment(
+                    "test-script pointer region catalog is poisoned".to_string(),
+                    frame_key,
+                );
+            }
+            if !has_pointer_obligation {
+                return;
+            }
+            runtime.fail_environment(error.clone(), frame_key);
+            let terminal_handle = if let Some(handle) = delivered_handle {
+                crate::key_input::fail_synthetic_pointer_delivered(&handle, error).then_some(handle)
+            } else {
+                pointer_owner
+                    .as_ref()
+                    .and_then(|owner| crate::key_input::fail_synthetic_pointer_owner_lost(owner))
+            };
+            if let Some(handle) = terminal_handle {
+                // This direct post-show error has already reached fail_environment. It can now
+                // release the typed terminal phase without waiting for issue polling.
+                let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+            }
+        }
+    }
+}
+
+pub(crate) fn reject_pointer_show(
+    ctx: &egui::Context,
+    output: pointer_input::ShowOutput,
+    error: String,
+) {
+    let delivered_handle = output.delivered_cancel_handle();
+    let pointer_owner = output.pointer_owner();
+    let catalog_owner = output.catalog_owner();
+    let has_pointer_obligation = output.has_pointer_obligation();
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let catalog_invalidated = runtime
+        .pointer_regions
+        .write()
+        .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+        .is_ok();
+    if !catalog_invalidated {
+        runtime.fail_environment(
+            "test-script pointer region catalog is poisoned".to_string(),
+            frame_key(ctx),
+        );
+    }
+    if !has_pointer_obligation {
+        return;
+    }
+    runtime.fail_environment(error.clone(), frame_key(ctx));
+    let terminal_handle = if let Some(handle) = delivered_handle {
+        crate::key_input::fail_synthetic_pointer_delivered(&handle, error).then_some(handle)
+    } else {
+        pointer_owner
+            .as_ref()
+            .and_then(crate::key_input::fail_synthetic_pointer_owner_lost)
+    };
+    if let Some(handle) = terminal_handle {
+        let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+    }
 }
 
 pub(crate) fn publish_fullscreen_input_state(
@@ -2660,6 +2869,7 @@ mod tests {
                 }),
                 next_hold_id: Arc::new(AtomicU64::new(0)),
                 action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+                pointer_regions: pointer_input::new_shared_catalog(),
             },
             rx,
             wakes,
@@ -3097,6 +3307,7 @@ mod tests {
             rx,
             Arc::new(RwLock::new(TestScriptSnapshot::default())),
             Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
         )
     }
 
@@ -3803,6 +4014,7 @@ mod tests {
             rx,
             Arc::clone(&snapshot),
             Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
         );
         let owner = window_identity(7, 11, 14);
         runtime
@@ -3874,6 +4086,7 @@ mod tests {
             rx,
             Arc::clone(&snapshot),
             Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
         );
         let old_owner = window_identity(7, 11, 13);
         let current_owner = window_identity(7, 11, 14);
@@ -3927,5 +4140,216 @@ mod tests {
         assert_eq!(ScriptOutcomeKind::Success.exit_code(), 0);
         assert_ne!(ScriptOutcomeKind::ScriptFailure.exit_code(), 0);
         assert_ne!(ScriptOutcomeKind::EnvironmentFailure.exit_code(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn poisoned_pointer_catalog_fails_the_actual_show_and_releases_its_exact_step() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_synthetic_input();
+
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("poisoned-pointer-catalog");
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, 0x7272);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = detached_identity_from_witness(witness, 17, 19);
+        let pointer_owner = crate::key_input::SyntheticPointerOwner {
+            identity: owner.clone(),
+            items_generation: 29,
+        };
+        let mode = pointer_input::FullscreenModeProof {
+            spread_mode: "Single".to_string(),
+            reading_flow: "Paged".to_string(),
+            strip_rtl: false,
+            seek_bar_rtl: false,
+            strip_visible: true,
+            strip_locked: true,
+            bar_locked: true,
+        };
+        let mode_signature = crate::key_input::SyntheticPointerModeSignature {
+            spread_mode: mode.spread_mode.clone(),
+            reading_flow: mode.reading_flow.clone(),
+            strip_rtl: mode.strip_rtl,
+            seek_bar_rtl: mode.seek_bar_rtl,
+            strip_visible: mode.strip_visible,
+            strip_locked: mode.strip_locked,
+            bar_locked: mode.bar_locked,
+        };
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+        let point = egui::pos2(20.0, 30.0);
+        let prepared = crate::key_input::prepared_synthetic_pointer_step_for_test(
+            73,
+            crate::key_input::SyntheticPointerLatch {
+                transaction_id: 73,
+                owner: pointer_owner,
+                region: crate::key_input::SyntheticPointerRegion::StillSeekTrack,
+                mode: mode_signature,
+                region_geometry_token: 1,
+                press_page_index: 2,
+                press_item_identity: "page-2".to_string(),
+                widget_id: egui::Id::new("poisoned-pointer-track"),
+                press_rect: rect,
+                coordinate_frame: rect,
+                press_pixels_per_point: 1.0,
+                press_point: point,
+            },
+            crate::key_input::SyntheticPointerStepKind::Down { point },
+            1,
+            1.0_f64.to_bits(),
+        );
+        let completion =
+            crate::key_input::install_synthetic_pointer_delivered_for_test(prepared.clone());
+
+        let mut warmup_input = egui::RawInput {
+            viewport_id: viewport,
+            time: Some(1.0),
+            ..Default::default()
+        };
+        warmup_input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                native_pixels_per_point: Some(1.0),
+                ..Default::default()
+            },
+        );
+        ctx.begin_pass(warmup_input);
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let _ = ui.interact(
+                rect,
+                egui::Id::new("poisoned-pointer-track"),
+                egui::Sense::click_and_drag(),
+            );
+        });
+        let _ = ctx.end_pass();
+
+        let mut child_input = egui::RawInput {
+            viewport_id: viewport,
+            time: Some(1.005),
+            events: vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        child_input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                native_pixels_per_point: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let show = pointer_input::enter_show(Some(pointer_input::ShowOwner {
+            identity: owner.clone(),
+            items_generation: 29,
+        }));
+        ctx.begin_pass(child_input.clone());
+        pointer_input::record_delivery_proof(&prepared, &child_input);
+        pointer_input::begin_pass(&ctx, 29, 2, "page-2".to_string(), mode);
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let response = ui.interact(
+                rect,
+                egui::Id::new("poisoned-pointer-track"),
+                egui::Sense::click_and_drag(),
+            );
+            assert!(
+                response.is_pointer_button_down_on(),
+                "test precondition: egui must hit the actual track response"
+            );
+            pointer_input::record_region(
+                pointer_input::RegionId::StillSeekTrack,
+                &response,
+                rect,
+                None,
+            );
+            pointer_input::observe_region_handler(
+                &response,
+                pointer_input::RegionId::StillSeekTrack,
+                None,
+            );
+        });
+        pointer_input::finish_pass(&ctx);
+        let output = show.finish();
+        let _ = ctx.end_pass();
+
+        let poisoned_catalog = pointer_input::new_shared_catalog();
+        let poison_target = Arc::clone(&poisoned_catalog);
+        let poison = std::thread::spawn(move || {
+            let _guard = poison_target.write().unwrap();
+            panic!("poison pointer catalog for publication regression");
+        });
+        assert!(poison.join().is_err());
+        let mut ui_runtime = local_runtime();
+        ui_runtime.pointer_regions = poisoned_catalog;
+        {
+            let mut active = runtime().lock().expect("test-script runtime lock poisoned");
+            assert!(active.is_none(), "no other runtime may own this regression");
+            *active = Some(ui_runtime);
+        }
+
+        publish_pointer_show(&ctx, output, owner, 29, 2);
+
+        let completion_error = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the exact delivered step must be completed")
+            .expect_err("catalog publication failure must not report pointer success");
+        assert!(completion_error.contains("catalog is poisoned"));
+        assert!(crate::key_input::synthetic_input_is_idle());
+        let mut active = runtime().lock().expect("test-script runtime lock poisoned");
+        let mut ui_runtime = active
+            .take()
+            .expect("the regression runtime must remain present");
+        ui_runtime.begin_finish(ScriptOutcome::success(), 1.005_f64.to_bits());
+        let finish = ui_runtime
+            .finish
+            .expect("environment failure must finish the run");
+        assert_eq!(finish.outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
+        assert_ne!(finish.outcome.kind.exit_code(), 0);
+        assert!(finish.outcome.message.contains("catalog is poisoned"));
+        drop(active);
+        crate::key_input::clear_test_synthetic_input();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pointer_terminal_ack_cannot_be_masked_by_same_frame_success() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_synthetic_input();
+        let handle = crate::key_input::SyntheticPointerCancelHandle {
+            transaction_id: 73,
+            step_id: 73_u64 << 32 | 1,
+            owner: crate::key_input::SyntheticPointerOwner {
+                identity: root_identity(17, 0x7171),
+                items_generation: 29,
+            },
+        };
+        crate::key_input::install_synthetic_pointer_terminal_for_test(handle.clone());
+        let mut runtime = local_runtime();
+
+        runtime.fail_environment(
+            "synthetic pointer cleanup did not release primary".to_string(),
+            41,
+        );
+        assert!(crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle));
+        runtime.begin_finish(ScriptOutcome::success(), 41);
+
+        let finish = runtime.finish.as_ref().expect("finish must be committed");
+        assert_eq!(finish.outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
+        assert_ne!(finish.outcome.kind.exit_code(), 0);
+        assert!(crate::key_input::synthetic_input_is_idle());
+        crate::key_input::clear_test_synthetic_input();
     }
 }
