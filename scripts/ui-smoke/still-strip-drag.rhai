@@ -3,6 +3,36 @@
 const STRIP = "fullscreen_still_seek_strip_row";
 const TRACK = "fullscreen_seek_track";
 const WAIT_MS = 30000;
+const FIXTURE_IMAGE_COUNT = 40;
+// The disposable fixture pins still_seek_strip_height=large. The production
+// drag handler quantizes the immutable press delta by this 152-point cell width.
+const STRIP_CELL_WIDTH = 152.0;
+
+fn strip_drag_positions(region, label, cell_width) {
+    let width = region.right - region.left;
+    if width <= 0.0 {
+        fail(label + " strip row has no usable width");
+    }
+    let down_x = 0.05;
+    let one_cell_x = down_x + cell_width / width;
+    let two_cells_x = down_x + 2.0 * cell_width / width;
+    let three_cells_x = down_x + 3.0 * cell_width / width;
+    if one_cell_x <= down_x
+            || two_cells_x <= one_cell_x
+            || three_cells_x <= two_cells_x
+            || three_cells_x > 0.95 {
+        fail(label + " strip row is too narrow for three distinct fixture steps"
+            + ": width=" + width
+            + " final_x=" + three_cells_x);
+    }
+    log("still-strip-drag: " + label + " coordinates"
+        + " width=" + width
+        + " down=" + down_x
+        + " one=" + one_cell_x
+        + " two=" + two_cells_x
+        + " three=" + three_cells_x);
+    [down_x, one_cell_x, two_cells_x, three_cells_x]
+}
 
 fn same_identity(actual, expected) {
     actual.role == expected.role
@@ -190,11 +220,72 @@ fn assert_strip_step(step, effect, page, label) {
     }
 }
 
-// Key-action completion proves the handler pass, whose geometry was captured before that handler.
-// Step over that publication and return a later callback observation of the resulting mode.
-fn settled_region_after_action(name, before_revision) {
-    let action_show = egui_pointer_region(name, before_revision, WAIT_MS);
-    egui_pointer_region(name, action_show.revision, WAIT_MS)
+// Mirror ReadingFlow::next: Paged -> Vertical -> Horizontal -> Paged.
+fn next_reading_flow(flow) {
+    if flow == "Paged" {
+        return "Vertical";
+    }
+    if flow == "Vertical" {
+        return "Horizontal";
+    }
+    if flow == "Horizontal" {
+        return "Paged";
+    }
+    fail("unknown reading flow while computing the expected transition: " + flow);
+}
+
+// run_action acknowledges exact-owner consumption, before the handler effect is
+// published. Advance only through fresh region revisions until that same owner
+// exposes the requested mode, under one monotonic absolute timeout.
+fn wait_for_region_mode(
+    name,
+    after_revision,
+    expected_spread,
+    expected_flow,
+    expected_rtl,
+    timeout_ms
+) {
+    if timeout_ms <= 0 {
+        fail("region mode timeout must be positive");
+    }
+    let started = timestamp();
+    let budget_ms = timeout_ms.to_float();
+    let current_after = after_revision;
+    let last_revision = after_revision;
+    let last_spread = "<unobserved>";
+    let last_flow = "<unobserved>";
+    let last_rtl = false;
+    while true {
+        let elapsed_ms = started.elapsed * 1000.0;
+        let remaining_ms = (budget_ms - elapsed_ms).to_int();
+        if elapsed_ms >= budget_ms || remaining_ms <= 0 {
+            fail("timed out waiting for exact-owner region mode"
+                + ": name=" + name
+                + " last_revision=" + last_revision
+                + " last_spread=" + last_spread
+                + " last_flow=" + last_flow
+                + " last_rtl=" + last_rtl);
+        }
+        let observed = egui_pointer_region(name, current_after, remaining_ms);
+        current_after = observed.revision;
+        last_revision = observed.revision;
+        last_spread = observed.spread_mode;
+        last_flow = observed.reading_flow;
+        last_rtl = observed.strip_rtl;
+        if started.elapsed * 1000.0 >= budget_ms {
+            fail("region mode arrived after its absolute deadline"
+                + ": name=" + name
+                + " last_revision=" + last_revision
+                + " last_spread=" + last_spread
+                + " last_flow=" + last_flow
+                + " last_rtl=" + last_rtl);
+        }
+        if last_spread == expected_spread
+                && last_flow == expected_flow
+                && last_rtl == expected_rtl {
+            return observed;
+        }
+    }
 }
 
 log("still-strip-drag: wait for image-book folder and PDF sibling");
@@ -239,16 +330,27 @@ assert_targeted(select_window(target.window_id, target.context_serial), "select 
 let strip = egui_pointer_region(STRIP, 0, WAIT_MS);
 if strip.spread_mode != "Single" {
     let before_revision = strip.revision;
+    let expected_flow = strip.reading_flow;
+    let expected_rtl = strip.strip_rtl;
     run_action("FsSpreadSingle");
-    strip = settled_region_after_action(STRIP, before_revision);
+    strip = wait_for_region_mode(
+        STRIP, before_revision, "Single", expected_flow, expected_rtl, WAIT_MS);
 }
 for mode_step in 0..3 {
     if strip.reading_flow == "Paged" {
         break;
     }
     let before_revision = strip.revision;
+    let expected_flow = next_reading_flow(strip.reading_flow);
     run_action("FsReadingFlowCycle");
-    strip = settled_region_after_action(STRIP, before_revision);
+    strip = wait_for_region_mode(
+        STRIP,
+        before_revision,
+        strip.spread_mode,
+        expected_flow,
+        strip.strip_rtl,
+        WAIT_MS
+    );
 }
 if strip.reading_flow != "Paged" {
     fail("FsReadingFlowCycle did not reach Paged");
@@ -256,7 +358,14 @@ if strip.reading_flow != "Paged" {
 if strip.strip_rtl {
     let before_revision = strip.revision;
     run_action("FsReadingDirectionToggle");
-    strip = settled_region_after_action(STRIP, before_revision);
+    strip = wait_for_region_mode(
+        STRIP,
+        before_revision,
+        strip.spread_mode,
+        strip.reading_flow,
+        false,
+        WAIT_MS
+    );
 }
 assert_base_mode(strip, false, "initial LTR setup");
 for page_step in 0..20 {
@@ -277,31 +386,59 @@ strip = egui_pointer_region(STRIP, 0, WAIT_MS);
 assert_base_mode(strip, false, "LTR setup");
 let page = strip.page_index;
 let initial_center = strip.strip_center;
+if initial_center < 3 {
+    fail("LTR fixture center has less than three pages of start-side margin");
+}
+let ltr_x = strip_drag_positions(strip, "LTR", STRIP_CELL_WIDTH);
+log("still-strip-drag: LTR initial"
+    + " revision=" + strip.revision
+    + " geometry_token=" + strip.geometry_token
+    + " page=" + page
+    + " center=" + initial_center
+    + " rect_left=" + strip.left
+    + " rect_right=" + strip.right
+    + " coordinate_left=" + strip.coordinate_left
+    + " coordinate_right=" + strip.coordinate_right);
 
-let down = egui_pointer_down(STRIP, strip.geometry_token, 0.50, 0.50, WAIT_MS);
+let down = egui_pointer_down(STRIP, strip.geometry_token, ltr_x[0], 0.50, WAIT_MS);
 assert_strip_step(down, "pressed", page, "LTR down");
-let moved = egui_pointer_move(0.62, 0.50, WAIT_MS);
+let moved = egui_pointer_move(ltr_x[1], 0.50, WAIT_MS);
 assert_strip_step(moved, "strip_center", page, "LTR threshold move");
-if moved.effect_value >= initial_center {
-    fail("LTR rightward threshold move did not decrease strip center");
+log("still-strip-drag: LTR threshold"
+    + " effect_value=" + moved.effect_value
+    + " after_revision=" + moved.after_revision
+    + " page_before=" + moved.page_before
+    + " page_after=" + moved.page_after);
+if moved.effect_value != initial_center - 1 {
+    fail("LTR one-cell move did not decrease strip center by one");
 }
 let painted = egui_pointer_region(STRIP, moved.after_revision, WAIT_MS);
 assert_base_mode(painted, false, "LTR threshold paint");
 assert_strip_paint(painted, moved.effect_value, page, "LTR threshold paint");
 assert_sibling_unchanged(sibling, "LTR threshold move");
 
-let continued = egui_pointer_move(0.75, 0.50, WAIT_MS);
+let continued = egui_pointer_move(ltr_x[2], 0.50, WAIT_MS);
 assert_strip_step(continued, "strip_center", page, "LTR continued move");
-if continued.effect_value >= moved.effect_value {
-    fail("LTR continued move did not advance beyond threshold move");
+log("still-strip-drag: LTR continued"
+    + " effect_value=" + continued.effect_value
+    + " after_revision=" + continued.after_revision
+    + " page_before=" + continued.page_before
+    + " page_after=" + continued.page_after
+    + " painted_center=" + painted.strip_center
+    + " painted_rect_left=" + painted.left
+    + " painted_rect_right=" + painted.right
+    + " painted_coordinate_left=" + painted.coordinate_left
+    + " painted_coordinate_right=" + painted.coordinate_right);
+if continued.effect_value != initial_center - 2 {
+    fail("LTR two-cell move did not decrease strip center by two");
 }
 painted = egui_pointer_region(STRIP, continued.after_revision, WAIT_MS);
 assert_strip_paint(painted, continued.effect_value, page, "LTR continued paint");
 
-let released = egui_pointer_up(0.90, 0.50, WAIT_MS);
+let released = egui_pointer_up(ltr_x[3], 0.50, WAIT_MS);
 assert_strip_step(released, "released_strip_center", page, "LTR final-coordinate release");
-if released.effect_value >= continued.effect_value {
-    fail("LTR release did not apply its distinct final coordinate");
+if released.effect_value != initial_center - 3 {
+    fail("LTR three-cell release did not decrease strip center by three");
 }
 painted = egui_pointer_region(STRIP, released.after_revision, WAIT_MS);
 assert_strip_paint(painted, released.effect_value, page, "LTR release paint");
@@ -310,32 +447,43 @@ assert_sibling_unchanged(sibling, "LTR release");
 // Use the existing production action to invert the effective strip direction, then repeat the
 // same physical rightward gesture. RTL must move the logical center in the opposite direction.
 run_action("FsReadingDirectionToggle");
-strip = settled_region_after_action(STRIP, painted.revision);
+strip = wait_for_region_mode(
+    STRIP,
+    painted.revision,
+    painted.spread_mode,
+    painted.reading_flow,
+    true,
+    WAIT_MS
+);
 assert_base_mode(strip, true, "RTL setup");
 let rtl_initial_center = strip.strip_center;
-down = egui_pointer_down(STRIP, strip.geometry_token, 0.50, 0.50, WAIT_MS);
+if rtl_initial_center > FIXTURE_IMAGE_COUNT - 4 {
+    fail("RTL fixture center has less than three pages of end-side margin");
+}
+let rtl_x = strip_drag_positions(strip, "RTL", STRIP_CELL_WIDTH);
+down = egui_pointer_down(STRIP, strip.geometry_token, rtl_x[0], 0.50, WAIT_MS);
 assert_strip_step(down, "pressed", page, "RTL down");
-moved = egui_pointer_move(0.62, 0.50, WAIT_MS);
+moved = egui_pointer_move(rtl_x[1], 0.50, WAIT_MS);
 assert_strip_step(moved, "strip_center", page, "RTL threshold move");
-if moved.effect_value <= rtl_initial_center {
-    fail("RTL rightward threshold move did not increase strip center");
+if moved.effect_value != rtl_initial_center + 1 {
+    fail("RTL one-cell move did not increase strip center by one");
 }
 painted = egui_pointer_region(STRIP, moved.after_revision, WAIT_MS);
 assert_base_mode(painted, true, "RTL threshold paint");
 assert_strip_paint(painted, moved.effect_value, page, "RTL threshold paint");
 
-continued = egui_pointer_move(0.75, 0.50, WAIT_MS);
+continued = egui_pointer_move(rtl_x[2], 0.50, WAIT_MS);
 assert_strip_step(continued, "strip_center", page, "RTL continued move");
-if continued.effect_value <= moved.effect_value {
-    fail("RTL continued move did not advance opposite to LTR");
+if continued.effect_value != rtl_initial_center + 2 {
+    fail("RTL two-cell move did not increase strip center by two");
 }
 painted = egui_pointer_region(STRIP, continued.after_revision, WAIT_MS);
 assert_strip_paint(painted, continued.effect_value, page, "RTL continued paint");
 
-released = egui_pointer_up(0.90, 0.50, WAIT_MS);
+released = egui_pointer_up(rtl_x[3], 0.50, WAIT_MS);
 assert_strip_step(released, "released_strip_center", page, "RTL final-coordinate release");
-if released.effect_value <= continued.effect_value {
-    fail("RTL release did not apply its distinct final coordinate");
+if released.effect_value != rtl_initial_center + 3 {
+    fail("RTL three-cell release did not increase strip center by three");
 }
 painted = egui_pointer_region(STRIP, released.after_revision, WAIT_MS);
 assert_strip_paint(painted, released.effect_value, page, "RTL release paint");

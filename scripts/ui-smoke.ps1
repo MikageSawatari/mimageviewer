@@ -660,7 +660,7 @@ if ($script:archiveErrors.Count -gt 0) {
         if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
             throw "[ui-smoke] scenario script not found: $candidateScriptPath"
         }
-        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"Single","default_reading_flow":"Paged","fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"still_seek_strip_visible":true}'
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"Single","default_reading_flow":"Paged","fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"still_seek_strip_visible":true,"still_seek_strip_height":"large"}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
 }

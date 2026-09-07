@@ -247,6 +247,15 @@ fixture命名は既定のFolder/Archive共通行・FileName順に対応し、実
 初訪問では、その証跡公開前に通常navigation sequenceが終了する順序を確認済み。
 見開き・effect holdover・同page再訪について、一般にfull paintがnavigation idleと同義とはしない。
 trackのUpは、直前Moveと異なる実pageへ着地することも要求する。
+列dragは使い捨て設定のheightを既定と同じ`large`へ固定し、実press rectの幅から
+152ptずつ1/2/3枚分の移動点を計算する。固定の正規化座標では、幅と整数丸めによって
+複数stepが同じ中心へ着地し得るためである。Down前に全点が領域内へ収まる幅と
+方向別3枚の余地を検査し、操作後は実handlerが返す中心と実paintを照合する。
+このfixtureは全heightや任意の小さい窓を網羅するものではない。
+KeyActionの成功ackはconsume/peek時点であり、handler完了やmode公開を保証しない。
+方向・flowの切替後は、Rhaiの単調timestampと残り予算を用いて、新鮮なregionの実mode一致を待つ。
+queryが期限後に返した一致も成功にせず、ownerエラーはそのまま伝播する。
+固定の描画回数を増やす方法は使わない。
 
 実装前提調査で確定した境界:
 
@@ -580,7 +589,14 @@ try_lock一回で所有し、UI/pumpで待たない。reset・記録・snapshot�
 snapshotをコピーしてlockを解放してから整形する。競合やpoisonによる欠測も明示し、
 記録なしを無配送と断定しない。独自unsafe排他や別のpending状態は追加しない。
 Microsoftの[MOUSEINPUT仕様](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
-はdwExtraInfoをULONG_PTRとしている。現環境で上位ビットがどう届くかは実測まで仮説である。
+はdwExtraInfoをULONG_PTRとしている。2026-09-08の隔離liveでは、送信値
+`0x4d49565300000001`に対し要求座標のWndProc入口・既存照合位置がともに`0x1`だった。
+受信値が送信値の下位32bitと一致したことは実測済みで、OS内部の変換箇所は未特定。
+32bit内に置く新しいprefixも保持されることは、修正後の2点moveで別途検証する。
+送信token自体を32bit内の共通prefixとchecked単調serialへ収める。
+0・周回・失敗時の番号返却を禁止し、枯渇時は送信前に失敗させる。
+受信値のmask比較へ変更せず、実際の送信値との完全一致とowner/sourceの照合を維持する。
+このprocess内での非再利用は、process再起動をまたぐOS packetの非再来まで保証するものではない。
 
 S0はscript実装・静的検証・独立レビューと実artifactのbuild/prepareを完了。
 S1aは実装・焦点23テスト・feature有無のcore check・独立レビューを完了。
@@ -592,6 +608,8 @@ S2は実egui probeでmultipass前提を修正し、`fd0f94b89`で本体を実装
 独立最終レビューとpointer_input 12件、key_input 20件、test_script 36件、
 still_seek 61件（別に1件ignored）、feature/default core check、root cargo fmtが成功。
 filter間には重複があるため件数を合算しない。static fixture/Rhaiとportable liveは別工程である。
+2026-09-08の最終StillStripDragはexit 0、複数窓PDF回帰もexit 0。
+量子化とRhai関数scope、KeyAction ackの誤った前提を修正した経緯・証跡は優先作業台帳へ記録した。
 S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
 通常/feature core check、owner/classification/期限/worker token回帰を完了。
 S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch0誤判定で入力前に停止した。
