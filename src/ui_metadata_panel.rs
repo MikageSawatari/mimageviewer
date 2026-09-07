@@ -232,7 +232,7 @@ enum SimilarPanelModel<'a> {
     NotIndexed,
     Featureless,
     Empty,
-    Results(&'a [crate::similar_index::QueryHit]),
+    Results(&'a crate::similar_index::ItemMatches),
     Failed(&'a str),
 }
 
@@ -264,13 +264,36 @@ fn similar_panel_model(query: &crate::similar_index::ItemQuery) -> SimilarPanelM
         crate::similar_index::ItemQuery::Preparing => SimilarPanelModel::Preparing,
         crate::similar_index::ItemQuery::NotIndexed => SimilarPanelModel::NotIndexed,
         crate::similar_index::ItemQuery::Featureless => SimilarPanelModel::Featureless,
-        crate::similar_index::ItemQuery::Ready(hits) if hits.is_empty() => SimilarPanelModel::Empty,
-        crate::similar_index::ItemQuery::Ready(hits) => SimilarPanelModel::Results(hits),
+        crate::similar_index::ItemQuery::Ready(matches) if matches.hits.is_empty() => {
+            SimilarPanelModel::Empty
+        }
+        crate::similar_index::ItemQuery::Ready(matches) => SimilarPanelModel::Results(matches),
         crate::similar_index::ItemQuery::Failed(error) => SimilarPanelModel::Failed(error),
     }
 }
 
-fn similar_difference_line(hit: &crate::similar_index::QueryHit) -> String {
+/// 表示中のページの要約。候補の行と同じ並び (寸法 / 形式 / 大きさ) にする。**ここだけ別の
+/// 書式にすると見比べられない。**
+fn similar_origin_line(origin: &crate::similar_index::OriginItem) -> String {
+    let size = crate::ui_helpers::format_bytes_small(origin.file_size.max(0) as u64);
+    let size = match origin.kind {
+        crate::similar_db::ItemKind::Image => size,
+        crate::similar_db::ItemKind::ZipPage => format!("書庫 {size}"),
+        crate::similar_db::ItemKind::PdfPage => format!("PDF {size}"),
+    };
+    format!(
+        "{}×{} / {} / {}",
+        origin.width,
+        origin.height,
+        origin.format.display_name(),
+        size
+    )
+}
+
+fn similar_difference_line(
+    hit: &crate::similar_index::QueryHit,
+    origin: &crate::similar_index::OriginItem,
+) -> String {
     let size = crate::ui_helpers::format_bytes_small(hit.file_size.max(0) as u64);
     let size = match hit.kind {
         crate::similar_db::ItemKind::Image => size,
@@ -281,8 +304,8 @@ fn similar_difference_line(hit: &crate::similar_index::QueryHit) -> String {
         "{}×{} (この画像は {}×{}) / {} / {}",
         hit.width,
         hit.height,
-        hit.origin_width,
-        hit.origin_height,
+        origin.width,
+        origin.height,
         hit.format.display_name(),
         size
     )
@@ -314,6 +337,222 @@ fn similar_location_line(hit: &crate::similar_index::QueryHit) -> String {
             format!("{} / Page {}", pdf_path.display(), page_num + 1)
         }
     }
+}
+
+/// 場所を「名前」と「その上のたどり」に分ける。
+///
+/// 差分の強調はこの単位で行う。パスを 1 本の文字列として比べると、違うのが何段目なのかを
+/// 読み取れない。
+struct SimilarPathParts {
+    name: String,
+    segments: Vec<String>,
+}
+
+fn similar_path_parts(
+    target: Option<&crate::similar_index::SimilarItemTarget>,
+    fallback_key: &str,
+) -> SimilarPathParts {
+    let split = |text: &str| {
+        text.split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    match target {
+        Some(crate::similar_index::SimilarItemTarget::File(path)) => SimilarPathParts {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            segments: path
+                .parent()
+                .map(|parent| split(&crate::ui_dialogs::context_menu::native_path_text(parent)))
+                .unwrap_or_default(),
+        },
+        Some(crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name,
+        }) => SimilarPathParts {
+            name: entry_name.clone(),
+            segments: split(&crate::ui_dialogs::context_menu::native_path_text(zip_path)),
+        },
+        Some(crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num }) => {
+            SimilarPathParts {
+                name: format!("{} ページ目", page_num + 1),
+                segments: split(&crate::ui_dialogs::context_menu::native_path_text(pdf_path)),
+            }
+        }
+        None => {
+            let mut segments = split(fallback_key);
+            let name = segments.pop().unwrap_or_default();
+            SimilarPathParts { name, segments }
+        }
+    }
+}
+
+/// 起点と比べて、`other` のどの区切りが違うかを返す。
+///
+/// 共通の頭と尻を残し、中間だけを違いとする。階層の深さが違うときに、位置がずれた共通部分を
+/// 全部「違う」と塗ってしまわないため。
+fn path_segment_diff(origin: &[String], other: &[String]) -> Vec<bool> {
+    let mut differs = vec![true; other.len()];
+    let mut head = 0;
+    while head < origin.len()
+        && head < other.len()
+        && origin[head].eq_ignore_ascii_case(&other[head])
+    {
+        differs[head] = false;
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < origin.len().saturating_sub(head)
+        && tail < other.len().saturating_sub(head)
+        && origin[origin.len() - 1 - tail].eq_ignore_ascii_case(&other[other.len() - 1 - tail])
+    {
+        differs[other.len() - 1 - tail] = false;
+        tail += 1;
+    }
+    differs
+}
+
+/// 違う部分の色。**警告ではない** — どちらが正しいという話ではなく、見比べる手がかり。
+const PATH_DIFF_COLOR: egui::Color32 = egui::Color32::from_rgb(226, 183, 106);
+
+fn path_layout_job(
+    parts: &SimilarPathParts,
+    origin: Option<&SimilarPathParts>,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let font = egui::FontId::proportional(10.0);
+    let name_differs = origin.is_some_and(|origin| !origin.name.eq_ignore_ascii_case(&parts.name));
+    job.append(
+        &parts.name,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: if name_differs {
+                PATH_DIFF_COLOR
+            } else {
+                DIM_COLOR
+            },
+            ..Default::default()
+        },
+    );
+    if parts.segments.is_empty() {
+        return job;
+    }
+    let differs = origin
+        .map(|origin| path_segment_diff(&origin.segments, &parts.segments))
+        .unwrap_or_else(|| vec![false; parts.segments.len()]);
+    job.append(
+        " / ",
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: DIM_COLOR,
+            ..Default::default()
+        },
+    );
+    for (index, segment) in parts.segments.iter().enumerate() {
+        if index > 0 {
+            job.append(
+                "\\",
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: DIM_COLOR,
+                    ..Default::default()
+                },
+            );
+        }
+        job.append(
+            segment,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: if differs[index] {
+                    PATH_DIFF_COLOR
+                } else {
+                    DIM_COLOR
+                },
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// 1 件ぶんのカード。表示中のページも候補も同じ形で出す。
+///
+/// `origin` を渡すと、場所のうち起点と違う部分だけ色を変える。同じ形で並べたうえで違いだけを
+/// 目立たせるのが目的なので、片方だけ別のレイアウトにしない。
+fn draw_similar_card(
+    ui: &mut egui::Ui,
+    thumb: Option<SimilarThumbState>,
+    info: &str,
+    path: &SimilarPathParts,
+    origin: Option<&SimilarPathParts>,
+) -> egui::Response {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(38, 40, 48, 210))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+        ))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(SIMILAR_THUMB_SIZE, SIMILAR_THUMB_SIZE),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rect, 2.0, egui::Color32::from_rgb(25, 26, 31));
+                match thumb {
+                    Some(SimilarThumbState::Ready(texture)) => {
+                        let image_size = texture.size_vec2();
+                        let scale = (rect.width() / image_size.x).min(rect.height() / image_size.y);
+                        let image_rect =
+                            egui::Rect::from_center_size(rect.center(), image_size * scale);
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    Some(SimilarThumbState::Loading) => {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "読込中",
+                            egui::FontId::proportional(10.0),
+                            DIM_COLOR,
+                        );
+                    }
+                    Some(SimilarThumbState::Failed) | None => {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "画像なし",
+                            egui::FontId::proportional(10.0),
+                            DIM_COLOR,
+                        );
+                    }
+                }
+                ui.vertical(|ui| {
+                    let width = (ui.available_width() - 2.0).max(20.0);
+                    ui.set_max_width(width);
+                    ui.label(egui::RichText::new(info).color(TEXT_COLOR).size(11.0));
+                    ui.add_space(3.0);
+                    ui.label(path_layout_job(path, origin, width));
+                });
+            });
+        })
+        .response
 }
 
 fn similar_copy_path_text(hit: &crate::similar_index::QueryHit) -> String {
@@ -1016,7 +1255,7 @@ impl App {
                     let origin_key = current_item
                         .as_ref()
                         .and_then(crate::app::similar_index_item_key);
-                    self.similar_panel.begin_origin(origin_key);
+                    self.similar_panel.begin_origin(origin_key.clone());
                     let query = current_item.as_ref().map_or_else(
                         || std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed),
                         |item| self.query_similar_item(item),
@@ -1030,6 +1269,7 @@ impl App {
                         ui,
                         model,
                         book.as_deref(),
+                        origin_key.as_deref(),
                         results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
@@ -2127,10 +2367,12 @@ fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn draw_similar_panel(
     ui: &mut egui::Ui,
     model: SimilarPanelModel<'_>,
     book: Option<&crate::similar_index::BookQuery>,
+    current_item_key: Option<&str>,
     results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
@@ -2193,9 +2435,38 @@ fn draw_similar_panel(
             ui.label("索引を読み込めませんでした");
             ui.label(egui::RichText::new(error).color(DIM_COLOR).size(11.0));
         }
-        SimilarPanelModel::Results(hits) => {
+        SimilarPanelModel::Results(matches) => {
+            let origin = &matches.origin;
+            let origin_path = similar_path_parts(origin.target.as_ref(), &origin.item_key);
+            state.ensure_thumbnail_for(
+                &origin.item_key,
+                origin.target.clone(),
+                origin.mtime,
+                origin.file_size,
+                thumb_px,
+                thumb_quality,
+                cache_decision,
+                pdf_passwords,
+                ctx,
+            );
+            ui.label(
+                egui::RichText::new("表示中")
+                    .color(egui::Color32::WHITE)
+                    .size(14.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            draw_similar_card(
+                ui,
+                state.thumbnails.get(&origin.item_key).cloned(),
+                &similar_origin_line(origin),
+                &origin_path,
+                None,
+            );
+            ui.add_space(10.0);
+
             let mut previous_band = None;
-            for hit in hits {
+            for hit in &matches.hits {
                 if previous_band != Some(hit.band) {
                     if previous_band.is_some() {
                         ui.add_space(8.0);
@@ -2223,80 +2494,14 @@ fn draw_similar_panel(
                     ctx,
                 );
 
-                let response = egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(38, 40, 48, 210))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
-                    ))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(SIMILAR_THUMB_SIZE, SIMILAR_THUMB_SIZE),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(
-                                rect,
-                                2.0,
-                                egui::Color32::from_rgb(25, 26, 31),
-                            );
-                            match state.thumbnails.get(&hit.item_key) {
-                                Some(SimilarThumbState::Ready(texture)) => {
-                                    let image_size = texture.size_vec2();
-                                    let scale = (rect.width() / image_size.x)
-                                        .min(rect.height() / image_size.y);
-                                    let size = image_size * scale;
-                                    let image_rect =
-                                        egui::Rect::from_center_size(rect.center(), size);
-                                    ui.painter().image(
-                                        texture.id(),
-                                        image_rect,
-                                        egui::Rect::from_min_max(
-                                            egui::Pos2::ZERO,
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-                                Some(SimilarThumbState::Loading) => {
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "読込中",
-                                        egui::FontId::proportional(10.0),
-                                        DIM_COLOR,
-                                    );
-                                }
-                                Some(SimilarThumbState::Failed) | None => {
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "画像なし",
-                                        egui::FontId::proportional(10.0),
-                                        DIM_COLOR,
-                                    );
-                                }
-                            }
-                            ui.vertical(|ui| {
-                                ui.set_max_width((ui.available_width() - 2.0).max(20.0));
-                                ui.label(
-                                    egui::RichText::new(similar_difference_line(hit))
-                                        .color(TEXT_COLOR)
-                                        .size(11.0),
-                                );
-                                ui.add_space(3.0);
-                                ui.label(
-                                    egui::RichText::new(similar_location_line(hit))
-                                        .color(DIM_COLOR)
-                                        .size(10.0),
-                                );
-                            });
-                        });
-                    })
-                    .response
-                    .interact(egui::Sense::click());
+                let response = draw_similar_card(
+                    ui,
+                    state.thumbnails.get(&hit.item_key).cloned(),
+                    &similar_difference_line(hit, origin),
+                    &similar_path_parts(hit.target.as_ref(), &hit.item_key),
+                    Some(&origin_path),
+                )
+                .interact(egui::Sense::click());
                 let response = response.on_hover_text("クリックでこの画像へ移動");
                 response.context_menu(|ui| {
                     if ui.button("パスをコピー").clicked() {
@@ -2316,6 +2521,7 @@ fn draw_similar_panel(
         draw_book_relations(
             ui,
             book,
+            current_item_key,
             state,
             thumb_px,
             thumb_quality,
@@ -2335,6 +2541,7 @@ fn draw_similar_panel(
 fn draw_book_relations(
     ui: &mut egui::Ui,
     book: &crate::similar_index::BookQuery,
+    current_item_key: Option<&str>,
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -2381,17 +2588,23 @@ fn draw_book_relations(
                     .size(11.0),
             );
         }
-        BookQuery::Ready(hits) if hits.is_empty() => {
+        BookQuery::Ready(relations) if relations.hits.is_empty() => {
             ui.label(
                 egui::RichText::new("重なる本は見つかりませんでした")
                     .color(DIM_COLOR)
                     .size(11.0),
             );
         }
-        BookQuery::Ready(hits) => {
+        BookQuery::Ready(relations) => {
             draw_page_strip_legend(ui);
             ui.add_space(6.0);
-            for hit in hits {
+            let current_page = current_item_key.and_then(|key| {
+                relations
+                    .origin_page_keys
+                    .iter()
+                    .position(|page| page == key)
+            });
+            for hit in &relations.hits {
                 ui.label(
                     egui::RichText::new(book_relation_name(&hit.other_container_key))
                         .color(TEXT_COLOR)
@@ -2417,6 +2630,7 @@ fn draw_book_relations(
                 draw_page_strip(
                     ui,
                     hit,
+                    current_page,
                     state,
                     thumb_px,
                     thumb_quality,
@@ -2587,6 +2801,7 @@ fn summarize_page_strip(
 fn draw_page_strip(
     ui: &mut egui::Ui,
     hit: &crate::similar_index::BookRelationHit,
+    current_page: Option<usize>,
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -2599,9 +2814,15 @@ fn draw_page_strip(
         return;
     }
     let width = ui.available_width().max(1.0);
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, STRIP_HEIGHT), egui::Sense::click());
-    let painter = ui.painter_at(rect);
+    let (outer, response) = ui.allocate_exact_size(
+        egui::vec2(width, STRIP_HEIGHT + STRIP_MARKER_HEIGHT),
+        egui::Sense::click(),
+    );
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(outer.left(), outer.top() + STRIP_MARKER_HEIGHT),
+        egui::vec2(width, STRIP_HEIGHT),
+    );
+    let painter = ui.painter_at(outer);
     painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(28, 28, 28));
 
     let columns = width.floor().max(1.0) as usize;
@@ -2619,6 +2840,22 @@ fn draw_page_strip(
             0.0,
             page_state_color(*state),
         );
+    }
+
+    // いま見ているページの位置。これが無いと、帯のどこに自分がいるのか分からない。
+    if let Some(page) = current_page {
+        let column = (page * columns / hit.pages.len().max(1)).min(columns - 1);
+        let x = rect.left() + column as f32 + 0.5;
+        let tip = egui::pos2(x, rect.top() - 1.0);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                egui::pos2(x - 4.0, tip.y - STRIP_MARKER_HEIGHT + 2.0),
+                egui::pos2(x + 4.0, tip.y - STRIP_MARKER_HEIGHT + 2.0),
+            ],
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
     }
 
     let Some(pos) = response.hover_pos() else {
@@ -2689,6 +2926,9 @@ fn draw_page_strip(
         actions.open_page = Some((item_key, target));
     }
 }
+
+/// いま見ているページを指す ▼ の高さ。帯の上に確保する。
+const STRIP_MARKER_HEIGHT: f32 = 7.0;
 
 /// ホバー時に出すページの一辺。行のサムネイル (72px) より大きくして、飛ぶ前に中身が分かる
 /// 程度にする。
@@ -2799,38 +3039,43 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
             }
         })
         .collect::<Vec<_>>();
-    crate::similar_index::BookQuery::Ready(vec![
-        crate::similar_index::BookRelationHit {
-            other_container_key: r"E:\books\総集編.zip".to_string(),
-            pair: crate::dupe::book::BookPair {
-                a: 1,
-                b: 2,
-                matched: 85,
-                distinctive_a: 176,
-                distinctive_b: 402,
-                coverage_a: 0.483,
-                coverage_b: 0.211,
-                relation: crate::dupe::book::Relation::Contains { whole: 2 },
-                alignment: Vec::new(),
+    crate::similar_index::BookQuery::Ready(crate::similar_index::BookRelations {
+        origin_page_keys: (0..180)
+            .map(|index| format!("c:/books/this/{index:03}.png"))
+            .collect(),
+        hits: vec![
+            crate::similar_index::BookRelationHit {
+                other_container_key: r"E:\books\総集編.zip".to_string(),
+                pair: crate::dupe::book::BookPair {
+                    a: 1,
+                    b: 2,
+                    matched: 85,
+                    distinctive_a: 176,
+                    distinctive_b: 402,
+                    coverage_a: 0.483,
+                    coverage_b: 0.211,
+                    relation: crate::dupe::book::Relation::Contains { whole: 2 },
+                    alignment: Vec::new(),
+                },
+                pages: contiguous,
             },
-            pages: contiguous,
-        },
-        crate::similar_index::BookRelationHit {
-            other_container_key: r"E:\books\別作品.zip".to_string(),
-            pair: crate::dupe::book::BookPair {
-                a: 1,
-                b: 3,
-                matched: 8,
-                distinctive_a: 176,
-                distinctive_b: 190,
-                coverage_a: 0.045,
-                coverage_b: 0.042,
-                relation: crate::dupe::book::Relation::Unrelated,
-                alignment: Vec::new(),
+            crate::similar_index::BookRelationHit {
+                other_container_key: r"E:\books\別作品.zip".to_string(),
+                pair: crate::dupe::book::BookPair {
+                    a: 1,
+                    b: 3,
+                    matched: 8,
+                    distinctive_a: 176,
+                    distinctive_b: 190,
+                    coverage_a: 0.045,
+                    coverage_b: 0.042,
+                    relation: crate::dupe::book::Relation::Unrelated,
+                    alignment: Vec::new(),
+                },
+                pages: scattered,
             },
-            pages: scattered,
-        },
-    ])
+        ],
+    })
 }
 
 pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {
@@ -2877,8 +3122,6 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     width: 2400,
                     height: 3200,
                     format: crate::similar_image::SimilarImageFormat::Png,
-                    origin_width: 1200,
-                    origin_height: 1600,
                     target: Some(crate::similar_index::SimilarItemTarget::File(
                         PathBuf::from(r"C:\Pictures\edits\sample.png"),
                     )),
@@ -2898,15 +3141,33 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     width: 900,
                     height: 1200,
                     format: crate::similar_image::SimilarImageFormat::WebP,
-                    origin_width: 1200,
-                    origin_height: 1600,
                     target: Some(crate::similar_index::SimilarItemTarget::File(
                         PathBuf::from(r"D:\Archive\sample.webp"),
                     )),
                 },
             ];
+            // 表示中のページと候補で、フォルダ名とファイル名が一部だけ違う組にする。
+            // 差分の色分けが効いているかを目で見て確かめられる。
+            let matches = crate::similar_index::ItemMatches {
+                origin: crate::similar_index::OriginItem {
+                    item_key: "c:/pictures/edits/2024-05/sample.png".to_string(),
+                    kind: crate::similar_db::ItemKind::Image,
+                    mtime: 0,
+                    file_size: 4_400_000,
+                    width: 1200,
+                    height: 1600,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(
+                        PathBuf::from(r"C:\Pictures\edits\2024-05\sample.png"),
+                    )),
+                },
+                hits,
+            };
             let mut state = SimilarPanelState::default();
-            for hit in &hits {
+            state
+                .thumbnails
+                .insert(matches.origin.item_key.clone(), SimilarThumbState::Failed);
+            for hit in &matches.hits {
                 state
                     .thumbnails
                     .insert(hit.item_key.clone(), SimilarThumbState::Failed);
@@ -2914,17 +3175,19 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
             let mut actions = SimilarPanelActions::default();
             let ctx = ui.ctx().clone();
             let book = book_snapshot_fixture();
+            let current_page = "c:/books/this/060.png".to_string();
             draw_similar_panel(
                 ui,
-                SimilarPanelModel::Results(&hits),
+                SimilarPanelModel::Results(&matches),
                 Some(&book),
+                Some(&current_page),
                 true,
                 &mut state,
                 72,
                 85,
                 crate::thumb_loader::CacheDecision::without_thumbnail(),
                 None,
-                Some(hits[0].item_key.as_str()),
+                Some(matches.hits[0].item_key.as_str()),
                 false,
                 &ctx,
                 &mut actions,
@@ -3987,6 +4250,51 @@ mod similar_panel_tests {
         );
     }
 
+    fn origin() -> crate::similar_index::OriginItem {
+        crate::similar_index::OriginItem {
+            item_key: "c:/pictures/original.png".to_string(),
+            kind: ItemKind::Image,
+            mtime: 0,
+            file_size: 4_400_000,
+            width: 1200,
+            height: 1600,
+            format: SimilarImageFormat::Png,
+            target: Some(crate::similar_index::SimilarItemTarget::File(
+                PathBuf::from(r"C:\Pictures\original.png"),
+            )),
+        }
+    }
+
+    /// 起点と違う区切りだけを違いとする。共通の頭と尻は残す。
+    #[test]
+    fn only_the_differing_path_segments_are_marked() {
+        let origin = ["E:", "share", "18", "doujin", "__new24", "283625"]
+            .map(str::to_owned)
+            .to_vec();
+        let other = ["E:", "share", "18", "doujin", "__new26", "286166"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            super::path_segment_diff(&origin, &other),
+            vec![false, false, false, false, true, true]
+        );
+
+        // 階層が 1 段深い相手でも、共通の尻は共通のまま残る。
+        let deeper = ["E:", "share", "18", "doujin", "old", "__new24", "283625"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            super::path_segment_diff(&origin, &deeper),
+            vec![false, false, false, false, true, false, false]
+        );
+
+        // 完全に同じなら、どこも違わない。
+        assert_eq!(
+            super::path_segment_diff(&origin, &origin),
+            vec![false; origin.len()]
+        );
+    }
+
     fn hit(kind: ItemKind, format: SimilarImageFormat) -> QueryHit {
         QueryHit {
             item_id: 2,
@@ -4001,8 +4309,6 @@ mod similar_panel_tests {
             width: 2400,
             height: 3200,
             format,
-            origin_width: 1200,
-            origin_height: 1600,
             target: Some(crate::similar_index::SimilarItemTarget::File(
                 PathBuf::from(r"C:\Pictures\copy.png"),
             )),
@@ -4028,7 +4334,10 @@ mod similar_panel_tests {
             SimilarPanelModel::Featureless
         );
         assert_eq!(
-            similar_panel_model(&ItemQuery::Ready(Vec::new())),
+            similar_panel_model(&ItemQuery::Ready(crate::similar_index::ItemMatches {
+                origin: origin(),
+                hits: Vec::new(),
+            })),
             SimilarPanelModel::Empty
         );
     }
@@ -4065,7 +4374,7 @@ mod similar_panel_tests {
             ),
         ];
         for (kind, format, format_label, size_label) in cases {
-            let line = similar_difference_line(&hit(kind, format));
+            let line = similar_difference_line(&hit(kind, format), &origin());
             assert!(line.contains("2400×3200 (この画像は 1200×1600)"));
             assert!(line.contains(format_label));
             assert!(line.contains(size_label));

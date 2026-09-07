@@ -98,18 +98,38 @@ pub struct QueryHit {
     pub width: u32,
     pub height: u32,
     pub format: SimilarImageFormat,
-    pub origin_width: u32,
-    pub origin_height: u32,
     /// 問い合わせ worker が一度だけ実在パスへ戻した表示・遷移先。
     /// 消失済みなら正規化 key から組み立てた fallback を保持する。
     pub target: Option<SimilarItemTarget>,
+}
+
+/// いま見ているページ自身。**候補と同じ形で出すために持つ。**
+///
+/// 以前は寸法だけを候補 1 件ごとに複製していた。同じ事実を件数分置くと、片方だけ更新される
+/// 余地が残る。起点は 1 つしかないので 1 か所に置く。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginItem {
+    pub item_key: String,
+    pub kind: ItemKind,
+    pub mtime: i64,
+    pub file_size: i64,
+    pub width: u32,
+    pub height: u32,
+    pub format: SimilarImageFormat,
+    pub target: Option<SimilarItemTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemMatches {
+    pub origin: OriginItem,
+    pub hits: Vec<QueryHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ItemQuery {
     NoIndex,
     Preparing,
-    Ready(Vec<QueryHit>),
+    Ready(ItemMatches),
     Featureless,
     NotIndexed,
     Failed(String),
@@ -182,10 +202,19 @@ pub struct BookRelationHit {
     pub pages: Vec<BookPageMatch>,
 }
 
+/// 本の関係一式。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookRelations {
+    /// 起点の本のページ順に並んだ item_key。帯の添字と一致する。いま見ているページが帯の
+    /// どこなのかは、これを引いて決める。
+    pub origin_page_keys: Vec<String>,
+    pub hits: Vec<BookRelationHit>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BookQuery {
     Preparing,
-    Ready(Vec<BookRelationHit>),
+    Ready(BookRelations),
     Featureless,
     NotIndexed,
     NotBook,
@@ -345,7 +374,7 @@ impl SimilarIndexManager {
                     .map_or_else(ItemQuery::Failed, |db| {
                         query_item_ready(&db, &index, &query_key)
                     });
-                if let ItemQuery::Ready(hits) = &mut result {
+                if let ItemQuery::Ready(ItemMatches { hits, .. }) = &mut result {
                     let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                     hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
                 }
@@ -482,9 +511,11 @@ impl SimilarIndexManager {
                 |error| BookQuery::Failed(db_error(error)),
                 |db| query_book_ready(&db, &snapshot, &query_key),
             );
-            if let BookQuery::Ready(hits) = &mut result {
+            if let BookQuery::Ready(relations) = &mut result {
                 let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
-                hits.retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
+                relations
+                    .hits
+                    .retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
             }
             if epoch_guard.load(Ordering::Acquire) == epoch {
                 let mut state = query_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1331,8 +1362,6 @@ fn query_item_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -
             width: item.width,
             height: item.height,
             format: SimilarImageFormat::from_i64(item.format),
-            origin_width: origin.width,
-            origin_height: origin.height,
             target,
         });
     }
@@ -1341,7 +1370,20 @@ fn query_item_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -
             .cmp(&right.distance)
             .then_with(|| left.item_key.cmp(&right.item_key))
     });
-    ItemQuery::Ready(hits)
+    let origin_target = resolved_target_for_item(&origin);
+    ItemQuery::Ready(ItemMatches {
+        origin: OriginItem {
+            item_key: origin.item_key,
+            kind: origin.kind,
+            mtime: origin.mtime,
+            file_size: origin.file_size,
+            width: origin.width,
+            height: origin.height,
+            format: SimilarImageFormat::from_i64(origin.format),
+            target: origin_target,
+        },
+        hits,
+    })
 }
 
 pub const fn match_band(distance: u32) -> Option<MatchBand> {
@@ -1505,7 +1547,13 @@ fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, container_key: &s
         }
     }
     hits.sort_by(|left, right| left.other_container_key.cmp(&right.other_container_key));
-    BookQuery::Ready(hits)
+    BookQuery::Ready(BookRelations {
+        origin_page_keys: origin_pages
+            .iter()
+            .map(|row| row.item.item_key.clone())
+            .collect(),
+        hits,
+    })
 }
 
 const BOOK_ORIGIN: u32 = 1;
@@ -3454,7 +3502,7 @@ mod tests {
         let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
         let resident_after = current_working_set_bytes();
         let summary = match &result {
-            BookQuery::Ready(hits) => format!("Ready({})", hits.len()),
+            BookQuery::Ready(relations) => format!("Ready({})", relations.hits.len()),
             other => format!("{other:?}"),
         };
         eprintln!(
@@ -3462,8 +3510,8 @@ mod tests {
             pages.len(),
             resident_after.saturating_sub(resident_loaded)
         );
-        if let BookQuery::Ready(hits) = &result {
-            for hit in hits.iter().take(10) {
+        if let BookQuery::Ready(relations) = &result {
+            for hit in relations.hits.iter().take(10) {
                 eprintln!(
                     "  other={} relation={:?} matched={} distinctive_a={} distinctive_b={} coverage_a={:.3} coverage_b={:.3} aligned={}",
                     hit.other_container_key,
@@ -3521,7 +3569,7 @@ mod tests {
             let result = std::hint::black_box(query_item_ready(&db, &index, &origin_key));
             query_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             hit_count = match result {
-                ItemQuery::Ready(hits) => hits.len(),
+                ItemQuery::Ready(matches) => matches.hits.len(),
                 other => panic!("unexpected benchmark result: {other:?}"),
             };
         }
@@ -3610,7 +3658,7 @@ mod tests {
         let mut add_to_query_ms = None;
         for _ in 0..2_000 {
             let result = manager.query_item(&origin.item_key);
-            if let ItemQuery::Ready(hits) = result.as_ref()
+            if let ItemQuery::Ready(ItemMatches { hits, .. }) = result.as_ref()
                 && hits.iter().any(|hit| hit.item_key == near.item_key)
             {
                 add_to_query_ms = Some(add_started.elapsed().as_secs_f64() * 1000.0);
@@ -3861,6 +3909,23 @@ mod tests {
         );
     }
 
+    /// 候補が 0 件の結果。identity だけを比べるテスト用。
+    fn empty_matches() -> ItemMatches {
+        ItemMatches {
+            origin: OriginItem {
+                item_key: "origin".to_owned(),
+                kind: ItemKind::Image,
+                mtime: 0,
+                file_size: 0,
+                width: 0,
+                height: 0,
+                format: SimilarImageFormat::Other,
+                target: None,
+            },
+            hits: Vec::new(),
+        }
+    }
+
     fn row(id: u64, key: &str, signature: [u8; 32], quality: u8) -> SearchRow {
         SearchRow {
             item_id: id,
@@ -3921,7 +3986,7 @@ mod tests {
     #[test]
     fn item_query_cache_changes_only_with_origin_or_memory_epoch() {
         let cache = Mutex::new(ItemQueryCache::default());
-        let first = Arc::new(ItemQuery::Ready(Vec::new()));
+        let first = Arc::new(ItemQuery::Ready(empty_matches()));
         store_cached_item_query(&cache, "origin-a", 4, Arc::clone(&first));
         let same = cached_item_query(&cache, "origin-a", 4).unwrap();
         assert!(Arc::ptr_eq(&first, &same));
@@ -3936,7 +4001,7 @@ mod tests {
             &cache,
             "origin-b",
             7,
-            Arc::new(ItemQuery::Ready(Vec::new())),
+            Arc::new(ItemQuery::Ready(empty_matches())),
         );
         replace_cached_item_query_if_current(
             &cache,
@@ -4038,7 +4103,7 @@ mod tests {
             row(3, "version", version, 1),
             row(4, "far", unrelated, 1),
         ];
-        let ItemQuery::Ready(hits) = query_test_rows(&rows, "origin") else {
+        let ItemQuery::Ready(ItemMatches { hits, .. }) = query_test_rows(&rows, "origin") else {
             panic!("expected ready query");
         };
         assert_eq!(hits.len(), 2);
@@ -4063,7 +4128,9 @@ mod tests {
         origin_signature[0] = 1;
         db.upsert_loose_item(&row(2, "new-origin", origin_signature, 1).item)
             .unwrap();
-        let ItemQuery::Ready(hits) = query_item_ready(&db, &snapshot, "new-origin") else {
+        let ItemQuery::Ready(ItemMatches { hits, .. }) =
+            query_item_ready(&db, &snapshot, "new-origin")
+        else {
             panic!("new origin should be read directly from SQLite");
         };
         assert_eq!(hits.len(), 1);
@@ -4097,7 +4164,7 @@ mod tests {
 
         for _ in 0..100 {
             let result = manager.query_item(&origin.item_key);
-            if let ItemQuery::Ready(hits) = result.as_ref() {
+            if let ItemQuery::Ready(ItemMatches { hits, .. }) = result.as_ref() {
                 assert_eq!(hits.len(), 1);
                 assert_eq!(hits[0].item_key, near.item_key);
                 return;
@@ -4127,7 +4194,8 @@ mod tests {
         changed.pdq256 = [0xff; 32];
         db.upsert_loose_item(&changed).unwrap();
 
-        let ItemQuery::Ready(hits) = query_item_ready(&db, &snapshot, "origin") else {
+        let ItemQuery::Ready(ItemMatches { hits, .. }) = query_item_ready(&db, &snapshot, "origin")
+        else {
             panic!("expected ready query");
         };
         assert_eq!(hits.len(), 1);
@@ -4161,7 +4229,7 @@ mod tests {
 
         for _ in 0..500 {
             let result = manager.query_item(&origin.item_key);
-            if let ItemQuery::Ready(hits) = result.as_ref()
+            if let ItemQuery::Ready(ItemMatches { hits, .. }) = result.as_ref()
                 && hits.iter().any(|hit| hit.item_key == near.item_key)
             {
                 let elapsed = started.elapsed();
@@ -4489,10 +4557,17 @@ mod tests {
         let BookQuery::Ready(relations) = query_book_ready(&db, &snapshot, "book-a") else {
             panic!("expected a book result");
         };
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].other_container_key, "book-b");
-        assert_eq!(relations[0].pair.relation, dupe::book::Relation::Same);
-        assert_eq!(relations[0].pair.matched, BOOK_MIN_MATCHED_PAGES);
+        assert_eq!(relations.hits.len(), 1);
+        assert_eq!(relations.hits[0].other_container_key, "book-b");
+        assert_eq!(relations.hits[0].pair.relation, dupe::book::Relation::Same);
+        assert_eq!(relations.hits[0].pair.matched, BOOK_MIN_MATCHED_PAGES);
+        // 帯の添字と本のページ順が一致していること。ここがずれると、いま見ているページを
+        // 帯の別の場所に指してしまう。
+        assert_eq!(
+            relations.origin_page_keys.len(),
+            relations.hits[0].pages.len()
+        );
+        assert_eq!(relations.origin_page_keys[0], "book-a/0");
     }
 
     /// 本の関係はページではなく本で引く。同じ本のどのページからでも同じ照会になり、
