@@ -9,8 +9,15 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 pub const HASH_ALGORITHM_VERSION: u32 = 1;
+
+/// `page_index` がどの並べ方で振られているか。
+///
+/// 1 = 閲覧側と同じファイル名順。0 は書庫のエントリ順で振られた古い索引で、本単位の
+/// 対応付けが崩れる。上げたときは [`SimilarDb::renumber_container_pages`] で振り直す。
+/// 署名は変わらないので再デコードは要らない。
+pub const PAGE_ORDER_VERSION: i64 = 1;
 
 pub const fn current_hash_version() -> i64 {
     hash_version(HASH_ALGORITHM_VERSION, crate::dupe::PROXY_VERSION)
@@ -921,6 +928,114 @@ impl SimilarDb {
             .collect()
     }
 
+    pub fn page_order_version(&self) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT page_order_version FROM search_content_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// 保存済みのページを、呼び出し側の並べ方で振り直す。
+    ///
+    /// 署名も mtime も触らないので**再デコードは起きない**。並べ方の判断はこの層では
+    /// 行わず、比較関数を受け取る。返り値は振り直したコンテナの数。
+    pub fn renumber_container_pages(
+        &self,
+        page_order_version: i64,
+        order: impl Fn(&str, &str) -> std::cmp::Ordering,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = write_transaction(&mut conn)?;
+        let containers = {
+            let mut statement = transaction.prepare(
+                "SELECT container_key FROM container WHERE kind = ?1 AND scan_state = ?2",
+            )?;
+            statement
+                .query_map(
+                    params![ContainerKind::Zip as i64, ScanState::Complete as i64],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut renumbered = 0usize;
+        for container_key in containers {
+            let mut pages = {
+                let mut statement = transaction
+                    .prepare("SELECT item_id, item_key FROM item WHERE container_key = ?1")?;
+                statement
+                    .query_map([&container_key], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let prefix_len = container_key.len() + 1;
+            pages.sort_by(|left, right| {
+                let left = left.1.get(prefix_len..).unwrap_or(&left.1);
+                let right = right.1.get(prefix_len..).unwrap_or(&right.1);
+                order(left, right)
+            });
+            for (page_index, (item_id, _)) in pages.iter().enumerate() {
+                transaction.execute(
+                    "UPDATE item SET page_index = ?1 WHERE item_id = ?2",
+                    params![page_index as i64, item_id],
+                )?;
+            }
+            renumbered += 1;
+        }
+        transaction.execute(
+            "UPDATE search_content_state SET page_order_version = ?1 WHERE singleton = 1",
+            [page_order_version],
+        )?;
+        transaction.commit()?;
+        Ok(renumbered)
+    }
+
+    /// 公開済みコンテナ 1 冊分のページを、ページ順で読む。
+    ///
+    /// 本単位の照会はこれと `resolve_pages_by_item_id` の 2 つだけで identity を得る。
+    /// 全行を読み込んだ在メモリ表は作らない (4.6M 行で 7.7 GB / 24 秒かかった)。
+    pub fn load_book_pages(
+        &self,
+        container_key: &str,
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut statement = conn.prepare(&format!(
+            "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key = i.container_key
+             WHERE i.container_key = ?1 AND i.hash_version = ?2 AND c.scan_state = ?3
+             ORDER BY i.page_index"
+        ))?;
+        statement
+            .query_map(
+                params![container_key, hash_version, ScanState::Complete as i64],
+                row_to_search_row,
+            )?
+            .collect()
+    }
+
+    /// 配列が提案した item_id 群を、一つの読み取り snapshot で解決する。
+    ///
+    /// 単体画像の照会と同じ契約で、公開済み Complete 世代と `hash_version` の一致を SQL 側で
+    /// 強制する。署名が配列と食い違う候補を捨てるのは呼び出し側の責任。
+    pub fn resolve_pages_by_item_id(
+        &self,
+        item_ids: &[u64],
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let mut rows = Vec::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            if let Some(row) = load_search_item_by_id(&transaction, item_id, hash_version)? {
+                rows.push(row);
+            }
+        }
+        transaction.commit()?;
+        Ok(rows)
+    }
+
     /// 完走した、有効な favorites 全体の snapshot に存在しなかった公開行を削除する。
     pub fn prune_except_seen(
         &self,
@@ -1474,8 +1589,8 @@ fn copy_v1_rows_into_v2(conn: &Connection) -> rusqlite::Result<()> {
            SELECT item_key, 1, kind, container_key, page_index, mtime,
                   file_size, hash_version, pdq256, quality, width, height, format
            FROM item_v1;
-         INSERT INTO search_content_state (singleton, store_id)
-           SELECT singleton, store_id FROM search_content_state_v1;
+         INSERT INTO search_content_state (singleton, store_id, page_order_version)
+           SELECT singleton, store_id, 0 FROM search_content_state_v1;
          DROP TABLE item_v1;
          DROP TABLE search_content_state_v1;",
     )
@@ -1515,6 +1630,14 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     let migrating_v1 = user_version == 0 && is_v1_layout(&transaction)?;
     if migrating_v1 {
         move_v1_tables_aside(&transaction)?;
+    } else if user_version == 2 {
+        // v2 の行はそのまま使える。`page_index` の並べ方だけが分からないので 0 を記録し、
+        // 起動時の振り直しに任せる。署名は変わらないので再索引は起きない。
+        transaction.execute_batch(
+            "ALTER TABLE search_content_state
+               ADD COLUMN page_order_version INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 3;",
+        )?;
     } else if user_version != SCHEMA_VERSION {
         transaction.execute_batch(
             "DROP TABLE IF EXISTS item_change;
@@ -1613,18 +1736,19 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS search_content_state (
            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-           store_id BLOB NOT NULL CHECK(length(store_id) = 16)
+           store_id BLOB NOT NULL CHECK(length(store_id) = 16),
+           page_order_version INTEGER NOT NULL
          );
-         PRAGMA user_version = 2;",
+         PRAGMA user_version = 3;",
     )?;
     if migrating_v1 {
         copy_v1_rows_into_v2(&transaction)?;
     }
     let store_id = *uuid::Uuid::new_v4().as_bytes();
     transaction.execute(
-        "INSERT OR IGNORE INTO search_content_state (singleton, store_id)
-         VALUES (1, ?1)",
-        [store_id.as_slice()],
+        "INSERT OR IGNORE INTO search_content_state (singleton, store_id, page_order_version)
+         VALUES (1, ?1, ?2)",
+        params![store_id.as_slice(), PAGE_ORDER_VERSION],
     )?;
     transaction.commit()
 }

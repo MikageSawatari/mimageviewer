@@ -1,6 +1,6 @@
 //! お気に入り配下の「別バージョン」索引ジョブと遅延ロード線形検索。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -419,6 +419,10 @@ impl SimilarIndexManager {
             MemoryState::Failed(error) => return BookQuery::Failed(error.clone()),
             MemoryState::Ready(_) => {}
         };
+        let MemoryState::Ready(snapshot) = &*memory else {
+            unreachable!("every other memory state returned above");
+        };
+        let snapshot = Arc::clone(snapshot);
         drop(memory);
         let mut query = self.book_query.lock().unwrap_or_else(|e| e.into_inner());
         match &*query {
@@ -441,14 +445,11 @@ impl SimilarIndexManager {
         let epoch_guard = Arc::clone(&self.memory_epoch);
         let db_path = SimilarDb::db_path_at(&self.data_dir);
         std::thread::spawn(move || {
-            // 本単位 UI は後続 step。常駐 index を膨らませず、要求された時だけ詳細表を読む。
-            let mut result = SimilarDb::open_at(&db_path)
-                .and_then(|db| db.load_search_rows(current_hash_version()))
-                .map(DetailedMemoryIndex::from_rows)
-                .map_or_else(
-                    |error| BookQuery::Failed(db_error(error)),
-                    |details| query_book_ready(&details, &query_key),
-                );
+            // 常駐配列で候補を出し、identity は SQLite から引く。照会のために全行を読み直さない。
+            let mut result = SimilarDb::open_at(&db_path).map_or_else(
+                |error| BookQuery::Failed(db_error(error)),
+                |db| query_book_ready(&db, &snapshot, &query_key),
+            );
             if let BookQuery::Ready(hits) = &mut result {
                 let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                 hits.retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
@@ -474,6 +475,34 @@ impl SimilarIndexManager {
             item_key,
             &self.enabled_roots.read().unwrap_or_else(|e| e.into_inner()),
         )
+    }
+}
+
+/// 書庫のエントリ順で振られた `page_index` を、閲覧側と同じページ順へ振り直す。
+///
+/// 本単位の対応付けは順序が揃っていることを前提にする。署名は変わらないので**再デコードは
+/// 起きず**、振り直しは保存済みの item_key だけで完結する。一度成功したら記録して二度と
+/// 走らない。失敗しても索引そのものは使えるので、記録せずに次の起動へ回す。
+fn repair_page_order_if_stale(db: &SimilarDb) {
+    let stored = match db.page_order_version() {
+        Ok(version) => version,
+        Err(error) => {
+            crate::logger::log(format!("similar page order version unreadable: {error}"));
+            return;
+        }
+    };
+    if stored >= crate::similar_db::PAGE_ORDER_VERSION {
+        return;
+    }
+    let started = std::time::Instant::now();
+    match db.renumber_container_pages(crate::similar_db::PAGE_ORDER_VERSION, |left, right| {
+        compare_book_pages(left, right)
+    }) {
+        Ok(containers) => crate::logger::log(format!(
+            "similar page order repaired: containers={containers} from_version={stored} elapsed_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        )),
+        Err(error) => crate::logger::log(format!("similar page order repair failed: {error}")),
     }
 }
 
@@ -771,6 +800,7 @@ impl SimilarIndexScheduler {
         };
         *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
         register_prefill_db(&db, &self.enabled_roots);
+        repair_page_order_if_stale(&db);
         // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
         // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
         start_memory_load(
@@ -1200,41 +1230,6 @@ fn retain_ready_memory_or_unload(state: &mut MemoryState) {
     }
 }
 
-struct DetailedMemoryIndex {
-    signatures: Vec<([u8; 32], u64)>,
-    rows: HashMap<u64, StoredItem>,
-    row_for_key: HashMap<String, u64>,
-    book_ids: BTreeMap<String, u32>,
-}
-
-impl DetailedMemoryIndex {
-    fn from_rows(rows: Vec<SearchRow>) -> Self {
-        let mut signatures = Vec::with_capacity(rows.len());
-        let mut by_id = HashMap::with_capacity(rows.len());
-        let mut row_for_key = HashMap::with_capacity(rows.len());
-        let mut container_keys = BTreeSet::new();
-        for row in rows {
-            signatures.push((row.item.pdq256, row.item_id));
-            row_for_key.insert(row.item.item_key.clone(), row.item_id);
-            if let Some(container) = &row.item.container_key {
-                container_keys.insert(container.clone());
-            }
-            by_id.insert(row.item_id, row.item);
-        }
-        let book_ids = container_keys
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, key)| u32::try_from(index + 1).ok().map(|id| (key, id)))
-            .collect();
-        Self {
-            signatures,
-            rows: by_id,
-            row_for_key,
-            book_ids,
-        }
-    }
-}
-
 fn query_item_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -> ItemQuery {
     let origin = match db.load_item(item_key, current_hash_version()) {
         Ok(Some(row)) => row,
@@ -1373,56 +1368,55 @@ fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-fn query_book_ready(index: &DetailedMemoryIndex, item_key: &str) -> BookQuery {
-    let Some(origin_id) = index.row_for_key.get(item_key).copied() else {
-        return BookQuery::NotIndexed;
+fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -> BookQuery {
+    let hash_version = current_hash_version();
+    let origin = match db.load_item(item_key, hash_version) {
+        Ok(Some(row)) => row,
+        Ok(None) => return BookQuery::NotIndexed,
+        Err(error) => return BookQuery::Failed(db_error(error)),
     };
-    let origin = &index.rows[&origin_id];
-    let Some(origin_key) = origin.container_key.as_deref() else {
+    let Some(origin_container) = origin.item.container_key.clone() else {
         return BookQuery::NotBook;
     };
-    let Some(&origin_book) = index.book_ids.get(origin_key) else {
-        return BookQuery::NotBook;
+    let origin_pages = match db.load_book_pages(&origin_container, hash_version) {
+        Ok(pages) => pages,
+        Err(error) => return BookQuery::Failed(db_error(error)),
     };
-    let pages_by_book = book_pages(index);
-    let Some(origin_pages) = pages_by_book.get(&origin_book) else {
+    if origin_pages.is_empty() {
         return BookQuery::NotBook;
-    };
+    }
     if origin_pages
         .iter()
-        .all(|page| page.quality < BOOK_MIN_QUALITY)
+        .all(|row| row.item.quality < BOOK_MIN_QUALITY)
     {
         return BookQuery::Featureless;
     }
 
-    // 現在の本の各ページだけを全署名へ線形照合する。全 book pair は作らない。
-    let mut candidates = BTreeSet::new();
-    for page in origin_pages {
-        if page.quality < BOOK_MIN_QUALITY {
+    let matches = match collect_book_page_matches(db, snapshot, &origin_pages, hash_version) {
+        Ok(matches) => matches,
+        Err(error) => return BookQuery::Failed(error),
+    };
+
+    // 候補の本は、よくあるページ由来の一致からは作らない。表紙や白ページで全ての本が
+    // 互いに候補になるのを防ぐ。
+    let mut matched_pages_per_book: HashMap<&str, u32> = HashMap::new();
+    for page in &matches.pages {
+        if page.origin_is_common {
             continue;
         }
-        let Sig::Bits(bits) = &page.sig else {
-            continue;
-        };
-        let signature: &[u8; 32] = match bits.as_ref().try_into() {
-            Ok(signature) => signature,
-            Err(_) => continue,
-        };
-        for (other, item_id) in &index.signatures {
-            if hamming256(signature, other) > BOOK_RADIUS {
-                continue;
-            }
-            let Some(container_key) = index.rows[item_id].container_key.as_deref() else {
-                continue;
-            };
-            let Some(&book) = index.book_ids.get(container_key) else {
-                continue;
-            };
-            if book != origin_book {
-                candidates.insert(book);
+        for row in &page.matched {
+            if row.container_key != origin_container {
+                *matched_pages_per_book
+                    .entry(row.container_key.as_str())
+                    .or_default() += 1;
             }
         }
     }
+    let candidates = matched_pages_per_book
+        .into_iter()
+        .filter(|(_, count)| *count >= BOOK_MIN_MATCHED_PAGES)
+        .map(|(key, _)| key.to_owned())
+        .collect::<BTreeSet<_>>();
 
     let params = dupe::book::Params {
         radius: BOOK_RADIUS,
@@ -1431,33 +1425,46 @@ fn query_book_ready(index: &DetailedMemoryIndex, item_key: &str) -> BookQuery {
         coverage_threshold: BOOK_COVERAGE,
         min_matched_pages: BOOK_MIN_MATCHED_PAGES,
     };
-    let key_for_book = index
-        .book_ids
-        .iter()
-        .map(|(key, id)| (*id, key.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut hits = Vec::new();
-    for candidate in candidates {
-        let mut corpus = [origin_book, candidate]
-            .into_iter()
-            .filter_map(|book| pages_by_book.get(&book))
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        let target_len = corpus.len();
-        let mut seen_pages = corpus
-            .iter()
-            .map(|page| (page.book, page.index))
-            .collect::<HashSet<_>>();
-        // K=8 の共通ページ除外に必要な「実際に近いページ」だけを context に加える。
-        // 近傍 book の全ページを展開しないため、全件 book pair sweep にはならない。
-        for target_index in 0..target_len {
-            let target_page = corpus[target_index].clone();
-            add_page_neighborhood(index, &target_page, &mut seen_pages, &mut corpus);
+
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    let mut candidate_pages = Vec::with_capacity(candidates.len());
+    for key in &candidates {
+        match db.load_book_pages(key, hash_version) {
+            Ok(pages) => candidate_pages.push(pages),
+            Err(error) => return BookQuery::Failed(db_error(error)),
         }
-        match dupe::book::classify_pair(&corpus, params, origin_book, candidate) {
+    }
+    // 相手の本のページも同じように全体へ当てる。これを省くと相手側のよくあるページを
+    // 見落とし、分母が大きくなって被覆率が過小に出る。候補ごとに走査すると配列を
+    // 候補の数だけ読み直すことになるので、ここで 1 回にまとめる。
+    let borrowed = candidate_pages
+        .iter()
+        .map(|pages| pages.as_slice())
+        .collect::<Vec<_>>();
+    let candidate_matches =
+        match collect_book_page_matches_for(db, snapshot, &borrowed, hash_version) {
+            Ok(matches) => matches,
+            Err(error) => return BookQuery::Failed(error),
+        };
+
+    let mut hits = Vec::new();
+    for ((candidate_key, pages), candidate_matches) in candidates
+        .into_iter()
+        .zip(candidate_pages.iter())
+        .zip(candidate_matches.iter())
+    {
+        if pages.is_empty() {
+            continue;
+        }
+        let mut corpus = BookCorpusBuilder::new(&origin_container, &candidate_key);
+        corpus.add_book(BOOK_ORIGIN, &origin_pages);
+        corpus.add_book(BOOK_CANDIDATE, pages);
+        corpus.add_context(&matches);
+        corpus.add_context(candidate_matches);
+
+        match dupe::book::classify_pair(&corpus.pages, params, BOOK_ORIGIN, BOOK_CANDIDATE) {
             Ok(pair) => hits.push(BookRelationHit {
-                other_container_key: key_for_book[&candidate].clone(),
+                other_container_key: candidate_key,
                 pair,
             }),
             Err(error) => return BookQuery::Failed(error.to_string()),
@@ -1467,69 +1474,261 @@ fn query_book_ready(index: &DetailedMemoryIndex, item_key: &str) -> BookQuery {
     BookQuery::Ready(hits)
 }
 
-fn book_pages(index: &DetailedMemoryIndex) -> HashMap<u32, Vec<dupe::book::BookPage>> {
-    let mut books = HashMap::<u32, Vec<dupe::book::BookPage>>::new();
-    for item in index.rows.values() {
-        let (Some(container), Some(page_index)) = (&item.container_key, item.page_index) else {
-            continue;
-        };
-        let Some(&book) = index.book_ids.get(container) else {
-            continue;
-        };
-        books.entry(book).or_default().push(dupe::book::BookPage {
-            book,
-            index: page_index,
-            quality: item.quality,
-            sig: Sig::Bits(Box::new(item.pdq256)),
-        });
-    }
-    for pages in books.values_mut() {
-        pages.sort_by_key(|page| page.index);
-    }
-    books
+const BOOK_ORIGIN: u32 = 1;
+const BOOK_CANDIDATE: u32 = 2;
+
+/// `dupe::book` に渡す corpus を組む。
+///
+/// 「よくあるページ」の判定は corpus の中だけで行われるため、比べる 2 冊のページに加えて
+/// 「その周辺に何冊いるか」を数えられるだけの文脈ページを入れる必要がある。冊数が上限を
+/// 超えたと分かればよいので、近傍の全ページは展開しない。
+struct BookCorpusBuilder<'a> {
+    origin_key: &'a str,
+    candidate_key: &'a str,
+    pages: Vec<dupe::book::BookPage>,
+    seen: HashSet<(u32, u32)>,
+    context_books: HashMap<String, u32>,
+    next_context_book: u32,
 }
 
-fn add_page_neighborhood(
-    index: &DetailedMemoryIndex,
-    page: &dupe::book::BookPage,
-    seen_pages: &mut HashSet<(u32, u32)>,
-    corpus: &mut Vec<dupe::book::BookPage>,
-) {
-    if page.quality < BOOK_MIN_QUALITY {
-        return;
-    }
-    let Sig::Bits(bits) = &page.sig else {
-        return;
-    };
-    let Ok(signature) = <&[u8; 32]>::try_from(bits.as_ref()) else {
-        return;
-    };
-    let mut neighborhood = BTreeSet::from([page.book]);
-    for (other, item_id) in &index.signatures {
-        if hamming256(signature, other) > BOOK_RADIUS {
-            continue;
-        }
-        let Some(container) = index.rows[item_id].container_key.as_deref() else {
-            continue;
-        };
-        let Some(&book) = index.book_ids.get(container) else {
-            continue;
-        };
-        neighborhood.insert(book);
-        if let Some(page_index) = index.rows[item_id].page_index
-            && seen_pages.insert((book, page_index))
-        {
-            corpus.push(dupe::book::BookPage {
-                book,
-                index: page_index,
-                quality: index.rows[item_id].quality,
-                sig: Sig::Bits(Box::new(*other)),
-            });
-        }
-        if neighborhood.len() as u32 > BOOK_MAX_BOOKS_PER_PAGE {
-            break;
+impl<'a> BookCorpusBuilder<'a> {
+    fn new(origin_key: &'a str, candidate_key: &'a str) -> Self {
+        Self {
+            origin_key,
+            candidate_key,
+            pages: Vec::new(),
+            seen: HashSet::new(),
+            context_books: HashMap::new(),
+            next_context_book: BOOK_CANDIDATE + 1,
         }
     }
+
+    fn add_book(&mut self, book: u32, rows: &[crate::similar_db::SearchRow]) {
+        for row in rows {
+            let Some(page_index) = row.item.page_index else {
+                continue;
+            };
+            if self.seen.insert((book, page_index)) {
+                self.pages.push(dupe::book::BookPage {
+                    book,
+                    index: page_index,
+                    quality: row.item.quality,
+                    sig: Sig::Bits(Box::new(row.item.pdq256)),
+                });
+            }
+        }
+    }
+
+    fn add_context(&mut self, matches: &BookMatchSet) {
+        for page in &matches.pages {
+            for row in &page.matched {
+                if row.container_key == self.origin_key || row.container_key == self.candidate_key {
+                    continue;
+                }
+                let book = match self.context_books.get(&row.container_key) {
+                    Some(book) => *book,
+                    None => {
+                        let book = self.next_context_book;
+                        self.next_context_book += 1;
+                        self.context_books.insert(row.container_key.clone(), book);
+                        book
+                    }
+                };
+                if self.seen.insert((book, row.page_index)) {
+                    self.pages.push(dupe::book::BookPage {
+                        book,
+                        index: row.page_index,
+                        quality: row.quality,
+                        sig: Sig::Bits(Box::new(row.signature)),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 1 ページぶんの一致。`origin_is_common` は「相手の本が多すぎて候補作りに使えない」印。
+struct BookPageMatches {
+    origin_is_common: bool,
+    matched: Vec<ResolvedPage>,
+}
+
+struct ResolvedPage {
+    container_key: String,
+    page_index: u32,
+    quality: u8,
+    signature: [u8; 32],
+}
+
+struct BookMatchSet {
+    pages: Vec<BookPageMatches>,
+}
+
+/// 1 ページが半径内に持てる一致の上限。
+///
+/// これを超えるページは、どの数え方でも distinctive ではない。上限に達したページは
+/// 候補作りから外すが、集めた分は文脈として残す。
+const BOOK_PAGE_MATCH_LIMIT: usize = 256;
+
+/// 走査を分割する単位。小さすぎると合流の費用が勝ち、大きすぎると尻尾で遊ぶ。
+const BOOK_SCAN_CHUNK: usize = 32_768;
+
+/// 何冊ぶんかのページを、常駐配列への **1 回の走査**でまとめて照合する。
+///
+/// 本ごとに走査すると、比較回数が同じでも配列 (222 MB) を本の数だけ読み直すことになる。
+/// 実測では候補 7 冊で 10.4 分かかっていた。署名は総ページ数 × 32 byte しかないので、
+/// 記録側を 1 回流して内側で全ページと比べ、chunk ごとに並列化する。
+fn scan_snapshot_for_pages(snapshot: &SearchSnapshot, signatures: &[[u8; 32]]) -> Vec<Vec<u64>> {
+    use rayon::prelude::*;
+
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+    let consider = |record: &crate::similar_search_array::SearchRecord,
+                    per_page: &mut Vec<Vec<u64>>| {
+        if record.quality == 0 {
+            return;
+        }
+        for (page, signature) in signatures.iter().enumerate() {
+            if hamming256_within(signature, &record.signature, BOOK_RADIUS).is_some() {
+                let bucket = &mut per_page[page];
+                // 上限に達したページは「よくあるページ」として扱うので、それ以上は集めない。
+                if bucket.len() <= BOOK_PAGE_MATCH_LIMIT {
+                    bucket.push(record.item_id);
+                }
+            }
+        }
+    };
+
+    let records = &snapshot.base.records;
+    let mut per_page = records
+        .par_chunks(BOOK_SCAN_CHUNK)
+        .enumerate()
+        .map(|(chunk, slice)| {
+            let mut local = vec![Vec::new(); signatures.len()];
+            let start = chunk * BOOK_SCAN_CHUNK;
+            for (offset, record) in slice.iter().enumerate() {
+                if !snapshot.base_record_is_superseded(start + offset) {
+                    consider(record, &mut local);
+                }
+            }
+            local
+        })
+        .reduce(
+            || vec![Vec::new(); signatures.len()],
+            |mut left, right| {
+                for (bucket, extra) in left.iter_mut().zip(right) {
+                    if bucket.len() <= BOOK_PAGE_MATCH_LIMIT {
+                        bucket.extend(extra);
+                    }
+                }
+                left
+            },
+        );
+    for entry in snapshot.delta.iter() {
+        if let Some(record) = &entry.record {
+            consider(record, &mut per_page);
+        }
+    }
+    per_page
+}
+
+/// 本のページ群を照合し、identity を SQLite で確定する。
+///
+/// `pages` は 1 冊ぶん。候補の本をまとめて調べるときは [`collect_book_page_matches_for`] を
+/// 使って走査を 1 回にまとめる。
+fn collect_book_page_matches(
+    db: &SimilarDb,
+    snapshot: &SearchSnapshot,
+    pages: &[crate::similar_db::SearchRow],
+    hash_version: i64,
+) -> Result<BookMatchSet, String> {
+    let mut out = collect_book_page_matches_for(db, snapshot, &[pages], hash_version)?;
+    Ok(out.remove(0))
+}
+
+/// 何冊ぶんかを 1 回の走査で照合する。返り値は入力と同じ並び。
+fn collect_book_page_matches_for(
+    db: &SimilarDb,
+    snapshot: &SearchSnapshot,
+    books: &[&[crate::similar_db::SearchRow]],
+    hash_version: i64,
+) -> Result<Vec<BookMatchSet>, String> {
+    // 走査対象は quality のあるページだけ。どの本のどのページかは添字で持ち帰る。
+    let mut owners = Vec::new();
+    let mut signatures = Vec::new();
+    for (book, pages) in books.iter().enumerate() {
+        for (page, row) in pages.iter().enumerate() {
+            if row.item.quality >= BOOK_MIN_QUALITY {
+                owners.push((book, page));
+                signatures.push(row.item.pdq256);
+            }
+        }
+    }
+    let scanned = scan_snapshot_for_pages(snapshot, &signatures);
+
+    // 提案された item_id を一つの読み取り snapshot で identity に変える。配列は候補しか出さない。
+    let mut wanted = scanned.iter().flatten().copied().collect::<Vec<_>>();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let resolved = db
+        .resolve_pages_by_item_id(&wanted, hash_version)
+        .map_err(db_error)?;
+    let by_id = resolved
+        .into_iter()
+        .filter_map(|row| {
+            let container = row.item.container_key?;
+            let page_index = row.item.page_index?;
+            Some((
+                row.item_id,
+                ResolvedPage {
+                    container_key: container,
+                    page_index,
+                    quality: row.item.quality,
+                    signature: row.item.pdq256,
+                },
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut out = books
+        .iter()
+        .map(|pages| BookMatchSet {
+            pages: pages
+                .iter()
+                .map(|_| BookPageMatches {
+                    origin_is_common: false,
+                    matched: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    for ((book, page), ids) in owners.into_iter().zip(scanned) {
+        let overflowed = ids.len() > BOOK_PAGE_MATCH_LIMIT;
+        let signature = books[book][page].item.pdq256;
+        let matched = ids
+            .into_iter()
+            .filter_map(|id| by_id.get(&id))
+            // DB 側の署名が配列と食い違っていた候補はここで落ちる。距離は DB の値で決める。
+            .filter(|page| hamming256_within(&signature, &page.signature, BOOK_RADIUS).is_some())
+            .map(|page| ResolvedPage {
+                container_key: page.container_key.clone(),
+                page_index: page.page_index,
+                quality: page.quality,
+                signature: page.signature,
+            })
+            .collect::<Vec<_>>();
+        let distinct_books = matched
+            .iter()
+            .map(|page| page.container_key.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u32;
+        out[book].pages[page] = BookPageMatches {
+            origin_is_common: overflowed || distinct_books > BOOK_MAX_BOOKS_PER_PAGE,
+            matched,
+        };
+    }
+    Ok(out)
 }
 
 fn hamming256(left: &[u8; 32], right: &[u8; 32]) -> u32 {
@@ -1537,6 +1736,24 @@ fn hamming256(left: &[u8; 32], right: &[u8; 32]) -> u32 {
         .zip(right)
         .map(|(left, right)| (left ^ right).count_ones())
         .sum()
+}
+
+/// 半径を超えると分かった時点で打ち切る距離判定。
+///
+/// 本単位の照会は 1 ページごとに全署名を見るので、比較回数が「ページ数 × 全行数」になる。
+/// 無関係な 2 枚は 256 bit のうち 128 bit 前後が違うため、多くは最初の 64 bit で超える。
+/// 半径内のときだけ距離を返す。
+fn hamming256_within(left: &[u8; 32], right: &[u8; 32], radius: u32) -> Option<u32> {
+    let mut distance = 0u32;
+    for offset in (0..32).step_by(8) {
+        let left = u64::from_le_bytes(left[offset..offset + 8].try_into().expect("8 bytes"));
+        let right = u64::from_le_bytes(right[offset..offset + 8].try_into().expect("8 bytes"));
+        distance += (left ^ right).count_ones();
+        if distance > radius {
+            return None;
+        }
+    }
+    Some(distance)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2348,6 +2565,10 @@ impl ScanContext<'_> {
                 return Ok(());
             }
         };
+        // 書庫のエントリ順ではなく、閲覧側と同じページ順に並べてから採番する。
+        // ここが展開済みフォルダと食い違うと、本単位の対応付けが崩れる。
+        let mut entries = entries;
+        entries.sort_by(|left, right| compare_book_pages(&left.entry_name, &right.entry_name));
         self.report.discovered += entries.len() as u64;
         let page_count = u32::try_from(entries.len())
             .map_err(|_| format!("too many ZIP pages: {}", candidate.path.display()))?;
@@ -2827,6 +3048,40 @@ pub fn item_key_for_file(path: &Path) -> String {
     crate::search_index_db::normalize_path(path)
 }
 
+/// 本の中でページが並ぶ順を決める鍵。
+///
+/// `page_index` は本単位の照合で「対応が連続した区間になっているか」を見るために使う。
+/// したがって**同じ中身なら、ZIP でも展開済みフォルダでも同じ順**でなければならない。
+/// 実店では ZIP だけが書庫のエントリ順で採番されており、同じ作品の ZIP 版と展開版を
+/// 比べると 373 ページ一致するはずのものが 35 ページしか揃わなかった (順序がばらばらだと
+/// 単調な対応付けは最長増加部分列の長さまでしか伸びない)。
+///
+/// 閲覧側の本のページ順 ([`crate::app::BOOK_READING_PAGE_ORDER`]) と同じく、数値を考慮した
+/// ファイル名順で固定する。フォルダの直下しか本にならないので、ディレクトリを先に比べて
+/// から名前を比べれば、平らな ZIP と展開済みフォルダは同じ並びになる。
+pub fn book_page_order_key(name_within_container: &str) -> (Vec<String>, String) {
+    let normalized = name_within_container.replace('\\', "/");
+    let mut parts = normalized.split('/').collect::<Vec<_>>();
+    let base = parts.pop().unwrap_or("").to_owned();
+    (parts.into_iter().map(str::to_owned).collect(), base)
+}
+
+/// 同じ本の 2 ページを並べる。[`book_page_order_key`] の鍵どうしを比べる。
+pub fn compare_book_pages(left: &str, right: &str) -> std::cmp::Ordering {
+    let (left_dirs, left_base) = book_page_order_key(left);
+    let (right_dirs, right_base) = book_page_order_key(right);
+    for (left, right) in left_dirs.iter().zip(&right_dirs) {
+        let ordering = crate::filename_sort::compare_file_names(left, right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left_dirs
+        .len()
+        .cmp(&right_dirs.len())
+        .then_with(|| crate::filename_sort::compare_file_names(&left_base, &right_base))
+}
+
 pub fn item_key_for_zip_page(zip_path: &Path, entry_name: &str) -> String {
     crate::search_norm::zip_entry_key(
         &crate::search_index_db::normalize_path(zip_path),
@@ -3033,6 +3288,87 @@ mod tests {
     #[cfg(not(windows))]
     fn current_working_set_bytes() -> usize {
         0
+    }
+
+    /// 本単位の照会を実店で測る。`MIV_SIMILAR_BENCH_DB` に store、
+    /// `MIV_SIMILAR_BENCH_CONTAINER` に本のコンテナキーを渡す。
+    ///
+    /// 起点ページの読み出し、常駐配列の走査、SQLite での identity 確定、分類までを通す。
+    /// 旧実装はここで全行を文字列込みで読み直しており、4,629,375 行で 24 秒 / 7.7 GB を
+    /// 使ったうえ照会が終わらなかった。
+    #[test]
+    #[ignore = "manual measurement of the book query against a caller-selected similar.db"]
+    fn measure_real_store_book_query() {
+        let db_path = std::env::var_os("MIV_SIMILAR_BENCH_DB")
+            .map(PathBuf::from)
+            .expect("set MIV_SIMILAR_BENCH_DB");
+        // コンテナキーを受け取って先頭ページを自分で引く。item_key の区切りは不可視の
+        // `\x1f` なので、環境変数へ手で書き写すと必ず取り違える。
+        let container_key =
+            std::env::var("MIV_SIMILAR_BENCH_CONTAINER").expect("MIV_SIMILAR_BENCH_CONTAINER");
+
+        let resident_before = current_working_set_bytes();
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        let load_started = std::time::Instant::now();
+        let loaded = similar_search_array::load_or_rebuild(
+            &db,
+            &similar_search_array::base_path(db_path.parent().expect("store has a parent")),
+        )
+        .unwrap();
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let snapshot = loaded.snapshot;
+        let rows = snapshot.record_count();
+        let resident_loaded = current_working_set_bytes();
+
+        if std::env::var_os("MIV_SIMILAR_BENCH_REPAIR").is_some() {
+            let started = std::time::Instant::now();
+            let containers = db
+                .renumber_container_pages(crate::similar_db::PAGE_ORDER_VERSION, |left, right| {
+                    compare_book_pages(left, right)
+                })
+                .unwrap();
+            eprintln!(
+                "similar_page_order_repair containers={containers} elapsed_ms={:.1}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let pages = db
+            .load_book_pages(&container_key, current_hash_version())
+            .unwrap();
+        let origin_key = pages
+            .iter()
+            .min_by_key(|row| row.item.page_index.unwrap_or(u32::MAX))
+            .map(|row| row.item.item_key.clone())
+            .expect("no page found for MIV_SIMILAR_BENCH_CONTAINER");
+
+        let query_started = std::time::Instant::now();
+        let result = query_book_ready(&db, &snapshot, &origin_key);
+        let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+        let resident_after = current_working_set_bytes();
+        let summary = match &result {
+            BookQuery::Ready(hits) => format!("Ready({})", hits.len()),
+            other => format!("{other:?}"),
+        };
+        eprintln!(
+            "similar_book_query_measurement rows={rows} pages={} load_ms={load_ms:.1} query_ms={query_ms:.1} resident_before_bytes={resident_before} resident_loaded_bytes={resident_loaded} resident_after_bytes={resident_after} query_delta_bytes={} result={summary}",
+            pages.len(),
+            resident_after.saturating_sub(resident_loaded)
+        );
+        if let BookQuery::Ready(hits) = &result {
+            for hit in hits.iter().take(10) {
+                eprintln!(
+                    "  other={} relation={:?} matched={} distinctive_a={} distinctive_b={} coverage_a={:.3} coverage_b={:.3} aligned={}",
+                    hit.other_container_key,
+                    hit.pair.relation,
+                    hit.pair.matched,
+                    hit.pair.distinctive_a,
+                    hit.pair.distinctive_b,
+                    hit.pair.coverage_a,
+                    hit.pair.coverage_b,
+                    hit.pair.alignment.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -3991,30 +4327,275 @@ mod tests {
         );
     }
 
+    /// 2 冊分のページを公開済みコンテナとして書き、本単位の照会が実際の経路
+    /// (常駐配列で候補、SQLite で identity) を通ることを確かめる。
+    fn publish_book(db: &SimilarDb, container_key: &str, pages: &[StoredItem]) {
+        let generation = db
+            .begin_container_build(
+                container_key,
+                ContainerKind::ImageFolder,
+                pages.len() as u32,
+                1,
+                1,
+            )
+            .unwrap();
+        for page in pages {
+            db.stage_item(generation, page).unwrap();
+        }
+        db.complete_container(container_key, generation).unwrap();
+    }
+
+    fn book_page(container: &str, page: u32, marker: u8) -> StoredItem {
+        StoredItem {
+            item_key: format!("{container}/{page}"),
+            kind: ItemKind::Image,
+            container_key: Some(container.to_owned()),
+            page_index: Some(page),
+            mtime: 1,
+            file_size: 1,
+            hash_version: current_hash_version(),
+            pdq256: [marker; 32],
+            quality: 10,
+            width: 100,
+            height: 100,
+            format: 1,
+        }
+    }
+
     #[test]
     fn book_query_calls_dupe_book_with_measured_product_params() {
-        let mut rows = Vec::new();
-        let mut item_id = 1;
-        for (container, marker) in [("book-a", 0u8), ("book-b", 0u8)] {
-            for page in 0..3 {
-                let mut item = row(
-                    item_id,
-                    &format!("{container}/{page}"),
-                    [marker.wrapping_add(page as u8); 32],
-                    10,
-                );
-                item.item.container_key = Some(container.to_owned());
-                item.item.page_index = Some(page);
-                rows.push(item);
-                item_id += 1;
-            }
+        let db = SimilarDb::open_in_memory().unwrap();
+        for container in ["book-a", "book-b"] {
+            let pages = (0..3)
+                .map(|page| book_page(container, page, page as u8))
+                .collect::<Vec<_>>();
+            publish_book(&db, container, &pages);
         }
-        let index = DetailedMemoryIndex::from_rows(rows);
-        let BookQuery::Ready(relations) = query_book_ready(&index, "book-a/0") else {
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: base.records.into_boxed_slice(),
+            store_id: base.store_id,
+            applied_seq: base.applied_seq,
+        });
+
+        let BookQuery::Ready(relations) = query_book_ready(&db, &snapshot, "book-a/0") else {
             panic!("expected a book result");
         };
         assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].other_container_key, "book-b");
         assert_eq!(relations[0].pair.relation, dupe::book::Relation::Same);
         assert_eq!(relations[0].pair.matched, BOOK_MIN_MATCHED_PAGES);
+    }
+
+    /// 起点ページが変わっても、同じ本を見ている限り結果は同じ本の関係になる。
+    /// 起点を item ではなく container で決めていることの確認。
+    #[test]
+    fn any_page_of_the_same_book_gives_the_same_relations() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for container in ["book-a", "book-b"] {
+            let pages = (0..4)
+                .map(|page| book_page(container, page, page as u8))
+                .collect::<Vec<_>>();
+            publish_book(&db, container, &pages);
+        }
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: base.records.into_boxed_slice(),
+            store_id: base.store_id,
+            applied_seq: base.applied_seq,
+        });
+
+        let first = query_book_ready(&db, &snapshot, "book-a/0");
+        let last = query_book_ready(&db, &snapshot, "book-a/3");
+        assert_eq!(first, last);
+        assert!(matches!(first, BookQuery::Ready(ref hits) if hits.len() == 1));
+    }
+
+    /// コンテナに属さない画像は本ではない。単体画像の照会と結果を混ぜない。
+    #[test]
+    fn a_loose_image_is_not_a_book() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let mut loose = book_page("ignored", 0, 7);
+        loose.item_key = "c:/loose.png".to_owned();
+        loose.container_key = None;
+        loose.page_index = None;
+        db.upsert_loose_item(&loose).unwrap();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: base.records.into_boxed_slice(),
+            store_id: base.store_id,
+            applied_seq: base.applied_seq,
+        });
+        assert_eq!(
+            query_book_ready(&db, &snapshot, "c:/loose.png"),
+            BookQuery::NotBook
+        );
+    }
+
+    /// 全ページが featureless な本は、0 件ではなく「判定できない」として返る。
+    #[test]
+    fn a_book_of_featureless_pages_is_typed_not_empty() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let pages = (0..3)
+            .map(|page| {
+                let mut page = book_page("blank", page, 0);
+                page.quality = 0;
+                page
+            })
+            .collect::<Vec<_>>();
+        publish_book(&db, "blank", &pages);
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: base.records.into_boxed_slice(),
+            store_id: base.store_id,
+            applied_seq: base.applied_seq,
+        });
+        assert_eq!(
+            query_book_ready(&db, &snapshot, "blank/0"),
+            BookQuery::Featureless
+        );
+    }
+
+    /// 平らな ZIP と、それを展開したフォルダが同じ並びになること。
+    ///
+    /// ここが食い違うと単調な対応付けが崩れ、373 ページ揃うはずの 2 冊が 35 ページしか
+    /// 一致しない (実店で観測)。
+    #[test]
+    fn an_archive_and_its_extracted_folder_order_pages_the_same() {
+        let names = ["10.jpg", "2.jpg", "1.jpg", "p03.png"];
+        let mut archive = names.to_vec();
+        archive.sort_by(|left, right| compare_book_pages(left, right));
+        assert_eq!(archive, ["1.jpg", "2.jpg", "10.jpg", "p03.png"]);
+
+        // 展開済みフォルダ側は索引が file_name で並べている。同じ結果になること。
+        let mut folder = names.to_vec();
+        folder.sort_by(|left, right| crate::filename_sort::compare_file_names(left, right));
+        assert_eq!(archive, folder);
+    }
+
+    /// 入れ子のあるアーカイブは、ディレクトリを先に見てから名前を見る。同じ名前のページが
+    /// 別のフォルダにあっても、並びが混ざらない。
+    #[test]
+    fn nested_archive_pages_sort_by_directory_then_name() {
+        let mut names = vec![
+            "vol2/1.jpg",
+            "vol10/1.jpg",
+            "vol1/10.jpg",
+            "vol1/2.jpg",
+            "cover.jpg",
+        ];
+        names.sort_by(|left, right| compare_book_pages(left, right));
+        assert_eq!(
+            names,
+            [
+                "cover.jpg",
+                "vol1/2.jpg",
+                "vol1/10.jpg",
+                "vol2/1.jpg",
+                "vol10/1.jpg"
+            ]
+        );
+    }
+
+    /// 書庫のエントリ順で保存された古い索引を、再デコードせずに振り直す。
+    #[test]
+    fn a_stale_archive_page_order_is_repaired_without_rehashing() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let container = "c:/books/a.zip";
+        let entries = ["10.jpg", "2.jpg", "1.jpg"];
+        let generation = db
+            .begin_container_build(container, ContainerKind::Zip, entries.len() as u32, 1, 1)
+            .unwrap();
+        // 書庫のエントリ順のまま採番された状態を作る。
+        for (page, entry) in entries.iter().enumerate() {
+            let mut item = book_page(container, page as u32, page as u8);
+            item.item_key = format!("{container}/{entry}");
+            db.stage_item(generation, &item).unwrap();
+        }
+        db.complete_container(container, generation).unwrap();
+
+        let before = db
+            .load_book_pages(container, current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.item_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before,
+            [
+                "c:/books/a.zip/10.jpg",
+                "c:/books/a.zip/2.jpg",
+                "c:/books/a.zip/1.jpg"
+            ],
+            "fixture reproduces the archive order the indexer used to store"
+        );
+        let signatures_before = db
+            .load_book_pages(container, current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.pdq256)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            db.renumber_container_pages(crate::similar_db::PAGE_ORDER_VERSION, |left, right| {
+                compare_book_pages(left, right)
+            })
+            .unwrap(),
+            1
+        );
+
+        let after = db
+            .load_book_pages(container, current_hash_version())
+            .unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|row| row.item.item_key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "c:/books/a.zip/1.jpg",
+                "c:/books/a.zip/2.jpg",
+                "c:/books/a.zip/10.jpg"
+            ]
+        );
+        // 署名は振り直しの対象ではない。ここが変わっていたら再デコードが起きている。
+        let mut signatures_after = after.iter().map(|row| row.item.pdq256).collect::<Vec<_>>();
+        signatures_after.sort();
+        let mut expected = signatures_before;
+        expected.sort();
+        assert_eq!(signatures_after, expected);
+        assert_eq!(
+            db.page_order_version().unwrap(),
+            crate::similar_db::PAGE_ORDER_VERSION
+        );
+    }
+
+    /// 半径を超えたと分かった時点で打ち切っても、半径内の距離は完全一致する。
+    #[test]
+    fn the_early_exit_distance_agrees_with_the_full_one() {
+        let mut left = [0u8; 32];
+        let mut right = [0u8; 32];
+        for bit in 0..=64u32 {
+            for index in 0..32 {
+                right[index] = 0;
+            }
+            let mut remaining = bit;
+            let mut index = 0;
+            while remaining >= 8 {
+                right[index] = 0xff;
+                remaining -= 8;
+                index += 1;
+            }
+            right[index] = (1u16 << remaining).wrapping_sub(1) as u8;
+            let full = hamming256(&left, &right);
+            assert_eq!(full, bit, "fixture builds the intended distance");
+            assert_eq!(hamming256_within(&left, &right, 64), Some(full));
+            if bit > 0 {
+                assert_eq!(hamming256_within(&left, &right, bit - 1), None);
+            }
+            assert_eq!(hamming256_within(&left, &right, bit), Some(full));
+        }
+        left[31] = 0xff;
+        assert_eq!(hamming256_within(&left, &left, 0), Some(0));
     }
 }
