@@ -598,6 +598,32 @@ zoom/raw-wheel/navigationの非発行、Appの同context/source/zoom不変を揃
 strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさず、Window spanの段変更を
 確認する場合はその前提を明示する。
 
+### 上部ボタンの観測契約（設計合意・未実装）
+
+親Astraと独立Astraのsource照合により、最初の対象を上部hover入口と
+`native_top_panorama`に限定する。既存catalogへ実renderの観測を加え、別のglobal widget表は作らない。
+契約は「同じsource/host ownerの下で描画された実Responseと、現在も一致する入力条件」。
+metadataや保持中のzoom値が新sourceから生成されたこと、クリック処理、GPU出力は保証しない。
+
+実owner stampを初期・候補ctorの描画前、source切替後の描画可能setterより前に渡す。
+overlay自身がArc markerを所有し、catalog/準備済みtargetはWeakで同一性を照合する。
+既存の数値IDはchecked非再利用が保証されていないため、その性質を仮定しない。
+候補の観測はcommit後のexact joinで初めて公開する。ctor後に対象状態が変われば旧frameは
+利用不可、同値なら元stamp/frameを保ったまま公開できる。旧sourceのframeを新sourceへ付け替えない。
+bind後の再描画待ちだけではpaused/cleanが固着するため、bootstrap/resizeを含む全render入口を覆う。
+
+位置は実Responseから採取し、明示enabled引数・actual click sense・rect/interact rect/layer/clipを保持する。
+既存button helperは無効時にSense::hoverへ変えるので、Response.enabled()だけでは不十分である。
+対象状態の比較は寸法/ppp、Unknown/Panorama/NonPanorama、audio、pose/zoomの存在、
+実chrome・dim・modal・重なりの入力条件に絞る。右固定配置に無関係な時刻・filename・
+metadata全体は比較せず、通常の再生tickでtargetを失効させない。
+Unknownからmetadataが届くと通常setterがdirtyを立てるため、診断repaintを足さずenabledを待つ。
+
+hover入口は通常の非表示時36ptの領域を共用し、表示後の76ptへの変化で自分自身を失効させない。
+named targetはfinal passの実inventoryを使い、非表示・再出現時には同じ矩形でも新tokenを発行する。
+frame revision、named geometry token、既存canvas geometry versionは別の意味を保つ。
+App/current-source receiptと実OS point/layer確認は後続層であり、Responseの存在だけでは入力成功にしない。
+
 ## 検証記録
 
 S3aのraw識別子診断は、WndProc入口と既存metadata照合位置でGetMessageExtraInfoを

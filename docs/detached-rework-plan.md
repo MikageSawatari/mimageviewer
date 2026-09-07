@@ -1459,6 +1459,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-08 §1.197 S3b: native上部ボタンの実描画観測（設計合意・未実装）:**
+
+利用者指定の親Astraと独立Astraで、既存render ownerに属する診断観測として合意した。
+Solは実装前に入口と前提を再確認する。対象は上部hover入口と実際の
+`native_top_panorama` Responseだけで、通常の入力・表示・初期化順は維持する。
+影響先は`video/mod.rs`のsource/host取引、`render_core.rs`の全render入口、
+`overlay_draw.rs`の実Response生成、`native_ui_smoke.rs`の既存catalogである。
+
+ctor前の不変な実owner stampとoverlay所有のArc markerを描画結果へ結び付ける。
+catalog・準備済みtargetはWeakだけを持ち、commit後に同じowner・marker・対象状態を照合する。
+旧sourceのframeを新epochへ付け替えない。初期化後のbindだけではpaused/clean状態で
+観測待ちが残るため、実bootstrapを捕捉する。診断だけのrepaintは追加しない。
+ボタンは位置に加えて明示enabled引数・実click sense・通常のmodal/dim等を確認する。
+この観測はmetadataの新規生成やApp処理完了を保証せず、それらのreceiptとは分ける。
+詳細は[自動化設計](ui-smoke-automation-plan.md)の「上部ボタンの観測契約」を参照。
+実装・回帰・portableでの実hover確認は未完了で、症状修正の代用にはしない。
+
 **2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
 
 利用者指定の親Astra設計・Sol前提検証・独立Astraレビューで、同じwheelをsemanticな
