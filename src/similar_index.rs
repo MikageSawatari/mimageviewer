@@ -1468,6 +1468,16 @@ fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, container_key: &str) -> BookQuery {
+    query_book_ready_inner(db, snapshot, container_key, false)
+}
+
+/// `scan_candidate_pages` は計測専用。製品経路は常に `false` で呼ぶ。
+fn query_book_ready_inner(
+    db: &SimilarDb,
+    snapshot: &SearchSnapshot,
+    container_key: &str,
+    scan_candidate_pages: bool,
+) -> BookQuery {
     let hash_version = current_hash_version();
     let origin_container = container_key.to_owned();
     let origin_pages = match db.load_book_pages(&origin_container, hash_version) {
@@ -1533,11 +1543,38 @@ fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, container_key: &s
         .iter()
         .map(|pages| pages.as_slice())
         .collect::<Vec<_>>();
-    let candidate_matches =
+    // **候補側のページは全体へ当てない。**
+    //
+    // 当てれば「相手の本にあり、蔵書全体でありふれたページ」を分母から外せるが、費用が
+    // 見合わない。実店 39 冊で測ると、走査ありは 123.6 秒、なしは 24.8 秒。差が出たのは
+    // 9 冊で、いずれも `distinctive_b` が数 % 増えて被覆率が 2〜4% 下がるだけ。**判定が
+    // 変わった本は 0 冊。**
+    //
+    // 構造的にもそうなる。この走査だけが拾うのは「起点側に近いページが無い、相手の
+    // ありふれたページ」で、起点側にあれば起点の走査が同じ文脈を拾う。そして起点に無い
+    // ページは被覆率 B の分母にしか効かないので、**誤差は必ず被覆率を低く見せる向き**に
+    // 出る。含有関係を過大に言うことはない。
+    //
+    // 代わりに、起点の走査で見つけた文脈だけを両方の本に使う。
+    let candidate_matches: Vec<BookMatchSet> = if scan_candidate_pages {
         match collect_book_page_matches_for(db, snapshot, &borrowed, hash_version) {
             Ok(matches) => matches,
             Err(error) => return BookQuery::Failed(error),
-        };
+        }
+    } else {
+        borrowed
+            .iter()
+            .map(|pages| BookMatchSet {
+                pages: pages
+                    .iter()
+                    .map(|_| BookPageMatches {
+                        origin_is_common: false,
+                        matched: Vec::new(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
 
     let mut hits = Vec::new();
     for ((candidate_key, pages), candidate_matches) in candidates
@@ -3520,6 +3557,84 @@ mod tests {
     #[cfg(not(windows))]
     fn current_working_set_bytes() -> usize {
         0
+    }
+
+    /// 候補側の走査が結果を変えるのかを、多数の本で突き合わせる。
+    ///
+    /// この走査は照会時間の大半を占める。**変えないなら払う理由がない。** 1 プロセスで
+    /// 両方を回すので、配列の読み込みは 1 回で済む。
+    #[test]
+    #[ignore = "manual sweep over a caller-selected similar.db"]
+    fn sweep_whether_the_candidate_scan_changes_any_answer() {
+        let db_path = std::env::var_os("MIV_SIMILAR_BENCH_DB")
+            .map(PathBuf::from)
+            .expect("set MIV_SIMILAR_BENCH_DB");
+        let books: usize = std::env::var("MIV_SIMILAR_SWEEP_BOOKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        let loaded = similar_search_array::load_or_rebuild(
+            &db,
+            &similar_search_array::base_path(db_path.parent().expect("store has a parent")),
+        )
+        .unwrap();
+        let snapshot = loaded.snapshot;
+
+        let containers = db.load_complete_containers().unwrap();
+        let stride = (containers.len() / books.max(1)).max(1);
+        let mut checked = 0usize;
+        let mut differing = 0usize;
+        let mut relation_changed = 0usize;
+        let mut full_ms = 0.0f64;
+        let mut skip_ms = 0.0f64;
+        for container in containers.iter().step_by(stride).take(books) {
+            let started = std::time::Instant::now();
+            let full = query_book_ready_inner(&db, &snapshot, &container.container_key, true);
+            full_ms += started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            let skip = query_book_ready_inner(&db, &snapshot, &container.container_key, false);
+            skip_ms += started.elapsed().as_secs_f64() * 1000.0;
+            let BookQuery::Ready(full) = &full else {
+                continue;
+            };
+            let BookQuery::Ready(skip) = &skip else {
+                panic!("one side answered and the other did not");
+            };
+            if full.hits.is_empty() {
+                continue;
+            }
+            checked += 1;
+            if full
+                .hits
+                .iter()
+                .zip(&skip.hits)
+                .any(|(a, b)| a.pair.relation != b.pair.relation)
+            {
+                relation_changed += 1;
+                eprintln!("  RELATION CHANGED: {}", container.container_key);
+            }
+            if full.hits != skip.hits {
+                differing += 1;
+                eprintln!("  differs: {}", container.container_key);
+                for (a, b) in full.hits.iter().zip(&skip.hits) {
+                    if a != b {
+                        eprintln!(
+                            "    other={} distinctive_b {} -> {} coverage_b {:.3} -> {:.3}",
+                            a.other_container_key,
+                            a.pair.distinctive_b,
+                            b.pair.distinctive_b,
+                            a.pair.coverage_b,
+                            b.pair.coverage_b
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "similar_candidate_scan_sweep books_with_hits={checked} differing={differing} relation_changed={relation_changed} full_ms={full_ms:.0} skip_ms={skip_ms:.0}"
+        );
     }
 
     /// 本単位の照会を実店で測る。`MIV_SIMILAR_BENCH_DB` に store、

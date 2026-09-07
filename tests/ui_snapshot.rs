@@ -328,6 +328,17 @@ fn metadata_panel_similar_results_dark() {
 }
 
 #[test]
+fn metadata_panel_similar_states_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_similar_states_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 640.0),
+        None,
+        mimageviewer::draw_similar_states_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_favorite_view_state_dark() {
     snapshot_with_theme_at_size(
         "preferences_favorite_view_state_dark",

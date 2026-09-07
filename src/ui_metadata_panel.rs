@@ -1339,9 +1339,6 @@ impl App {
                         .iter()
                         .map(|item| self.query_similar_item(item))
                         .collect();
-                    let query = queries.first().cloned().unwrap_or_else(|| {
-                        std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed)
-                    });
                     let book = current_item
                         .as_ref()
                         .map(|item| self.query_similar_book(item));
@@ -2501,15 +2498,6 @@ fn draw_similar_panel(
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
-    let compare_state = |hit: &crate::similar_index::QueryHit| {
-        if pinned_item_key == Some(hit.item_key.as_str()) {
-            SimilarCompareState::Pinned
-        } else if compare_pin_preparing {
-            SimilarCompareState::Preparing
-        } else {
-            SimilarCompareState::Idle
-        }
-    };
     if results_are_stale
         && views.iter().any(|view| {
             !matches!(
@@ -2602,8 +2590,12 @@ fn draw_similar_page_results(
     let showing_previous = view.showing_previous;
     match view.model {
         SimilarPanelModel::NoIndex => {
-            ui.label("索引がありません");
-            if ui.button("お気に入りで索引を有効にする").clicked() {
+            draw_similar_state_message(
+                ui,
+                "索引がありません",
+                Some(SIMILAR_INDEX_NO_STORE_GUIDANCE),
+            );
+            if ui.button("お気に入りの設定を開く").clicked() {
                 actions.open_favorites = true;
             }
         }
@@ -2615,17 +2607,29 @@ fn draw_similar_page_results(
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         SimilarPanelModel::NotIndexed => {
-            ui.label("この画像は索引に含まれていません");
+            draw_similar_state_message(
+                ui,
+                "この画像は索引に含まれていません",
+                Some(SIMILAR_INDEX_MISSING_ITEM_GUIDANCE),
+            );
+            if ui.button("お気に入りの設定を開く").clicked() {
+                actions.open_favorites = true;
+            }
         }
         SimilarPanelModel::Featureless => {
-            ui.label("この画像は特徴が少ないため判定できません");
+            draw_similar_state_message(
+                ui,
+                "この画像は特徴が少ないため判定できません",
+                Some(
+                    "色や模様の情報が乏しい画像 (単色・ほぼ白紙など) は、別の画像と区別できないため対象外です。",
+                ),
+            );
         }
         SimilarPanelModel::Empty => {
-            ui.label("別バージョンは見つかりませんでした");
+            draw_similar_state_message(ui, "別バージョンは見つかりませんでした", None);
         }
         SimilarPanelModel::Failed(error) => {
-            ui.label("索引を読み込めませんでした");
-            ui.label(egui::RichText::new(error).color(DIM_COLOR).size(11.0));
+            draw_similar_state_message(ui, "索引を読み込めませんでした", Some(error));
         }
         SimilarPanelModel::Results(matches) => {
             let origin = &matches.origin;
@@ -3182,6 +3186,32 @@ fn decide_similar_peek(current: Option<&str>, held: Option<&str>) -> SimilarPeek
     }
 }
 
+/// 索引が無い / 対象外のときに出す案内。
+///
+/// **どうすれば使えるようになるかを書く。** 「含まれていません」だけでは、それが設定で
+/// 変えられることも、どこで変えるのかも分からない。
+const SIMILAR_INDEX_NO_STORE_GUIDANCE: &str = "この機能はお気に入りに登録した場所で使えます。お気に入りの設定で「別バージョン索引」を \
+     有効にすると、その場所の画像が対象になります。";
+
+/// 索引はあるが、この画像が入っていないときの案内。
+///
+/// **原因を断定しない。** 場所が対象外なのか、対象だがまだ登録されていないのかは、この状態
+/// からは区別できない。断定すると片方の場合に嘘になる。
+const SIMILAR_INDEX_MISSING_ITEM_GUIDANCE: &str = "この場所が「別バージョン索引」の対象になっていないか、まだ登録されていない画像です。 \
+     お気に入りの設定で、対象の場所と索引の状態を確認できます。";
+
+/// 結果が無いときの状態表示。
+///
+/// 既定の `ui.label` は暗色パネル上で読みづらい色になる。結果一覧と同じ色使いに揃える。
+fn draw_similar_state_message(ui: &mut egui::Ui, headline: &str, detail: Option<&str>) {
+    ui.label(egui::RichText::new(headline).color(TEXT_COLOR).size(12.0));
+    if let Some(detail) = detail {
+        ui.add_space(3.0);
+        ui.label(egui::RichText::new(detail).color(DIM_COLOR).size(11.0));
+        ui.add_space(3.0);
+    }
+}
+
 /// 1 件ぶんの操作ボタン。/// 1 件ぶんの操作ボタン。
 ///
 /// 以前はホバー中に X を押す設計だったが、mIV に「ホバーしたまま打鍵する」操作は他に無く、
@@ -3304,6 +3334,49 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
             },
         ],
     })
+}
+
+/// 結果が無いときの各状態。**ここが撮られていないと、読めない色や案内の欠落に気付けない。**
+/// 実際、索引に無い旨の一行は既定色のままで暗く沈んでいた。
+pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.set_width(360.0);
+    apply_metadata_panel_dark_widget_style(ui);
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(28, 30, 36))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            let mut actions = SimilarPanelActions::default();
+            let mut state = SimilarPanelState::default();
+            let ctx = ui.ctx().clone();
+            for model in [
+                SimilarPanelModel::NoIndex,
+                SimilarPanelModel::NotIndexed,
+                SimilarPanelModel::Featureless,
+                SimilarPanelModel::Empty,
+                SimilarPanelModel::Failed("similar.db: database is locked"),
+            ] {
+                draw_similar_page_results(
+                    ui,
+                    &SimilarPageView {
+                        heading: None,
+                        item_key: None,
+                        model,
+                        showing_previous: false,
+                    },
+                    &mut state,
+                    72,
+                    85,
+                    crate::thumb_loader::CacheDecision::without_thumbnail(),
+                    None,
+                    None,
+                    false,
+                    &ctx,
+                    &mut actions,
+                );
+                ui.add_space(10.0);
+            }
+        });
 }
 
 pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {

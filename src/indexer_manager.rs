@@ -1114,10 +1114,15 @@ mod tests {
     /// 機械の混み具合で決まる。単体で 1.3 秒の初回照合が、混雑した完走で 20 秒の締切を一度
     /// 超えた。締切を機械の負荷が届かない位置へ置き、締切が鳴ったら本当に止まっている、と
     /// 読めるようにする。
-    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    fn wait_until(what: &str, ready: impl FnMut() -> bool) {
+        wait_until_with(|| what.to_owned(), ready);
+    }
+
+    /// 締切が鳴ったときの説明を、そのとき組み立てる版。待っている対象の状態を載せられる。
+    fn wait_until_with(mut describe: impl FnMut() -> String, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(120);
         while !ready() {
-            assert!(Instant::now() < deadline, "{what}");
+            assert!(Instant::now() < deadline, "{}", describe());
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1164,12 +1169,23 @@ mod tests {
             manager.all_supervisors_idle()
         });
 
-        wait_until("initial similar reconciliation did not complete", || {
-            matches!(
-                similar.progress(),
-                crate::similar_index::IndexProgress::Complete(_)
-            )
-        });
+        // 締切が鳴ったときに**何を待っていたのか**が分かるようにする。この待ちは以前から
+        // 稀に鳴っており (本セッション最初の全体実行でも 20 秒で落ちた)、状態が分からないと
+        // 次に鳴っても同じ推測を繰り返すことになる。
+        let last_progress = std::cell::RefCell::new(String::new());
+        wait_until_with(
+            || {
+                format!(
+                    "initial similar reconciliation did not complete; last progress = {}",
+                    last_progress.borrow()
+                )
+            },
+            || {
+                let progress = similar.progress();
+                *last_progress.borrow_mut() = format!("{progress:?}");
+                matches!(progress, crate::similar_index::IndexProgress::Complete(_))
+            },
+        );
 
         // 同じ supervisor の watcher が追加と変更を類似索引へ渡すことを確認する。
         // 類似索引用の watcher を別に作る実装では、この結合テストを満たせない。
