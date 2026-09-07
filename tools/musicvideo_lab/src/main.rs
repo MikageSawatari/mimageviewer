@@ -14,6 +14,7 @@ mod export;
 mod playback;
 mod project;
 mod project_file;
+mod resource_blobs;
 
 fn main() {
     let mut args = std::env::args().skip(1);

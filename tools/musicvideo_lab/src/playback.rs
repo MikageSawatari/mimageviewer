@@ -13,6 +13,7 @@ pub struct AudioPlayer {
 
 struct PlayerState {
     audio: Arc<AudioData>,
+    output_sample_rate: u32,
     source_frames_per_output_frame: f64,
     next_source_frame: f64,
     playing: bool,
@@ -49,6 +50,7 @@ impl AudioPlayer {
         let stream_config: cpal::StreamConfig = supported.into();
         let output_rate = stream_config.sample_rate.0;
         let shared = Arc::new(Mutex::new(PlayerState {
+            output_sample_rate: output_rate,
             source_frames_per_output_frame: f64::from(audio.sample_rate)
                 / f64::from(output_rate.max(1)),
             audio,
@@ -112,6 +114,14 @@ impl AudioPlayer {
         }
     }
 
+    pub fn replace_audio(&self, audio: Arc<AudioData>, position_secs: f64) -> PlaybackSnapshot {
+        if let Ok(mut state) = self.shared.lock() {
+            replace_audio_state(&mut state, audio, position_secs);
+            return snapshot_at(&mut state, Instant::now());
+        }
+        PlaybackSnapshot::default()
+    }
+
     pub fn seek(&self, position_secs: f64) -> PlaybackSnapshot {
         if let Ok(mut state) = self.shared.lock() {
             let frames = state.audio.stereo_pcm.len() / 2;
@@ -130,6 +140,18 @@ impl AudioPlayer {
             .map(|mut state| snapshot_at(&mut state, Instant::now()))
             .unwrap_or_default()
     }
+}
+
+fn replace_audio_state(state: &mut PlayerState, audio: Arc<AudioData>, position_secs: f64) {
+    let frames = audio.stereo_pcm.len() / 2;
+    state.source_frames_per_output_frame =
+        f64::from(audio.sample_rate) / f64::from(state.output_sample_rate.max(1));
+    state.next_source_frame = (position_secs.max(0.0) * f64::from(audio.sample_rate))
+        .round()
+        .clamp(0.0, frames as f64);
+    state.audio = audio;
+    state.playback_anchors.clear();
+    state.playing = false;
 }
 
 fn snapshot_at(state: &mut PlayerState, now: Instant) -> PlaybackSnapshot {
@@ -236,6 +258,7 @@ mod tests {
                 sample_rate: 48_000,
                 duration_secs: 1.0,
             }),
+            output_sample_rate: 48_000,
             source_frames_per_output_frame: 1.0,
             next_source_frame: 12_000.0,
             playing: true,
@@ -255,6 +278,36 @@ mod tests {
     }
 
     #[test]
+    fn replacing_audio_reuses_the_player_state_and_pauses_at_the_requested_time() {
+        let old = Arc::new(AudioData {
+            stereo_pcm: vec![0.0; 96_000],
+            sample_rate: 48_000,
+            duration_secs: 1.0,
+        });
+        let mut state = PlayerState {
+            audio: old,
+            output_sample_rate: 44_100,
+            source_frames_per_output_frame: 48_000.0 / 44_100.0,
+            next_source_frame: 1_000.0,
+            playing: true,
+            playback_anchors: VecDeque::new(),
+        };
+        let replacement = Arc::new(AudioData {
+            stereo_pcm: vec![0.5; 192_000],
+            sample_rate: 96_000,
+            duration_secs: 1.0,
+        });
+
+        replace_audio_state(&mut state, Arc::clone(&replacement), 0.25);
+
+        assert!(Arc::ptr_eq(&state.audio, &replacement));
+        assert_eq!(state.source_frames_per_output_frame, 96_000.0 / 44_100.0);
+        assert_eq!(state.next_source_frame, 24_000.0);
+        assert!(!state.playing);
+        assert!(state.playback_anchors.is_empty());
+    }
+
+    #[test]
     fn output_rate_conversion_advances_the_source_clock_without_a_second_buffer() {
         let shared = Arc::new(Mutex::new(PlayerState {
             audio: Arc::new(AudioData {
@@ -262,6 +315,7 @@ mod tests {
                 sample_rate: 48_000,
                 duration_secs: 1.0,
             }),
+            output_sample_rate: 44_100,
             source_frames_per_output_frame: 48_000.0 / 44_100.0,
             next_source_frame: 0.0,
             playing: true,
@@ -289,6 +343,7 @@ mod tests {
                 sample_rate: 48_000,
                 duration_secs: 1.0,
             }),
+            output_sample_rate: 48_000,
             source_frames_per_output_frame: 1.0,
             next_source_frame: 0.0,
             playing: true,

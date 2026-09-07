@@ -153,6 +153,21 @@ DocumentSession の identity は process 全体で一意に発行する。対象
 匿名 blob の File clone は seek cursor を共有するため、同じ blob の seek/read 全体を一つの
 mutex の所有範囲に置く。独立 store、別 session、同一 blob 並行復元を回帰テストに含める。
 
+接続レビューで確認した状態境界:
+
+- cold restore 中に新しい画像・音声が成功しても、一つの slot だけで全体を Ready としない。
+  Project と最新 manifest を確定し、必要な全素材を揃えてから runtime を Ready にする。
+- 取消は pending の receiver を即座に捨てず、実行中の処理を drain するまで owner を保持する。
+  新しい要求は最新一件として待たせ、取消→開始の反復でも worker 数の制約を維持する。
+- cold restore 中・失敗中は旧 preview texture を表示対象から外す。無音 PCM を入れた
+  再利用用 stream の存在を、音声の準備完了や timeline 位置の正本と混同しない。
+- 復元完了は一件だけでなく、同じ poll に到着済みの結果を drain して最新の採否を決める。
+- 終了時も receiver owner ごと cleanup worker へ移す。先に空まで drain してから UI で
+  receiver を捨てる方式では、その間の send による大きなデータの UI 解放を防げない。
+- LRC 読込は対象歌詞の要求時 baseline を保持する。同じレイヤーの本文・時刻が変わった場合は
+  読込結果を Ready として保持し、反映または現在の歌詞を維持する選択を求める。
+  他レイヤーや無関係な property の編集では確認を要求しない。
+
 ### 歌詞の行対応（独立調査後の設計方針）
 
 通常編集は custom TextBuffer で Unicode char 範囲の splice を記録する。
@@ -184,6 +199,12 @@ widget ID と sidecar は session / layer の寿命に所属させ、別 Project
 全体 Undo は current identity を復元し、残存する native 履歴から到達する既知対応は有界に保持する。
 LRC や全体 Undo のたびに widget ID を変えて native 履歴を消す回避は行わない。
 
+sidecar から古い候補を破棄した後も、残った同本文の候補だけで対応を断定しない。
+native Undoer の独立コピーから到達可能な本文を観測し、対応を失った本文の印をその寿命に沿って
+保持・回収する。長い入力 session の後にすべての本文 Undo が恒久的に確認待ちになる方式は採らない。
+native の内容を観測できない場合は安全側の確認に留める。UI には内部の履歴機構名を出さず、
+変更前後の歌詞と保持する時刻を比較できる候補・取消を当該歌詞欄に表示する。
+
 ## 5. 実装・検証記録
 
 ### 保存・選択の先行修正
@@ -203,6 +224,7 @@ LRC や全体 Undo のたびに widget ID を変えて native 履歴を消す回
 ### 素材履歴の共有 API 基盤
 
 lab の接続から分けて、`musicvideo-core/src/assets.rs` と共有 UI の基盤を先行確認した。
+コミット: `91326ca8d`。
 独立 Astra の最終レビューで追加の修正要求なし。lab の非同期接続と歌詞の承認は別に扱う。
 Sol 実行: `cargo test -p musicvideo-core` 72 passed、`cargo test -p musicvideo-ui` 50 passed、
 `cargo fmt --check -p musicvideo-core -p musicvideo-ui` は exit 0。
@@ -217,6 +239,22 @@ Sol 実行: `cargo test -p musicvideo-core` 72 passed、`cargo test -p musicvide
   既存 repo のフォント利用は読み取りであり、Arc 化後も同じデータを読む。
 - この基盤だけでは lab の H2 は解消しない。部分復元中の素材追加、取消後の worker 所有、
   古い完了の drain、preview の切離し、音声なし transport、終了・失敗の処理を接続側で検証する。
+
+### lab の素材・読込接続
+
+Sol 実行: `cargo test -p musicvideo_lab -- --nocapture` 44 passed / 0 failed、
+`cargo fmt -p musicvideo_lab --check` exit 0。独立レビューの初回指摘を修正した後の再実行である。
+独立 Astra の最終再レビューで新たな blocking 指摘なし。
+
+- 匿名 blob の同一 lease 並行復元、同 path 別内容、別 store の revision、元ファイルに
+  依存しない画像・PCM 復元を確認。
+- host handler で Undo と pending 取消の同時処理、ABA 拒否、復元中の画像/音声追加、
+  stale と最新の完了 drain、後発 property 編集の保持、失敗・再試行を確認。
+- project/LRC 読込中の対象変更は明示確認まで結果を保持。再生 stream の有無だけで
+  音声なし timeline の位置を上書きしない。出力初期化失敗では具体的な通知を維持する。
+- receiver owner と大きな decoded 内容の cleanup worker への移譲を追加。
+  復元 worker の切断後は再生成して再試行し、再生成失敗は未解決状態として通知する。
+- この結果は headless の自動確認であり、Windows 実音出力・実 IME・目視の検収とは分ける。
 
 ## 6. 修正後の短い実機確認
 
@@ -238,3 +276,15 @@ Sol 実行: `cargo test -p musicvideo-core` 72 passed、`cargo test -p musicvide
 操作感については「どの操作をしたかったか」「どこで手が止まったか」を優先して記録する。
 次の UI 改善では、時間軸の拡大・移動、キーの発見と選択、現在時刻と選択キーの関係、
 レイヤー一覧と編集ペインの面積配分を、この実用結果に沿って具体化する。
+
+後続 UI 設計で確認する具体的な条件:
+
+- 現 timeline は曲全体を横幅へ当てはめ、左ラベルに 190 px を使う。例えば表示時間軸が
+  800 px の 5 分曲では約 0.375 秒/px となり、微調整には拡大表示が必要。
+  任意の短い区間へ移動し、編集後に曲全体へ戻れることを受け入れ条件にする。
+- 同時刻・近接したキーを個別に選び、対象 property と時刻を確認してから動かせること。
+  選択キーの時刻と再生位置が異なる場合も、どちらを書き換える操作かが見えること。
+- lab の下部 panel は既に resize 可能だが、timeline 内の行領域は最大 190 px である。
+  panel を広げた分が編集対象の一覧に使えるかを実用確認し、pane の単なる大型化で済ませない。
+
+これらは今回の整合性修正へ追加実装する条件ではなく、ユーザー確認後の UI 改善の入力である。
