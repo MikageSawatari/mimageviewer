@@ -124,3 +124,63 @@ Sol / xhigh が現 HEAD で再実行（2026-09-07）。すべて正常終了し�
 | `AGENTS.md` / `CLAUDE.md` / detached plan §2・§3 | ClaudeCode と Codex の双方合意、ClaudeCode への相談/検収、完了条件と diff の照合を中心に記述した検収手順 | 担当名は移行対象。実際に触れる前に主担当設計判断＋独立 Astra の構造レビューへ対応付け、§11 に範囲・合意理由を残す。ユーザー指示に従い設計誤りもレビューする。症状パッチ禁止・別系統との非同時編集・既存テスト維持は変更しない |
 
 旧担当名の全リポジトリ一括置換は行わない。他系統の運用まで書き換えず、このタスクの新しい実装指示書で移行範囲を明記する。
+
+## 7. v3.6.0 の取り込み（2026-09-07）
+
+引き継ぎ後のユーザー依頼により、master の v3.6.0 リリース地点
+`56d97632ce3eb20bb3cec0b61016a2b18b2b1dc4` を musicvideo へ取り込んだ（マージコミット `17a9664d1`）。
+引き継ぎ文書は先に `857d6db05` で記録した。取り込み時の master は `843fa4cc8` だが、
+タグより後の 5 コミットは今回の対象に含めない。§4 の分岐数は取り込み前の監査記録として残す。
+
+自動マージは衝突なし。重複した `Cargo.toml`、`Cargo.lock`、`src/video/mod.rs`、`docs/README.md` は
+双方の追加を保持している。独立 Astra / 高のレビューで、musicvideo の実装・共有 music-core・
+ui_music_spectrum は取り込み前と同一、encoder / audio_decode / comic-core はタグと同一であることを確認。
+新たな P1/P2 の統合問題は見つからなかった。§3 の既存 H1/H2/H3 はこのマージでは修正しない。
+
+`git diff --cached --check` はタグ由来の `docs/video-zoom-pan-plan.md` の 2 行に末尾スペースを報告する。
+Markdown の改行用スペースであり、リリース内容を保つため変更しない。
+
+統合後の検証結果は以下へ記録する。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 |
+| `cargo check -p mimageviewer --features dev-tools --bin mvexport_cli` | 成功 |
+| `cargo test -p musicvideo-core` / `-p musicvideo-ui` / `-p musicvideo_lab` | 71 / 37 / 24 件、全件成功 |
+| `cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | dangerous glyphs なし |
+| `cargo build --release --bin mimageviewer-core` | 成功（14 分 16 秒） |
+| `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets` | 成功（54.30 秒） |
+| 全体ゲート再実行・workspace 段 | 成功。本体 lib 7,498 passed / 0 failed / 33 ignored、Susie 8 passed、UI snapshot 45 passed、workspace / doctest 全体も失敗なし |
+| `.\scripts\test-full.ps1` 最終結果 | exit 0 / `[test-full] PASS`。上記に加え vendored egui-wgpu 9 passed、eframe 15 passed |
+| テスト修正後の `cargo fmt --check` | 成功 |
+| `.\scripts\build-dev.ps1` | exit 0 / `[build-dev] DONE`。normal feature set の core / remote を生成、未起動 |
+
+全体テスト初回は launcher build.rs が必要とする release core / remote が未生成のため、
+テスト開始前に終了した。これは CLAUDE.md「開発中のビルド・テスト選択」に記載された前提不足であり、
+テスト失敗とは分けて記録する。指定の release core / remote の生成は成功し、全体テストを再実行した。
+
+前提を揃えた後の全体テストでは、本体 lib が 7,497 成功 / 1 失敗 / 33 ignored、Susie integration が
+5 成功 / 3 失敗だった。lib の失敗は `every_pass2_read_is_preceded_by_a_cancel_check` が
+CRLF の `include_str!` 入力から LF の関数末尾区切りを見つけられないためで、取消の assertion より前に
+停止していた。対象ファイルは v3.6.0 と同一。独立 Astra が CRLF / LF の検索差と正規化後の抽出を確認し、
+テスト入力だけを正規化する局所修正に合意した。5 種類の読み取りの存在・取消観測順序の検査は維持する。
+製品コードやリポジトリ全体の改行設定は変更しない。この修正はリリース取り込みと別コミットに分ける。
+改行修正後、当該局所テストは 1 件成功。修正差分は独立 Astra によるレビューでも指摘なし。
+Susie はローカル `testdata` が存在するため共有 testdata への fallback が使われず、ローカルの
+`susie-plugins/extracted` に README しかないことが原因だった。共有 testdata の `ifpi.spi` / `ifmag.spi` を
+非 reparse と確認して実コピーし、コピー前後の SHA-256 一致を確認した。元の testdata・ユーザー設定は変更していない。
+`cargo test -p mimageviewer --test susie_integration -- --test-threads=1` は 8 件成功 / ignored なし。
+別 target の不要な再コンパイルを避けるため、途中の明示 `--target` 付きコマンドは意図的に中断し、
+全体テストと同じ既定の Windows x64 target で上記検証を行った。
+
+上記最終検証は、マージ内容にこのテスト修正を加えた作業ツリーに対して行った。
+確認用成果物は `target/dev-runtime/mimageviewer-core.exe`（308,096,512 bytes）と
+`mimageviewer-remote.exe`（12,169,216 bytes）。エージェントは起動していない。
+ユーザーが確認する場合は installed/tray 常駐版を終了してから、次を実行する。
+通常の `%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。
+確認対象は本体音楽ビューの鍵盤・横長スペクトラム表示と、音声の再生/seek。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```

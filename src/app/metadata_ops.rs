@@ -2139,6 +2139,7 @@ mod tests {
     #[test]
     fn every_pass2_read_is_preceded_by_a_cancel_check() {
         const SOURCE: &str = include_str!("metadata_ops.rs");
+        let source = SOURCE.replace("\r\n", "\n");
         const READS: [&str; 5] = [
             "build_searchable_from_path_counted",
             "read_tweet_info_counted",
@@ -2148,18 +2149,18 @@ mod tests {
         ];
         const CANCEL: &str = "self.cancel.load(";
 
-        let start = SOURCE
+        let start = source
             .find("    fn process(&self, idx: usize, item: &GridItem)")
             .expect("pass 2 item entry point");
         let end = start
-            + SOURCE[start..]
+            + source[start..]
                 .find(
                     "
     }
 ",
                 )
                 .expect("end of the item entry point");
-        let body = &SOURCE[start..end];
+        let body = &source[start..end];
 
         let mut events: Vec<(usize, &str)> = Vec::new();
         for (offset, _) in body.match_indices(CANCEL) {
