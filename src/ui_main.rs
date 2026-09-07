@@ -16698,14 +16698,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         selection_info_bar_contains_pos(self.selection_info_bar_rect, pos)
     }
 
-    /// 選択中アイテムの情報を選択セル / 行の直下に表示する。
-    pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
-        // メインウィンドウを専有するビューア中は出さない (独自のホバーヘッダーを持つため)。
-        if self.viewer_session_blocks_main_window()
+    /// 選択情報ツールチップを描かない条件。
+    ///
+    /// これは受動的なヒントなので、ビューアがメインウィンドウを専有している間 (独自の
+    /// ホバーヘッダーを持つ) と、モーダル相当のダイアログが画面を持っている間は出さない。
+    /// 後者を入れているのは、ツールチップが同じ `Order::Middle` の後ろに描かれるため、
+    /// 放っておくと「重要な変更点」のようなダイアログの手前へ重なるから (実機 2026-09-07)。
+    /// 順序を入れ替えるのではなく描かないことで、どのダイアログでも同じ結果になる。
+    pub(crate) fn selection_info_tooltip_suppressed(&self) -> bool {
+        self.viewer_session_blocks_main_window()
+            || self.common_modal_dialog_open()
             || !self.settings.selection_info_display_mode.shows_tooltip()
             || !grid_row_text_tooltips_enabled(self.settings.grid_view_mode)
             || self.items_are_drive_list
-        {
+    }
+    /// 選択中アイテムの情報を選択セル / 行の直下に表示する。
+    pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
+        if self.selection_info_tooltip_suppressed() {
             return;
         }
 
@@ -17309,6 +17318,33 @@ mod selection_info_tests {
     fn row_text_tooltips_are_disabled_only_in_details_view() {
         assert!(grid_row_text_tooltips_enabled(GridViewMode::Thumbnail));
         assert!(!grid_row_text_tooltips_enabled(GridViewMode::Details));
+    }
+
+    #[test]
+    fn selection_info_tooltip_yields_to_a_modal_dialog() {
+        let mut app = app_with_item(
+            GridItem::Image(PathBuf::from(r"C:\pics.jpg")),
+            Some((1_600_000_000, 100)),
+        );
+        assert!(
+            !app.selection_info_tooltip_suppressed(),
+            "通常の一覧では出す"
+        );
+
+        // 「重要な変更点」は共通のモーダル一覧に載っている。ツールチップは同じ
+        // `Order::Middle` の後ろに描かれるので、出したままだとダイアログへ重なる。
+        app.show_whats_new = true;
+        assert!(
+            app.selection_info_tooltip_suppressed(),
+            "モーダルダイアログが出ている間は描かない"
+        );
+
+        app.show_whats_new = false;
+        app.show_preferences = true;
+        assert!(
+            app.selection_info_tooltip_suppressed(),
+            "個別のダイアログ名ではなく共通の述語で決める"
+        );
     }
 
     #[test]

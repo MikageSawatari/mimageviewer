@@ -15,12 +15,30 @@
 #   .\scripts\check-panic-log.ps1 -LogDir <p>  # another profile's logs
 [CmdletBinding()]
 param(
-    [string]$LogDir = (Join-Path $env:APPDATA 'mimageviewer\logs'),
-    [string]$AckFile = (Join-Path $PSScriptRoot '..\docs\panic-acknowledged.tsv'),
+    [string]$LogDir = '',
+    [string]$AckFile = '',
     [switch]$List
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrEmpty($AckFile)) {
+    # $PSScriptRoot is empty in some hosts (dot-sourcing, -Command, some agents),
+    # and a parameter default is bound before the body runs, so resolve it here
+    # and fall back to the command path and then the working directory.
+    $root = $PSScriptRoot
+    if ([string]::IsNullOrEmpty($root) -and -not [string]::IsNullOrEmpty($PSCommandPath)) {
+        $root = Split-Path -Parent $PSCommandPath
+    }
+    if ([string]::IsNullOrEmpty($root)) {
+        $AckFile = Join-Path (Get-Location).Path 'docs\panic-acknowledged.tsv'
+    } else {
+        $AckFile = Join-Path $root '..\docs\panic-acknowledged.tsv'
+    }
+}
+if ([string]::IsNullOrEmpty($LogDir)) {
+    $LogDir = Join-Path $env:APPDATA 'mimageviewer\logs'
+}
 
 function ConvertFrom-FileTimeIntervals {
     param([string]$Intervals)
