@@ -15,6 +15,17 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
+/// スクロール領域の内容幅を、**バーの有無にかかわらず**同じにする。
+///
+/// egui は非 floating のバーを出すときだけ溝を取る。内容量が変わるたびにパネルの幅が動き、
+/// タブや本の帯が伸び縮みして読みづらい。常時表示にすれば幅は揃うが、今度は使わない灰色の
+/// 溝がずっと見える。**溝の分だけ内容を狭めておく**と、バーが出る側では egui の確保と一致し、
+/// 出ない側ではただの余白になる。
+fn metadata_scroll_content_width(ui: &egui::Ui, outer_width: f32) -> f32 {
+    let scroll = &ui.spacing().scroll;
+    (outer_width - (scroll.bar_width + scroll.bar_inner_margin)).max(1.0)
+}
+
 const SIMILAR_THUMB_SIZE: f32 = 72.0;
 
 /// パネルが抱えるサムネイルの上限。1 冊分の帯とその候補が丸ごと収まる程度にする。
@@ -1295,7 +1306,7 @@ impl App {
             .id_salt("metadata_scroll")
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
-                ui.set_width(ui.available_width());
+                ui.set_width(metadata_scroll_content_width(ui, inner_rect.width()));
 
                 draw_metadata_panel_tabs(ui, &mut self.similar_panel.tab);
                 ui.add_space(4.0);
@@ -3298,122 +3309,132 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
 pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {
     ui.set_width(360.0);
     apply_metadata_panel_dark_widget_style(ui);
+    // 本番と同じ scroll 構成で描く。ここを省くと、**溝の有無で幅が動く**という当の症状が
+    // スナップショットに出ない。
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(28, 30, 36))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
-            let mut tab = if similar_selected {
-                MetadataPanelTab::Similar
-            } else {
-                MetadataPanelTab::Info
-            };
-            draw_metadata_panel_tabs(ui, &mut tab);
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(8.0);
-            if !similar_selected {
-                ui.label(
-                    egui::RichText::new("画像情報")
-                        .color(egui::Color32::WHITE)
-                        .size(16.0)
-                        .strong(),
-                );
-                draw_key_value_wrapped(ui, "ファイル", "sample.jpg");
-                draw_key_value_wrapped(ui, "サイズ", "1200×1600");
-                return;
-            }
+            let outer_width = ui.available_width();
+            egui::ScrollArea::vertical()
+                .id_salt("metadata_snapshot_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(metadata_scroll_content_width(ui, outer_width));
+                    let mut tab = if similar_selected {
+                        MetadataPanelTab::Similar
+                    } else {
+                        MetadataPanelTab::Info
+                    };
+                    draw_metadata_panel_tabs(ui, &mut tab);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    if !similar_selected {
+                        ui.label(
+                            egui::RichText::new("画像情報")
+                                .color(egui::Color32::WHITE)
+                                .size(16.0)
+                                .strong(),
+                        );
+                        draw_key_value_wrapped(ui, "ファイル", "sample.jpg");
+                        draw_key_value_wrapped(ui, "サイズ", "1200×1600");
+                        return;
+                    }
 
-            let hits = vec![
-                crate::similar_index::QueryHit {
-                    item_id: 2,
-                    item_key: crate::similar_index::item_key_for_file(Path::new(
-                        r"C:\Pictures\edits\sample.png",
-                    )),
-                    kind: crate::similar_db::ItemKind::Image,
-                    container_key: None,
-                    page_index: None,
-                    distance: 5,
-                    band: crate::similar_index::MatchBand::NearlyIdentical,
-                    mtime: 1,
-                    file_size: 4_404_019,
-                    width: 2400,
-                    height: 3200,
-                    format: crate::similar_image::SimilarImageFormat::Png,
-                    target: Some(crate::similar_index::SimilarItemTarget::File(
-                        PathBuf::from(r"C:\Pictures\edits\sample.png"),
-                    )),
-                },
-                crate::similar_index::QueryHit {
-                    item_id: 3,
-                    item_key: crate::similar_index::item_key_for_file(Path::new(
-                        r"D:\Archive\sample.webp",
-                    )),
-                    kind: crate::similar_db::ItemKind::Image,
-                    container_key: None,
-                    page_index: None,
-                    distance: 24,
-                    band: crate::similar_index::MatchBand::OtherVersion,
-                    mtime: 1,
-                    file_size: 921_600,
-                    width: 900,
-                    height: 1200,
-                    format: crate::similar_image::SimilarImageFormat::WebP,
-                    target: Some(crate::similar_index::SimilarItemTarget::File(
-                        PathBuf::from(r"D:\Archive\sample.webp"),
-                    )),
-                },
-            ];
-            // 表示中のページと候補で、フォルダ名とファイル名が一部だけ違う組にする。
-            // 差分の色分けが効いているかを目で見て確かめられる。
-            let matches = crate::similar_index::ItemMatches {
-                origin: crate::similar_index::OriginItem {
-                    item_key: "c:/pictures/edits/2024-05/sample.png".to_string(),
-                    kind: crate::similar_db::ItemKind::Image,
-                    mtime: 0,
-                    file_size: 4_400_000,
-                    width: 1200,
-                    height: 1600,
-                    format: crate::similar_image::SimilarImageFormat::Png,
-                    target: Some(crate::similar_index::SimilarItemTarget::File(
-                        PathBuf::from(r"C:\Pictures\edits\2024-05\sample.png"),
-                    )),
-                },
-                hits,
-            };
-            let mut state = SimilarPanelState::default();
-            state
-                .thumbnails
-                .insert(matches.origin.item_key.clone(), SimilarThumbState::Failed);
-            for hit in &matches.hits {
-                state
-                    .thumbnails
-                    .insert(hit.item_key.clone(), SimilarThumbState::Failed);
-            }
-            let mut actions = SimilarPanelActions::default();
-            let ctx = ui.ctx().clone();
-            let book = book_snapshot_fixture();
-            let current_page = "c:/books/this/060.png".to_string();
-            let views = [SimilarPageView {
-                heading: None,
-                item_key: Some(current_page.as_str()),
-                model: SimilarPanelModel::Results(&matches),
-                showing_previous: false,
-            }];
-            draw_similar_panel(
-                ui,
-                &views,
-                Some(&book),
-                true,
-                &mut state,
-                72,
-                85,
-                crate::thumb_loader::CacheDecision::without_thumbnail(),
-                None,
-                Some(matches.hits[0].item_key.as_str()),
-                false,
-                &ctx,
-                &mut actions,
-            );
+                    let hits = vec![
+                        crate::similar_index::QueryHit {
+                            item_id: 2,
+                            item_key: crate::similar_index::item_key_for_file(Path::new(
+                                r"C:\Pictures\edits\sample.png",
+                            )),
+                            kind: crate::similar_db::ItemKind::Image,
+                            container_key: None,
+                            page_index: None,
+                            distance: 5,
+                            band: crate::similar_index::MatchBand::NearlyIdentical,
+                            mtime: 1,
+                            file_size: 4_404_019,
+                            width: 2400,
+                            height: 3200,
+                            format: crate::similar_image::SimilarImageFormat::Png,
+                            target: Some(crate::similar_index::SimilarItemTarget::File(
+                                PathBuf::from(r"C:\Pictures\edits\sample.png"),
+                            )),
+                        },
+                        crate::similar_index::QueryHit {
+                            item_id: 3,
+                            item_key: crate::similar_index::item_key_for_file(Path::new(
+                                r"D:\Archive\sample.webp",
+                            )),
+                            kind: crate::similar_db::ItemKind::Image,
+                            container_key: None,
+                            page_index: None,
+                            distance: 24,
+                            band: crate::similar_index::MatchBand::OtherVersion,
+                            mtime: 1,
+                            file_size: 921_600,
+                            width: 900,
+                            height: 1200,
+                            format: crate::similar_image::SimilarImageFormat::WebP,
+                            target: Some(crate::similar_index::SimilarItemTarget::File(
+                                PathBuf::from(r"D:\Archive\sample.webp"),
+                            )),
+                        },
+                    ];
+                    // 表示中のページと候補で、フォルダ名とファイル名が一部だけ違う組にする。
+                    // 差分の色分けが効いているかを目で見て確かめられる。
+                    let matches = crate::similar_index::ItemMatches {
+                        origin: crate::similar_index::OriginItem {
+                            item_key: "c:/pictures/edits/2024-05/sample.png".to_string(),
+                            kind: crate::similar_db::ItemKind::Image,
+                            mtime: 0,
+                            file_size: 4_400_000,
+                            width: 1200,
+                            height: 1600,
+                            format: crate::similar_image::SimilarImageFormat::Png,
+                            target: Some(crate::similar_index::SimilarItemTarget::File(
+                                PathBuf::from(r"C:\Pictures\edits\2024-05\sample.png"),
+                            )),
+                        },
+                        hits,
+                    };
+                    let mut state = SimilarPanelState::default();
+                    state
+                        .thumbnails
+                        .insert(matches.origin.item_key.clone(), SimilarThumbState::Failed);
+                    for hit in &matches.hits {
+                        state
+                            .thumbnails
+                            .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+                    }
+                    let mut actions = SimilarPanelActions::default();
+                    let ctx = ui.ctx().clone();
+                    let book = book_snapshot_fixture();
+                    let current_page = "c:/books/this/060.png".to_string();
+                    let views = [SimilarPageView {
+                        heading: None,
+                        item_key: Some(current_page.as_str()),
+                        model: SimilarPanelModel::Results(&matches),
+                        showing_previous: false,
+                    }];
+                    draw_similar_panel(
+                        ui,
+                        &views,
+                        Some(&book),
+                        true,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        Some(matches.hits[0].item_key.as_str()),
+                        false,
+                        &ctx,
+                        &mut actions,
+                    );
+                });
         });
 }
 

@@ -319,8 +319,9 @@ fn metadata_panel_similar_results_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_similar_results_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        // 本の関係とページ帯まで入る高さ。切れていると帯の退行に気付けない。
-        egui::vec2(400.0, 830.0),
+        // わざと内容より低くして**スクロールする側**を撮る。情報タブ側は収まるので、
+        // 2 枚でバーの有無を跨いだ幅の一致が押さえられる。
+        egui::vec2(400.0, 400.0),
         None,
         |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
     );
