@@ -1802,6 +1802,58 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 規模 / 優先度: 小 / P2。
 
 
+### 1.195 detached の binding 不整合が、まだ 2 種残っている (2026-09-07)
+
+- 出典: `panic.log` の棚卸し (§1.196 で入れた `scripts/check-panic-log.ps1`)。
+- 記録されている 3 種のうち、複数ウィンドウで PDF を開く経路 (`src/app.rs:39069`
+  `detached session binding failed for ViewerContextId(N): ContextOwnedBy(N)`) は
+  v3.6.0 で修正した。**残る 2 種は原因未特定**:
+  - `src/ui_fullscreen.rs:13611` `active detached backstop window N has no context binding`
+    (2026-08-28 09:23)
+  - `src/app/viewer_context_registry.rs:2935` `window N has no viewer-context binding`
+    (2026-08-28 11:10)
+- どちらも **BA-7 (所有状態の分散)** の同族で、後者のスタックにも
+  `render_active_detached_viewport_backstop` が出る。**panic のスタックだけでは操作列を
+  特定できない**ので、再現手順を作るところから始める。
+- v3.6.0 の修正で消えたかどうかは**未確認**。修正後に同じ操作を踏んで確かめること。
+- detached リワークの凍結ルールが適用される。症状パッチを入れず、BA 番号に対応付けて扱う。
+- 規模 / 優先度: 中 / **P1** (クラッシュ)。
+
+### 1.196 panic.log に 5 か月ぶんの未処理クラッシュが 12 種たまっていた (2026-09-07)
+
+- 経緯: v3.6.0 の出荷直前に、複数ウィンドウで PDF を開くと必ず落ちる不具合が実機で出た。
+  そのとき `panic.log` を開いたら、**2026-04 以降のクラッシュが 15 種 52 件記録されていて、
+  どれもバックログにも既知の問題ページにも載っていなかった**。
+  出荷前チェックリストには R8「セッション終了後に `panic.log` を確認」が既にあり、
+  **手順の抜けではなく実行しなかったこと**が原因である。
+- 対策として `scripts/check-panic-log.ps1` を入れた。記録されたすべての panic に
+  `docs/panic-acknowledged.tsv` の disposition (fixed / filed / external) を要求し、
+  無いものがあれば exit 1 する。リリース手順 Phase 2 の先頭で回す。
+- **本項は、その seed で `filed` にした 12 種の棚卸しそのもの。** 1 種ずつ、
+  現行版で再現するか / 既に直っているか / 依存側の問題かを判定して処理する。
+
+| 種別 | 場所 | 最終 | 件数 |
+| --- | --- | --- | --- |
+| index out of bounds | `src/ui_main.rs:1013` | 2026-04-21 | 3 |
+| index out of bounds | `src/ui_main.rs:1026` | 2026-04-21 | 1 |
+| RefCell already mutably borrowed | `src/video/dsp/gui.rs:221` | 2026-05-03 | 7 |
+| RefCell already borrowed | `src/video/gpu_renderer/d3d11_device.rs:759` | 2026-05-14 | 1 |
+| `Option::unwrap()` on None | ffmpeg-the-third `resampling/context.rs:189` | 2026-05-14 | 14 |
+| wgpu Out of Memory | wgpu `wgpu_core.rs:2015` / `:2568` | 2026-05-15 | 各 1 |
+| min > max, or either was NaN | `core/num/f32.rs:1434` (clamp) | 2026-05-21 | 1 |
+| texture size と texel count の不一致 | egui-wgpu `renderer.rs:615` | 2026-05-27 | 1 |
+| wgpu Validation Error | wgpu `wgpu_core.rs:1970` | 2026-08-14 | 9 |
+| wgpu Validation Error | wgpu `wgpu_core.rs:1588` | 2026-08-27 | 8 |
+| egui layout indent | egui `ui.rs:2569` | 2026-04-14 | 1 |
+
+- **自前のコードのものを先に見る**: `ui_main.rs` の添字 2 件、`video/dsp/gui.rs` と
+  `d3d11_device.rs` の RefCell 2 件、clamp の NaN 1 件。
+- wgpu の Validation Error は **2026-08 まで続いている**ので、直近の版でも起きている可能性が高い。
+  同時刻の `mimageviewer.log` と突き合わせて操作を特定する。
+- disposition を `filed` から動かすときは `docs/panic-acknowledged.tsv` も更新する
+  (fingerprint 列は script の出力からコピーする。手で書くと正規化がずれる)。
+- 規模 / 優先度: 中 / P2 (1 種ずつ独立して進められる)。
+
 ### 1.193 編集バッジがファイル名スタックへ集約されない (2026-09-07)
 
 - 出典: v3.6.0 リリース差分レビュー (Codex Astra) の指摘 7。**v3.6.0 の退行ではない。**
