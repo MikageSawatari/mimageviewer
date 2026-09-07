@@ -8,12 +8,15 @@ mod document;
 mod history;
 mod keyframes;
 mod modulators;
+mod resources;
 mod timeline;
 
+pub use document::{DocumentSession, DocumentSessionId, EditGeneration, SaveCheckpoint};
 pub use keyframes::{
     AnimProperty, AnimationValue, CommandResult, EditorCommand, EditorCommandError,
     LayerMoveDirection, apply_editor_command,
 };
+pub use resources::{EditTargetLifetime, ResourceLease, ResourceManifest, ResourceRevision};
 pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use egui::TextureHandle;
@@ -28,6 +31,7 @@ use musicvideo_core::{
 
 use history::{EditSurface, UndoHistory};
 use modulators::ModulatorEditorState;
+use resources::EditTargetLifetimes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailSelection {
@@ -43,6 +47,7 @@ enum DetailSelection {
 #[derive(Debug, Clone, PartialEq)]
 struct EditorSnapshot {
     project: Project,
+    resources: ResourceManifest,
     selected_layer: Option<LayerId>,
     selected_detail: Option<DetailSelection>,
 }
@@ -60,6 +65,8 @@ pub struct EditorState {
     selected_layer: Option<LayerId>,
     selected_detail: Option<DetailSelection>,
     dragging_detail: Option<DetailSelection>,
+    resources: ResourceManifest,
+    target_lifetimes: EditTargetLifetimes,
     lyrics_notice: Option<(LayerId, String)>,
     pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
@@ -72,6 +79,8 @@ impl Default for EditorState {
             selected_layer: None,
             selected_detail: None,
             dragging_detail: None,
+            resources: ResourceManifest::default(),
+            target_lifetimes: EditTargetLifetimes::default(),
             lyrics_notice: None,
             pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
@@ -97,6 +106,17 @@ impl EditorState {
 
     /// Clears selections and pending confirmations that belong to the previous project.
     pub fn reset_for_project(&mut self, project: &Project) {
+        self.reset_for_project_with_resources(project, ResourceManifest::default());
+    }
+
+    pub fn reset_for_project_with_resources(
+        &mut self,
+        project: &Project,
+        mut resources: ResourceManifest,
+    ) {
+        resources.retain_project_resources(project);
+        self.resources = resources;
+        self.target_lifetimes.reset(project);
         self.selected_layer = project
             .layers
             .get(1)
@@ -110,6 +130,7 @@ impl EditorState {
     }
 
     pub fn reconcile(&mut self, project: &Project) {
+        self.target_lifetimes.reconcile(project);
         if self
             .selected_layer
             .is_none_or(|selected| !project.layers.iter().any(|layer| layer.id == selected))
@@ -203,6 +224,7 @@ impl EditorState {
     fn snapshot(&self, project: &Project) -> EditorSnapshot {
         EditorSnapshot {
             project: project.clone(),
+            resources: self.resources.clone(),
             selected_layer: self.selected_layer,
             selected_detail: self.selected_detail,
         }
@@ -210,6 +232,7 @@ impl EditorState {
 
     fn restore_snapshot(&mut self, project: &mut Project, snapshot: EditorSnapshot) {
         *project = snapshot.project;
+        self.resources = snapshot.resources;
         self.selected_layer = snapshot
             .selected_layer
             .filter(|id| project.layers.iter().any(|layer| layer.id == *id))
@@ -262,10 +285,39 @@ impl EditorState {
     }
 
     pub fn finish_external_edit(&mut self, project: &Project, checkpoint: EditCheckpoint) -> bool {
+        self.target_lifetimes.reconcile(project);
+        self.resources.retain_project_resources(project);
         let after = self.snapshot(project);
         let changed = checkpoint.0 != after;
         self.history.record_atomic(checkpoint.0, &after);
         changed
+    }
+
+    pub fn finish_external_edit_with_resources(
+        &mut self,
+        project: &Project,
+        checkpoint: EditCheckpoint,
+        mut resources: ResourceManifest,
+    ) -> bool {
+        self.target_lifetimes.reconcile(project);
+        resources.retain_project_resources(project);
+        self.resources = resources;
+        let after = self.snapshot(project);
+        let changed = checkpoint.0 != after;
+        self.history.record_atomic(checkpoint.0, &after);
+        changed
+    }
+
+    pub fn resource_manifest(&self) -> &ResourceManifest {
+        &self.resources
+    }
+
+    pub fn layer_target_lifetime(&self, id: LayerId) -> Option<EditTargetLifetime> {
+        self.target_lifetimes.layer(id)
+    }
+
+    pub fn image_target_lifetime(&self, id: &ImageId) -> Option<EditTargetLifetime> {
+        self.target_lifetimes.image(id)
     }
 
     pub fn apply_external_command(
@@ -299,6 +351,7 @@ impl EditorState {
         pointer_active: bool,
         text_focus: Option<egui::Id>,
     ) {
+        self.resources.retain_project_resources(project);
         let after = self.snapshot(project);
         self.history.observe_ui_pass(
             surface,
@@ -325,6 +378,7 @@ impl EditorState {
             .map(|layer| layer.id);
         let animation_target = command.animation_target();
         let result = apply_editor_command(project, command)?;
+        self.resources.retain_project_resources(project);
         if let Some((layer, property)) = animation_target {
             self.select_layer_id(project, layer);
             if result.clear_selection
@@ -373,6 +427,7 @@ impl EditorState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EditorResponse {
     pub project_changed: bool,
+    pub history_changed: bool,
     pub add_image_layer_requested: bool,
     pub import_lrc_requested: Option<LayerId>,
     pub export_lrc_requested: Option<LayerId>,
@@ -616,6 +671,7 @@ pub fn draw_editor(
                     }
                     EditorResponse {
                         project_changed,
+                        history_changed: false,
                         add_image_layer_requested,
                         import_lrc_requested,
                         export_lrc_requested,
@@ -629,6 +685,7 @@ pub fn draw_editor(
         },
     );
     let mut response = allocation.inner;
+    response.history_changed = history_changed;
     let pointer_active = context.input(|input| input.pointer.primary_down());
     // Context::wants_keyboard_input is true while a TextEdit (including the
     // editable part of DragValue) owns focus. This both defines the text-edit
@@ -1558,10 +1615,11 @@ fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
 mod tests {
     use super::*;
     use musicvideo_core::{
-        Animatable, ImageRef, Interp, Keyframe, LyricLine, ModulationBinding, ModulationCurve,
-        ModulationTarget, Track, default_project, new_band_energy_modulator, new_image_layer,
-        new_solid_layer,
+        Animatable, AudioRef, ImageRef, Interp, Keyframe, LyricLine, ModulationBinding,
+        ModulationCurve, ModulationTarget, Track, default_project, new_band_energy_modulator,
+        new_image_layer, new_solid_layer,
     };
+    use std::sync::Arc;
 
     fn assert_undo_redo_round_trip(
         state: &mut EditorState,
@@ -2077,6 +2135,127 @@ mod tests {
     }
 
     #[test]
+    fn resource_manifest_and_project_use_the_same_undo_entry() {
+        let mut project = default_project(10.0);
+        project.audio = Some(AudioRef {
+            path: PathBuf::from("first.wav"),
+        });
+        let first = ResourceLease::new(Arc::new(()));
+        let second = ResourceLease::new(Arc::new(()));
+        let mut first_manifest = ResourceManifest::default();
+        first_manifest.set_audio(Some(first));
+        let mut state = EditorState::default();
+        state.reset_for_project_with_resources(&project, first_manifest.clone());
+
+        let checkpoint = state.begin_external_edit(&project);
+        project.audio = Some(AudioRef {
+            path: PathBuf::from("second.wav"),
+        });
+        let mut second_manifest = first_manifest.clone();
+        second_manifest.set_audio(Some(second));
+        assert!(state.finish_external_edit_with_resources(
+            &project,
+            checkpoint,
+            second_manifest.clone(),
+        ));
+
+        assert!(state.undo(&mut project));
+        assert_eq!(
+            project.audio.as_ref().unwrap().path,
+            PathBuf::from("first.wav")
+        );
+        assert_eq!(state.resource_manifest(), &first_manifest);
+        assert!(state.redo(&mut project));
+        assert_eq!(
+            project.audio.as_ref().unwrap().path,
+            PathBuf::from("second.wav")
+        );
+        assert_eq!(state.resource_manifest(), &second_manifest);
+    }
+
+    #[test]
+    fn deleting_and_recreating_ids_allocates_new_async_target_lifetimes() {
+        let mut project = default_project(10.0);
+        let image_id = ImageId::new("replace-me");
+        project.images.push(ImageRef {
+            id: image_id.clone(),
+            path: PathBuf::from("first.png"),
+        });
+        let layer = new_image_layer(&project, image_id.clone());
+        let layer_id = layer.id;
+        project.layers.push(layer.clone());
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let original_layer_lifetime = state.layer_target_lifetime(layer_id).unwrap();
+        let original_image_lifetime = state.image_target_lifetime(&image_id).unwrap();
+
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteLayer { layer: layer_id },
+        ));
+        let checkpoint = state.begin_external_edit(&project);
+        project.images.push(ImageRef {
+            id: image_id.clone(),
+            path: PathBuf::from("second.png"),
+        });
+        project.layers.push(layer);
+        assert!(state.finish_external_edit(&project, checkpoint));
+
+        assert_ne!(
+            state.layer_target_lifetime(layer_id),
+            Some(original_layer_lifetime)
+        );
+        assert_ne!(
+            state.image_target_lifetime(&image_id),
+            Some(original_image_lifetime)
+        );
+    }
+
+    #[test]
+    fn evicting_the_delete_snapshot_releases_its_last_resource_lease() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropNotice(Arc<AtomicUsize>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let image_id = ImageId::new("history-image");
+        let mut project = default_project(10.0);
+        project.images.push(ImageRef {
+            id: image_id.clone(),
+            path: PathBuf::from("history.png"),
+        });
+        let layer = new_image_layer(&project, image_id.clone());
+        let layer_id = layer.id;
+        project.layers.push(layer);
+        let mut resources = ResourceManifest::default();
+        resources.set_image(
+            image_id,
+            ResourceLease::new(Arc::new(DropNotice(Arc::clone(&drops)))),
+        );
+        let mut state = EditorState::default();
+        state.reset_for_project_with_resources(&project, resources);
+
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteLayer { layer: layer_id },
+        ));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        for step in 0..history::HISTORY_LIMIT {
+            let checkpoint = state.begin_external_edit(&project);
+            project.display_gain_db = step as f32 + 1.0;
+            assert!(state.finish_external_edit(&project, checkpoint));
+        }
+
+        assert_eq!(state.history_depths().0, history::HISTORY_LIMIT);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn new_edit_discards_redo_and_history_evicts_the_oldest_step() {
         let mut project = default_project(10.0);
         let mut state = EditorState::default();
@@ -2185,4 +2364,3 @@ mod tests {
         assert_eq!(state.history_depths(), (1, 0));
     }
 }
-pub use document::{DocumentSession, EditGeneration, SaveCheckpoint};

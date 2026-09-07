@@ -1,7 +1,8 @@
 # 音楽ビデオ: 編集の整合性修正
 
 開始: 2026-09-08、`musicvideo` / `849c5a9d2`。
-Status: 設計・前提検証中。実装・自動検証・実機確認の結果は別々に記録する。
+Status: 実装中。保存所有・選択の先行修正は完了、素材・読込切替・歌詞は作業中。
+実装・自動検証・実機確認の結果は別々に記録する。
 
 正本: [music-video-export-plan.md](music-video-export-plan.md)。
 前回監査: [music-video-handoff-20260907.md](music-video-handoff-20260907.md)。
@@ -14,7 +15,11 @@ H3 の解析時刻列・較正入力整合、時間軸 zoom/pan、重複キー�
 再生 shortcut、編集済み Project の MP4 導線、P4 本体統合は後続工程として残す。
 
 - 主担当 Astra / 高: 要件・設計判断、進行管理、文書の単独編集。
-- Sol / xhigh: 主要前提の検証後、コードとテストを単独編集。矛盾は編集前に根拠付きで主担当へ戻す。
+- Sol / xhigh（素材担当）: 主要前提の検証後、保存・選択・素材・読込のコードとテストを編集。
+  矛盾は編集前に根拠付きで主担当へ戻す。
+- Sol / xhigh（歌詞担当）: 並行段階では新規 `musicvideo-ui/src/lyrics_editing.rs` だけを編集。
+  既存 UI への接続は素材担当の該当ファイルを固定し、主担当が編集権を移してから行う。
+  Cargo の実行も調整し、同じファイルの同時編集とビルドの重複を避ける。
 - 独立 Astra / 高: 設計段階と実装後のレビュー。指示への適合だけでなく設計自体の誤りも対象。
 - 旧 brief の ClaudeCode 統括・検収・コミット指定は、この工程では上記体制に移行する。
   AGENTS.md の検証・データ保護・非同期処理・変更範囲の要件は維持する。
@@ -95,8 +100,8 @@ fmt と UI 文字列を変えた場合の glyph 検査を通す。
   付け替えず、並べ替えでは同じレイヤーの詳細を維持する。最初の実装レビューで index 所有の
   残経路が見つかったため、この不変条件に沿って修正する。
 
-H2 の素材保管・メモリ budget と、歌詞の編集範囲 / TextEdit Undo の対応は追加設計中。
-この部分は実装前に具体案の独立レビューを行う。
+H2 の素材保管・メモリ budget と、歌詞の編集範囲 / TextEdit Undo は
+この先行塊に含めず、以下の具体案を独立レビューして順に実装する。
 
 ### 素材の一時保持と保存形式の境界（設計レビュー済み）
 
@@ -123,6 +128,12 @@ cold Undo は blob を worker で復元し、別の素材の画素や PCM を復
 資源変更で新しい Assets bundle を作り、既に実行中の preview/PNG の bundle は変更しない。
 最後の大きな decoded 内容の解放と blob 削除は worker へ委譲する。
 
+共有機構への変更は `musicvideo-core/src/assets.rs` の資源所有 API に限定する。
+フォントと画像の共有参照から独立した Assets bundle を作れるようにし、
+lab の preview/PNG が開始時の内容を保持するために使う。
+既存の raster/MP4/CLI 呼出し側への型・所有の影響を core テスト、CLI check と全体 gate で確認する。
+Project の JSON schema と描画計算、`music-core`、本体の再生・viewport 機構は変更しない。
+
 新素材の要求開始は Project/履歴を変更しない。画像の追加も、読み込み中は未確定の要求として
 表示し、成功時にレイヤー・参照・資源を一括で確定する。通常の property 編集は継続できる。
 完了は対象の所有を確認して最新 Project へ適用する。
@@ -135,11 +146,49 @@ cold Undo は blob を worker で復元し、別の素材の画素や PCM を復
 
 cold restore 失敗では logical な Project/履歴と復元用 lease を保持し、未解決状態を表示する。
 誤った旧素材を表示・再生せず、再試行または別の Undo/Redo で復帰できるようにする。
-歌詞の編集範囲・TextEdit Undo の対応設計は引き続き未確定。
+
+独立した store / editor を本体へ複数組み込んでも識別子が衝突しないよう、素材 lease と
+DocumentSession の identity は process 全体で一意に発行する。対象レイヤー・画像は ID 値だけで
+非同期完了を受理せず、削除して同じ ID を再生成した場合にも異なる lifetime で判別する。
+匿名 blob の File clone は seek cursor を共有するため、同じ blob の seek/read 全体を一つの
+mutex の所有範囲に置く。独立 store、別 session、同一 blob 並行復元を回帰テストに含める。
+
+### 歌詞の行対応（独立調査後の設計方針）
+
+通常編集は custom TextBuffer で Unicode char 範囲の splice を記録する。
+delete と insert の途中状態だけで時刻を失わないよう、同じ pass / IME 編集を一つの操作として解釈する。
+本文と行 identity・時刻を分けて持ち、次の境界を固定する。
+
+- 一行内の訂正は、本文全体の消去と再入力を含めてその行の時刻を維持する。
+- 行頭の `X\n` 挿入は X を未設定にし、既存行の identity と時刻を後ろへ移す。
+- 行内分割は先頭 fragment に元の時刻を残す。完全行削除はその行の時刻と一緒に削除する。
+- 時刻付き行の本文を空にしただけなら、空行の消去 cue を維持する。
+  空文字だけでは「0 行」と「空行 1 行」を区別できないため、本文だけから決めない。
+- 複数の時刻付き行を結合して時刻が競合する場合だけ、保持する時刻を画面で確認する。
+
+egui の native TextEdit Undo/Redo は `replace_with(全文)` となり、通常 splice と区別する。
+有界の行対応情報（sidecar）から意味を復元し、候補間で対応が異なる場合・記録外の場合は
+明示確認する。全文・cursor の一致だけで過去行を断定せず、時刻を黙って消す fallback も入れない。
+sidecar は native TextEdit の意味対応情報であり、別の編集 Undo stack を実装するものではない。
+
+本文 Undo は、存続する行に後から設定した時刻を巻き戻さない。削除行の復活ではその行の
+削除時情報を使う。全体 Undo は Project と行 identity を同時復元する。
+widget ID と sidecar は session / layer の寿命に所属させ、別 Project の同じ layer ID から
+前の歌詞を取り消し復元しない。LRC による外部置換も同じ境界へ接続する。
+通常入力・IME で毎回確認を要求せず、実際の API で前提を満たせない場合は実装前に設計へ戻す。
+
+確認待ちでも、存続する行への最新の時刻修正を resolve で上書きしない。
+本文の外部置換・全体 Undo・session 切替では待機中の提案を失効または再評価する。
+取消は本文/identity だけでなく native TextEdit の cursor と undoer も操作前へ戻す。
+`TextEditState::clone()` は undoer を Arc 共有するため、必要な pass で独立した undoer コピーを保持する。
+全体 Undo は current identity を復元し、残存する native 履歴から到達する既知対応は有界に保持する。
+LRC や全体 Undo のたびに widget ID を変えて native 履歴を消す回避は行わない。
 
 ## 5. 実装・検証記録
 
 ### 保存・選択の先行修正
+
+コミット: `4ba3b7932`。独立 Astra の最終再レビューで追加指摘なし。
 
 - 保存の状態遷移を `musicvideo-ui/src/document.rs` の `DocumentSession` に共有化。
   lab の保存 worker 完了 handler が、要求時の `SaveCheckpoint` を渡して受理する。
@@ -150,3 +199,42 @@ cold restore 失敗では logical な Project/履歴と復元用 lease を保持
   レビューで並べ替え後の同じ描画 pass 内に残る古い index も修正し、UI 44 件を再確認。
   全体の最終検証・実機確認は別途記録する。
 - この先行塊には、読込開始後の編集を保護する切替確認と、素材/歌詞の修正は含まれない。
+
+### 素材履歴の共有 API 基盤
+
+lab の接続から分けて、`musicvideo-core/src/assets.rs` と共有 UI の基盤を先行確認した。
+独立 Astra の最終レビューで追加の修正要求なし。lab の非同期接続と歌詞の承認は別に扱う。
+Sol 実行: `cargo test -p musicvideo-core` 72 passed、`cargo test -p musicvideo-ui` 50 passed、
+`cargo fmt --check -p musicvideo-core -p musicvideo-ui` は exit 0。
+歌詞 module の登録を外した基盤だけの状態で実行した。
+
+- `ResourceManifest` / `ResourceLease` を Project と同じ snapshot に保持する。
+  128 段の履歴上限による最終 lease 解放、Project と資源の Undo/Redo を回帰テストに追加。
+- lease / DocumentSession は process 全体で採番し、別 store / editor の衝突を防ぐ。
+  非同期対象には削除・再生成を区別する lifetime を付ける。
+- `Assets` は既存の挿入・参照 API を維持し、必要な画像とフォントを共有した独立 bundle を
+  作成できるようにした。fork で scaled/text cache・inflight・待機条件は共有しない。
+  既存 repo のフォント利用は読み取りであり、Arc 化後も同じデータを読む。
+- この基盤だけでは lab の H2 は解消しない。部分復元中の素材追加、取消後の worker 所有、
+  古い完了の drain、preview の切離し、音声なし transport、終了・失敗の処理を接続側で検証する。
+
+## 6. 修正後の短い実機確認
+
+この工程では完成した一本を作る前に、以下を小さい試験用 Project で確認する。
+自動テストで判定した内容と、実音・IME・操作感の結果を分けて記録する。
+ラボの起動対象は `target/release/musicvideo_lab.exe`。P4 未実装なので、本体 core から
+この編集画面へ入る導線はまだない。ビルド完了時の起動手順は検証結果とともに追記する。
+
+1. 音声と画像を開き、見分けられる別画像・別音声へ差し替える。Undo/Redo で表示・音・波形が
+   対応して戻ること、連続操作しても途中の素材が遅れて復活しないことを見る。
+2. 歌詞 A/B/C に時刻を付け、先頭へ一行追加し、中間行を削除し、本文を日本語 IME で訂正する。
+   残った行の時刻、空行の消去区間、本文入力中の Ctrl+Z とフォーカス外の共通 Undo を見る。
+3. 歌詞の行・キーフレームを選択してから別レイヤーへ切り替え、並べ替え・削除・Undo を行う。
+   選択表示と右ペインの編集対象が一致することを見る。
+4. 試験用の別名で保存して開き直す。大きめの Project の読込中に編集できる場合は、切替確認で
+   「現在の編集を続ける」を選び、その変更が残ることを見る。非同期の競合自体は handler テストで
+   固定し、ユーザーが短い時間窓を繰り返し狙うことを検収条件にしない。
+
+操作感については「どの操作をしたかったか」「どこで手が止まったか」を優先して記録する。
+次の UI 改善では、時間軸の拡大・移動、キーの発見と選択、現在時刻と選択キーの関係、
+レイヤー一覧と編集ペインの面積配分を、この実用結果に沿って具体化する。

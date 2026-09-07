@@ -46,7 +46,7 @@ pub struct Assets {
     next_image_generation: AtomicU64,
     scaled_images: Mutex<ScaledImageCache>,
     scaled_image_ready: Condvar,
-    pub fonts: FontSet,
+    pub fonts: Arc<FontSet>,
     text_cache: TextCache,
 }
 
@@ -115,30 +115,52 @@ impl Assets {
             next_image_generation: AtomicU64::new(1),
             scaled_images: Mutex::new(ScaledImageCache::default()),
             scaled_image_ready: Condvar::new(),
-            fonts,
+            fonts: Arc::new(fonts),
             text_cache: TextCache::default(),
         }
     }
 
     pub fn insert_image(&self, id: ImageId, image: ImageAsset) -> Arc<ImageAsset> {
         let image = Arc::new(image);
+        self.insert_shared_image(id, Arc::clone(&image));
+        image
+    }
+
+    pub fn insert_shared_image(&self, id: ImageId, image: Arc<ImageAsset>) {
         let generation = self.next_image_generation.fetch_add(1, Ordering::Relaxed);
         self.images
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                id.clone(),
-                ImageRecord {
-                    generation,
-                    image: Arc::clone(&image),
-                },
-            );
+            .insert(id.clone(), ImageRecord { generation, image });
         self.scaled_images
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
             .retain(|entry| entry.key.image != id);
-        image
+    }
+
+    /// Creates an independent image bundle that shares only the requested
+    /// immutable source images and the font collection.
+    pub fn fork_retain_images(&self, retained: &[ImageId]) -> Self {
+        let images = self
+            .images
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let images = images
+            .iter()
+            .filter(|(id, _)| retained.iter().any(|retained_id| retained_id == *id))
+            .map(|(id, record)| (id.clone(), record.clone()))
+            .collect();
+        Self {
+            images: RwLock::new(images),
+            next_image_generation: AtomicU64::new(
+                self.next_image_generation.load(Ordering::Relaxed),
+            ),
+            scaled_images: Mutex::new(ScaledImageCache::default()),
+            scaled_image_ready: Condvar::new(),
+            fonts: Arc::clone(&self.fonts),
+            text_cache: TextCache::default(),
+        }
     }
 
     pub fn image(&self, id: &ImageId) -> Option<Arc<ImageAsset>> {
@@ -432,3 +454,32 @@ impl fmt::Display for AssetError {
 }
 
 impl std::error::Error for AssetError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pixel(value: u8) -> ImageAsset {
+        ImageAsset::new(1, 1, vec![value, value, value, 255]).unwrap()
+    }
+
+    #[test]
+    fn fork_shares_only_retained_images_and_replacement_is_isolated() {
+        let assets = Assets::default();
+        let retained_id = ImageId::new("retained");
+        let removed_id = ImageId::new("removed");
+        let retained = assets.insert_image(retained_id.clone(), pixel(10));
+        let removed = assets.insert_image(removed_id.clone(), pixel(20));
+
+        let fork = assets.fork_retain_images(std::slice::from_ref(&retained_id));
+        assert!(Arc::ptr_eq(&fork.image(&retained_id).unwrap(), &retained));
+        assert!(!fork.has_image(&removed_id));
+        fork.insert_image(retained_id.clone(), pixel(30));
+        assert_eq!(assets.image(&retained_id).unwrap().rgba[0], 10);
+        assert_eq!(fork.image(&retained_id).unwrap().rgba[0], 30);
+
+        drop(assets);
+        assert_eq!(Arc::strong_count(&removed), 1);
+        assert_eq!(Arc::strong_count(&retained), 1);
+    }
+}

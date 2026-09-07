@@ -1,6 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use musicvideo_core::Project;
+
+static NEXT_DOCUMENT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_document_session_id() -> DocumentSessionId {
+    DocumentSessionId(NEXT_DOCUMENT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocumentSessionId(u64);
@@ -34,7 +41,6 @@ struct SavedDocument {
 #[derive(Debug, Clone)]
 pub struct DocumentSession {
     id: DocumentSessionId,
-    next_id: u64,
     edit_generation: EditGeneration,
     next_edit_generation: u64,
     saved: Option<SavedDocument>,
@@ -43,8 +49,7 @@ pub struct DocumentSession {
 impl Default for DocumentSession {
     fn default() -> Self {
         Self {
-            id: DocumentSessionId(1),
-            next_id: 2,
+            id: fresh_document_session_id(),
             edit_generation: EditGeneration(1),
             next_edit_generation: 2,
             saved: None,
@@ -65,6 +70,14 @@ impl DocumentSession {
 
     pub fn edit_generation(&self) -> EditGeneration {
         self.edit_generation
+    }
+
+    pub fn id(&self) -> DocumentSessionId {
+        self.id
+    }
+
+    pub fn is_current(&self, id: DocumentSessionId) -> bool {
+        self.id == id
     }
 
     /// Records a committed edit, including runtime resource changes whose
@@ -98,8 +111,7 @@ impl DocumentSession {
     }
 
     pub fn replace_with_loaded(&mut self, path: PathBuf, project: &Project) {
-        self.id = DocumentSessionId(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.id = fresh_document_session_id();
         self.note_edit();
         self.saved = Some(SavedDocument {
             path,
@@ -160,5 +172,16 @@ mod tests {
         let before = document.edit_generation();
         document.note_edit();
         assert_ne!(document.edit_generation(), before);
+    }
+
+    #[test]
+    fn checkpoint_from_another_document_instance_is_rejected() {
+        let first = DocumentSession::default();
+        let mut second = DocumentSession::default();
+        let project = default_project(10.0);
+        let checkpoint = first.begin_save(PathBuf::from("first.mivmv.json"), &project);
+
+        assert!(!second.complete_save(checkpoint));
+        assert_eq!(second.path(), None);
     }
 }
