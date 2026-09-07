@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -41,6 +41,7 @@ const DISPOSABLE_DATA_MARKER: &str = "mimageviewer-disposable-smoke-v1;test-scri
 const TARGET_WAIT_POLL: Duration = Duration::from_millis(20);
 const TARGET_DIAGNOSTIC_RECORD_LIMIT: usize = 4;
 const TARGET_DIAGNOSTIC_PAIR_LIMIT: usize = 8;
+const WNDPROC_TRACE_RECORD_LIMIT: usize = 8;
 const STEP_TOKEN_PREFIX: usize = if usize::BITS >= 64 {
     0x4d49_5653_0000_0000
 } else {
@@ -51,6 +52,64 @@ static NEXT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PUBLISHER_NONCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STEP_TOKEN: AtomicUsize = AtomicUsize::new(1);
 static ACTIVE_STEP_TOKEN: AtomicUsize = AtomicUsize::new(0);
+// Process-lifetime count. It is intentionally not presented as belonging to any one step.
+static WNDPROC_TRACE_UNAVAILABLE_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeUiSmokeMessageEntry {
+    active_token: usize,
+    extra_info: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WndProcTraceRecord {
+    entry_active_token: usize,
+    match_active_token: usize,
+    receiver_hwnd: u64,
+    event_x: i32,
+    event_y: i32,
+    entry_extra_info: usize,
+    match_extra_info: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WndProcTraceState {
+    owner_token: usize,
+    len: usize,
+    overflow: usize,
+    records: [Option<WndProcTraceRecord>; WNDPROC_TRACE_RECORD_LIMIT],
+}
+
+impl Default for WndProcTraceState {
+    fn default() -> Self {
+        Self {
+            owner_token: 0,
+            len: 0,
+            overflow: 0,
+            records: [None; WNDPROC_TRACE_RECORD_LIMIT],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WndProcTraceSnapshot {
+    Available {
+        len: usize,
+        overflow: usize,
+        records: [Option<WndProcTraceRecord>; WNDPROC_TRACE_RECORD_LIMIT],
+    },
+    Inactive,
+    OwnerMismatch {
+        owner_token: usize,
+    },
+    Busy,
+    Poisoned,
+}
+
+fn wndproc_trace() -> &'static Mutex<WndProcTraceState> {
+    static TRACE: OnceLock<Mutex<WndProcTraceState>> = OnceLock::new();
+    TRACE.get_or_init(|| Mutex::new(WndProcTraceState::default()))
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct NativeUiSmokeOutputId(u64);
@@ -510,16 +569,141 @@ fn receipt_point_matches(
         && point[1].abs_diff(requested[1]) <= step.coordinate_tolerance[1] as u32
 }
 
-pub(crate) fn message_metadata(receiver_hwnd: HWND) -> Option<NativeUiSmokeMessageMetadata> {
+pub(crate) fn capture_message_entry() -> Option<NativeUiSmokeMessageEntry> {
+    let active_token = ACTIVE_STEP_TOKEN.load(Ordering::Acquire);
+    (active_token != 0).then(|| NativeUiSmokeMessageEntry {
+        active_token,
+        extra_info: unsafe { GetMessageExtraInfo().0 as usize },
+    })
+}
+
+pub(crate) fn message_metadata(
+    receiver_hwnd: HWND,
+    event: &super::native_window::NativeVideoWindowEvent,
+    entry: Option<NativeUiSmokeMessageEntry>,
+) -> Option<NativeUiSmokeMessageMetadata> {
+    // Keep this second read at the existing match point. The entry read only diagnoses whether
+    // earlier WndProc work changed what GetMessageExtraInfo exposes; it does not authorize input.
     let active = ACTIVE_STEP_TOKEN.load(Ordering::Acquire);
     if active == 0 {
         return None;
     }
     let observed = unsafe { GetMessageExtraInfo().0 as usize };
-    (observed == active).then_some(NativeUiSmokeMessageMetadata {
+    if let (Some(entry), super::native_window::NativeVideoWindowEvent::MouseMove(mouse)) =
+        (entry, event)
+    {
+        record_wndproc_trace(
+            entry,
+            active,
+            observed,
+            hwnd_value(receiver_hwnd),
+            mouse.x,
+            mouse.y,
+        );
+    }
+    message_metadata_from_values(active, observed, hwnd_value(receiver_hwnd))
+}
+
+fn message_metadata_from_values(
+    active: usize,
+    observed: usize,
+    receiver_hwnd: u64,
+) -> Option<NativeUiSmokeMessageMetadata> {
+    (active != 0 && observed == active).then_some(NativeUiSmokeMessageMetadata {
         token: observed,
-        receiver_hwnd: hwnd_value(receiver_hwnd),
+        receiver_hwnd,
     })
+}
+
+fn begin_wndproc_trace(token: usize) {
+    begin_wndproc_trace_in(wndproc_trace(), &WNDPROC_TRACE_UNAVAILABLE_TOTAL, token);
+}
+
+fn begin_wndproc_trace_in(
+    trace: &Mutex<WndProcTraceState>,
+    unavailable_total: &AtomicUsize,
+    token: usize,
+) {
+    match trace.try_lock() {
+        Ok(mut state) => {
+            *state = WndProcTraceState {
+                owner_token: token,
+                ..WndProcTraceState::default()
+            };
+        }
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+            unavailable_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn record_wndproc_trace(
+    entry: NativeUiSmokeMessageEntry,
+    match_active_token: usize,
+    match_extra_info: usize,
+    receiver_hwnd: u64,
+    event_x: i32,
+    event_y: i32,
+) {
+    if entry.active_token == 0 || entry.active_token != match_active_token {
+        return;
+    }
+    record_wndproc_trace_in(
+        wndproc_trace(),
+        &ACTIVE_STEP_TOKEN,
+        &WNDPROC_TRACE_UNAVAILABLE_TOTAL,
+        entry,
+        match_active_token,
+        match_extra_info,
+        receiver_hwnd,
+        event_x,
+        event_y,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_wndproc_trace_in(
+    trace: &Mutex<WndProcTraceState>,
+    active_token: &AtomicUsize,
+    unavailable_total: &AtomicUsize,
+    entry: NativeUiSmokeMessageEntry,
+    match_active_token: usize,
+    match_extra_info: usize,
+    receiver_hwnd: u64,
+    event_x: i32,
+    event_y: i32,
+) {
+    if entry.active_token == 0 || entry.active_token != match_active_token {
+        return;
+    }
+    let mut state = match trace.try_lock() {
+        Ok(state) => state,
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+            unavailable_total.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    if active_token.load(Ordering::Acquire) != entry.active_token {
+        return;
+    }
+    if state.owner_token != entry.active_token {
+        return;
+    }
+    if state.len == WNDPROC_TRACE_RECORD_LIMIT {
+        state.overflow = state.overflow.saturating_add(1);
+        return;
+    }
+    let index = state.len;
+    state.records[index] = Some(WndProcTraceRecord {
+        entry_active_token: entry.active_token,
+        match_active_token,
+        receiver_hwnd,
+        event_x,
+        event_y,
+        entry_extra_info: entry.extra_info,
+        match_extra_info,
+    });
+    state.len += 1;
 }
 
 pub(crate) fn record_pump_receipt(
@@ -709,6 +893,7 @@ pub(crate) fn send_prepared_real_mouse_move(
         return Err("another native mouse diagnostic step is already active".into());
     }
     let _active = ActiveStepToken(token);
+    begin_wndproc_trace(token);
     {
         let mut state = lock_broker_state(broker)?;
         if state.pending.is_some() {
@@ -785,7 +970,15 @@ fn run_pending_step<T>(
     token: usize,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let result = operation();
+    let result = operation().map_err(|error| {
+        format!(
+            "{error}; wndproc_trace={}",
+            format_wndproc_trace(
+                snapshot_wndproc_trace(token),
+                WNDPROC_TRACE_UNAVAILABLE_TOTAL.load(Ordering::Relaxed),
+            )
+        )
+    });
     match lock_broker_state(broker) {
         Ok(mut state) => {
             if state
@@ -1334,6 +1527,93 @@ fn bounded_diagnostic_text(text: &str) -> String {
         format!("{bounded}...")
     } else {
         bounded
+    }
+}
+
+fn snapshot_wndproc_trace(expected_token: usize) -> WndProcTraceSnapshot {
+    snapshot_wndproc_trace_in(wndproc_trace(), expected_token, || {
+        ACTIVE_STEP_TOKEN.load(Ordering::Acquire)
+    })
+}
+
+fn snapshot_wndproc_trace_in(
+    trace: &Mutex<WndProcTraceState>,
+    expected_token: usize,
+    active_token: impl Fn() -> usize,
+) -> WndProcTraceSnapshot {
+    if active_token() != expected_token {
+        return WndProcTraceSnapshot::Inactive;
+    }
+    let state = match trace.try_lock() {
+        Ok(state) => state,
+        Err(TryLockError::WouldBlock) => return WndProcTraceSnapshot::Busy,
+        Err(TryLockError::Poisoned(_)) => return WndProcTraceSnapshot::Poisoned,
+    };
+    if state.owner_token != expected_token {
+        return WndProcTraceSnapshot::OwnerMismatch {
+            owner_token: state.owner_token,
+        };
+    }
+    let snapshot = WndProcTraceSnapshot::Available {
+        len: state.len,
+        overflow: state.overflow,
+        records: state.records,
+    };
+    if active_token() != expected_token {
+        WndProcTraceSnapshot::Inactive
+    } else {
+        snapshot
+    }
+}
+
+fn format_wndproc_trace(
+    snapshot: WndProcTraceSnapshot,
+    process_unavailable_total: usize,
+) -> String {
+    match snapshot {
+        WndProcTraceSnapshot::Available {
+            len,
+            overflow,
+            records,
+        } => {
+            let mut text = format!(
+                "available,count={len},overflow={overflow},process_unavailable_total={process_unavailable_total},records=["
+            );
+            for (index, record) in records.into_iter().take(len).flatten().enumerate() {
+                if index > 0 {
+                    text.push('|');
+                }
+                let matched = record.match_active_token != 0
+                    && record.match_extra_info == record.match_active_token;
+                let _ = write!(
+                    text,
+                    "kind=mouse_move,entry_active=0x{:x},match_active=0x{:x},hwnd=0x{:x},client=({},{}),entry_extra=0x{:x},match_extra=0x{:x},matched={matched}",
+                    record.entry_active_token,
+                    record.match_active_token,
+                    record.receiver_hwnd,
+                    record.event_x,
+                    record.event_y,
+                    record.entry_extra_info,
+                    record.match_extra_info,
+                );
+            }
+            text.push(']');
+            text
+        }
+        WndProcTraceSnapshot::Inactive => format!(
+            "unavailable(reason=active-token-changed,process_unavailable_total={process_unavailable_total})"
+        ),
+        WndProcTraceSnapshot::OwnerMismatch { owner_token } => {
+            format!(
+                "unavailable(reason=owner-mismatch,owner=0x{owner_token:x},process_unavailable_total={process_unavailable_total})"
+            )
+        }
+        WndProcTraceSnapshot::Busy => format!(
+            "unavailable(reason=busy,process_unavailable_total={process_unavailable_total})"
+        ),
+        WndProcTraceSnapshot::Poisoned => format!(
+            "unavailable(reason=poisoned,process_unavailable_total={process_unavailable_total})"
+        ),
     }
 }
 
@@ -2368,6 +2648,171 @@ mod tests {
                 .unwrap()
                 .pending
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn wndproc_trace_preserves_entry_and_match_extra_info_without_weakening_the_token_match() {
+        let token = STEP_TOKEN_PREFIX | 1;
+        let trace = Mutex::new(WndProcTraceState::default());
+        let active = AtomicUsize::new(token);
+        let unavailable = AtomicUsize::new(0);
+        begin_wndproc_trace_in(&trace, &unavailable, token);
+        record_wndproc_trace_in(
+            &trace,
+            &active,
+            &unavailable,
+            NativeUiSmokeMessageEntry {
+                active_token: token,
+                extra_info: token,
+            },
+            token,
+            1,
+            0x200,
+            504,
+            432,
+        );
+
+        let snapshot = snapshot_wndproc_trace_in(&trace, token, || active.load(Ordering::Acquire));
+        let WndProcTraceSnapshot::Available {
+            len,
+            overflow,
+            records,
+        } = snapshot
+        else {
+            panic!("trace was not available: {snapshot:?}");
+        };
+        assert_eq!(len, 1);
+        assert_eq!(overflow, 0);
+        assert_eq!(
+            records[0],
+            Some(WndProcTraceRecord {
+                entry_active_token: token,
+                match_active_token: token,
+                receiver_hwnd: 0x200,
+                event_x: 504,
+                event_y: 432,
+                entry_extra_info: token,
+                match_extra_info: 1,
+            })
+        );
+        assert_eq!(unavailable.load(Ordering::Relaxed), 0);
+        assert!(message_metadata_from_values(token, token, 0x200).is_some());
+        assert!(message_metadata_from_values(token, 1, 0x200).is_none());
+        assert!(message_metadata_from_values(0, 0, 0x200).is_none());
+    }
+
+    #[test]
+    fn wndproc_trace_is_bounded_and_old_steps_are_not_visible_after_active_owner_changes() {
+        let token = 0x1234;
+        let trace = Mutex::new(WndProcTraceState::default());
+        let active = AtomicUsize::new(token);
+        let unavailable = AtomicUsize::new(0);
+        begin_wndproc_trace_in(&trace, &unavailable, token);
+        for x in 0..(WNDPROC_TRACE_RECORD_LIMIT + 2) {
+            record_wndproc_trace_in(
+                &trace,
+                &active,
+                &unavailable,
+                NativeUiSmokeMessageEntry {
+                    active_token: token,
+                    extra_info: token,
+                },
+                token,
+                token,
+                0x200,
+                x as i32,
+                20,
+            );
+        }
+        let snapshot = snapshot_wndproc_trace_in(&trace, token, || active.load(Ordering::Acquire));
+        assert!(matches!(
+            snapshot,
+            WndProcTraceSnapshot::Available {
+                len: WNDPROC_TRACE_RECORD_LIMIT,
+                overflow: 2,
+                ..
+            }
+        ));
+
+        active.store(0, Ordering::Release);
+        assert_eq!(
+            snapshot_wndproc_trace_in(&trace, token, || active.load(Ordering::Acquire)),
+            WndProcTraceSnapshot::Inactive
+        );
+
+        let next_token = 0x1235;
+        active.store(next_token, Ordering::Release);
+        begin_wndproc_trace_in(&trace, &unavailable, next_token);
+        record_wndproc_trace_in(
+            &trace,
+            &active,
+            &unavailable,
+            NativeUiSmokeMessageEntry {
+                active_token: token,
+                extra_info: token,
+            },
+            token,
+            token,
+            0x200,
+            99,
+            20,
+        );
+        assert!(matches!(
+            snapshot_wndproc_trace_in(&trace, next_token, || active.load(Ordering::Acquire)),
+            WndProcTraceSnapshot::Available {
+                len: 0,
+                overflow: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wndproc_trace_reports_nonblocking_contention_and_poison_as_unavailable() {
+        let token = 0x1234;
+        let trace = Mutex::new(WndProcTraceState {
+            owner_token: token,
+            ..WndProcTraceState::default()
+        });
+        let active = AtomicUsize::new(token);
+        let unavailable = AtomicUsize::new(0);
+        let guard = trace.lock().unwrap();
+        assert_eq!(
+            snapshot_wndproc_trace_in(&trace, token, || active.load(Ordering::Acquire)),
+            WndProcTraceSnapshot::Busy
+        );
+        begin_wndproc_trace_in(&trace, &unavailable, token + 1);
+        record_wndproc_trace_in(
+            &trace,
+            &active,
+            &unavailable,
+            NativeUiSmokeMessageEntry {
+                active_token: token,
+                extra_info: token,
+            },
+            token,
+            token,
+            0x200,
+            1,
+            2,
+        );
+        assert_eq!(unavailable.load(Ordering::Relaxed), 2);
+        drop(guard);
+
+        let poisoned = Arc::new(Mutex::new(WndProcTraceState::default()));
+        let poisoner = Arc::clone(&poisoned);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoner.lock().unwrap();
+                panic!("poison local wndproc trace");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            snapshot_wndproc_trace_in(&poisoned, token, || token),
+            WndProcTraceSnapshot::Poisoned
         );
     }
 

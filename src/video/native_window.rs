@@ -330,14 +330,20 @@ impl NativeVideoWindowEventSink {
     }
 
     #[cfg(feature = "test-script")]
-    pub(crate) fn send_window_message(&self, hwnd: HWND, event: NativeVideoWindowEvent) {
+    pub(crate) fn send_window_message(
+        &self,
+        hwnd: HWND,
+        event: NativeVideoWindowEvent,
+        entry: Option<super::native_ui_smoke::NativeUiSmokeMessageEntry>,
+    ) {
+        let smoke_metadata = super::native_ui_smoke::message_metadata(hwnd, &event, entry);
         let envelope = NativeVideoWindowEventEnvelope {
             sequence: 0,
             epoch: self.epoch,
             generation: self.generation,
             source: self.source,
             event,
-            smoke_metadata: super::native_ui_smoke::message_metadata(hwnd),
+            smoke_metadata,
         };
         self.dispatch(envelope);
     }
@@ -1741,6 +1747,14 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    #[cfg(feature = "test-script")]
+    // Capture before touch-source/debug helpers, then compare with the value read at the
+    // established metadata match point. This trace is observational and MouseMove-only.
+    let ui_smoke_message_entry = if msg == WM_MOUSEMOVE {
+        super::native_ui_smoke::capture_message_entry()
+    } else {
+        None
+    };
     log_win32_message(TouchDebugWindow::Presenter, hwnd, msg, wparam, lparam);
     if let Some(result) = handle_presenter_pointer_message(hwnd, msg, wparam) {
         return result;
@@ -1979,7 +1993,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 let event = NativeVideoWindowEvent::MouseMove(native_mouse_event(wparam, lparam));
                 #[cfg(feature = "test-script")]
-                sink.send_window_message(hwnd, event);
+                sink.send_window_message(hwnd, event, ui_smoke_message_entry);
                 #[cfg(not(feature = "test-script"))]
                 sink.send(event);
                 if !track_mouse_leave(hwnd) {

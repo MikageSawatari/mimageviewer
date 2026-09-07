@@ -556,14 +556,24 @@ strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさ�
 
 ## 検証記録
 
+S3aのraw識別子診断は、WndProc入口と既存metadata照合位置でGetMessageExtraInfoを
+別々に読み、元の照合位置・完全一致条件を維持する。固定8件の記録は標準Mutexの
+try_lock一回で所有し、UI/pumpで待たない。reset・記録・snapshotのowner tokenを照合し、
+snapshotをコピーしてlockを解放してから整形する。競合やpoisonによる欠測も明示し、
+記録なしを無配送と断定しない。独自unsafe排他や別のpending状態は追加しない。
+Microsoftの[MOUSEINPUT仕様](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
+はdwExtraInfoをULONG_PTRとしている。現環境で上位ビットがどう届くかは実測まで仮説である。
+
 S0はscript実装・静的検証・独立レビューと実artifactのbuild/prepareを完了。
 S1aは実装・焦点23テスト・feature有無のcore check・独立レビューを完了。
 S1bは対象配送とbackend host観測を実装し、独立source reviewを完了。
 最終検証はfeatureあり対象37件、featureなしlib test対象29件、manager関連7件、
 backend witness 3件が成功。通常/診断core checkと通常dependencyへのfeature非混入も確認。
 対話desktopでのMultiWindowPdf run4はexit 0。複数窓PDFの自動確認は成功した。
-S2は実egui probeでmultipass前提を修正し、ignoredコピー上の実装草案を準備中。
-standaloneのpointer reducer 11件、show/geometry reducer 11件成功はApp統合試験と区別する。
+S2は実egui probeでmultipass前提を修正し、`fd0f94b89`で本体を実装した。
+独立最終レビューとpointer_input 12件、key_input 20件、test_script 36件、
+still_seek 61件（別に1件ignored）、feature/default core check、root cargo fmtが成功。
+filter間には重複があるため件数を合算しない。static fixture/Rhaiとportable liveは別工程である。
 S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
 通常/feature core check、owner/classification/期限/worker token回帰を完了。
 S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch0誤判定で入力前に停止した。
