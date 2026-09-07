@@ -1876,9 +1876,9 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   featureあり/なしcore check・通常lib焦点テストを通り、隔離portable実行で静止画列dragが成功。
   2026-09-08の最終scenarioでは左右方向・最終Up・別trackのpage着地・PDF sibling不変を確認し、
   複数窓PDFの回帰実行も成功した。実mode条件待ちと量子化に対応した座標を用いる。
-  S3aの診断側source epoch0誤判定は修正・回帰・再build済みだが、再liveも
-  最初のmove完了前に失敗した。追加診断版の再liveではSendInput成功後の
-  pump/render両route未受領とfresh owner応答待ちの期限切れが判明し、配送区間を調査中。
+  S3aはsource epoch0の誤判定、送信tokenの幅・非再利用、PowerShell間のbuild照合を修正した。
+  2026-09-08 06:36の隔離liveで、新prefixの2点moveが要求座標・受信値の完全一致で
+  WM/pump/renderを通過しexit 0。S3bのbutton/wheel/panと負例の自動化は未完了。
   以下の部品表は開始時点の棚卸しを保持する。
 - 動機: リリースごとの手作業確認が**リリース間隔を延ばす主因**になっている。
   v3.6.0 では、レビュー指摘 1 件につき 1 項目という誤った単位で 15 項目まで膨らんだ。
