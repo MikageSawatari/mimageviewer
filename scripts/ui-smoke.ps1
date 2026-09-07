@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'StillStripDrag')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120
@@ -318,6 +318,15 @@ function Save-UiSmokeEvidence {
         if ($script:fixtureDir) {
             Try-AddUiSmokeEvidenceDirectory $script:fixtureDir 'inputs/fixture' 'fixture'
         }
+        if ($script:fixtureGeneratorPath) {
+            Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPath 'inputs/fixture-generator.py' 'fixture-generator'
+        }
+        if ($script:fixtureGeneratorDependencyPath) {
+            Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorDependencyPath 'inputs/fixture-generator-dependency.py' 'fixture-generator-dependency'
+        }
+        if ($script:fixtureGeneratorPdfDependencyPath) {
+            Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPdfDependencyPath 'inputs/fixture-generator-pdf-dependency.py' 'fixture-generator-pdf-dependency'
+        }
         Try-AddUiSmokeEvidenceDirectory (Join-Path $dataDir 'logs') 'logs' 'application-log'
     }
 
@@ -434,6 +443,9 @@ $script:timedOut = $false
 $script:scriptPath = $null
 $script:settingsPath = $null
 $script:fixtureDir = $null
+$script:fixtureGeneratorPath = $null
+$script:fixtureGeneratorDependencyPath = $null
+$script:fixtureGeneratorPdfDependencyPath = $null
 
 try {
     Initialize-UiSmokeEvidence
@@ -442,7 +454,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove')
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'StillStripDrag')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -521,9 +533,13 @@ Try-AddUiSmokeEvidenceFile $marker 'artifact/disposable-smoke-data.txt' 'data-ma
 if ($script:archiveErrors.Count -gt 0) {
     throw '[ui-smoke] diagnostic artifact evidence could not be preserved before launch'
 }
-$script:runPhase = 'building-fixture'
+    $script:runPhase = 'building-fixture'
 
-switch ($Scenario) {
+    $candidateFixtureGeneratorPath = $null
+    $candidateFixtureGeneratorDependencyPath = $null
+    $candidateFixtureGeneratorPdfDependencyPath = $null
+
+    switch ($Scenario) {
     'MultiWindowPdf' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\multi-window-pdf'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-pdf.rhai'
@@ -589,11 +605,72 @@ switch ($Scenario) {
         $settingsJson = '{"detached_viewer_open_images_in_window":true}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
+    'StillStripDrag' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\still-strip-drag'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\still-strip-drag.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_still_strip_drag_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $candidateFixtureGeneratorPdfDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py'
+
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\still-strip-drag') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($generatorPath in @(
+            $candidateFixtureGeneratorPath,
+            $candidateFixtureGeneratorDependencyPath,
+            $candidateFixtureGeneratorPdfDependencyPath
+        )) {
+            Assert-NoReparsePath $generatorPath $repoRoot 'still-strip-generator'
+            if (-not (Test-Path -LiteralPath $generatorPath -PathType Leaf)) {
+                throw "[ui-smoke] still-strip fixture generator not found: $generatorPath"
+            }
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        Assert-NoReparsePath $candidateFixtureDir $repoRoot 'still-strip-fixture'
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir --count 40
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] still-strip fixture generator failed with exit $LASTEXITCODE"
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'still-strip-fixture'
+        $imageFixtureDir = Join-Path $candidateFixtureDir 'images'
+        Assert-NoReparsePath $imageFixtureDir $repoRoot 'still-strip-image-fixture'
+        $fixtureRootEntries = @(Get-ChildItem -LiteralPath $candidateFixtureDir -Force)
+        if ($fixtureRootEntries.Count -ne 2 -or
+            -not (Test-Path -LiteralPath $imageFixtureDir -PathType Container)) {
+            throw '[ui-smoke] still-strip fixture root must contain only images/ and the PDF sibling'
+        }
+        $pngFiles = @(Get-ChildItem -LiteralPath $imageFixtureDir -Filter '*.png' -File | Sort-Object Name)
+        if ($pngFiles.Count -ne 40 -or @($pngFiles | Where-Object { $_.Length -le 0 }).Count -ne 0) {
+            throw '[ui-smoke] still-strip fixture must contain exactly forty non-empty PNG files'
+        }
+        for ($page = 1; $page -le 40; $page++) {
+            if ($pngFiles[$page - 1].Name -ne ('{0:D3}.png' -f $page)) {
+                throw '[ui-smoke] still-strip fixture page names are not the expected contiguous sequence'
+            }
+        }
+        $pdfFiles = @(Get-ChildItem -LiteralPath $candidateFixtureDir -Filter '*.pdf' -File)
+        if ($pdfFiles.Count -ne 1 -or $pdfFiles[0].Name -ne 'zzz-sibling.pdf' -or $pdfFiles[0].Length -le 0) {
+            throw '[ui-smoke] still-strip fixture must contain the one non-empty PDF sibling'
+        }
+        if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw "[ui-smoke] scenario script not found: $candidateScriptPath"
+        }
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"Single","default_reading_flow":"Paged","fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"still_seek_strip_visible":true}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
 }
 
 $script:scriptPath = $candidateScriptPath
 $script:fixtureDir = $candidateFixtureDir
 $script:settingsPath = $candidateSettingsPath
+$script:fixtureGeneratorPath = $candidateFixtureGeneratorPath
+$script:fixtureGeneratorDependencyPath = $candidateFixtureGeneratorDependencyPath
+$script:fixtureGeneratorPdfDependencyPath = $candidateFixtureGeneratorPdfDependencyPath
 
 if (-not ('MivUiSmokeWindow' -as [type])) {
     Add-Type @'
@@ -618,6 +695,15 @@ $arguments = @(
     Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
     Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'
     Try-AddUiSmokeEvidenceDirectory $fixtureDir 'inputs/fixture' 'fixture'
+    if ($script:fixtureGeneratorPath) {
+        Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPath 'inputs/fixture-generator.py' 'fixture-generator'
+    }
+    if ($script:fixtureGeneratorDependencyPath) {
+        Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorDependencyPath 'inputs/fixture-generator-dependency.py' 'fixture-generator-dependency'
+    }
+    if ($script:fixtureGeneratorPdfDependencyPath) {
+        Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPdfDependencyPath 'inputs/fixture-generator-pdf-dependency.py' 'fixture-generator-pdf-dependency'
+    }
     if ($script:archiveErrors.Count -gt 0) {
         throw '[ui-smoke] scenario inputs could not be preserved before launch'
     }

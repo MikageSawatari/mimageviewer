@@ -223,7 +223,8 @@ featureありgraphを別々に確認する。通常版のsource cfg除外と実b
 
 ## S2: egui pointerと名前付き矩形
 
-既存の合成キーと同じviewport指定・timelineへ、move/button/wheelを載せる。
+既存の合成キーと同じviewport指定・timelineへ、今回の初期APIではmove/buttonを載せる。
+egui面のwheelはこの初期APIにはまだ含めない。
 矩形は実際の描画ownerがcontext/viewport・frame/revision・pixels-per-pointとともに公開し、
 scriptは領域名と正規化位置を指定する。テスト用に別レイアウトを再構築しない。
 press、drag閾値を超すmove、継続moveを別frameにする。最終stepは同一batch内で
@@ -234,6 +235,18 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
 `fullscreen_seek_bar_locked=true`・`still_seek_strip_locked=true`を指定する。
 実callbackのspread/flow/読み方向/表示/lockを公開して条件を確認し、LTR/RTL等の変更は
 既存KeyActionを使う。lock切替操作そのものを試験したとは扱わない。
+
+`StillStripDrag`は使い捨てrootに`images/`の40枚（5種類の縦横比を反復）と
+`zzz-sibling.pdf`の2ページを生成する。PDFを先に開き、既存設定
+`auto_fullscreen_image_folders=true`で画像folderを通常Openして独立book contextを作る。
+同folderの画像leafを2回開くlegacy passive経路の窓は、S1のbinding由来DTOと同一ではないため
+このsetupには使わない。ROOT初期2件のidentity/items generation、PDFと画像のcontext分離、
+両identityとgenerationを照合し、画像targetをactiveに保って列を操作する。
+fixture命名は既定のFolder/Archive共通行・FileName順に対応し、実media kindでも確認する。
+中央pageへの移動は各FsPageNextの着地とfull paintを待つ。Single/Paged・未調整PNGの
+初訪問では、その証跡公開前に通常navigation sequenceが終了する順序を確認済み。
+見開き・effect holdover・同page再訪について、一般にfull paintがnavigation idleと同義とはしない。
+trackのUpは、直前Moveと異なる実pageへ着地することも要求する。
 
 実装前提調査で確定した境界:
 
@@ -444,6 +457,11 @@ HUD wndprocにはpresenterと異なるMouseLeave/capture/held-buttons/focus clai
 GPU scanoutを一括して合格とは扱わない。
 
 ### S3b: ズーム確認の精度と追加調査
+
+既存のcanvas入力矩形は`video_visual_layout`から`compute_video_visual_target_rect`で求める。
+同layoutが使うのはclient extent/DPI・compact・固定bar/strip・固定info panelの予約領域で、
+video zoomの倍率やpan中心は含まない。固定領域を変えない今回のzoom/panで厳密なcanvas
+geometry照合を維持でき、成功したzoomを受け入れるために照合を緩める必要はない。
 
 S3aのmoveにwheelと左button down/upを加え、既存のズーム開始操作を通す。
 nativeのVは`matches_vk_action`経由で、S1bのdirect action consumerとは別経路である。

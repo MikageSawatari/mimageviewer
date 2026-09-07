@@ -1872,7 +1872,8 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 進捗: S0隔離scriptに続き、`b20a1e502`でS1aのread-only窓一覧・実texture由来のpaint証跡を実装。
   S1bの対象配送とbackend窓識別も実装し、37+29+7+3件の焦点テスト・feature有無core check・
   独立レビュー成功。2026-09-08に隔離portableの対話desktop実行で複数窓PDFがexit 0。
-  手作業3項目のうち列dragと動画zoomが残る。S2は実装草案の独立再レビューを通り、実compile待ち。
+  手作業3項目のうち列dragと動画zoomが残る。S2本体は独立Astraレビューとfeatureあり焦点テスト・
+  featureあり/なしcore checkを通り、隔離portable buildも完了。scenarioの静的検証まで済み、実機実行待ち。
   S3aの診断側source epoch0誤判定は修正・回帰・再build済みだが、再liveも
   最初のmove完了前に失敗した。追加診断版の再liveではSendInput成功後の
   pump/render両route未受領とfresh owner応答待ちの期限切れが判明し、配送区間を調査中。
