@@ -1750,6 +1750,55 @@ const BOOK_PAGE_MATCH_LIMIT: usize = 256;
 /// 走査を分割する単位。小さすぎると合流の費用が勝ち、大きすぎると尻尾で遊ぶ。
 const BOOK_SCAN_CHUNK: usize = 32_768;
 
+/// 本単位の走査に使う専用プール。
+///
+/// **rayon の共有プールを使わない。** 共有プールは全コアを取るので、数秒続くこの走査が
+/// 走っている間、他所の音声が途切れる (利用者環境で実際に起きた)。パネルを開いただけで
+/// 機械が持っていかれるのは、答えが数秒早いことと引き合わない。
+///
+/// スレッド数を絞ったうえで、優先度も下げる。数を絞るだけでは、詰まっているときに走査が
+/// 前面のスレッドと同じ土俵で競ってしまう。
+fn book_scan_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        // 2 コア分は空けておく。1 つは音声、1 つは UI と OS のために残す。**上限は置かない** —
+        // 24 論理プロセッサの機械で 8 に絞ったところ、所要時間が 3.4 秒から 6.5 秒になった。
+        // 前面へ譲る役目は優先度が担うので、数はコアを空けるためだけに使う。
+        let threads = std::thread::available_parallelism()
+            .map(|cores| cores.get().saturating_sub(2).max(1))
+            .unwrap_or(2);
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("similar-book-scan-{index}"))
+            .start_handler(|_| lower_current_thread_priority())
+            .build()
+        {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                crate::logger::log(format!("similar book scan pool: {error}"));
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// 走査スレッドを前面より下の優先度にする。
+///
+/// `THREAD_MODE_BACKGROUND_BEGIN` は I/O まで大きく絞るので使わない。ここで読むのは
+/// 在メモリの配列で、利用者はパネルの答えを待っている。CPU の順番だけを譲る。
+fn lower_current_thread_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL).is_err() {
+            crate::logger::log("similar book scan: SetThreadPriority(BelowNormal) failed");
+        }
+    }
+}
+
 /// 何冊ぶんかのページを、常駐配列への **1 回の走査**でまとめて照合する。
 ///
 /// 本ごとに走査すると、比較回数が同じでも配列 (222 MB) を本の数だけ読み直すことになる。
@@ -1778,30 +1827,36 @@ fn scan_snapshot_for_pages(snapshot: &SearchSnapshot, signatures: &[[u8; 32]]) -
     };
 
     let records = &snapshot.base.records;
-    let mut per_page = records
-        .par_chunks(BOOK_SCAN_CHUNK)
-        .enumerate()
-        .map(|(chunk, slice)| {
-            let mut local = vec![Vec::new(); signatures.len()];
-            let start = chunk * BOOK_SCAN_CHUNK;
-            for (offset, record) in slice.iter().enumerate() {
-                if !snapshot.base_record_is_superseded(start + offset) {
-                    consider(record, &mut local);
-                }
-            }
-            local
-        })
-        .reduce(
-            || vec![Vec::new(); signatures.len()],
-            |mut left, right| {
-                for (bucket, extra) in left.iter_mut().zip(right) {
-                    if bucket.len() <= BOOK_PAGE_MATCH_LIMIT {
-                        bucket.extend(extra);
+    let scan = || {
+        records
+            .par_chunks(BOOK_SCAN_CHUNK)
+            .enumerate()
+            .map(|(chunk, slice)| {
+                let mut local = vec![Vec::new(); signatures.len()];
+                let start = chunk * BOOK_SCAN_CHUNK;
+                for (offset, record) in slice.iter().enumerate() {
+                    if !snapshot.base_record_is_superseded(start + offset) {
+                        consider(record, &mut local);
                     }
                 }
-                left
-            },
-        );
+                local
+            })
+            .reduce(
+                || vec![Vec::new(); signatures.len()],
+                |mut left, right| {
+                    for (bucket, extra) in left.iter_mut().zip(right) {
+                        if bucket.len() <= BOOK_PAGE_MATCH_LIMIT {
+                            bucket.extend(extra);
+                        }
+                    }
+                    left
+                },
+            )
+    };
+    let mut per_page = match book_scan_pool() {
+        Some(pool) => pool.install(scan),
+        None => scan(),
+    };
     for entry in snapshot.delta.iter() {
         if let Some(record) = &entry.record {
             consider(record, &mut per_page);
@@ -3512,14 +3567,9 @@ mod tests {
         let pages = db
             .load_book_pages(&container_key, current_hash_version())
             .unwrap();
-        let origin_key = pages
-            .iter()
-            .min_by_key(|row| row.item.page_index.unwrap_or(u32::MAX))
-            .map(|row| row.item.item_key.clone())
-            .expect("no page found for MIV_SIMILAR_BENCH_CONTAINER");
 
         let query_started = std::time::Instant::now();
-        let result = query_book_ready(&db, &snapshot, &origin_key);
+        let result = query_book_ready(&db, &snapshot, &container_key);
         let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
         let resident_after = current_working_set_bytes();
         let summary = match &result {
