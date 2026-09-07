@@ -22,11 +22,11 @@
 
 | 指摘 | 実装・独立レビュー | 検証 |
 | --- | --- | --- |
-| R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt成功。全体gate・実機は後続 |
+| R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt成功 |
-| R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/pollを含む16件・既存legacy lock1件・resolver1件成功。全体gate・実機は後続 |
-| R4/R8 長押しと見開き | 独立レビューで実装境界を確認済み、実装前 | 未実施 |
-| R1/R5/R6 本照会 | 厳密検索・一貫したDB読取の設計候補。試作前 | 正確性と実データ性能による採否判断が必要 |
+| R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
+| R4/R8 長押しと見開き | 独立レビューで実装境界を確認済み。Solが現コードとの前提照合を再開 | 実装・自動検証・実機は未完了 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -561,3 +561,113 @@ lock/ownerをともに解放する。製品回帰を隠す期待値変更では�
 tests.rsだけ編集を再開し、狭域・fmt・full gateを再実行する。実機・portableはまだ未実施。
 初回source checkpointはtarget/r2-portable-milestone-20260908に失敗証跡として保持し、
 修正後は別checkpointを採る。R2のindexとcommit境界は親が管理する。
+### R2/R3/R7/R9 共通full gate成功とportable build開始
+
+3追随fixtureは `target/r2-full-failure-fixtures-{1,2,3}.log` 各1成功。
+独立Astraが実poll終端・既存viewport assert保持と成功ログを確認し、追加指摘なし。
+`target/r2-test-full-v2.log` は終了コード0 / [test-full] PASS。
+本体7630成功/38ignored (328.39秒)、snapshot54成功、vendor egui-wgpu9成功/eframe15成功。
+他workspace suiteを含め、ログの51結果合計は8562成功/44ignored。失敗0。
+初回本体384.64秒との時間差は測定条件を切り分けておらず、pool影響を特定したとは扱わない。
+
+検証基点は `8c83ecdc81c781870573bbd81e8bce3fb719ff95`。
+R2の8ファイルは未commitでstageし、source checkpointを
+`target/r2-portable-milestone-20260908-v2/` に保存した。
+patch SHA-256: `3adba6c9c6768c1540f3d8f0791d1dfefdc322acb270ec90966d5bca2131f42a`。
+full gate成功時に8ファイルのdisk SHAがcheckpointと一致することも確認した。
+
+`target/r2-portable-preflight.json` でpackageとコピー先対象/親のreparseなし、
+packageのdata/data-remoteなし、対象アプリの稼働なしを確認。
+`build-portable.ps1 -KeepRunning` を開始し、ログは `target/r2-build-portable.log`。
+この記録時点はbuild中であり、portable-devの更新・実機確認は未完了。
+
+### R1 dense alignment checkpoint候補の独立監査
+
+checkpoint＋block再実行は、現Fenwickの完全同点手順まで再現できる設計候補として成立する。
+A行グループ開始直前の全Fenwick cellをscoreと安定したtail(row,col)で保存し、
+同じA行の全query後にB昇順updateする。tieでは既存値を保持し、queryのcell訪問順も変えない。
+全passで辺を(index_a,index_b,distance)順にし、同座標は最小distanceへdedupする。
+B座標圧縮は「辺のあるBだけ」でglobalに固定し、A/Bを転置しない。
+Aが1行・辺B={0,2}の同点では現圧縮がB0、辺のないB1を足すとB2になる反例がある。
+
+後方復元はtailが属するblock開始前checkpointから再実行し、そのblockの全辺parentを一時保持する。
+親がblock外へ出たらその親のblockへ進み、A行が厳密に減るため各blockの再実行は最大1回。
+保持量はO(ceil(N/K)M + KM + N + M + 出力長)、ただし上流のnear_pairs/全辺Vecを残すと削減にならない。
+同一TXの入力から決定的に辺を再列挙できる行producerが採用境界となる。
+B圧縮を別に取得できなければ列挙passも必要。1億辺の処理時間/TX寿命は未解決で、
+この監査は実装・oracle一致・性能確認や採用判断ではない。
+### R1 検索prototype sourceと実行前レビュー
+
+Solが `target/review-fixes-bench-20260908/mih_radius32.rs`、`export_delta.py`、`PROTOTYPE.md` を作成。
+この時点はPython syntax/rustfmtだけで、DB export・rustc・self-test・実計測は未実行。
+exportはコピーDBをmode=ro/query_only・同read TXで読み、出力はxbで新規作成する。
+親の確認でbase identity取得を全222MB読込から96byteだけのreadへ縮小した。
+
+独立Astraはkernel/delta last-write-winsの読取に誤りを認めなかったが、実行前の検証補強を要求した。
+現合成差分は先頭64bit内だけなので、残りの完全一致blockがprobe漏れを隠す。
+全16block各2bit、およびj=1..15でblock0=3bit/j=1bit/他14block=2bitの32境界、
+block0=3bit/他15block=2bitの33除外をbruteと比較する。
+実queryでもitem_id全集合をbrute比較し、delta更新/削除/追加/同ID連続変更は既知期待値で別検査する。
+
+現prototypeはdelta適用後に全体を再構築したsingle MIHで、base/delta別索引やcompaction性能ではない。
+メモリ集計はposting/offset/marks以外のsnapshot/index records・構築一時領域も区別して記録し、
+採用には実peakを測る。radius<=32の制約を明記する。product変更や採用を意味せず、portableには含めない。
+### 初回portable更新完了・実機確認依頼
+
+`build-portable.ps1 -KeepRunning` はexit0。core release build9分15秒、remote0.40秒。
+更新直前の `target/r2-portable-update-preflight.json` で、fresh package24files/440920142bytes、
+userdata/reparseなし、コピー先対象/親reparseなし、対象processなしを再確認した。
+`update-portable-dev.ps1 -SkipBuild` はexit0 (`target/r2-update-portable-dev.log`)。
+`target/r2-portable-hash-verify.json` は全24filesのsize/SHA-256一致、mismatch0。
+既存data/data-remoteは保持、agentによるアプリ起動はしていない。
+
+起動先: `C:\home\mimageviewer-dupe\target\portable-dev\mimageviewer.exe`。
+coreは94249472bytes、SHA-256 `ea4cf7a17d64609bf83056db44bb52ebc9e1e264065508c81d57973a67554804`。
+zipは264631167bytes、SHA-256 `fea8d788b9247e2b4d8f7dff0c039ea58d3e96baa183e36cd8e54f44e0ce1474`。
+後続buildから独立して保存するため、同zipをcheckpoint v2内の `r2-portable-verification.zip` に複製し一致確認した。
+source・成功log・binary hashはcheckpoint v2のmanifest.jsonで照合できる。
+
+利用者へ起動コマンドと、右パネルの場所間移動/別窓/ZIP/PDF、静止画ウィンドウ/全画面切替の確認を依頼した。
+R2の実機確認回答とcommitは未完了。初回版にはR4/R8・R1/R5/R6の修正を含めておらず、作業は継続する。
+### R1 検索prototype v2の限定検証完了
+
+`target/review-fixes-bench-20260908/prototype-self-test-v2.log`、`mih-metrics-v2.json` と
+sourceを独立Astraが照合し、新規P1/P2なし。前回のoracle不足2点も解消した。
+既知binary fixtureは実load_deltaと同じdecoderを通り、seq11..15の更新/削除/追加と
+同IDの連続変更をsignature/quality/revisionまで検査する。
+実oracleは全体に分散した8件とdelta由来の分散8件でbruteの全item_id集合と一致した。
+
+9852件のdelta適用後の有効4631165件を単一MIHへ再構築し、build606.306ms。
+2048署名のp50 2.5465ms、p95 3.2077ms、最大6.9884ms。これは単署名の検索時間であり、
+本照会全体の時間や音声への影響を示すものではない。品質正値は4621867件。
+snapshot records約222MBとindex records約222MBを二重保持し、posting約296MB等を別途使用する。
+allocator・構築scratch・process peakは未測定。split base/delta、compaction、同TX common、
+全book/alignment、取消とviewer間公平性は製品採用前の後続gateとして残る。
+この試作はignored target内のみで、初回portable成果物にも製品コードにも含めていない。
+
+### R4/R8 実装前再照合と描画consumerの補足
+
+Solは現在のApp-global SimilarPeekが通常比較slot/modeを書き換え、panel末尾だけでheld終了を
+判定する根因を確認した。viewer-ownedの一時gesture/asset/requestへ分離する合意設計で進める。
+独立Astraの棚卸しで、single_transform以外にもcapture-region、loupe、continuous調整outline、
+original-preview indicatorが元pageを読むと確認。本文と同じ一時表示の選択に従わせる。
+既にactiveのloupeも元pageを候補上へ重ねない。操作開始時は一時表示を解除し元geometryへ合流する。
+navigatorのPendingCenter/PendingPanTransitionも新pressなしにfs_panを書けるため、
+候補のpaintと通常interaction consumerを分離する。
+
+提示完了の契約は「候補を元pageとしてpublishしない」とする。候補からemit-ready、
+fs_painted_lastのSome、page layoutを発行しない。一方prepare_fullscreen_state等で元画像の
+実texture消失に伴うNone無効化や準備処理は継続し、元ownerの状態機械を凍結しない。
+この明確化に親と独立Astraが合意した。
+明示parkのmain/detached両経路はreset_detached_pause_foreground_modesの後にsnapshotする。
+この既存境界で一時表示を解除し、raw mount/swapへの取消副作用は追加しない。
+
+### R1 候補集合の維持
+
+現query_book_readyの候補条件は、commonでない起点ページから得た近傍辺数の合計>=3であり、
+最終alignmentのmatched>=3やdistinct起点ページ数とは異なる。UIはUnrelatedも部分一致として表示する。
+修正時に候補集合を不用意に縮小しない。各起点の適格な近傍をcandidate bookごとに3で飽和集計し、
+その起点が非commonの場合だけ本別合計へ加える。commonは起点の本も含む9冊を確認して確定する。
+候補側commonや最終alignmentでdiscoveryをfilterしない。1起点×3候補ページと3起点×1候補ページの
+双方が残ることを回帰対象にする。同署名の起点反復は、非common確定後に出現数を掛けて集約可能。
+飽和はdiscoveryだけに使用し、alignment/strip用の全辺は固定TXから厳密に再列挙できるよう保持する。
