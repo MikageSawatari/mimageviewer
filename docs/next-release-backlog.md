@@ -1891,11 +1891,12 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
    - `NativeVideoOutputEvent` へ直接注入すると**presenter 自身の当たり判定を飛ばす**。
      「ストリップや左右パネルの上ではそれぞれの操作を優先する」という、まさに
      確認したい部分が抜ける
-   - 2026-09-07 の設計レビューでは、第三の入口として **pump owner の既存 per-HWND
-     event sink** を選ぶ。test専用commandからpump/renderの両routeへ送り、通常の
-     generation検査とpresenterの当たり判定を通す。render routeだけへの注入では
-     cursor ownership/activity更新が抜ける。USER32配送・capture・focus/z-order・
-     GPU scanoutはこの継ぎ目では検証できず、実機確認の対象として残す。
+   - 2026-09-07 の調査で、per-HWND sinkから両routeへ注入するだけでも不十分と判明。
+     実OSのcursor/button/captureを読む定期監視が、合成dragを上書きするため。
+     診断入力providerの追加設計との比較を説明し、**利用者は実マウス入力を選択**した。
+     テスト中は前面とマウスを使用し、使い捨てportableの既存Windows入力経路を通す。
+     exact host・実描画矩形・配送/処理receiptを設計し、無配送を「優先判定成功」と誤認しない。
+     実際に到達・観測したOS経路だけを確認済みとし、GPU scanout等は別の限界として残す。
 
 3. **座標の指定方法**。座標直書きはレイアウト変更で総崩れになる。
    `TestScriptSnapshot` は今は真偽値と数値だけなので、**名前付きの矩形**

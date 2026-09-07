@@ -1470,11 +1470,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   mountやworker drainを起こさない。Mounted↔AtRestは保存場所の移動でありidentityに含めない。
 - host lifetimeは既存`DetachedWindowManager`の`DetachedHostClaim`/incarnationを使い、
   独自のepochやViewportIdだけの生存判定を追加しない。
+  ROOTは別のtyped ownerとし、`viewer_context_main()`・ROOT viewport・既存`main_hwnd`を使う。
+  detached用のwindow ID/host incarnationをROOTへ捏造せず、別fullscreen viewportとも区別する。
 - activeの`CurrentItem`実texture描画だけを現在ページの証拠とし、Captured holdoverを除外。
   passiveはtexture選択時にcontent/source TextureId/thumbnail由来を同時記録し、
   Snapshot→DeferredView→実行時`shared.view()`の同じpayloadへ保持する。
 - 登録時ownerと実行時最新viewを別々に結合しない。後からcache readyを見て凍結thumbnailを
   fullと推定しない。source TextureIdはLanczos化後も保持される既存resource APIと照合する。
+- 実装時の統合先は共通`FullscreenPaintResource`の診断feature限定メタデータとする。
+  `gpu_lanczos.rs`のDirect/Resampleable/Lanczos変換で画像と証拠を一体で保持し、
+  Snapshot/Viewへ重複ownerを作らない。通常featureの型・描画選択・cache keyを変更せず、
+  証拠の有無を表示制御には使わない。この共通境界の追加は親が確認し、最終レビューに含める。
 - close/recreate・context退去・page/gen変更をexact identityで拒否し、旧callbackが後着しても
   現ownerの有効証拠を上書きしない。full/processedのpaint-command発行と、実解像度・
   USER32配送・GPU scanoutの保証は区別する。

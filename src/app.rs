@@ -136,6 +136,8 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+#[cfg(all(windows, feature = "test-script"))]
+mod test_script_support;
 pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
@@ -507,6 +509,8 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
     pub(crate) right_drag_guide: Option<RightDragGuide>,
+    #[cfg(feature = "test-script")]
+    pub(crate) test_script_window_identity: Option<crate::test_script::TestScriptWindowIdentity>,
 }
 
 #[cfg(windows)]
@@ -530,6 +534,8 @@ impl DeferredDetachedImageWindowView {
             placement,
             apply_initial_placement,
             right_drag_guide,
+            #[cfg(feature = "test-script")]
+            test_script_window_identity: None,
         }
     }
 }
@@ -41132,12 +41138,21 @@ impl App {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
         let right_drag_guide = self
             .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
-        DeferredDetachedImageWindowView::from_snapshot(
+        let view = DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,
             apply_initial_placement,
             right_drag_guide,
-        )
+        );
+        #[cfg(feature = "test-script")]
+        let view = {
+            let mut view = view;
+            let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            view.test_script_window_identity =
+                self.test_script_window_identity(window.id, viewport_id);
+            view
+        };
+        view
     }
 
     #[cfg(windows)]
@@ -42867,6 +42882,12 @@ impl App {
             ));
             return None;
         };
+        #[cfg(feature = "test-script")]
+        let test_script_content_proof = self.test_script_content_proof(
+            idx,
+            &texture,
+            self.test_script_paint_source_kind(idx, &texture),
+        );
         let texture_size = texture.size_vec2();
         let rotation = self.get_rotation(idx);
         let zoom_pan = self.fs_zoom_pan();
@@ -42936,6 +42957,11 @@ impl App {
             pixels_per_point,
             visible_region,
         );
+        #[cfg(feature = "test-script")]
+        let texture = match test_script_content_proof {
+            Some(proof) => texture.with_test_script_content_proof(proof),
+            None => texture,
+        };
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();

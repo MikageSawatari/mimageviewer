@@ -7,7 +7,7 @@
 
 #![cfg_attr(all(test, not(feature = "test-script")), allow(dead_code))]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
@@ -38,6 +38,234 @@ pub(crate) struct KeymapLevelObservation {
     pub(crate) key: String,
     pub(crate) hold_ids: Vec<u64>,
     pub(crate) held: bool,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TestScriptPaintSourceKind {
+    CatalogThumbnail,
+    FullOrProcessed,
+}
+
+impl TestScriptPaintSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogThumbnail => "catalog_thumbnail",
+            Self::FullOrProcessed => "full_or_processed",
+        }
+    }
+
+    fn preference(self) -> u8 {
+        match self {
+            Self::CatalogThumbnail => 0,
+            Self::FullOrProcessed => 1,
+        }
+    }
+}
+
+/// Identity captured by the producer that selected the texture later painted.
+///
+/// This is diagnostic evidence only. It must travel with the selected resource;
+/// reconstructing it from the current cache would incorrectly relabel a frozen
+/// thumbnail after a full-resolution entry arrives.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct TestScriptContentProof {
+    pub(crate) context_serial: u64,
+    pub(crate) items_generation: u64,
+    pub(crate) page_index: usize,
+    pub(crate) item_identity: String,
+    pub(crate) source_texture_id: egui::TextureId,
+    pub(crate) source_kind: TestScriptPaintSourceKind,
+}
+
+/// Existing window lifetime owners represented without inventing a shared ID space.
+///
+/// The root HWND lives for the `App` lifetime and its content owner is the registry's
+/// main context. Detached host incarnations come from `DetachedWindowManager`; they
+/// are not a second test-owned epoch. Residence is deliberately absent because
+/// Mounted/AtRest is only the storage location of the same logical viewer and host.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TestScriptWindowIdentity {
+    Root {
+        context_serial: u64,
+        hwnd: u64,
+    },
+    Detached {
+        window_id: u64,
+        context_serial: u64,
+        viewport_id: egui::ViewportId,
+        host_incarnation: u64,
+        hwnd: u64,
+    },
+}
+
+impl TestScriptWindowIdentity {
+    #[cfg(test)]
+    pub(crate) fn role(&self) -> &'static str {
+        match self {
+            Self::Root { .. } => "root",
+            Self::Detached { .. } => "detached",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_id(&self) -> Option<u64> {
+        match self {
+            Self::Root { .. } => None,
+            Self::Detached { window_id, .. } => Some(*window_id),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_serial(&self) -> u64 {
+        match self {
+            Self::Root { context_serial, .. } | Self::Detached { context_serial, .. } => {
+                *context_serial
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn viewport_id(&self) -> egui::ViewportId {
+        match self {
+            Self::Root { .. } => egui::ViewportId::ROOT,
+            Self::Detached { viewport_id, .. } => *viewport_id,
+        }
+    }
+
+    pub(crate) fn host_incarnation(&self) -> Option<u64> {
+        match self {
+            Self::Root { .. } => None,
+            Self::Detached {
+                host_incarnation, ..
+            } => Some(*host_incarnation),
+        }
+    }
+
+    pub(crate) fn hwnd(&self) -> u64 {
+        match self {
+            Self::Root { hwnd, .. } | Self::Detached { hwnd, .. } => *hwnd,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TestScriptPaintEvidenceKey {
+    owner: TestScriptWindowIdentity,
+    content: TestScriptContentProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptWindowSnapshot {
+    pub(crate) identity: Option<TestScriptWindowIdentity>,
+    pub(crate) role: String,
+    pub(crate) window_id: Option<u64>,
+    pub(crate) context_serial: u64,
+    pub(crate) viewport_id: egui::ViewportId,
+    pub(crate) host_incarnation: Option<u64>,
+    pub(crate) hwnd: Option<u64>,
+    pub(crate) residence: String,
+    pub(crate) media_kind: String,
+    pub(crate) page_index: Option<usize>,
+    pub(crate) items_generation: u64,
+    pub(crate) item_identity: String,
+    pub(crate) page_ready: bool,
+    pub(crate) viewport_rendered: bool,
+    pub(crate) viewport_revision: u64,
+    pub(crate) paint_matches_current_page: bool,
+    pub(crate) full_texture_painted: bool,
+    pub(crate) paint_source: String,
+    pub(crate) paint_source_texture: String,
+    pub(crate) painted_page_index: Option<usize>,
+    pub(crate) paint_revision: u64,
+}
+
+impl TestScriptWindowSnapshot {
+    fn current_content_matches(&self, proof: &TestScriptContentProof) -> bool {
+        self.context_serial == proof.context_serial
+            && self.items_generation == proof.items_generation
+            && self.page_index == Some(proof.page_index)
+            && self.item_identity == proof.item_identity
+    }
+
+    fn accepts_owner(&self, owner: &TestScriptWindowIdentity) -> bool {
+        self.identity.as_ref() == Some(owner)
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("role".into(), self.role.clone().into());
+        map.insert(
+            "window_id".into(),
+            self.window_id
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "context_serial".into(),
+            saturating_rhai_int(self.context_serial).into(),
+        );
+        map.insert("viewport".into(), format!("{:?}", self.viewport_id).into());
+        map.insert(
+            "host_incarnation".into(),
+            self.host_incarnation
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "hwnd".into(),
+            self.hwnd
+                .map(|value| Dynamic::from(format!("0x{value:x}")))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("host_ready".into(), self.identity.is_some().into());
+        map.insert("residence".into(), self.residence.clone().into());
+        map.insert("media_kind".into(), self.media_kind.clone().into());
+        map.insert(
+            "page_index".into(),
+            self.page_index
+                .map_or(-1, |value| i64::try_from(value).unwrap_or(i64::MAX))
+                .into(),
+        );
+        map.insert(
+            "items_generation".into(),
+            saturating_rhai_int(self.items_generation).into(),
+        );
+        map.insert("item_identity".into(), self.item_identity.clone().into());
+        map.insert("page_ready".into(), self.page_ready.into());
+        map.insert("viewport_rendered".into(), self.viewport_rendered.into());
+        map.insert(
+            "viewport_revision".into(),
+            saturating_rhai_int(self.viewport_revision).into(),
+        );
+        map.insert(
+            "paint_matches_current_page".into(),
+            self.paint_matches_current_page.into(),
+        );
+        map.insert(
+            "full_texture_painted".into(),
+            self.full_texture_painted.into(),
+        );
+        map.insert("paint_source".into(), self.paint_source.clone().into());
+        map.insert(
+            "paint_source_texture".into(),
+            self.paint_source_texture.clone().into(),
+        );
+        map.insert(
+            "painted_page_index".into(),
+            self.painted_page_index
+                .map_or(-1, |value| i64::try_from(value).unwrap_or(i64::MAX))
+                .into(),
+        );
+        map.insert(
+            "paint_revision".into(),
+            saturating_rhai_int(self.paint_revision).into(),
+        );
+        map
+    }
+}
+
+fn saturating_rhai_int(value: u64) -> rhai::INT {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +307,7 @@ pub(crate) struct TestScriptSnapshot {
     /// Why the page has no stand-in to show, or empty. See `PassthroughUnavailable`.
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
+    pub(crate) windows: Vec<TestScriptWindowSnapshot>,
 }
 
 impl Default for TestScriptSnapshot {
@@ -111,6 +340,7 @@ impl Default for TestScriptSnapshot {
             upload_deferral_streak: 0,
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
+            windows: Vec::new(),
         }
     }
 }
@@ -152,6 +382,14 @@ impl TestScriptSnapshot {
         insert!(reading_flow);
         insert!(upload_deferral_streak);
         insert!(passthrough_unavailable);
+        map.insert(
+            "windows".into(),
+            self.windows
+                .iter()
+                .map(|window| Dynamic::from_map(window.to_rhai_map()))
+                .collect::<rhai::Array>()
+                .into(),
+        );
         map
     }
 }
@@ -862,6 +1100,43 @@ struct PendingAction {
     applied: Option<mpsc::SyncSender<Result<(), String>>>,
 }
 
+fn joined_window_snapshots(
+    authoritative: &[TestScriptWindowSnapshot],
+    viewport_observations: &HashMap<TestScriptWindowIdentity, u64>,
+    paint_observations: &HashMap<TestScriptPaintEvidenceKey, u64>,
+) -> Vec<TestScriptWindowSnapshot> {
+    authoritative
+        .iter()
+        .cloned()
+        .map(|mut window| {
+            if let Some(revision) = window
+                .identity
+                .as_ref()
+                .and_then(|identity| viewport_observations.get(identity))
+            {
+                window.viewport_rendered = true;
+                window.viewport_revision = *revision;
+            }
+            let best = paint_observations
+                .iter()
+                .filter(|(key, _)| {
+                    window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
+                })
+                .max_by_key(|(key, revision)| (key.content.source_kind.preference(), **revision));
+            if let Some((key, revision)) = best {
+                window.paint_matches_current_page = true;
+                window.full_texture_painted =
+                    key.content.source_kind == TestScriptPaintSourceKind::FullOrProcessed;
+                window.paint_source = key.content.source_kind.as_str().to_string();
+                window.paint_source_texture = format!("{:?}", key.content.source_texture_id);
+                window.painted_page_index = Some(key.content.page_index);
+                window.paint_revision = *revision;
+            }
+            window
+        })
+        .collect()
+}
+
 struct FinishState {
     outcome: ScriptOutcome,
     started_frame: u64,
@@ -876,6 +1151,10 @@ struct UiRuntime {
     last_frame: Option<u64>,
     finish: Option<FinishState>,
     cancel_requested: bool,
+    authoritative_windows: Vec<TestScriptWindowSnapshot>,
+    viewport_observations: HashMap<TestScriptWindowIdentity, u64>,
+    paint_observations: HashMap<TestScriptPaintEvidenceKey, u64>,
+    next_observation_revision: u64,
 }
 
 impl UiRuntime {
@@ -892,7 +1171,97 @@ impl UiRuntime {
             last_frame: None,
             finish: None,
             cancel_requested: false,
+            authoritative_windows: Vec::new(),
+            viewport_observations: HashMap::new(),
+            paint_observations: HashMap::new(),
+            next_observation_revision: 0,
         }
+    }
+
+    fn replace_authoritative_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) {
+        self.authoritative_windows = windows;
+        self.viewport_observations.retain(|identity, _| {
+            self.authoritative_windows
+                .iter()
+                .any(|window| window.accepts_owner(identity))
+        });
+        self.paint_observations.retain(|key, _| {
+            self.authoritative_windows.iter().any(|window| {
+                window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
+            })
+        });
+    }
+
+    fn joined_windows(&self) -> Vec<TestScriptWindowSnapshot> {
+        joined_window_snapshots(
+            &self.authoritative_windows,
+            &self.viewport_observations,
+            &self.paint_observations,
+        )
+    }
+
+    fn publish_snapshot(&mut self, mut snapshot: TestScriptSnapshot) -> Result<(), String> {
+        self.replace_authoritative_windows(std::mem::take(&mut snapshot.windows));
+        snapshot.windows = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| *published = snapshot)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn publish_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) -> Result<(), String> {
+        self.replace_authoritative_windows(windows);
+        let joined = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| published.windows = joined)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn publish_window_frame(
+        &mut self,
+        owner: TestScriptWindowIdentity,
+        content: Option<TestScriptContentProof>,
+    ) -> Result<bool, String> {
+        let owner_is_current = self
+            .authoritative_windows
+            .iter()
+            .any(|window| window.accepts_owner(&owner));
+        if !owner_is_current {
+            return Ok(false);
+        }
+        self.next_observation_revision = self.next_observation_revision.wrapping_add(1).max(1);
+        let revision = self.next_observation_revision;
+        self.viewport_observations.insert(owner.clone(), revision);
+        if let Some(content) = content
+            && self.authoritative_windows.iter().any(|window| {
+                window.accepts_owner(&owner) && window.current_content_matches(&content)
+            })
+        {
+            let existing_preference = self
+                .paint_observations
+                .iter()
+                .filter(|(key, _)| key.owner == owner)
+                .map(|(key, _)| key.content.source_kind.preference())
+                .max();
+            if existing_preference
+                .is_none_or(|preference| content.source_kind.preference() >= preference)
+            {
+                // One current-content observation per exact owner is enough. A new
+                // processed texture must not grow this table forever, while a late
+                // thumbnail callback must not replace evidence that a full source was
+                // already painted for the same current page.
+                self.paint_observations.retain(|key, _| key.owner != owner);
+                self.paint_observations
+                    .insert(TestScriptPaintEvidenceKey { owner, content }, revision);
+            }
+        }
+        let joined = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| published.windows = joined)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())?;
+        Ok(true)
     }
 
     fn begin_finish(&mut self, mut outcome: ScriptOutcome, frame: u64) {
@@ -1176,10 +1545,8 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         runtime.last_frame = Some(frame);
     }
     emit_perf_level_reads(&snapshot.keymap_level_observations);
-    if let Ok(mut published) = runtime.snapshot.write() {
-        *published = snapshot;
-    } else {
-        runtime.fail_environment("test-script snapshot is poisoned".to_string(), frame);
+    if let Err(error) = runtime.publish_snapshot(snapshot) {
+        runtime.fail_environment(error, frame);
     }
 
     for issue in issues {
@@ -1272,6 +1639,34 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         *guard = None;
     }
     close
+}
+
+/// Replace the read-only detached-window table after a lifecycle phase that can
+/// establish or retire an HWND claim. This never drives the lifecycle itself.
+pub(crate) fn publish_window_snapshots(windows: Vec<TestScriptWindowSnapshot>) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let _ = runtime.publish_windows(windows);
+}
+
+/// Record one viewport callback and, when supplied, the exact texture command
+/// queued by that callback. The current table is checked before either record is
+/// exposed, so a callback from a retired host cannot displace current evidence.
+pub(crate) fn publish_window_frame(
+    owner: TestScriptWindowIdentity,
+    content: Option<TestScriptContentProof>,
+) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let _ = runtime.publish_window_frame(owner, content);
 }
 
 pub(crate) fn publish_fullscreen_input_state(
@@ -1740,6 +2135,336 @@ mod tests {
         let message = describe_issue(&issue);
         assert!(message.contains("not rendered"));
         assert!(message.contains("event_count=3"));
+    }
+
+    fn window_identity(
+        window_id: u64,
+        context_serial: u64,
+        host_incarnation: u64,
+    ) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Detached {
+            window_id,
+            context_serial,
+            viewport_id: egui::ViewportId::from_hash_of(("test-window", window_id)),
+            host_incarnation,
+            hwnd: 0x1000 + host_incarnation,
+        }
+    }
+
+    fn content_proof(
+        context_serial: u64,
+        generation: u64,
+        page_index: usize,
+        item: &str,
+        texture: u64,
+        source_kind: TestScriptPaintSourceKind,
+    ) -> TestScriptContentProof {
+        TestScriptContentProof {
+            context_serial,
+            items_generation: generation,
+            page_index,
+            item_identity: item.to_string(),
+            source_texture_id: egui::TextureId::Managed(texture),
+            source_kind,
+        }
+    }
+
+    fn window_snapshot(
+        identity: TestScriptWindowIdentity,
+        generation: u64,
+        page_index: usize,
+        item: &str,
+    ) -> TestScriptWindowSnapshot {
+        TestScriptWindowSnapshot {
+            identity: Some(identity.clone()),
+            role: identity.role().to_string(),
+            window_id: identity.window_id(),
+            context_serial: identity.context_serial(),
+            viewport_id: identity.viewport_id(),
+            host_incarnation: identity.host_incarnation(),
+            hwnd: Some(identity.hwnd()),
+            residence: "at_rest".to_string(),
+            media_kind: "pdf".to_string(),
+            page_index: Some(page_index),
+            items_generation: generation,
+            item_identity: item.to_string(),
+            page_ready: true,
+            viewport_rendered: false,
+            viewport_revision: 0,
+            paint_matches_current_page: false,
+            full_texture_painted: false,
+            paint_source: String::new(),
+            paint_source_texture: String::new(),
+            painted_page_index: None,
+            paint_revision: 0,
+        }
+    }
+
+    #[test]
+    fn paint_evidence_requires_the_exact_owner_and_current_page_identity() {
+        let owner = window_identity(7, 11, 13);
+        let current = window_snapshot(owner.clone(), 17, 2, "pdf::current#2");
+        let exact = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            19,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        let mut observations = HashMap::new();
+        observations.insert(
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: exact.clone(),
+            },
+            1,
+        );
+        assert!(
+            joined_window_snapshots(&[current.clone()], &HashMap::new(), &observations)[0]
+                .paint_matches_current_page
+        );
+
+        let stale_cases = [
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(8, 11, 13),
+                content: exact.clone(),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(7, 12, 13),
+                content: content_proof(
+                    12,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(7, 11, 14),
+                content: exact.clone(),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: content_proof(
+                    11,
+                    18,
+                    2,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: content_proof(
+                    11,
+                    17,
+                    3,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner,
+                content: content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::other#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+        ];
+        for stale in stale_cases {
+            let joined = joined_window_snapshots(
+                &[current.clone()],
+                &HashMap::new(),
+                &HashMap::from([(stale, 2)]),
+            );
+            assert!(!joined[0].paint_matches_current_page);
+        }
+    }
+
+    #[test]
+    fn late_old_callback_cannot_replace_current_full_paint_evidence() {
+        let current_owner = window_identity(7, 11, 14);
+        let old_owner = window_identity(7, 11, 13);
+        let window = window_snapshot(current_owner.clone(), 17, 2, "pdf::current#2");
+        let full = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            20,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        let thumbnail = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            19,
+            TestScriptPaintSourceKind::CatalogThumbnail,
+        );
+        let observations = HashMap::from([
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: current_owner.clone(),
+                    content: full,
+                },
+                2,
+            ),
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: old_owner,
+                    content: thumbnail.clone(),
+                },
+                3,
+            ),
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: current_owner,
+                    content: thumbnail,
+                },
+                4,
+            ),
+        ]);
+
+        let joined = joined_window_snapshots(&[window], &HashMap::new(), &observations);
+        assert!(joined[0].full_texture_painted);
+        assert_eq!(joined[0].paint_revision, 2);
+        assert_eq!(joined[0].paint_source, "full_or_processed");
+    }
+
+    #[test]
+    fn repeated_textures_keep_one_best_paint_observation_per_owner() {
+        let (_tx, rx) = mpsc::channel();
+        let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
+        let mut runtime = UiRuntime::new(
+            rx,
+            Arc::clone(&snapshot),
+            Arc::new(InterruptState::default()),
+        );
+        let owner = window_identity(7, 11, 14);
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+
+        for texture in 100..164 {
+            runtime
+                .publish_window_frame(
+                    owner.clone(),
+                    Some(content_proof(
+                        11,
+                        17,
+                        2,
+                        "pdf::current#2",
+                        texture,
+                        TestScriptPaintSourceKind::CatalogThumbnail,
+                    )),
+                )
+                .unwrap();
+        }
+        assert_eq!(runtime.paint_observations.len(), 1);
+
+        runtime
+            .publish_window_frame(
+                owner.clone(),
+                Some(content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    1000,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                )),
+            )
+            .unwrap();
+        let full_revision = snapshot.read().unwrap().windows[0].paint_revision;
+        runtime
+            .publish_window_frame(
+                owner,
+                Some(content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    1001,
+                    TestScriptPaintSourceKind::CatalogThumbnail,
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(runtime.paint_observations.len(), 1);
+        let published = snapshot.read().unwrap();
+        assert!(published.windows[0].full_texture_painted);
+        assert_eq!(published.windows[0].paint_revision, full_revision);
+        assert!(published.windows[0].viewport_revision > full_revision);
+    }
+
+    #[test]
+    fn table_change_prunes_stale_callbacks_without_clearing_current_evidence() {
+        let (_tx, rx) = mpsc::channel();
+        let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
+        let mut runtime = UiRuntime::new(
+            rx,
+            Arc::clone(&snapshot),
+            Arc::new(InterruptState::default()),
+        );
+        let old_owner = window_identity(7, 11, 13);
+        let current_owner = window_identity(7, 11, 14);
+        let content = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            20,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        runtime
+            .publish_windows(vec![window_snapshot(
+                old_owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+        assert!(
+            runtime
+                .publish_window_frame(old_owner.clone(), Some(content.clone()))
+                .unwrap()
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                current_owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+        assert!(
+            runtime
+                .publish_window_frame(current_owner, Some(content.clone()))
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .publish_window_frame(old_owner, Some(content))
+                .unwrap()
+        );
+        let published = snapshot.read().unwrap();
+        assert!(published.windows[0].paint_matches_current_page);
+        assert!(published.windows[0].full_texture_painted);
     }
 
     #[test]

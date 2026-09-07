@@ -15840,6 +15840,8 @@ impl App {
             self.prune_deferred_detached_image_window_views();
             return;
         }
+        #[cfg(feature = "test-script")]
+        self.test_script_publish_window_snapshots();
 
         let windows = self.detached_image_windows.clone();
         let mut deferred_windows = Vec::new();
@@ -15953,6 +15955,19 @@ impl App {
                             );
                         }
                         Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        #[cfg(feature = "test-script")]
+                        if let Some(owner) = view.test_script_window_identity.clone() {
+                            let content = view
+                                .frozen_continuous_pages
+                                .is_empty()
+                                .then(|| view.texture.test_script_content_proof())
+                                .flatten()
+                                .filter(|proof| {
+                                    proof.source_texture_id == view.texture.source_texture_id()
+                                })
+                                .cloned();
+                            crate::test_script::publish_window_frame(owner, content);
+                        }
                         Self::draw_detached_image_window_bar(
                             ui,
                             vp_ctx,
@@ -16044,6 +16059,8 @@ impl App {
                 apply_initial_placement,
                 None,
             );
+            #[cfg(feature = "test-script")]
+            let mut test_script_passive_frame = None;
             let right_drag_guide = egui_owns_right_drag
                 .then(|| {
                     self.right_drag_guide_for_owner(
@@ -16139,6 +16156,19 @@ impl App {
                             );
                         } else {
                             Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                            #[cfg(feature = "test-script")]
+                            {
+                                let content = view
+                                    .frozen_continuous_pages
+                                    .is_empty()
+                                    .then(|| view.texture.test_script_content_proof())
+                                    .flatten()
+                                    .filter(|proof| {
+                                        proof.source_texture_id == view.texture.source_texture_id()
+                                    })
+                                    .cloned();
+                                test_script_passive_frame = Some(content);
+                            }
                             Self::draw_detached_image_window_bar(
                                 ui,
                                 vp_ctx,
@@ -16161,6 +16191,10 @@ impl App {
                 viewport_id,
                 hwnd_before.as_deref(),
             );
+            #[cfg(feature = "test-script")]
+            if let Some(content) = test_script_passive_frame {
+                self.test_script_publish_detached_frame(window.id, viewport_id, content);
+            }
 
             let right_drag_live =
                 egui_owns_right_drag && self.right_drag_pointer_pos(right_drag_owner).is_some();
@@ -18487,6 +18521,8 @@ impl App {
                 self.frame_counter
             ));
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        let mut test_script_current_item_paint = None;
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
@@ -19158,7 +19194,21 @@ impl App {
                                                         )
                                                     });
                                                 let bg_style = self.fs_bg_style(ctx);
-                                                single_transform = self.draw_fs_image(
+                                                #[cfg(all(windows, feature = "test-script"))]
+                                                let test_script_content_proof = paint_resource
+                                                    .as_ref()
+                                                    .map(|resource| resource.source_texture())
+                                                    .or(state.thumb_tex.as_ref())
+                                                    .and_then(|texture| {
+                                                        self.test_script_content_proof(
+                                                            fs_idx,
+                                                            texture,
+                                                            self.test_script_paint_source_kind(
+                                                                fs_idx, texture,
+                                                            ),
+                                                        )
+                                                    });
+                                                let painted = self.draw_fs_image(
                                                     ui,
                                                     image_rect,
                                                     fs_idx,
@@ -19180,6 +19230,14 @@ impl App {
                                                     fit_scale_limits,
                                                     content_bbox,
                                                 );
+                                                #[cfg(all(windows, feature = "test-script"))]
+                                                if painted.is_some() {
+                                                    test_script_current_item_paint = Some((
+                                                        ctx.viewport_id(),
+                                                        test_script_content_proof,
+                                                    ));
+                                                }
+                                                single_transform = painted;
                                             }
                                         }
                                     } // else (= !panorama_painted) ブロック終端
@@ -20409,6 +20467,12 @@ impl App {
                 ));
             }
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        self.test_script_publish_active_frame(
+            active_render_window_id,
+            fs_id,
+            test_script_current_item_paint,
+        );
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::ViewportRender);
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
@@ -23214,6 +23278,7 @@ impl App {
                 .map(|(_, reason, _)| reason.as_str().to_owned())
                 .unwrap_or_default(),
             keymap_level_observations,
+            windows: self.test_script_window_snapshots(),
         }
     }
 
