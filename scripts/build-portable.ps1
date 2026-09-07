@@ -95,7 +95,26 @@ function Assert-NoReparsePath {
     }
 }
 
-function Get-MivSourceFingerprint {
+function Get-MivOrdinalUniquePaths {
+    param([object[]] $Paths)
+
+    [string[]] $sorted = @($Paths | ForEach-Object { [string] $_ })
+    [System.Array]::Sort($sorted, [System.StringComparer]::Ordinal)
+
+    $unique = New-Object 'System.Collections.Generic.List[string]'
+    $previous = $null
+    $hasPrevious = $false
+    foreach ($path in $sorted) {
+        if (-not $hasPrevious -or -not [System.StringComparer]::Ordinal.Equals($previous, $path)) {
+            $unique.Add($path)
+            $previous = $path
+            $hasPrevious = $true
+        }
+    }
+    return $unique.ToArray()
+}
+
+function Get-MivSourceFingerprintRecords {
     param([string] $Root)
 
     $sourcePaths = @(
@@ -128,19 +147,26 @@ function Get-MivSourceFingerprint {
             $relativeFiles += (Get-NormalizedPath $absoluteInput).Substring((Get-NormalizedPath $Root).Length + 1).Replace('\', '/')
         }
     }
-    $relativeFiles = @($relativeFiles | Sort-Object -Unique)
+    $relativeFiles = @(Get-MivOrdinalUniquePaths $relativeFiles)
     if ($relativeFiles.Count -eq 0) {
         throw '[portable-smoke-build] build source file set is empty'
     }
 
-    $records = foreach ($relative in $relativeFiles) {
+    return @($relativeFiles | ForEach-Object {
+        $relative = $_
         $absolute = Join-Path $Root ($relative -replace '/', '\')
         if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
             throw "[portable-smoke-build] source disappeared while fingerprinting: $relative"
         }
         $hash = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
         "$relative`t$hash"
-    }
+    })
+}
+
+function Get-MivSourceFingerprint {
+    param([string] $Root)
+
+    $records = @(Get-MivSourceFingerprintRecords $Root)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes(($records -join "`n"))
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
