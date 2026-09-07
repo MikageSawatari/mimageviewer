@@ -6813,11 +6813,32 @@ impl NativeRenderCore {
 
     fn video_input_region(&self) -> NativeVideoInputRegion {
         let layout = self.video_visual_layout();
+        Self::video_input_region_for_layout(self.width, self.height, layout)
+    }
+
+    fn video_input_region_for_layout(
+        width: u32,
+        height: u32,
+        layout: VideoVisualLayout,
+    ) -> NativeVideoInputRegion {
         let ppp = layout.pixels_per_point.max(f32::MIN_POSITIVE);
-        let rect = compute_video_visual_target_rect(self.width, self.height, layout);
+        let rect = compute_video_visual_target_rect(width, height, layout);
         NativeVideoInputRegion {
             origin_points: [rect.x / ppp, rect.y / ppp],
             size_points: [rect.width / ppp, rect.height / ppp],
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn ui_smoke_canvas_geometry(
+        &self,
+    ) -> crate::video::native_ui_smoke::NativeUiSmokeCanvasGeometry {
+        let layout = self.video_visual_layout();
+        crate::video::native_ui_smoke::NativeUiSmokeCanvasGeometry {
+            region: Self::video_input_region_for_layout(self.width, self.height, layout),
+            pixels_per_point: layout.pixels_per_point.max(f32::MIN_POSITIVE),
+            client_width: self.width,
+            client_height: self.height,
         }
     }
 

@@ -148,6 +148,8 @@ pub(crate) struct NativeVideoWindowEventEnvelope {
     pub(crate) generation: u64,
     pub(crate) source: NativeVideoWindowSource,
     pub(crate) event: NativeVideoWindowEvent,
+    #[cfg(feature = "test-script")]
+    pub(crate) smoke_metadata: Option<super::native_ui_smoke::NativeUiSmokeMessageMetadata>,
 }
 
 const WINDOW_EVENT_LATEST_MOUSE_MOVE: usize = 0;
@@ -321,7 +323,26 @@ impl NativeVideoWindowEventSink {
             generation: self.generation,
             source: self.source,
             event,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
+        self.dispatch(envelope);
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn send_window_message(&self, hwnd: HWND, event: NativeVideoWindowEvent) {
+        let envelope = NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: self.epoch,
+            generation: self.generation,
+            source: self.source,
+            event,
+            smoke_metadata: super::native_ui_smoke::message_metadata(hwnd),
+        };
+        self.dispatch(envelope);
+    }
+
+    fn dispatch(&self, envelope: NativeVideoWindowEventEnvelope) {
         if matches!(
             envelope.event,
             NativeVideoWindowEvent::CloseRequested { .. }
@@ -1956,9 +1977,11 @@ unsafe extern "system" fn wnd_proc(
                         ));
                     }
                 }
-                sink.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
-                    wparam, lparam,
-                )));
+                let event = NativeVideoWindowEvent::MouseMove(native_mouse_event(wparam, lparam));
+                #[cfg(feature = "test-script")]
+                sink.send_window_message(hwnd, event);
+                #[cfg(not(feature = "test-script"))]
+                sink.send(event);
                 if !track_mouse_leave(hwnd) {
                     sink.send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::TrackingFailed,
@@ -2659,6 +2682,8 @@ mod tests {
             generation: 1,
             source: NativeVideoWindowSource::Presenter,
             event: key(0x41),
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         });
         route.send(NativeVideoWindowEventEnvelope {
             sequence: 0,
@@ -2666,8 +2691,46 @@ mod tests {
             generation: 1,
             source: NativeVideoWindowSource::Presenter,
             event: key(0x42),
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         });
         assert!(overflow.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn coalesced_mouse_move_keeps_only_the_metadata_of_the_surviving_event() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (route, rx) = native_window_event_route(1, Arc::clone(&overflow));
+        let mouse = |x, token| NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: 3,
+            generation: 3,
+            source: NativeVideoWindowSource::Presenter,
+            event: NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
+                x,
+                y: 20,
+                shift: false,
+                ctrl: false,
+            }),
+            smoke_metadata: Some(
+                super::super::native_ui_smoke::NativeUiSmokeMessageMetadata {
+                    token,
+                    receiver_hwnd: 0x200,
+                },
+            ),
+        };
+        route.send(mouse(10, 41));
+        route.send(mouse(30, 42));
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent { x: 30, .. })
+        ));
+        assert_eq!(events[0].smoke_metadata.unwrap().token, 42);
+        assert!(!overflow.load(Ordering::Acquire));
     }
 
     #[test]
