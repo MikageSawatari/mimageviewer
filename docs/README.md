@@ -133,6 +133,7 @@
 
 ## 進行中のレビュー
 
+- [duplicate-detection-handoff-review-20260907.md](duplicate-detection-handoff-review-20260907.md) — `duplicate-detection` の引き継ぎ監査。実装状況、独立レビュー指摘、検証証跡、Astra/Sol体制への移行と統合条件。
 - [review-v2.8.1/README.md](review-v2.8.1/README.md) — v2.8.1 前の全体点検。領域別の
   docs↔コード整合監査の結果 (不一致 / リファクタ候補 / バグ) と、文書ごとの信頼度。
   **文書を現行仕様として読む前に、ここで該当文書の信頼度を確認すること。**
