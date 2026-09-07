@@ -1806,6 +1806,13 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 - 発見: v3.6.0 出荷前の `check-idle-health.ps1`。**進捗バーが 112/116 と 113/116 を往復**し、
   静止しているのに収束しない、という実機報告から。
+- **2026-09-07 再調査**: 以下の「セル幅で頭打ち」「結果が捨てられる」は反証された。
+  `resize_to_display_color_image` は `display_px × display_px` の正方形へ fit し、セル比率は
+  入力していない。`should_save=false` でも Source の表示メッセージは先に送られる。
+  `thumb/ready` は Pending/Evicted からの初回表示だけを記録するため、Loaded の高画質化で
+  出ないことは結果破棄の証拠にならない。寸法選択の `aspect_accurate_fit_dimensions` と
+  idle 判定の品質契約を調査中。下の旧提案をそのまま実装しない。
+  経過は [v3.7.0 作業台帳](v3.7.0-priority-work.md) に記録する。
 - 実測 (`perf_events.jsonl`、239 秒):
 
 | イベント | 件数 |
@@ -1916,22 +1923,27 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   提案 3 (実アプリ smoke) をポインタ対応まで広げたもの。
 - 規模 / 優先度: 大 / **P1** (毎リリースの手作業を減らす投資。次版の頭で着手する)。
 
-### 1.195 detached の binding 不整合が、まだ 2 種残っている (2026-09-07)
+### 1.195 detached binding panic の既修正照合と現行再検証 (2026-09-07)
 
-- 出典: `panic.log` の棚卸し (§1.196 で入れた `scripts/check-panic-log.ps1`)。
-- 記録されている 3 種のうち、複数ウィンドウで PDF を開く経路 (`src/app.rs:39069`
-  `detached session binding failed for ViewerContextId(N): ContextOwnedBy(N)`) は
-  v3.6.0 で修正した。**残る 2 種は原因未特定**:
-  - `src/ui_fullscreen.rs:13611` `active detached backstop window N has no context binding`
-    (2026-08-28 09:23)
-  - `src/app/viewer_context_registry.rs:2935` `window N has no viewer-context binding`
-    (2026-08-28 11:10)
-- どちらも **BA-7 (所有状態の分散)** の同族で、後者のスタックにも
-  `render_active_detached_viewport_backstop` が出る。**panic のスタックだけでは操作列を
-  特定できない**ので、再現手順を作るところから始める。
-- v3.6.0 の修正で消えたかどうかは**未確認**。修正後に同じ操作を踏んで確かめること。
-- detached リワークの凍結ルールが適用される。症状パッチを入れず、BA 番号に対応付けて扱う。
-- 規模 / 優先度: 中 / **P1** (クラッシュ)。
+- 出典: `panic.log` の棚卸し (§1.196)。**初稿の「残る2種は原因未特定」は履歴との
+  照合漏れだった**。独立 Astra の再調査と親のコード照合で、次の同一根因・検出場所変更を確認。
+  - `src/ui_fullscreen.rs:13611:21` / `active detached backstop window # has no context binding`:
+    2026-08-28 09:23:56。`29ecf9429` の親のソース行と一致。
+  - `src/app/viewer_context_registry.rs:2935:32` / `window # has no viewer-context binding`:
+    同日11:10:24。11:07:56の `29ecf9429` が backstop を共通 mount helper へ移した後の検出場所。
+- **根本修正は同日13:24:46の `786992a34`**。追加計装で native
+  `apply_video_presentation_switched` が binding を作らず session を公開したと確定し、
+  native / egui F12 / book の公開境界を修正した。現在の master と v3.3.0～v3.6.0 の tag に含まれる。
+  正本の [detached-rework-plan.md](detached-rework-plan.md) の
+  「R2e active detached session / binding lifetime follow-up」と §11 に当時の根拠がある。
+- v3.6.0 の `c40716b37` は別の PDF 二重窓ID問題を修正し、窓IDを registry binding /
+  build reservation から導出する。これと8/28の修正を同一視しない。
+- **現行再検証済み**。Sol が session 公開前の binding、release/retire の所有順、
+  backstop の owner mount、PDF等の10件の identity 回帰を含む22件を再実行し、すべて成功。
+  runtime追加修正は現時点で不要。結果は [v3.7.0 作業台帳](v3.7.0-priority-work.md) に記録した。
+- 既存 panic.log に同 fingerprint の後続記録は無いが、それだけで実 HWND・F12連打の
+  実アプリ再確認済みとは扱わない。§1.197 の自動化と実機検証の限界を区別する。
+- 元優先度 **P1** (クラッシュ)。修正済み根因への症状パッチは加えない。
 
 ### 1.196 panic.log に 5 か月ぶんの未処理クラッシュが 12 種たまっていた (2026-09-07)
 
