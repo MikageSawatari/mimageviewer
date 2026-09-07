@@ -113,11 +113,9 @@ if ($TimeoutSeconds -le 0) {
     throw '[ui-smoke] TimeoutSeconds must be greater than zero'
 }
 
-# MultiWindowPdf is a checked-in draft until the S1 window-target API lands.
-# Reject it before preparing or launching a diagnostic portable build.
-$implementedScenarios = @()
+$implementedScenarios = @('MultiWindowPdf')
 if ($implementedScenarios -notcontains $Scenario) {
-    throw "[ui-smoke] scenario $Scenario requires the unimplemented S1 window-target API"
+    throw "[ui-smoke] scenario $Scenario is not implemented"
 }
 
 $prepareArgs = @{ TestScript = $true }
@@ -197,7 +195,7 @@ switch ($Scenario) {
         if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
             throw "[ui-smoke] scenario script not found: $scriptPath"
         }
-        $settingsJson = '{"detached_viewer_open_images_in_window":true}'
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
         [System.IO.File]::WriteAllText($settingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
 }
@@ -247,10 +245,16 @@ if (-not $process.HasExited) {
     $process.WaitForExit()
     exit 124
 }
+$process.WaitForExit()
+$process.Refresh()
+$processExitCode = $process.ExitCode
+if ($null -eq $processExitCode -or -not ($processExitCode -is [int])) {
+    throw '[ui-smoke] process exited without an integer exit code'
+}
 
 $actualMarker = (Get-Content -LiteralPath $marker -Raw -Encoding ASCII).Trim()
 if ($actualMarker -ne $expectedMarker) {
     throw '[ui-smoke] disposable marker changed during the run'
 }
-Write-Host "[ui-smoke] exit: $($process.ExitCode)"
-exit $process.ExitCode
+Write-Host "[ui-smoke] exit: $processExitCode"
+exit $processExitCode

@@ -103,6 +103,11 @@ close/binding移譲後は拒否、snapshot前後でmounted owner・queue・gener
 PDF fixtureは既存`page-turn/generate_pdf_fixture.py`で使い捨て領域に2文書を作る。
 設定overrideで複数窓モードを選び、ROOTからそれぞれ開く。異なる2つのwindow/contextと
 各PDFページの描画、片方への操作で兄弟状態が変わらないことを確認する。
+close後のlive確認はwindow ID自体のregistry不在と、保持した選択identityの
+`current == false`を両方要求する。identityの不在だけでは同じ窓のHWND再生成も成功になる。
+固定fixtureの初期page 0、対象page 0→1、対象と兄弟のitems generation不変も照合する。
+stale action受付の拒否・LegacyへfallbackしないことはUiRuntime/consumer回帰で確認し、
+意図的なlive失敗や任意のexit 2を成功へ読み替える経路を追加しない。
 
 ### S1b: 実装前提調査で確定した配送境界
 
@@ -122,6 +127,10 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   test-script consumerへctxを伝える。`keyboard_owner_for_pass`の既存pass境界を使って
   実行中の論理ownerを公開し、Targetedのownerと一致するhandlerだけに渡す。
   兄弟のconsume/peekはTargeted要求・ackを変更しない。Legacyへこの新規条件を重ねない。
+  eguiのdataはviewport間で共有されるため観測keyへviewport IDを含め、pass番号だけで
+  区別しない。inventoryではなく実mounted contextとidentityの一致を観測する。
+- Targeted Rootは既存`ViewportCommand::Focus`を要求し、既存gridのfocus/permit/text/modal等の
+  guardを通った実handlerのeligible passを待つ。専用のguard迂回は加えない。
 - passive detachedのactivationは、既存`queue_deferred_detached_window_activation`と
   `commit_pending_deferred_detached_window_activation`を使う。既存intentはwindow IDだけを
   保持し、commitは全pendingの最小IDを選ぶため、直前queueだけでは対象commitを保証しない。
@@ -129,6 +138,8 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   exact claimを再検証→queue→通常commitする。同じUI処理内で行い、actual ownerも照合する。
   既存intentは消去・並替え・追越しをしない。commit失敗で再queueせず明示失敗にする。
   close/transfer後に最新bindingへ付け替えず、独自mount/session変更を加えない。
+  active contextもROOT処理中はAtRestになり得るため、residenceをpassive判定に使わない。
+  既存active session/bindingを先に確認し、真のpassiveだけactivationへ渡す。
 - Targetedには従来の新ROOT frameごとのexpiryを適用せず、passiveのactivation/child処理を待つ。
   受付後の対象ownerの最初のeligible passを基準に未消費失敗を判定する。pass開始を
   完了と誤認せず、対象handlerが処理する機会を持った後に判定する。対象が消えた場合は
@@ -136,14 +147,48 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   ROOTは既存`update_frame`の外側、childはcallback scope終端を使い、対象handlerに機会の
   あったpassだけ完了を観測する。cached `KeyboardOwner`の早期returnでも論理owner観測を省かず、
   その戻り値（focus等の許可区分）を新しいdirect action許可条件として使わない。
+  実peekでack済みの要求は、一般handlerのeligible値にかかわらずそのowner pass終端で
+  解放し、次passで再実行させない。同pass内のrepeatable peekは維持する。
 - cancel/environment failure/finishではdirect actionのackも一度だけErrで解放する。
   script由来の長寿命activation intentをmanagerへ残さない。配送ackと操作結果は区別し、
   PDFシナリオはその後のpage/full-paintと兄弟不変を待って判定する。
+
+PDF fixtureのoverrideは`detached_viewer_open_images_in_window: true`、
+`default_spread_mode: "Single"`、`default_reading_flow: "Paged"`を明示する。
 
 回帰にはLegacyの従来consume/peek/expiryの維持、Targetedへのfallback禁止、
 兄弟の非消費、exact対象だけの消費、close/transfer、activation前stale、
 対象pass基準のexpiry、取消時のack一回解放を含める。既存Grid等のfocus/permit guardを
 迂回する意味ではない。上記のLegacy/Targeted分離とdispatch境界は独立Astraレビューで合意済み。
+
+### S1b追加: backendの実hostとの照合
+
+manager claimだけをactual callbackのHWNDとみなす当初前提は独立レビューで反証された。
+旧hostが生存中でもeguiが新hostを作る実機記録があるため、claimの`IsWindow`では足りない。
+診断featureをvendor eframeへ連動させ、wgpuのROOT/deferred `integration.update`直前と
+immediate `ctx.run`直前で、RawInput取得と同じ実`Arc<Window>`を観測する。
+既存`surface_generation`は通常resizeでも進み、viewport再挿入で再利用されるためhost identityに
+使わない。Windowsのwinit `WindowId`もHWNDそのものであり、HWND再利用を区別できない。
+
+実WindowへのWeak identityを診断recordで保持し、同じallocationには同じprocess内非再利用tokenを
+対応させる。WeakはOS窓の寿命を延ばさない。dead recordを回収し、窓の履歴を無制限に持たない。
+callback中のactual witnessはthread-local RAII scopeに置き、nested immediate終了時に親へ戻す。
+取得不成立も明示的なNoneにし、親や過去callbackのwitnessを借用しない。
+App snapshotは観測したviewport/HWNDとmanager claimをjoinし、target identityへtokenを含める。
+入力consumerでは最新recordでなく現在scopeのactual witnessを照合する。
+selected tokenを更新して対象変更を救済しない。初回未観測は未準備として待つ。
+paint証跡も実callbackと同じhostであることを照合する。
+
+影響先はvendor eframeのwgpu backend、test-scriptのsnapshot/選択/consumer/paint観測。
+通常ビルドへ観測を有効化せず、host登録・生成・focus・mountの正常処理を変更しない。
+S2 input_hookもこのactual witnessを参照可能だが、App contextとの配達直前joinは別途必要。
+親Astraと独立Astraが観測境界に合意し、Solが実装前にContext分離・初回・テスト構築を検証する。
+
+通常lib testも`cfg(test)`でtest_script moduleをコンパイルするため、rootのdev-dependencyには
+同じeframeの診断featureを指定する。root packageはedition 2024であり、通常buildとdev用の
+featureを分離できる（[Cargoのfeature resolver仕様](https://doc.rust-lang.org/cargo/reference/resolver.html#feature-resolver-version-2)）。
+`--all-targets`等はdev featureも統合するため配布の根拠にせず、通常core指定buildの依存graphと
+featureありgraphを別々に確認する。通常版のsource cfg除外と実build graphの両方を検証する。
 
 ## S2: egui pointerと名前付き矩形
 
@@ -162,11 +207,42 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
 - press時のrectとexact targetをgestureへ保持する。動く列の最新rectへ毎frame再正規化して
   pointer deltaを変えない。owner/hostが変われば最新窓へ付け替えない。
 - 注入口は既存`SyntheticInputPlugin::input_hook`のviewport batch。配達済みviewportは
-  widget処理済みではない。実handler・paint・同frame後段のnavigationが完了したowner tailで
+  widget処理済みではない。実handler・同frame後段のnavigationが完了したowner tailで
   input tokenとpost stateをackし、列中心の移動とpage変更を区別する。
+- ROOTでbatchを作ってからchild input_hookまでにownerが移る可能性があるため、raw eventを
+  eguiへ渡す直前にもexact context/hostを検証する。S1bのKeymap consumer検証だけでは不十分。
+  Appのmount/show直前のowner共有とinput_hookの照合をS1b確定後に設計する。
+  新ownerへDownを配送した後でackだけstaleにして済ませない。
+- 現stripはlayout計算→gesture更新→先に計算したcellsのpaintという順序である。
+  handler後のgesture中心を同frameの描画中心として公開しない。step ackは処理/navigation完了、
+  見た目の確認は実layout中心・セル位置の次のpaint revisionを待つことで区別する。
 - key専用timelineのidle/cancel/finishへpointerのheld button・queued/in-flight stepも統合する。
   cancel時は生存するlatched targetへのButtonUp、または閉鎖済みtargetの明示的なterminal処理を
   行い、egui側を押下中のまま放置して成功としない。
+- releaseをROOTでmaterializeしてheld集合が空になっても、prepared batch・配送中・
+  対象handlerのrelease receiptが残っていればidle/成功ではない。logical context退去と
+  egui viewport破棄は別であり、同じviewportの新ownerへcleanup Upを送らない。
+  元surfaceへの安全な解放を証明できない場合は環境不成立としてrunを終了し、
+  使い捨てアプリの終了まで確認する。後続操作やPASSへ進めない。
+- seek track自身によるpage変更はgestureのhost変更ではない。同じwindow/context内の
+  page着地を許し、actual landingをnavigation後に検証する。入力中の物理pointer混入は
+  合成gestureの成功証明から除外し、通常入力を抑止する代わりに明示的な環境不成立とする。
+
+追加の実装境界:
+
+- 初期pointer APIはdetached静止画のstrip/trackを対象とする。既存Legacy keyは維持する。
+  SyntheticTimelineが単一のtyped pointer transactionを所有し、pluginのprepared batchは
+  step ID付きの輸送用cacheとする。受信boolとreceipt Option等の二重状態を作らない。
+- child input_hook前にAppの実mounted context scopeを開始し、backend active witnessとjoinする。
+  callback開始では入力注入より遅い。ROOT pointerやpassive deferredを未確認のまま受理しない。
+- activeのnavigation処理はshow_viewport_immediate復帰後にある。widgetが捕捉したstep ID・
+  child witness・handler結果をframe-local値で運び、navigation後の実App ownerとjoinしてackする。
+  その時点のactive witnessはROOTへ復元済みなので、child証拠の代用にしない。
+- eguiの同じrunは複数passを回せる。callbackの各passで一時receiptをclearして実処理で置換し、
+  最終passを採用する。次stepへの移行はshow復帰/navigation後とし、pass番号の増加だけで
+  pressとmoveを別frameと扱わない。既存ROOT materialization frame/time/run境界を使う。
+- Rhai pointerとnative wrapperは別child moduleへ置ける。親test_script.rsのmod/登録接点は
+  一人ずつ統合し、同じファイルの同時編集を避ける。
 
 ## S3: native入力の継ぎ目
 
@@ -207,6 +283,53 @@ API根拠: [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winus
 [MOUSEINPUT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)、
 [GetMessageExtraInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessageextrainfo)。
 
+### S3a: 実MouseMoveの最小経路試験
+
+最初はproductionで使われる`DetachedViewerChild + PresenterOnly`を対象に、canvas内の
+異なる2点へ識別子付きMouseMoveを一段ずつ送る。HUD設定・topologyを無効化する必要はない。
+Button/capture/zoom/panel/modalを一度に実装せず、実WM→両route→render後段まで
+`dwExtraInfo`が保持される前提をsafe portableで実証してからS3bへ進む。
+
+- 実sourceの正本はrenderの`PresenterSourceState.source_epoch`。UI側のAtomicは
+  `SwitchSource`送信前に進むため、実sourceの代わりにしない。ただし両者が不一致な
+  切替途中はprepareを成立させない。一致条件としてのみUI値を利用する。
+- `NativeVideoInputRegion`・同layoutのeffective ppp・render width/heightを同時に保持する。
+  同placement内のresize/DPI/予約panel変更もあるため、SendInput直前に実client extentと照合し、
+  render消費時にもsource/placement/geometryを再検証する。geometry versionは内容の変更を
+  表し、動画の通常render回数だけでは増やさない。
+- brokerは実HostWindows/leaseのpublisher寿命と退去を管理する。parent HWNDだけの
+  last-writer-winsにせず、同parentに複数live候補があれば曖昧として拒否する。
+  old rendererの遅いpublishで新ownerを上書きしない。
+- tagged moveも通常latest-slotのcoalesceを通す。診断入力だけlosslessにする案は採用しない。
+  metadataはeventと不可分に保持し、上書き・片route欠落は失敗/timeoutにする。
+- `handle_window_events`のErrは通常コードがdefault routingへfallbackする場合も診断失敗。
+  正常Resultと最終routing/raw-forwarding判定を揃えてrender receiptを出す。
+  pump receiptはactive epoch判定とcursor reducer適用後とする。
+- runtime guardはworkerでcompile manifest workspaceからのexact
+  `target/portable-smoke/mimageviewer.exe`・同`data`のcanonical一致とexact markerを確認する。
+  path末尾だけの一致や、利用者の別portableでは成立させない。
+
+実装レビューで、token/HWND一致だけでは要求したcanvas座標への配送を証明できないと判明。
+pump/renderの実MouseMove座標とPresenter sourceもreceiptへ保持し、両route一致、実canvas内、
+要求との距離を検査する。許容は仮想desktopの16bit絶対座標への量子化から導出し、
+要求座標を実績として返さない。最初の2点は実測座標も異なることを確認する。
+broker-local回帰は両receipt順序、片側受領後のsource/geometry変更、publisher退去・曖昧化、
+不一致後に正しいreceiptが来ても失敗維持、lock外callbackと取消後始末、local poisonを含む。
+共有global brokerをテストで故障させず、故障状態もbroker自身に所有させる。
+
+Rhai workerはcallback-localなbackend `latest(viewport)`を呼べない。選択済みの
+viewport/HWND/process-unique tokenについて、registryを変更せずWeakの生存と完全一致だけを
+確認するAPIを用いる。workerでdead recordを掃除したりWindowをupgradeして保持したりしない。
+同じbackend allocationでAppの論理ownerが変わる場合はcached snapshotにも遅延があるため、
+準備前とreceipt後は既存UiCommand上のUI検証barrierを通す。Appが直前に作ったread-only窓一覧を
+ui_update入口でpublishし、その直後のcommand drainでexpected identityを照合する。
+その間にApp ownerを変更できない順序を維持し、finish/cancel/timeoutはErrを返す。
+UI側では待たず、workerが既存wake・interrupt・期限でreplyを待つ。barrier後にも
+backend tokenとnative prepared targetを再検証し、snapshotだけの成功にしない。
+
+親Astra・調査Sol・独立Astraが上記を実装条件として確認した。S3a成功は入力経路だけの
+証明で、zoom/panのApp適用、他surface、GPU scanoutの成功とは扱わない。
+
 **採用しなかった注入案と反証**: `NativeVideoOutputEvent`直接注入はpresenterの当たり判定を、
 render routeだけの注入はpumpのcursor ownership/activityを飛ばす。当初はper-HWND sinkから
 両routeへ注入する案を選んだが、`NativeWindowHost::observe`が実OSのcursor/button/captureを
@@ -220,10 +343,44 @@ HUD wndprocにはpresenterと異なるMouseLeave/capture/held-buttons/focus clai
 実OS入力で到達・観測した範囲だけを検証済みとし、touch・未実施のfocus/z-orderシナリオ・
 GPU scanoutを一括して合格とは扱わない。
 
+### S3b: ズーム確認の精度と追加調査
+
+S3aのmoveにwheelと左button down/upを加え、既存のズーム開始操作を通す。
+nativeのVは`matches_vk_action`経由で、S1bのdirect action consumerとは別経路である。
+`run_action("FsPanorama")`だけで開始できると仮定せず、実描画した`native_top_panorama`
+ボタンのResponse.rectを公開し、実クリックする。panelは`native_top_side_panel_mode`から
+ClickToShowへ切り替え、端moveで描画されるcalloutをクリックする。左jump panelの
+`native_jump_bulk_bookmark`で空のbulk dialogを開き、実closeボタンで閉じれば、
+既存bookmarkやOSキー入力の追加を前提とせずmodal経路へ到達できる。
+これらのfixture操作では登録実行・全削除・clipboard取込を押さない。
+非360動画でzoom stateが存在することを確認し、+120の1回がscale 1.0→1.2の1段だけに
+なることを検証する。単にscaleが増えた条件では二重処理も成功になる。
+panは動かせる倍率へ上げてdown→move→upを通し、center変化、scale不変、再生toggleなし、
+drag state解放を確認する。Appへの送信成功とsource epoch検査後の実適用receiptを区別する。
+
+独立Astraのコード調査で、canvas wheelから`VideoZoomWheel`を生成する一方、
+`render_if_dirty`の`consumed_wheel`判定に同variantがなく、raw wheelもAppへ送られる
+二重適用の可能性を発見した。親も両App handlerへの経路を確認したが、まだ実行による
+再現結果ではない。S3a観測実装へ無検証で混ぜず、実handler回帰とliveの1段確認で根因を
+検証してから独立した修正単位にする。frame単位のwheel消費が複数eventに与える影響も調べる。
+調査時点ではzoom/audio modeが同batch内で変わらず、canvasの各wheelは各zoom command、
+strip/panel/modalのwheelは各領域が所有するため、Zoom commandを含むbatchのraw wheel抑止は
+整合する。回帰ではcanvas+canvasの2命令、canvas+strip/panelの両順序と領域操作の維持を確認する。
+ただしframe全体のany-commandは個々のtokenの処理理由ではなく、receiptに流用しない。
+
+strip/panel/modalの負例は、実領域内で指定tokenが処理された証拠、hit-testの理由、
+zoom/raw-wheel/navigationの非発行、Appの同context/source/zoom不変を揃える。
+strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさず、Window spanの段変更を
+確認する場合はその前提を明示する。
+
 ## 検証記録
 
 S0はscript実装・静的検証・独立レビューを完了。実artifactのbuild・起動は未実施。
 S1aは実装・焦点23テスト・feature有無のcore check・独立レビューを完了。
-S1b～S3は設計段階であり、複数窓PDF・列drag・動画zoomを
-自動化済みとは扱わない。
+S1bは対象配送とbackend host観測を実装し、独立source reviewを完了。
+最終検証はfeatureあり対象37件、featureなしlib test対象29件、manager関連7件、
+backend witness 3件が成功。通常/診断core checkと通常dependencyへのfeature非混入も確認。
+S2は設計段階。S3aのnative観測と実入力driverは独立source review、featureありcore check、
+broker回帰12件、coalescing回帰1件を完了。Rhai接続と実portable入力は未実施である。
+複数窓PDF・列drag・動画zoomを自動化済みとは扱わない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。

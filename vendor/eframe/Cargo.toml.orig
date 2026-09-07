@@ -25,6 +25,9 @@ workspace = true
 
 
 [features]
+## mImageViewer-only witness for joining test-script window identities to the
+## exact native window instance that owns an egui viewport callback.
+miv-test-script-window-witness = []
 default = [
   "accesskit",
   "default_fonts",

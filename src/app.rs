@@ -17007,12 +17007,22 @@ impl App {
     ) -> crate::keyboard_input::KeyboardOwner {
         if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
             crate::ime_focus::record_keyboard_owner(ctx, owner);
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::publish_action_pass_owner(
+                ctx,
+                self.test_script_action_owner_for_pass(ctx),
+            );
             return owner;
         }
         let owner =
             crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
         crate::keyboard_input::cache_keyboard_owner(ctx, owner);
         crate::ime_focus::record_keyboard_owner(ctx, owner);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::publish_action_pass_owner(
+            ctx,
+            self.test_script_action_owner_for_pass(ctx),
+        );
         owner
     }
 
@@ -35558,6 +35568,9 @@ impl App {
         {
             return None;
         }
+
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::mark_action_pass_eligible(ctx);
 
         if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
             return Some(nav);
@@ -70401,8 +70414,14 @@ impl App {
         self.sync_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
         self.drain_deferred_detached_activation_watcher(ctx);
+        #[cfg(all(windows, feature = "test-script"))]
+        let test_script_committed_activation = self.test_script_drive_targeted_activation(ctx);
+        #[cfg(not(all(windows, feature = "test-script")))]
+        let test_script_committed_activation = false;
         #[cfg(windows)]
-        self.commit_pending_deferred_detached_window_activation(ctx);
+        if !test_script_committed_activation {
+            self.commit_pending_deferred_detached_window_activation(ctx);
+        }
         mark_update_perf(
             &mut update_perf,
             UpdatePerfStage::DetachedViewportManagement,
@@ -72055,6 +72074,8 @@ impl eframe::App for App {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::finish_action_pass(ctx);
         // UI の代入箇所を列挙せず、frame 終端で有効値との差分を一括検出する。
         self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
         self.poll_favorite_view_writes(ctx);

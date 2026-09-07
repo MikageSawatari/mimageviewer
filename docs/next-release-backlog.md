@@ -1855,6 +1855,10 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md)。S0の診断portable隔離を
   先行し、S1の複数窓、S2のegui pointer、S3のnative入力を別々に検証する。
   既存の`target_rendered`は入力callback到達であり、PDFのpaint成功を表す値ではない。
+- 進捗: S0隔離scriptに続き、`b20a1e502`でS1aのread-only窓一覧・実texture由来のpaint証跡を実装。
+  S1bの対象配送とbackend窓識別も実装し、37+29+7+3件の焦点テスト・feature有無core check・
+  独立レビュー成功。実portable実行は未完了で、
+  手作業3項目の削減実績にはまだ数えない。以下の部品表は開始時点の棚卸しを保持する。
 - 動機: リリースごとの手作業確認が**リリース間隔を延ばす主因**になっている。
   v3.6.0 では、レビュー指摘 1 件につき 1 項目という誤った単位で 15 項目まで膨らんだ。
   正しい単位は「**自動テストが届かない経路の数**」で、そこまで絞ると 3 項目になる

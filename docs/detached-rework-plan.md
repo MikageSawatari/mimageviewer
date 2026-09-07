@@ -1459,6 +1459,48 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-07 §1.197 S3a: 実MouseMoveのnative経路観測（実装前の構造合意）:**
+
+親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の
+S3a条件を確認した。利用者が選択した実OS入力を、通常のDetachedViewerChild/PresenterOnlyで
+試す。`test-script`限定で実WndProcのtoken・HWNDを既存event envelopeに保持し、pumpの
+active epoch/cursor reducer後、renderの正常handler/routing/raw-forward判定後を観測する。
+通常coalesce・polling・capture・topology・source切替順を変更せず、診断だけlosslessにしない。
+
+native側はoutput/host leaseのpublisher寿命、実render source/placement/geometryを正本として
+既存source Atomicを切替途中の検出にだけ用いる。遅い旧publishや曖昧候補を拒否する。
+UI threadへ重い処理/待機を追加せず、SendInput・path検証・receipt待ちはscript workerで行う。
+Appとの共通接続は既存選択context/hostの再検証へ限定し、App stateやactivation busを増やさない。
+最初は異なる2点へのmoveだけを実portableで確認し、zoom/他surface/GPU確認を完了とはしない。
+共通native envelopeの影響先はpump/render全consumerだが、通常eventは同じ処理を保つ。
+metadata保持・世代/geometry不一致・publisher退去・render error・欠落を回帰/独立レビューする。
+
+**2026-09-07 §1.197 S1b: 明示した窓への診断action配送（実装前の構造合意）:**
+
+親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の
+S1b境界を確認した。未選択のLegacyImplicitは既存動作を保ち、新しいTargeted requestだけ
+S1aのexact ownerへ固定する。5つのKeymap consumerへ既存ctxを渡し、実handler scopeの
+owner・完了を観測する。通常のKeyboardOwner判定やfocus/permit guardは変更しない。
+ROOT frame基準のLegacy expiryとTargetedの対象pass完了を型で分離する。
+
+passive activationは既存managerへ長寿命のtest intentを足さず、typed request内で待つ。
+Closingを含む全既存intentがなくなった同じUI処理内で、exact claim再検証→既存queue→
+既存commit→actual owner照合を行う。通常intentの順序・選択規則を変えず、失敗で再queueしない。
+managerの追加は全intent有無のread-only観測に限り、独自mount/session・viewport生成・
+host lifetime・placement変更は加えない。cancel/staleは要求のackを一度だけ終了させる。
+共通Keymapの影響先は全action consumerだが、新分岐はtest-scriptのTargetedに限定し、
+兄弟非消費・既存Legacy互換・close/transfer・activation競合・pass expiryを回帰で固定する。
+実装前提が違えばSolが根拠付きで親へ戻し、実装後も独立Astraレビューを行う。
+
+S1b追加レビューで、旧host claim生存中にも実backendのhostが再生成されるためclaimだけでは
+callbackを認証できないと判明した。親Astra・独立Astraはvendor eframeのwgpu 2入口に
+診断feature限定の実Window witnessを置く設計に合意。RawInputと同じArcのWeak identityと
+非再利用tokenで通常resizeとWindow再生成を区別し、nested callback scopeを復元する。
+Appのhost registryや生成規則を直す症状パッチではなく、診断証拠を実ownerへ結び付ける変更。
+影響先・token寿命・snapshot/consumer/paintへの統合はui-smoke計画書のS1b追加節に記録した。
+下のS1a合意にある「host claimのみ」の観測はこの追加検証で補強する。通常host lifetimeの
+ownerは引き続きmanagerであり、診断tokenからrecreate・placement同期を起こさない。
+
 **2026-09-07 §1.197 S1a: 診断feature内のwindow観測とpaint証跡（実装前の構造合意）:**
 
 利用者の明示指示による担当移行は [v3.7.0-priority-work.md](v3.7.0-priority-work.md) を参照。

@@ -15966,7 +15966,11 @@ impl App {
                                     proof.source_texture_id == view.texture.source_texture_id()
                                 })
                                 .cloned();
-                            crate::test_script::publish_window_frame(owner, content);
+                            if eframe::miv_test_script_window_witness::active()
+                                .is_some_and(|witness| owner.matches_backend_witness(witness))
+                            {
+                                crate::test_script::publish_window_frame(owner, content);
+                            }
                         }
                         Self::draw_detached_image_window_bar(
                             ui,
@@ -16167,7 +16171,9 @@ impl App {
                                         proof.source_texture_id == view.texture.source_texture_id()
                                     })
                                     .cloned();
-                                test_script_passive_frame = Some(content);
+                                test_script_passive_frame =
+                                    eframe::miv_test_script_window_witness::active()
+                                        .map(|witness| (witness, content));
                             }
                             Self::draw_detached_image_window_bar(
                                 ui,
@@ -16192,8 +16198,8 @@ impl App {
                 hwnd_before.as_deref(),
             );
             #[cfg(feature = "test-script")]
-            if let Some(content) = test_script_passive_frame {
-                self.test_script_publish_detached_frame(window.id, viewport_id, content);
+            if let Some((witness, content)) = test_script_passive_frame {
+                self.test_script_publish_detached_frame(window.id, viewport_id, witness, content);
             }
 
             let right_drag_live =
@@ -18929,6 +18935,10 @@ impl App {
                             ));
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+                        #[cfg(all(windows, feature = "test-script"))]
+                        if !embedded {
+                            crate::test_script::finish_action_pass(ctx);
+                        }
                         if key_action.close {
                             close_fs = true;
                         }
@@ -19232,10 +19242,15 @@ impl App {
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
-                                                    test_script_current_item_paint = Some((
-                                                        ctx.viewport_id(),
-                                                        test_script_content_proof,
-                                                    ));
+                                                    test_script_current_item_paint =
+                                                        eframe::miv_test_script_window_witness::active()
+                                                            .map(|witness| {
+                                                                (
+                                                                    ctx.viewport_id(),
+                                                                    witness,
+                                                                    test_script_content_proof,
+                                                                )
+                                                            });
                                                 }
                                                 single_transform = painted;
                                             }
@@ -23338,6 +23353,9 @@ impl App {
             self.fs_zoom_reset_transient();
             return action;
         }
+
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::mark_action_pass_eligible(ctx);
 
         // The overflow panel is a menu, so the next keystroke closes it - and then goes on to do
         // whatever it was going to do. It does not swallow the key: a menu that eats the input

@@ -79,15 +79,18 @@ pub(crate) struct TestScriptContentProof {
 
 /// Existing window lifetime owners represented without inventing a shared ID space.
 ///
-/// The root HWND lives for the `App` lifetime and its content owner is the registry's
-/// main context. Detached host incarnations come from `DetachedWindowManager`; they
-/// are not a second test-owned epoch. Residence is deliberately absent because
-/// Mounted/AtRest is only the storage location of the same logical viewer and host.
+/// The root content owner is the registry's main context. Detached host incarnations
+/// come from `DetachedWindowManager`; they are not a second test-owned epoch. Both
+/// variants also carry the eframe backend token for the exact live `winit::Window`
+/// allocation, because an HWND alone can be reused while an older host is still alive.
+/// Residence is deliberately absent because Mounted/AtRest is only the storage
+/// location of the same logical viewer and host.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum TestScriptWindowIdentity {
     Root {
         context_serial: u64,
         hwnd: u64,
+        backend_token: u64,
     },
     Detached {
         window_id: u64,
@@ -95,11 +98,11 @@ pub(crate) enum TestScriptWindowIdentity {
         viewport_id: egui::ViewportId,
         host_incarnation: u64,
         hwnd: u64,
+        backend_token: u64,
     },
 }
 
 impl TestScriptWindowIdentity {
-    #[cfg(test)]
     pub(crate) fn role(&self) -> &'static str {
         match self {
             Self::Root { .. } => "root",
@@ -107,7 +110,6 @@ impl TestScriptWindowIdentity {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn window_id(&self) -> Option<u64> {
         match self {
             Self::Root { .. } => None,
@@ -115,7 +117,6 @@ impl TestScriptWindowIdentity {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn context_serial(&self) -> u64 {
         match self {
             Self::Root { context_serial, .. } | Self::Detached { context_serial, .. } => {
@@ -124,7 +125,6 @@ impl TestScriptWindowIdentity {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn viewport_id(&self) -> egui::ViewportId {
         match self {
             Self::Root { .. } => egui::ViewportId::ROOT,
@@ -146,6 +146,59 @@ impl TestScriptWindowIdentity {
             Self::Root { hwnd, .. } | Self::Detached { hwnd, .. } => *hwnd,
         }
     }
+
+    pub(crate) fn backend_token(&self) -> u64 {
+        match self {
+            Self::Root { backend_token, .. } | Self::Detached { backend_token, .. } => {
+                *backend_token
+            }
+        }
+    }
+
+    pub(crate) fn matches_backend_witness(
+        &self,
+        witness: eframe::miv_test_script_window_witness::WindowWitness,
+    ) -> bool {
+        self.viewport_id() == witness.viewport_id()
+            && self.hwnd() == witness.hwnd()
+            && self.backend_token() == witness.token()
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Root {
+                context_serial,
+                hwnd,
+                backend_token,
+            } => format!("root/context={context_serial}/hwnd=0x{hwnd:x}/backend={backend_token}"),
+            Self::Detached {
+                window_id,
+                context_serial,
+                viewport_id,
+                host_incarnation,
+                hwnd,
+                backend_token,
+            } => format!(
+                "detached/window={window_id}/context={context_serial}/viewport={viewport_id:?}/host={host_incarnation}/hwnd=0x{hwnd:x}/backend={backend_token}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum TestScriptActionSelection {
+    #[default]
+    LegacyImplicit,
+    Targeted(TestScriptWindowIdentity),
+}
+
+impl TestScriptActionSelection {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::LegacyImplicit => "legacy_implicit",
+            Self::Targeted(_) => "targeted",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -163,6 +216,7 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) viewport_id: egui::ViewportId,
     pub(crate) host_incarnation: Option<u64>,
     pub(crate) hwnd: Option<u64>,
+    pub(crate) backend_token: Option<u64>,
     pub(crate) residence: String,
     pub(crate) media_kind: String,
     pub(crate) page_index: Option<usize>,
@@ -215,6 +269,12 @@ impl TestScriptWindowSnapshot {
             "hwnd".into(),
             self.hwnd
                 .map(|value| Dynamic::from(format!("0x{value:x}")))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "backend_token".into(),
+            self.backend_token
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
                 .unwrap_or(Dynamic::UNIT),
         );
         map.insert("host_ready".into(), self.identity.is_some().into());
@@ -473,6 +533,7 @@ enum UiCommand {
     },
     RunAction {
         action: KeyAction,
+        selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
     },
     Log(String),
@@ -546,6 +607,7 @@ struct RunnerBridge {
     interrupt: Arc<InterruptState>,
     wake: Arc<dyn Fn() + Send + Sync>,
     next_hold_id: Arc<AtomicU64>,
+    action_selection: Arc<Mutex<TestScriptActionSelection>>,
 }
 
 impl RunnerBridge {
@@ -597,6 +659,96 @@ impl RunnerBridge {
 
     fn allocate_hold_id(&self) -> u64 {
         self.next_hold_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn action_selection(&self) -> Result<TestScriptActionSelection, String> {
+        self.action_selection
+            .lock()
+            .map(|selection| selection.clone())
+            .map_err(|_| "test-script action selection is poisoned".to_string())
+    }
+
+    fn select_root(&self) -> Result<Map, String> {
+        let snapshot = self.latest_snapshot()?;
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|window| window.role == "root")
+            .ok_or_else(|| "select_root could not find the root window".to_string())?;
+        self.select_window_snapshot(window)
+    }
+
+    fn select_window(&self, window_id: u64, context_serial: u64) -> Result<Map, String> {
+        let snapshot = self.latest_snapshot()?;
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|window| {
+                window.role == "detached"
+                    && window.window_id == Some(window_id)
+                    && window.context_serial == context_serial
+            })
+            .ok_or_else(|| {
+                format!(
+                    "select_window target is not current: window={window_id} context={context_serial}"
+                )
+            })?;
+        self.select_window_snapshot(window)
+    }
+
+    fn select_window_snapshot(&self, window: &TestScriptWindowSnapshot) -> Result<Map, String> {
+        let identity = window
+            .identity
+            .clone()
+            .ok_or_else(|| format!("select_{} target has no current host identity", window.role))?;
+        let mut selection = self
+            .action_selection
+            .lock()
+            .map_err(|_| "test-script action selection is poisoned".to_string())?;
+        *selection = TestScriptActionSelection::Targeted(identity.clone());
+        drop(selection);
+
+        let mut selected = window.to_rhai_map();
+        selected.insert("target_mode".into(), Dynamic::from("targeted"));
+        selected.insert("current".into(), Dynamic::from(true));
+        let _ = self.send_unchecked(UiCommand::Log(format!(
+            "action target selected mode=targeted owner={}",
+            identity.describe()
+        )));
+        Ok(selected)
+    }
+
+    fn selected_target(&self) -> Result<Map, String> {
+        let selection = self.action_selection()?;
+        let snapshot = self.latest_snapshot()?;
+        let mut selected = Map::new();
+        selected.insert("target_mode".into(), Dynamic::from(selection.mode()));
+        match selection {
+            TestScriptActionSelection::LegacyImplicit => {
+                selected.insert("current".into(), Dynamic::from(true));
+                selected.insert("role".into(), Dynamic::from("implicit"));
+            }
+            TestScriptActionSelection::Targeted(identity) => {
+                let current = snapshot
+                    .windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(&identity));
+                selected.insert("current".into(), Dynamic::from(current));
+                selected.insert("role".into(), Dynamic::from(identity.role()));
+                selected.insert(
+                    "context_serial".into(),
+                    Dynamic::from(saturating_rhai_int(identity.context_serial())),
+                );
+                selected.insert(
+                    "window_id".into(),
+                    identity
+                        .window_id()
+                        .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                        .unwrap_or(Dynamic::UNIT),
+                );
+            }
+        }
+        Ok(selected)
     }
 }
 
@@ -690,6 +842,10 @@ fn checked_duration(ms: rhai::INT, argument: &str) -> Result<Duration, Box<EvalA
     let ms =
         u64::try_from(ms).map_err(|_| rhai_error(format!("{argument} must be zero or greater")))?;
     Ok(Duration::from_millis(ms))
+}
+
+fn checked_u64(value: rhai::INT, argument: &str) -> Result<u64, Box<EvalAltResult>> {
+    u64::try_from(value).map_err(|_| rhai_error(format!("{argument} must be zero or greater")))
 }
 
 fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAltResult>> {
@@ -807,6 +963,32 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    let select_root_bridge = bridge.clone();
+    engine.register_fn("select_root", move || -> Result<Map, Box<EvalAltResult>> {
+        select_root_bridge.select_root().map_err(rhai_error)
+    });
+
+    let select_window_bridge = bridge.clone();
+    engine.register_fn(
+        "select_window",
+        move |window_id: rhai::INT, context_serial: rhai::INT| -> Result<Map, Box<EvalAltResult>> {
+            select_window_bridge
+                .select_window(
+                    checked_u64(window_id, "select_window window_id")?,
+                    checked_u64(context_serial, "select_window context_serial")?,
+                )
+                .map_err(rhai_error)
+        },
+    );
+
+    let selected_target_bridge = bridge.clone();
+    engine.register_fn(
+        "selected_target",
+        move || -> Result<Map, Box<EvalAltResult>> {
+            selected_target_bridge.selected_target().map_err(rhai_error)
+        },
+    );
+
     let hold_bridge = bridge.clone();
     engine.register_fn(
         "hold_key",
@@ -865,10 +1047,12 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         "run_action",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             let action = parse_action(&name)?;
+            let selection = action_bridge.action_selection().map_err(rhai_error)?;
             let (applied_tx, applied_rx) = mpsc::sync_channel(1);
             action_bridge
                 .send(UiCommand::RunAction {
                     action,
+                    selection,
                     applied: applied_tx,
                 })
                 .map_err(rhai_error)?;
@@ -1094,10 +1278,33 @@ fn spawn_script_source(source: String, bridge: RunnerBridge) -> Result<(), Strin
 
 struct PendingAction {
     action: KeyAction,
+    dispatch: PendingActionDispatch,
     // `None` means a non-consuming pressed_action peek already acknowledged
     // the command. Keep the entry until the frame ends so later peeks observe
     // the same press, just like an egui input event.
     applied: Option<mpsc::SyncSender<Result<(), String>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingActionDispatch {
+    LegacyImplicit,
+    Targeted {
+        owner: TestScriptWindowIdentity,
+        phase: TargetedActionPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetedActionPhase {
+    AwaitingDetachedOwner,
+    AwaitingPass,
+}
+
+#[derive(Clone, Debug)]
+struct TestScriptActionPassObservation {
+    pass: u64,
+    owner: Option<TestScriptWindowIdentity>,
+    eligible: bool,
 }
 
 fn joined_window_snapshots(
@@ -1180,6 +1387,33 @@ impl UiRuntime {
 
     fn replace_authoritative_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) {
         self.authoritative_windows = windows;
+        let mut retained_actions = VecDeque::with_capacity(self.pending_actions.len());
+        while let Some(mut pending) = self.pending_actions.pop_front() {
+            let stale_owner = match &pending.dispatch {
+                PendingActionDispatch::LegacyImplicit => None,
+                PendingActionDispatch::Targeted { owner, .. } => (!self
+                    .authoritative_windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(owner)))
+                .then(|| owner.clone()),
+            };
+            if let Some(owner) = stale_owner {
+                let message = format!(
+                    "run_action target is no longer current: {}",
+                    owner.describe()
+                );
+                if let Some(applied) = pending.applied.take() {
+                    let _ = applied.send(Err(message.clone()));
+                }
+                crate::logger::log(format!(
+                    "[test-script] action rejected target_mode=targeted owner={} reason=stale",
+                    owner.describe()
+                ));
+            } else {
+                retained_actions.push_back(pending);
+            }
+        }
+        self.pending_actions = retained_actions;
         self.viewport_observations.retain(|identity, _| {
             self.authoritative_windows
                 .iter()
@@ -1276,6 +1510,7 @@ impl UiRuntime {
         if let Some(environment_failure) = self.interrupt.failure_message() {
             outcome = ScriptOutcome::environment_failure(environment_failure);
         }
+        self.release_pending_actions("script finished before run_action was consumed");
         self.finish = Some(FinishState {
             outcome,
             started_frame: frame,
@@ -1285,6 +1520,7 @@ impl UiRuntime {
 
     fn fail_environment(&mut self, message: String, frame: u64) {
         self.interrupt.fail(message.clone());
+        self.release_pending_actions(&message);
         self.begin_finish(ScriptOutcome::environment_failure(message), frame);
     }
 
@@ -1296,15 +1532,154 @@ impl UiRuntime {
         self.cancel_requested
     }
 
-    fn expire_unconsumed_actions(&mut self, frame: u64) {
+    fn release_pending_actions(&mut self, message: &str) {
+        for mut pending in self.pending_actions.drain(..) {
+            if let Some(applied) = pending.applied.take() {
+                let _ = applied.send(Err(message.to_string()));
+            }
+        }
+    }
+
+    fn queue_action(
+        &mut self,
+        action: KeyAction,
+        selection: TestScriptActionSelection,
+        applied: mpsc::SyncSender<Result<(), String>>,
+    ) -> Option<egui::ViewportId> {
+        match selection {
+            TestScriptActionSelection::LegacyImplicit => {
+                self.pending_actions.push_back(PendingAction {
+                    action,
+                    dispatch: PendingActionDispatch::LegacyImplicit,
+                    applied: Some(applied),
+                });
+                crate::logger::log(format!(
+                    "[test-script] run_action action={} target_mode=legacy_implicit",
+                    action.ini_name()
+                ));
+                None
+            }
+            TestScriptActionSelection::Targeted(owner) => {
+                let Some(window) = self
+                    .authoritative_windows
+                    .iter()
+                    .find(|window| window.identity.as_ref() == Some(&owner))
+                else {
+                    let message = format!(
+                        "run_action target is no longer current: {}",
+                        owner.describe()
+                    );
+                    let _ = applied.send(Err(message));
+                    return None;
+                };
+                let phase = match (&owner, window.residence.as_str()) {
+                    (TestScriptWindowIdentity::Root { .. }, "mounted" | "at_rest") => {
+                        TargetedActionPhase::AwaitingPass
+                    }
+                    (TestScriptWindowIdentity::Detached { .. }, "mounted" | "at_rest") => {
+                        TargetedActionPhase::AwaitingDetachedOwner
+                    }
+                    _ => {
+                        let message = format!(
+                            "run_action target cannot accept input: {} residence={}",
+                            owner.describe(),
+                            window.residence
+                        );
+                        let _ = applied.send(Err(message));
+                        return None;
+                    }
+                };
+                let focus =
+                    (phase == TargetedActionPhase::AwaitingPass).then(|| owner.viewport_id());
+                crate::logger::log(format!(
+                    "[test-script] run_action action={} target_mode=targeted owner={} phase={phase:?}",
+                    action.ini_name(),
+                    owner.describe()
+                ));
+                self.pending_actions.push_back(PendingAction {
+                    action,
+                    dispatch: PendingActionDispatch::Targeted { owner, phase },
+                    applied: Some(applied),
+                });
+                focus
+            }
+        }
+    }
+
+    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+        self.pending_actions
+            .iter()
+            .find_map(|pending| match &pending.dispatch {
+                PendingActionDispatch::Targeted {
+                    owner,
+                    phase: TargetedActionPhase::AwaitingDetachedOwner,
+                } => Some(owner.clone()),
+                PendingActionDispatch::LegacyImplicit
+                | PendingActionDispatch::Targeted {
+                    phase: TargetedActionPhase::AwaitingPass,
+                    ..
+                } => None,
+            })
+    }
+
+    fn finish_targeted_detached_owner(
+        &mut self,
+        owner: &TestScriptWindowIdentity,
+        result: Result<(), String>,
+    ) {
+        let Some(index) = self.pending_actions.iter().position(|pending| {
+            matches!(
+                &pending.dispatch,
+                PendingActionDispatch::Targeted {
+                    owner: pending_owner,
+                    phase: TargetedActionPhase::AwaitingDetachedOwner,
+                } if pending_owner == owner
+            )
+        }) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                if let PendingActionDispatch::Targeted { phase, .. } =
+                    &mut self.pending_actions[index].dispatch
+                {
+                    *phase = TargetedActionPhase::AwaitingPass;
+                }
+                crate::logger::log(format!(
+                    "[test-script] action target ready owner={}",
+                    owner.describe()
+                ));
+            }
+            Err(message) => {
+                let mut pending = self.pending_actions.remove(index).expect("index exists");
+                if let Some(applied) = pending.applied.take() {
+                    let _ = applied.send(Err(message.clone()));
+                }
+                crate::logger::log(format!(
+                    "[test-script] action target resolution failed owner={} error={message}",
+                    owner.describe()
+                ));
+            }
+        }
+    }
+
+    fn expire_unconsumed_legacy_actions(&mut self, frame: u64) {
         if self.pending_actions.is_empty() {
             return;
         }
-        let unconsumed = self
-            .pending_actions
-            .drain(..)
-            .filter(|pending| pending.applied.is_some())
-            .collect::<Vec<_>>();
+        let mut retained = VecDeque::with_capacity(self.pending_actions.len());
+        let mut unconsumed = Vec::new();
+        while let Some(pending) = self.pending_actions.pop_front() {
+            match pending.dispatch {
+                PendingActionDispatch::LegacyImplicit => {
+                    if pending.applied.is_some() {
+                        unconsumed.push(pending);
+                    }
+                }
+                PendingActionDispatch::Targeted { .. } => retained.push_back(pending),
+            }
+        }
+        self.pending_actions = retained;
         if unconsumed.is_empty() {
             return;
         }
@@ -1314,6 +1689,46 @@ impl UiRuntime {
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!("run_action was not consumed in its UI frame: {names}");
+        for mut pending in unconsumed {
+            if let Some(applied) = pending.applied.take() {
+                let _ = applied.send(Err(message.clone()));
+            }
+        }
+        self.fail_environment(message, frame);
+    }
+
+    fn finish_target_pass(&mut self, owner: &TestScriptWindowIdentity, eligible: bool, frame: u64) {
+        let mut retained = VecDeque::with_capacity(self.pending_actions.len());
+        let mut unconsumed = Vec::new();
+        while let Some(pending) = self.pending_actions.pop_front() {
+            let belongs_to_pass = matches!(
+                &pending.dispatch,
+                PendingActionDispatch::Targeted {
+                    owner: pending_owner,
+                    phase: TargetedActionPhase::AwaitingPass,
+                } if pending_owner == owner
+            );
+            if belongs_to_pass && (eligible || pending.applied.is_none()) {
+                if eligible && pending.applied.is_some() {
+                    unconsumed.push(pending);
+                }
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        self.pending_actions = retained;
+        if unconsumed.is_empty() {
+            return;
+        }
+        let names = unconsumed
+            .iter()
+            .map(|pending| pending.action.ini_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "run_action was not consumed in its target UI pass: owner={} actions={names}",
+            owner.describe()
+        );
         for mut pending in unconsumed {
             if let Some(applied) = pending.applied.take() {
                 let _ = applied.send(Err(message.clone()));
@@ -1398,6 +1813,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
             wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
         }),
         next_hold_id: Arc::new(AtomicU64::new(0)),
+        action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
     };
 
     let mut guard = runtime()
@@ -1421,14 +1837,31 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     Ok(())
 }
 
+fn action_matches_owner(
+    dispatch: &PendingActionDispatch,
+    owner: Option<&TestScriptWindowIdentity>,
+) -> bool {
+    match dispatch {
+        PendingActionDispatch::LegacyImplicit => true,
+        PendingActionDispatch::Targeted {
+            owner: target,
+            phase: TargetedActionPhase::AwaitingPass,
+        } => owner == Some(target),
+        PendingActionDispatch::Targeted {
+            phase: TargetedActionPhase::AwaitingDetachedOwner,
+            ..
+        } => false,
+    }
+}
+
 fn consume_pending_action_from(
     pending_actions: &mut VecDeque<PendingAction>,
+    owner: Option<&TestScriptWindowIdentity>,
     action: KeyAction,
 ) -> bool {
-    let Some(index) = pending_actions
-        .iter()
-        .position(|pending| pending.action == action)
-    else {
+    let Some(index) = pending_actions.iter().position(|pending| {
+        pending.action == action && action_matches_owner(&pending.dispatch, owner)
+    }) else {
         return false;
     };
     let mut pending = pending_actions.remove(index).expect("index exists");
@@ -1440,11 +1873,12 @@ fn consume_pending_action_from(
 
 fn peek_pending_action_from(
     pending_actions: &mut VecDeque<PendingAction>,
+    owner: Option<&TestScriptWindowIdentity>,
     action: KeyAction,
 ) -> bool {
     let Some(pending) = pending_actions
         .iter_mut()
-        .find(|pending| pending.action == action)
+        .find(|pending| pending.action == action && action_matches_owner(&pending.dispatch, owner))
     else {
         return false;
     };
@@ -1454,24 +1888,127 @@ fn peek_pending_action_from(
     true
 }
 
-pub(crate) fn consume_pending_action(action: KeyAction) -> bool {
-    let Ok(mut guard) = runtime().lock() else {
-        return false;
-    };
-    let Some(runtime) = guard.as_mut() else {
-        return false;
-    };
-    consume_pending_action_from(&mut runtime.pending_actions, action)
+fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
+    egui::Id::new("miv.test_script.action_pass_observation").with(viewport_id)
 }
 
-pub(crate) fn peek_pending_action(action: KeyAction) -> bool {
+fn action_pass_observation(ctx: &egui::Context) -> Option<TestScriptActionPassObservation> {
+    let pass = ctx.cumulative_pass_nr();
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<TestScriptActionPassObservation>(observation_id)
+            .filter(|observation| observation.pass == pass)
+    })
+}
+
+fn action_pass_observation_for_active_backend(
+    ctx: &egui::Context,
+) -> Option<TestScriptActionPassObservation> {
+    let observation = action_pass_observation(ctx)?;
+    if observation.owner.as_ref().is_none_or(|owner| {
+        eframe::miv_test_script_window_witness::active()
+            .is_some_and(|witness| owner.matches_backend_witness(witness))
+    }) {
+        Some(observation)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn publish_action_pass_owner(
+    ctx: &egui::Context,
+    owner: Option<TestScriptWindowIdentity>,
+) {
+    let owner = owner.filter(|owner| {
+        eframe::miv_test_script_window_witness::active()
+            .is_some_and(|witness| owner.matches_backend_witness(witness))
+    });
+    let pass = ctx.cumulative_pass_nr();
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data_mut(|data| {
+        let eligible = data
+            .get_temp::<TestScriptActionPassObservation>(observation_id)
+            .is_some_and(|observation| {
+                observation.pass == pass && observation.owner == owner && observation.eligible
+            });
+        data.insert_temp(
+            observation_id,
+            TestScriptActionPassObservation {
+                pass,
+                owner,
+                eligible,
+            },
+        );
+    });
+}
+
+pub(crate) fn mark_action_pass_eligible(ctx: &egui::Context) {
+    let Some(mut observation) = action_pass_observation_for_active_backend(ctx) else {
+        return;
+    };
+    observation.eligible = true;
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data_mut(|data| data.insert_temp(observation_id, observation));
+}
+
+pub(crate) fn finish_action_pass(ctx: &egui::Context) {
+    let Some(observation) = action_pass_observation_for_active_backend(ctx) else {
+        return;
+    };
+    let Some(owner) = observation.owner else {
+        return;
+    };
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    runtime.finish_target_pass(&owner, observation.eligible, frame_key(ctx));
+}
+
+pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
+    let owner =
+        action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
     let Ok(mut guard) = runtime().lock() else {
         return false;
     };
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    peek_pending_action_from(&mut runtime.pending_actions, action)
+    consume_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+}
+
+pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
+    let owner =
+        action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
+    let Ok(mut guard) = runtime().lock() else {
+        return false;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return false;
+    };
+    peek_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+}
+
+pub(crate) fn pending_targeted_detached_owner() -> Option<TestScriptWindowIdentity> {
+    runtime()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_owner())
+}
+
+pub(crate) fn finish_targeted_detached_owner(
+    owner: &TestScriptWindowIdentity,
+    result: Result<(), String>,
+) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    runtime.finish_targeted_detached_owner(owner, result);
 }
 
 fn flush_exit_logs() {
@@ -1540,7 +2077,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let new_frame = runtime.last_frame != Some(frame);
     if new_frame {
         if runtime.last_frame.is_some() {
-            runtime.expire_unconsumed_actions(frame);
+            runtime.expire_unconsumed_legacy_actions(frame);
         }
         runtime.last_frame = Some(frame);
     }
@@ -1565,6 +2102,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 }
             }
             UiCommand::Cancel(at) => {
+                runtime.release_pending_actions("run_action was cancelled before consumption");
                 if crate::key_input::cancel_synthetic_input(at) {
                     runtime.cancel_requested = true;
                 } else {
@@ -1582,14 +2120,18 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     );
                 }
             }
-            UiCommand::RunAction { action, applied } => {
+            UiCommand::RunAction {
+                action,
+                selection,
+                applied,
+            } => {
                 if runtime.finish.is_some() {
                     let _ = applied.send(Err("script is already finishing".to_string()));
                 } else {
-                    runtime.pending_actions.push_back(PendingAction {
-                        action,
-                        applied: Some(applied),
-                    });
+                    if let Some(viewport_id) = runtime.queue_action(action, selection, applied) {
+                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                        ctx.request_repaint_of(viewport_id);
+                    }
                 }
             }
             UiCommand::Log(message) => {
@@ -1709,7 +2251,7 @@ pub(crate) fn publish_fullscreen_input_state(
 
 pub(crate) fn on_app_exit() {
     let active = runtime().lock().ok().and_then(|mut guard| guard.take());
-    let Some(runtime) = active else {
+    let Some(mut runtime) = active else {
         return;
     };
     PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
@@ -1719,6 +2261,7 @@ pub(crate) fn on_app_exit() {
     runtime
         .interrupt
         .fail("application exited before the test script completed");
+    runtime.release_pending_actions("application exited before run_action was consumed");
     let _ = crate::key_input::cancel_synthetic_input(Instant::now());
     crate::key_input::disarm_synthetic_input();
     crate::logger::log(format!(
@@ -1859,6 +2402,7 @@ mod tests {
                     wake_count.fetch_add(1, AtomicOrdering::Relaxed);
                 }),
                 next_hold_id: Arc::new(AtomicU64::new(0)),
+                action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
             },
             rx,
             wakes,
@@ -2032,9 +2576,11 @@ mod tests {
         match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
             UiCommand::RunAction {
                 action: actual,
+                selection,
                 applied,
             } => {
                 assert_eq!(actual, action);
+                assert_eq!(selection, TestScriptActionSelection::LegacyImplicit);
                 applied.send(Ok(())).unwrap();
             }
             command => panic!("unexpected command before action acknowledgement: {command:?}"),
@@ -2061,27 +2607,96 @@ mod tests {
     }
 
     #[test]
+    fn selected_root_is_attached_to_run_action_as_an_exact_target() {
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 31,
+            hwnd: 0x3131,
+            backend_token: 41,
+        };
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 1, 0, "root-item")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        spawn_script_source(
+            r#"
+                let selected = select_root();
+                if selected.target_mode != "targeted" || !selected.current {
+                    fail("root target missing");
+                }
+                run_action("GridMoveFirst");
+            "#
+            .to_string(),
+            bridge,
+        )
+        .unwrap();
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                UiCommand::RunAction {
+                    action,
+                    selection,
+                    applied,
+                } => {
+                    assert_eq!(action, KeyAction::GridMoveFirst);
+                    assert_eq!(selection, TestScriptActionSelection::Targeted(owner));
+                    applied.send(Ok(())).unwrap();
+                    break;
+                }
+                UiCommand::Log(message) => assert!(message.contains("mode=targeted")),
+                command => panic!("unexpected command before targeted action: {command:?}"),
+            }
+        }
+        assert!(matches!(
+            receive_through_finished(&rx).last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::Success,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn explicit_selection_fails_instead_of_reserving_a_missing_identity() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("select_root();".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::RunAction { .. }))
+        );
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("could not find the root window")
+        ));
+    }
+
+    #[test]
     fn pending_action_peek_is_repeatable_within_the_ui_frame() {
         let action = KeyAction::FsClose;
         let (applied, acknowledgement) = mpsc::sync_channel(1);
         let mut pending = VecDeque::from([PendingAction {
             action,
+            dispatch: PendingActionDispatch::LegacyImplicit,
             applied: Some(applied),
         }]);
 
-        assert!(peek_pending_action_from(&mut pending, action));
+        assert!(peek_pending_action_from(&mut pending, None, action));
         assert_eq!(
             acknowledgement
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
             Ok(())
         );
-        assert!(peek_pending_action_from(&mut pending, action));
+        assert!(peek_pending_action_from(&mut pending, None, action));
         assert!(matches!(
             acknowledgement.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-        assert!(consume_pending_action_from(&mut pending, action));
+        assert!(consume_pending_action_from(&mut pending, None, action));
         assert!(pending.is_empty());
     }
 
@@ -2142,13 +2757,394 @@ mod tests {
         context_serial: u64,
         host_incarnation: u64,
     ) -> TestScriptWindowIdentity {
+        window_identity_with_backend_token(
+            window_id,
+            context_serial,
+            host_incarnation,
+            0x2000 + host_incarnation,
+        )
+    }
+
+    fn window_identity_with_backend_token(
+        window_id: u64,
+        context_serial: u64,
+        host_incarnation: u64,
+        backend_token: u64,
+    ) -> TestScriptWindowIdentity {
         TestScriptWindowIdentity::Detached {
             window_id,
             context_serial,
             viewport_id: egui::ViewportId::from_hash_of(("test-window", window_id)),
             host_incarnation,
             hwnd: 0x1000 + host_incarnation,
+            backend_token,
         }
+    }
+
+    fn root_identity(context_serial: u64, hwnd: u64) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Root {
+            context_serial,
+            hwnd,
+            backend_token: 0x3000 + context_serial,
+        }
+    }
+
+    fn local_runtime() -> UiRuntime {
+        let (_tx, rx) = mpsc::channel();
+        UiRuntime::new(
+            rx,
+            Arc::new(RwLock::new(TestScriptSnapshot::default())),
+            Arc::new(InterruptState::default()),
+        )
+    }
+
+    #[test]
+    fn targeted_action_waits_for_exact_owner_and_does_not_repeat_after_peek() {
+        let owner = window_identity(7, 11, 14);
+        let sibling = window_identity(8, 12, 15);
+        let action = KeyAction::FsPageNext;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![
+                window_snapshot(owner.clone(), 17, 2, "pdf::owner#2"),
+                window_snapshot(sibling.clone(), 18, 4, "pdf::sibling#4"),
+            ])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                applied,
+            ),
+            None,
+            "detached owner is resolved by App before a pass is eligible"
+        );
+        assert_eq!(
+            runtime.pending_targeted_detached_owner(),
+            Some(owner.clone())
+        );
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&sibling),
+            action
+        ));
+        runtime.finish_target_pass(&sibling, true, 1);
+        runtime.finish_target_pass(&owner, false, 1);
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(
+            acknowledgement
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(())
+        );
+        assert!(peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.finish_target_pass(&owner, false, 1);
+        assert!(runtime.pending_actions.is_empty());
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+    }
+
+    #[test]
+    fn root_frame_expiry_does_not_expire_a_detached_target_before_its_pass() {
+        let owner = window_identity(7, 11, 14);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "pdf::owner#2")])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+        );
+
+        runtime.expire_unconsumed_legacy_actions(2);
+        assert_eq!(runtime.pending_actions.len(), 1);
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        runtime.finish_target_pass(&owner, true, 2);
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("target UI pass"));
+    }
+
+    #[test]
+    fn stale_target_is_rejected_without_legacy_fallback() {
+        let owner = window_identity(7, 11, 14);
+        let sibling = window_identity(8, 12, 15);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "pdf::owner#2")])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                sibling.clone(),
+                18,
+                4,
+                "pdf::sibling#4",
+            )])
+            .unwrap();
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no longer current"));
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&sibling),
+            action
+        ));
+    }
+
+    #[test]
+    fn backend_replacement_stales_target_without_a_manager_claim_change() {
+        let old_owner = window_identity_with_backend_token(7, 11, 14, 101);
+        let replacement_owner = window_identity_with_backend_token(7, 11, 14, 102);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                old_owner.clone(),
+                17,
+                2,
+                "pdf::owner#2",
+            )])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(old_owner),
+            applied,
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                replacement_owner,
+                17,
+                2,
+                "pdf::owner#2",
+            )])
+            .unwrap();
+
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no longer current"));
+        assert!(runtime.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn legacy_action_retains_first_matching_consumer_behavior() {
+        let action = KeyAction::GridMoveFirst;
+        let owner = window_identity(7, 11, 14);
+        let mut runtime = local_runtime();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(action, TestScriptActionSelection::LegacyImplicit, applied);
+
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(
+            acknowledgement
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn action_pass_observations_are_partitioned_by_viewport_at_the_same_pass() {
+        let ctx = egui::Context::default();
+        let root = root_identity(1, 0x100);
+        let child = window_identity(7, 11, 14);
+        let pass = 9;
+        let root_observation = TestScriptActionPassObservation {
+            pass,
+            owner: Some(root.clone()),
+            eligible: true,
+        };
+        let child_observation = TestScriptActionPassObservation {
+            pass,
+            owner: Some(child.clone()),
+            eligible: false,
+        };
+        let child_viewport = child.viewport_id();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                action_pass_observation_id(egui::ViewportId::ROOT),
+                root_observation,
+            );
+            data.insert_temp(
+                action_pass_observation_id(child_viewport),
+                child_observation,
+            );
+        });
+
+        ctx.data(|data| {
+            assert_eq!(
+                data.get_temp::<TestScriptActionPassObservation>(action_pass_observation_id(
+                    egui::ViewportId::ROOT
+                ))
+                .and_then(|observation| observation.owner),
+                Some(root)
+            );
+            assert_eq!(
+                data.get_temp::<TestScriptActionPassObservation>(action_pass_observation_id(
+                    child_viewport
+                ))
+                .and_then(|observation| observation.owner),
+                Some(child)
+            );
+        });
+    }
+
+    #[test]
+    fn action_pass_publication_and_eligibility_use_egui_data_without_reentry() {
+        let ctx = egui::Context::default();
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = fixture.enter(&ctx, egui::ViewportId::ROOT, 0x100);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 1,
+            hwnd: 0x100,
+            backend_token: witness.token(),
+        };
+        ctx.begin_pass(Default::default());
+
+        publish_action_pass_owner(&ctx, Some(owner.clone()));
+        mark_action_pass_eligible(&ctx);
+        let observation = action_pass_observation(&ctx).expect("current pass observation");
+
+        assert_eq!(observation.owner, Some(owner));
+        assert!(observation.eligible);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn replacement_backend_with_the_same_hwnd_cannot_consume_an_old_target() {
+        let ctx = egui::Context::default();
+        let first = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let old_owner = {
+            let _scope = first.enter(&ctx, egui::ViewportId::ROOT, 0x101);
+            TestScriptWindowIdentity::Root {
+                context_serial: 1,
+                hwnd: 0x101,
+                backend_token: eframe::miv_test_script_window_witness::active()
+                    .unwrap()
+                    .token(),
+            }
+        };
+        let replacement = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = replacement.enter(&ctx, egui::ViewportId::ROOT, 0x101);
+        ctx.begin_pass(Default::default());
+
+        publish_action_pass_owner(&ctx, Some(old_owner.clone()));
+        let observed_owner = action_pass_observation_for_active_backend(&ctx)
+            .and_then(|observation| observation.owner);
+        let (applied, _acknowledgement) = mpsc::sync_channel(1);
+        let mut pending = VecDeque::from([PendingAction {
+            action: KeyAction::GridToggleDetailsView,
+            dispatch: PendingActionDispatch::Targeted {
+                owner: old_owner,
+                phase: TargetedActionPhase::AwaitingPass,
+            },
+            applied: Some(applied),
+        }]);
+
+        assert_eq!(observed_owner, None);
+        assert!(!consume_pending_action_from(
+            &mut pending,
+            observed_owner.as_ref(),
+            KeyAction::GridToggleDetailsView
+        ));
+        assert_eq!(pending.len(), 1);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn backend_witness_scope_is_context_scoped_nested_and_thread_local() {
+        let first_context = egui::Context::default();
+        let second_context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("same-viewport-separate-contexts");
+        let first = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let second = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let first_scope = first.enter(&first_context, viewport, 0x201);
+        let first_witness = eframe::miv_test_script_window_witness::active().unwrap();
+
+        assert_eq!(
+            eframe::miv_test_script_window_witness::latest(viewport),
+            Some(first_witness)
+        );
+        std::thread::spawn(move || {
+            assert_eq!(eframe::miv_test_script_window_witness::active(), None);
+            assert_eq!(
+                eframe::miv_test_script_window_witness::latest(viewport),
+                None
+            );
+        })
+        .join()
+        .unwrap();
+        {
+            let _second_scope = second.enter(&second_context, viewport, 0x202);
+            let second_witness = eframe::miv_test_script_window_witness::active().unwrap();
+            assert_ne!(first_witness.token(), second_witness.token());
+            assert_eq!(
+                eframe::miv_test_script_window_witness::latest(viewport),
+                Some(second_witness)
+            );
+        }
+
+        assert_eq!(
+            eframe::miv_test_script_window_witness::active(),
+            Some(first_witness)
+        );
+        assert_eq!(
+            eframe::miv_test_script_window_witness::latest(viewport),
+            Some(first_witness)
+        );
+        drop(first_scope);
+        assert_eq!(eframe::miv_test_script_window_witness::active(), None);
     }
 
     fn content_proof(
@@ -2183,6 +3179,7 @@ mod tests {
             viewport_id: identity.viewport_id(),
             host_incarnation: identity.host_incarnation(),
             hwnd: Some(identity.hwnd()),
+            backend_token: Some(identity.backend_token()),
             residence: "at_rest".to_string(),
             media_kind: "pdf".to_string(),
             page_index: Some(page_index),
