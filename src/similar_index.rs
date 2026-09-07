@@ -634,7 +634,7 @@ fn start_memory_load(
                 Err(error) => MemoryState::Failed(error),
             };
             drop(state);
-            cache.lock().unwrap_or_else(|e| e.into_inner()).entry = None;
+            cache.lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
             epoch_guard.fetch_add(1, Ordering::AcqRel);
             if let Some(scheduler) = scheduler.and_then(|scheduler| scheduler.upgrade()) {
                 scheduler.request_array_refresh();
@@ -1104,7 +1104,8 @@ impl SimilarIndexScheduler {
             self.item_query
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry = None;
+                .entries
+                .clear();
             *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
         }
         published
@@ -1242,10 +1243,18 @@ enum BookQueryState {
     },
 }
 
+/// 単体照会の結果置き場。
+///
+/// **1 枠では足りない。** 見開きは 2 ページを同じフレームで引くので、1 枠だと後の照会が前の
+/// 照会を追い出し、返ってきた結果も捨てられる。どちらも永久に「読み込み中」のまま、毎フレーム
+/// worker を 2 本ずつ起こし続ける状態になる。
 #[derive(Default)]
 struct ItemQueryCache {
-    entry: Option<CachedItemQuery>,
+    entries: Vec<CachedItemQuery>,
 }
+
+/// 同時に覚えておく照会の数。見開きの 2 ページに、行き来したときの数ページ分の余裕を足す。
+const ITEM_QUERY_CACHE_LIMIT: usize = 6;
 
 struct CachedItemQuery {
     item_key: String,
@@ -1261,9 +1270,9 @@ fn cached_item_query(
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry
-        .as_ref()
-        .filter(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
+        .entries
+        .iter()
+        .find(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
         .map(|entry| Arc::clone(&entry.result))
 }
 
@@ -1273,11 +1282,17 @@ fn store_cached_item_query(
     memory_epoch: u64,
     result: Arc<ItemQuery>,
 ) {
-    cache.lock().unwrap_or_else(|e| e.into_inner()).entry = Some(CachedItemQuery {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entries
+        .retain(|entry| entry.item_key != item_key && entry.memory_epoch == memory_epoch);
+    cache.entries.push(CachedItemQuery {
         item_key: item_key.to_owned(),
         memory_epoch,
         result,
     });
+    let overflow = cache.entries.len().saturating_sub(ITEM_QUERY_CACHE_LIMIT);
+    cache.entries.drain(..overflow);
 }
 
 fn replace_cached_item_query_if_current(
@@ -1287,12 +1302,14 @@ fn replace_cached_item_query_if_current(
     result: Arc<ItemQuery>,
 ) {
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(entry) = cache.entry.as_mut() else {
+    let Some(entry) = cache
+        .entries
+        .iter_mut()
+        .find(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
+    else {
         return;
     };
-    if entry.item_key == item_key && entry.memory_epoch == memory_epoch {
-        entry.result = result;
-    }
+    entry.result = result;
 }
 
 fn retain_ready_memory_or_unload(state: &mut MemoryState) {
@@ -4178,6 +4195,72 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("item query worker did not publish its result");
+    }
+
+    /// 同じフレームで 2 ページを引いても、両方が結果まで辿り着くこと。
+    ///
+    /// 置き場が 1 枠だったとき、後の照会が前の照会を追い出し、返ってきた結果も捨てられて
+    /// **どちらも永久に「読み込み中」**のまま毎フレーム worker を起こし続けた。見開きで
+    /// 左右を同時に引くようにして初めて踏んだ。
+    #[test]
+    fn two_pages_queried_together_both_reach_a_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = SimilarDb::db_path_at(temp.path());
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        let left = row(1, "c:/library/left.png", [0; 32], 1).item;
+        let right = row(2, "c:/library/right.png", [0x0f; 32], 1).item;
+        let near_left = row(3, "c:/library/left-copy.png", [1; 32], 1).item;
+        let near_right = row(4, "c:/library/right-copy.png", [0x0e; 32], 1).item;
+        for item in [&left, &right, &near_left, &near_right] {
+            db.upsert_loose_item(item).unwrap();
+        }
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let index = Arc::new(SearchSnapshot::from_base(
+            crate::similar_search_array::BaseArray {
+                records: base.records.into_boxed_slice(),
+                store_id: base.store_id,
+                applied_seq: base.applied_seq,
+            },
+        ));
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.memory.lock().unwrap() = MemoryState::Ready(index);
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+
+        // 描画のたびに両方を引く、という UI と同じ順で回す。
+        let mut settled = [None, None];
+        for _ in 0..200 {
+            for (slot, key) in [&left.item_key, &right.item_key].into_iter().enumerate() {
+                let result = manager.query_item(key);
+                if matches!(result.as_ref(), ItemQuery::Ready(_)) {
+                    settled[slot] = Some(result);
+                }
+            }
+            if settled.iter().all(Option::is_some) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for (slot, key) in [&left.item_key, &right.item_key].into_iter().enumerate() {
+            let Some(result) = settled[slot].as_ref() else {
+                panic!("page {key} never settled");
+            };
+            let ItemQuery::Ready(matches) = result.as_ref() else {
+                unreachable!("only Ready is stored");
+            };
+            assert_eq!(&matches.origin.item_key, key);
+            assert_eq!(matches.hits.len(), 1, "{key} should see its own copy");
+        }
+
+        // 両方が置き場に残っていること。片方を引いてももう片方が追い出されない。
+        assert!(matches!(
+            manager.query_item(&left.item_key).as_ref(),
+            ItemQuery::Ready(_)
+        ));
+        assert!(matches!(
+            manager.query_item(&right.item_key).as_ref(),
+            ItemQuery::Ready(_)
+        ));
     }
 
     #[test]
