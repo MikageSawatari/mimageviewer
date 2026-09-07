@@ -214,6 +214,10 @@ press、drag閾値を超すmove、継続moveを別frameにする。最終stepは
 `PointerMoved(final)`→`PointerButton(up)`を送り、release frameで変化した最終座標も検証する。
 各stepは対象frameの処理を待つ。待つのはscript workerであり、UI threadにblocking waitを追加しない。
 LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終位置を検証する。
+このfixtureは既存の使い捨て`--settings-override`でSingle/Pagedと
+`fullscreen_seek_bar_locked=true`・`still_seek_strip_locked=true`を指定する。
+実callbackのspread/flow/読み方向/表示/lockを公開して条件を確認し、LTR/RTL等の変更は
+既存KeyActionを使う。lock切替操作そのものを試験したとは扱わない。
 
 実装前提調査で確定した境界:
 

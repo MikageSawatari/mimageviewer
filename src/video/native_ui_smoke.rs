@@ -1242,18 +1242,22 @@ fn wait_for_receipts(
             let state = lock_broker_state(broker)?;
             completed_actual_point(&state, token, prepared)?.is_some()
         };
-        validate_owner_for_phase(
+        if let Err(error) = validate_owner_for_phase(
             validate_owner_and_interrupt,
             "receipt_wait_after_state_scan",
-        )?;
+        ) {
+            return Err(receipt_wait_failure(broker, token, error));
+        }
         if complete {
             require_unexpired_deadline(deadline, "validating native mouse receipts")?;
             validate_os_target(&prepared.target)?;
             validate_prepared_target(broker, prepared)?;
-            validate_owner_for_phase(
+            if let Err(error) = validate_owner_for_phase(
                 validate_owner_and_interrupt,
                 "receipt_completion_after_target_validation",
-            )?;
+            ) {
+                return Err(receipt_wait_failure(broker, token, error));
+            }
             let state = lock_broker_state(broker)?;
             let point = completed_actual_point(&state, token, prepared)?.ok_or_else(|| {
                 "native mouse receipt completion was revoked during final validation".to_string()
@@ -1284,6 +1288,52 @@ fn wait_for_receipts(
                 return Err("native mouse diagnostic broker state is poisoned".into());
             }
         }
+    }
+}
+
+fn receipt_wait_failure(broker: &Broker, expected_token: usize, error: String) -> String {
+    match lock_broker_state(broker) {
+        Ok(state) => match state.pending.as_ref() {
+            Some(step) => format!(
+                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending_token=0x{:x},requested=({},{}),tolerance=({},{}),pump_actual={},render_actual={},failure={}}}",
+                step.token,
+                step.target.client_point.x,
+                step.target.client_point.y,
+                step.coordinate_tolerance[0],
+                step.coordinate_tolerance[1],
+                format_receipt_point(step.pump_actual_point),
+                format_receipt_point(step.render_actual_point),
+                step.failure
+                    .as_deref()
+                    .map(bounded_diagnostic_text)
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            None => format!(
+                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending=none}}"
+            ),
+        },
+        Err(diagnostic_error) => format!(
+            "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},unavailable={}}}",
+            bounded_diagnostic_text(&diagnostic_error)
+        ),
+    }
+}
+
+fn format_receipt_point(point: Option<[i32; 2]>) -> String {
+    point.map_or_else(
+        || "none".to_string(),
+        |point| format!("({},{})", point[0], point[1]),
+    )
+}
+
+fn bounded_diagnostic_text(text: &str) -> String {
+    const LIMIT: usize = 240;
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
     }
 }
 
@@ -2288,6 +2338,37 @@ mod tests {
         )
         .expect_err("complete receipts must still respect the shared deadline");
         assert!(error.contains("deadline expired"));
+    }
+
+    #[test]
+    fn receipt_owner_failure_keeps_pending_route_evidence_before_cleanup() {
+        let fixture = ReceiptFixture::new();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        let error = wait_for_receipts(
+            &fixture.broker,
+            fixture.metadata.token,
+            &fixture.prepared,
+            Instant::now() + Duration::from_secs(1),
+            &mut || {
+                let mut state = lock_broker_state(&fixture.broker)?;
+                state.pending.as_mut().unwrap().failure =
+                    Some("render failed while owner callback ran".to_string());
+                Err("fresh owner validation failed".to_string())
+            },
+        )
+        .expect_err("owner failure must stop receipt completion");
+        assert!(error.contains("owner_validation_phase=receipt_wait_after_state_scan"));
+        assert!(error.contains("expected_token=0x1234,pending_token=0x1234"));
+        assert!(error.contains("requested=(120,100),tolerance=(1,1)"));
+        assert!(error.contains("pump_actual=(120,100),render_actual=none"));
+        assert!(error.contains("failure=render failed while owner callback ran"));
+        assert!(
+            lock_broker_state(&fixture.broker)
+                .unwrap()
+                .pending
+                .is_some()
+        );
     }
 
     #[test]
