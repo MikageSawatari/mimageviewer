@@ -11,11 +11,13 @@
 # Usage:
 #   PS> scripts\build-portable.ps1
 #   PS> scripts\build-portable.ps1 -SkipBuild      (re-assemble only, reuse last core build)
+#   PS> scripts\build-portable.ps1 -KeepRunning    (do not stop repo-built app processes)
 
 [CmdletBinding()]
 param(
     [switch] $SkipBuild,
-    [switch] $Sign
+    [switch] $Sign,
+    [switch] $KeepRunning
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,28 +63,34 @@ Write-Host "[portable] version = $version"
 # ---------------------------------------------------------------------------
 # Stop any running core/portable instances that may lock the exe.
 # Only repo-built ones (path under repo root) are touched.
+# -KeepRunning skips only this block so build/package preparation can proceed
+# while a portable copy is open. The default behavior remains unchanged.
 # ---------------------------------------------------------------------------
-$repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
-# Exact names only. "mimageviewer*" also matches Cargo's test harnesses
-# (target\debug\deps\mimageviewer-<hash>.exe), which live under the repo root and so pass
-# the path check - stopping those killed another session's `cargo test` (backlog 5.3).
-$stoppableProcessNames = @(
-    'mimageviewer',
-    'mimageviewer-core',
-    'mimageviewer-remote',
-    'mimageviewer-vst3-host',
-    'mimageviewer-susie32'
-)
-Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $stoppableProcessNames -contains $_.Name } |
-    ForEach-Object {
-        $p = $null
-        try { $p = $_.Path } catch { $p = $null }
-        if ($p -and $p.ToLower().StartsWith($repoPrefix)) {
-            Write-Host "[portable] stopping $($_.Name) (PID=$($_.Id))"
-            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+if ($KeepRunning) {
+    Write-Host "[portable] leaving repo-built app processes running"
+} else {
+    $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
+    # Exact names only. "mimageviewer*" also matches Cargo's test harnesses
+    # (target\debug\deps\mimageviewer-<hash>.exe), which live under the repo root and so pass
+    # the path check - stopping those killed another session's `cargo test` (backlog 5.3).
+    $stoppableProcessNames = @(
+        'mimageviewer',
+        'mimageviewer-core',
+        'mimageviewer-remote',
+        'mimageviewer-vst3-host',
+        'mimageviewer-susie32'
+    )
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $stoppableProcessNames -contains $_.Name } |
+        ForEach-Object {
+            $p = $null
+            try { $p = $_.Path } catch { $p = $null }
+            if ($p -and $p.ToLower().StartsWith($repoPrefix)) {
+                Write-Host "[portable] stopping $($_.Name) (PID=$($_.Id))"
+                try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+            }
         }
-    }
+}
 
 # ---------------------------------------------------------------------------
 # Build the portable core (no launcher; native deps NOT embedded).

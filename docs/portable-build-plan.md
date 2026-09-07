@@ -482,6 +482,31 @@ AV 誤検知は「unsigned + 低レピュテーション + dropper 挙動」の�
 緩和できる (署名すればランチャー版の誤検知も減る)。両者は別軸で、両方やると最も堅い。
 署名は費用・更新運用が絡むので本計画とは分けて検討する。
 
+## 11. データを保持する開発用portable更新 (2026-09-08)
+
+`target/portable-dev` は利用者が設定・索引を保持して検証する場所。
+毎回データを作り直す `prepare-portable-smoke.ps1` と区別する。
+
+稼働中の開発用portableを停止せず、別の出力先で成果物だけを作る場合:
+
+```powershell
+.\scripts\build-portable.ps1 -KeepRunning
+```
+
+`-KeepRunning` は既存のプロセス停止段だけを省略する。指定しない既存callerの挙動、
+`target-portable` でのfeature分離、`dist/mImageViewer_portable_v<VERSION>` の組立は維持する。
+稼働中の実行ファイル自体を上書きできるようにするoptionではない。
+
+ビルド成功後、利用者が旧portable-devを終了してから更新・起動する:
+
+```powershell
+.\scripts\update-portable-dev.ps1 -SkipBuild
+Start-Process -FilePath .\target\portable-dev\mimageviewer.exe
+```
+
+既存の `data` と `data-remote` を保持する。既存検証データへ `-Seed` は使わない。
+エージェントは利用者のportable-devを起動せず、UI自動検証が必要な場合は別の使い捨てportable-smokeを使う。
+
 ## 関連ドキュメント
 
 - [architecture-overview.md](architecture-overview.md) — 全体構造・永続化ストア一覧
