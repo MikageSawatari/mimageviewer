@@ -1459,6 +1459,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
+
+利用者指定の親Astra設計・Sol前提検証・独立Astraレビューで、同じwheelをsemanticな
+`VideoZoomWheel`と元のraw `MouseWheel`の両方としてAppへ渡す分類漏れを確認した。
+既存のcommand消費判定を純関数へ集約し、当該variantを加える案に合意する。
+overlayを無効にする、入力を遅らせる、App側で回数を補正する症状パッチではない。
+
+影響先はnative overlayのcommand/raw振り分け。1回のpush→render batch内では
+video zoom/audio modeが一定で、canvas wheelにはsemantic command、strip/panel/modalには
+既存egui/local処理先がある。正当な処理先がApp rawだけになる兄弟wheelは見つからず、
+pending egui入力は維持する。Panorama/項目移動/tile/strip-rangeの既存消費分類も保持する。
+§1.199の混在batchで最終pointer位置が先行egui wheelに影響する問題は、この修正では未解決。
+
+production helper→raw非転送と、実Appのcurrent source epochにおける1.0→1.2/stale不変を
+分けて回帰検証する。epoch 0を無効とは扱わない。実compile・portable実入力・通常確認用buildは
+これからで、Windows nativeのproduction変更は利用者の実機確認前にcommitしない。
+
 **2026-09-08 §1.197 S2: 診断pointerのexact owner配送（実装前の構造合意）:**
 
 今回の利用者指定による担当移行の下で、親Astraの設計・Solの実装前提検証・独立Astraの
