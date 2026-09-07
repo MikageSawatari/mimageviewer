@@ -20773,9 +20773,12 @@ impl App {
         self.similar_index.query_results_are_stale()
     }
 
-    pub(crate) fn query_similar_book(&self, item: &GridItem) -> crate::similar_index::BookQuery {
+    pub(crate) fn query_similar_book(
+        &self,
+        item: &GridItem,
+    ) -> std::sync::Arc<crate::similar_index::BookQuery> {
         let Some(key) = similar_index_container_key(item) else {
-            return crate::similar_index::BookQuery::NotBook;
+            return std::sync::Arc::new(crate::similar_index::BookQuery::NotBook);
         };
         self.similar_index.query_book(&key)
     }

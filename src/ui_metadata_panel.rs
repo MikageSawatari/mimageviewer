@@ -1000,7 +1000,7 @@ impl App {
                     draw_similar_panel(
                         ui,
                         model,
-                        book.as_ref(),
+                        book.as_deref(),
                         results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),

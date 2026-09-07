@@ -419,17 +419,17 @@ impl SimilarIndexManager {
 
     /// `container_key` で引く。**ページではなく本で引くこと** — ページごとに引き直すと、
     /// 本を読み進めるあいだ 1 ページごとに数秒の照会が走る。
-    pub fn query_book(&self, container_key: &str) -> BookQuery {
+    pub fn query_book(&self, container_key: &str) -> Arc<BookQuery> {
         let item_key = container_key;
         if !self.item_is_enabled(item_key) {
-            return BookQuery::NotIndexed;
+            return Arc::new(BookQuery::NotIndexed);
         }
         let running = matches!(self.progress(), IndexProgress::Running(_));
         let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         match &*memory {
             MemoryState::Unloaded => {
                 if running {
-                    return BookQuery::Preparing;
+                    return Arc::new(BookQuery::Preparing);
                 }
                 drop(memory);
                 start_memory_load(
@@ -440,12 +440,12 @@ impl SimilarIndexManager {
                     MemoryLoadTrigger::BookQueryFallback,
                     Some(Arc::downgrade(&self.scheduler)),
                 );
-                return BookQuery::Preparing;
+                return Arc::new(BookQuery::Preparing);
             }
-            MemoryState::Missing if running => return BookQuery::Preparing,
-            MemoryState::Missing => return BookQuery::NotIndexed,
-            MemoryState::Loading => return BookQuery::Preparing,
-            MemoryState::Failed(error) => return BookQuery::Failed(error.clone()),
+            MemoryState::Missing if running => return Arc::new(BookQuery::Preparing),
+            MemoryState::Missing => return Arc::new(BookQuery::NotIndexed),
+            MemoryState::Loading => return Arc::new(BookQuery::Preparing),
+            MemoryState::Failed(error) => return Arc::new(BookQuery::Failed(error.clone())),
             MemoryState::Ready(_) => {}
         };
         let MemoryState::Ready(snapshot) = &*memory else {
@@ -456,12 +456,12 @@ impl SimilarIndexManager {
         let mut query = self.book_query.lock().unwrap_or_else(|e| e.into_inner());
         match &*query {
             BookQueryState::Loading { item_key: active } if active == item_key => {
-                return BookQuery::Preparing;
+                return Arc::new(BookQuery::Preparing);
             }
             BookQueryState::Ready {
                 item_key: active,
                 result,
-            } if active == item_key => return result.clone(),
+            } if active == item_key => return Arc::clone(result),
             _ => {}
         }
         *query = BookQueryState::Loading {
@@ -491,12 +491,12 @@ impl SimilarIndexManager {
                 ) {
                     *state = BookQueryState::Ready {
                         item_key: query_key,
-                        result,
+                        result: Arc::new(result),
                     };
                 }
             }
         });
-        BookQuery::Preparing
+        Arc::new(BookQuery::Preparing)
     }
 
     fn item_is_enabled(&self, item_key: &str) -> bool {
@@ -1196,8 +1196,13 @@ enum SummaryState {
 
 enum BookQueryState {
     Idle,
-    Loading { item_key: String },
-    Ready { item_key: String, result: BookQuery },
+    Loading {
+        item_key: String,
+    },
+    Ready {
+        item_key: String,
+        result: Arc<BookQuery>,
+    },
 }
 
 #[derive(Default)]
