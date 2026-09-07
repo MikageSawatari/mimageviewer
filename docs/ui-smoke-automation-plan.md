@@ -630,5 +630,6 @@ filter間には重複があるため件数を合算しない。static fixture/Rh
 S3aはnative基盤に続きRhai接続・fresh UI owner validationを実装し、独立source review、
 通常/feature core check、owner/classification/期限/worker token回帰を完了。
 S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch0誤判定で入力前に停止した。
-列drag・動画zoomを自動化済みとは扱わない。
+静止画列dragは上記S2の最終liveで自動確認済み。動画zoomは未完了であり、
+S3aのmove配送確認だけでzoom・button・panの完了を主張しない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。
