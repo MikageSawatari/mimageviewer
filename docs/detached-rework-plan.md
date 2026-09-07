@@ -1,4 +1,4 @@
-﻿# Detached viewer 構造リワーク マスタープラン (正本)
+# Detached viewer 構造リワーク マスタープラン (正本)
 
 作成: 2026-07-05 / ClaudeCode
 体制: **実装 = Codex / 検収 = ClaudeCode / 実機検証 = ユーザー**
@@ -1458,6 +1458,44 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-09-08 別バージョン検索レビューR4/R8: 一時候補表示のviewer所有と描画identity
+（実装前の構造合意。実装・検証は[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡）:**
+
+親Astra/highと独立Astra/highは、長押し表示をApp-globalな通常比較modeから分離し、
+既存viewer-owned SimilarPanelStateにgestureと有界asset準備を所有させる方針で合意した。
+パネル可視性でreleaseが抜ける根因を、所有viewportの入力段で終端を処理する形で正す。
+raw mount/swapに取消副作用を加えず、明示park/close/pagechange/modechangeを終端境界とする。
+本文とnavigatorが候補専用identity/geometryを使い、元pageのidx・編集座標・提示完了へ偽装しない。
+幾何計算/paintのidentity非依存部分を共有し、通常page APIはwrapperとして維持する。
+元viewerのzoom/pan等へ書き戻さず、通常比較pin/mode/pair、viewport生成、host/registryの所有は維持する。
+新規detached bool/Optionや時間guardではなく、入力と描画資源の所有境界を揃える構造修正と判断した。
+通常/見開き/continuous、release/focus/遅延完了、park/mount/retire、2viewer非干渉を回帰対象とする。
+役割移行は利用者が明示した今回の開発体制に限り、実装・実機確認の完了を意味しない。
+
+**2026-09-08 別バージョン検索レビューR2: 明示候補移動が所有するviewer継続
+（製品コード・テスト設計は独立Astra承認、handler回帰16件・legacy lock1件成功。全体gate・portable・実機は[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡）:**
+
+右パネルのロックが別場所への類似移動で解除される根因は、一覧差替えのcloseを
+`fs_nav_locked_gen` の有無だけで真の退出と判定する点にある。password待ちでは入力lockが
+外れても同じ移動要求が続くため、lockを延長するだけの修正では契約を満たさない。
+親Astra/highと独立Astra/highは、既存context-owned `FsNavigationSequence` のphaseから
+viewer継続、入力block、holdover描画を導く変更を、症状パッチではない所有境界の修正と判断した。
+明示候補はRequired targetを持ち、真の退出/取消/失敗はownerを終端する。
+既存snapshotのPreferred target、通常動画transition、viewport生成とgeometryは維持する。
+入れ子ZIPの解決は既存bookmarkのtree解決を共有し、別contextへ副作用を出さない。
+通常/ZIP/PDF、password retry/cancel、対象欠落、真の終了、2viewer非干渉を回帰対象とする。
+事前レビューで、raw `release_fs_nav_lock` に退出副作用を足す案はsupersede時のロック消失を
+再導入するため撤回した。明示typed終端でViewerExitedとSupersededを区別する。
+既存legacy FolderNavigationも、任意のprevious画像と常に存在する移動ownerを分ける。
+capture失敗と非page bind fallbackでもownerを生成し、TargetReadyの描画消費はpreviousだけを
+解放する。動画を含むlegacy pollの経路を維持する所有修正として両Astraが合意した。
+全srcのproducer棚卸しで、`app/native_video.rs::toggle_still_window_mode` が同じvariantを
+表示切替用に使う第3経路だと確認した。`PresentationSwitch` へ分離し、viewer継続とは別に
+描画資源/timeoutを所有することを両Astraが追加承認した。viewport-enter描画は専用accessorへ接続し、
+既存navigation ownerをtoggle/timeoutで上書き・破棄しない。native presentation API全体とregistryは維持する。
+表示切替直後の退出、資源の描画/解放、移動待ち中のtoggle非干渉を自動回帰とportable実機で確認する。
+役割移行は利用者が明示した今回の開発体制に限る。
 
 **2026-09-07 別バージョン検索R3: パネル派生状態のviewer所有への移行
 （2026-09-08実装・独立レビュー完了。検証結果は[修正記録](duplicate-detection-review-fixes-20260907.md)を参照）:**

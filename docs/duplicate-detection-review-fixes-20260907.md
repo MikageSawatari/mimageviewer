@@ -1,4 +1,4 @@
-﻿# 別バージョン検索のレビュー修正計画 (2026-09-07)
+# 別バージョン検索のレビュー修正計画 (2026-09-07)
 
 開始点: `duplicate-detection` / `52723f7ce` (v3.6.0 統合済み)。
 指摘の根拠は [引き継ぎレビュー](duplicate-detection-handoff-review-20260907.md) の R1〜R9。
@@ -23,8 +23,8 @@
 | 指摘 | 実装・独立レビュー | 検証 |
 | --- | --- | --- |
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt成功。全体gate・実機は後続 |
-| R7 完成キャッシュ / R9 prefillとscope | 実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt成功 |
-| R2 類似移動でのパネルロック | 型付きnavigationの設計レビュー済み、実装前 | password・入れ子ZIPを含む回帰が必要 |
+| R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt成功 |
+| R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/pollを含む16件・既存legacy lock1件・resolver1件成功。全体gate・実機は後続 |
 | R4/R8 長押しと見開き | 独立レビューで実装境界を確認済み、実装前 | 未実施 |
 | R1/R5/R6 本照会 | 厳密検索・一貫したDB読取の設計候補。試作前 | 正確性と実データ性能による採否判断が必要 |
 
@@ -66,6 +66,34 @@ close/poll/drawはこのphaseを同じ意味で扱い、明示終了・取消・
   元要求の論理targetを書き換えて残さず、その要求内だけで実targetを使う。
 
 これらは実装担当がコードと再照合する前提であり、まだ実装完了の記録ではない。
+
+実装前照合で、通常フォルダは既存bundle-owned `FolderPaneOpenPending` の
+`FolderOpenScanPurpose` にRequired targetを持たせて共有できると確認した。
+既存 `snapshot_load_and_open` はそのままPreferredの挙動を保持し、明示候補の入口を分ける。
+
+再照合時に `release_fs_nav_lock` へ「sequenceあり・fullscreen_idxなしならpanel終了」を
+追加する案が出たが、親と独立Astraが不承認とした。password待ちから別候補へsupersedeする際も
+その条件が成立し、新要求開始前にロックが失われるためである。
+実装担当もこの反例を確認し、raw releaseは資源解放だけに保つ方針へ戻した。
+再openしない `ViewerExited` と同viewerの要求置換 `Superseded` をtypedな終端処理で区別する。
+password待ち→別候補のhandler経路でロック維持を必須回帰とする。
+
+さらに独立レビューで、従来Ctrl+↑↓のlegacy `FolderNavigation` は画像取得に失敗しても
+nav lockを取得する一方、owner自体がNoneになることを確認した。
+legacy ownerに任意のprevious画像を持たせ、captureと非page bind fallbackの両producerが
+画像なしでもownerを生成する形を採用する。legacy poll・動画bindの既存挙動は維持する。
+描画がTargetReadyになったらpreviousだけを解放し、要求ownerは既存terminalまで保持する。
+このOptionは移動状態のsentinelではなく任意の描画資源であり、移動中はenum variantで表す。
+通常Ctrl+↑↓とsnapshotのロック維持、画像資源なしの移動も回帰に含める。
+
+全srcを再検索すると `app/native_video.rs::toggle_still_window_mode` にも同variantのproducerがあり、
+これはnav lockを持たない表示切替用captureだった。単なるOption包みでは新しい継続判定へ
+誤分類されるため、親/独立Astraが `PresentationSwitch` としての分離を承認した。
+texture/traceとviewport-enter描画は専用資源を参照し、timeout/中断は当該variantだけ解放する。
+toggleで既存NavigationSequence/FolderNavigation (Display段階を含む) を上書きしない。
+表示切替直後の真の退出、資源の描画/解放、移動中toggle/timeoutの非干渉を回帰へ追加する。
+native presentation APIやregistry fieldの追加はしないが、静止画のウィンドウ/全画面切替は
+portable実機確認にも含める。
 
 ### R3: 類似サムネイルの要求・完了・退避
 
@@ -184,6 +212,8 @@ portable成果物を作成してから手渡す。実機確認前の項目を自
    索引の対象を変更する際にUIがDB待ちで止まらないことを確認する。
 6. 従来と同じ本・候補で本照会を行い、YouTube等の音声が途切れないことを再確認する。
    正確性の反例・SQLite世代整合は自動回帰と照合し、見た目の確認だけで保証しない。
+7. 静止画のウィンドウ表示/全画面を切り替え、表示とロック状態が維持されることを確認する。
+   直後に閲覧を終了した場合はロックが解除され、移動待ち中の切替では移動先を失わないことを確認する。
 
 この節は確認予定であり、実機検証の完了記録ではない。
 
@@ -241,3 +271,256 @@ DB保持中にOFF完了→書込み拒否と、旧ON読取→OFF完了→旧書�
 DB側の既存回帰は16成功/0失敗/1ignored (`target/r7-r9-similar-db-tests.log`)。
 core checkも成功 (`target/r7-r9-core-check.log`)、fmtとdiff checkも成功した。
 全体gate・portable実機は後続確認。
+
+### R2 編集監査での復元 (2026-09-08)
+
+実装途中の親のdiff監査で、`app.rs` に予定外の約3,800行削除を検出した。
+当初は複数置換のoffsetずれと判断していたが、後述の隔離再現により編集ツールとCRLFの
+組合せも原因候補として確認した。初回事象の原因は断定しない。誤った3hunkだけを逆適用し、
+正しいR2変更を保持した。親も巨大削除の消失とdiff checkを確認した。
+復元前差分は `target/r2-app-diff-audit-before-recovery.patch` に保持している。
+以後は一意contextのpatchを一変更ずつ適用し、直後にdiffを監査する。
+この段階のコードから検証成果物の作成・利用者アプリの更新はしていない。
+
+追加の独立監査で、別編集による約130行の予定外削除と裸のコメント断片も検出した。
+親は実装担当を停止し、そのhunkだけを復元して全コード差分を再監査した。
+既存fileは1回につき一意contextの1hunkだけを編集し、直後に差分を確認する手順へ限定した。
+構文確認を再開条件とし、実装途中の未定義参照とは区別して検査する。
+構文確認は成功した (fmtは未整形差分だけを報告)。第2事象の直前の2つのpatch原文を
+親が隔離したHEADコピーへ同順で再適用したところ、意図した6hunk (+46/-1) だけとなり、
+破損は再現しなかった。第2事象の原因は未特定で、patch toolの欠陥とは断定しない。
+原文は `target/r2-edit-incident-call.txt`、隔離試行は `target/r2-edit-probe/` に保持する。
+
+同じ先行レビューで、`fs_nav_is_locked` をDisplay全phaseへ拡張すると、RenditionFailed後も
+snapshotのCtrl+↑↓を拒否し続けるP2を検出した。AwaitingPasswordだけ入力を解除し、
+その他の既存lockgenによる入力制約は保持する方針へ修正する。
+viewer継続のtyped ownerと、従来の入力制約の意味を混同しない。
+
+### R2 編集ツールの隔離再現と手順変更 (2026-09-08)
+
+一意contextの1hunkだけでも約440行の予定外削除が再発したため、同じ手順を停止した。
+親がHEADの隔離コピーをCRLFにして、その1hunkを `tools.apply_patch` へ渡すと、
+意図は1行置換なのにsemantic diffが +123/-3489となる破損を再現できた。
+LF版の先行試行では正常だった。大きなUTF-8/CRLFファイルとツールの組合せが再現条件であり、
+ツール内部の原因までは特定していない。第1・第2事象を担当者のoffset処理だけに帰属させない。
+証拠: `target/r2-edit-incident-third-call.txt`、`target/r2-app-third-corruption.patch`、
+`target/r2-edit-probe/after-crlf.rs`。隔離コピーを製品のソースや検証成果物には使わない。
+
+実装担当は破損した181 bytesだけをHEAD由来の正しい18,613 bytesへ復元した。
+直前SHA-256、context一意性、変更外prefix/suffixのbytes一致、UTF-8妥当性とNULなしを確認し、
+app.rsのsemantic diffは +138/-16、core checkも成功した。正しいR2変更は保持した。
+以後、既存CRLF/混在sourceにはこのpatch toolを使わず、現ファイルのbytesを直前に読み、
+一意contextの1回置換・書込直前hash一致・範囲外bytes同一・直後diff監査を行う。
+全体の改行変換やファイル全体のcheckoutで復旧しない。
+
+### R1/R5/R6 API境界の独立再照合 (2026-09-08)
+
+既存SimilarDbのload_base_search_rows/load_item_changes_after/load_book_pages/
+resolve_pages_by_item_idは各自mutex・transactionを取得する。新read transaction内から呼ばず、
+SQL本体をprivateなConnection reader helperへ抽出し、既存wrapperとBookReadSnapshotで共有する。
+本照会専用接続はschema操作をしない。read_seqは履歴prune後も残るsqlite_sequenceを使う。
+履歴欠落・store不一致・array先行時の復旧は、同TX公開行からmemory-only snapshotを構築する。
+永続base書込・history pruneを伴うload_or_rebuild/rebuild_from_sqliteをqueryから呼ばない。
+ページ順修復はitem_changeを増やさないため、page orderは同TXから読む。
+
+起点要求/scope/store変更とshutdownはhard cancel、同storeのarray進行・compactionはsoft staleとする。
+後者では同TXの整合した結果を一度公開し、最新refreshを1件へまとめる。memory_epoch一致だけで
+完成結果を捨てると、索引更新中の数秒queryが永久に表示されないためである。
+『変更後に旧結果を採用しない』はfavorite scope等のhard identity変更を指す。
+既存BookQueryStateを実行中1件＋最新待機1件のownerへ拡張し、desired/requested/completedを束ねる。
+同一完了要求を毎frame再投入せず、既存last_ready即表示を維持する。
+
+新classifier入口はcommon状態だけでなく、同TX検証済みの対応辺(index_a,index_b,distance)を受け、
+既存weighted_monotonic_alignmentと判定計算を共有する。全corpus入口は参照実装として残す。
+少数2冊の同一頁が各10,000回反復する場合は真の辺が1億になるため、MIHだけで性能を保証できない。
+試作で反復数を段階的に増やし、辺保持/alignmentが限界なら間引きせず設計へ戻す。
+全頁commonとquality=0の既存表示区別を維持し、未依頼のUI分類を追加しない。
+
+### MIH bucket分布の予備調査 (2026-09-08)
+
+親が検証用baseコピーをread-only memmapし、quality正値4,619,313件の16bit bucketを集計した。
+blockごとの最大bucketは784～1,843件。等間隔に選んだ2,048署名について392bucketを読む場合、
+重複排除前posting参照数は中央値31,682、p95 39,884、最大68,844だった。
+`target/review-fixes-bench-20260908/base-bucket-research.json` に詳細を保持した。
+これはseq=0の分布調査で、実本のquery計測や正確性検証ではない。delta追随・全照会性能・
+重複排除・alignment・音声影響について採用判断はまだ行わない。
+
+### R4/R8 描画境界の独立再照合 (2026-09-08)
+
+DisplayedImageTransform/Inputはpage_idxを必須とし、draw_fs_imageは元pageのcontent_bboxを読む。
+候補を元idxやsentinelで渡さず、identity非依存の幾何計算・paintを共有helperへ抽出する。
+従来page APIはwrapperとして残し、candidate identity付きの一時transformは別に所有する。
+render_fullscreen_viewportのpage layout clear後、continuous/Single/Spreadより前で
+Original/TemporaryPreviewを選び、本文・navigator・提示完了判定へ同じ選択を渡す。
+候補表示では通常比較・旧holdover重畳を通さず、元のnormal pin/mode/pairは変更しない。
+
+候補はcanonical orientationと候補自身のsource/texture寸法・全体領域を使う。
+viewerのfit mode/scale limits/zoom/panは読取専用で適用するが、元ページのtrim、split、
+rotation/free rotation、postfilter、調整は転用しない。必要なpan補正は一時transform内だけに留める。
+release時は元の表示状態へ戻す。continuousでも候補一枚を同じ画像領域へ一時表示する。
+panoramaでは現行UIに新規press入口がないため、新APIを加えずmode変更で取消する。
+
+navigatorは同じcandidate asset/geometryから縮図を作り、FsNavigatorTextureSourcesへ
+候補idxを偽装登録しない。通常page layoutを取得する部分と縮図の幾何計算を共有化する。
+候補geometryはsingle_transform/fullscreen_page_layoutへ保存せず、候補frameで元pageの
+emit_fs_page_turn_ready_for_display_unitやfs_painted_lastを更新しない。
+編集・範囲copy・ルーペ・navigator等のcanvas操作開始ではpreviewを取消し、元pageのgeometryを
+解決して通常操作へ渡す。候補の座標を元画像への操作に流用しない。
+
+### R2 終端ownerの先行レビュー補強 (2026-09-08)
+
+内部closeではNavigationSequenceとlegacy FolderNavigationの両方を閲覧継続として扱うため、
+ViewerExitedの終端でも両variantへpanel終了を投影する必要があると独立Astraが指摘した。
+NavigationSequenceだけに限定すると、従来Ctrl+↑↓のPDF取消/Interrupted/対象なし/非継続password待ちで
+ownerだけ消え、ロック状態が残る。PresentationSwitchは移動ownerに含めない。
+また通常folder scanは受付時に旧要求を取消し、成功時にだけ新viewer teardownを行う境界を監査中。
+同itemsの別候補操作・真の終了・password待ちからの別scan後に、旧完了を適用しない回帰を加える。
+
+### R1 対応辺が密な場合の設計境界 (2026-09-08)
+
+独立Astraが現Fenwick alignmentの完全同点規則を確認した。A=X/B=XXXでは(A0,B2)、
+A=X/B=XXXXでは(A0,B0)が選ばれる。候補辺のあるB座標だけを圧縮するtree形状にも依存し、
+scoreだけ同じ別LCSへ置き換えるとページ帯の位置・クリック先が変わる。
+同長かつ全eligibleページが同一署名なら、最適な単調全単射はk番目同士だけなので、
+common判定後のO(n+m) shortcutを厳密に検証できる。異長/混在/非連続反復へ一般化しない。
+一般の密な対応ではstreaming Fenwickとcheckpoint再実行が保持量を下げる候補だが、
+CPU費用は残り、正当性・速度は未検証。性能試作で必要性が判明した場合に設計へ戻す境界とする。
+
+### R2 最終コードレビューでの適用境界の訂正 (2026-09-08)
+
+独立Astraのcall graph照合で、load_folder_with_scan_claimedに共通closeはなく、通常folderは
+start_loading_items_innerでclose、ZIP/PDFは早期returnと条件付きcloseに分かれると確認した。
+ZIPのsame-viewer移動はnav lockにより条件付きcloseを通らず、PDF cache missも列挙完了まで
+closeしない。converted ZIPも同じZIP loaderへ到達する。
+実装中Required入口のclose省略はこの前提を満たさず、旧fullscreen_idxを残すため訂正する。
+共有適用境界は『owner取得→旧要求取消→snapshot解除→content close→load→strict open/defer』。
+通常folderはscan成功後にこの境界へ入り、受付時は旧request取消だけを行う。
+SLIでの重複closeは同じFolderItems ownerの内部teardownとして扱い、個別loader/video APIへ
+症状ごとの分岐を増やさない。
+
+併せて、実装中差分の次の取りこぼしを修正対象とした。
+- Fs scan前のsnapshot解除は失敗/取消でもsnapshot/★固定/戻り先payloadを失うため成功applyへ遅延する。
+- 新scan受付では旧folder-nav worker/累積stepも取消し、古いDFS完了で新要求が負けないようにする。
+- RequiredFullscreenTargetは既存bundle-owned purposeであり、main/detached双方のapply consumerで扱う。
+- deferred/embedded holdoverのEsc/閉じるもraw releaseだけにせず、ViewerExitedと旧列挙取消を通す。
+- HEAD既存のZIP exact→item_key fallbackは共有resolverに保持する。今回新規のFs/PDF path_eqは
+  Required resolverだけに置く。既存Preferredの挙動を縮小しない。
+これらは検証成果物を渡す前のレビュー指摘であり、修正完了・回帰成功の記録ではない。
+
+### R1 同長alignmentの厳密shortcut候補 (2026-09-08)
+
+親が前記shortcutを一般化し、独立Astraが数学的成立条件を再確認した。
+同じTX/scopeでidentity・common・qualityを検証したeligible列が両側N件で、実page_index順の
+k番目同士がすべてradius以内なら、matched=Nを達成する厳密単調対応はk→kの全単射だけである。
+署名が混在し距離が0でなくても、距離合計やFenwick同点処理に選択余地はなく、O(N)で確定できる。
+元のpage_indexと実距離を返し、N=0、最低一致数、coverage、Strong/Weak等の既存分類は共有する。
+params・同一本・page_index重複・署名幅など参照APIの入力検査も飛ばさない。
+
+適用は候補発見と両側common確定後、pair辺の展開/ソート/Fenwick前とする。
+候補発見段階で同署名の近傍結果を共有し、container集合と検証済みページidentityを保持して、
+各Aページとの直積展開を遅らせる。先に全辺を作るとshortcut前に1億辺となり意味がない。
+対角に一つでも半径外がある場合、異長の場合は通常の厳密経路へ戻る。
+これは正当性の設計レビューであり、実装・oracle一致・速度の検証は後続で行う。
+
+### R6 ページ順修復の通知境界 (2026-09-08)
+
+独立再照合で、memory loadは索引workerのpage-order修復と並行し、修復前に本queryが始まれると確認した。
+修復成功は現在logだけで、通常run終端のIdle化まで再照会されない。旧query→修復→Idle→同key新query→
+旧query完成で新結果を阻むABAもあり、read_seqだけでは修復前結果を失効できない。
+修復transaction成功直後に本query ownerへ通知し、既存の要求ID境界で旧要求を失効させる設計候補とする。
+同read_seqでも再照会し、同TXのpage_order_versionをbook検証/stampへ含める。
+originだけでなくcandidate/common対象の修復も通知の対象とし、UIにSQLや全book集計を追加しない。
+reader側の修復・base再生成・人工的な履歴追加はしない。実装前に通知とownerの具体APIを再検証する。
+
+### R2 中間compileと既存resolver回帰 (2026-09-08)
+
+中間core checkは成功 (17秒、実装担当の実行結果)。最初のlib test compileは、新しい
+FolderNavigationの任意資源型とAwaitingPasswordに既存test helperが未追随で、9 compile errorとなった。
+helperを追随させた後、`cargo test -p mimageviewer --features pack-build-tools --lib
+resolve_snapshot_target_idx_matches_each_leaf_kind` は1成功/0失敗 (compile 1分55秒、test 0.16秒)。
+ログ: `target/r2-snapshot-target-narrow.log`、`target/r2-snapshot-target-narrow-compile2.log`。
+これは既存resolverの狭域確認であり、新Required handler・全終端・複数viewerの回帰完了ではない。
+レビュー指摘への最新修正、handler回帰、最終独立レビューは継続中。
+
+### R2 製品コードの独立承認 (2026-09-08)
+
+Required scan失敗をmain/detached共通化し、旧pageありはSuperseded（入力制限/資源を解放しpanel保持）、
+pageなしはViewerExitedへ終端した。still-owned receiverのDisconnectedもRequiredだけ同じ終端へ進む。
+新候補受付では旧DFS/累積stepを取消し、snapshotはscan成功まで保持する。
+同contextの実open境界を共通化して、別viewerへの転送後、validかつ別display unit時に旧Required scanを取消す。
+continuous seek/reanchorはidxまたはPageSliceの実変更を扱い、同項目内部再適用/無効idx/別contextは巻き込まない。
+scan成功ではpendingは既にpoll.take済みで、新しく作る移動ownerを自分で取り消さない。
+
+独立Astra/highが全体の製品差分と最後の2修正の直接影響を確認し、残存P1/P2なしでコードを承認した。
+予定外の巨大削除はなく、HEAD既存のsnapshot ZIP fallbackも保持されている。
+実handler回帰の追加・成功ログ照合、全体gate、portable実機確認はまだ未完了である。
+
+### 最初のportable検証マイルストーン
+
+利用者が右パネル修正を先に実機確認できるよう、R2のhandler回帰と独立承認後、R2/R3/R7/R9を
+含む最初のfull gate・portable buildを行う。その後もR4/R8、本照会R1/R5/R6の試作・修正を継続する。
+最初の成果物では未修正の指摘を完了と扱わない。ビルド元、成功ログ、実際の更新可否は作成後に記録する。
+初回の実機対象は右パネルの場所間移動/取消/真の終了、別窓の状態独立、候補scroll、索引状態と対象変更、
+静止画のウィンドウ/全画面切替である。長押しと本の判定修正の確認は、それぞれを含む後続成果物で行う。
+`build-portable.ps1 -KeepRunning`で先にpackageを用意し、利用者が旧portableを終了した後だけ
+`update-portable-dev.ps1 -SkipBuild`で更新する。data/data-remoteは保持し、Seed/初期化/agent起動はしない。
+
+### R2 状態回帰14件の中間結果 (2026-09-08)
+
+新規 `app::similar_navigation_tests` の初回compileはfixture内の借用競合6件で失敗した。
+生成番号を先に読むhelperへ修正後、同filterは14成功/0失敗 (compile 1分08秒、test 2.18秒)。
+ログ: `target/r2-similar-navigation-tests-compile1.log`、`target/r2-similar-navigation-tests-compile2.log`。
+
+独立レビューでは実際の `open_similar_hit` / `open_similar_book_page`、ZIP/PDFのpoll完了、
+Aの完了時にBの表示/待機が不変であること、PresentationSwitch自身の資源解放、legacy ownerの
+実producer経由の確認が不足していると判断した。14件の成功だけでR2の検証完了とは扱わず補強中。
+PDFのテスト用handle生成は既存coordinator/leaseを使うcfg(test) factoryに限定する。
+### portable更新手順の独立確認 (2026-09-08)
+
+独立Astraがscriptsの読取確認を完了。test-fullにはfmt/glyphが含まれないので別途実行する。
+`build-portable.ps1 -KeepRunning`は当worktree直下から実行し、終了コード0とpackage完成を確認する。
+updaterはdataだけを明示除外するため、更新直前の未起動packageにdata/data-remoteがないことを確認する。
+対象アプリが終了している状態で`update-portable-dev.ps1 -SkipBuild`を実行し、更新後にpackageと
+実行物のSHA-256を照合する。コピーは非原子的なので、途中失敗時は未更新と扱い、閉じたまま再実行する。
+事前walkでは既存dist v3.6.0は24files/439399502bytesでdata/data-remote・reparse pointなし。
+これはbuild前の確認であり、package再生成と更新直前には再確認する。
+### R2 実機確認とcommit境界
+
+PresentationSwitch分離はnative APIを追加しなくても、専用fullscreen viewportへの切替時の
+表示保持・移動ownerへ影響する。親と独立AstraはAGENTS.mdの
+「For these native features, commit after the user confirms on real hardware」に該当すると判断した。
+R2は未commitで初回portableを作り、基点HEAD、最終fmt後の正確な差分、検証ログ、成果物SHA-256を保存する。
+利用者の実機確認後にR2単位でcommitする。後続R4が同ファイルを編集する前にR2差分を確定保存し、
+R2としてcommitする差分が検証版と一致することを照合する。R3/R7/R9等の既存commitは変更しない。
+### 初回portable版の利用者確認手順
+
+成果物の更新成功とハッシュ一致を記録した後、利用者が次で起動する。
+`Start-Process -FilePath C:\home\mimageviewer-dupe\target\portable-dev\mimageviewer.exe`
+既存portableのdata/data-remoteを使用する。エージェントは起動しない。
+
+1. 右パネルをロックし、類似画像または本のページ帯から、別フォルダ・ZIP・PDFへ移動する。
+   対象ページへ移り、パネルと類似タブが維持されることを確認する。
+2. 読み込み中に別ページへ移動する／閲覧を閉じる。古い完了で元の移動が復活しないこと、
+   真の終了後に画像を開き直したときはパネルのロックが解除されていることを確認する。
+3. パスワード付きPDFを利用する場合、待機中の再入力と取消を確認する。
+   別の無関係な先頭ページへ移動しないことも確認する。
+4. 別窓を二つ開き、一方の類似移動・閉じる操作が他方の画像、パネル、類似タブを変えないことを確認する。
+   静止画のウィンドウ／全画面切替も行い、画像の保持と操作の復帰を確認する。
+5. 類似一覧をスクロールして候補サムネイルを確認し、お気に入りの索引対象を変更して操作が止まらないこと、
+   索引終了後に未収録画像が「準備中」のまま残らないことを確認する。
+
+音声途切れは前版で解消を利用者確認済み。今回のUI変更でも同時再生を確認し、再発があれば記録する。
+R4/R8の長押しとR1/R5/R6の本判定は初回成果物の修正完了項目に含めない。
+### R2 handler回帰の最終狭域結果 (2026-09-08)
+
+初回final compileは新fixtureのVec<GridItem>直接比較2箇所でPartialEq/Debug不足の6診断となった。
+product型のtraitを増やさず、既存perf_keyの順序付きidentity列の比較に修正した。
+`target/r2-similar-navigation-tests-final-v2.log` は16成功/0失敗/0ignored、compile1分06秒/test2.83秒。
+旧log `target/r2-similar-navigation-tests-final.log` も失敗証跡として保持する。
+既存legacy lock回帰は `target/r2-legacy-lock-test.log` で1成功/0失敗。
+
+独立Astraの確定差分レビューは製品コード・追加16tests・cfg(test) helperに残存P1/P2なし。
+実hit/book-page handler、ZIP/PDF channelから実poll、main/detachedの完了・終了、閉じたBへのA完了の
+非干渉、PresentationSwitch資源と期限解放、previous無しlegacy captureからの内部closeを確認した。
+PDF factoryはtest用local coordinatorの正規leaseを使い、UI helperは実handlerへの委譲だけとした。
+全体gate・portable build・実機確認はこの狭域成功時点では未完了である。
