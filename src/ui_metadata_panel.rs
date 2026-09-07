@@ -29,6 +29,7 @@ struct SimilarThumbResult {
     image: Option<egui::ColorImage>,
 }
 
+#[derive(Clone)]
 enum SimilarThumbState {
     Loading,
     Ready(egui::TextureHandle),
@@ -88,21 +89,49 @@ impl SimilarPanelState {
         pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
         ctx: &egui::Context,
     ) {
-        if self.thumbnails.contains_key(&hit.item_key) {
+        self.ensure_thumbnail_for(
+            &hit.item_key,
+            crate::similar_index::target_for_hit(hit).cloned(),
+            hit.mtime,
+            hit.file_size,
+            thumb_px,
+            thumb_quality,
+            cache_decision,
+            pdf_passwords,
+            ctx,
+        );
+    }
+
+    /// 場所が分かっている 1 件のサムネイルを用意する。
+    ///
+    /// 結果一覧の行と、ページ帯にホバーしたページが同じ経路を通る。別々に読むと、同じ画像を
+    /// 2 回読み、キャッシュの当たり方も食い違う。
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_thumbnail_for(
+        &mut self,
+        key: &str,
+        target: Option<crate::similar_index::SimilarItemTarget>,
+        mtime: i64,
+        file_size: i64,
+        thumb_px: u32,
+        thumb_quality: u8,
+        cache_decision: crate::thumb_loader::CacheDecision,
+        pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+        ctx: &egui::Context,
+    ) {
+        if self.thumbnails.contains_key(key) {
             return;
         }
-        let Some(target) = crate::similar_index::target_for_hit(hit).cloned() else {
+        let Some(target) = target else {
             self.thumbnails
-                .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+                .insert(key.to_owned(), SimilarThumbState::Failed);
             return;
         };
         self.thumbnails
-            .insert(hit.item_key.clone(), SimilarThumbState::Loading);
-        let item_key = hit.item_key.clone();
+            .insert(key.to_owned(), SimilarThumbState::Loading);
+        let item_key = key.to_owned();
         let result_tx = self.thumb_tx.clone();
         let repaint = ctx.clone();
-        let mtime = hit.mtime;
-        let file_size = hit.file_size;
         let pdf_passwords = pdf_passwords.cloned();
         let context_epoch = crate::pdf_loader::current_render_context_epoch();
         let spawned = std::thread::Builder::new()
@@ -191,7 +220,7 @@ impl SimilarPanelState {
             });
         if spawned.is_err() {
             self.thumbnails
-                .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+                .insert(key.to_owned(), SimilarThumbState::Failed);
         }
     }
 }
@@ -2284,7 +2313,17 @@ fn draw_similar_panel(
         }
     }
     if let Some(book) = book {
-        draw_book_relations(ui, book, ctx, actions);
+        draw_book_relations(
+            ui,
+            book,
+            state,
+            thumb_px,
+            thumb_quality,
+            cache_decision,
+            pdf_passwords,
+            ctx,
+            actions,
+        );
     }
 }
 
@@ -2292,9 +2331,15 @@ fn draw_similar_panel(
 ///
 /// 本を開いていないときは何も出さない。`NotBook` は失敗ではなく「この画像は本のページでは
 /// ない」という状態なので、文言を出して場所を取ることはしない。
+#[allow(clippy::too_many_arguments)]
 fn draw_book_relations(
     ui: &mut egui::Ui,
     book: &crate::similar_index::BookQuery,
+    state: &mut SimilarPanelState,
+    thumb_px: u32,
+    thumb_quality: u8,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
@@ -2344,6 +2389,8 @@ fn draw_book_relations(
             );
         }
         BookQuery::Ready(hits) => {
+            draw_page_strip_legend(ui);
+            ui.add_space(6.0);
             for hit in hits {
                 ui.label(
                     egui::RichText::new(book_relation_name(&hit.other_container_key))
@@ -2356,7 +2403,28 @@ fn draw_book_relations(
                         .size(10.0),
                 );
                 ui.add_space(3.0);
-                draw_page_strip(ui, hit, actions);
+                // 単体画像の結果と同じ語彙にする。あちらに [移動] があってこちらに無いと、
+                // 本へ移る手段が帯のクリックだけになり、操作が別物に見える。
+                if ui
+                    .small_button("移動")
+                    .on_hover_text("重なりが始まるページを、相手の本で開く")
+                    .clicked()
+                    && let Some(opened) = book_open_target(hit)
+                {
+                    actions.open_page = Some(opened);
+                }
+                ui.add_space(3.0);
+                draw_page_strip(
+                    ui,
+                    hit,
+                    state,
+                    thumb_px,
+                    thumb_quality,
+                    cache_decision,
+                    pdf_passwords,
+                    ctx,
+                    actions,
+                );
                 ui.add_space(8.0);
             }
         }
@@ -2389,6 +2457,56 @@ fn book_relation_line(hit: &crate::similar_index::BookRelationHit) -> String {
     )
 }
 
+/// 帯の色の意味。**濃さの違いは説明が無いと読めない。**
+fn draw_page_strip_legend(ui: &mut egui::Ui) {
+    use crate::similar_index::BookPageState;
+
+    let swatch = |ui: &mut egui::Ui, state: BookPageState, label: &str, hover: &str| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 1.0, page_state_color(state));
+        response.on_hover_text(hover);
+        ui.label(egui::RichText::new(label).color(DIM_COLOR).size(10.0));
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+        swatch(
+            ui,
+            BookPageState::Strong,
+            "ほぼ同一",
+            "対応するページがあり、見た目もほぼ同じ",
+        );
+        swatch(
+            ui,
+            BookPageState::Weak,
+            "別バージョン",
+            "対応するページはあるが、解像度や修正で見た目が違う",
+        );
+        swatch(
+            ui,
+            BookPageState::Unmatched,
+            "対応なし",
+            "相手の本に対応するページが無い",
+        );
+        swatch(
+            ui,
+            BookPageState::Excluded,
+            "対象外",
+            "特徴が少ないか、どの本にもあるページ。割合の分母からも外れている",
+        );
+    });
+}
+
+/// 本の [移動] が開くページ。
+///
+/// **重なりが始まるページ**を選ぶ。相手の本の 1 ページ目ではない — 単話が総集編の 34 ページ
+/// 目から入っているとき、開きたいのは表紙ではなくそこである。
+fn book_open_target(
+    hit: &crate::similar_index::BookRelationHit,
+) -> Option<(String, crate::similar_index::SimilarItemTarget)> {
+    let page = hit.pages.iter().find(|page| page.other_target.is_some())?;
+    Some((page.other_item_key.clone()?, page.other_target.clone()?))
+}
+
 const STRIP_HEIGHT: f32 = 16.0;
 
 fn page_state_color(state: crate::similar_index::BookPageState) -> egui::Color32 {
@@ -2396,8 +2514,11 @@ fn page_state_color(state: crate::similar_index::BookPageState) -> egui::Color32
     match state {
         BookPageState::Strong => egui::Color32::from_rgb(86, 156, 214),
         BookPageState::Weak => egui::Color32::from_rgb(78, 105, 130),
-        BookPageState::Unmatched => egui::Color32::from_rgb(58, 58, 58),
-        BookPageState::Excluded => egui::Color32::from_rgb(38, 38, 38),
+        // 帯の地色 (28,28,28) から見分けられる明るさにする。暗くしすぎると「何も無い」と
+        // 区別が付かず、除外したページ数を隠したのと同じになる。
+        BookPageState::Unmatched => egui::Color32::from_rgb(72, 72, 72),
+        // 採点対象外は不一致の「濃い版」ではなく別種なので、明るさではなく色味で分ける。
+        BookPageState::Excluded => egui::Color32::from_rgb(84, 74, 56),
     }
 }
 
@@ -2462,13 +2583,18 @@ fn summarize_page_strip(
 /// 200〜600 ページを 300 px 弱に収めるので 1 ページが 1 px を切る。1 コマに複数ページが
 /// 入るときは**一番強い状態を出す**。対応が連続していれば塗りが続き、たまたま数ページ
 /// 一致しただけなら細い線として残る — この見分けが判定そのものになる (§14.2)。
+#[allow(clippy::too_many_arguments)]
 fn draw_page_strip(
     ui: &mut egui::Ui,
     hit: &crate::similar_index::BookRelationHit,
+    state: &mut SimilarPanelState,
+    thumb_px: u32,
+    thumb_quality: u8,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+    ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
-    use crate::similar_index::BookPageState;
-
     if hit.pages.is_empty() {
         return;
     }
@@ -2495,28 +2621,78 @@ fn draw_page_strip(
         );
     }
 
-    if let Some(pos) = response.hover_pos() {
-        let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
-        if let Some(page) = first_target[column] {
-            let entry = &hit.pages[page];
-            response.clone().on_hover_text(format!(
-                "この本の {} ページ目 → 相手の {} ページ目",
-                page + 1,
-                entry.other_page_index.map_or(0, |index| index + 1)
-            ));
-            if response.clicked()
-                && let (Some(target), Some(item_key)) =
-                    (entry.other_target.clone(), entry.other_item_key.clone())
-            {
-                actions.open_page = Some((item_key, target));
+    let Some(pos) = response.hover_pos() else {
+        return;
+    };
+    let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+    // ホバーしている位置に印を出す。帯は 1 px 単位なので、どこを指しているのか分からないと
+    // 押した先が予測できない。
+    painter.rect_stroke(
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + column as f32 - 1.0, rect.top()),
+            egui::vec2(3.0, STRIP_HEIGHT),
+        ),
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::WHITE),
+        egui::StrokeKind::Inside,
+    );
+    let Some(page) = first_target[column] else {
+        response.on_hover_text("ここに対応するページはありません");
+        return;
+    };
+    let entry = &hit.pages[page];
+    let Some(item_key) = entry.other_item_key.clone() else {
+        return;
+    };
+    // 行のサムネイルと同じ経路で読む。飛ぶ前にどのページなのかを見せる。
+    state.ensure_thumbnail_for(
+        &item_key,
+        entry.other_target.clone(),
+        entry.other_mtime,
+        entry.other_file_size,
+        thumb_px,
+        thumb_quality,
+        cache_decision,
+        pdf_passwords,
+        ctx,
+    );
+    let thumb = state.thumbnails.get(&item_key).cloned();
+    let caption = format!(
+        "この本の {} ページ目 → 相手の {} ページ目",
+        page + 1,
+        entry.other_page_index.map_or(0, |index| index + 1)
+    );
+    response.clone().on_hover_ui(|ui| {
+        ui.set_max_width(STRIP_PREVIEW_SIZE);
+        ui.label(egui::RichText::new(caption).size(11.0));
+        match thumb {
+            Some(SimilarThumbState::Ready(texture)) => {
+                let size = texture.size_vec2();
+                let scale = (STRIP_PREVIEW_SIZE / size.x.max(size.y)).min(1.0);
+                ui.add(egui::Image::new(&texture).fit_to_exact_size(size * scale));
             }
-        } else {
-            response
-                .clone()
-                .on_hover_text("ここに対応するページはありません");
+            Some(SimilarThumbState::Loading) | None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("読込中").size(10.0));
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Some(SimilarThumbState::Failed) => {
+                ui.label(egui::RichText::new("画像なし").size(10.0));
+            }
         }
+    });
+    if response.clicked()
+        && let Some(target) = entry.other_target.clone()
+    {
+        actions.open_page = Some((item_key, target));
     }
 }
+
+/// ホバー時に出すページの一辺。行のサムネイル (72px) より大きくして、飛ぶ前に中身が分かる
+/// 程度にする。
+const STRIP_PREVIEW_SIZE: f32 = 180.0;
 
 /// 「長押し表示」が 1 フレームでどう動くか。押している対象は key で見分ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2540,7 +2716,7 @@ fn decide_similar_peek(current: Option<&str>, held: Option<&str>) -> SimilarPeek
     }
 }
 
-/// 1 件ぶんの操作ボタン。
+/// 1 件ぶんの操作ボタン。/// 1 件ぶんの操作ボタン。
 ///
 /// 以前はホバー中に X を押す設計だったが、mIV に「ホバーしたまま打鍵する」操作は他に無く、
 /// どの候補が対象なのか画面から読み取れなかった。押した対象が曖昧にならないボタンにする。
@@ -2598,6 +2774,8 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
 
     let page = |state: BookPageState, other: Option<u32>| BookPageMatch {
         state,
+        other_mtime: 0,
+        other_file_size: 0,
         other_page_index: other,
         other_target: other.map(|_| {
             crate::similar_index::SimilarItemTarget::File(PathBuf::from(r"D:\Archive\other.png"))
@@ -3616,6 +3794,8 @@ mod similar_panel_tests {
     fn strip_page(state: crate::similar_index::BookPageState, other: Option<u32>) -> BookPageMatch {
         BookPageMatch {
             state,
+            other_mtime: 0,
+            other_file_size: 0,
             other_page_index: other,
             other_target: other.map(|_| {
                 crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/other.png"))
@@ -3743,6 +3923,44 @@ mod similar_panel_tests {
                 Some(BookPageState::Unmatched),
             ]
         );
+    }
+
+    /// 本の [移動] は重なりが始まるページを開く。相手の 1 ページ目を開くと、総集編の
+    /// どこに入っているのかを自分で探し直すことになる。
+    #[test]
+    fn opening_a_book_lands_where_the_overlap_starts() {
+        use crate::similar_index::{BookPageState, BookRelationHit};
+
+        let mut pages = (0..10)
+            .map(|_| strip_page(BookPageState::Unmatched, None))
+            .collect::<Vec<_>>();
+        pages[4] = strip_page(BookPageState::Strong, Some(33));
+        pages[5] = strip_page(BookPageState::Strong, Some(34));
+        let hit = BookRelationHit {
+            other_container_key: "e:/books/anthology.zip".to_string(),
+            pair: crate::dupe::book::BookPair {
+                a: 1,
+                b: 2,
+                matched: 2,
+                distinctive_a: 10,
+                distinctive_b: 200,
+                coverage_a: 0.2,
+                coverage_b: 0.01,
+                relation: crate::dupe::book::Relation::Contains { whole: 2 },
+                alignment: Vec::new(),
+            },
+            pages,
+        };
+        let (key, _) = super::book_open_target(&hit).expect("an overlapping page exists");
+        assert_eq!(key, "c:/other.png");
+
+        let empty = BookRelationHit {
+            pages: (0..3)
+                .map(|_| strip_page(BookPageState::Unmatched, None))
+                .collect(),
+            ..hit
+        };
+        assert!(super::book_open_target(&empty).is_none());
     }
 
     /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を

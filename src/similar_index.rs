@@ -169,6 +169,9 @@ pub struct BookPageMatch {
     /// 移動先。`items` に無い場所も開けるよう、照会側で解決しておく。
     pub other_target: Option<SimilarItemTarget>,
     pub other_item_key: Option<String>,
+    /// サムネイルのキャッシュ判定に使う。帯にホバーしたページを出すため。
+    pub other_mtime: i64,
+    pub other_file_size: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1617,6 +1620,8 @@ fn build_page_strip(
                 other_page_index: None,
                 other_target: None,
                 other_item_key: None,
+                other_mtime: 0,
+                other_file_size: 0,
             }
         })
         .collect::<Vec<_>>();
@@ -1643,6 +1648,8 @@ fn build_page_strip(
             other_page_index: Some(other_page),
             other_target: target,
             other_item_key: Some(other.item.item_key.clone()),
+            other_mtime: other.item.mtime,
+            other_file_size: other.item.file_size,
         };
     }
     strip
