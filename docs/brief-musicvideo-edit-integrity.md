@@ -1,7 +1,7 @@
 # 音楽ビデオ: 編集の整合性修正
 
 開始: 2026-09-08、`musicvideo` / `849c5a9d2`。
-Status: 対象修正の実装・独立レビュー・全体テスト完了。確認用ビルドを準備中。
+Status: 対象修正の実装・独立レビュー・全体テスト・確認用ビルド完了。実機確認は未実施。
 実装・自動検証・実機確認の結果は別々に記録する。
 
 正本: [music-video-export-plan.md](music-video-export-plan.md)。
@@ -283,6 +283,7 @@ Sol の narrow test は 1 passed、core fmt check は exit 0。最終 gate の c
 
 ### 歌詞の行対応と入力・読込境界
 
+コミット: `8e12458e4`。
 旧 `ReplaceLyricsText` の行番号による時刻再付与を撤去し、Unicode の編集範囲と行 identity に
 基づく `LyricsTextBuffer` へ移行した。Project JSON の `LyricLine` schema は変更していない。
 共通 snapshot には Project と行 identity を同時に格納する。本文訂正・挿入・削除・空行 cue・
@@ -305,7 +306,7 @@ IME・native TextEdit Undo/Redo と共通 Undo の境界を別々に検証した
 - 独立 Astra の最終再レビューで、H1/H2・歌詞 identity/時刻・選択の今回の freeze 範囲に
   未解決の blocking 指摘なし。実機確認、H3 の解析一致、P4 は承認の対象外。
 
-### 最終検証（進行中）
+### 最終検証（完了）
 
 ログ保存先: `target/musicvideo-edit-integrity-verification/`。
 
@@ -318,16 +319,30 @@ IME・native TextEdit Undo/Redo と共通 Undo の境界を別々に検証した
 | `cargo fmt --check` | exit 0。`cargo-fmt-check.log` |
 | `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphs なし。`check-ui-glyphs.log` |
 | `.\scripts\test-full.ps1` | exit 0 / PASS。本体 lib 7,498 passed / 33 ignored、UI snapshot 45 passed、core 73 / UI 87 / lab 45 passed、vendor egui-wgpu 9 / eframe 15 passed。`test-full.log` |
+| `cargo build --release -p musicvideo_lab` | exit 0、32.94 秒。`cargo-build-release-musicvideo-lab.log` |
+| `.\scripts\build-dev.ps1` | exit 0 / DONE。core 3 分 39 秒、remote 0.34 秒。`build-dev.log` |
 
 本体の既存 warning は残るが、上記 check に error はない。歌詞 UI に依存しない両対象を先行確認した。
-依存ソースが変わらなければ同じ check を繰り返さず、検証済み HEAD から確認用ビルドへ進む。
+検証後に runtime のコードを変えず、同じ HEAD から確認用ビルドを作成した。
+
+確認用ビルドのソース HEAD は `8e12458e4`。
+`target/release/musicvideo_lab.exe` は 2026-09-08 02:29:12 JST、26,081,280 bytes。未起動。
+`target/dev-runtime/mimageviewer-core.exe` は 2026-09-08 02:33:04 JST、308,096,512 bytes。未起動。
+remote は同じ既存出力を再利用した（12,169,216 bytes、2026-09-07 23:06:51 JST）。
+コマンド・exit・成果物の一覧は同じログディレクトリの `verification-summary.txt` に保存した。
+最終の文書記録コミットは、上記の検証済みコード・生成物を変更しない。
 
 ## 6. 修正後の短い実機確認
 
 この工程では完成した一本を作る前に、以下を小さい試験用 Project で確認する。
 自動テストで判定した内容と、実音・IME・操作感の結果を分けて記録する。
 ラボの起動対象は `target/release/musicvideo_lab.exe`。P4 未実装なので、本体 core から
-この編集画面へ入る導線はまだない。ビルド完了時の起動手順は検証結果とともに追記する。
+この編集画面へ入る導線はまだない。§5 のビルドは成功済みで、以下はユーザーが実行する。
+
+```powershell
+Set-Location C:\home\mimageviewer-musicvideo
+Start-Process -FilePath .\target\release\musicvideo_lab.exe
+```
 
 1. 音声と画像を開き、見分けられる別画像・別音声へ差し替える。Undo/Redo で表示・音・波形が
    対応して戻ること、連続操作しても途中の素材が遅れて復活しないことを見る。
@@ -354,3 +369,19 @@ IME・native TextEdit Undo/Redo と共通 Undo の境界を別々に検証した
   panel を広げた分が編集対象の一覧に使えるかを実用確認し、pane の単なる大型化で済ませない。
 
 これらは今回の整合性修正へ追加実装する条件ではなく、ユーザー確認後の UI 改善の入力である。
+
+### 本体の確認用ビルド
+
+AGENTS.md に従い `scripts/build-dev.ps1` でも通常 feature set の core を作成済み。
+本体側の基本的な閲覧・音楽ビュー等を確認する場合のコマンドは次のとおり。
+音楽ビデオ編集の確認には上のラボを使用する。
+
+```powershell
+Set-Location C:\home\mimageviewer-musicvideo
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+この core は通常の `%APPDATA%\mimageviewer` を使用し、実際の設定・データを更新し得る。
+single-instance mutex を共有するため、ユーザーは起動前にインストール版・tray 常駐版を終了する。
+`dev-runtime` は最適化 profile の名前であり、データの隔離ではない。エージェントは起動しない。
+今回、通常 profile の起動・設定ファイルの退避/初期化・ユーザー素材の書き換えは行っていない。
