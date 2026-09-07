@@ -46,12 +46,13 @@ pub(crate) struct SimilarPanelState {
     thumbnails: std::collections::HashMap<String, SimilarThumbState>,
     /// 読み込んだ順。上限を超えた分をここから古い順に落とす。
     thumb_order: std::collections::VecDeque<String>,
-    /// 直前に出せた結果。次の照会が返るまでこれを出し続ける。
+    /// 直前に出せた結果。次の照会が返るまでこれを出し続ける。**表示している面ごとに 1 つ**
+    /// (見開きなら左右で 2 つ)。
     ///
     /// 本を読み進めると起点はページごとに変わり、そのたびに照会が走る。返るまでの数フレーム
     /// を spinner に差し替えると、ページを送るたびに内容が消えて戻る。**古い内容を出したまま
     /// 差し替える方が読める。** 出している間は「更新中」と明記する。
-    last_ready: Option<std::sync::Arc<crate::similar_index::ItemQuery>>,
+    last_ready: Vec<Option<std::sync::Arc<crate::similar_index::ItemQuery>>>,
     thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
     thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
 }
@@ -64,7 +65,7 @@ impl Default for SimilarPanelState {
             origin_key: None,
             thumbnails: std::collections::HashMap::new(),
             thumb_order: std::collections::VecDeque::new(),
-            last_ready: None,
+            last_ready: Vec::new(),
             thumb_tx,
             thumb_rx,
         }
@@ -264,6 +265,30 @@ enum SimilarPanelModel<'a> {
     Empty,
     Results(&'a crate::similar_index::ItemMatches),
     Failed(&'a str),
+}
+
+/// パネルが扱う面。見開きなら**両方のページ**、単ページならそれだけ。
+///
+/// 見開きで片方しか調べないと、もう片方に別バージョンがあっても気付けない。補正パネルが
+/// 左右を切り替えるのは編集が一度に 1 ページだからで、閲覧側にその制約はない。
+fn similar_shown_indices(
+    fullscreen_idx: Option<usize>,
+    spread: crate::ui_fullscreen::SpreadPair,
+) -> Vec<usize> {
+    match (fullscreen_idx, spread) {
+        (Some(_), crate::ui_fullscreen::SpreadPair::Double { left, right }) => vec![left, right],
+        (Some(idx), crate::ui_fullscreen::SpreadPair::Single) => vec![idx],
+        (None, _) => Vec::new(),
+    }
+}
+
+/// パネルに並べる 1 面。見開きなら 2 つ、単ページなら 1 つ。
+struct SimilarPageView<'a> {
+    /// 見開きのときだけ付ける見出し。単ページでは面が 1 つしかないので付けない。
+    heading: Option<&'static str>,
+    item_key: Option<&'a str>,
+    model: SimilarPanelModel<'a>,
+    showing_previous: bool,
 }
 
 #[derive(Default)]
@@ -477,7 +502,7 @@ fn path_layout_job(
         .map(|origin| path_segment_diff(&origin.segments, &parts.segments))
         .unwrap_or_else(|| vec![false; parts.segments.len()]);
     job.append(
-        " / ",
+        "\n",
         0.0,
         egui::TextFormat {
             font_id: font.clone(),
@@ -1278,42 +1303,80 @@ impl App {
                 ui.add_space(8.0);
 
                 if self.similar_panel.tab == MetadataPanelTab::Similar {
-                    let current_item = self
+                    // 見開き中は**両方のページ**を見ている。片方だけ調べると、もう片方に
+                    // 別バージョンがあっても気付けない。補正パネルが左右を切り替えるのは
+                    // 編集が一度に 1 ページだからで、閲覧側にその制約はない。
+                    let spread = self
                         .fullscreen_idx
-                        .and_then(|index| self.items.get(index))
-                        .cloned();
+                        .map(|idx| self.resolve_spread_pair(idx))
+                        .unwrap_or(crate::ui_fullscreen::SpreadPair::Single);
+                    let shown_indices = similar_shown_indices(self.fullscreen_idx, spread);
+                    let shown_items: Vec<crate::grid_item::GridItem> = shown_indices
+                        .iter()
+                        .filter_map(|index| self.items.get(*index).cloned())
+                        .collect();
+                    let current_item = shown_items.first().cloned();
                     let origin_key = current_item
                         .as_ref()
                         .and_then(crate::app::similar_index_item_key);
                     self.similar_panel.begin_origin(origin_key.clone());
-                    let query = current_item.as_ref().map_or_else(
-                        || std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed),
-                        |item| self.query_similar_item(item),
-                    );
+                    let page_keys: Vec<Option<String>> = shown_items
+                        .iter()
+                        .map(crate::app::similar_index_item_key)
+                        .collect();
+                    let queries: Vec<std::sync::Arc<crate::similar_index::ItemQuery>> = shown_items
+                        .iter()
+                        .map(|item| self.query_similar_item(item))
+                        .collect();
+                    let query = queries.first().cloned().unwrap_or_else(|| {
+                        std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed)
+                    });
                     let book = current_item
                         .as_ref()
                         .map(|item| self.query_similar_book(item));
                     let results_are_stale = self.similar_query_results_are_stale();
-                    // 照会が返るまでの数フレームだけ、直前の結果を出し続ける。
-                    let showing_previous =
-                        if matches!(query.as_ref(), crate::similar_index::ItemQuery::Preparing) {
-                            self.similar_panel.last_ready.clone()
-                        } else {
-                            if matches!(query.as_ref(), crate::similar_index::ItemQuery::Ready(_)) {
-                                self.similar_panel.last_ready = Some(std::sync::Arc::clone(&query));
-                            } else {
-                                self.similar_panel.last_ready = None;
+                    // 照会が返るまでの数フレームだけ、直前の結果を出し続ける。面ごとに覚える
+                    // ので、見開きでも左右それぞれが空白にならない。
+                    self.similar_panel.last_ready.resize(queries.len(), None);
+                    let shown_queries: Vec<(
+                        std::sync::Arc<crate::similar_index::ItemQuery>,
+                        bool,
+                    )> = queries
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, query)| {
+                            if matches!(query.as_ref(), crate::similar_index::ItemQuery::Preparing)
+                                && let Some(previous) = self.similar_panel.last_ready[slot].clone()
+                            {
+                                return (previous, true);
                             }
-                            None
-                        };
-                    let shown = showing_previous.as_ref().unwrap_or(&query);
-                    let model = similar_panel_model(shown.as_ref());
+                            self.similar_panel.last_ready[slot] =
+                                matches!(query.as_ref(), crate::similar_index::ItemQuery::Ready(_))
+                                    .then(|| std::sync::Arc::clone(query));
+                            (std::sync::Arc::clone(query), false)
+                        })
+                        .collect();
+                    let spread_headings = shown_queries.len() > 1;
+                    let views: Vec<SimilarPageView<'_>> = shown_queries
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, (shown, showing_previous))| SimilarPageView {
+                            heading: spread_headings.then(|| {
+                                if slot == 0 {
+                                    "左ページ"
+                                } else {
+                                    "右ページ"
+                                }
+                            }),
+                            item_key: page_keys.get(slot).and_then(Option::as_deref),
+                            model: similar_panel_model(shown.as_ref()),
+                            showing_previous: *showing_previous,
+                        })
+                        .collect();
                     draw_similar_panel(
                         ui,
-                        model,
+                        &views,
                         book.as_deref(),
-                        origin_key.as_deref(),
-                        showing_previous.is_some(),
                         results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
@@ -2414,10 +2477,8 @@ fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
 #[allow(clippy::too_many_arguments)]
 fn draw_similar_panel(
     ui: &mut egui::Ui,
-    model: SimilarPanelModel<'_>,
+    views: &[SimilarPageView<'_>],
     book: Option<&crate::similar_index::BookQuery>,
-    current_item_key: Option<&str>,
-    showing_previous: bool,
     results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
@@ -2439,12 +2500,14 @@ fn draw_similar_panel(
         }
     };
     if results_are_stale
-        && !matches!(
-            model,
-            SimilarPanelModel::NoIndex
-                | SimilarPanelModel::Preparing
-                | SimilarPanelModel::Failed(_)
-        )
+        && views.iter().any(|view| {
+            !matches!(
+                view.model,
+                SimilarPanelModel::NoIndex
+                    | SimilarPanelModel::Preparing
+                    | SimilarPanelModel::Failed(_)
+            )
+        })
     {
         ui.label(
             egui::RichText::new("索引を更新中です。変更は更新完了後に結果へ反映されます")
@@ -2456,10 +2519,14 @@ fn draw_similar_panel(
     // 本の関係を先に出す。これは本ごとに決まるので読み進めても動かない。ページの結果は
     // 件数が変わるので、後ろに置かないと本の節が上下に動いてしまう。
     if let Some(book) = book {
+        let shown_keys = views
+            .iter()
+            .filter_map(|view| view.item_key)
+            .collect::<Vec<_>>();
         draw_book_relations(
             ui,
             book,
-            current_item_key,
+            &shown_keys,
             state,
             thumb_px,
             thumb_quality,
@@ -2469,7 +2536,60 @@ fn draw_similar_panel(
             actions,
         );
     }
-    match model {
+    for (index, view) in views.iter().enumerate() {
+        if let Some(heading) = view.heading {
+            if index > 0 {
+                ui.add_space(10.0);
+            }
+            ui.label(
+                egui::RichText::new(heading)
+                    .color(egui::Color32::WHITE)
+                    .size(14.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+        }
+        draw_similar_page_results(
+            ui,
+            view,
+            state,
+            thumb_px,
+            thumb_quality,
+            cache_decision,
+            pdf_passwords,
+            pinned_item_key,
+            compare_pin_preparing,
+            ctx,
+            actions,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_similar_page_results(
+    ui: &mut egui::Ui,
+    view: &SimilarPageView<'_>,
+    state: &mut SimilarPanelState,
+    thumb_px: u32,
+    thumb_quality: u8,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+    pinned_item_key: Option<&str>,
+    compare_pin_preparing: bool,
+    ctx: &egui::Context,
+    actions: &mut SimilarPanelActions,
+) {
+    let compare_state = |hit: &crate::similar_index::QueryHit| {
+        if pinned_item_key == Some(hit.item_key.as_str()) {
+            SimilarCompareState::Pinned
+        } else if compare_pin_preparing {
+            SimilarCompareState::Preparing
+        } else {
+            SimilarCompareState::Idle
+        }
+    };
+    let showing_previous = view.showing_previous;
+    match view.model {
         SimilarPanelModel::NoIndex => {
             ui.label("索引がありません");
             if ui.button("お気に入りで索引を有効にする").clicked() {
@@ -2593,7 +2713,8 @@ fn draw_similar_panel(
 fn draw_book_relations(
     ui: &mut egui::Ui,
     book: &crate::similar_index::BookQuery,
-    current_item_key: Option<&str>,
+    // shown_item_keys: いま画面に出ているページ。見開きなら 2 つ。帯にはそれぞれ ▼ を出す。
+    shown_item_keys: &[&str],
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -2648,12 +2769,15 @@ fn draw_book_relations(
             draw_page_strip_legend(ui);
 
             ui.add_space(6.0);
-            let current_page = current_item_key.and_then(|key| {
-                relations
-                    .origin_page_keys
-                    .iter()
-                    .position(|page| page == key)
-            });
+            let current_pages = shown_item_keys
+                .iter()
+                .filter_map(|key| {
+                    relations
+                        .origin_page_keys
+                        .iter()
+                        .position(|page| page == key)
+                })
+                .collect::<Vec<_>>();
             for hit in &relations.hits {
                 ui.label(
                     egui::RichText::new(book_relation_name(&hit.other_container_key))
@@ -2680,7 +2804,7 @@ fn draw_book_relations(
                 draw_page_strip(
                     ui,
                     hit,
-                    current_page,
+                    &current_pages,
                     state,
                     thumb_px,
                     thumb_quality,
@@ -2856,7 +2980,7 @@ fn summarize_page_strip(
 fn draw_page_strip(
     ui: &mut egui::Ui,
     hit: &crate::similar_index::BookRelationHit,
-    current_page: Option<usize>,
+    current_pages: &[usize],
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -2915,8 +3039,9 @@ fn draw_page_strip(
     }
 
     // いま見ているページの位置。これが無いと、帯のどこに自分がいるのか分からない。
-    if let Some(page) = current_page {
-        let x = rect.left() + strip_page_center(width, hit.pages.len(), page);
+    // 見開きなら 2 ページとも指す。片方だけだと、もう片方を見落とす。
+    for page in current_pages {
+        let x = rect.left() + strip_page_center(width, hit.pages.len(), *page);
         let tip = egui::pos2(x, rect.top() - 1.0);
         painter.add(egui::Shape::convex_polygon(
             vec![
@@ -3268,12 +3393,16 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
             let ctx = ui.ctx().clone();
             let book = book_snapshot_fixture();
             let current_page = "c:/books/this/060.png".to_string();
+            let views = [SimilarPageView {
+                heading: None,
+                item_key: Some(current_page.as_str()),
+                model: SimilarPanelModel::Results(&matches),
+                showing_previous: false,
+            }];
             draw_similar_panel(
                 ui,
-                SimilarPanelModel::Results(&matches),
+                &views,
                 Some(&book),
-                Some(&current_page),
-                false,
                 true,
                 &mut state,
                 72,
@@ -4341,6 +4470,22 @@ mod similar_panel_tests {
         // ページが 1 枚しかなくても割り算が壊れないこと。
         assert_eq!(super::strip_page_left(width, 1, 0), 0.0);
         assert!((super::strip_page_center(width, 1, 0) - width / 2.0).abs() < 0.001);
+    }
+
+    /// 見開きでは両方のページを調べる。片方に落とすと、もう片方の別バージョンが出なくなる。
+    #[test]
+    fn a_spread_asks_about_both_pages() {
+        use crate::ui_fullscreen::SpreadPair;
+
+        assert_eq!(
+            super::similar_shown_indices(Some(4), SpreadPair::Double { left: 4, right: 5 }),
+            vec![4, 5]
+        );
+        assert_eq!(
+            super::similar_shown_indices(Some(4), SpreadPair::Single),
+            vec![4]
+        );
+        assert!(super::similar_shown_indices(None, SpreadPair::Single).is_empty());
     }
 
     /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を
