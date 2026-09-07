@@ -234,6 +234,15 @@ pub struct SimilarIndexManager {
     book_query: Arc<Mutex<BookQueryState>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
     scheduler: Arc<SimilarIndexScheduler>,
+    #[cfg(test)]
+    item_query_test_hook: Mutex<Option<ItemQueryTestHook>>,
+}
+
+#[cfg(test)]
+struct ItemQueryTestHook {
+    started: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+    completed: std::sync::mpsc::Sender<()>,
 }
 
 impl SimilarIndexManager {
@@ -271,6 +280,8 @@ impl SimilarIndexManager {
             book_query,
             enabled_roots,
             scheduler,
+            #[cfg(test)]
+            item_query_test_hook: Mutex::new(None),
         }
     }
 
@@ -369,9 +380,20 @@ impl SimilarIndexManager {
         let enabled_roots = Arc::clone(&self.enabled_roots);
         let db_path = SimilarDb::db_path_at(&self.data_dir);
         let query_key = item_key.to_owned();
+        #[cfg(test)]
+        let test_hook = self
+            .item_query_test_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         let spawn_result = std::thread::Builder::new()
             .name("similar-item-query".to_owned())
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(hook) = test_hook.as_ref() {
+                    let _ = hook.started.send(());
+                    let _ = hook.resume.recv();
+                }
                 let mut result = SimilarDb::open_at(&db_path)
                     .map_err(db_error)
                     .map_or_else(ItemQuery::Failed, |db| {
@@ -381,9 +403,6 @@ impl SimilarIndexManager {
                     let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                     hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
                 }
-                if running && matches!(result, ItemQuery::NotIndexed) {
-                    result = ItemQuery::Preparing;
-                }
                 if epoch_guard.load(Ordering::Acquire) == epoch {
                     replace_cached_item_query_if_current(
                         &cache,
@@ -391,6 +410,10 @@ impl SimilarIndexManager {
                         epoch,
                         Arc::new(result),
                     );
+                }
+                #[cfg(test)]
+                if let Some(hook) = test_hook {
+                    let _ = hook.completed.send(());
                 }
             });
         if let Err(error) = spawn_result {
@@ -854,9 +877,8 @@ impl SimilarIndexScheduler {
     }
 
     fn worker_loop(self: Arc<Self>) {
-        let db_path = SimilarDb::db_path_at(&self.data_dir);
-        let db = match SimilarDb::open_at(&db_path) {
-            Ok(db) => Arc::new(db),
+        let db = match self.db_for_worker() {
+            Ok(db) => db,
             Err(error) => {
                 self.finish_worker(IndexProgress::Failed(format!(
                     "similar.db open failed: {error}"
@@ -864,8 +886,6 @@ impl SimilarIndexScheduler {
                 return;
             }
         };
-        *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
-        register_prefill_db(&db, &self.enabled_roots);
         repair_page_order_if_stale(&db);
         // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
         // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
@@ -957,6 +977,23 @@ impl SimilarIndexScheduler {
             self.request_array_refresh();
             return;
         }
+    }
+
+    /// Index schedulerが存続する間、scan/purgeとthumbnail prefillは同じSQLite mutex ownerを
+    /// 使う。runごとに開き直すと、旧runのprefillと新runのpurgeが別connectionで競合する。
+    fn db_for_worker(&self) -> rusqlite::Result<Arc<SimilarDb>> {
+        let mut owner = self.prefill_db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = if let Some(db) = owner.as_ref() {
+            Arc::clone(db)
+        } else {
+            let db = Arc::new(SimilarDb::open_at(&SimilarDb::db_path_at(&self.data_dir))?);
+            *owner = Some(Arc::clone(&db));
+            db
+        };
+        drop(owner);
+        // The global decode callback registration always carries the matching DB/scope pair.
+        register_prefill_db(&db, &self.enabled_roots);
+        Ok(db)
     }
 
     fn retain_loaded_snapshot_during_run(&self) {
@@ -3399,8 +3436,29 @@ fn prefill_target() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)> {
     Some((registration.db.upgrade()?, enabled_roots))
 }
 
-/// 保存済み thumbnail ではなく、元 source の oriented decode buffer を再利用する。
-pub(crate) fn offer_thumbnail_raster(
+fn thumbnail_prefill_scope_allows(
+    enabled_roots: &RwLock<Vec<String>>,
+    normalized_path: &str,
+) -> bool {
+    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+    key_is_under_any(normalized_path, &roots)
+}
+
+struct PreparedThumbnailPrefill {
+    normalized_path: String,
+    item: StoredItem,
+}
+
+#[derive(Debug)]
+struct ThumbnailPrefillPrepareError {
+    stage: &'static str,
+    item_key: String,
+    message: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_thumbnail_prefill(
+    enabled_roots: &RwLock<Vec<String>>,
     path: &Path,
     zip_entry: Option<&str>,
     pdf_page: Option<u32>,
@@ -3408,16 +3466,12 @@ pub(crate) fn offer_thumbnail_raster(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-) {
-    let Some((db, enabled_roots)) = prefill_target() else {
-        return;
-    };
-    // scope の read lock を put 完了まで保持する。OFF 切替側は write lock の取得後に
-    // prune を予約するため、無効化済み root が prefill で後から復活しない。
-    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+) -> Result<Option<PreparedThumbnailPrefill>, ThumbnailPrefillPrepareError> {
     let normalized_path = crate::search_index_db::normalize_path(path);
-    if !key_is_under_any(&normalized_path, &roots) {
-        return;
+    // Fast rejection only. This helper returns an owned value, so its scope guard cannot survive
+    // the decode/signature work or the later DB wait.
+    if !thumbnail_prefill_scope_allows(enabled_roots, &normalized_path) {
+        return Ok(None);
     }
     let (item_key, kind, format) = if let Some(entry) = zip_entry {
         (
@@ -3439,42 +3493,87 @@ pub(crate) fn offer_thumbnail_raster(
         )
     };
     if !raster_is_large_enough_for_canonical_proxy(format, image.dimensions(), source_dims) {
-        return;
+        return Ok(None);
     }
-    let canonical = match proxy_from_source(
+    let canonical = proxy_from_source(
         ProxySource::Raster {
             image,
             source_dims,
             format,
         },
         None,
-    ) {
-        Ok(canonical) => canonical,
-        Err(error) => {
-            crate::logger::log(format!(
-                "similar prefill proxy failed for {item_key}: {error}"
-            ));
-            return;
-        }
-    };
+    )
+    .map_err(|error| ThumbnailPrefillPrepareError {
+        stage: "proxy",
+        item_key: item_key.clone(),
+        message: error.to_string(),
+    })?;
     let candidate = FileCandidate {
         path: path.to_path_buf(),
         mtime,
         file_size,
     };
-    match stored_from_proxy(&item_key, kind, None, pdf_page, &candidate, canonical) {
-        Ok(item) => {
-            if let Err(error) = db.put_prefill(&item) {
-                crate::logger::log(format!(
-                    "similar prefill write failed for {item_key}: {error}"
-                ));
-            }
-        }
+    let item = stored_from_proxy(&item_key, kind, None, pdf_page, &candidate, canonical).map_err(
+        |error| ThumbnailPrefillPrepareError {
+            stage: "signature",
+            item_key,
+            message: error.to_string(),
+        },
+    )?;
+    Ok(Some(PreparedThumbnailPrefill {
+        normalized_path,
+        item,
+    }))
+}
+
+fn store_offered_thumbnail_prefill(
+    db: &SimilarDb,
+    enabled_roots: &RwLock<Vec<String>>,
+    prepared: &PreparedThumbnailPrefill,
+) -> rusqlite::Result<bool> {
+    db.put_prefill_if(&prepared.item, || {
+        thumbnail_prefill_scope_allows(enabled_roots, &prepared.normalized_path)
+    })
+}
+
+/// 保存済み thumbnail ではなく、元 source の oriented decode buffer を再利用する。
+pub(crate) fn offer_thumbnail_raster(
+    path: &Path,
+    zip_entry: Option<&str>,
+    pdf_page: Option<u32>,
+    mtime: i64,
+    file_size: i64,
+    image: &image::DynamicImage,
+    source_dims: (u32, u32),
+) {
+    let Some((db, enabled_roots)) = prefill_target() else {
+        return;
+    };
+    let prepared = match prepare_thumbnail_prefill(
+        &enabled_roots,
+        path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        image,
+        source_dims,
+    ) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return,
         Err(error) => {
             crate::logger::log(format!(
-                "similar prefill signature failed for {item_key}: {error}"
+                "similar prefill {} failed for {}: {}",
+                error.stage, error.item_key, error.message
             ));
+            return;
         }
+    };
+    if let Err(error) = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared) {
+        crate::logger::log(format!(
+            "similar prefill write failed for {}: {error}",
+            prepared.item.item_key
+        ));
     }
 }
 
@@ -4265,6 +4364,264 @@ mod tests {
             (1024, 768),
             (1024, 768),
         ));
+    }
+
+    #[test]
+    fn running_projection_does_not_replace_the_cached_not_indexed_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: base.records.into_boxed_slice(),
+            store_id: base.store_id,
+            applied_seq: base.applied_seq,
+        });
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(snapshot));
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        let epoch = manager.memory_epoch.load(Ordering::Acquire);
+        let run_query = |key: &str, terminal_before_completion: Option<IndexProgress>| {
+            *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
+                stage: IndexStage::Scanning,
+                current_path: None,
+                report: IndexReport::default(),
+            });
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            *manager.item_query_test_hook.lock().unwrap() = Some(ItemQueryTestHook {
+                started: started_tx,
+                resume: resume_rx,
+                completed: completed_tx,
+            });
+
+            assert_eq!(manager.query_item(key).as_ref(), &ItemQuery::Preparing);
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("query worker reached the deterministic barrier");
+            if let Some(terminal) = terminal_before_completion.clone() {
+                *manager.progress.lock().unwrap() = terminal;
+            }
+            resume_tx.send(()).unwrap();
+            completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("query worker published its terminal cache entry");
+            let cached = cached_item_query(&manager.item_query, key, epoch)
+                .expect("terminal query result is cached");
+            assert_eq!(cached.as_ref(), &ItemQuery::NotIndexed);
+
+            if terminal_before_completion.is_none() {
+                assert_eq!(manager.query_item(key).as_ref(), &ItemQuery::Preparing);
+                *manager.progress.lock().unwrap() = IndexProgress::Idle;
+            }
+            let projected = manager.query_item(key);
+            assert_eq!(projected.as_ref(), &ItemQuery::NotIndexed);
+            assert!(Arc::ptr_eq(&cached, &projected));
+        };
+
+        run_query("c:/library/running.png", None);
+        run_query(
+            "c:/library/complete.png",
+            Some(IndexProgress::Complete(IndexReport::default())),
+        );
+        run_query(
+            "c:/library/cancelled.png",
+            Some(IndexProgress::Cancelled(IndexReport::default())),
+        );
+        run_query(
+            "c:/library/failed.png",
+            Some(IndexProgress::Failed("injected terminal".to_owned())),
+        );
+    }
+
+    #[test]
+    fn scheduler_reuses_one_db_owner_across_runs_and_purge_sees_old_prefill() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let old_run_db = manager.scheduler.db_for_worker().unwrap();
+        let prefill = row(1, "c:/library/old.png", [7; 32], 10).item;
+        old_run_db.put_prefill(&prefill).unwrap();
+
+        let new_run_db = manager.scheduler.db_for_worker().unwrap();
+        assert!(Arc::ptr_eq(&old_run_db, &new_run_db));
+        assert_eq!(
+            new_run_db
+                .purge_roots_except(&["c:/library".to_owned()], &[])
+                .unwrap(),
+            1
+        );
+        assert!(
+            old_run_db
+                .load_prefill(
+                    &prefill.item_key,
+                    prefill.mtime,
+                    prefill.file_size,
+                    prefill.hash_version,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn off_scope_update_completes_while_prefill_holds_db_then_rejects_insert() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        let db = manager.scheduler.db_for_worker().unwrap();
+        let prepared = prepare_thumbnail_prefill(
+            &manager.enabled_roots,
+            Path::new("c:/library/racing.png"),
+            None,
+            None,
+            10,
+            20,
+            &image::DynamicImage::new_rgba8(2, 2),
+            (2, 2),
+        )
+        .unwrap()
+        .expect("the in-scope offer is prepared as an owned value");
+        let blocker = row(1, "c:/library/blocker.png", [8; 32], 10).item;
+        let (db_owned_tx, db_owned_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (off_done_tx, off_done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let blocking_db = Arc::clone(&db);
+            let blocker = blocker.clone();
+            let blocker_thread = scope.spawn(move || {
+                blocking_db.put_prefill_if(&blocker, || {
+                    db_owned_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    false
+                })
+            });
+            db_owned_rx.recv().unwrap();
+
+            let offer_db = Arc::clone(&db);
+            let roots = Arc::clone(&manager.enabled_roots);
+            let offered = &prepared;
+            let offer_thread =
+                scope.spawn(move || store_offered_thumbnail_prefill(&offer_db, &roots, offered));
+            let scheduler = Arc::clone(&manager.scheduler);
+            let off_thread = scope.spawn(move || {
+                scheduler.configure(
+                    Vec::new(),
+                    crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+                    None,
+                );
+                let _ = off_done_tx.send(());
+            });
+            let off_completed = off_done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+            let _ = resume_tx.send(());
+            let blocker_result = blocker_thread.join().unwrap().unwrap();
+            let inserted = offer_thread.join().unwrap().unwrap();
+            off_thread.join().unwrap();
+            assert!(off_completed, "scope OFF must not wait for the DB mutex");
+            assert!(!blocker_result, "the DB blocker is never inserted");
+            assert!(!inserted, "the predicate must observe the latest OFF scope");
+        });
+        assert!(
+            db.load_prefill(
+                &prepared.item.item_key,
+                prepared.item.mtime,
+                prepared.item.file_size,
+                prepared.item.hash_version,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn old_scope_insert_finishes_before_the_already_completed_off_purge() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        let db = manager.scheduler.db_for_worker().unwrap();
+        let prefill = row(1, "c:/library/racing.png", [9; 32], 10).item;
+        let (scope_released_tx, scope_released_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (off_done_tx, off_done_rx) = std::sync::mpsc::channel();
+        let (purge_started_tx, purge_started_rx) = std::sync::mpsc::channel();
+        let (purge_done_tx, purge_done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let prefill_db = Arc::clone(&db);
+            let roots = Arc::clone(&manager.enabled_roots);
+            let candidate = prefill.clone();
+            let writer = scope.spawn(move || {
+                prefill_db.put_prefill_if(&candidate, || {
+                    let allowed = {
+                        let roots = roots.read().unwrap_or_else(|e| e.into_inner());
+                        key_is_under_any(&candidate.item_key, &roots)
+                    };
+                    scope_released_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    allowed
+                })
+            });
+            scope_released_rx.recv().unwrap();
+
+            let scheduler = Arc::clone(&manager.scheduler);
+            let off_thread = scope.spawn(move || {
+                scheduler.configure(
+                    Vec::new(),
+                    crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+                    None,
+                );
+                let _ = off_done_tx.send(());
+            });
+            let off_completed = off_done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+            let mut purge_thread = None;
+            let mut purge_waited_for_db = false;
+            if off_completed {
+                let purge_db = Arc::clone(&db);
+                purge_thread = Some(scope.spawn(move || {
+                    purge_started_tx.send(()).unwrap();
+                    let removed = purge_db
+                        .purge_roots_except(&["c:/library".to_owned()], &[])
+                        .unwrap();
+                    let _ = purge_done_tx.send(removed);
+                }));
+                purge_started_rx.recv().unwrap();
+                purge_waited_for_db = purge_done_rx.try_recv().is_err();
+            }
+
+            let _ = resume_tx.send(());
+            let inserted = writer.join().unwrap().unwrap();
+            off_thread.join().unwrap();
+            let removed = if let Some(purge_thread) = purge_thread {
+                purge_thread.join().unwrap();
+                Some(purge_done_rx.recv().unwrap())
+            } else {
+                None
+            };
+            assert!(off_completed, "scope OFF must complete while DB is held");
+            assert!(
+                purge_waited_for_db,
+                "purge must serialize on the same DB owner"
+            );
+            assert!(inserted, "the already-read old scope may finish its insert");
+            assert_eq!(
+                removed,
+                Some(1),
+                "the queued purge must run after that insert"
+            );
+        });
+        assert!(
+            db.load_prefill(
+                &prefill.item_key,
+                prefill.mtime,
+                prefill.file_size,
+                prefill.hash_version,
+            )
+            .unwrap()
+            .is_none(),
+            "an old in-flight prefill must not resurrect the disabled root"
+        );
     }
 
     #[test]

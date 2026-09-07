@@ -18,6 +18,16 @@
 
 ## 修正単位
 
+進捗 (2026-09-08):
+
+| 指摘 | 実装・独立レビュー | 検証 |
+| --- | --- | --- |
+| R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt成功。全体gate・実機は後続 |
+| R7 完成キャッシュ / R9 prefillとscope | 実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt成功 |
+| R2 類似移動でのパネルロック | 型付きnavigationの設計レビュー済み、実装前 | password・入れ子ZIPを含む回帰が必要 |
+| R4/R8 長押しと見開き | 独立レビューで実装境界を確認済み、実装前 | 未実施 |
+| R1/R5/R6 本照会 | 厳密検索・一貫したDB読取の設計候補。試作前 | 正確性と実データ性能による採否判断が必要 |
+
 ### R2: 類似候補への移動と閲覧終了を区別する
 
 類似画像と本のページ帯の両入口を、viewer内の移動として共有ナビゲーションへ接続する。
@@ -38,6 +48,24 @@ close/poll/drawはこのphaseを同じ意味で扱い、明示終了・取消・
 変換ZIPのaliasは、既存の `archive_source_override` と `current_folder == nav.tree.zip_path` が
 確定している要求にだけ適用し、無関係なZIP内の同名entryへは着地させない。
 静止画の類似移動を直すために、動画presentation transition全体へ新close理由を伝搬する案は採らない。
+
+独立レビューで合意した実装境界:
+
+- `FsNavigationSequenceTarget` の `FolderItems / AwaitingPassword / Display` を正本とし、
+  viewer内の継続、入力block、旧画像holdover表示をownerのメソッドから別々に導く。
+  password待ちは継続するが、入力blockと旧画像表示はしない。
+- 明示候補移動は既存 `DeferredFsTarget::Required`、従来snapshotは `Preferred` として区別する。
+  Requiredの消失時に無関係な先頭ページへfallbackしない。deferredをtakeしても表示完了前にownerを消さない。
+- 通常フォルダは既存workerで走査し、成功して一覧を適用するときにsequenceを開始する。
+  走査前の失敗/取消で旧viewerを閉じない。同items内の直接openは維持する。
+- ZIP/PDFの `Opened / Deferred / NoPlayableItem / RequiredTargetMissing` を終端処理まで通す。
+  パスワードretryは同ownerを再開し、cancelは終端する。
+- Esc/Enter/右click/閉じる、Backspaceのページ一覧復帰、列挙待ち取消、別移動、context退役、
+  エラー/切断を棚卸しし、真の終了はearly returnより前にsequenceを終端する。
+- 入れ子ZIPはbookmarkの既存tree解決を共通化し、実entryと実階層をmaterializeしてから照合する。
+  元要求の論理targetを書き換えて残さず、その要求内だけで実targetを使う。
+
+これらは実装担当がコードと再照合する前提であり、まだ実装完了の記録ではない。
 
 ### R3: 類似サムネイルの要求・完了・退避
 
@@ -72,14 +100,32 @@ release/focus喪失はパネルの可視性から独立した所有viewportの�
 準備済み候補は次の長押しに再利用できるよう保持する。
 通常比較Wipe/Diffの見開き制約を一律解除しない。
 
+独立レビューで既存通常比較slot/pending/preparation/modeもApp-globalと確認したが、
+今回これらの所有全体を移行する必要はない。一時表示だけをviewer-owned `SimilarPanelState` に置く。
+純asset準備APIを共有し、peekは通常pin jobや現在ページとのpair準備を起動しない。
+一時assetは実行1件＋最新待機1件に有界化し、取消不能な処理はDrainingで終端まで回収する。
+新しいprimary press edgeだけがgestureを開始し、held levelから再生成しない。
+release/focus喪失後、focusが戻っても同じ押下で再開しない。
+
+描画はSingle/Spread分岐の前で一時assetを選び、本文とナビゲータが同じ画像・変換を参照する。
+候補を元ページのidxへ偽装せず、編集座標や元ページの提示完了にも公開しない。
+raw mount/swapには取消副作用を加えず、明示park/close/pagechangeとowner viewportでの
+source/session照合により終端する。明示「比較に設定」だけが通常slotへassetをcommitする。
+通常pin A→peek B→A、左右/LTR/RTL見開き、未準備release、hidden panel、focus復帰、
+遅延完了、2viewer、画像/ZIP/PDF/認証更新、ナビゲータと編集座標の非干渉を回帰対象とする。
+
 ### R7/R9: 索引ジョブの終端とprefillの所有境界
 
 R7の完成キャッシュは `NotIndexed` という照会結果を保持し、現在のジョブ進行状態に応じた
 `Preparing` 表示は返値の投影とする。過去のRunning状態を結果に焼き付けない。
 
-R9はscheduler存続中のDB ownerを固定してprefillとpruneの直列化を保証する案を検証する。
+R9の実装前検証で、既存workerがrunごとに `prefill_db` を別Arcへ置換することを確認した。
+scheduler存続中のDB ownerを固定してprefillとpruneの直列化を保証する。
 prefillはDB mutex取得後に最新scopeを短時間参照し、scope guardを解放してから書き込む。
 UIのscope変更はDB待ちや署名生成を待たない。runを跨ぐ旧prefillとON/OFF連打で、prune後の復活がないことを検証する。
+DBは初回workerだけが開き、正常終了/取消/失敗後も同じArcを次runへ渡す。
+query/array用の別接続はこの共有化へ含めない。global登録はDB/scopeのweak pairを維持する。
+既存DB回帰の親root OFF・有効子root保持・prefix兄弟保持は引き続き実行対象とする。
 
 ### R1/R5/R6: 本照会の正確性と負荷 (採用前に試作・測定)
 
@@ -103,6 +149,16 @@ MIHは462万件でposting約296MBとoffset約4MBを追加する概算であり�
 通常/既存portableのDBへschema更新するbenchを直接実行せず、read-onlyまたは一貫したbackupで検証用コピーを作る。
 R1の非推移性反例、R5の2冊300ページ一致、R6のtransaction中更新、array遅延中の第三本追加、
 OFF後prune待ちの本を必須回帰とする。
+
+独立レビューで、旧sweep helperの `zip` 比較は候補件数・キー集合の違いを見逃すため、
+そのまま正確性oracleにできないと確認した。起点/候補keyで対応づけ、relation、matched、
+distinctive、coverage、alignment、ページ帯まで比較する。
+試作は合成反例→実PDQのbucket分布/重複排除/256bit検証件数→同transactionの全照会の順とする。
+postingは連続配列、scratchは実行中の有界workerが所有し、多数threadへの複製を避ける。
+初回構築込み・warm中央値/p95・総CPU時間・常駐/compactionピーク・delta追随を別に計測する。
+既存400ページの約1.69秒は目標であり、新仕様の許容値ではない。
+元DBへのread-only接続からSQLite online backupでworkspace内に整合複製を作る方法を検証する。
+稼働中の `.db` 単体コピーは使わない。
 
 ## 完了の確認
 
@@ -157,3 +213,31 @@ viewerのpark/mount/retire非干渉を含め、同じ絞込コマンドで21件�
 上記binの `cargo check` と `cargo fmt --check` も成功。
 独立Astra/highが最終コードと21件の成功ログを確認し、阻害するP1/P2なしで承認した。
 全体gateとportableでの実機確認は後続であり、未実施。
+
+### 本照会試作用の入力準備 (2026-09-08)
+
+親の調査作業として、元portable-devのDBを `mode=ro` / `query_only` で開き、
+SQLite online backupで `target/review-fixes-bench-20260908/similar.db` へ整合複製した (8.325秒)。
+元アプリの停止、元DBへのschema操作、索引再生成はしていない。
+対応する `similar.base` も複製し、複製DBの `quick_check=ok`、store_id一致、base checksum一致を確認した。
+baseは4,628,611件・applied_seq=0、DBはlatest_seq=9852で、必要な変更履歴1～9852が連続して残る。
+prototypeではこの履歴を適用してから同世代の比較に使う。入力準備は性能試作・採用の完了ではない。
+手順と結果は同directoryの `input-provenance.json` / `input-validation.json` に保存した。
+
+### R7/R9 実装・回帰補強 (2026-09-08)
+
+R7はworkerが完成 `NotIndexed` を保持し、現在のRunning状態だけを返値へ投影する。
+manager-localな `cfg(test)` の通知でworker完了前後を固定し、Running、Complete、Cancelled、Failedを検証した。
+R9はscheduler存続中のDB Arcを固定し、scope確認からownedな準備値を返す処理と、
+DB mutex内で最新scopeを確認して書き込む処理を分けた。scope guardは準備値に含めない。
+DB保持中にOFF完了→書込み拒否と、旧ON読取→OFF完了→旧書込みcommit→purge削除の順序を検証した。
+
+初回の索引回帰は38成功/1失敗/4ignored。新テストが100回yieldでSQLite worker完了を待つ方式で、
+待機不足だったため完了通知へ修正した。次のcompileでテスト用unwrapに必要なDebugの不足を修正し、
+最終は39成功/0失敗/4ignoredとなった。これらを製品機能の失敗とは混同しない。
+ログ: `target/r7-r9-similar-index-tests.log`、`target/r7-r9-similar-index-tests-final.log`、
+`target/r7-r9-similar-index-tests-final-v2.log`。最後の実行はcompile込み1分23秒。
+独立Astra/highが最終差分と成功ログを確認し、P1/P2なしで承認した。
+DB側の既存回帰は16成功/0失敗/1ignored (`target/r7-r9-similar-db-tests.log`)。
+core checkも成功 (`target/r7-r9-core-check.log`)、fmtとdiff checkも成功した。
+全体gate・portable実機は後続確認。

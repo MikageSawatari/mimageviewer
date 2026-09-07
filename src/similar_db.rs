@@ -342,7 +342,22 @@ impl SimilarDb {
 
     /// サムネイル元 buffer から得た署名を、公開索引とは別に再利用用として置く。
     pub fn put_prefill(&self, item: &StoredItem) -> rusqlite::Result<()> {
+        self.put_prefill_if(item, || true).map(|_| ())
+    }
+
+    /// DB write ownershipを先に取得してから、呼び出し元の最新scope判定を実行する。
+    ///
+    /// predicateは短時間で完了し、外部lockのguardを返値より先に解放すること。これにより
+    /// scope更新側はDBを待たず、scopeを外れた行は後続purgeより後に復活しない。
+    pub(crate) fn put_prefill_if(
+        &self,
+        item: &StoredItem,
+        should_insert: impl FnOnce() -> bool,
+    ) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_insert() {
+            return Ok(false);
+        }
         conn.execute(
             "INSERT INTO item_prefill
              (item_key, mtime, file_size, hash_version, pdq256, quality, width, height, format)
@@ -364,7 +379,7 @@ impl SimilarDb {
                 item.format,
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn load_prefill(
