@@ -458,6 +458,10 @@ impl std::error::Error for AssetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Frame, ImageRef, Output, SpectrumFrame, default_project, evaluate, new_image_layer,
+        render_frame,
+    };
 
     fn pixel(value: u8) -> ImageAsset {
         ImageAsset::new(1, 1, vec![value, value, value, 255]).unwrap()
@@ -481,5 +485,48 @@ mod tests {
         drop(assets);
         assert_eq!(Arc::strong_count(&removed), 1);
         assert_eq!(Arc::strong_count(&retained), 1);
+    }
+
+    #[test]
+    fn replacing_an_image_in_a_fork_does_not_change_a_pinned_render_snapshot() {
+        let image_id = ImageId::new("snapshot-image");
+        let mut project = default_project(1.0);
+        project.output = Output {
+            width: 2,
+            height: 2,
+            fps: 30.0,
+        };
+        project.images = vec![ImageRef {
+            id: image_id.clone(),
+            path: "snapshot.png".into(),
+        }];
+        project.layers.clear();
+        let image_layer = new_image_layer(&project, image_id.clone());
+        project.layers.push(image_layer);
+        let scene = evaluate(&project, 0.0, &SpectrumFrame::new(Vec::new()));
+
+        let pinned = Arc::new(Assets::default());
+        pinned.insert_image(
+            image_id.clone(),
+            ImageAsset::new(2, 2, vec![10, 20, 30, 255].repeat(4)).unwrap(),
+        );
+        let mut before = Frame::new(2, 2).unwrap();
+        let before_report = render_frame(&scene, &pinned, &mut before).unwrap();
+        assert!(before_report.unresolved_assets.is_empty());
+
+        let fork = pinned.fork_retain_images(std::slice::from_ref(&image_id));
+        fork.insert_shared_image(
+            image_id,
+            Arc::new(ImageAsset::new(2, 2, vec![200, 100, 50, 255].repeat(4)).unwrap()),
+        );
+        let mut pinned_after_fork = Frame::new(2, 2).unwrap();
+        let mut forked = Frame::new(2, 2).unwrap();
+        let pinned_report = render_frame(&scene, &pinned, &mut pinned_after_fork).unwrap();
+        let forked_report = render_frame(&scene, &fork, &mut forked).unwrap();
+
+        assert!(pinned_report.unresolved_assets.is_empty());
+        assert!(forked_report.unresolved_assets.is_empty());
+        assert_eq!(pinned_after_fork.rgba, before.rgba);
+        assert_ne!(forked.rgba, before.rgba);
     }
 }
