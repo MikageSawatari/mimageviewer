@@ -542,6 +542,13 @@ Down後・返信前のアプリ終了、EOF、runner timeoutとの競合、挿�
 単独owner/非blocking返信とpure reducerを接続し、PS5.1/7各16群のfake・自process pipe試験を
 独立レビューした。queue飢餓、app death後のcleanup期限停止、最後の肯定証拠で終了検査を
 飛ばす3経路を修正済み。実SendInput・OS observer・Rust/runner接続はこの承認範囲に含まない。
+
+2026-09-08の後続checkpointではtyped OS observerとWin32 backendをignored草案へ追加し、
+独立レビュー・PS5.1/7各36群のfake/自process pipe試験を完了した。
+通常送信はfacts取得後にも実ownerの生存・期限を確認し、Refused/Calledを区別する。
+挿入countを既存reducerへ記録してからDPI等の復元失敗を扱い、cleanup義務を失わない。
+残留last_errorだけでcount 1を失敗にしない。拒否/挿入0の理由は既存の最初の失敗へ保持する。
+これは同一点clickの草案承認で、実SendInput・Rust/App・runner host接続は未実装である。
 期限/owner変更/元HWND退去でも
 この義務を捨てず、通常操作とは別の短いcleanup期限で移動なしのglobal LeftUpを試みる。
 cleanupで元の失敗を成功へ変換せず、AppのZoomPanを診断コードで直接resetしない。
