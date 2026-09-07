@@ -23,9 +23,9 @@
 | 指摘 | 実装・独立レビュー | 検証 |
 | --- | --- | --- |
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
-| R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt成功 |
+| R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
-| R4/R8 長押しと見開き | 独立レビューで実装境界を確認済み。Solが現コードとの前提照合を再開 | 実装・自動検証・実機は未完了 |
+| R4/R8 長押しと見開き | viewer-owned owner/pure asset第1段は独立Astra承認済み。描画・lifecycle接続中 | owner state 15件成功。renderer/lifecycle・全体gate・実機は未完了 |
 | R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
@@ -671,3 +671,236 @@ fs_painted_lastのSome、page layoutを発行しない。一方prepare_fullscree
 候補側commonや最終alignmentでdiscoveryをfilterしない。1起点×3候補ページと3起点×1候補ページの
 双方が残ることを回帰対象にする。同署名の起点反復は、非common確定後に出現数を掛けて集約可能。
 飽和はdiscoveryだけに使用し、alignment/strip用の全辺は固定TXから厳密に再列挙できるよう保持する。
+
+### R1 不変base/deltaと派生MIHの所有・世代選択
+
+独立Astraがsrc/similar_search_array.rsの実型と照合した。book worker内の派生cacheだけが
+SearchSnapshotとbase/delta postingsを保持し、postingsは元配列の行位置を参照する。
+BaseArrayへのMIH埋込みやrecords複製はしない。単体画像照会とそのcache/workerは変更しない。
+baseは品質正値を登録しても、品質0への変更・削除を含めsuperseded maskを常に適用する。
+deltaは最終Live品質正値だけ。dedupe marks・候補buffer等はworker private scratchとする。
+待機要求/完成UI結果にsnapshotを保持させず、workerの派生cacheは現在1組に有界化する。
+scopeはpostingへ焼き込まず、同TXの行適格性検証で適用する。
+
+ItemChangeBatch自体にはstore_idがない。適用前に必ず同TX storeとの一致を検査する。
+shared/private候補はstore一致とbase_seq<=snapshot_seq<=TX read_seqを先に確認し、
+(base_seq,snapshot_seq)の降順で選ぶ。同順位なら既存MIHを再利用できる候補を優先する。
+postings再利用は数値の一致でなく保持中Arc<BaseArray>同一性で判定する。
+private=(base0,snapshot200)、shared=(base100,snapshot180)、TX201ならsharedを選んで180→201を追随する。
+snapshot seqだけを優先するとprivate旧baseが毎回最新へ進み、compactionへ移れなくなる。
+未来snapshotは最終deltaから巻き戻せない。履歴不足等は同TX公開行からmemory-only baseを作り、
+そのprivate snapshotを後続の追随元として再利用する。queryはbase永続化/履歴pruneを行わない。
+
+新baseへの切替が確定したら旧MIHをworkerで解放してから新MIHを構築する。
+旧base recordsはitem queryやcompactionが保持し得るため、アプリ全体のpeakが1世代分とは保証しない。
+構築途中のMIHは公開せず取消時に破棄する。完成base MIHはorigin/scope変更後も再利用可能だが、
+結果/common/TX文脈は失効させる。store変更/shutdownではworker上でcacheを退役させる。
+新旧postingの二重保持回避、初回/compaction/復旧peakは実測が必要で、実装・採用の完了ではない。
+
+### R1 全corpus意味論のoracleと規模制限
+
+旧256件打切り/候補側skipのqueryはoracleにしない。独立bruteで同TXの適格全体を走査し、
+候補本別の3飽和集計からcandidate key全集合を照合する。最終matched数で代用しない。
+分類はorigin/candidate全pagesに、common=trueの各対象ページの実近傍9冊分のwitnessだけを
+加えたcertificate corpusを旧classify_pairへ渡す。falseの代表追加は不要と独立Astraが証明した。
+certificateはglobalのsubsetなのでfalse commonを新たに作らず、trueは9冊の証拠で維持する。
+witness自身のcommonは証拠能力へ影響せず、再帰closureは不要。実container→book IDは一意に割り当てる。
+対象の品質0行・実page_index・A/B向きを保持すれば、対象間の全辺、分母、alignment同点、
+matched/coverage/relationが一致する。ページ帯も同じ実行の独立対応値と照合する。
+
+対象Lページに追加witness<=9L、certificate<=10L。ただし旧分類器は全近傍辺を保持するので、
+2冊各10000同署名ではcertificateが20000行でも約2億辺を作る。巨大旧oracleは実行しない。
+通常/短い実本はcertificateによる全フィールド比較、denseは小規模の網羅/反復/同点oracleと
+10k級の証明済み構造の期待値および負荷計測を分ける。同一TX内の同署名brute結果は再利用可能だが、
+非common確定には全走査が必要。これはoracleの設計合意であり、実行完了ではない。
+
+### R1 実本ケースの形状調査
+
+親はコピーDBをmode=ro/query_only・同read TXで照合し、
+`target/review-fixes-bench-20260908/book-case-shape.json`へ50ケースを記録した。
+Completeの400ページ全24冊、10000ページ全8冊、kind別の短い本18冊を選択した。
+read_seq9852/page_order_version1。最大8冊は品質正値10000行、異なる署名9197〜9788、
+同一署名の最多反復3〜10。dense合成だけでなく高いunique署名数の負荷を確認する必要がある。
+これは署名/ページ数の形状調査だけで、照会・分類・性能テストではない。
+旧1.69秒計測の400ページ/7候補の具体keyは現記録から未特定。条件の同一性を推測しない。
+
+### R4 第1段owner APIの独立レビューと修正指示
+
+新規similar_preview.rs作成後、UI接続/compile前に独立AstraがAPIを先行レビューした。
+gesture（表示権限）/cached（有効資源）/worker（未完了処理）は独立寿命として分離可能だが、
+releaseをworker取消と同一にしていた点を修正する。release/focusは表示だけ終了し、有効な準備完了は
+非表示cacheへ保持する。page/park/close等のsource/session失効はcancel→Drainingで旧結果を拒否する。
+失敗済み要求はIdleと区別し、新pressの明示retryを定義する。cache hitでも古worker/nextを調停する。
+File/ZIPのcanonical source_dimsをGPU縮小後pixels.sizeと区別して保持する。
+新preview uploadはArc<ColorImage>をload_textureへ渡し、UI上の不要な全画素cloneを避ける。
+
+freshnessは親/独立Astraで次の境界に合意した。
+indexed hit stampとworkerが実file/outer ZIP/PDFから得るobserved stamp（modified SystemTime+len）を分ける。
+decode前後のobserved一致を検査し、再pressは同じ有界workerのValidateOrPrepareで確認する。
+同一ならtextureを再利用し、変化ならcurrent sourceを再decodeする。cacheの存在だけで表示を許可せず、
+当該press/requestの確認成功後に表示する。metadata失敗/前後不一致はFailedで、旧画像へ戻さない。
+release後completionはcacheへ採用可能だが、source/session失効後の旧completionは採用しない。
+PDF認証の現revisionをpredrawと完了採用時に照合する。workerへ渡すPdfPasswordStoreは値cloneである。
+
+既知候補更新はmetadata panelがfresh Readyを受領した時、同target/keyのindexed stamp更新をownerへ渡す。
+Preparing中のlast_ready表示や、候補が結果から消えたことだけを更新/削除通知にしない。
+hidden中のDB照会追加、global memory_epochによる全viewer失効、UI同期stat、watcher新設はしない。
+保証境界は既知更新/現認証revision/新press/decode前後。metadata同値を内容hash同値や常時外部変更検出とは謳わない。
+この節は修正指示・設計合意であり、実装/自動検証完了ではない。
+
+### R4 owner改訂の再レビューと初回compile
+
+改訂APIと7回帰を作成後の先行再レビューで、独立Astraが3件P2を確認した。
+Ready中も現credentialを確認すること、Drainingの旧pendingをactive freshness対象から外すこと、
+cache A更新で無関係Bのrequest/gestureを消さないこと。いずれも修正対象とする。
+要求正本はRunning.request/Draining.next/Failed.request、cacheは独立resource。
+既知更新は一致するcache/gesture/要求だけを失効し、viewer全体generationはsession/park/close等に限る。
+
+独立coreはZIP/PDF各pageのindexed mtime/sizeがouter FileCandidate由来と確認した。
+同candidateの変更に加え、正規化resource_pathが同じでouter versionが違う別entry/pageも対象にする。
+別physical sourceと、既に新versionに対応する資源は保持。認証revisionは同PDFの全pageに関係し、
+viewport等の描画条件差とは分ける。新watcher/同期stat/全体epochは追加しない。
+
+`target/r4-similar-preview-state-tests1.log` はexit101、テスト実行前のcompile失敗。
+新fixtureのitem_idへi64のmtimeを代入した型不一致と、存在しないMatchBand::Sameの2診断。
+製品型を拡げずfixtureを実型へ合わせ、上記P2の回帰とともに別ログで再実行する。
+この時点ではR4テスト成功・renderer接続・portable再buildは未完了。
+
+### R4 owner state test run2成功
+
+`target/r4-similar-preview-state-tests2.log` はexit0、10成功/0失敗、compile1分57秒。
+Ready後credential変更、旧drain中のnew Ready反復、cache A更新時の別source B維持を含む。
+release hidden-cache、新press validation、focus復帰非再開、失敗retry、session ABAも成功した。
+実metadata前後検証と同outer ZIP/PDF別pageの回帰を補強後、第1段の独立再レビューを行う。
+現時点はowner/pure assetの検証であり、renderer/lifecycle接続の完了ではない。
+
+### R4 owner追加レビューとrun3 compile
+
+driveを落とすpath_key::normalizeをsource identityに使う新P2を独立Astraが検出。
+索引と同様にdrive/UNCを保持する正規化へ直し、C:/D:の同階層同名の非干渉を回帰へ追加する。
+2viewer回帰はBが空ownerだったため、Bも実pendingとcancel tokenを持たせ、
+B dropでBだけ取消・A非取消とA完了採用を検査するよう補強する。
+PDFはclamp前render寸法保持まで確認。page box aspect/native raster寸法/Vectorのpixel基準の
+具体契約はrenderer接続前に確定する必要があり、PDF描画全体の完了とは扱わない。
+
+`target/r4-similar-preview-state-tests3.log` はexit101、追加fixtureのcompile失敗3診断。
+存在しないItemKind::ZipImageと、source_version test helperが本体関数を隠した型不一致/unwrap不存在。
+テスト実行は未到達。fixture修正と上記補強後のrun4を別ログで行う。
+
+### 設計概要の旧索引記述の訂正
+
+architecture-overviewのrowid/key hash・44byte similar.compact・1件cache・終了時のみ再読込の記述を、
+現行の明示item ID/revision・48byte similar.base/base-delta・6件cache・array worker追随へ訂正した。
+独立coreが既存コードと照合。header applied_seqは保持されるがread_baseでDB最新seqと照合しないため、
+検証対象の説明から切り離した。本文SHA-256がheader seqを保護する保証も記述しない。
+R1の未採用MIH等は現行architectureへ混ぜず、修正計画への参照に留めた。
+
+
+### R4 owner第1段の検証・独立承認
+
+`target/r4-similar-preview-state-tests4.log` はexit0、15成功/0失敗、compile1分53秒。
+実metadata同値のcache再利用、変更後の再decode、decode前後変更の拒否、同outer archiveの別page、
+C:/D:の非干渉、双方が実workerを持つA/BでB dropがAを取り消さないことを確認した。
+独立Astraはowner/pure asset段階を承認し、追加P1/P2なしと報告した。
+`target/r4-owner-stage1-20260908/manifest.json` とpatch/new moduleを保存した。
+基準は79d30b23eとR2 staged index。R4 tracked patch SHA-256は
+`e6b1b6455b738280009acd3d073497ad39e96ee7316d179b7c55205719852a82`。
+これはrenderer、入力・park等のlifecycle、PDF geometry、全体gateの完了を意味しない。
+
+### R4 共通geometry抽出の実装前合意
+
+親・実装Sol・独立Astraは、identityを持たないDisplayedImageGeometryへ数学/paint geometryを集約し、
+既存DisplayedImageTransformはpage_idxとgeometryを保持するwrapperにする境界で合意した。
+既存のflat input APIと読み取りを維持し、immutable Derefだけを実装する。DerefMutは追加しない。
+唯一の外部source_size書込はcapture用座標変更なので、明示的with_coordinate_source_sizeへ移し、
+矩形・UV・倍率を再計算しない。wrapperのtranslated_byはpage_idxを保持したSelfを返す。
+候補画像はGeometryを直接使い、偽page_idxや元ページのlayout/cache identityを借用しない。
+
+base resolveのfit/Original/no-upscaleは従来のtexture_size基準を維持する。
+canonical 100%とPDF aspectは既存resolve_fs_image_transformのidentityなし抽出に集約する。
+layout長辺をsource長辺へ正規化し、Proportional中間枠、texture contain、最終pixel snapの順を保つ。
+PDF Rasterのsourceはcanonical native寸法、Vectorはrender寸法、layoutはpage box aspect、
+textureはGPU実寸法として分離する。RasterのGPU clampもcanonical layout経路を使う。
+通常・連続・別窓・captureを含む共有機構のため、wrapper移動/座標変更と既存geometry回帰を検証し、
+最終full gateで統合する。API合意時点ではこの段階の実装・テストは未完了。
+
+
+### R4 共通GPU paint/cacheの実装前合意
+
+FullscreenPaintSourceIdをPage(usize)/SimilarPreview(u64)に分け、既存page constructorはwrapperで維持する。
+resourceのResampleable/Lanczos変換、cache key、fallback key、同source判定、旧source掃除の全経路で
+variantを保持する。page_idx()は既にOptionなので候補はNone、postfilter None/trace falseとする。
+page由来のinput_generationを借りず、preview assetのidentity/generation/TextureIdを使う。
+同値のValidate完了では資源IDを保持し、新Preparedだけ新IDとする。pressごとにcacheを捨てない。
+fs_lanczos_cacheはViewerContextBundleでSimilarPanelStateと一緒に移動するため、viewer-local IDでよい。
+
+retain_page_indices/remove_pageはPageだけ、preview専用retainは候補だけを掃除する。
+releaseでcached assetを保持する間は派生cacheも保持でき、失効/置換で旧候補IDのentriesと
+limit_fallback_sourcesの双方を退役させる。後者の無上限HashSetへ旧IDを累積させない。
+outputsはtyped sourceを返し、VRAM全体集計(None)には両variant、ページ別予算(Some(indices))には
+Pageだけを含める。候補の元textureもowner cached assetから全体集計へ含める。
+候補を架空pageへ帰属させず、at-rest viewerの資源も集計対象とする。
+同数値ID/同TextureId/同世代でもPageとPreviewが異keyになること、双方の退役非干渉を回帰対象にする。
+親・独立Astraが既存consumerを照合した設計合意であり、この段階の実装検証は後続。
+
+
+### R1/R5/R6 実装区切りと依存境界の先行棚卸し
+
+独立coreが製品callerを再確認した。ui_metadata_panel→App::query_similar_book→managerの1系統。
+実装は(1)viewer client/fair worker owner、(2)同read TX helpers、(3)worker-private MIH、
+(4)common/discovery/classifier・stripの4区切りで進める。単体画像照会/cacheには混ぜない。
+clientはSimilarPanelStateのdefault可能なfieldとし、park/swapで退役させない。
+query_bookがpublicを維持する場合、引数clientも公開可能なopaque型にする。
+DBはcommit結果の値を返しschedulerが通知する。DBからquery ownerへ依存させない。
+workerからmanager/schedulerへの強参照循環や、ConnectionとTransactionの自己参照構造を作らない。
+readerはworker localで所有し、BookReadSnapshotはread TX期間だけ借用する。
+
+ページ順修復はworker_loop→repair_page_order_if_stale→renumber_container_pages。
+DB側のtransaction.commit成功後、helperは変更なし/commit済みを返し、schedulerが直ちに通知する。
+containers==0でもorder-version更新がcommitされ得るため、件数を通知省略条件にしない。
+現在のBookQueryState::Idle代入はscope変更・run終端・array公開に分けてhard/soft通知へ移行する。
+この棚卸しはread-onlyであり、新query ownerやTX実装の完了ではない。
+
+
+### R4 handler回帰の入口
+
+独立UIは既存harnessを確認し、実装担当へ次の4境界を共有した（テスト実行は後続）。
+setup_fullscreen_fixed_key_testとviewport focus入力でhidden release/focus lossを実predrawへ通す。
+spread/navigator既存texture fixtureで実pair解決と共通paint selectionを通し、LTR/RTL本文・overviewを検証する。
+実open_fullscreen(second)のpark経路で候補のsnapshot混入と遅延完了の復活を防ぐ。
+navigatorの実input handler、およびcapture_region_target_at/cropで操作開始後の元geometryを検証する。
+metadata_panel_similar_results_dark等はパネル単体fixtureなので、このlifecycle回帰の代用にはしない。
+
+
+### R4 geometry/GPU製品差分の先行実装レビュー
+
+独立Astraが79d30b23eとR2 stagedの上のgeometry/GPU/accounting差分を確認し、追加P1/P2なしとした。
+数学式、immutable wrapper/page identity、cache/fallback/familyのtyped identity、双方向退役、
+VRAMの全体/ページ予算投影は合意した境界を維持している。
+`target/r4-geometry-check1.log` はFinished dev 36.00s、
+`target/r4-geometry-gpu-check1.log` はFinished dev 31.75sを確認した。
+追加回帰の結果は後続。preview retainの製品caller、元textureのmounted/at-rest計上、
+candidate generation/paint/input取消は未接続であり、このレビューはR4全体の完成承認ではない。
+
+
+### R4 geometry/GPU狭域回帰の成功
+
+`cargo test -p mimageviewer --features pack-build-tools --lib` のfilterとして
+page_wrapper_and_identity_free_geometry_resolve_to_the_same_result、続いて
+page_retention_and_preview_retirement_do_not_cross_source_ownersを実行した。
+`target/r4-geometry-test1.log` は1成功/0失敗（compile1分55秒）、
+`target/r4-gpu-retire-test1.log` は1成功/0失敗（warm compile0.67秒）。順次実行sessionはexit0。
+既存geometry/GPU module回帰とfmt、renderer接続は次の区切りで確認する。
+
+
+### R4 geometry/GPU共有回帰とcheckpoint
+
+`target/r4-displayed-transform-tests-stage1.log` は22成功/0失敗（compile1分29秒）、
+`target/r4-gpu-lanczos-tests-stage1.log` は36成功/0失敗（warm compile0.63秒）。
+初回fmt checkは整形差分でexit1。cargo fmt適用後のfmt checkとgit diff --checkはexit0と実装担当が報告。
+成功fmtはstdout/stderr 0bytesでTeeがlogを作らなかった。command/exit0の記録は
+`target/r4-fmt-check-stage1-v2.meta.json` に保存され、親がmanifestへ取り込んだ。
+整形は新R4 hunksのみで、R2 staged8files +1632/-79を保持した。
+親はsource編集停止中に `target/r4-geometry-stage1-20260908/` へpatch/new module/manifestを保存し、
+R2 staged patch SHA-256が最初のportable成果物と一致することを再照合した。
+共有部の独立レビュー・回帰が済んだ区切りであり、renderer/lifecycleと新portableはまだ未完了。
