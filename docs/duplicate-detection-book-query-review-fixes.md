@@ -691,3 +691,26 @@ target canonicalize-or-raw fallbackは同じread-only規約を独立導出する
 
 ケース生成の具体ファイル境界とデータ保護は実装担当が既存APIに照合してから着手する。追加狭域と凍結差分の独立レビューを行う。
 既存の成功済み小規模oracleは再実行せず、追加の構造期待を確認する。通常20標本の生値と巨大条件の標本数・限界を明記する。
+
+具体preflightは既存4fileのcfg(test)だけで着手承認: ui_metadata_panel.rs（実draw/ScrollAreaと軽いthread-local観測）、
+similar_book_engine.rs（7N/1万2shapeのactual DB/base/queryと構造期待）、similar_index.rs（実proxy/PDQのnear-white8冊/9冊）、
+similar_search_array.rs（基準base化と65535/65536件・old base保持/new base publish）。lib/Cargo/DB製品helperを追加しない。
+世代用のguard copy scriptも同じ固定差分でレビューする。sourceは既知prepared入力へ固定、copy script/testのfresh root作成所有を一本化する。
+target配下というだけでportable-dev等既存dirを受け入れず、そのrunで新規作成し期待hash/store/seqを検査したcopyだけを変更する。祖先reparse/aliasも拒否する。
+世代差分は実base由来の品質適格な分散署名を持つ新規loose itemを使う。MIHはquality>0を収録するため全件quality0で埋めた負荷試験にしない。
+upsert_loose_itemはcontainer_key=Noneを前提とする。API呼出回数からdelta.lenやseq差を推定せず実値を確認する。
+通常n20は完了。残るUI/fixtureは共通release test buildへまとめ、生成・engine測定・UI測定を直列にする。製品UI修正は測定結果と設計判断の後に限る。
+UIはwarmup後の値に加え初回drawも補助値として保存し、短時間CPUの0をOS計時粒度と区別する。
+UI予備コードはContext::defaultだけで日本語の製品フォントを適用していなかったため、親がrelease測定前に訂正を指示した。
+sizingと各fresh Contextへui_fonts::configure_fontsをtimer外で適用する。この入口はUiFontSettings::defaultを使い、OS fontを読むが通常設定DBを初期化しない。
+初回fresh Contextのdrawにはatlas/layout準備が含まれるため、アプリ全体の初回パネル表示時間と同一視しない。
+
+fixed2（target/r1-scale-ui-fixtures-fixed2-20260909/manifest.json、SHA256 b4f7a3047d93f7a6c4c5cfa72555d95230aaac4f508c95ba044096b3d787a12f）は、
+親が23 artifacts・4 source・R2 staged patchの一致を確認した。独立Solは構造を承認し、実行前の検証不足P2を2点指摘した。
+1. 65535件時点はassert後に同じDBへ追加されるだけで、凍結CLIに渡す独立入力が残らない。
+   全DB handleを閉じてDELETE/no-sidecarを確認し、その時点のDBとseq9852 baseをCreateNewで保存・hash固定してから元copyを65536件へ進める。
+2. 全生成fixtureの最終DB/base/retained-baseにlen/SHA256がなく、生成後から測定前までの改変を照合できない。
+   close/quick_check/sidecar確認後にmanifestへ記録し、wrapperが測定CLI起動前に照合して不一致を拒否する。採用済みCLIを変更しない。
+これらは製品コードの不具合ではなく測定入力の保存・検証の不備である。進行中の共通release compileは中断せず証跡を残す。
+修正後は保存/照合の増分だけを狭域確認・独立レビューし、成功済み通常n20や混在92件を繰り返さない。
+UI sourceが不変ならbuild1の固定exeでrelease補助測定を一度行い、build2やfixture生成と同時に測定しない。

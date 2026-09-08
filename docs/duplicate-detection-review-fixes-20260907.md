@@ -28,6 +28,22 @@
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
 | R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。特殊大規模/世代更新、大規模UI、最終gate/portable・実機は未完了 |
 
+### 現在の残作業（2026-09-09、利用者への状況説明時点）
+
+製品の主要修正と独立レビューは完了し、通常4条件のcold/warm各20標本、実本2件の全field照合、実行途中取消4件も完了した。
+残る自動検証の範囲を次の4群に固定し、既存成功ケースの反復や新たな探索へ広げない。
+
+1. 400頁からの2800候補と実PDQ near-whiteの8冊/9冊境界。
+2. 1万頁の対角一致と一般dense対応。
+3. 実入力copyの差分65535/65536件、base再構築後と旧base保持時。
+4. 実draw/ScrollArea経路の大量結果描画（releaseの補助測定）。
+
+現在は共通release test compile中。生成fixtureの65535時点保存と最終hash/測定前照合に独立SolがP2を指摘し、増分修正する。
+これらは検証コードの不備であり、新たな製品バグの発見とは区別する。UI source不変のビルドはUI測定に再利用する。
+4群の結果を採用判断へ反映した後、最終sourceでtest-full.ps1を実行し、portableをbuild/updateする。
+最終portableでR2のロック、R4/R8の長押し・見開き、新engineの音声への影響は利用者の実機確認が残る。
+§9.2横断一覧、masterへの逆統合、pushは今回の残作業へ追加しない。
+
 ### R2: 類似候補への移動と閲覧終了を区別する
 
 類似画像と本のページ帯の両入口を、viewer内の移動として共有ナビゲーションへ接続する。
