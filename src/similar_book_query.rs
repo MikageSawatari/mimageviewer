@@ -44,6 +44,18 @@ pub(crate) enum BookQueryTerminal<T> {
     Failed(String),
 }
 
+/// Result of checking the process-wide prerequisites for the FIFO head.
+///
+/// `Wait` is not a terminal result and never consumes the queued request. `Complete` is reserved
+/// for a stable global terminal such as a confirmed missing index; a later freshness publication
+/// must use `soft_refresh`, rather than a bare dispatch signal, to schedule active clients again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BookQueryDispatchDecision<T> {
+    Run,
+    Wait,
+    Complete(BookQueryTerminal<T>),
+}
+
 pub(crate) trait BookQueryRuntime<T>: Send + 'static {
     fn execute(
         &mut self,
@@ -54,6 +66,7 @@ pub(crate) trait BookQueryRuntime<T>: Send + 'static {
 
 type RuntimeFactory<T> =
     dyn Fn() -> Result<Box<dyn BookQueryRuntime<T>>, String> + Send + Sync + 'static;
+type DispatchProbe<T> = dyn Fn() -> BookQueryDispatchDecision<T> + Send + Sync + 'static;
 type ThreadJob = Box<dyn FnOnce() + Send + 'static>;
 type ThreadSpawner = dyn Fn(ThreadJob) -> Result<(), String> + Send + Sync + 'static;
 type ResultNotifier = dyn Fn() + Send + Sync + 'static;
@@ -119,6 +132,25 @@ struct Running {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct QueuedHead {
+    client_id: ClientId,
+    hard_generation: u64,
+    container_key: String,
+}
+
+enum WorkerDispatch<T> {
+    Run(Running),
+    Complete(Running, BookQueryTerminal<T>),
+    Stop,
+}
+
+enum WorkerRuntime<T> {
+    Initial,
+    Ready(Box<dyn BookQueryRuntime<T>>),
+    Restart,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerLifecycle {
     Dormant,
     Starting,
@@ -143,6 +175,7 @@ struct OwnerState<T> {
     next_client_id: u64,
     next_request_id: u64,
     current_refresh: RefreshId,
+    dispatch_ticket: u64,
 }
 
 impl<T> Default for OwnerState<T> {
@@ -155,6 +188,7 @@ impl<T> Default for OwnerState<T> {
             next_client_id: 1,
             next_request_id: 1,
             current_refresh: RefreshId(0),
+            dispatch_ticket: 0,
         }
     }
 }
@@ -164,8 +198,24 @@ struct ExecutorInner<T> {
     state: Mutex<OwnerState<T>>,
     wake: Condvar,
     runtime_factory: Arc<RuntimeFactory<T>>,
+    dispatch_probe: Arc<DispatchProbe<T>>,
     thread_spawner: Arc<ThreadSpawner>,
     notify_result_change: Arc<ResultNotifier>,
+}
+
+/// Type-erased, non-owning wake handle for readiness publishers.
+///
+/// This only invalidates a `Wait` probe. A publication which makes cached results stale must call
+/// `soft_refresh` or `hard_invalidate` so freshness and the dispatch ticket advance atomically.
+#[derive(Clone)]
+pub(crate) struct BookQueryDispatchNotifier {
+    signal: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+impl BookQueryDispatchNotifier {
+    pub(crate) fn signal(&self) {
+        (self.signal)();
+    }
 }
 
 static NEXT_EXECUTOR_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -210,13 +260,31 @@ where
         + 'static,
         notify_result_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        Self::with_spawner(runtime_factory, notify_result_change, |job| {
-            std::thread::Builder::new()
-                .name("similar-book-query".to_owned())
-                .spawn(job)
-                .map(|_| ())
-                .map_err(|error| format!("similar book query worker spawn failed: {error}"))
+        Self::with_dispatch_gate(runtime_factory, notify_result_change, || {
+            BookQueryDispatchDecision::Run
         })
+    }
+
+    pub(crate) fn with_dispatch_gate(
+        runtime_factory: impl Fn() -> Result<Box<dyn BookQueryRuntime<T>>, String>
+        + Send
+        + Sync
+        + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
+        dispatch_probe: impl Fn() -> BookQueryDispatchDecision<T> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_gate_and_spawner(
+            runtime_factory,
+            notify_result_change,
+            dispatch_probe,
+            |job| {
+                std::thread::Builder::new()
+                    .name("similar-book-query".to_owned())
+                    .spawn(job)
+                    .map(|_| ())
+                    .map_err(|error| format!("similar book query worker spawn failed: {error}"))
+            },
+        )
     }
 
     fn with_spawner(
@@ -227,14 +295,43 @@ where
         notify_result_change: impl Fn() + Send + Sync + 'static,
         thread_spawner: impl Fn(ThreadJob) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
+        Self::with_gate_and_spawner(
+            runtime_factory,
+            notify_result_change,
+            || BookQueryDispatchDecision::Run,
+            thread_spawner,
+        )
+    }
+
+    fn with_gate_and_spawner(
+        runtime_factory: impl Fn() -> Result<Box<dyn BookQueryRuntime<T>>, String>
+        + Send
+        + Sync
+        + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
+        dispatch_probe: impl Fn() -> BookQueryDispatchDecision<T> + Send + Sync + 'static,
+        thread_spawner: impl Fn(ThreadJob) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             inner: Arc::new(ExecutorInner {
                 identity: NEXT_EXECUTOR_IDENTITY.fetch_add(1, Ordering::Relaxed),
                 state: Mutex::new(OwnerState::default()),
                 wake: Condvar::new(),
                 runtime_factory: Arc::new(runtime_factory),
+                dispatch_probe: Arc::new(dispatch_probe),
                 thread_spawner: Arc::new(thread_spawner),
                 notify_result_change: Arc::new(notify_result_change),
+            }),
+        }
+    }
+
+    pub(crate) fn dispatch_notifier(&self) -> BookQueryDispatchNotifier {
+        let inner = Arc::downgrade(&self.inner);
+        BookQueryDispatchNotifier {
+            signal: Arc::new(move || {
+                if let Some(inner) = inner.upgrade() {
+                    inner.signal_dispatch_change();
+                }
             }),
         }
     }
@@ -526,6 +623,7 @@ where
         if !state.worker.accepts_requests() {
             return;
         }
+        state.dispatch_ticket = state.dispatch_ticket.wrapping_add(1);
         state.current_refresh = RefreshId(state.current_refresh.0.saturating_add(1));
         let refresh = state.current_refresh;
         let mut client_ids = state.clients.keys().copied().collect::<Vec<_>>();
@@ -551,6 +649,7 @@ where
         if !state.worker.accepts_requests() {
             return;
         }
+        state.dispatch_ticket = state.dispatch_ticket.wrapping_add(1);
         if let Some(running) = &state.running {
             running.cancel.store(true, Ordering::Release);
         }
@@ -573,6 +672,16 @@ where
         if result_changed {
             self.notify_result_change();
         }
+    }
+
+    fn signal_dispatch_change(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.worker.accepts_requests() {
+            return;
+        }
+        state.dispatch_ticket = state.dispatch_ticket.wrapping_add(1);
+        drop(state);
+        self.wake.notify_all();
     }
 
     fn retain(&self, client_id: ClientId) {
@@ -634,6 +743,38 @@ where
             && matches!(client.work, ClientWork::Queued)
         {
             client.work = ClientWork::Idle;
+        }
+    }
+
+    fn queued_head_locked(state: &OwnerState<T>) -> Option<QueuedHead> {
+        let client_id = *state.fifo.front()?;
+        let client = state.clients.get(&client_id)?;
+        if !matches!(client.work, ClientWork::Queued) {
+            return None;
+        }
+        Some(QueuedHead {
+            client_id,
+            hard_generation: client.hard_generation,
+            container_key: client.demand.container_key()?.to_owned(),
+        })
+    }
+
+    fn queued_head_matches(state: &OwnerState<T>, expected: &QueuedHead) -> bool {
+        let Some(&client_id) = state.fifo.front() else {
+            return false;
+        };
+        let Some(client) = state.clients.get(&client_id) else {
+            return false;
+        };
+        client_id == expected.client_id
+            && matches!(client.work, ClientWork::Queued)
+            && client.hard_generation == expected.hard_generation
+            && client.demand.container_key() == Some(expected.container_key.as_str())
+    }
+
+    fn discard_stale_queue_heads_locked(state: &mut OwnerState<T>) {
+        while state.fifo.front().is_some() && Self::queued_head_locked(state).is_none() {
+            state.fifo.pop_front();
         }
     }
 
@@ -719,6 +860,79 @@ where
         }
     }
 
+    fn wait_for_dispatch(&self) -> WorkerDispatch<T> {
+        loop {
+            let (ticket, head) = {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                loop {
+                    match state.worker {
+                        WorkerLifecycle::Live => {
+                            Self::discard_stale_queue_heads_locked(&mut state);
+                            if let Some(head) = Self::queued_head_locked(&state) {
+                                break (state.dispatch_ticket, head);
+                            }
+                            state = self
+                                .wake
+                                .wait(state)
+                                .unwrap_or_else(|error| error.into_inner());
+                        }
+                        WorkerLifecycle::Stopping
+                        | WorkerLifecycle::Stopped
+                        | WorkerLifecycle::Failed(_) => return WorkerDispatch::Stop,
+                        WorkerLifecycle::Dormant | WorkerLifecycle::Starting => {
+                            return WorkerDispatch::Stop;
+                        }
+                    }
+                }
+            };
+
+            // Readiness may lock scheduler/memory state or perform other bounded probes. It must
+            // never run while the request owner is locked.
+            let decision = (self.dispatch_probe)();
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !matches!(state.worker, WorkerLifecycle::Live) {
+                return WorkerDispatch::Stop;
+            }
+            Self::discard_stale_queue_heads_locked(&mut state);
+            if state.dispatch_ticket != ticket || !Self::queued_head_matches(&state, &head) {
+                continue;
+            }
+            match decision {
+                BookQueryDispatchDecision::Run => {
+                    if let Some(running) = Self::take_next_locked(&mut state) {
+                        return WorkerDispatch::Run(running);
+                    }
+                }
+                BookQueryDispatchDecision::Complete(terminal) => {
+                    if let Some(running) = Self::take_next_locked(&mut state) {
+                        return WorkerDispatch::Complete(running, terminal);
+                    }
+                }
+                BookQueryDispatchDecision::Wait => {
+                    let state = self
+                        .wake
+                        .wait_while(state, |state| {
+                            matches!(state.worker, WorkerLifecycle::Live)
+                                && state.dispatch_ticket == ticket
+                                && Self::queued_head_matches(state, &head)
+                        })
+                        .unwrap_or_else(|error| error.into_inner());
+                    drop(state);
+                }
+            }
+        }
+    }
+
+    fn running_is_authorized(&self, running: &Running) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        matches!(state.worker, WorkerLifecycle::Live)
+            && !running.cancel.load(Ordering::Acquire)
+            && state.running.as_ref().is_some_and(|active| {
+                active.client_id == running.client_id
+                    && active.request.request_id == running.request.request_id
+            })
+    }
+
     fn ensure_worker(self: &Arc<Self>) {
         let should_spawn = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -756,38 +970,49 @@ where
             }
         }
 
-        let mut runtime = match self.create_runtime_if_live() {
-            Some(Ok(runtime)) => runtime,
-            Some(Err(error)) => {
-                self.fail_worker(format!("similar book query runtime init failed: {error}"));
-                return;
-            }
-            None => return,
-        };
+        let mut runtime = WorkerRuntime::Initial;
 
         loop {
-            let running = {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                loop {
-                    match state.worker {
-                        WorkerLifecycle::Live => {
-                            if let Some(running) = Self::take_next_locked(&mut state) {
-                                break running;
-                            }
-                            state = self
-                                .wake
-                                .wait(state)
-                                .unwrap_or_else(|error| error.into_inner());
-                        }
-                        WorkerLifecycle::Stopping
-                        | WorkerLifecycle::Stopped
-                        | WorkerLifecycle::Failed(_) => return,
-                        WorkerLifecycle::Dormant | WorkerLifecycle::Starting => return,
-                    }
+            let running = match self.wait_for_dispatch() {
+                WorkerDispatch::Run(running) => running,
+                WorkerDispatch::Complete(running, terminal) => {
+                    self.finish(&running, terminal);
+                    continue;
                 }
+                WorkerDispatch::Stop => return,
             };
 
+            if !matches!(&runtime, WorkerRuntime::Ready(_)) {
+                let phase = match &runtime {
+                    WorkerRuntime::Initial => "init",
+                    WorkerRuntime::Restart => "restart",
+                    WorkerRuntime::Ready(_) => unreachable!(),
+                };
+                runtime = match self.create_runtime_if_live() {
+                    Some(Ok(runtime)) => WorkerRuntime::Ready(runtime),
+                    Some(Err(error)) => {
+                        self.fail_worker(format!(
+                            "similar book query runtime {phase} failed: {error}"
+                        ));
+                        return;
+                    }
+                    None => return,
+                };
+                if !self.running_is_authorized(&running) {
+                    self.finish(
+                        &running,
+                        BookQueryTerminal::Failed(
+                            "similar book query request cancelled before execution".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
             let terminal = catch_unwind(AssertUnwindSafe(|| {
+                let WorkerRuntime::Ready(runtime) = &mut runtime else {
+                    unreachable!("runtime creation completed without a runtime")
+                };
                 runtime.execute(running.request.clone(), Arc::clone(&running.cancel))
             }));
             match terminal {
@@ -797,17 +1022,8 @@ where
                         &running,
                         BookQueryTerminal::Failed("similar book query job panicked".to_owned()),
                     );
-                    drop(runtime);
-                    runtime = match self.create_runtime_if_live() {
-                        Some(Ok(runtime)) => runtime,
-                        Some(Err(error)) => {
-                            self.fail_worker(format!(
-                                "similar book query runtime restart failed: {error}"
-                            ));
-                            return;
-                        }
-                        None => return,
-                    };
+                    let old = std::mem::replace(&mut runtime, WorkerRuntime::Restart);
+                    drop(old);
                 }
             }
         }
@@ -1006,9 +1222,25 @@ mod tests {
         + 'static,
         notify_result_change: impl Fn() + Send + Sync + 'static,
     ) -> (BookQueryExecutor<i32>, Receiver<()>) {
+        executor_with_gate_done_spawner_and_notifier(runtime_factory, notify_result_change, || {
+            BookQueryDispatchDecision::Run
+        })
+    }
+
+    fn executor_with_gate_done_spawner_and_notifier(
+        runtime_factory: impl Fn() -> Result<Box<dyn BookQueryRuntime<i32>>, String>
+        + Send
+        + Sync
+        + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
+        dispatch_probe: impl Fn() -> BookQueryDispatchDecision<i32> + Send + Sync + 'static,
+    ) -> (BookQueryExecutor<i32>, Receiver<()>) {
         let (done_tx, done_rx) = channel();
-        let executor =
-            BookQueryExecutor::with_spawner(runtime_factory, notify_result_change, move |job| {
+        let executor = BookQueryExecutor::with_gate_and_spawner(
+            runtime_factory,
+            notify_result_change,
+            dispatch_probe,
+            move |job| {
                 let done = done_tx.clone();
                 std::thread::Builder::new()
                     .name("similar-book-query-test".to_owned())
@@ -1018,7 +1250,8 @@ mod tests {
                     })
                     .map(|_| ())
                     .map_err(|error| error.to_string())
-            });
+            },
+        );
         (executor, done_rx)
     }
 
@@ -1035,11 +1268,18 @@ mod tests {
         }
 
         fn with_notifier(notify_result_change: impl Fn() + Send + Sync + 'static) -> Self {
+            Self::with_gate_and_notifier(|| BookQueryDispatchDecision::Run, notify_result_change)
+        }
+
+        fn with_gate_and_notifier(
+            dispatch_probe: impl Fn() -> BookQueryDispatchDecision<i32> + Send + Sync + 'static,
+            notify_result_change: impl Fn() + Send + Sync + 'static,
+        ) -> Self {
             let (command_tx, command_rx) = channel();
             let commands = Arc::new(Mutex::new(command_rx));
             let (event_tx, event_rx) = channel();
             let next_runtime_id = Arc::new(AtomicU64::new(1));
-            let executor = BookQueryExecutor::new(
+            let executor = BookQueryExecutor::with_dispatch_gate(
                 {
                     let commands = Arc::clone(&commands);
                     let events = event_tx;
@@ -1053,6 +1293,7 @@ mod tests {
                     }
                 },
                 notify_result_change,
+                dispatch_probe,
             );
             Self {
                 executor: Some(executor),
@@ -1131,6 +1372,300 @@ mod tests {
                 state = next;
             }
         }
+    }
+
+    #[test]
+    fn dispatch_gate_wait_preserves_fifo_and_defers_runtime_creation_until_run() {
+        let gate = Arc::new(Mutex::new(BookQueryDispatchDecision::Wait));
+        let (probed_tx, probed_rx) = channel();
+        let harness = Harness::with_gate_and_notifier(
+            {
+                let gate = Arc::clone(&gate);
+                move || {
+                    let decision = gate
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    let _ = probed_tx.send(());
+                    decision
+                }
+            },
+            || {},
+        );
+        let notifier = harness.executor().dispatch_notifier();
+        let a = BookQueryClient::default();
+        let b = BookQueryClient::default();
+        assert_eq!(harness.executor().query(&a, "a"), BookQueryPoll::Preparing);
+        assert_eq!(harness.executor().query(&b, "b"), BookQueryPoll::Preparing);
+        probed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(harness.next_runtime_id.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            harness.events.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        *gate.lock().unwrap_or_else(|error| error.into_inner()) = BookQueryDispatchDecision::Run;
+        notifier.signal();
+        assert_eq!(harness.started().0, "a");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.started().0, "b");
+        harness.commands.send(Command::Complete(2)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&b, "b", &2), 2);
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn dispatch_signal_between_probe_and_wait_is_not_lost() {
+        let run = Arc::new(AtomicBool::new(false));
+        let first = Arc::new(AtomicBool::new(true));
+        let (probe_entered_tx, probe_entered_rx) = channel();
+        let (release_probe_tx, release_probe_rx) = channel();
+        let release_probe = Arc::new(Mutex::new(release_probe_rx));
+        let harness = Harness::with_gate_and_notifier(
+            {
+                let run = Arc::clone(&run);
+                let first = Arc::clone(&first);
+                let release_probe = Arc::clone(&release_probe);
+                move || {
+                    if first.swap(false, Ordering::AcqRel) {
+                        probe_entered_tx.send(()).unwrap();
+                        release_probe
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .recv()
+                            .unwrap();
+                        return BookQueryDispatchDecision::Wait;
+                    }
+                    if run.load(Ordering::Acquire) {
+                        BookQueryDispatchDecision::Run
+                    } else {
+                        BookQueryDispatchDecision::Wait
+                    }
+                }
+            },
+            || {},
+        );
+        let notifier = harness.executor().dispatch_notifier();
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        probe_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(harness.next_runtime_id.load(Ordering::Acquire), 1);
+
+        run.store(true, Ordering::Release);
+        let (operator_returned_tx, operator_returned_rx) = channel();
+        let returned_before_release = std::thread::scope(|scope| {
+            let operator = scope.spawn(|| {
+                notifier.signal();
+                operator_returned_tx.send(()).unwrap();
+            });
+            let returned = operator_returned_rx.recv_timeout(Duration::from_secs(3));
+            release_probe_tx.send(()).unwrap();
+            operator.join().unwrap();
+            returned
+        });
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &1), 1);
+        harness.shutdown(1);
+        assert!(
+            returned_before_release.is_ok(),
+            "dispatch notifier blocked on the owner while the probe ran: {returned_before_release:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_complete_advances_fifo_without_constructing_runtime() {
+        let next = Arc::new(AtomicU64::new(10));
+        let factory_calls = Arc::new(AtomicU64::new(0));
+        let (executor, done) = executor_with_gate_done_spawner_and_notifier(
+            {
+                let factory_calls = Arc::clone(&factory_calls);
+                move || {
+                    factory_calls.fetch_add(1, Ordering::AcqRel);
+                    panic!("terminal dispatch must not construct a runtime")
+                }
+            },
+            || {},
+            {
+                let next = Arc::clone(&next);
+                move || {
+                    BookQueryDispatchDecision::Complete(BookQueryTerminal::Ready(
+                        next.fetch_add(10, Ordering::AcqRel) as i32,
+                    ))
+                }
+            },
+        );
+        let a = BookQueryClient::default();
+        let b = BookQueryClient::default();
+        assert_eq!(executor.query(&a, "a"), BookQueryPoll::Preparing);
+        assert_eq!(executor.query(&b, "b"), BookQueryPoll::Preparing);
+        assert_eq!(executor.wait_for_ready(&a, "a", &10), 10);
+        assert_eq!(executor.wait_for_ready(&b, "b", &20), 20);
+        assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+        drop(executor);
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+
+    #[test]
+    fn soft_refresh_atomically_discards_an_obsolete_complete_probe() {
+        let first = Arc::new(AtomicBool::new(true));
+        let (probe_entered_tx, probe_entered_rx) = channel();
+        let (release_probe_tx, release_probe_rx) = channel();
+        let release_probe = Arc::new(Mutex::new(release_probe_rx));
+        let harness = Harness::with_gate_and_notifier(
+            {
+                let first = Arc::clone(&first);
+                let release_probe = Arc::clone(&release_probe);
+                move || {
+                    if first.swap(false, Ordering::AcqRel) {
+                        probe_entered_tx.send(()).unwrap();
+                        release_probe
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .recv()
+                            .unwrap();
+                        BookQueryDispatchDecision::Complete(BookQueryTerminal::Ready(9))
+                    } else {
+                        BookQueryDispatchDecision::Run
+                    }
+                }
+            },
+            || {},
+        );
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        probe_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let (operator_returned_tx, operator_returned_rx) = channel();
+        let executor = harness.executor();
+        let returned_before_release = std::thread::scope(|scope| {
+            let operator = scope.spawn(move || {
+                executor.soft_refresh();
+                operator_returned_tx.send(()).unwrap();
+            });
+            let returned = operator_returned_rx.recv_timeout(Duration::from_secs(3));
+            release_probe_tx.send(()).unwrap();
+            operator.join().unwrap();
+            returned
+        });
+        let (key, refresh, _) = harness.started();
+        assert_eq!((key.as_str(), refresh), ("book", 1));
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        harness.commands.send(Command::Complete(10)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &10), 10);
+        harness.shutdown(1);
+        assert!(
+            returned_before_release.is_ok(),
+            "soft refresh blocked on the owner while the probe ran: {returned_before_release:?}"
+        );
+    }
+
+    #[test]
+    fn gate_rechecks_same_client_after_hard_origin_aba() {
+        let first = Arc::new(AtomicBool::new(true));
+        let probes = Arc::new(AtomicU64::new(0));
+        let (probe_entered_tx, probe_entered_rx) = channel();
+        let (release_probe_tx, release_probe_rx) = channel();
+        let release_probe = Arc::new(Mutex::new(release_probe_rx));
+        let harness = Harness::with_gate_and_notifier(
+            {
+                let first = Arc::clone(&first);
+                let probes = Arc::clone(&probes);
+                let release_probe = Arc::clone(&release_probe);
+                move || {
+                    probes.fetch_add(1, Ordering::AcqRel);
+                    if first.swap(false, Ordering::AcqRel) {
+                        probe_entered_tx.send(()).unwrap();
+                        release_probe
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .recv()
+                            .unwrap();
+                    }
+                    BookQueryDispatchDecision::Run
+                }
+            },
+            || {},
+        );
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "a"),
+            BookQueryPoll::Preparing
+        );
+        probe_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let (operator_returned_tx, operator_returned_rx) = channel();
+        let executor = harness.executor();
+        let client_ref = &client;
+        let returned_before_release = std::thread::scope(|scope| {
+            let operator = scope.spawn(move || {
+                let b = executor.query(client_ref, "b");
+                let a = executor.query(client_ref, "a");
+                operator_returned_tx.send((b, a)).unwrap();
+            });
+            let returned = operator_returned_rx.recv_timeout(Duration::from_secs(3));
+            release_probe_tx.send(()).unwrap();
+            operator.join().unwrap();
+            returned
+        });
+        loop {
+            assert_eq!(harness.started().0, "a");
+            let state = harness
+                .executor()
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let hard_generation = state.running.as_ref().unwrap().request.hard_generation;
+            drop(state);
+            if hard_generation == 3 {
+                break;
+            }
+            harness.commands.send(Command::Complete(-1)).unwrap();
+        }
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "a", &1), 1);
+        harness.shutdown(1);
+        assert_eq!(
+            returned_before_release,
+            Ok((BookQueryPoll::Preparing, BookQueryPoll::Preparing)),
+            "hard origin change blocked on the owner while the probe ran"
+        );
+        assert!(probes.load(Ordering::Acquire) >= 2);
+    }
+
+    #[test]
+    fn waiting_gate_honors_withdraw_and_executor_shutdown() {
+        let (probed_tx, probed_rx) = channel();
+        let (executor, done) = executor_with_gate_done_spawner_and_notifier(
+            || panic!("waiting gate must not construct a runtime"),
+            || {},
+            move || {
+                let _ = probed_tx.send(());
+                BookQueryDispatchDecision::Wait
+            },
+        );
+        let client = BookQueryClient::default();
+        assert_eq!(executor.query(&client, "book"), BookQueryPoll::Preparing);
+        probed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        executor.withdraw(&client);
+        assert_eq!(executor.query(&client, "book"), BookQueryPoll::Preparing);
+        probed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(executor);
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
     }
 
     #[test]
