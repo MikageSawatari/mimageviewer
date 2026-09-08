@@ -5,7 +5,7 @@
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateもad2130581で保存済み（28件・製品check・独立レビュー成功）。既存query callerとDB/検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1bで保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -221,6 +221,7 @@ DB不在と権限・破損・schema/read errorは区別し、is_file=falseやCan
 捕捉した配列・scope・要求から read TX を開始し、同 TX で store_id と変更連番を取得する。
 BEGIN DEFERREDだけでは読取snapshotは固定されず、最初のmetadata SELECTで固定される。
 先行実装はsimilar_db内のSQL helper共有・専用reader・with_snapshot要求scopeまでとし、MIH/classifier/manager callerは接続しない。
+編集範囲はsrc/similar_db.rsとCargo.tomlのhooks featureに限定した。similar_search_arrayの非永続fallbackとZIP comparator/effective orderは次区切りであり、このreader保存の完了へ含めない。
 変更連番 `read_seq` は履歴 prune 後も残る `sqlite_sequence` を読み、履歴の `MAX(seq)` で代用しない。
 配列を同 TX の連番まで delta 追随してから、起点・候補・common・ページ帯をすべて同じ時点で解決する。
 対象の identity、revision、signature、quality、Complete 状態、hash version、scope、page-order version も混在させない。

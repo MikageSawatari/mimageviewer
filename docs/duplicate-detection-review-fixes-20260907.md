@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、28回帰/製品check/独立レビュー成功。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b。狭域/既存DB・array回帰/製品check/独立レビュー成功。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1661,3 +1661,38 @@ fmt-check/diff-check成功。source生bytes SHA256=0b4f52b9d73c8534812a6992c11c8
 詳細とSQL取消/busy限界はbook-query-review-fixesを正本とする。共有loaderと単体画像検索の再設計には範囲を広げない。
 architecture-overviewの永続化表に旧similar.compact/44byteの説明が残っていたため、コードに一致するsimilar.base/48byteへ訂正した。
 R4 portableと実機確認待ちは維持。reader/MIH/classifier/実caller/本照会性能とpeak/最終gate/portableの完了を意味しない。
+
+### R1/R6 readonly readerの第1区切り（配列追随・製品caller未接続）
+
+focused commit: 5e0d2bd1b1f456e54cef87d7e8e1a257f4904cfb、2files/686追加/83削除。
+src/similar_db.rsにworker専用SimilarBookReader、要求借用BookReadSnapshot、取消可能なreadTX guardを実装した。
+READ_ONLY/NO_MUTEX接続は不在だけNone、権限・破損・schema/read errorをFailed用のエラーへ残す。
+Deferred TX最初のmetadata SELECTでstore_id/read_seq/page-order versionを固定し、同TXのbase/delta/pages/targetを読める。
+SQL本体をprivate &Connection helperへ共有し、既存public wrapperのlock/TX・条件/列順/並び・ID解決の入力順と重複を維持した。
+HRTB closureでsnapshot借用を要求外へ逃がさず、SQL/row loopの取消と、成功/error/panic時のhook解除→TX終了を所有する。
+Cargo.tomlはrusqlite hooks featureだけ追加した。専用readerのbusy timeoutは5秒で、busy即取消の保証とはしない。
+
+初回target/r1-book-reader-tests1.logは4成功、compile3分25秒。tests2も4成功、compile1分17秒。
+独立レビューで、次TXがhandlerを上書きしてしまうと解除漏れを隠すfixtureを補強した。
+最終はcancel後join→旧token破棄→Weak消滅確認→別tokenの同接続TX、error/panic後も次TX前にWeakを確認する。
+同TX固定の回帰ではmetadata確定後に別WAL writerが本のgenerationを更新し、それ以後の全readが旧snapshotのままなのを確認した。
+別の取消回帰内writer更新は取消通知後・join前の正常性を確認するものであり、SQLとの実行重複を固定した証明ではない。
+
+最終fixtureをcompileしたcancel-tests3はfilter未完全修飾のため0件実行であり、成功根拠に含めない。logは保存した。
+完全修飾したcancel-tests4は対象1成功、最終tests5は4成功/0失敗/0ignored、test0.04秒。
+既存target/r1-book-reader-db-tests1.logは23成功/1ignored/0失敗、0.44秒。reader4件もこの23件に含まれる。
+既存target/r1-book-reader-array-tests1.logは8成功、0.05秒。製品check1は37.24秒/exit0（以後test-only変更）。
+fmt-check/diff-check成功。独立coreは最終source SHAを照合し追加指摘なしでreader第1区切りを承認した。
+
+- source生bytes SHA256=d01f24299a991e05d3ec2676250d928fd118f057dd973d4d9dbe9bcab3107c4c。
+- tests5 log SHA256=f803f447c16aa330277d2c2a3e136706176197bb0f3156e24775ff88c5efbf01。
+- DB suite log SHA256=38fbe415e8e73ae01fa9fcb7c2229b374ed715aeb92c584fec543ba1165e099f。
+- array suite log SHA256=587fe29c73c533540796f55f35f7f1905bdd8f5a6c9786b2d882b3ef94bc1a1d。
+- product check1 log SHA256=fcf3370bf26c6a262d8e39393545a5e231c886fe4262e8acd5adecddcac826ec。
+
+R4 Cargo差分が共存するため、一時GIT_INDEX_FILEへreaderとHEAD Cargoのhooks1行だけを構成し、通常hook付きで保存した。
+当該2entryのみreal indexへ同期し、source/Cargo生bytes不変、R2 staged patch100651bytes/3adba6c9...f42a不変を前後検証した。
+正本: target/r1-reader-slice1-commit-20260908/manifest.json。Cargo.lockに今回の新package差分はなく、既存R4 path patch差分だけを保持した。
+
+arrayの同TX追随・非永続fallback、ZIPのeffective order、MIH/classifier、manager/実caller通知接続はこのcommitの完了へ含めない。
+前者2点を次のcoherentな区切りとして設計確認中。R4 portableと実機返答待ちは維持する。
