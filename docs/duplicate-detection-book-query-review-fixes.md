@@ -5,7 +5,7 @@
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1bで保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9で保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -270,6 +270,31 @@ busy handler用の別所有構造や監視workerは先行gate区切りには追�
 ZIP移動先はitem keyのentry名、帯clickはother_targetを使うので、private ordinalで別entryへ移動しない。
 writer修復成功commitの通知（0containersを含む）は引き続き行い、失敗を成功通知へ変えない。
 修復前後の結果/strip一致、旧hashの穴、quality0、index Noneと正しいentryへの移動先を回帰で確認する。
+### 配列追随・ZIP orderの第2区切りの実装合意
+
+編集担当はSol、対象src/similar_db.rsとsrc/similar_search_array.rs。comparatorは注入するためsimilar_indexの実callerはまだ変更しない。
+BookReadSnapshotのmetadataに対し、private/shared候補はstore一致かつbase.seq <= snapshot.seq <= read_seqだけを適格とする。
+(base.seq,snapshot.seq)降順、完全tieだけ既存MIHが保持するBaseArrayとのArc identityを優先し、出自だけでは順位を変えない。
+equal-seqはArcを再利用し、選択したsnapshotのseqから同TX batchで追随する。
+
+最高rank候補が履歴不足なら、低rankへ後退せず、元合意どおり同TX全適格行から非永続base(read_seq)を構築する。
+shared(base100,seq100)/private(base0,seq200)/TX201、history151..201では下位候補なら追随可能だが、
+再構築も正確であり、より新しいbaseへ前進させる方針を維持する。この反例は結果・seq・非永続性の回帰に置く。
+future/store不一致/no候補/apply不整合も同TX fallbackとし、Cancelled/DB read errorは履歴不足へ変換せず伝播する。
+候補列、既存delta map複製、change適用、大きなrecords変換は周期的に取消を確認し、前後の確認だけにしない。
+
+全ZIP key SQLとprefix除去/pure stable sortをwriter/private readerで共有する。
+通常の正規化ZIP keyではcompare_book_pagesが元文字列まで比較し、異なるUNIQUE keyの完全Equalは生じない。
+任意comparator/旧keyに備え、同点時は現在の保存済みページ順を保持するため全key取得をORDER BY page_index,item_idで明示する。
+現item_container_idx(container_key,page_index)があるため、旧ORDERなしSQLをrowid順と断定してitem_idだけへ固定しない。
+新しいitem_key二次比較は足さず、stable comparator sortを維持する。
+
+stored order != currentのComplete ZIPだけ、hash/quality/page_index filter前の全key集合から必要な本ごとのrequest-local mapを作る。
+book Vecとresolve edge双方へeffective ordinalを適用し、book Vecも新ordinal順に並べる。旧hash等の穴を詰めず、移動先keyを保持する。
+期待値は既存writer renumber後と比較する。load_book_pagesはindex None行も返し、writerは全keyへSome ordinalを付けるため、
+current hashのNone行はprivate map後に適格化し得る。旧hash行は取得対象外でもordinal穴を予約する。
+永続DBのversion/page_index/item_change、similar.baseは書き換えない。MIH本体・generic owner・製品callerはこの区切りで接続しない。
+
 ## worker 専有の MIH と世代選択
 
 PDQ 256bit を16bit×16に分割する。1 block は距離2以内（137 bucket）、残り15 block は距離1以内
@@ -290,6 +315,19 @@ PDQ 256bit を16bit×16に分割する。1 block は距離2以内（137 bucket�
   store 変更・shutdown は MIH も退役させる。
 - scope と本の有効性は同 TX の解決で検査し、postings 自体へ scope を焼き付けない。
 
+### MIH kernel着手前のAPI・再利用境界
+
+独立UIレビューで試作と現SearchSnapshotを再照合した。実装前にSolが具体型/APIを提示し、次の条件を維持する。
+同一BaseArrayのArc identityなら完成base postingsを保持し、新snapshot/mask/delta postingsへ更新する。
+同じseqでも異なるArcのrow index互換を仮定しない。世代順位はsnapshot_for_book_readへ委譲する。
+queryは全candidate Vec→全hit Vecを必須にせず、row重複排除後に全256bit距離を検証してvisitor/bounded chunkへ渡す。
+完走、用途上の途中終了、取消/失敗を区別する。commonは同TXで有効な異なる9冊を確認した後だけ途中終了できる。
+候補発見の本別count3飽和は他候補の走査を打ち切る理由にならず、alignment列挙には流用しない。
+取消点はbucket計数/prefix sum/postings充填/巨大bucket/seen世代wrapのclear内部にも置く。
+wrap clear途中で取消されても、次queryで未消去の古いmarkと世代が一致してhitを欠落させない。
+未完成indexは公開せず破棄し、同baseの完成postingsは保持する。別baseなら旧cacheをbuild右辺評価前にdropする。
+旧delta/新delta、counts/cursors、marks、他ownerの旧base Arc、新snapshotをpeakへ含める。
+row indexとposting offsetの範囲はcheckedで扱う。この境界監査は製品kernelの実装・測定完了を意味しない。
 ## common と候補集合
 
 common は半径32内の **有効な異なる9冊**を同 TX で確認した場合だけ成立する。起点自身の冊数も含む。

@@ -1696,3 +1696,37 @@ R4 Cargo差分が共存するため、一時GIT_INDEX_FILEへreaderとHEAD Cargo
 
 arrayの同TX追随・非永続fallback、ZIPのeffective order、MIH/classifier、manager/実caller通知接続はこのcommitの完了へ含めない。
 前者2点を次のcoherentな区切りとして設計確認中。R4 portableと実機返答待ちは維持する。
+
+### R1/R6 配列追随・ZIP effective orderの区切り（製品caller未接続）
+
+focused commit: 69f33e6a957b6b9b27c241020173ecbf05cf6f16、src/similar_db.rs / src/similar_search_array.rs、783追加/30削除。
+同TX metadataと整合する最高rank snapshotを選び、連続差分を取消可能に適用する。完全tieは既存MIH baseのArc identityを優先する。
+最高rankの履歴不足、未来/store不一致/no適格候補は同TX全行からmemory-only baseを再構築し、取消/DB errorはそのまま伝播する。
+ZIPはwriter/private readerで全key SQLと取消可能なstable merge sortを共有し、保存済みpage_index,item_id順を同点時に保持する。
+stored orderがcurrentと異なるComplete ZIPに必要な本ごとのmapを作り、book行とtarget行へ同じordinalを適用する。
+旧hash行は穴を予約し、current hashのindex Noneは全key ordinal付与後にwriter修復後と同じ適格行になる。quality0と実target keyも保持する。
+同TX全keyに存在するはずのpage/targetのordinal欠落は黙ってNoneにせずerrorへ伝播する。readerは永続page_index/version/item_change/sidecarを書かない。
+
+初期narrowのDB1/array tie・追随2/fallback2/取消各1はtool出力のみでlog原本未保存。重複実行せず初期成立確認に限定した。
+最終suiteは試行ごとのtarget/r1-reader-follow-order-*へ保存した。
+
+- db-tests1: 25成功/1ignored/0失敗、compile1分31秒、test0.18秒。
+- array-tests1: 13成功/0失敗、test0.06秒。
+- existing-page-order-tests1: 17成功/0失敗、test1.68秒。名前filterなので他featureも含み、上記との重複を除いた総数とはしない。
+- zip-oracle-tests2: future versionケースを同fixtureへ追加後、対象1成功/0失敗、test0.02秒。
+- check1: 製品cfg check成功、31.98秒。fmt-check1/diff-checkも成功。
+
+独立coreは製品とテストを再レビューし、下記最終source SHAを承認した。sortは32比較で取消停止する。
+delta fixtureは現処理順でvalidationと既存delta/mask複製を通過し、適用途中の146回目checkで取消を検証する。
+cloneの各取消箇所を独立に実証するmutation testではなく、その範囲はcode review根拠と区別する。
+
+- DB source SHA256=8466dc8025e1239e18e591d5215dcf817836dd802e1e55395a4c321dbc746bc2。
+- array source SHA256=321f6533a4902c6fca9fe535d860d134a3f6b3fc67614929a6a65c5e773a2028。
+- DB log SHA256=6c15e4e5ea64a17c187cef38d4cebc1a8dcf6b85a1d1311a918a49b94ac17ad5。
+- array log SHA256=194a5fa1d0f6dfb39d5d86f1a1273a51df95fb37cbfdec48d565aeb52f23e1ab。
+- page-order log SHA256=1c85f95f8e6e5af5a8883a271923489027df087d74aee494551af9a15e56e631。
+- ZIP追加 log SHA256=acc0c67aa7955457fdfff7e657eb4a9bfb91dbff38ba95eb88646d2c2290eba6。
+- check log SHA256=82951a913e53e053b8de26a293a910164f19b98d91d00fc85da7aff67bb264b0。
+
+通常hook付きgit commit --onlyで当該2filesだけ保存し、前後のsource生bytesとR2 staged patch100651bytes/3adba6c9...f42aを照合して不変を確認した。
+製品caller切替、MIH、common/分類/alignment/帯、最終全体gateとportable更新は未完了。既存R4 portableと実機返答待ちを維持する。
