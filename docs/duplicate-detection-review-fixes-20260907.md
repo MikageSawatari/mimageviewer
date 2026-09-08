@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。特殊大規模/世代更新、大規模UI、最終gate/portable・実機は未完了 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。大規模UIのrelease補助測定も完了。特殊大規模/世代更新、最終gate/portable・実機は未完了 |
 
 ### 現在の残作業（2026-09-09、利用者への状況説明時点）
 
@@ -38,7 +38,7 @@
 3. 実入力copyの差分65535/65536件、base再構築後と旧base保持時。
 4. 実draw/ScrollArea経路の大量結果描画（releaseの補助測定）。
 
-現在は共通release test compile中。生成fixtureの65535時点保存と最終hash/測定前照合に独立SolがP2を指摘し、増分修正する。
+共通release test compileと4のUI補助測定は成功。生成fixtureの65535時点保存と最終hash/測定前照合に独立SolがP2を指摘し、増分修正中。
 これらは検証コードの不備であり、新たな製品バグの発見とは区別する。UI source不変のビルドはUI測定に再利用する。
 4群の結果を採用判断へ反映した後、最終sourceでtest-full.ps1を実行し、portableをbuild/updateする。
 最終portableでR2のロック、R4/R8の長押し・見開き、新engineの音声への影響は利用者の実機確認が残る。
@@ -2079,3 +2079,23 @@ phase sampled peakは別fieldに保持し、lifetimeの差分からwarm peakを�
 manifest-n20.json（38940B/SHAda85e82fdc1e843cf9e836f7463c7b79eacc8d90960367c45af305eeb9a7f403）、run-manifest.json（26215B/SHA70bdbaa65bcfe44a01f3846408d04fb18b44bac56538e0a708503bf5961d7af1）は同dirに別名保存。
 親は161artifact hash、全query metricのn20/raw/nearest-rank整合、R2 cached不変を確認した。製品queryの再実行はしていない。
 残りは大規模engine/世代条件とUI補助計測、最終full gate/portable・実機。検証コードを共通test buildへまとめ、各測定は直列で行う。
+
+### 大規模UIのrelease補助測定完了（2026-09-09）
+
+共通release test --no-runは41分31秒で成功。固定exeはtarget/r1-scale-ui-release-build1-20260909/mimageviewer-lib-tests.exe、
+362117120 bytes、SHA256 5d5d304d77f32c2c2bc9b707ba27ce14de3de91d508a1b7078e3d57b148dc7ca。
+build.logは10800 bytes、SHA256 6cef747b4224a012898f80847b145957589600a524b18630dd8920eec31989fd。
+最初の起動は依存DLL PATH不足でtest開始前C0000135/空log。同exeへ既存vendor PATHを設定したmeasurement2は1件成功、9 records、0.52秒。
+ui-release-measurement2.logは16876 bytes、SHA256 cc8f36c7d97f75ca5e8648290b333451bdb6d3a2b1327b2d99eb1cebcedc9b82。
+親は9 recordsの各10 raw warm値からnearest-rank p50/p95/maxと全row到達/origin projection1を確認した。
+
+| 条件 | first draw ms（top/middle/end） | warm p50 ms（同順） | warm p95=max ms（同順、n=10） |
+| --- | --- | --- | --- |
+| N400 / C56 / sparse1 | 34.5500 / 10.1765 / 8.7400 | 0.2184 / 0.2452 / 0.1699 | 0.4639 / 0.2997 / 0.3484 |
+| N400 / C2800 / sparse1 | 23.8086 / 16.9538 / 21.0716 | 5.9687 / 5.2218 / 5.6513 | 8.3227 / 8.3456 / 11.9665 |
+| N10000 / C1 / dense9999 | 9.1310 / 6.4196 / 6.5557 | 0.0545 / 0.0541 / 0.0537 | 0.0581 / 0.0573 / 0.0559 |
+
+default製品日本語fontの設定/OS I/Oはtimer外、fresh Contextのfirstはatlas/layout準備込み。warmはwarmup後の10回で、n20 engine性能とは区別する。
+全候補行は走査するがvisible strip foldは多候補で3〜4、C1で1。N10000/C1はscroll範囲0なので3位置とも同じ表示位置である。
+thread CPUの0/15.625ms刻みはOS計時粒度であり、CPU消費なしとはしない。headless CPU/layoutの補助値で、GPU/compositor・hover thumbnail・アプリ全体のframe latencyを含まない。
+親はこの結果を追加の製品UI改修へ広げる根拠にしないと判断し、UI測定完了とする。残るengine/世代fixtureの修正・生成・release CLI測定へ進む。
