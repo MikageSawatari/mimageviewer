@@ -649,3 +649,21 @@ stripは簡単な独立mapでbaseline/override全fieldを照合する。witness�
 no-hit pilotのdigestは空候補集合の再現性であり、pair/stripの証明ではない。実hit通常本と3頁以上の実hit短本を別途1件ずつ選ぶ。
 raw全corpusを巨大な所有Vecへ複製する必要性は認めず、走査/署名ごとの小さなwitness・count・候補保持を設計してから実装する。
 具体ファイル境界、旧ZIP effective order/適格性の独立導出、資源予算は実装担当がAPIと照合して提示し、矛盾は親へ戻す。
+
+具体preflightは5file（Cargo/lib・bench DTO/getter・新verifier lib/bin）で独立Sol承認、新規P1/P2なし。測定CLI/engine/lockは変えない。
+common witnessのbook IDはcontainer_key単位で全signature共通、A/B=1/2を別のwitness本へ数え直さず、実row/距離/適格性とdistinct9冊を保存する。
+raw certificateはquality0/indexNone/旧hashを理由付きで残す一方、legacy入力はcurrent-hashかつeffective index Someに限定しquality0は含める。
+候補はactual hitからseedせずoriginの独立全scanで導出し、同署名の各origin pageの辺数も加算する。
+初期予算は全case累積checkedで比較5B・候補64・certificate頁10k・stale1container100k・JSON64MiB。
+legacyのeligible quality>=1 pages choose2は2Mまでとし、witness item/book dedup後かつ旧classifier呼出前に拒否する。
+初稿50M案は旧HashSet<(usize,usize)>とNearPair Vecの同時保持が大きすぎるため親が却下した。
+capはcandidate/page/DTO clone前とLimitedWriterのstreaming途中で効かせ、無制限JSONを生成した後のlen検査にしない。
+全error/panicはengine/RO connection終了後のguard下final hashへ収束し、verifier workerも実測BelowNormalで実行する。
+target canonicalize-or-raw fallbackは同じread-only規約を独立導出するが、外部filesystemまでDB guardで固定したとは主張せず、不一致は検証失敗とする。
+この条件で実装着手を承認した。狭いfixtureと固定差分レビュー後にselected400の実certificateへ進み、測定とは別の証跡に保存する。
+
+実装後の独立Solレビューでscope外stale ZIPをcap/sort前に除くP2を修正し、fixed2を承認した（追加E2Eを含む7件成功）。
+2026-09-09、5頁/1候補と400頁/1候補の実本certificateで全候補・全pair・全strip・target導出が独立oracleと一致した。
+同じguarded DB/baseの前後hash一致、実優先度=-1、既定予算内。正本はtarget/r1-book-query-real-certificates-20260909/manifest.json。
+詳細値とビルド/入力/出力SHAはduplicate-detection-review-fixes-20260907.mdの「実本certificate完了」を参照する。
+実本2件の正しさを確認した段階であり、20標本の性能採用・大規模特殊条件・途中取消・大量UI・最終gate/portableを完了したとは扱わない。

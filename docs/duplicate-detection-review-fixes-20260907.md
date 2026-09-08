@@ -1974,3 +1974,47 @@ private sampled peakはcold569577472〜570281984B、warm567009280〜567078912B�
 同dirのselected-positive-n3-summary.json SHA5e20537984adb84d81054f7f3ed9a88d273be894787ea5baafc0158a744086e8、
 manifest-selected-positive-n3.json SHA1a7856bd894fbd37ec37fb0108ad7bfde00b0bfdfb6d1271da8b8b3d23b3953dへ別名保存した。
 これもn3でp95や旧400/7候補との比較を主張しない。全候補/分類/stripの独立oracleは別verifierの実装前照合へ進む。
+
+## 実本独立verifier fixed1（2026-09-08、レビュー/実本実行は後続）
+
+5file境界で独立SQLite stream scan/plain Hamming、witness/candidate導出、bounded legacy pair/独立strip照合とCLIを実装した。
+現hashのpage_index=None行はBookOrigin/表示slotに残り、legacyだけSomeへ絞る。独立期待値でNone行を落とさず、複数Noneのactual SQL順もfixtureで確認する。
+事前checkpoint初稿のcached diffをPowerShell text変換して103053Bにした記録は不採用のまま保持し、manifest-v2.jsonとPython raw100651B/SHA522b...8043を正本とした。source/indexは変更していない。
+最終tests4は6/6成功（compile1分47秒/実行0.02秒）、release check2は36.10秒成功、fmt-check1空logで成功。
+6件はRare8/Common9とedge3飽和、旧ZIP旧hash穴/currentNone/安定tie、current複数None表示slot、legacy予算、JSON上限、legacy全pair/独立strip全fieldを覆う。
+tests1のstale ZIP synthetic key期待順1件失敗、tests3の追加fixture f32/f64誤認によるcompile失敗は各logを保持した。
+正本target/r1-book-query-verifier-fixed1-20260908/manifest.json SHA34890ccc65ba2a9fb4ff18fd99287f9ea62c94f5f97b57dd5b7eaf9c9138b254。
+親は11artifact/現5source/R2 cached完全一致を照合した。独立Solレビュー中。測定CLI/sampler/engine/lockを変更していない。
+レビュー待ちで保存済み3/5頁短本を最大12件・各cold1に限定してscreeningし、最初のReady/hit>0で停止する。
+測定とcargoは直列。source固定のverifier release buildはreviewと並行可だが、実本certificateは承認後に実行する。
+
+## verifierの範囲外stale ZIP修正（2026-09-09、fixed2）
+
+独立SolがP2を1件検出。stale corpus scanがscope確認前に全Complete ZIPをbuffer/cap/sortし、範囲外巨大ZIPでoracleだけ誤って上限失敗する。
+製品処理は変更せず、group key/前group flushを維持してscope外rowをbuffer/cap/sort前にstream skipする最小修正を行った。
+小cap3、範囲外4頁、範囲内A/B各3頁のfixtureで実BenchEngine digest→BelowNormal workerのverify_real_book→直接SQL/full DTO比較→guard最終hashまで通す。
+この追加exact回帰1件と関連7件が成功、release check3/fmt-check2も成功。tests5-p2のテスト用import漏れE0425はlog保持後に修正した。
+fixed1 release buildは修正前の履歴とし、実本検証には使わない。fixed2の増分レビューとrelease buildを進める。
+正本target/r1-book-query-verifier-fixed2-20260909/manifest.json SHA7f5c1393939245116c5a35bd3fb61cf68e477d19d7a2d763b12ef0b4abe3f805。
+増分patchは6562B/SHAf58f233fed3a88d372cfb0797bbcb006f4792276d131e5ee08cb6eac45dadf93、verifier sourceは71796B/SHAcc02e815219cf2b4e803a0636f1bc88c2327c1561f339a3c720374a481d5d4f1。
+他4sourceはfixed1と同じ。親は7artifact/現5source/R2 cached完全一致を照合した。fixed2増分は独立Sol承認、新規P1/P2なし。
+
+## 実本certificate完了（2026-09-09）
+
+fixed2 release build2は6分25秒成功。隔離保存exe2981376B/SHA529e02f0cce4e27f005457ac361a68c0d8775ca79b4e605a043542d19ff854b1。
+正本はtarget/r1-book-query-verifier-fixed2-20260909/manifest-build2.json（SHAba0fa1b53c606ec14b27cdb3b78b7eba73943a88ee42100256c40982914bdac1）。
+短本screeningは最大12件中3件目の5頁case92e3dc21f5adac8fでReady/hit1/override5となり停止した。前2件は3頁/hit0。
+正本target/r1-book-query-short-screening-20260909/manifest.json（SHAf2a3628d84afabfc09be33c5a002091c22e7767a19694de3c62456fd3a1f28f1）。
+
+| 実本 | 候補 / override | verifier全体時間 | 実Hamming比較 / 予算計上比較 | certificate頁単位 / legacy可能pair |
+| --- | --- | --- | --- | --- |
+| 5頁・case92e3dc21f5adac8f | 1 / 5 | 10.818秒 | 5669645 / 22219210 | 10 / 45 |
+| 400頁・case669ffde46830e57f | 1 / 64 | 21.104秒 | 680357400 / 2666305200 | 664 / 220116 |
+
+両caseで測定digest・独立TX metadata・全候補key・全pair field・全strip field・現filesystem target導出の6照合が全てtrue。
+worker実優先度=-1、既定予算のまま、初期/最終DB/base hash一致、runner log空、exit0。
+短本digest983f96348cbcbecf0e04c64ea3bf6e411b12e5e147b24cec0f62e68eb97fad79、400頁digest35388d4d4aea3c9d99154ff2fd199e755dfa67e88356d774fa2d268da4a9cd7d。
+certificateは短本30855B/SHA8b8804ec93d2c00218397e903ff1d2f00bb960fa02e41fcc748a0c4d23b5b3f6、400頁1139176B/SHA4bbe21e318c206da498b6458f9fcc85e846c70aef7703fb80e0d750cf033718e。
+正本target/r1-book-query-real-certificates-20260909/manifest.json（SHA29c6e54b6e9feeb7f876fb0af3c7f5eea532e05bc5918d562596071ceafb2557）。
+親はbuild2の2artifact・screeningの9artifact・certificateの8artifactをhash照合し、R2 cached不変も確認した。検証は再実行していない。
+この時間は独立oracleを含む検証全体で、query-core性能値ではない。通常20標本・特殊大規模/世代更新・途中取消結合・大量UI・最終gate/portableは別の未完了条件。
