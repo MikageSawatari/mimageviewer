@@ -25,7 +25,7 @@
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
-| R4/R8 長押しと見開き | viewer-owned owner/pure asset第1段は独立Astra承認済み。描画・lifecycle接続中 | owner state 15件成功。renderer/lifecycle・全体gate・実機は未完了 |
+| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存APIは段階レビュー済み。Ready描画/実lifecycle回帰が残る | owner 15件・geometry 22件・GPU既存36件・paint寿命の新5群・navigator 54件＋補強各1件・capture 11件＋実Esc補強1件・vendor egui 25件成功。最終gate・実機は未完了 |
 | R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
@@ -904,3 +904,401 @@ page_retention_and_preview_retirement_do_not_cross_source_ownersを実行した�
 親はsource編集停止中に `target/r4-geometry-stage1-20260908/` へpatch/new module/manifestを保存し、
 R2 staged patch SHA-256が最初のportable成果物と一致することを再照合した。
 共有部の独立レビュー・回帰が済んだ区切りであり、renderer/lifecycleと新portableはまだ未完了。
+
+
+### R4 候補表示の一時pan補正
+
+元画像用のpanを候補へそのまま適用すると候補がviewport外へ出るため、親・独立UIは
+候補をresolveした後、既存pan_correction_for_minimum_overlapの補正を候補専用local panへ加え、
+元GeometryInputから再resolveする境界で合意した。元fs_panへ書き戻さない。
+候補はrotation0/free0/bboxNoneなのでfull_image_rectを補正の入力に使える。
+各軸min(48 logical points,画像幅,viewport幅)の既存最小重なりを維持し、最終snapの約0.5 physical px差を許容する。
+snap済rectをfrom_resolved_rectへ再入力せず、補正0なら元geometryを返す。
+translated_byはviewportを移さないが、placement.panを更新せず物理整数px移動の契約なので、
+任意補正には使わない。この節は設計合意で、実際の候補描画回帰は後続。
+
+
+### R4 編集操作との逆順とcaptureの入力所有
+
+独立UIのsource照合で、capture-region/loupe/通常adjustment中もmetadata候補へ到達する。
+erase/conceal/text/localadjust/exportcrop/SNS/viewtrim/analysis中は既存UIがmetadataを表示しない。
+長押し開始を共通entryへまとめ、競合する一時captureだけを終了してpreviewを開始する。
+loupeの固定設定やadjustment mode/paramsは保持し、候補表示中の元page overlayを外す。
+調整・canvas操作開始時はpreview終了後に元pageへ合流する。park用resetの流用でpin等を消さない。
+
+capture overlayはpanel描画より先にprimary pressed/released/downと最終hover位置を読む。
+Release(canvas)→Press(panel)が同frameに入ると、正当な先行releaseのcropを後続panel位置で上書きし得る。
+frame全体をpanel pressで取消す案も、先行の正当なコピーを失うため親の確認で棄却した。
+親・独立UIは、既存selectionをPointerButton(pos,pressed)/PointerMovedの順に更新し、
+releaseの座標で一度だけframe-local Copy/Cancelを出して終端するreducerへ移すことに合意した。
+canvas所有のreleaseはpanel上でもclampして確定する。panel所属pressはその時点で残るselectionだけ取消す。
+wait_for_releaseも最初の該当releaseで解除し、同frameの後続pressを処理できるようにする。
+terminal後はcaptureだけ処理を終了し、metadata側のeventをconsume/removeしない。
+集約primary_down/final hoverによる後書きはしない。新しいApp bool/Optionは追加しない。
+panel所有の判定は当該frameのhover latch/実効visible/seek-height込みrectをdrawと共有し、
+古いframeのhover/表示boolや、clipboard worker開始後のresetでは代用しない。
+これは通常captureにも届く共有入力境界の修正であり、両順序、wait解除同frame、canvas→panel releaseを回帰対象にする。
+実装前の構造合意で、実行結果は後続。renderer/lifecycle初回checkは
+`target/r4-renderer-check1.log`、cargo check -p mimageviewer --bin mimageviewer-core、exit0/30.21秒。
+
+
+### R4 renderer/lifecycle先行レビューの3指摘
+
+基準d0784377ffとstaged R2の上のR4差分を独立UIが確認し、次のP2を共有した。
+調整panelのopenだけでsession=Noneにすると表示中の長押しbuttonが無反応になる。mode/paramsを保持する契約へ戻す。
+候補frameで元page layoutをclearする一方、navigator入口はそのlayout無しでreturnするため、
+候補navigatorへの最初の操作が捕捉されずcanvasへ漏れる。既存interaction activeの検査だけでは足りない。
+候補navigatorの操作edgeを入口で所有し、gesture終了→元geometryを同frameに解決→同eventを既存handlerへ渡す必要がある。
+元geometryの最小共有resolver境界は実装担当が確認し、page偽装/1frame delay/layout温存sentinelを追加しない。
+
+parkはowner invalidateだけで、preview outputの退役がpredraw内にしかないためAtRest bundleに旧GPU資源が残る。
+session=None分岐はDrainingをpollせず毎frame再invalidateし、遅延completion/pixelsを回収しない。
+共通終端でpreview-only GPU退役を揃え、表示可否と独立した非blocking terminal drainを所有contextへ接続する。
+Page/通常GPU cacheをclearせず、有界workerの契約をreceiverの無断detachで崩さない。
+
+肯定確認: 本文/専用navigatorは同assetとcandidate geometryを使い、元page layoutや提示完了/traceへ混ぜない。
+元prepare_fullscreen_state/PDF準備、通常比較pin/mode、temporary local-pan clampは維持する。
+mounted/AtRestのsource texture計上と全体/ページ別output予算も確認済み。
+新3P2、capture ordered修正、handler回帰が残るため、R4全体の承認は保留。
+
+
+### R4 終端・capture接続のcheckとowner再回帰
+
+`target/r4-terminal-capture-check2.log` はcargo check -p mimageviewer --bin mimageviewer-core、exit0/16.31秒。
+atomic preview失効、AtRest bundle直接poll、capture ordered処理を接続した段階のcompile確認。
+`target/r4-similar-preview-state-tests5.log` はowner15成功/0失敗、compile1分48秒。新handler回帰は後続。
+独立UIは、ROOT更新がactive detachedのmountとshow_viewport_immediate callbackまで同期実行すると確認した。
+完了wakeはROOTへ一度だけ送り、古session viewportへの追加通知はしない。
+全context pollはeframe::App::updateのupdate_frame前へ置き、early returnや描画可否から独立させる。
+新timer/loop、pollのためのraw mount/swapは追加しない。
+
+### R4 navigatorの同frame入力所有（設計合意）
+
+元画像を裏で通常paintし、全面黒と候補で上描きする案は棄却した。提示通知やContinuousの状態更新、
+背景と描画コストを候補中へ混ぜるため。試行2hunkは実装担当がexact reverseで戻し、親承認前の新設計編集を停止した。
+Single/Spread/Continuousのpure frame plan抽出も調査したが、既存input/実paint layout契約を維持できる次案で合意した。
+
+現image_rectとgeometry非依存fs_navigator_panel_rectから入力所有をframe-local typed予約で確定し、
+preview gestureを終了する。予約済み入力をcanvas/touchへ渡さず、元rendererを一度だけ実行する。
+本文・holdover・通常navigatorの描画と既存pending消費が完了した後、予約nav操作を同frame内でmodelへ適用する。
+pan等の表示更新は通常repaintで行う。要求を次frameへ保存せず、新App pending/sentinel/偽page_idx/二重paintを使わない。
+元geometryが未準備等で得られなくても、そのframeで入力所有を終端しcanvasへ漏らさない。
+nav外枠は画像aspect非依存で、aspect差による外枠不一致の懸念は独立UIが実コード照合後に撤回した。
+
+既存handlerはframe冒頭interactionをsnapshotしており、Press→Release同frameで新Pan/Selectが残る。
+そのため単に後段で同handlerを再呼出しせず、normal入口と予約入口が同じordered reducerを使う。
+peekのrelease→navのnew pressと、navのpress→releaseを所有順で区別する。既存Pan/Select/PendingCenter/
+PendingPanTransitionの意味を保持し、primary/secondary、header操作一度、capture/editorへの二重配信を回帰する。
+これは親・独立Astraの設計合意であり、実装担当はAPIの前提を検証してから進める。
+
+
+### R4 終端・capture・adjustment接続の再レビュー
+
+独立UIはnav未完成部分を除いて再確認し、追加P1/P2なしとした。
+captureはrelease.event.posで確定して即終端し、後続panel eventを残す。逆順panel pressはcopy前に取消し、
+canvasから始めたdragはpanel上releaseでも確定する。wait_for_release解除後も同frame後続pressへ進む。
+共通invalidateはownerとpreview-only GPU退役を揃え、App::update冒頭の全context pollはAtRestへ直接作用する。
+ROOT一回の完了wake、Draining成功/切断の資源破棄とIdle/最新1件遷移を確認した。
+sessionからadjustment/captureのblanket拒否が除去され、begin entryはcaptureだけ退役しpin/params/loupeを保持する。
+前節の3P2のうちこれらの接続はコード再確認済みだが、nav修正と新実handler回帰の検証は残る。
+
+### R4 navigator回帰の中間結果と追加レビュー
+
+`target/r4-nav-check2.log` は cargo check -p mimageviewer --bin mimageviewer-core、exit0/29.54秒。
+check1のmatch arm型不整合2件は修正した。ordered primary/secondary、旧peek release→新nav press、
+元layout不在の予約終端、header/wheelの狭域4テストは各1成功。header初回失敗は証跡を残した。
+ただし独立UI再レビューでは、最終pointer位置による先行guardがcanvas内press→panel外releaseを捨てるP2と、
+header action先処理が先行する範囲選択releaseの確定を捨てるP2が残る。既存Responseとraw action併用は
+複数corner clickで余分なsettings保存を起こし得るため、最終値だけのテストでは「一度」を証明できない。
+共通ordered ownerと単一副作用出口へ修正し、操作順と副作用の回帰を追加する。中間PASSを最終承認としない。
+
+### R4 native textureのpaint batch寿命（追加欠陥・設計調査中）
+
+候補をpaint commandへ追加した後、同frameでpark/page/closeによりcacheを退役すると、
+UI closure終了で最後のLanczosOutput Arcがdropし、実egui render前にnative TextureIdが消える経路を確認した。
+NativeTextureIdLease::drop→RendererTextureIdReleaser→renderer.free_textureは即時登録削除であり、
+既存textures_delta.freeのrender後解放とは別経路。meshはTextureIdだけを保持するため、frame-local Arcでは足りない。
+独立UIも既存の自動遅延解放がないことを確認し、このままでは承認不可とした。
+previewだけでなく共有typed paint resourceの通常/holdover/frozen各paint入口を棚卸しし、
+実paint outputがnative登録を所有する方式を調査する。任意の1frame遅延、App pending field、
+viewportを無視した一括解放queueにはしない。現時点では修正済み・実機検証済みとは扱わない。
+### R4 native texture寿命の構造合意
+
+親・独立coreはmain/immediate paint順を照合し、FullscreenPaintResourceのpaint境界で同painter/同clipへ
+有効なno-op egui_wgpu::Callbackを添え、不変Arc<LanczosOutput>を実paint outputに保持させる案で合意した。
+rendererはprimitivesを借用し、update_buffersのwrite guardとrenderのread guardは局所で解除される。
+primitivesは呼出元でpaint完了まで生存し、surface不在/取得失敗は未描画outputの破棄で資源を終端できる。
+callback内でArcをtake/dropするとrenderer再writeのdeadlock、callback_resources保存は循環所有になるため禁止。
+通常/holdover/候補のpaint_texture_id群に加え、id()を使うfrozen window/continuous pageも共有境界へ統合する。
+診断用ID取得とpaint時の寿命所有を区別する。vendorやviewportの生成/選択は変更しない。
+private callbackのArc<dyn Send + Sync>にproduction outputとtest CountingReleaser leaseを載せ、
+実Context::run→tessellate→primitives破棄、未描画output/空clip/2batch独立をGPU不要で回帰する方針。
+これはpaint outputのRAII所有を確認するテストであり、実GPU paint/renderer lockの実行検証とは区別する。
+### R4 nav追加レビューでの設計訂正と再lock欠陥
+
+nav-p2-check2は33.36秒でcompile成功したが、nav-p2-tests1でContext RwLockの10秒deadlock失敗を検出。
+ctx.data/data_mut closure内のctx.viewport_id呼出しが再lockする製品コードの欠陥であり、テスト揺れではない。
+viewport/frame/keyをclosure外で確定し、新R4の同種呼出しを棚卸しする。失敗ログは保存する。
+前回の内press→外releaseとheader先処理の2P2、およびResponse/raw actionの重複は独立UIが解消を確認した。
+ただしwheelのprevious pointer更新がlayout成功時だけで、候補中のMove-only frameを記録せず、次frame wheelを
+誤配信する問題を追加検出した。PointerGoneの失効も含め、描画可否に依存しないviewport入力境界へ移す。
+
+親・独立UIが以前合意した「reserved handlerを通常nav paint前」はPendingCenter consumerを取り落としていた。
+Select確定→新zoom/panとPendingCenter→直後の古geometry navがpending消費、という順でpanを二重加算する。
+最小接続を本文/holdover/通常navigator描画後、capture/editor入力前へ訂正した。予約は同frameで一度適用し、
+既存PendingCenterは次の本物の新geometryで消費する。新timer/pending/遅延frame sentinelは追加しない。
+既述設計段落も訂正し、handler-onlyではなく実frameのproducer/consumer順を通す回帰を必須とした。
+### R4 pointer snapshotの入力入口合意
+
+handle_fs_wheel_and_clickの冒頭だけでは、ROOT grid、ZIP/PDF deferred、native backdrop、park中の
+同detached viewportのframeを覆えないと独立UI・親が確認した。snapshot作成をegui on_begin_passへ置き、
+各viewportのbegin-passごとに新入力を記録し、同pass内のhandlerは読取りにする。既存libの入力plugin群へ登録。
+eguiは内部Context write lockを解放してからhookを呼ぶ。viewport/frame/keyは各ctx closureの外で確定する。
+同frame再利用、PointerGone→None、初回未知Noneを未来のfinal positionで補完しない契約を維持する。
+必要なPointerMoved/Button/Gone/MouseWheelのみを記録し、Paste/IME/ファイルdrop payloadは複製しない。
+raw input/key/IME自体は消費・改変しない。hookはtest ctxにも設置し、grid/passive gap→Wheel→Move、
+Move-only→次frameWheel、初回/Gone後の未知位置を実複数frameで回帰する。
+GPU callbackはrectだけRect::ZERO、clipはmeshと同painterとする。現epaintはZERO callbackも保持し、
+rendererの不要viewport切替は省略する。mesh batching分割は残るため無コストとは扱わない。
+nav-p2-tests1の最終結果は30成功/11失敗、112.22秒。Context再lockの失敗ログを保持した。
+今回のtimeoutはコマンドrunnerによる中断ではなく、egui DEBUG PANICによる再lock検出である。
+修正後の再実行と実frame回帰が終わるまで、この段階をgreenとは扱わない。
+### R4 nav tests2とviewer所有の追加欠陥
+
+nav-p2-check4は29.12秒で成功。限定UI再レビューはContext再lock、全viewport begin hook、未知位置/Gone、
+nav描画後reserved適用のコード修正を承認した。nav-p2-tests2は41成功/2失敗、3.12秒。
+失敗はHeader導入後の旧global state assertionsであり、所有設計の確定前に機械的追随はしない。
+
+親・独立coreは、既存flat/panorama interactionの固定egui temp IDが全Context共通であることを確認した。
+AのPendingCenter→B activate/mount→B geometryの同page_idxでconsume/pan変更しglobal entry削除、
+またBが対象外modeのhandlerでAのentry削除、という経路がある。bundle swap/明示終端に退避保証がない。
+viewport suffixだけでは同viewport別viewer mountを覆えず、flat/panoramaの互いに排他的な操作を一つのtyped ownerにし、
+Appのmounted field/ViewerContextBundleに移す方針で合意。egui global tempに二重の正本を残さない。
+入力観測はviewport所有、操作意図はviewer所有と区別し、raw mount/swapはpayload交換だけにする。
+page/source/真のcloseで対象ownerを失効し、parkのpointer gestureと確定済Pending*の扱いは別途コード照合する。
+A→B→A、同viewportのcontext交替、flat/panorama別viewer、B変更でAが不変という回帰を要求する。
+
+### R4 multipassと入力cache回収の設計訂正
+
+frame_nrはegui runの全pass終了後だけ増えるため、第1passの入力をframe単位で再利用する以前の合意は誤り。
+第2passのRawInput.eventsはtake済みで空だが、旧snapshotを再生するとwheel/headerを重複適用し得る。
+begin-pass hookは毎回そのpassのsnapshotを作り、同passのconsumerだけが共有する契約へ訂正した。
+pass番号も同ID viewport再生成時には0へ戻るため、hookのrefreshを番号等価で省略しない。
+
+新viewport-keyed tempの自動GCはなく、closed IDごとの最後のVecが残る。single typed snapshot mapで所有し、
+on_begin_passのcurrent_pass_index()==0時だけbackend RawInput.viewports+currentのlive集合で回収する。
+rootの第1passでchild生成→discard→第2passの古いviewport集合でchildを消さないため、第2passでGCしない。
+本番runとheadless begin/endの双方でpass indexが成立することを独立coreと照合した。
+前passのfold済pointer位置は引き継ぎ、Unknown/Goneを未来位置で補完しない。live siblingを含む正しいRawInputで、
+実multipassの副作用一度、新child保持、次fresh入力でのclosed回収を回帰する。
+
+実装担当は利用上限により一度中断した。利用者の「続きをお願いします」を受け同Sol担当を再開し、
+中断時の差分・tests2の失敗記録を保持したまま、合意済み所有修正へ継続する。GPU paint leaseはこの時点で未実装。
+### R4 Flat navigatorの復元意図とpointer gestureを分離
+
+親と独立UIの追加監査で、単一unionにPendingCenterとHeaderを置く設計では確定済みの位置復元が失われると確認した。
+Zの中心外表示→Primary pressでmanual zoomへ採用（pan ZERO）→releaseでPendingCenter→同passのHeader press/release、
+という経路で復元意図がHeader/Idleに上書きされる。viewport幅800・描画幅1600・中心UV .75では約400pxの視点差になる。
+これはコードとgeometryによる根因確認であり、実機での再現結果とは区別する。旧テストは次の実geometryの中心を見ていなかった。
+
+実装前にSolが前提を再確認し、親・独立UIが以下の構造訂正に合意した。App/ViewerContextBundleの唯一のownerは維持し、
+Flat payload内をgeometry intent（None/Center）とpointer gesture（Idle/Pan/Select/Header/AwaitingPan）の独立した型へ分ける。
+これらは同時に存在する別の責務であり、同じ状態のbool/sentinel追加ではない。両軸が空ならouter Idleへ正規化する。
+旧PendingPanTransitionはCenter+AwaitingPanに対応する。release/park/focus lossはgestureだけ終了し、次の実geometryで
+Centerだけを一度消費する。Header/Selectはその消費で消さず、AwaitingPanは復元後panをbaselineとしてPanへ移す。
+Center待ち中の新Pan pressはzoomを再採用せずAwaitingPanを設定する。page/source/真のcloseは両軸を失効する。
+Headerだけに保存用pendingを足す案は、続くPan/Selectで同じ欠陥を残すため採用しない。新App fieldやディスク保存は不要。
+normal/reserved両経路の次実geometry、Headerのframe跨ぎ/park、続くPan、およびA→B→Aの回帰を要求した。
+
+GPU paint batch leaseの製品接続は実装済みで、r4-gpu-lifetime-check1は28.82秒で成功。
+独立coreは6描画経路の接続とimmutable Arc保持を限定承認した。r4-gpu-lifetime-tests1はFnMut closure内のmoveで
+E0507となり、テスト成功には至っていない。Arc cloneの修正に加え、未tessellate outputと空clipでの解放回帰を要求した。
+### R4 capture focus終端の独立監査
+
+独立UI・親が、canvas drag中のWindowFocused(false)で旧targetが残り、他アプリでrelease後の復帰clickが
+旧startからCopyを確定する残存経路を確認した。R4導入回帰とは断定せず、変更中の入力所有境界の穴として修正する。
+PointerGoneは正当なviewport外dragにも起きるため取消条件にしない。focus lossはevent順のCancel terminalとし、
+それより前のreleaseで確定したCopyを後続focus loss/panel pressで覆さない。実Clipboardへ書く前のtyped effectへ分離する。
+唯一のarm callerはcapture overlayより後のhoverbar結果処理なので、開始前の同passイベントを新selectionへreplayしない
+現在の順序を維持すれば新frame/session sentinelは不要。次passはeguiがvolatile eventsを再送しない。
+回帰は実handler/target resolverで、canvas→panel releaseのclamp、Copyとpanel pressの両順序、wait解除後の同pass再press、
+focus lossとCopyの両順序、Esc取消後、overlay後armの旧event非replayを確認する。OS Clipboard操作は行わない。
+
+独立coreはR1/R5/R6の既合意設計と現APIを追加照合し、着手を阻む新たな重大矛盾なしと報告した。
+R4後の最初のスライスはviewer client/fair ownerの型と独立executor状態回帰、既存SQLを共有するsame-TX reader。
+NotBook早期returnも自client撤回、page-order修復0件のcommitも通知、item query不変を接続条件とする。
+製品の照会切替は取消可能な実workerとの接続後。MIH採用と本全体の正確性・peak・公平性の合格を意味しない。
+### R4 navigator owner checkと共有layout所有の追加修正
+
+r4-nav-owner-check1は30.77秒で成功。独立UIはFlat二軸のHeader/Center共存、AwaitingPanの復元後baseline、
+App/bundleの操作owner移管とglobal temp正本除去を確認したが、lifecycleとgeometry共有境界は承認保留とした。
+独立coreは入力snapshotの毎pass更新、pass0 live GC、Unknown/Gone、全button、Context非再入をコード上で限定承認。
+同IDの物理窓再生成で旧pointerが誤用される実経路は確定せず、counter resetの推測的失効は追加しない。
+
+fullscreen_page_layoutはAppだけのfieldでBundle交換対象に無いと親・独立UI/coreが確認した。
+update_active_viewer_contextはwith_active_viewer_context内でBを描画し、closure終了時にAへswap復元するが、
+BのlayoutだけAppに残る。次Aのhandle_fs_wheel_and_click→fs_navigator_layoutは新rendererのlayout.clearより前なので、
+A/Bのpage_idxが同じならB transformからA ownerのgesture/panが決まる。これは実mount/描画順のコード確認である。
+geometryも操作ownerと対でViewerContextBundleへ移す最小修正を親・独立Astraが構造的根因修正として承認した。
+raw mountの既存swap/default/capture/restoreへ接続し、ディスクSnapshot、新viewport predicate、blanketclearを追加しない。
+影響先はnavigator、ルーペ、範囲コピー、holdoverの表示geometry参照。A/B同page_idx・異geometryで実swap後の描画前handlerを回帰する。
+
+独立UIが、same-idx Splitの直接slice変更で操作ownerが失効しない経路と、focusfalseでgesture終了後に
+同pass raw Pressがgestureを再生成する経路も検出した。slice producer全体とordered focus終端を設計照合中。
+Continuousではflat layoutがNoneとなる既存仕様があるため、旧Panが直ちに新continuous geometryへ適用されるとは主張しない。
+### R4 ordered focusとdouble-clickの依存API境界
+
+Flat/Panoramaのfocusfalse終端後にraw Pressがgestureを復活させる問題は、共通filtered event列へWindowFocusedを加え、
+focused区間の操作とFocusLost終端を順序処理する根因修正とする。focusfalseはgestureだけ終了しCenterを保持、
+unfocused中のMoved/Button/Wheelは作用させず、focustrueだけで旧gestureを再開しない。先行releaseの確定は保つ。
+表示許可（最終focus/key permit）と、既存ownerの終端受付・構造的禁止を区別する。
+Panoramaも既存UV/yaw/pitch/FOV計算を各event armへ移す。表示・投影・native APIの再設計はしない。
+
+ただしegui0.33.3のResponse.double_clickedはwidget CLICKED bitとpass全体のdouble-click有無を合成する。
+公開位置・時刻にevent序数が無いため、同passのfocus往復を挟んだreleaseへ正確に対応付けられない。
+独立UIは以前の「Responseを残して承認区間だけdispatch」案を撤回し、親・独立coreもAPIの情報不足を確認した。
+独自時間窓、曖昧時drop、機能制限、unsafe/privateアクセスは採らず、同versionのeguiをvendorへ置き、
+PointerStateの判定済み全release列をread-only iteratorで公開する小さい依存変更を独立した境界として承認した。
+APIはbuttonと任意のclick位置/回数の値射影のみ。内部mutable型、クリック判定、時刻、入力挙動は変更しない。
+raw releaseごとに必ず内部Releasedが1件あり、非click=Noneを含めるとordinalが1:1になる。Focus/Goneはreleaseを合成しない。
+全button/全focus区間へ注釈後にappのhit/gesture/focusを判定する。API自体はwidgetのclick所有を保証しない。
+root patchとworkspace除外に加え、standalone vendor/eframe・egui-wgpuにも同local egui patchを接続する。
+直接依存だけpathに変えてtransitive registry eguiと型を分裂させない。各cargo tree/lockの一実体化、
+vendor/eguiの無filter lib testsをtest-fullへ追加することを統合条件とする。Solも実装前に前提整合を確認した。
+
+親の原本検証: cached egui-0.33.3.crateのSHA256はCargo.lockの
+6a9b567d356674e9a5121ed3fedfb0a7c31e059fe71f6972b691bcd0bfc284e3と一致。
+archive内106fileと展開sourceの全bytesが一致（mismatch0）。追加.cargo-okはregistry markerなのでvendorへ不要。
+upstream git sha1は44cdd653e2317d300fb8a6c9c36b03f23991e803、path_in_vcs=crates/egui。
+これはread-only検証であり、依存変更の実装・テスト完了を意味しない。
+
+initial focusを!eventで逆算する案も訂正した。winit adapterは重複Focused通知を除かない。
+既存viewport snapshotの前pass final factを使い、focus event無しpassは現在raw.focusedをその区間のfactとする。
+native egui-winitはfocused=falseで作られ通知を待つため、初回にfocus eventsがある場合のseedはその初期条件と照合する。
+初回/重複通知/通常複数passの回帰を実装前確認に含め、新Appfieldやcounter reset heuristicは追加しない。
+### R4 paint batch寿命の補強回帰成功
+
+r4-gpu-lifetime-tests2.logはcompile 1m04s、exit0、5件成功（既存lease単体1件＋新4件）。
+filterから外れたempty_clip_discards_mesh_and_callback_and_releases_leaseは
+r4-gpu-empty-clip-test1.logで別途実行し、compile0.67秒、exit0、1件成功した。
+これにより新5群（shapes→tessellate→batch、未描画FullOutput破棄、空clip、同lease2batch、異lease独立）はすべて成功。
+独立coreは余分なArcが結果を隠さないことを含めコード承認済み。実renderer lock/GPU実機の実行検証とは区別する。
+
+navigatorはr4-nav-owner-tests-compile1が旧state fixture型で33errorsとなり、その追随後の
+r4-nav-owner-tests-compile2は2m08sでno-run成功。これはsuite実行成功ではない。
+その後fullscreen_page_layoutをbundleのfield/default/destructure/swap/parked moveへ移管し、状態回帰へ進む。
+親はR2 staged binary diffを再計算し、100651 bytes、SHA256
+3adba6c9c6768c1540f3d8f0791d1dfefdc322acb270ec90966d5bca2131f42aが引き続き一致することを確認した。
+### R4 navigator所有と依存APIの成功checkpoint
+
+r4-nav-owner-tests3はPageSlice import不足、tests4は実enumに無いFirstHalf指定でcompile失敗。
+tests5は46成功/2失敗（hook未導入fixture、通常zoomの即時panをCenter待ちと誤認した期待値）。
+fixtureを訂正し、r4-nav-owner-tests6はcompile 1m00s、3.06秒、exit0、49件すべて成功した。
+Zの実adopt→短押し→Header→次の実geometry consumerで中心外UVを復元する回帰と、
+復元後baselineからの実Moved移動量を追加し、独立UIが検証内容を承認した。
+A/B同page_idx・異geometryの実bundle swap後handler、slice変更失効、multipass更新/GCもこの49件に含む。
+
+新vendor eguiのAPI/2回帰/manifest/test-full接続は独立coreがコード承認済み。
+r4-vendor-egui-tests1はofflineでcolor-hexが未取得のためexit101（製品テスト失敗ではない）。
+通常取得後のtests2はcompile 7.40秒、exit0、無filter lib 25件すべて成功した。
+appのordered focus/release接続、各standalone graph/lock、provenance記録はこの時点では未完了。
+
+復元可能な中間記録をtarget/r4-nav-owner-stage1-20260908へ保存した。
+HEAD=d0784377ff9259de21d5db38559eb0326328c5bf、staged R2 patchは従来のSHA256と一致。
+unstaged-source.patch SHA256=9c3aaa458aab0efa4b7446cd959032dd32852f24a521e5620ae4c63fd9a3ec78、
+vendor-egui.zip SHA256=ba0364691db9af7924f5e5e9893993ad98ef37796981f56d5802600f971b4963。
+親も保存artifactの4 hashをmanifestと再照合して一致を確認した。vendorは106 source files、生成targetを含まない。
+このcheckpointはR4全体合格や新portable完成を意味しない。capture effect/実handler・lifecycle回帰、
+残るfocus接続、fmt/glyph/full gate、portable更新と実機確認を継続する。R1/R5/R6の製品実装も未完了。
+### R4 ordered Flat接続の先行レビュー（未合格）
+
+通常画像のordered focus/release接続後、compile前の独立UIレビューで2件のP2を確認した。
+1. Zの先行Primary pressでmanual adopt済み・Center未消費なのに、double-click release時の
+   再adopt=falseを理由にgeometry=Noneへ上書きしていた。既存Centerを踏まえて新clicked UVの
+   Centerへ置換し、次の実geometryで解決する。通常zoomの即時panを保持し、新sentinelは不要。
+   実count2、中心外Z表示、handler→consumer→UV中心を回帰する。親もコードで確認済み。
+2. 固定表示OFFのhold表示中、同passのpress/release→focus lossで最終hold permitが消えると、
+   ordered reducer前のfs_navigator_allowedが先行操作まで捨てる。入力受付と最終表示許可の
+   分離が入口では未完了。過去focusを使った偽permitで現在OS levelを読むことや、gate全撤去で
+   不可視navigatorを操作可能にすることはしない。event-time修飾キーと既存Keymap解決の境界を調査中。
+SolはPanorama接続も進めており、この2件の修正・狭域回帰までは接続全体を承認しない。
+### R4 hold-onlyの既存別件を分離（範囲訂正）
+
+親/Solが変更前HEAD=d0784377fを照合し、hold-only未開始操作→focus loss/hold releaseの消失は
+元から同じ入口gateで発生する既存欠陥で、今回のordered接続が導入した回帰ではないと確認した。
+「あらゆる先行操作を保持」をこの別件まで広げた親の要求を訂正し、今回R4の阻害指摘から外す。
+独立UIも、これを残して今回の既存owner終端/fixed-visible順序/preview handoffを正しく実装できない
+追加経路は確認していないと回答した。既存機能の削除・劣化による回避は行わない。
+
+event ModifiersにはWindowsの左右情報が無く、既存matches_modifiersも非Windows用exact matchのため、
+カスタムを保つ単純helper追加では直せない。実描画済み領域・Fixed/Hold根拠をnavigator ownerへ統合する
+案は今後の候補としてのみ残す。今回その新構造を実装しない。
+別件はnext-release-backlog.md §1.200へ記録（branch最大198、ローカルmaster最大199をread-only確認し採番）。
+Z double-clickで未消費Centerが消える今回の接続回帰は引き続き必須修正・必須回帰とする。
+R4 ordered接続の製品check: target/r4-ordered-focus-check1.logは47.04秒で成功。
+独立UIはPanorama handlerを変更前HEADと対比し、今回変更による新P1/P2なしと限定承認した。
+Selectのrelease位置→従来UV/yaw/pitch/FOV式、Panのstart/TAU/PI/clamp/sanitize、headerの同owner処理、
+所有Panと対応release count2での再中心、focus終端と先行確定保持を確認。追加回帰の実行成功は未確認。
+### R4 ordered focus/releaseの段階回帰成功
+
+r4-ordered-focus-tests1.logはexit0、54成功/0失敗、4.36秒。Z実count2→次geometry復元、
+Flat/Panoramaのheader releaseとfocus lossの両順、focus復帰後の新pressを含む。
+独立UIはhad_pending_centerを使ったZ double-clickの製品修正と回帰を承認し、追加製品P1/P2なし。
+テスト検出力の指摘に対し、Panoramaは2回目release後の別位置Movedを追加して補強した。
+r4-panorama-release-position-test1.logはcompile38.92秒、exit0、1成功、0.16秒。
+初回focus通知/重複false通知/次pass no-event raw trueの実ctx.run snapshot回帰は
+r4-focus-snapshot-test1.logでcompile55.54秒、exit0、1成功、0.00秒。
+54件suite後の補強2件は各々実行したもので、55件suite一括再実行とは記録しない。
+Solはcapture typed Copy/Cancel effectと既合意handler5群へ進む。R4最終gate/portableは後続。
+### R4 capture effect接続のcheckと初期focus終端
+
+r4-capture-check1.logは35.06秒で製品check成功。Copy{idx,crop}/Cancelのtyped effectをoverlayが返し、
+唯一callerがClipboard dispatchする境界へ分離した。OS Clipboard非操作のhandler回帰は追加中。
+親が、既存selectionでinitial_focused=falseのままloopへ進むと、同pass後続Focused(true)→releaseで
+旧targetをCopyできる枝を確認。Solも所有契約の矛盾に同意し、loop前にCancel終端するよう修正する。
+focusfalseをoverlay非実行passで記録→次passFocus(true)+releaseでもCopy0の回帰を含める。
+新armは既存どおりoverlayより後なので、旧focus往復の後に始めた選択を次passで誤取消しない。
+### R4 capture回帰初回のfixture自己待ち
+
+r4-capture-tests1.logはcompile 1m48s後、11件中7件成功、4件がover60sの実行中表示となった。
+親/独立UIはrelease→panel逆順テストとfocus/Escテストで、旧AppTestEnvを同scopeに保持したまま
+次のsetupを呼ぶ自己待ちを確認した。let shadowingでは旧値がscope末までdropされず、
+AppTestEnv::_lockが保持する非再入data_dir::test_override_lockを同threadが再取得する。
+他2件は共有lock待ちに巻き込まれ得るため、4件を製品hang/製品テスト失敗とは分類しない。
+実装担当が該当実行を管理し、各caseを独立scope/closureとして次setup前にAppTestEnv全体をdropする。
+設定override/保護mutexや既存drop順を弱めず、十分な実行時間で再試験する。
+r4-capture-tests1はfixture自己待ちのため実装担当が中断し、次setup前にAppTestEnv全体をdropする4箇所を訂正。
+r4-capture-tests2.logはcompile38.82秒、exit0、11成功/0失敗、1.35秒。保護mutex/OverrideGuardは不変。
+独立UIは初期focusのloop前Cancel、typed terminal、実overlay/target/crop、fixture寿命を限定承認した。
+検証表記の訂正: Esc caseはこの時点でselection=None直代入のため、実Esc handlerは未検証。
+成功は「取消済みownerへの後続releaseがCopyしない」まで。実Esc event→handle_fs_key_inputへ
+同caseを置換する最小補強を要求した。未変更のEsc製品経路に新P1/P2を発見したという意味ではない。
+### R4 実Esc補強とテストlock順の追加訂正
+
+r4-capture-esc-handler-test1.logはcompile1m04s、exit0、1成功、0.65秒。
+Windowsでnative Escape KeyEdge＋egui Escape event→実handle_fs_key_input→次pass releaseを確認。
+非Windowsは取消済state回帰のままなので、実Escの合格範囲はこのWindows実行に限る。
+ただし親/独立UIは、当初の補強がAppTestEnv(data_dir lock)の後でTEST_INPUT_LOCKを取り、
+既存app/tests.rs::same_frame_second_ctrl_down_edge_is_dropped_until_target_is_presented等の
+input→data順とAB/BAを作ることを確認。狭域単独PASSは並列安全性を意味しない。
+TEST_INPUT_LOCKをtest冒頭・最初のAppTestEnvより先に取得し、App全体のdrop後まで保持する。
+入力cleanupと保護overrideも維持する。修正確認までこの補強の最終承認を保留する。
+capture Esc lock順v2: r4-capture-esc-handler-test2.logはcompile39.46秒、exit0、1成功、0.63秒。
+TEST_INPUT_LOCK→ClearTestKeyFrame→最初のAppTestEnvを取得し、各caseのAppTestEnvを次setup前にdrop。
+終了時もAppTestEnv→入力cleanup→input lockとなることを独立UIが確認し、capture段階を最終承認した。
+先の11件成功＋実Esc補強後1件成功であり、11件全体を最終版で再実行したとの表記はしない。
+
+残るR4既合意の実入口回帰は、(1) compare pin Aを保持してReady B描画→release後A保持、
+(2) Single/Spread/ContinuousでReady assetをbody/nav双方の実描画へ通すこと、
+(3) 実park/close/source通知とmounted/AtRestのpreview遅延完了pollの接続。
+独立coreが棚卸しし、製品接続はあるが現在のbegin_test_pressは未完了workerを保持してB描画へ到達しないと確認。
+新規機能範囲ではなく、既合意の残検証として進める。snapshot、依存provenance/graph/lock、fmt/full gate、
+portable更新、利用者実機確認も後続。R1/R5/R6の製品修正は引き続き未完了。
+### R4 入力/captureの整形区切り
+
+cargo fmt -p mimageviewer成功後、cargo fmt --all -- --checkもexit0。
+記録はtarget/r4-cargo-fmt-stage2.metaとr4-cargo-fmt-check-stage2.{log,meta}。
+vendor/egui/src/input_state/mod.rsの前後SHA256は
+866485bd3cb04f63639a1e6c142d85dab0689e28a471942ee1f9fa03fd942c0cで一致し、原本の一括整形はしていない。
+親がR2 staged patchを再確認し、100651 bytes/既定SHA256一致。source editを一時freezeして
+文書8件だけをpathspec commitし、入力/capture段階のsource checkpointを保存してから次回帰へ進む。

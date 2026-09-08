@@ -10,7 +10,7 @@
 | 型・借用・依存関係だけ早く確認 | `cargo check -p mimageviewer --bin mimageviewer-core` | 本体 core |
 | 変更したモジュールのテスト | `cargo test -p mimageviewer --lib <filter>` | 本体の指定テストだけ実行 |
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core だけを `dev-runtime` でビルド |
-| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin |
+| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 3 crate の lib test |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 テスト名フィルタは実行するテストを絞るだけで、Cargo がコンパイルする target の種類は
@@ -96,7 +96,18 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 
 `test-full.ps1` は次のコマンドを実行し、失敗すれば非ゼロで終了する。
 
-`cargo test --workspace --features pack-build-tools --no-fail-fast`
+```powershell
+cargo test --workspace --features pack-build-tools --no-fail-fast
+cargo test --manifest-path vendor/egui/Cargo.toml --lib
+cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
+cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
+```
+
+vendor 3 crate は workspace から除外されているため、各 manifest から無 filter で lib test を実行する。
+egui の判定済み release 列 API、GPU mipmap、native repaint scheduler の回帰をこの経路で保持する。
+`vendor/egui` は既存と同じ 0.33.3 に読み取り API だけを加えたもので、root と standalone の
+`vendor/eframe` / `vendor/egui-wgpu` に同じ path patch を置く。更新時は各 dependency graph が
+同じ local egui を参照することを確認し、直接依存と transitive 依存の型を分裂させない。
 
 workspace 全体、統合テスト、doc testに加え、単体テストを持つpack builder 2本を同じ
 `mimageviewer` libのコンパイル結果で実行する。

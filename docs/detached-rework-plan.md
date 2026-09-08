@@ -1471,6 +1471,37 @@ raw mount/swapに取消副作用を加えず、明示park/close/pagechange/modec
 元viewerのzoom/pan等へ書き戻さず、通常比較pin/mode/pair、viewport生成、host/registryの所有は維持する。
 新規detached bool/Optionや時間guardではなく、入力と描画資源の所有境界を揃える構造修正と判断した。
 通常/見開き/continuous、release/focus/遅延完了、park/mount/retire、2viewer非干渉を回帰対象とする。
+captureとmetadataの逆順操作では、集約pointer flagsと最終位置が先行releaseのcropを上書きする根因も確認した。
+親・独立Astraは既存selectionをevent順に更新し、release座標で一度だけCopy/Cancelを出す共有入力修正に合意。
+後続panel pressのために先行の正当なコピーを消さず、canvasからpanel上へのreleaseも維持する。
+新App状態やclipboard開始後のresetを足さず、当該frameのpanel表示/矩形の入力所有をdrawと共有する。
+候補navigatorの操作復帰はframe-local入力所有を確定し、元rendererを一度描いた最終layoutへ同frameで適用する。
+normal/候補復帰が共通のordered pointer reducerを使い、入力を次frameへ持越すpendingや背景上塗りは追加しない。
+同frame退役でnative TextureIdが実render前に解放される欠陥には、実paint outputが共有資源を所有する方式で合意。
+親・独立Astraがmain/immediate双方のrenderer guardとprimitive寿命を照合した。通常/holdover/frozen/候補の
+typed resource描画境界で、同painter/clipに不変Arcを持つ有効なno-op egui_wgpu callbackを添える。
+callback処理中のArc破棄やcallback_resourcesへの保存は再lock/循環所有になるため禁止する。
+viewport別の任意1frame遅延やApp pending field、vendor変更は追加しない。実装・回帰は修正記録で追跡する。
+追加監査で既存navigatorのglobal temp操作状態を別viewerが消費・削除する欠陥を確認した。
+親・独立AstraはIdle/Flat/Panoramaの唯一typed ownerをApp mounted field/ViewerContextBundleへ移す方針で合意。
+viewport入力観測は操作意図と分け、全viewport begin-passに必要なpointer eventだけを記録する。
+同passで共有し、multipassで旧eventsを再生しない。fresh pass index 0のlive viewport集合でclosed入力cacheを回収する。
+raw mount/swapはowner payloadの交換だけ。page/source/真のcloseで対象ownerを失効し、他viewerへ作用させない。
+Flat payload内ではgeometry intent（None/Center）とpointer gesture（Idle/Pan/Select/Header/AwaitingPan）を別責務として所有する。
+park/focus loss/primary releaseはgestureだけを終了し、確定済みCenterを保つ。旧PendingPanTransitionはCenter+AwaitingPanに対応する。
+描画はCenterだけを消費し、Header/Selectを保持する。AwaitingPanは復元後panからdrag baselineを作る。
+これはZ→短press/release→Headerが復元意図を上書きする欠陥を親・独立UI・Solがコード確認した構造訂正であり、
+新App field、ディスク保存、detached専用分岐は追加しない。page/source/真のcloseだけが両軸を失効する。
+またfullscreen_page_layoutはAppに残りB描画後のA復元でB geometryをA入力へ渡すため、既存layoutを同じbundleへ移す。
+親・独立core/UIは実with_viewer_contextのswapと描画前handler順で根因を確認し、操作ownerとgeometryの同時所有を承認した。
+影響先はnavigator/ルーペ/範囲コピー/holdover。raw mountはpayload交換だけ、disk Snapshot/viewport predicate/blanketclearは追加しない。
+focus終端後のraw Press再生成はFlat/Panorama共通のordered focus区間で閉じる。既存Centerと先行release確定を保つ。
+Response.double_clickedのpass集約だけでは正しいreleaseへ対応できないため、同egui0.33.3の判定済み全release列を
+read-only公開する小API追加を親・独立core/UI・Solが前提確認した。クリック判定/native/viewport生成は変更しない。
+rootとstandalone vendor両方を同local eguiへ統合し、依存の新lib testsと既存full gateを必須にする。
+予約nav操作は本文/holdover/通常navigator描画後に同frame適用し、確定した復元を次の実geometryで消費する。
+新pending fieldでの回避ではなく、既存操作状態の所有移管と終端責務の分離であり、viewport生成/host選択は変えない。
+A→B→A・同viewport context交替・flat/panorama別窓・短いpress/release・古drag不復活を回帰対象に追加する。
 役割移行は利用者が明示した今回の開発体制に限り、実装・実機確認の完了を意味しない。
 
 **2026-09-08 別バージョン検索レビューR2: 明示候補移動が所有するviewer継続

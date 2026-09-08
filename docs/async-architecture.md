@@ -9,6 +9,7 @@
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
+| 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |

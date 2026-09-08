@@ -1262,14 +1262,20 @@ resource を通る。見開きは高さ合わせ係数を含むページ別実�
 まま。比較表示 (wipe/diff) と 360 度パノラマは既存 callback ownership、thumbnail、animated、
 動画、mask、checker、UI preview は direct 経路のままである。
 
-GPU resampler cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
+GPU resampler cache は viewer context ごとに所有し、key は Page / SimilarPreview の source identity、元 `TextureId`、
 `items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent、
 拡大 / 縮小 branch から成る。拡大 entry だけは可視 source UV も key に含め、縮小 entry は
 従来どおり full source 固定である。設定値が変わると context 内の Lanczos 出力 cache を消去し、
 typed resource に保持した旧 percent と一致しない出力も再利用しない。source ごとの直近 2 寸法
 (拡大 / 縮小 branch 別)、context 全体 64 entry の LRU とし、
 fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
-`TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
+`TextureId` は cache、holdover、snapshot、実 paint batch が共有する `Arc` lease の最終 drop で free する。
+UI closureの終了は実renderより前なので、frame-local変数だけではnative登録の寿命を保証できない。
+Lanczos resourceをpaintした同painter/clipへ、出力Arcを不変fieldに持つ有効なno-op egui_wgpu callbackを添える。
+callbackのrectはZEROで、画像のmeshとともにtessellate/paint outputへ保持される。通常/候補/holdover/
+backstop/frozenの全typed paint入口が共通helperを使う。callback内ではArcを破棄せず、callback_resourcesへ
+保存しない（renderer lockの再取得と循環所有を避ける）。surface不在等で描画をしないoutputも、その破棄で終端する。
+新しい任意frame遅延やvendorの解放queueは追加しない。ZEROでもmesh batchingの分割コストは残る。
 出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計する。拡大 cache だけは context ごとに
 総画素 4096×4096 相当の 2 枚分を追加上限として古い entry を落とし、縮小 cache の保持規則は変えない。
 perf log の
