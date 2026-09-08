@@ -1852,3 +1852,20 @@ ui_metadata_panel.rsのR4 working残余70追加/244削除、R2 staged8件を保�
 旧Astraレビュー担当へ新規依頼を追加せず、完了済みレビュー・判断根拠・未解決事項・差分・検証記録を本書と本照会引き継ぎ書から承継する。
 max/ultraは使用しない。既存レビューの全面やり直しや同一検査の重複は避け、新規差分と未解決の検証条件を対象とする。
 品質・実機確認・データ保護・一人だけのファイル編集・R2/R4未コミット保持の条件は変えない。
+
+## B先行: raw hit解決とexact署名射影（2026-09-08）
+
+新しい独立Solレビューで承認、重大指摘なし。変更はsimilar_db.rsとsimilar_book_mih.rsの2件。
+DB hitはMissingとPresentを分け、Present内にraw rowとEligible/HashMismatch/ContainerNotCompleteを保持する。
+固定chunk内でstatementを共有し、入力順・重複を保持。Eligibleだけを同TXのeffective ZIP ordinalへ通す。
+MIH hitは距離を判定したSearchRecordのexact署名を渡す。旧filtered wrapperと製品callerは変更していない。
+実際の旧hash deltaとMissingの区別、ZIP順適用、signature射影の回帰を追加・補強した。
+
+検証正本はtarget/r1-engine-b-*.log。raw-tests1は誤filterで0件、コンパイル確認のみとして原本保持。
+raw-tests2、raw-zip-tests1、mih-signature-tests1は各1件成功。raw-reader-suite1は6件、mih-suite1は10件成功。
+raw-check1は28.76秒/exit0。独立レビューは同じログを読み、テストを再実行していない。
+B engine本体、C製品接続、実エンジンの性能測定、最終gate/portableは後続の未完了条件である。
+
+この区切りはd9673f57f8c5db6001ee1bb0fa461f9c66987708で保存した。
+正本target/r1-engine-b-raw-signature-20260908/manifest.jsonの8件を親が照合し一致。fmt/diffも成功。
+R2 cached差分100651bytes/522b17...8043とR4未コミット変更を保持した。
