@@ -3,7 +3,7 @@
 //! `item` / `container` は検索に公開済みの世代だけを持つ。再索引中のページは
 //! staging 表へ書き、最後の transaction でだけ公開世代と入れ替える。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,17 @@ pub enum ScanState {
     Building = 0,
     Complete = 1,
     Failed = 2,
+}
+
+impl ScanState {
+    fn from_i64(value: i64) -> rusqlite::Result<Self> {
+        match value {
+            0 => Ok(Self::Building),
+            1 => Ok(Self::Complete),
+            2 => Ok(Self::Failed),
+            _ => Err(rusqlite::Error::IntegralValueOutOfRange(1, value)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +256,22 @@ pub(crate) struct BookReadSnapshot<'transaction> {
     conn: &'transaction Connection,
     cancel: &'transaction AtomicBool,
     metadata: BookReadMetadata,
+}
+
+/// Request-local projection of stale ZIP ordinals into the current viewer page order.
+///
+/// The cache lives only for one [`BookReadSnapshot`]. It never writes the repaired order back to
+/// SQLite, and both full-book rows and item-id targets use the same map.
+pub(crate) struct BookPageOrderResolver<'snapshot, 'transaction, Compare> {
+    snapshot: &'snapshot BookReadSnapshot<'transaction>,
+    compare: Compare,
+    effective_zip_orders: BTreeMap<String, Option<Arc<BTreeMap<u64, u32>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContainerPageKey {
+    item_id: u64,
+    item_key: String,
 }
 
 struct CancellableReadTransaction<'conn> {
@@ -423,6 +450,115 @@ impl BookReadSnapshot<'_> {
         hash_version: i64,
     ) -> rusqlite::Result<Vec<SearchRow>> {
         resolve_pages_by_item_id_connection(self.conn, item_ids, hash_version, Some(self.cancel))
+    }
+
+    pub(crate) fn page_order_resolver<Compare>(
+        &self,
+        compare: Compare,
+    ) -> BookPageOrderResolver<'_, '_, Compare>
+    where
+        Compare: Fn(&str, &str) -> std::cmp::Ordering,
+    {
+        BookPageOrderResolver {
+            snapshot: self,
+            compare,
+            effective_zip_orders: BTreeMap::new(),
+        }
+    }
+}
+
+impl<Compare> BookPageOrderResolver<'_, '_, Compare>
+where
+    Compare: Fn(&str, &str) -> std::cmp::Ordering,
+{
+    pub(crate) fn load_book_pages(
+        &mut self,
+        container_key: &str,
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        let pages = self.snapshot.load_book_pages(container_key, hash_version)?;
+        let Some(order) = self.effective_zip_order(container_key)? else {
+            return Ok(pages);
+        };
+
+        let mut ordered = BTreeMap::new();
+        for mut page in pages {
+            self.snapshot.check_cancelled()?;
+            let page_index = order.get(&page.item_id).copied().ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "book page was absent from its complete ZIP order".into(),
+                )
+            })?;
+            page.item.page_index = Some(page_index);
+            if ordered.insert(page_index, page).is_some() {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    "complete ZIP order contained a duplicate ordinal".into(),
+                ));
+            }
+        }
+        self.snapshot.check_cancelled()?;
+        let mut pages = Vec::with_capacity(ordered.len());
+        for page in ordered.into_values() {
+            self.snapshot.check_cancelled()?;
+            pages.push(page);
+        }
+        Ok(pages)
+    }
+
+    pub(crate) fn resolve_pages_by_item_id(
+        &mut self,
+        item_ids: &[u64],
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        let mut rows = self
+            .snapshot
+            .resolve_pages_by_item_id(item_ids, hash_version)?;
+        for row in &mut rows {
+            self.snapshot.check_cancelled()?;
+            let Some(container_key) = row.item.container_key.as_deref() else {
+                continue;
+            };
+            if let Some(order) = self.effective_zip_order(container_key)? {
+                row.item.page_index = Some(order.get(&row.item_id).copied().ok_or_else(|| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        "resolved page was absent from its complete ZIP order".into(),
+                    )
+                })?);
+            }
+        }
+        self.snapshot.check_cancelled()?;
+        Ok(rows)
+    }
+
+    fn effective_zip_order(
+        &mut self,
+        container_key: &str,
+    ) -> rusqlite::Result<Option<Arc<BTreeMap<u64, u32>>>> {
+        if self.snapshot.metadata.page_order_version == PAGE_ORDER_VERSION {
+            return Ok(None);
+        }
+        if let Some(order) = self.effective_zip_orders.get(container_key) {
+            return Ok(order.clone());
+        }
+
+        let order = load_complete_zip_page_keys(
+            self.snapshot.conn,
+            container_key,
+            Some(self.snapshot.cancel),
+        )?
+        .map(|pages| {
+            canonical_page_ordinals(
+                container_key,
+                &pages,
+                &self.compare,
+                Some(self.snapshot.cancel),
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
+        self.effective_zip_orders
+            .insert(container_key.to_owned(), order.clone());
+        Ok(order)
     }
 }
 
@@ -1214,25 +1350,12 @@ impl SimilarDb {
         };
         let mut renumbered = 0usize;
         for container_key in containers {
-            let mut pages = {
-                let mut statement = transaction
-                    .prepare("SELECT item_id, item_key FROM item WHERE container_key = ?1")?;
-                statement
-                    .query_map([&container_key], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let prefix_len = container_key.len() + 1;
-            pages.sort_by(|left, right| {
-                let left = left.1.get(prefix_len..).unwrap_or(&left.1);
-                let right = right.1.get(prefix_len..).unwrap_or(&right.1);
-                order(left, right)
-            });
-            for (page_index, (item_id, _)) in pages.iter().enumerate() {
+            let pages = load_container_page_keys(&transaction, &container_key, None)?;
+            let ordinals = canonical_page_ordinals(&container_key, &pages, &order, None)?;
+            for (item_id, page_index) in ordinals {
                 transaction.execute(
                     "UPDATE item SET page_index = ?1 WHERE item_id = ?2",
-                    params![page_index as i64, item_id],
+                    params![i64::from(page_index), item_id],
                 )?;
             }
             renumbered += 1;
@@ -1863,6 +1986,141 @@ fn load_item_changes_after_connection(
     })
 }
 
+fn load_container_page_keys(
+    conn: &Connection,
+    container_key: &str,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Vec<ContainerPageKey>> {
+    check_book_read_cancelled(cancel)?;
+    let mut statement = conn.prepare(
+        "SELECT item_id, item_key FROM item WHERE container_key = ?1
+         ORDER BY page_index, item_id",
+    )?;
+    let mut query = statement.query([container_key])?;
+    let mut pages = Vec::new();
+    while let Some(row) = query.next()? {
+        check_book_read_cancelled(cancel)?;
+        pages.push(ContainerPageKey {
+            item_id: i64_to_u64(row.get(0)?, 0)?,
+            item_key: row.get(1)?,
+        });
+    }
+    drop(query);
+    drop(statement);
+    check_book_read_cancelled(cancel)?;
+    Ok(pages)
+}
+
+fn load_complete_zip_page_keys(
+    conn: &Connection,
+    container_key: &str,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Option<Vec<ContainerPageKey>>> {
+    check_book_read_cancelled(cancel)?;
+    let kind_and_state = conn
+        .query_row(
+            "SELECT kind, scan_state FROM container WHERE container_key = ?1",
+            [container_key],
+            |row| {
+                Ok((
+                    ContainerKind::from_i64(row.get(0)?)?,
+                    ScanState::from_i64(row.get(1)?)?,
+                ))
+            },
+        )
+        .optional()?;
+    check_book_read_cancelled(cancel)?;
+    if kind_and_state != Some((ContainerKind::Zip, ScanState::Complete)) {
+        return Ok(None);
+    }
+    load_container_page_keys(conn, container_key, cancel).map(Some)
+}
+
+fn canonical_page_ordinals<Compare>(
+    container_key: &str,
+    pages: &[ContainerPageKey],
+    compare: &Compare,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<BTreeMap<u64, u32>>
+where
+    Compare: Fn(&str, &str) -> std::cmp::Ordering,
+{
+    check_book_read_cancelled(cancel)?;
+    let mut order = Vec::with_capacity(pages.len());
+    for index in 0..pages.len() {
+        check_book_read_cancelled(cancel)?;
+        order.push(index);
+    }
+
+    // Bottom-up merge sort lets cancellation abort the Rust-side ordering work. Equal keys take
+    // the left item, preserving the stored (page_index, item_id) order supplied by the SQL above.
+    let prefix_len = container_key.len().saturating_add(1);
+    let mut scratch = vec![0usize; order.len()];
+    let mut width = 1usize;
+    while width < order.len() {
+        let mut start = 0usize;
+        while start < order.len() {
+            let middle = start.saturating_add(width).min(order.len());
+            let end = middle.saturating_add(width).min(order.len());
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle && right < end {
+                check_book_read_cancelled(cancel)?;
+                let left_key = pages[order[left]]
+                    .item_key
+                    .get(prefix_len..)
+                    .unwrap_or(&pages[order[left]].item_key);
+                let right_key = pages[order[right]]
+                    .item_key
+                    .get(prefix_len..)
+                    .unwrap_or(&pages[order[right]].item_key);
+                if compare(left_key, right_key) != std::cmp::Ordering::Greater {
+                    scratch[output] = order[left];
+                    left += 1;
+                } else {
+                    scratch[output] = order[right];
+                    right += 1;
+                }
+                output += 1;
+            }
+            while left < middle {
+                check_book_read_cancelled(cancel)?;
+                scratch[output] = order[left];
+                left += 1;
+                output += 1;
+            }
+            while right < end {
+                check_book_read_cancelled(cancel)?;
+                scratch[output] = order[right];
+                right += 1;
+                output += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+
+    let mut ordinals = BTreeMap::new();
+    for (page_index, source_index) in order.into_iter().enumerate() {
+        check_book_read_cancelled(cancel)?;
+        let page_index = u32::try_from(page_index).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure(
+                "complete ZIP contains more than u32::MAX pages".into(),
+            )
+        })?;
+        if ordinals
+            .insert(pages[source_index].item_id, page_index)
+            .is_some()
+        {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                "complete ZIP contains duplicate item ids".into(),
+            ));
+        }
+    }
+    check_book_read_cancelled(cancel)?;
+    Ok(ordinals)
+}
+
 fn load_book_pages_connection(
     conn: &Connection,
     container_key: &str,
@@ -2254,6 +2512,198 @@ mod tests {
                 .map(|page| page.item.item_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["book/new-a", "book/new-b"]
+        );
+    }
+
+    #[test]
+    fn book_reader_private_zip_order_matches_writer_repair_before_filtering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let book = "book.zip";
+        let separator = '\u{1f}';
+        let names = ["same-b", "old", "a", "quality", "same-a"];
+        let generation = db
+            .begin_container_build(book, ContainerKind::Zip, names.len() as u32, 1, 2)
+            .unwrap();
+        for (page_index, name) in names.iter().enumerate() {
+            let mut page = item(
+                &format!("{book}{separator}{name}"),
+                Some(book),
+                Some(page_index as u32),
+                page_index as u8 + 1,
+            );
+            page.kind = ItemKind::ZipPage;
+            db.stage_item(generation, &page).unwrap();
+        }
+        db.complete_container(book, generation).unwrap();
+
+        let (old_id, same_a_id) = {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "UPDATE item SET hash_version = ?1 WHERE item_key = ?2",
+                params![current_hash_version() - 1, format!("{book}{separator}old")],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE item SET quality = 0 WHERE item_key = ?1",
+                [format!("{book}{separator}quality")],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE item SET page_index = NULL WHERE item_key = ?1",
+                [format!("{book}{separator}same-a")],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE search_content_state SET page_order_version = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+            (
+                conn.query_row(
+                    "SELECT item_id FROM item WHERE item_key = ?1",
+                    [format!("{book}{separator}old")],
+                    |row| i64_to_u64(row.get(0)?, 0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT item_id FROM item WHERE item_key = ?1",
+                    [format!("{book}{separator}same-a")],
+                    |row| i64_to_u64(row.get(0)?, 0),
+                )
+                .unwrap(),
+            )
+        };
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        let compare = |left: &str, right: &str| {
+            let rank = |value: &str| match value {
+                "a" => 0,
+                "old" => 1,
+                "same-a" | "same-b" => 2,
+                "quality" => 3,
+                _ => 4,
+            };
+            rank(left).cmp(&rank(right))
+        };
+
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let (private_pages, private_targets) = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                let mut resolver = snapshot.page_order_resolver(compare);
+                let pages = resolver.load_book_pages(book, current_hash_version())?;
+                let targets = resolver.resolve_pages_by_item_id(
+                    &[same_a_id, old_id, pages[0].item_id],
+                    current_hash_version(),
+                )?;
+                Ok((pages, targets))
+            })
+            .unwrap();
+        let private_projection = private_pages
+            .iter()
+            .map(|row| {
+                (
+                    row.item
+                        .item_key
+                        .rsplit(separator)
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                    row.item.page_index,
+                    row.item.quality,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            private_projection,
+            vec![
+                ("a".to_owned(), Some(0), 50),
+                ("same-a".to_owned(), Some(2), 50),
+                ("same-b".to_owned(), Some(3), 50),
+                ("quality".to_owned(), Some(4), 0),
+            ]
+        );
+        assert_eq!(
+            private_targets
+                .iter()
+                .map(|row| (
+                    row.item.item_key.rsplit(separator).next().unwrap(),
+                    row.item.page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![("same-a", Some(2)), ("a", Some(0))]
+        );
+        assert_eq!(db.page_order_version().unwrap(), 0);
+        assert_eq!(
+            db.load_item_changes_after(0).unwrap().latest_seq,
+            before_seq
+        );
+
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute(
+                "UPDATE search_content_state SET page_order_version = ?1 WHERE singleton = 1",
+                [PAGE_ORDER_VERSION + 1],
+            )
+            .unwrap();
+        let future_version_pages = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                snapshot
+                    .page_order_resolver(compare)
+                    .load_book_pages(book, current_hash_version())
+            })
+            .unwrap();
+        assert_eq!(future_version_pages, private_pages);
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute(
+                "UPDATE search_content_state SET page_order_version = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.renumber_container_pages(PAGE_ORDER_VERSION, compare)
+                .unwrap(),
+            1
+        );
+        let repaired_pages = db.load_book_pages(book, current_hash_version()).unwrap();
+        let repaired_targets = db
+            .resolve_pages_by_item_id(
+                &[same_a_id, old_id, repaired_pages[0].item_id],
+                current_hash_version(),
+            )
+            .unwrap();
+        assert_eq!(repaired_pages, private_pages);
+        assert_eq!(repaired_targets, private_targets);
+        assert_eq!(
+            db.load_item_changes_after(0).unwrap().latest_seq,
+            before_seq
+        );
+    }
+
+    #[test]
+    fn cancellable_page_ordering_propagates_interrupt() {
+        let pages = (0..4_096)
+            .map(|index| ContainerPageKey {
+                item_id: index,
+                item_key: format!("book.zip\u{1f}{:08}", 4_096 - index),
+            })
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let comparisons = std::sync::atomic::AtomicUsize::new(0);
+        let compare = |left: &str, right: &str| {
+            if comparisons.fetch_add(1, Ordering::Relaxed) == 31 {
+                cancel.store(true, Ordering::Release);
+            }
+            left.cmp(right)
+        };
+        let result = canonical_page_ordinals("book.zip", &pages, &compare, Some(&cancel));
+        assert_eq!(comparisons.load(Ordering::Relaxed), 32);
+        assert!(
+            matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::OperationInterrupted)
         );
     }
 

@@ -4,6 +4,7 @@
 //! 一切変更せず、更新は新しい [`SearchSnapshot`] の差し替えだけで公開する。
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -17,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dupe;
 use crate::similar_db::{
-    BaseSearchRow, ItemChangeBatch, ItemChangeOp, SimilarDb, current_hash_version,
+    BaseSearchRow, BookReadSnapshot, ItemChangeBatch, ItemChangeOp, SimilarDb, current_hash_version,
 };
 
 const BASE_FILE: &str = "similar.base";
@@ -208,34 +209,64 @@ pub(crate) fn apply_change_batch(
     snapshot: &SearchSnapshot,
     batch: ItemChangeBatch,
 ) -> Result<Option<SearchSnapshot>, MissingHistory> {
+    match apply_change_batch_checked(snapshot, batch, || Ok::<(), Infallible>(())) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(ApplyChangeError::MissingHistory) => Err(MissingHistory),
+        Err(ApplyChangeError::Check(error)) => match error {},
+    }
+}
+
+enum ApplyChangeError<CheckError> {
+    MissingHistory,
+    Check(CheckError),
+}
+
+impl<CheckError> From<MissingHistory> for ApplyChangeError<CheckError> {
+    fn from(_: MissingHistory) -> Self {
+        Self::MissingHistory
+    }
+}
+
+fn apply_change_batch_checked<CheckError>(
+    snapshot: &SearchSnapshot,
+    batch: ItemChangeBatch,
+    mut check: impl FnMut() -> Result<(), CheckError>,
+) -> Result<Option<SearchSnapshot>, ApplyChangeError<CheckError>> {
+    check().map_err(ApplyChangeError::Check)?;
     if batch.latest_seq == snapshot.applied_seq {
         return Ok(None);
     }
     if batch.latest_seq < snapshot.applied_seq {
-        return Err(MissingHistory);
+        return Err(ApplyChangeError::MissingHistory);
     }
     let expected_first = snapshot.applied_seq.checked_add(1).ok_or(MissingHistory)?;
     if batch.changes.first().map(|change| change.seq) != Some(expected_first) {
-        return Err(MissingHistory);
+        return Err(ApplyChangeError::MissingHistory);
     }
     let mut expected = expected_first;
     for change in &batch.changes {
+        check().map_err(ApplyChangeError::Check)?;
         if change.seq != expected {
-            return Err(MissingHistory);
+            return Err(ApplyChangeError::MissingHistory);
         }
         expected = expected.checked_add(1).ok_or(MissingHistory)?;
     }
     if batch.changes.last().map(|change| change.seq) != Some(batch.latest_seq) {
-        return Err(MissingHistory);
+        return Err(ApplyChangeError::MissingHistory);
     }
 
-    let mut delta = snapshot
-        .delta
-        .iter()
-        .map(|entry| (entry.item_id, *entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut superseded = snapshot.superseded.to_vec();
+    let mut delta = BTreeMap::new();
+    for entry in snapshot.delta.iter().copied() {
+        check().map_err(ApplyChangeError::Check)?;
+        delta.insert(entry.item_id, entry);
+    }
+    let mut superseded = Vec::with_capacity(snapshot.superseded.len());
+    for word in snapshot.superseded.iter().copied() {
+        check().map_err(ApplyChangeError::Check)?;
+        superseded.push(word);
+    }
     for change in batch.changes {
+        check().map_err(ApplyChangeError::Check)?;
         if let Ok(index) = snapshot
             .base
             .records
@@ -261,12 +292,83 @@ pub(crate) fn apply_change_batch(
             },
         );
     }
+    let mut delta_entries = Vec::with_capacity(delta.len());
+    for entry in delta.into_values() {
+        check().map_err(ApplyChangeError::Check)?;
+        delta_entries.push(entry);
+    }
+    check().map_err(ApplyChangeError::Check)?;
     Ok(Some(SearchSnapshot {
         base: Arc::clone(&snapshot.base),
-        delta: delta.into_values().collect(),
+        delta: delta_entries.into(),
         superseded: superseded.into(),
         applied_seq: batch.latest_seq,
     }))
+}
+
+/// Selects the freshest usable in-memory array for this transaction and follows its change log.
+///
+/// A fallback is built only in memory from the same SQLite snapshot. It never writes the sidecar or
+/// prunes history. Once the highest-ranked candidate is selected, missing history falls straight
+/// back to that private base rather than choosing an older candidate with a different derivation.
+pub(crate) fn snapshot_for_book_read(
+    read: &BookReadSnapshot<'_>,
+    candidates: &[Arc<SearchSnapshot>],
+    preferred_mih_base: Option<&Arc<BaseArray>>,
+) -> rusqlite::Result<Arc<SearchSnapshot>> {
+    let metadata = read.metadata();
+    let mut selected: Option<&Arc<SearchSnapshot>> = None;
+    for candidate in candidates {
+        read.check_cancelled()?;
+        if candidate.base.store_id != metadata.store_id
+            || candidate.base.applied_seq > candidate.applied_seq
+            || candidate.applied_seq > metadata.read_seq
+        {
+            continue;
+        }
+        let candidate_rank = (candidate.base.applied_seq, candidate.applied_seq);
+        let replace = selected.is_none_or(|current| {
+            let current_rank = (current.base.applied_seq, current.applied_seq);
+            candidate_rank > current_rank
+                || (candidate_rank == current_rank
+                    && preferred_mih_base.is_some_and(|preferred| {
+                        Arc::ptr_eq(&candidate.base, preferred)
+                            && !Arc::ptr_eq(&current.base, preferred)
+                    }))
+        });
+        if replace {
+            selected = Some(candidate);
+        }
+    }
+    read.check_cancelled()?;
+
+    let Some(selected) = selected else {
+        return private_snapshot_for_book_read(read);
+    };
+    if selected.applied_seq == metadata.read_seq {
+        return Ok(Arc::clone(selected));
+    }
+
+    let batch = read.load_item_changes_after(selected.applied_seq)?;
+    match apply_change_batch_checked(selected, batch, || read.check_cancelled()) {
+        Ok(Some(snapshot)) => Ok(Arc::new(snapshot)),
+        Ok(None) => Ok(Arc::clone(selected)),
+        Err(ApplyChangeError::MissingHistory) => private_snapshot_for_book_read(read),
+        Err(ApplyChangeError::Check(error)) => Err(error),
+    }
+}
+
+fn private_snapshot_for_book_read(
+    read: &BookReadSnapshot<'_>,
+) -> rusqlite::Result<Arc<SearchSnapshot>> {
+    read.check_cancelled()?;
+    let rows = read.load_base_search_rows(current_hash_version())?;
+    read.check_cancelled()?;
+    Ok(Arc::new(SearchSnapshot::from_base(BaseArray {
+        records: rows.records.into_boxed_slice(),
+        store_id: rows.store_id,
+        applied_seq: rows.applied_seq,
+    })))
 }
 
 pub(crate) fn compacted_base(snapshot: &SearchSnapshot) -> BaseArray {
@@ -577,6 +679,8 @@ fn db_error(error: rusqlite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::similar_db::{ItemKind, SimilarBookReader, StoredItem};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn record(item_id: u64, marker: u8, revision: u32) -> SearchRecord {
         SearchRecord {
@@ -585,6 +689,205 @@ mod tests {
             quality: 50,
             revision,
         }
+    }
+
+    fn db_item(key: &str, marker: u8) -> StoredItem {
+        StoredItem {
+            item_key: key.to_owned(),
+            kind: ItemKind::Image,
+            container_key: None,
+            page_index: None,
+            mtime: 10,
+            file_size: 20,
+            hash_version: current_hash_version(),
+            pdq256: [marker; 32],
+            quality: 50,
+            width: 100,
+            height: 80,
+            format: 1,
+        }
+    }
+
+    fn empty_snapshot(base_seq: u64, applied_seq: u64, store_id: [u8; 16]) -> SearchSnapshot {
+        SearchSnapshot {
+            base: Arc::new(BaseArray {
+                records: Box::new([]),
+                store_id,
+                applied_seq: base_seq,
+            }),
+            delta: Arc::from([]),
+            superseded: Arc::from([]),
+            applied_seq,
+        }
+    }
+
+    #[test]
+    fn book_read_snapshot_prefers_the_existing_mih_base_on_an_exact_rank_tie() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&db_item("one", 1)).unwrap();
+        let store_id = db.search_store_id().unwrap();
+        let read_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        drop(db);
+
+        let first = Arc::new(empty_snapshot(read_seq, read_seq, store_id));
+        let preferred = Arc::new(empty_snapshot(read_seq, read_seq, store_id));
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let selected = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |read| {
+                snapshot_for_book_read(
+                    read,
+                    &[Arc::clone(&first), Arc::clone(&preferred)],
+                    Some(&preferred.base),
+                )
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &preferred));
+    }
+
+    #[test]
+    fn book_read_snapshot_follows_the_selected_base_to_the_transaction_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&db_item("one", 1)).unwrap();
+        let base_rows = db.load_base_search_rows(current_hash_version()).unwrap();
+        let base = Arc::new(BaseArray {
+            records: base_rows.records.into_boxed_slice(),
+            store_id: base_rows.store_id,
+            applied_seq: base_rows.applied_seq,
+        });
+        let candidate = Arc::new(SearchSnapshot {
+            base: Arc::clone(&base),
+            delta: Arc::from([]),
+            superseded: vec![0; base.records.len().div_ceil(64)].into(),
+            applied_seq: base.applied_seq,
+        });
+        db.upsert_loose_item(&db_item("two", 2)).unwrap();
+        let read_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        drop(db);
+
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let selected = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |read| {
+                snapshot_for_book_read(read, &[Arc::clone(&candidate)], Some(&base))
+            })
+            .unwrap();
+        assert_eq!(selected.applied_seq, read_seq);
+        assert!(Arc::ptr_eq(&selected.base, &base));
+        assert_eq!(selected.record_count(), 2);
+        assert_eq!(selected.delta.len(), 1);
+    }
+
+    #[test]
+    fn highest_rank_history_gap_builds_the_current_private_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&db_item("one", 1)).unwrap();
+        db.upsert_loose_item(&db_item("two", 2)).unwrap();
+        let store_id = db.search_store_id().unwrap();
+        db.upsert_loose_item(&db_item("three", 3)).unwrap();
+        db.prune_item_changes_through(2).unwrap();
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        let expected = db
+            .load_base_search_rows(current_hash_version())
+            .unwrap()
+            .records;
+        assert_eq!(before_seq, 3);
+
+        // Highest rank (base 1, snapshot 1) needs pruned seq 2. The lower-ranked candidate could
+        // follow seq 2 -> 3, but choosing it would move back to an older base derivation.
+        let highest = Arc::new(empty_snapshot(1, 1, store_id));
+        let lower_followable = Arc::new(empty_snapshot(0, 2, store_id));
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let selected = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |read| {
+                snapshot_for_book_read(
+                    read,
+                    &[Arc::clone(&lower_followable), Arc::clone(&highest)],
+                    Some(&lower_followable.base),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(selected.base.applied_seq, before_seq);
+        assert_eq!(selected.applied_seq, before_seq);
+        assert_eq!(selected.base.records.as_ref(), expected.as_slice());
+        assert!(!Arc::ptr_eq(&selected.base, &highest.base));
+        assert!(!Arc::ptr_eq(&selected.base, &lower_followable.base));
+        assert!(!base_path(temp.path()).exists());
+        assert_eq!(
+            db.load_item_changes_after(0).unwrap().latest_seq,
+            before_seq
+        );
+    }
+
+    #[test]
+    fn invalid_book_read_candidates_use_a_same_transaction_private_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&db_item("one", 1)).unwrap();
+        let store_id = db.search_store_id().unwrap();
+        let read_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        let wrong_store = Arc::new(empty_snapshot(read_seq, read_seq, [9; 16]));
+        let future = Arc::new(empty_snapshot(read_seq + 1, read_seq + 1, store_id));
+        drop(db);
+
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let selected = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |read| {
+                snapshot_for_book_read(read, &[wrong_store, future], None)
+            })
+            .unwrap();
+        assert_eq!(selected.base.store_id, store_id);
+        assert_eq!(selected.applied_seq, read_seq);
+        assert_eq!(selected.record_count(), 1);
+        assert!(!base_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn checked_delta_application_propagates_cancellation_instead_of_history_loss() {
+        let mut snapshot = empty_snapshot(0, 0, [2; 16]);
+        snapshot.delta = (0..8)
+            .map(|index| DeltaEntry {
+                item_id: 1_000 + index,
+                seq: 0,
+                record: None,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        snapshot.superseded = vec![0; 2].into();
+        let changes = (1..=128)
+            .map(|seq| crate::similar_db::ItemChange {
+                seq,
+                item_id: seq,
+                op: ItemChangeOp::Add,
+                revision: Some(1),
+                signature: Some([seq as u8; 32]),
+                quality: Some(50),
+            })
+            .collect::<Vec<_>>();
+        let checks = AtomicUsize::new(0);
+        let result = apply_change_batch_checked(
+            &snapshot,
+            ItemChangeBatch {
+                latest_seq: 128,
+                first_available_seq: Some(1),
+                changes,
+            },
+            || {
+                if checks.fetch_add(1, Ordering::Relaxed) >= 145 {
+                    Err("cancelled")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(ApplyChangeError::Check("cancelled"))));
+        assert_eq!(checks.load(Ordering::Relaxed), 146);
     }
 
     #[test]
