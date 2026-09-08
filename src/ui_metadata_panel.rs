@@ -3164,19 +3164,22 @@ fn draw_book_relations(
                 .iter()
                 .filter_map(|key| {
                     relations
-                        .origin_page_keys
+                        .origin
+                        .pages
                         .iter()
-                        .position(|page| page == key)
+                        .position(|page| page.item_key.as_str() == *key)
                 })
                 .collect::<Vec<_>>();
+            let mut origin_columns = None;
             for hit in &relations.hits {
+                let strip = crate::similar_index::BookStripView::new(&relations.origin, hit);
                 ui.label(
                     egui::RichText::new(book_relation_name(&hit.other_container_key))
                         .color(TEXT_COLOR)
                         .size(11.0),
                 );
                 ui.label(
-                    egui::RichText::new(book_relation_line(hit))
+                    egui::RichText::new(book_relation_line(hit, strip.len()))
                         .color(DIM_COLOR)
                         .size(10.0),
                 );
@@ -3187,15 +3190,16 @@ fn draw_book_relations(
                     .small_button("移動")
                     .on_hover_text("重なりが始まるページを、相手の本で開く")
                     .clicked()
-                    && let Some(opened) = book_open_target(hit)
+                    && let Some(opened) = book_open_target(strip)
                 {
                     actions.open_page = Some(opened);
                 }
                 ui.add_space(3.0);
                 draw_page_strip(
                     ui,
-                    hit,
+                    strip,
                     &current_pages,
+                    &mut origin_columns,
                     state,
                     thumb_px,
                     thumb_quality,
@@ -3224,7 +3228,7 @@ fn book_relation_name(container_key: &str) -> String {
 
 /// 関係の要約。**「消してよい」とは書かない** (§0)。何ページ重なっていて、それぞれの本の
 /// どれだけを占めるかという事実だけを出す。
-fn book_relation_line(hit: &crate::similar_index::BookRelationHit) -> String {
+fn book_relation_line(hit: &crate::similar_index::BookRelationHit, origin_pages: usize) -> String {
     let relation = match &hit.pair.relation {
         crate::dupe::book::Relation::Same => "ほぼ同じ内容",
         crate::dupe::book::Relation::Contains { .. } => "片方がもう片方を含む",
@@ -3236,7 +3240,7 @@ fn book_relation_line(hit: &crate::similar_index::BookRelationHit) -> String {
         hit.pair.matched,
         hit.pair.coverage_a * 100.0,
         hit.pair.coverage_b * 100.0,
-        hit.pages.len(),
+        origin_pages,
         hit.other_page_count
     )
 }
@@ -3285,10 +3289,10 @@ fn draw_page_strip_legend(ui: &mut egui::Ui) {
 /// **重なりが始まるページ**を選ぶ。相手の本の 1 ページ目ではない — 単話が総集編の 34 ページ
 /// 目から入っているとき、開きたいのは表紙ではなくそこである。
 fn book_open_target(
-    hit: &crate::similar_index::BookRelationHit,
+    strip: crate::similar_index::BookStripView<'_>,
 ) -> Option<(String, crate::similar_index::SimilarItemTarget)> {
-    let page = hit.pages.iter().find(|page| page.other_target.is_some())?;
-    Some((page.other_item_key.clone()?, page.other_target.clone()?))
+    let page = strip.first_target()?;
+    Some((page.other_item_key.clone(), page.other_target.clone()?))
 }
 
 const STRIP_HEIGHT: f32 = 16.0;
@@ -3314,45 +3318,112 @@ struct StripColumns {
     first_target: Vec<Option<usize>>,
 }
 
+#[derive(Clone, Copy)]
+struct StripColumnRange {
+    start: usize,
+    end: usize,
+}
+
+/// Origin-only column projection shared by every visible relation row in one draw pass.
+struct OriginStripColumns {
+    pages: usize,
+    columns: usize,
+    ranges: Vec<StripColumnRange>,
+    strongest: Vec<Option<crate::similar_index::BookPageState>>,
+}
+
+fn strip_column_page_range(pages: usize, columns: usize, column: usize) -> StripColumnRange {
+    let start = column * pages / columns;
+    let end = (((column + 1) * pages) / columns).max(start + 1).min(pages);
+    StripColumnRange { start, end }
+}
+
+fn page_state_rank(state: crate::similar_index::BookPageState) -> u8 {
+    use crate::similar_index::BookPageState;
+    match state {
+        BookPageState::Strong => 3,
+        BookPageState::Weak => 2,
+        BookPageState::Unmatched => 1,
+        BookPageState::Excluded => 0,
+    }
+}
+
+fn origin_strip_columns(
+    strip: crate::similar_index::BookStripView<'_>,
+    columns: usize,
+) -> OriginStripColumns {
+    let mut ranges = Vec::with_capacity(columns);
+    let mut strongest = Vec::with_capacity(columns);
+    for column in 0..columns {
+        let range = strip_column_page_range(strip.len(), columns, column);
+        let mut state = None;
+        for page in range.start..range.end {
+            let baseline = strip
+                .baseline_state(page)
+                .expect("strip column range stays inside the origin");
+            if state.is_none_or(|current| page_state_rank(baseline) > page_state_rank(current)) {
+                state = Some(baseline);
+            }
+        }
+        ranges.push(range);
+        strongest.push(state);
+    }
+    OriginStripColumns {
+        pages: strip.len(),
+        columns,
+        ranges,
+        strongest,
+    }
+}
+
 /// ページを表示幅のコマへ畳む。
 ///
 /// 1 コマに複数ページが入るときは**一番強い状態を出す**。対応が連続していれば塗りが続き、
 /// たまたま数ページ一致しただけなら細い線として残る — この見分けが判定そのものになる
 /// (§14.2)。弱い側に寄せて平均を取ると、その区別が消える。
 fn summarize_page_strip(
-    pages: &[crate::similar_index::BookPageMatch],
+    strip: crate::similar_index::BookStripView<'_>,
     columns: usize,
+    origin_cache: &mut Option<OriginStripColumns>,
 ) -> StripColumns {
-    use crate::similar_index::BookPageState;
-
-    let mut strongest = vec![None::<BookPageState>; columns];
+    let mut strongest = Vec::new();
     let mut first_target = vec![None::<usize>; columns];
-    if pages.is_empty() || columns == 0 {
+    if strip.is_empty() || columns == 0 {
         return StripColumns {
             strongest,
             first_target,
         };
     }
-    let rank = |state: BookPageState| match state {
-        BookPageState::Strong => 3,
-        BookPageState::Weak => 2,
-        BookPageState::Unmatched => 1,
-        BookPageState::Excluded => 0,
-    };
-    // コマ側から回す。ページ数が幅より多いときは 1 コマが範囲を受け持ち、少ないときは
-    // 1 ページが複数のコマにまたがる。ページ側から回すと後者で空のコマが残り、帯が縞に
-    // なって「対応が途切れている」ように見えてしまう。
-    for column in 0..columns {
-        let start = column * pages.len() / columns;
-        let end = (((column + 1) * pages.len()) / columns)
-            .max(start + 1)
-            .min(pages.len());
-        for (page, entry) in pages.iter().enumerate().take(end).skip(start) {
-            if strongest[column].is_none_or(|current| rank(entry.state) > rank(current)) {
-                strongest[column] = Some(entry.state);
+
+    if origin_cache
+        .as_ref()
+        .is_none_or(|cached| cached.pages != strip.len() || cached.columns != columns)
+    {
+        *origin_cache = Some(origin_strip_columns(strip, columns));
+    }
+    let cached = origin_cache
+        .as_ref()
+        .expect("a non-empty strip creates its shared origin columns");
+    strongest.clone_from(&cached.strongest);
+
+    // Each sparse override is considered only by the columns that own its origin slot. The
+    // origin baseline above is reused across hits, so relation count no longer multiplies the
+    // full origin length.
+    let overrides = strip.overrides();
+    for (column, range) in cached.ranges.iter().copied().enumerate() {
+        let start = overrides.partition_point(|entry| entry.origin_slot < range.start);
+        for entry in overrides[start..]
+            .iter()
+            .take_while(|entry| entry.origin_slot < range.end)
+        {
+            let state = entry.state.state();
+            if strongest[column]
+                .is_none_or(|current| page_state_rank(state) > page_state_rank(current))
+            {
+                strongest[column] = Some(state);
             }
             if entry.other_target.is_some() && first_target[column].is_none() {
-                first_target[column] = Some(page);
+                first_target[column] = Some(entry.origin_slot);
             }
         }
     }
@@ -3370,8 +3441,9 @@ fn summarize_page_strip(
 #[allow(clippy::too_many_arguments)]
 fn draw_page_strip(
     ui: &mut egui::Ui,
-    hit: &crate::similar_index::BookRelationHit,
+    strip: crate::similar_index::BookStripView<'_>,
     current_pages: &[usize],
+    origin_columns: &mut Option<OriginStripColumns>,
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -3380,7 +3452,7 @@ fn draw_page_strip(
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
-    if hit.pages.is_empty() {
+    if strip.is_empty() {
         return;
     }
     let width = ui.available_width().max(1.0);
@@ -3388,6 +3460,11 @@ fn draw_page_strip(
         egui::vec2(width, STRIP_HEIGHT + STRIP_MARKER_HEIGHT),
         egui::Sense::click(),
     );
+    // Keep the row's full layout height, but do no folding, painting, hover thumbnail work, or
+    // input resolution when the scroll clip cannot show it.
+    if !ui.is_rect_visible(outer) {
+        return;
+    }
     let rect = egui::Rect::from_min_size(
         egui::pos2(outer.left(), outer.top() + STRIP_MARKER_HEIGHT),
         egui::vec2(width, STRIP_HEIGHT),
@@ -3399,20 +3476,23 @@ fn draw_page_strip(
     let StripColumns {
         strongest,
         first_target,
-    } = summarize_page_strip(&hit.pages, columns);
+    } = summarize_page_strip(strip, columns, origin_columns);
     // 1 ページが 3 px 以上取れるなら、ページごとの区画として描く。ページ数を数えられ、
     // ▼ がどの区画を指しているのかが分かる。取れないときだけ 1 px のコマへ畳む。
-    let per_page = width / hit.pages.len() as f32;
+    let per_page = width / strip.len() as f32;
     if per_page >= STRIP_MIN_CELL {
-        for (page, entry) in hit.pages.iter().enumerate() {
-            let left = rect.left() + strip_page_left(width, hit.pages.len(), page);
+        for page in 0..strip.len() {
+            let entry = strip
+                .get(page)
+                .expect("page strip iterates only within the origin");
+            let left = rect.left() + strip_page_left(width, strip.len(), page);
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(left, rect.top()),
                     egui::vec2((per_page - 1.0).max(1.0), STRIP_HEIGHT),
                 ),
                 0.0,
-                page_state_color(entry.state),
+                page_state_color(entry.state()),
             );
         }
     } else {
@@ -3432,7 +3512,7 @@ fn draw_page_strip(
     // いま見ているページの位置。これが無いと、帯のどこに自分がいるのか分からない。
     // 見開きなら 2 ページとも指す。片方だけだと、もう片方を見落とす。
     for page in current_pages {
-        let x = rect.left() + strip_page_center(width, hit.pages.len(), *page);
+        let x = rect.left() + strip_page_center(width, strip.len(), *page);
         let tip = egui::pos2(x, rect.top() - 1.0);
         painter.add(egui::Shape::convex_polygon(
             vec![
@@ -3451,9 +3531,11 @@ fn draw_page_strip(
     let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
     // 押したときに対象になるページ範囲を、そのまま囲う。カーソル中心の固定幅にすると、
     // 1 ページが十数 px ある帯で枠だけが細く残り、どのページを指しているのか分からない。
-    let pages = hit.pages.len();
-    let first = column * pages / columns;
-    let last = (((column + 1) * pages) / columns).max(first + 1).min(pages);
+    let pages = strip.len();
+    let StripColumnRange {
+        start: first,
+        end: last,
+    } = strip_column_page_range(pages, columns, column);
     let left = strip_page_left(width, pages, first);
     let right = strip_page_left(width, pages, last).max(left + STRIP_MIN_CELL);
     painter.rect_stroke(
@@ -3469,10 +3551,10 @@ fn draw_page_strip(
         response.on_hover_text("ここに対応するページはありません");
         return;
     };
-    let entry = &hit.pages[page];
-    let Some(item_key) = entry.other_item_key.clone() else {
+    let Some(entry) = strip.get(page).and_then(|entry| entry.match_override()) else {
         return;
     };
+    let item_key = entry.other_item_key.clone();
     // 行のサムネイルと同じ経路で読む。飛ぶ前にどのページなのかを見せる。
     state.ensure_thumbnail_for(
         &item_key,
@@ -3490,7 +3572,7 @@ fn draw_page_strip(
     let caption = format!(
         "この本の {} ページ目 → 相手の {} ページ目",
         page + 1,
-        entry.other_page_index.map_or(0, |index| index + 1)
+        entry.other_page_index + 1
     );
     response.clone().on_hover_ui(|ui| {
         ui.set_max_width(STRIP_PREVIEW_SIZE);
@@ -3643,44 +3725,66 @@ fn draw_similar_hit_buttons(
 /// スナップショット用の本の関係。**連続した収録**と**散発的な一致**の両方を入れて、
 /// 帯がその区別を保っていることを目で見て確かめられるようにする。
 fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
-    use crate::similar_index::{BookPageMatch, BookPageState};
-
-    let page = |state: BookPageState, other: Option<u32>| BookPageMatch {
-        state,
-        other_mtime: 0,
-        other_file_size: 0,
-        other_page_index: other,
-        other_target: other.map(|_| {
-            crate::similar_index::SimilarItemTarget::File(PathBuf::from(r"D:\Archive\other.png"))
-        }),
-        other_item_key: other.map(|_| "d:/archive/other.png".to_string()),
+    use crate::similar_index::{
+        BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
     };
-    let contiguous = (0..180u32)
-        .map(|index| match index {
-            0..=3 => page(BookPageState::Excluded, None),
-            34..=110 => page(BookPageState::Strong, Some(index - 34)),
-            111..=118 => page(BookPageState::Weak, Some(index - 34)),
-            _ => page(BookPageState::Unmatched, None),
-        })
-        .collect::<Vec<_>>();
-    let scattered = (0..180u32)
+
+    let page =
+        |origin_slot: usize, state: BookPageMatchState, other_page_index: u32| BookPageMatch {
+            origin_slot,
+            state,
+            other_mtime: 0,
+            other_file_size: 0,
+            other_page_index,
+            other_target: Some(crate::similar_index::SimilarItemTarget::File(
+                PathBuf::from(r"D:\Archive\other.png"),
+            )),
+            other_item_key: "d:/archive/other.png".to_string(),
+        };
+    let origin = std::sync::Arc::new(BookOrigin {
+        pages: (0..180)
+            .map(|index| BookOriginPage {
+                item_key: format!("c:/books/this/{index:03}.png"),
+                baseline: if index <= 3 {
+                    BookPageBaseline::Excluded
+                } else {
+                    BookPageBaseline::Unmatched
+                },
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    });
+    let contiguous = (34..=118usize)
         .map(|index| {
-            if index % 23 == 0 {
-                page(BookPageState::Strong, Some(index))
-            } else {
-                page(BookPageState::Unmatched, None)
-            }
+            page(
+                index,
+                if index <= 110 {
+                    BookPageMatchState::Strong
+                } else {
+                    BookPageMatchState::Weak
+                },
+                (index - 34) as u32,
+            )
         })
         .collect::<Vec<_>>();
+    let scattered = (4..180usize)
+        .filter(|index| index % 23 == 0)
+        .map(|index| {
+            page(
+                index,
+                BookPageMatchState::Strong,
+                u32::try_from(index).expect("snapshot page index fits u32"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let origin_len = origin.pages.len();
     crate::similar_index::BookQuery::Ready(crate::similar_index::BookRelations {
-        origin_page_keys: (0..180)
-            .map(|index| format!("c:/books/this/{index:03}.png"))
-            .collect(),
+        origin,
         hits: vec![
-            crate::similar_index::BookRelationHit {
-                other_container_key: r"E:\books\総集編.zip".to_string(),
-                other_page_count: 402,
-                pair: crate::dupe::book::BookPair {
+            crate::similar_index::BookRelationHit::new(
+                r"E:\books\総集編.zip".to_string(),
+                402,
+                crate::dupe::book::BookPair {
                     a: 1,
                     b: 2,
                     matched: 85,
@@ -3691,24 +3795,28 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
                     relation: crate::dupe::book::Relation::Contains { whole: 2 },
                     alignment: Vec::new(),
                 },
-                pages: contiguous,
-            },
-            crate::similar_index::BookRelationHit {
-                other_container_key: r"E:\books\別作品.zip".to_string(),
-                other_page_count: 190,
-                pair: crate::dupe::book::BookPair {
+                contiguous,
+                origin_len,
+            )
+            .expect("snapshot overrides are valid"),
+            crate::similar_index::BookRelationHit::new(
+                r"E:\books\別作品.zip".to_string(),
+                190,
+                crate::dupe::book::BookPair {
                     a: 1,
                     b: 3,
-                    matched: 8,
+                    matched: 7,
                     distinctive_a: 176,
                     distinctive_b: 190,
-                    coverage_a: 0.045,
-                    coverage_b: 0.042,
+                    coverage_a: 0.040,
+                    coverage_b: 0.037,
                     relation: crate::dupe::book::Relation::Unrelated,
                     alignment: Vec::new(),
                 },
-                pages: scattered,
-            },
+                scattered,
+                origin_len,
+            )
+            .expect("snapshot overrides are valid"),
         ],
     })
 }
@@ -4757,19 +4865,120 @@ mod similar_panel_tests {
     };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
-    use crate::similar_index::BookPageMatch;
     use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
 
-    fn strip_page(state: crate::similar_index::BookPageState, other: Option<u32>) -> BookPageMatch {
-        BookPageMatch {
-            state,
-            other_mtime: 0,
-            other_file_size: 0,
-            other_page_index: other,
-            other_target: other.map(|_| {
-                crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/other.png"))
-            }),
-            other_item_key: other.map(|_| "c:/other.png".to_string()),
+    #[derive(Clone, Copy)]
+    struct TestStripPage {
+        state: crate::similar_index::BookPageState,
+        other: Option<u32>,
+    }
+
+    fn strip_page(state: crate::similar_index::BookPageState, other: Option<u32>) -> TestStripPage {
+        TestStripPage { state, other }
+    }
+
+    fn test_book_relations(pages: Vec<TestStripPage>) -> crate::similar_index::BookRelations {
+        use crate::similar_index::{
+            BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
+            BookPageState, BookRelationHit, BookRelations,
+        };
+
+        let origin = std::sync::Arc::new(BookOrigin {
+            pages: pages
+                .iter()
+                .enumerate()
+                .map(|(slot, page)| BookOriginPage {
+                    item_key: format!("c:/origin/{slot}.png"),
+                    baseline: if page.state == BookPageState::Excluded {
+                        BookPageBaseline::Excluded
+                    } else {
+                        BookPageBaseline::Unmatched
+                    },
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+        let overrides = pages
+            .iter()
+            .enumerate()
+            .filter_map(|(origin_slot, page)| {
+                let state = match page.state {
+                    BookPageState::Strong => BookPageMatchState::Strong,
+                    BookPageState::Weak => BookPageMatchState::Weak,
+                    BookPageState::Unmatched | BookPageState::Excluded => return None,
+                };
+                let other_page_index = page.other?;
+                Some(BookPageMatch {
+                    origin_slot,
+                    state,
+                    other_mtime: 0,
+                    other_file_size: 0,
+                    other_page_index,
+                    other_target: Some(crate::similar_index::SimilarItemTarget::File(
+                        PathBuf::from("c:/other.png"),
+                    )),
+                    other_item_key: "c:/other.png".to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let hit = BookRelationHit::new(
+            "e:/books/other.zip".to_owned(),
+            pages.len() as u32,
+            crate::dupe::book::BookPair {
+                a: 1,
+                b: 2,
+                matched: overrides.len() as u32,
+                distinctive_a: pages.len() as u32,
+                distinctive_b: pages.len() as u32,
+                coverage_a: 0.0,
+                coverage_b: 0.0,
+                relation: crate::dupe::book::Relation::Unrelated,
+                alignment: Vec::new(),
+            },
+            overrides,
+            origin.pages.len(),
+        )
+        .unwrap();
+        BookRelations {
+            origin,
+            hits: vec![hit],
+        }
+    }
+
+    fn summarize_test_strip(pages: Vec<TestStripPage>, columns: usize) -> super::StripColumns {
+        let relations = test_book_relations(pages);
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let mut cache = None;
+        summarize_page_strip(strip, columns, &mut cache)
+    }
+
+    fn summarize_dense_strip_oracle(
+        pages: &[(crate::similar_index::BookPageState, bool)],
+        columns: usize,
+    ) -> super::StripColumns {
+        let mut strongest = Vec::with_capacity(columns);
+        let mut first_target = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let start = column * pages.len() / columns;
+            let end = (((column + 1) * pages.len()) / columns)
+                .max(start + 1)
+                .min(pages.len());
+            strongest.push(
+                pages[start..end]
+                    .iter()
+                    .map(|(state, _)| *state)
+                    .max_by_key(|state| match state {
+                        crate::similar_index::BookPageState::Strong => 3,
+                        crate::similar_index::BookPageState::Weak => 2,
+                        crate::similar_index::BookPageState::Unmatched => 1,
+                        crate::similar_index::BookPageState::Excluded => 0,
+                    }),
+            );
+            first_target.push((start..end).find(|slot| pages[*slot].1));
+        }
+        super::StripColumns {
+            strongest,
+            first_target,
         }
     }
 
@@ -4788,7 +4997,7 @@ mod similar_panel_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let folded = summarize_page_strip(&contiguous, 20);
+        let folded = summarize_test_strip(contiguous, 20);
         let strong = folded
             .strongest
             .iter()
@@ -4805,7 +5014,7 @@ mod similar_panel_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let folded = summarize_page_strip(&scattered, 20);
+        let folded = summarize_test_strip(scattered, 20);
         let strong = folded
             .strongest
             .iter()
@@ -4827,14 +5036,14 @@ mod similar_panel_tests {
             strip_page(BookPageState::Excluded, None),
             strip_page(BookPageState::Unmatched, None),
         ];
-        let folded = summarize_page_strip(&pages, 1);
+        let folded = summarize_test_strip(pages, 1);
         assert_eq!(folded.strongest[0], Some(BookPageState::Unmatched));
 
         let pages = vec![
             strip_page(BookPageState::Excluded, None),
             strip_page(BookPageState::Weak, Some(3)),
         ];
-        let folded = summarize_page_strip(&pages, 1);
+        let folded = summarize_test_strip(pages, 1);
         assert_eq!(folded.strongest[0], Some(BookPageState::Weak));
         assert_eq!(folded.first_target[0], Some(1));
     }
@@ -4848,7 +5057,7 @@ mod similar_panel_tests {
         let pages = (0..3)
             .map(|page| strip_page(BookPageState::Strong, Some(page as u32)))
             .collect::<Vec<_>>();
-        let folded = summarize_page_strip(&pages, 10);
+        let folded = summarize_test_strip(pages, 10);
         assert_eq!(folded.strongest.len(), 10);
         assert!(
             folded
@@ -4876,7 +5085,7 @@ mod similar_panel_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let folded = summarize_page_strip(&pages, 10);
+        let folded = summarize_test_strip(pages, 10);
         assert_eq!(
             folded.strongest,
             vec![
@@ -4894,43 +5103,254 @@ mod similar_panel_tests {
         );
     }
 
+    #[test]
+    fn relation_rows_share_origin_baselines_and_compose_only_their_overrides() {
+        use crate::similar_index::{BookPageMatch, BookPageMatchState, BookPageState};
+
+        let mut relations = test_book_relations(vec![
+            strip_page(BookPageState::Excluded, None),
+            strip_page(BookPageState::Strong, Some(11)),
+            strip_page(BookPageState::Unmatched, None),
+        ]);
+        let pair = relations.hits[0].pair.clone();
+        relations.hits.push(
+            crate::similar_index::BookRelationHit::new(
+                "e:/books/second.zip".to_owned(),
+                3,
+                pair,
+                vec![BookPageMatch {
+                    origin_slot: 2,
+                    state: BookPageMatchState::Weak,
+                    other_page_index: 22,
+                    other_target: Some(crate::similar_index::SimilarItemTarget::File(
+                        PathBuf::from("c:/second.png"),
+                    )),
+                    other_item_key: "c:/second.png".to_owned(),
+                    other_mtime: 0,
+                    other_file_size: 0,
+                }],
+                relations.origin.pages.len(),
+            )
+            .unwrap(),
+        );
+        let mut cache = None;
+        let first = summarize_page_strip(
+            crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]),
+            3,
+            &mut cache,
+        );
+        let second = summarize_page_strip(
+            crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[1]),
+            3,
+            &mut cache,
+        );
+        assert_eq!(
+            first.strongest,
+            [
+                Some(BookPageState::Excluded),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Unmatched),
+            ]
+        );
+        assert_eq!(
+            second.strongest,
+            [
+                Some(BookPageState::Excluded),
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Weak),
+            ]
+        );
+        assert_eq!(first.first_target, [None, Some(1), None]);
+        assert_eq!(second.first_target, [None, None, Some(2)]);
+    }
+
+    #[test]
+    fn sparse_columns_match_dense_folding_and_keep_the_first_real_target() {
+        use crate::similar_index::{
+            BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
+            BookPageState, BookRelationHit, BookStripView, SimilarItemTarget,
+        };
+
+        let origin = std::sync::Arc::new(BookOrigin {
+            pages: (0..5)
+                .map(|slot| BookOriginPage {
+                    item_key: format!("c:/origin/{slot}.png"),
+                    baseline: BookPageBaseline::Unmatched,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+        let matched = |origin_slot, state, other_target| BookPageMatch {
+            origin_slot,
+            state,
+            other_page_index: origin_slot as u32 + 10,
+            other_target,
+            other_item_key: format!("c:/other/{origin_slot}.png"),
+            other_mtime: 1,
+            other_file_size: 2,
+        };
+        let weak_target = SimilarItemTarget::File(PathBuf::from("c:/other/1.png"));
+        let hit = BookRelationHit::new(
+            "c:/other".to_owned(),
+            5,
+            crate::dupe::book::BookPair {
+                a: 1,
+                b: 2,
+                matched: 3,
+                distinctive_a: 5,
+                distinctive_b: 5,
+                coverage_a: 0.6,
+                coverage_b: 0.6,
+                relation: crate::dupe::book::Relation::Unrelated,
+                alignment: Vec::new(),
+            },
+            vec![
+                matched(1, BookPageMatchState::Weak, Some(weak_target.clone())),
+                matched(2, BookPageMatchState::Strong, None),
+                matched(4, BookPageMatchState::Strong, None),
+            ],
+            origin.pages.len(),
+        )
+        .unwrap();
+        let strip = BookStripView::new(&origin, &hit);
+        let dense = [
+            (BookPageState::Unmatched, false),
+            (BookPageState::Weak, true),
+            (BookPageState::Strong, false),
+            (BookPageState::Unmatched, false),
+            (BookPageState::Strong, false),
+        ];
+        let mut origin_columns = None;
+        let sparse = summarize_page_strip(strip, 3, &mut origin_columns);
+        let oracle = summarize_dense_strip_oracle(&dense, 3);
+        assert_eq!(sparse.strongest, oracle.strongest);
+        assert_eq!(sparse.first_target, oracle.first_target);
+        assert_eq!(
+            sparse.strongest,
+            [
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Strong),
+            ]
+        );
+        assert_eq!(sparse.first_target, [None, Some(1), None]);
+        assert!(
+            strip
+                .get(2)
+                .and_then(|page| page.match_override())
+                .is_some_and(|page| page.other_target.is_none()),
+            "a targetless Strong match remains part of the sparse evidence"
+        );
+        let (key, target) = super::book_open_target(strip).expect("the Weak page has a target");
+        assert_eq!(key, "c:/other/1.png");
+        assert_eq!(target, weak_target);
+    }
+
+    #[test]
+    fn clipped_book_strip_keeps_its_row_but_defers_origin_projection_until_visible() {
+        use crate::similar_index::BookPageState;
+
+        let relations = test_book_relations(
+            (0..12)
+                .map(|page| strip_page(BookPageState::Strong, Some(page)))
+                .collect(),
+        );
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut state = SimilarPanelState::default();
+        let mut actions = super::SimilarPanelActions::default();
+        let mut origin_columns = None;
+        let mut allocated_height = 0.0;
+
+        let _ = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_clip_rect(egui::Rect::from_min_max(
+                    screen.min,
+                    egui::pos2(screen.right(), 36.0),
+                ));
+                ui.add_space(80.0);
+                let before = ui.cursor().top();
+                super::draw_page_strip(
+                    ui,
+                    strip,
+                    &[3],
+                    &mut origin_columns,
+                    &mut state,
+                    72,
+                    85,
+                    crate::thumb_loader::CacheDecision::without_thumbnail(),
+                    None,
+                    ctx,
+                    &mut actions,
+                );
+                allocated_height = ui.cursor().top() - before;
+            });
+        });
+        assert!(
+            allocated_height >= super::STRIP_HEIGHT + super::STRIP_MARKER_HEIGHT,
+            "the clipped row must keep its scroll layout height: {allocated_height}"
+        );
+        assert!(
+            origin_columns.is_none(),
+            "a clipped row must not fold N pages"
+        );
+        assert!(state.thumbnails.is_empty());
+        assert!(actions.thumbnail_demand.is_empty());
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_clip_rect(screen);
+                super::draw_page_strip(
+                    ui,
+                    strip,
+                    &[3],
+                    &mut origin_columns,
+                    &mut state,
+                    72,
+                    85,
+                    crate::thumb_loader::CacheDecision::without_thumbnail(),
+                    None,
+                    ctx,
+                    &mut actions,
+                );
+            });
+        });
+        assert!(
+            origin_columns.is_some(),
+            "a visible row builds the shared origin projection"
+        );
+        assert!(state.thumbnails.is_empty());
+        assert!(actions.thumbnail_demand.is_empty());
+    }
+
     /// 本の [移動] は重なりが始まるページを開く。相手の 1 ページ目を開くと、総集編の
     /// どこに入っているのかを自分で探し直すことになる。
     #[test]
     fn opening_a_book_lands_where_the_overlap_starts() {
-        use crate::similar_index::{BookPageState, BookRelationHit};
+        use crate::similar_index::BookPageState;
 
         let mut pages = (0..10)
             .map(|_| strip_page(BookPageState::Unmatched, None))
             .collect::<Vec<_>>();
         pages[4] = strip_page(BookPageState::Strong, Some(33));
         pages[5] = strip_page(BookPageState::Strong, Some(34));
-        let hit = BookRelationHit {
-            other_container_key: "e:/books/anthology.zip".to_string(),
-            other_page_count: 200,
-            pair: crate::dupe::book::BookPair {
-                a: 1,
-                b: 2,
-                matched: 2,
-                distinctive_a: 10,
-                distinctive_b: 200,
-                coverage_a: 0.2,
-                coverage_b: 0.01,
-                relation: crate::dupe::book::Relation::Contains { whole: 2 },
-                alignment: Vec::new(),
-            },
-            pages,
-        };
-        let (key, _) = super::book_open_target(&hit).expect("an overlapping page exists");
+        let relations = test_book_relations(pages);
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let (key, _) = super::book_open_target(strip).expect("an overlapping page exists");
         assert_eq!(key, "c:/other.png");
 
-        let empty = BookRelationHit {
-            pages: (0..3)
+        let empty = test_book_relations(
+            (0..3)
                 .map(|_| strip_page(BookPageState::Unmatched, None))
                 .collect(),
-            ..hit
-        };
-        assert!(super::book_open_target(&empty).is_none());
+        );
+        let strip = crate::similar_index::BookStripView::new(&empty.origin, &empty.hits[0]);
+        assert!(super::book_open_target(strip).is_none());
     }
 
     /// 区画・▼・ホバー枠が同じ換算を使うこと。ここが割れると、指している場所と開く場所が
@@ -4954,6 +5374,48 @@ mod similar_panel_tests {
         // ページが 1 枚しかなくても割り算が壊れないこと。
         assert_eq!(super::strip_page_left(width, 1, 0), 0.0);
         assert!((super::strip_page_center(width, 1, 0) - width / 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn strip_columns_cover_exactly_the_pages_used_by_hover_and_folding() {
+        let ten = (0..10)
+            .map(|column| super::strip_column_page_range(100, 10, column))
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ten,
+            [
+                (0, 10),
+                (10, 20),
+                (20, 30),
+                (30, 40),
+                (40, 50),
+                (50, 60),
+                (60, 70),
+                (70, 80),
+                (80, 90),
+                (90, 100),
+            ]
+        );
+        let short = (0..10)
+            .map(|column| super::strip_column_page_range(3, 10, column))
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            short,
+            [
+                (0, 1),
+                (0, 1),
+                (0, 1),
+                (0, 1),
+                (1, 2),
+                (1, 2),
+                (1, 2),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ]
+        );
     }
 
     /// 見開きでは両方のページを調べる。片方に落とすと、もう片方の別バージョンが出なくなる。

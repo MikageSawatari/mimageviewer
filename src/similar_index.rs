@@ -181,14 +181,59 @@ pub enum BookPageState {
     Excluded,
 }
 
+/// Per-origin-page state shared by every relation hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookPageBaseline {
+    Unmatched,
+    Excluded,
+}
+
+impl BookPageBaseline {
+    pub(crate) fn state(self) -> BookPageState {
+        match self {
+            Self::Unmatched => BookPageState::Unmatched,
+            Self::Excluded => BookPageState::Excluded,
+        }
+    }
+}
+
+/// State stored only for a page that has a concrete counterpart in one hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookPageMatchState {
+    Strong,
+    Weak,
+}
+
+impl BookPageMatchState {
+    pub(crate) fn state(self) -> BookPageState {
+        match self {
+            Self::Strong => BookPageState::Strong,
+            Self::Weak => BookPageState::Weak,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookOriginPage {
+    pub item_key: String,
+    pub baseline: BookPageBaseline,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookOrigin {
+    pub pages: Box<[BookOriginPage]>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookPageMatch {
-    pub state: BookPageState,
+    /// Slot in [`BookOrigin::pages`] replaced by this match.
+    pub origin_slot: usize,
+    pub state: BookPageMatchState,
     /// 相手の本での対応ページ。押すとそこへ移動する。
-    pub other_page_index: Option<u32>,
+    pub other_page_index: u32,
     /// 移動先。`items` に無い場所も開けるよう、照会側で解決しておく。
     pub other_target: Option<SimilarItemTarget>,
-    pub other_item_key: Option<String>,
+    pub other_item_key: String,
     /// サムネイルのキャッシュ判定に使う。帯にホバーしたページを出すため。
     pub other_mtime: i64,
     pub other_file_size: i64,
@@ -201,17 +246,125 @@ pub struct BookRelationHit {
     /// 帯が何を表しているのか読めない。
     pub other_page_count: u32,
     pub pair: dupe::book::BookPair,
-    /// 起点の本のページ順に並んだ帯。長さは起点の本のページ数と一致する。
-    pub pages: Vec<BookPageMatch>,
+    /// 起点ページ順の sparse override。対応が無いページは [`BookOrigin`] の baseline を使う。
+    overrides: Box<[BookPageMatch]>,
 }
 
 /// 本の関係一式。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookRelations {
-    /// 起点の本のページ順に並んだ item_key。帯の添字と一致する。いま見ているページが帯の
-    /// どこなのかは、これを引いて決める。
-    pub origin_page_keys: Vec<String>,
+    /// Every hit borrows this one origin strip instead of copying its baseline pages.
+    pub origin: Arc<BookOrigin>,
     pub hits: Vec<BookRelationHit>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BookStripPage<'a> {
+    origin: &'a BookOriginPage,
+    matched: Option<&'a BookPageMatch>,
+}
+
+impl BookStripPage<'_> {
+    pub(crate) fn state(self) -> BookPageState {
+        self.matched.map_or_else(
+            || self.origin.baseline.state(),
+            |matched| matched.state.state(),
+        )
+    }
+}
+
+impl<'a> BookStripPage<'a> {
+    pub(crate) fn match_override(self) -> Option<&'a BookPageMatch> {
+        self.matched
+    }
+}
+
+/// Borrowed dense projection of one sparse relation strip.
+#[derive(Clone, Copy)]
+pub(crate) struct BookStripView<'a> {
+    origin: &'a BookOrigin,
+    hit: &'a BookRelationHit,
+}
+
+impl<'a> BookStripView<'a> {
+    pub(crate) fn new(origin: &'a BookOrigin, hit: &'a BookRelationHit) -> Self {
+        Self { origin, hit }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.origin.pages.len()
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.origin.pages.is_empty()
+    }
+
+    pub(crate) fn get(self, slot: usize) -> Option<BookStripPage<'a>> {
+        let origin = self.origin.pages.get(slot)?;
+        let matched = self
+            .hit
+            .overrides
+            .binary_search_by_key(&slot, |entry| entry.origin_slot)
+            .ok()
+            .and_then(|index| self.hit.overrides.get(index));
+        Some(BookStripPage { origin, matched })
+    }
+
+    pub(crate) fn baseline_state(self, slot: usize) -> Option<BookPageState> {
+        self.origin
+            .pages
+            .get(slot)
+            .map(|page| page.baseline.state())
+    }
+
+    pub(crate) fn overrides(self) -> &'a [BookPageMatch] {
+        &self.hit.overrides
+    }
+
+    pub(crate) fn first_target(self) -> Option<&'a BookPageMatch> {
+        self.hit
+            .overrides
+            .iter()
+            .find(|entry| entry.other_target.is_some())
+    }
+}
+
+impl BookRelationHit {
+    pub(crate) fn new(
+        other_container_key: String,
+        other_page_count: u32,
+        pair: dupe::book::BookPair,
+        mut overrides: Vec<BookPageMatch>,
+        origin_len: usize,
+    ) -> Result<Self, String> {
+        overrides.sort_by_key(|entry| entry.origin_slot);
+        let mut previous = None;
+        for entry in &overrides {
+            if entry.origin_slot >= origin_len {
+                return Err(format!(
+                    "book strip override {} is outside origin length {origin_len}",
+                    entry.origin_slot
+                ));
+            }
+            if previous == Some(entry.origin_slot) {
+                return Err(format!(
+                    "book strip contains duplicate override {}",
+                    entry.origin_slot
+                ));
+            }
+            previous = Some(entry.origin_slot);
+        }
+        Ok(Self {
+            other_container_key,
+            other_page_count,
+            pair,
+            overrides: overrides.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn overrides(&self) -> &[BookPageMatch] {
+        &self.overrides
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1535,6 +1688,7 @@ fn query_book_ready_inner(
         Ok(matches) => matches,
         Err(error) => return BookQuery::Failed(error),
     };
+    let origin = Arc::new(build_book_origin(&origin_pages, &matches));
 
     // 候補の本は、よくあるページ由来の一致からは作らない。表紙や白ページで全ての本が
     // 互いに候補になるのを防ぐ。
@@ -1630,25 +1784,24 @@ fn query_book_ready_inner(
 
         match dupe::book::classify_pair(&corpus.pages, params, BOOK_ORIGIN, BOOK_CANDIDATE) {
             Ok(pair) => {
-                let strip = build_page_strip(&origin_pages, pages, &matches, &pair);
-                hits.push(BookRelationHit {
-                    other_container_key: candidate_key,
-                    other_page_count: pages.len() as u32,
+                let overrides = build_page_strip_overrides(&origin_pages, pages, &pair);
+                let hit = match BookRelationHit::new(
+                    candidate_key,
+                    pages.len() as u32,
                     pair,
-                    pages: strip,
-                })
+                    overrides,
+                    origin.pages.len(),
+                ) {
+                    Ok(hit) => hit,
+                    Err(error) => return BookQuery::Failed(error),
+                };
+                hits.push(hit)
             }
             Err(error) => return BookQuery::Failed(error.to_string()),
         }
     }
     hits.sort_by(|left, right| left.other_container_key.cmp(&right.other_container_key));
-    BookQuery::Ready(BookRelations {
-        origin_page_keys: origin_pages
-            .iter()
-            .map(|row| row.item.item_key.clone())
-            .collect(),
-        hits,
-    })
+    BookQuery::Ready(BookRelations { origin, hits })
 }
 
 const BOOK_ORIGIN: u32 = 1;
@@ -1724,15 +1877,42 @@ impl<'a> BookCorpusBuilder<'a> {
     }
 }
 
-/// 起点の本のページ帯を組む。
+fn build_book_origin(
+    origin_pages: &[crate::similar_db::SearchRow],
+    origin_matches: &BookMatchSet,
+) -> BookOrigin {
+    BookOrigin {
+        pages: origin_pages
+            .iter()
+            .enumerate()
+            .map(|(slot, row)| {
+                let excluded = row.item.quality < BOOK_MIN_QUALITY
+                    || origin_matches
+                        .pages
+                        .get(slot)
+                        .is_some_and(|page| page.origin_is_common);
+                BookOriginPage {
+                    item_key: row.item.item_key.clone(),
+                    baseline: if excluded {
+                        BookPageBaseline::Excluded
+                    } else {
+                        BookPageBaseline::Unmatched
+                    },
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }
+}
+
+/// 起点の本のページ帯に重ねる sparse match を組む。
 ///
 /// 対応が取れたページは `alignment` に (起点ページ, 相手ページ) として並ぶ。距離は
 /// `alignment` に載っていないので、両方の署名から測り直して「ほぼ同一」と「別バージョン」を
 /// 分ける。単体画像の帯 (§9.5) と同じ切り方にして、2 か所で違う基準を持たない。
-fn build_page_strip(
+fn build_page_strip_overrides(
     origin_pages: &[crate::similar_db::SearchRow],
     candidate_pages: &[crate::similar_db::SearchRow],
-    origin_matches: &BookMatchSet,
     pair: &dupe::book::BookPair,
 ) -> Vec<BookPageMatch> {
     let by_origin_page = origin_pages
@@ -1745,32 +1925,9 @@ fn build_page_strip(
         .filter_map(|row| row.item.page_index.map(|page| (page, row)))
         .collect::<HashMap<_, _>>();
 
-    let mut strip = origin_pages
-        .iter()
-        .enumerate()
-        .map(|(slot, row)| {
-            let excluded = row.item.quality < BOOK_MIN_QUALITY
-                || origin_matches
-                    .pages
-                    .get(slot)
-                    .is_some_and(|page| page.origin_is_common);
-            BookPageMatch {
-                state: if excluded {
-                    BookPageState::Excluded
-                } else {
-                    BookPageState::Unmatched
-                },
-                other_page_index: None,
-                other_target: None,
-                other_item_key: None,
-                other_mtime: 0,
-                other_file_size: 0,
-            }
-        })
-        .collect::<Vec<_>>();
-
     // 同じ本のページはコンテナが同じなので、移動先の解決は本の中で 1 度で足りる。
     let mut resolved_targets: HashMap<u64, Option<SimilarItemTarget>> = HashMap::new();
+    let mut overrides = Vec::with_capacity(pair.alignment.len());
     for &(origin_page, other_page) in &pair.alignment {
         let Some(&slot) = by_origin_page.get(&origin_page) else {
             continue;
@@ -1783,19 +1940,20 @@ fn build_page_strip(
             .entry(other.item_id)
             .or_insert_with(|| resolved_target_for_item(&other.item))
             .clone();
-        strip[slot] = BookPageMatch {
+        overrides.push(BookPageMatch {
+            origin_slot: slot,
             state: match match_band(distance) {
-                Some(MatchBand::NearlyIdentical) => BookPageState::Strong,
-                _ => BookPageState::Weak,
+                Some(MatchBand::NearlyIdentical) => BookPageMatchState::Strong,
+                _ => BookPageMatchState::Weak,
             },
-            other_page_index: Some(other_page),
+            other_page_index: other_page,
             other_target: target,
-            other_item_key: Some(other.item.item_key.clone()),
+            other_item_key: other.item.item_key.clone(),
             other_mtime: other.item.mtime,
             other_file_size: other.item.file_size,
-        };
+        });
     }
-    strip
+    overrides
 }
 
 /// 1 ページぶんの一致。`origin_is_common` は「相手の本が多すぎて候補作りに使えない」印。
@@ -5149,6 +5307,96 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct DenseBookStripPage {
+        state: BookPageState,
+        other_page_index: Option<u32>,
+        other_target: Option<SimilarItemTarget>,
+        other_item_key: Option<String>,
+        other_mtime: i64,
+        other_file_size: i64,
+    }
+
+    fn dense_book_strip_oracle(
+        origin_pages: &[crate::similar_db::SearchRow],
+        candidate_pages: &[crate::similar_db::SearchRow],
+        origin_matches: &BookMatchSet,
+        pair: &dupe::book::BookPair,
+    ) -> Vec<DenseBookStripPage> {
+        let by_origin_page = origin_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, row)| row.item.page_index.map(|page| (page, slot)))
+            .collect::<HashMap<_, _>>();
+        let candidate_by_page = candidate_pages
+            .iter()
+            .filter_map(|row| row.item.page_index.map(|page| (page, row)))
+            .collect::<HashMap<_, _>>();
+        let mut strip = origin_pages
+            .iter()
+            .enumerate()
+            .map(|(slot, row)| DenseBookStripPage {
+                state: if row.item.quality < BOOK_MIN_QUALITY
+                    || origin_matches
+                        .pages
+                        .get(slot)
+                        .is_some_and(|page| page.origin_is_common)
+                {
+                    BookPageState::Excluded
+                } else {
+                    BookPageState::Unmatched
+                },
+                other_page_index: None,
+                other_target: None,
+                other_item_key: None,
+                other_mtime: 0,
+                other_file_size: 0,
+            })
+            .collect::<Vec<_>>();
+        for &(origin_page, other_page) in &pair.alignment {
+            let Some(&slot) = by_origin_page.get(&origin_page) else {
+                continue;
+            };
+            let Some(other) = candidate_by_page.get(&other_page) else {
+                continue;
+            };
+            let distance = hamming256(&origin_pages[slot].item.pdq256, &other.item.pdq256);
+            strip[slot] = DenseBookStripPage {
+                state: match match_band(distance) {
+                    Some(MatchBand::NearlyIdentical) => BookPageState::Strong,
+                    _ => BookPageState::Weak,
+                },
+                other_page_index: Some(other_page),
+                other_target: resolved_target_for_item(&other.item),
+                other_item_key: Some(other.item.item_key.clone()),
+                other_mtime: other.item.mtime,
+                other_file_size: other.item.file_size,
+            };
+        }
+        strip
+    }
+
+    fn materialize_sparse_book_strip(
+        relations: &BookRelations,
+        hit: &BookRelationHit,
+    ) -> Vec<DenseBookStripPage> {
+        let strip = BookStripView::new(&relations.origin, hit);
+        (0..strip.len())
+            .map(|slot| {
+                let page = strip.get(slot).expect("slot belongs to the origin");
+                let matched = page.match_override();
+                DenseBookStripPage {
+                    state: page.state(),
+                    other_page_index: matched.map(|matched| matched.other_page_index),
+                    other_target: matched.and_then(|matched| matched.other_target.clone()),
+                    other_item_key: matched.map(|matched| matched.other_item_key.clone()),
+                    other_mtime: matched.map_or(0, |matched| matched.other_mtime),
+                    other_file_size: matched.map_or(0, |matched| matched.other_file_size),
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn book_query_calls_dupe_book_with_measured_product_params() {
         let db = SimilarDb::open_in_memory().unwrap();
@@ -5165,6 +5413,35 @@ mod tests {
             applied_seq: base.applied_seq,
         });
 
+        let origin_pages = db
+            .load_book_pages("book-a", current_hash_version())
+            .unwrap();
+        let candidate_pages = db
+            .load_book_pages("book-b", current_hash_version())
+            .unwrap();
+        let origin_matches =
+            collect_book_page_matches(&db, &snapshot, &origin_pages, current_hash_version())
+                .unwrap();
+        let mut corpus = BookCorpusBuilder::new("book-a", "book-b");
+        corpus.add_book(BOOK_ORIGIN, &origin_pages);
+        corpus.add_book(BOOK_CANDIDATE, &candidate_pages);
+        corpus.add_context(&origin_matches);
+        let pair = dupe::book::classify_pair(
+            &corpus.pages,
+            dupe::book::Params {
+                radius: BOOK_RADIUS,
+                max_books_per_page: BOOK_MAX_BOOKS_PER_PAGE,
+                min_quality: BOOK_MIN_QUALITY,
+                coverage_threshold: BOOK_COVERAGE,
+                min_matched_pages: BOOK_MIN_MATCHED_PAGES,
+            },
+            BOOK_ORIGIN,
+            BOOK_CANDIDATE,
+        )
+        .unwrap();
+        let dense_oracle =
+            dense_book_strip_oracle(&origin_pages, &candidate_pages, &origin_matches, &pair);
+
         let BookQuery::Ready(relations) = query_book_ready(&db, &snapshot, "book-a") else {
             panic!("expected a book result");
         };
@@ -5174,11 +5451,75 @@ mod tests {
         assert_eq!(relations.hits[0].pair.matched, BOOK_MIN_MATCHED_PAGES);
         // 帯の添字と本のページ順が一致していること。ここがずれると、いま見ているページを
         // 帯の別の場所に指してしまう。
+        let strip = BookStripView::new(&relations.origin, &relations.hits[0]);
+        assert_eq!(relations.origin.pages.len(), strip.len());
+        assert_eq!(relations.origin.pages[0].item_key, "book-a/0");
+        assert_eq!(relations.hits[0].overrides().len(), 3);
+        assert!((0..strip.len()).all(|slot| {
+            strip
+                .get(slot)
+                .is_some_and(|page| page.state() == BookPageState::Strong)
+        }));
         assert_eq!(
-            relations.origin_page_keys.len(),
-            relations.hits[0].pages.len()
+            materialize_sparse_book_strip(&relations, &relations.hits[0]),
+            dense_oracle
         );
-        assert_eq!(relations.origin_page_keys[0], "book-a/0");
+    }
+
+    #[test]
+    fn book_relation_hit_rejects_duplicate_and_out_of_range_overrides() {
+        let pair = dupe::book::BookPair {
+            a: BOOK_ORIGIN,
+            b: BOOK_CANDIDATE,
+            matched: 0,
+            distinctive_a: 1,
+            distinctive_b: 1,
+            coverage_a: 0.0,
+            coverage_b: 0.0,
+            relation: dupe::book::Relation::Unrelated,
+            alignment: Vec::new(),
+        };
+        let matched = |origin_slot| BookPageMatch {
+            origin_slot,
+            state: BookPageMatchState::Strong,
+            other_page_index: 0,
+            other_target: None,
+            other_item_key: "other/0".to_owned(),
+            other_mtime: 0,
+            other_file_size: 0,
+        };
+        let sorted = BookRelationHit::new(
+            "other".to_owned(),
+            1,
+            pair.clone(),
+            vec![matched(2), matched(0)],
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            sorted
+                .overrides()
+                .iter()
+                .map(|page| page.origin_slot)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(
+            BookRelationHit::new(
+                "other".to_owned(),
+                1,
+                pair.clone(),
+                vec![matched(0), matched(0)],
+                1,
+            )
+            .unwrap_err()
+            .contains("duplicate")
+        );
+        assert!(
+            BookRelationHit::new("other".to_owned(), 1, pair, vec![matched(1)], 1)
+                .unwrap_err()
+                .contains("outside")
+        );
     }
 
     /// 本の関係はページではなく本で引く。同じ本のどのページからでも同じ照会になり、
