@@ -5,7 +5,7 @@
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9で保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60eで保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -328,6 +328,17 @@ wrap clear途中で取消されても、次queryで未消去の古いmarkと世�
 未完成indexは公開せず破棄し、同baseの完成postingsは保持する。別baseなら旧cacheをbuild右辺評価前にdropする。
 旧delta/新delta、counts/cursors、marks、他ownerの旧base Arc、新snapshotをpeakへ含める。
 row indexとposting offsetの範囲はcheckedで扱う。この境界監査は製品kernelの実装・測定完了を意味しない。
+具体型は新similar_book_mih.rsのworker-local BookMihRuntimeとする。base/derivedの2Option案は、
+derived-only不正状態を許すため撤回し、MihCacheState::{Empty,BaseOnly,Ready{base,derived}}へ統合した。
+Ready生成口はprivate、base.arrayとderived.snapshot.baseのArc identityを確認する。
+prepareは旧stateをmem::replaceで取り出し、旧derivedをdrop→同baseならBaseOnly保持／別baseなら旧baseもdrop→build。
+delta構築成功後だけReadyとし、取消時は完成baseがあればBaseOnly、base未完成ならEmptyへ戻す。
+MihHitはitem_id/revision/distance、visitorは用途Stopとerrorを返せ、query完走/Stop/Cancel/Visitor/Invariantを区別する。
+この具体案は親・独立coreが着手前に承認した。Solが新moduleとlib宣言を専有編集し、R4の既存lib差分は保持する。
+後続snapshot選択の入口はcached_snapshot_candidateとpreferred_baseのworker専用APIとする。
+Ready候補はArc clone、BaseOnly候補は同Arc<BaseArray>＋empty delta＋zero mask(len.div_ceil(64)個のu64)＋base.applied_seq。
+Readyだけ候補にする案は、private BaseOnlyしか残らない取消後に有効候補がなく、全base再構築で完成MIHを再利用できないため訂正した。
+候補生成物は要求ローカルで、PDQ/postingsを複製せず、callerに別の巨大cacheを増やさない。
 ## common と候補集合
 
 common は半径32内の **有効な異なる9冊**を同 TX で確認した場合だけ成立する。起点自身の冊数も含む。
@@ -379,6 +390,16 @@ entryが24〜32bytesの場合の両者合計48〜64MBは設計上の概算であ
 pair-levelの追加反例はA=X×9999,Y、B=Y,X×9999、dist(X,Y)>32（quality等の適格条件を満たす）。
 対角shortcutを使えず約1億辺がある一方、最大9999一致の解は(i,i+1), i=0..9998に一意である。
 巨大な旧二乗oracleを実行せず、一般dense経路の厳密期待値・時間・memoryを検証できる。
+### classifier入口の最小分離（source監査済み・具体実装は後続）
+
+独立coreはdupe/book.rsを再照合し、既存公開classify_pair/analyzeと旧Fenwickをoracleとして維持できると確認した。
+新product用crate内入口は2冊の全page、同TXのcommon flags、a行単位の再列挙closureを受ける。
+入力検証・除外後BookStats集計とBookPairのcoverage/relation/Undecidable確定を既存側と共有する。
+distinctiveはquality適格かつnoncommonな各ページ数であり、同署名memoを使っても反復ページの多重度を畳まない。
+再列挙closureはFnMut(a_index,visitor(b_index,distance))->Result相当、DB/MIH所有をproduct callerへ閉じる。
+classifierは1a行だけsort/dedup最小距離を持ち、B集合発見・forward・checkpoint replayへ同じ入口を使う。
+新経路からBookMatchSet.matched/BookCorpusBuilder.pages/PreparedCorpus.near_pairs/全candidates・predecessorの全E保持連鎖を外す。
+旧全E経路は小規模oracleとして残せる。これはAPI境界の監査で、checkpointの実装・実測を完了したものではない。
 ### 多候補の結果容量とページ帯consumer
 
 独立UI監査で、全Eを除去しても現BookRelationHit.pagesの候補数C×起点全長Nが残ることを確認した。
@@ -406,6 +427,18 @@ N=5,W=3,slot1で所属が変わる反例がある。[移動]はorigin順の最�
 
 これは容量/consumerの設計監査であり、分類器全体のpeak・最終UI性能を達成した証明ではない。
 O(C)のlabel/行処理も残るので、多hitの実UI計測と合わせて採用判断する。
+### 疎な帯の具体型案（独立UI source監査済み）
+
+BookRelationsだけがArc<BookOrigin>を保持し、BookOrigin.pagesはkeyとBaseline::{Excluded,Unmatched}の全長Box sliceを持つ。
+hitはorigin_slot順のBox<[BookPageMatch]>をoverridesとして保持する。構築境界でslot順・一意・範囲内を保証する。
+一致descriptorはStrong/Weak、対応page/key/mtime/sizeを持ち、実targetだけは解決失敗を表すOptionを維持する。
+各hitに同じArcを重ねず、短命BookStripView{origin,hit}で全長len/is_empty、getの借用projection、overrides、first_targetを提供する。
+空のheavy BookPageMatchを全Nに作らず、仮想Index参照も要求しない。現在の添字consumerはgetへ移行する。
+基底列集計はdraw_book_relationsの1pass×列数で共有し、最初の可視stripで生成する。永続App cacheを増やさない。
+全長表示/区画/▼/hoverはview.len()で換算し、first_targetはorigin順を維持する。
+UI snapshotの先頭4ページの基底矛盾を共通originへ直す。dense oracleはtest内だけに残し、strip列・移動fixtureと比較する。
+workspaceのcrates/tools/testsにこの公開型の外部consumerは見つからず、field互換のための重複全長Vecは不要と判断した。
+これは後続実装の具体案であり、Solの着手前照合と実装後レビューを省略しない。
 ## 正確性 oracle と採用前の確認
 
 旧256 hit打切り照会や、候補列を `zip` するだけの比較は oracle にしない。

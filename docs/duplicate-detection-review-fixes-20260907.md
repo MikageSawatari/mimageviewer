@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b。狭域/既存DB・array回帰/製品check/独立レビュー成功。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60eで単独回帰・独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1730,3 +1730,33 @@ cloneの各取消箇所を独立に実証するmutation testではなく、そ�
 
 通常hook付きgit commit --onlyで当該2filesだけ保存し、前後のsource生bytesとR2 staged patch100651bytes/3adba6c9...f42aを照合して不変を確認した。
 製品caller切替、MIH、common/分類/alignment/帯、最終全体gateとportable更新は未完了。既存R4 portableと実機返答待ちを維持する。
+
+### R1/R5 MIH kernelの先行区切り（本照会への統合・採用測定は未完了）
+
+focused commit: 2ffe3b60ec7cfb399021f9a2918ead0d9da27aa9。新src/similar_book_mih.rsとlib mod宣言1行、996追加。
+単一workerのEmpty/BaseOnly/Ready cacheがbase/delta row-index postingsと借用元snapshotを所有する。
+16bit×16の392bucketを列挙し、row重複除去後に256bit距離を確認してvisitorへ逐次返す。全candidate/hit VecやPDQ配列コピーを要求しない。
+品質0更新・削除もbase maskへ反映し、deltaは最終Liveかつquality>0だけを扱う。
+同一BaseArray Arcの完成postingsを再利用し、別Arcなら旧derived/base/scratchを明示dropしてから新buildへ進む。
+Ready構築口はprivateでbase Arc一致を検査する。取消時は未完成だけ破棄し、完成baseがあればBaseOnlyを保持する。
+BaseOnlyも基底seqの軽量snapshot候補を返せるため、private baseだけ残る取消後にも次の配列選択へ引き渡せる。
+store/shutdownは明示clear、origin/scopeは完成cacheを保持する。実runtimeの通知接続は後続。
+
+独立coreレビューで、約100万cursor変換の取消、Arc所有数fixture、wrap後の世代1と衝突するmarks、
+全16blockの救済枝を単独で通る半径32の固定例を補強した。距離33を含む小さいbrute-forceと比較する。
+wrap clear途中取消では次世代発行を遅らせ、次queryでclearをやり直して全hitを復元する。
+BaseOnly候補の回帰は同base Arcとpostings pointer再利用、基底時点の全hit[1]を確認するものであり、DB差分追随との統合検証とは区別する。
+
+初回cargo test --lib similar_book_mih --no-runはtool出力のみ、1分36秒/exit0。失敗試行はなかった。
+最終target/r1-mih-kernel-tests1.logは10成功/0失敗/0ignored、compile57.71秒、test0.10秒。
+product check1は31.50秒/exit0、fmt-check1は空log/exit0、diff-check成功。独立coreは下記最終source SHAを承認した。
+
+- module生bytes SHA256=f54c91686c9f34d9eebde783a559541fdba6dac9c834a499c967ac1535511068。
+- working lib生bytes SHA256=23e099c68c783544414116c03da2a74d013d981667147060e0a56ecae0b5ec46。
+- tests log SHA256=62998beba15540cb9d7a3a496f7bd95ad2bd0f3aaed811f076f687290280bcc0。
+- check log SHA256=4b8eba3d1a885c89939d47820e12919742cde596f81de93d9acade99e8bd9b6d。
+
+一時GIT_INDEX_FILEへ新moduleとHEAD libのmod1行だけを構成し、通常hook付きcommit後にその2entryだけreal indexへ同期した。
+module/lib生bytesとR2 staged patch100651bytes/3adba6c9...f42aは前後不変。正本target/r1-mih-kernel-commit-20260908/manifest.json。
+実common/候補集合/分類とalignment/疎な帯、同TX runtime/caller、実データの時間・peak RAM・最終gate・portable更新は未完了。
+次classifier入口と帯consumerの最小型案は独立source監査済み、book-query-review-fixesへ記録した。R4 portableと実機返答待ちは維持する。
