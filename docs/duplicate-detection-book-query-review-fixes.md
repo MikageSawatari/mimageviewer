@@ -1,0 +1,227 @@
+# 本照会 R1 / R5 / R6 の実装引き継ぎ
+
+2026-09-08。親 Astra / high が設計・進行、Sol / xhigh が実装・テスト、独立 Astra / high がレビューする。
+本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
+撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
+R4 の全体テスト・portable 作成と更新照合が完了したため、独立owner/executorの第1区切りを実装中。
+既存query callerとDB/検索計算はまだ切り替えていない。
+
+## 修正対象と維持する性質
+
+- R1: PDQ 半径32の一致は推移的でない。候補側の common 調査を省くと、判定不能な本を「同じ」と過大評価する。
+- R5: 256ページの hit 上限は、8冊を超える common の証拠にならない。
+- R6: 配列・SQLite・ページ順を異なる時点から組み合わせない。
+- 単体画像の検索と cache は維持し、本照会だけを変更する。表示機能の削除、ページ間引き、hit 打切りは行わない。
+- 利用者は音声途切れの解消を確認済み。高負荷の全走査を単純に復活させない。既存の低優先度実行を維持する。
+- 通常設定と既存 portable の DB・配列を再生成・初期化しない。実データ計測は read-only または一貫した検証用 backup を使う。
+- §9.2 の横断一覧、master への逆統合、push は今回の範囲外。
+
+## 実装の区切りと責任
+
+1. viewer client と公平な実行所有: `SimilarPanelState` → `App::query_similar_book` → manager / worker。
+2. 一つの read transaction で完結する DB reader と配列追随。
+3. worker が所有する厳密半径検索 MIH。
+4. common / 候補発見 / 分類と alignment / ページ帯、および oracle・負荷検証。
+
+各区切りで主要前提を既存コードと照合し、独立レビューと狭域回帰を入れる。
+新 worker が取消・終了まで接続される前に製品の呼出先を切り替えない。
+DB は commit 結果を値で返し、scheduler が通知する。DB から query owner へ依存させない。
+worker から manager への強参照循環や、Connection と Transaction の自己参照構造を作らない。
+同じファイルは Sol だけが編集し、親は設計文書を担当する。
+
+## 公平な要求所有
+
+- global の実行 worker は1件。既存の viewer bundle 内 `SimilarPanelState` が `BookQueryClient` を所有する。
+- client ごとに要求ID、desired / requested / completed、取消、完成結果、最新待機1件を所有する。
+  完成済みの同一要求を毎 frame 再投入しない。同一本を要求する2窓も別 client。
+- 待機は FIFO / round-robin。同一要求の poll は順番を変えず、soft refresh の最初の投入は列末尾。
+  既存の待機 refresh があれば最新1件へその場で集約し、連続更新で順番を毎回移動させない。
+- client の origin 変更・撤回・drop はその client だけを取消す。park / raw swap は client を失効させない。
+- 完了・失敗・取消の終了回収後は、UI polling を待たず次 client を実行する。
+- `query_book(client, container_key)` 相当へ接続する。公開 API の引数になる client は opaque な公開型にできることを確認する。
+- `current_item == None` / NotBook の早期 return でも当該 client の要求を撤回する。
+- 起点は本の key。Item 用 `begin_origin` のページ key 変更を、そのまま本照会の取消キーにしない。
+- 既存 `last_ready` は ItemQuery 用。本の直前結果が既に保持されているという前提を置かない。
+
+scope / store / shutdown と要求 origin の変更は hard invalidation。
+同一 store の配列更新・compaction は soft stale とし、整合した実行中 TX の結果を一度公開し、refresh を集約する。
+同じ hard identity の旧 Ready は refresh の待機・実行中にも取得できるよう保持する。
+`requested` は実行中 ID を維持し、soft 更新は wanted と待機だけを更新する。完了採用は実行 ID と
+hard identity の一致で判断し、wanted ID 一致を要求して実行結果を捨てない。
+A実行＋B待機中の連続soft更新では、Aの結果を採用した後、UIpollを待たずB→A refreshへ進む。
+hard origin/scope/store更新はReadyを即退役し、A→B→Aでも旧完了が復活しない要求世代を使う。
+現 `BookQueryState::Idle` 代入を一律置換せず、`configure`、scope、run 終端、配列公開の意味で分類する。
+第1区切りの接続では現 `Arc<Mutex<BookQueryState>>` を置き換える。次を明示してから切り替える。
+
+- 現 scheduler shutdown は index cancel だけなので、manager Drop から新 book owner の停止・wake・終了回収を接続する。
+  Drop は signal/cancel/wake までとし、UIで join・DB待ちをしない。worker側の停止と資源解放を回帰で観測する。
+- `retain_loaded_snapshot_during_run` は roots configure による hard、`publish_snapshot_if_current` と
+  run の正常終端は soft。`start_memory_load` の Ready / Missing / Failed 公開も待機 worker を起こす。
+- `SimilarPanelState` は true close でも drop されない。実 close で当該 client を明示撤回し、
+  bundle park / raw swap では保持する。client Drop だけを close の取消条件にしない。
+- park でも使う `invalidate_similar_preview` へ本照会の取消を混ぜない。
+- scheduler は現 state lock 中に旧 owner へ到達する。新 owner の lock から scheduler / memory / DB を
+  取りに戻らず、通知・dispatch は guard 解放後に行う。
+
+先に opaque client・公平 owner・executor の終了/取消を回帰で確認し、次に manager / scheduler 通知と
+viewer 撤回を一緒に接続する。旧分類器を一時的に executor へ移す段階は R1/R5/R6 の判定修正完了とは扱わない。
+先行 module は `src/similar_book_query.rs` を想定し、独立レビューで次の境界を合意した。
+
+- client は移譲可能・非Clone。初回登録のWeakとexecutor identityを照合し、別managerへの投入で旧登録を残さない。
+- 実行権は global `Running(client_id, request_id, cancel)` だけを正本とし、client側はそのidentityを参照する。
+- Condvarはlock下で状態述語を再確認するloop。未起動・常駐idle・job実行を区別し、lazy spawn失敗もterminal化する。
+- 受付/停止はworker lifecycle enumから導き、shutdown boolを重ねない。clientの未投入/待機/実行ID参照も
+  単一phaseへまとめ、未bind/登録済みは一つのbinding enumとする。completedはrefreshと共存する独立結果cache。
+- refresh世代はownerが通知受付時に単調発行する。外部DB/配列連番をIDとして渡さず、遅延通知で
+  global世代や新規clientのdesiredが後退しない。DB/TX/配列の世代選択はruntimeの別契約とする。
+- shutdownは受付拒否・待機退役・実行取消・wakeを行い、job終了後にworker-local資源をdropする。
+- reader/MIHを将来のworker-local runtimeへ置けるAPIとし、client/待機jobに巨大snapshotやmanager強参照を捕捉しない。
+
+純mock段階で公平性・supersede・withdraw/drop・失敗後dispatch・shutdown回収を検証する。
+旧query計算にはまだ取消点がないため、通知・viewer lifecycle・取消可能な実計算を揃えた後を製品caller切替の完成境界とする。
+
+### 未ロード時の受付と実storeの識別
+
+草稿でOriginへraw store_idを必須にすると、現Unloaded/LoadingでPreparingを返す受付と衝突する。
+親・独立coreはclient要求を本key、requestのhard identityをowner内部のopaque環境世代へ分ける方針を承認した。
+第1区切りへraw DB型を入れず、初期ロード中もdesired/FIFOを保持する。memory Ready/Missing/Failedの通知で
+再開または終端化するadapterは第2区切りで接続する。UIでDBを開いたり、ゼロstore IDを未確定sentinelにしない。
+
+実store IDはruntimeが同TXで観測し、未確定/確定は型で表す。
+配列のstore不一致はsnapshot候補の棄却と同TX memory-only fallbackであり、既知の実DB store変更と区別する。
+shared base X・DB Yの反例では、Yを実storeとして確定後に旧base Xを見るたびhard世代を進めてはならない。
+それを行うとYの要求を永久に取消す。実DB storeの変更時だけhard失効し、配列選択はruntimeの整合条件で処理する。
+## 同一 SQLite read transaction
+
+専用の read-only 接続を worker local に持つ。schema 更新を行う `SimilarDb::open_at` は照会 reader に使わない。
+既存 SQL は private な `&Connection` helper へ共有し、旧 public wrapper の挙動を維持する。
+`BookReadSnapshot` は reader の transaction 期間だけを借用する。
+
+捕捉した配列・scope・要求から read TX を開始し、同 TX で store_id と変更連番を取得する。
+変更連番 `read_seq` は履歴 prune 後も残る `sqlite_sequence` を読み、履歴の `MAX(seq)` で代用しない。
+配列を同 TX の連番まで delta 追随してから、起点・候補・common・ページ帯をすべて同じ時点で解決する。
+対象の identity、revision、signature、quality、Complete 状態、hash version、scope、page-order version も混在させない。
+
+- store 不一致、履歴欠落、配列が TX より先なら、同 TX 内でメモリ上だけの compact base を作る。
+- 本照会から persistent `load_or_rebuild` / rebuild / prune を呼ばない。
+- `ItemChangeBatch` 自体に store_id はないため、別途 store を照合する。
+- ページ順修復は item_change を増やさない。`worker_loop` → `repair_page_order_if_stale` →
+  `renumber_container_pages` の commit 成功を `NoChange / Committed` 相当で通知する。
+- 修復対象 container が0でも order-version の commit があり得る。件数0を理由に通知を省略しない。
+- 同じ変更連番でも修復後の要求IDを更新し、起点・候補・common のページ順を同じ version へ揃える。
+
+### ページ順修復が失敗・未完了の場合
+
+実装前の再照合で、現repairは失敗をlogして続行するため、旧versionを同TXで読むだけでは
+古いZIP順のalignment/ページ帯を正しくできないと判明した。親・独立coreは次のprivate正規化を承認した。
+
+- stored order versionが現行と異なる場合（旧/将来versionとも）、Complete ZIPだけを対象にする。
+- 同TXの全item_id/item_keyを取得し、既存renumberと同じprefix除去・compare_book_pagesで採番する。
+  hash/quality/index Noneを落とす前の全key集合を使い、その後に照会適格行へordinalを対応付ける。
+  旧hash行が間にある実index0,2を、filter後の0,1へ詰めない。
+- writer修復とreader private採番で全key SQL・純order helperを共有し、comparatorは引数で渡す。
+  DBからscheduler/UIへ依存させない。mapは必要な対象ZIPごとにTX内共有し、全corpusの文字列表を常駐化しない。
+- origin/candidateのVec自体をeffective ordinal順へ並べ直し、resolve_pages_by_item_id由来の辺にも
+  同じmapを適用する。alignmentだけ新順、origin_page_keys/stripや対応辺だけ旧順という混在を作らない。
+- DBのpage_index/version/item_changeを変更しない。現行versionはstored ordinal、PDF/physical順は従来どおり。
+  将来versionを永続的に下げず、実行中viewerの現行順だけをprivateに導く。
+- metadata読取失敗はquery Failedへ伝播する。恒久Preparing・旧順のReady・queryからの永続修復は行わない。
+
+ZIP移動先はitem keyのentry名、帯clickはother_targetを使うので、private ordinalで別entryへ移動しない。
+writer修復成功commitの通知（0containersを含む）は引き続き行い、失敗を成功通知へ変えない。
+修復前後の結果/strip一致、旧hashの穴、quality0、index Noneと正しいentryへの移動先を回帰で確認する。
+## worker 専有の MIH と世代選択
+
+PDQ 256bit を16bit×16に分割する。1 block は距離2以内（137 bucket）、残り15 block は距離1以内
+（各17 bucket）、計392 bucket を読む。どこにも入らない署名は距離が最低33なので半径32を漏らさない。
+最後に全256bitの距離を検証し、row を重複排除する。これは近似・sampling ではない。
+
+- `DerivedBookSearch` 相当が不変 `SearchSnapshot` と base / delta の row index postings を所有する。
+- PDQ record 全体を別コピーせず、base の共有 owner へ MIH の `OnceLock` 等を加えない。
+- quality>0 の base を索引化し、superseded mask は quality0・削除を含む全置換へ適用する。
+  delta は最終 Live かつ quality>0 だけを索引化する。
+- seen marks と scratch は worker 専有。待機 client・UI は snapshot や巨大配列を保持しない。
+- cache は派生検索1世代。旧 MIH を drop してから新世代を構築し、他機構が保持する base Arc も peak RAM に数える。
+- 同 store で `base_seq <= snapshot_seq <= TX_seq` の候補から `(base_seq, snapshot_seq)` 降順で選び、
+  tie は既存 MIH を再利用する。base の Arc identity も照合する。
+- private base0/snapshot200 と shared base100/snapshot180、TX201なら shared を選んで追随する。
+  未来の配列を巻き戻さない。履歴不足時に作った同 TX の memory base は再利用できる。
+- 取消された未完成 MIH は破棄。完成 base MIH は origin / scope 変更後にも再利用できるが、結果は再利用しない。
+  store 変更・shutdown は MIH も退役させる。
+- scope と本の有効性は同 TX の解決で検査し、postings 自体へ scope を焼き付けない。
+
+## common と候補集合
+
+common は半径32内の **有効な異なる9冊**を同 TX で確認した場合だけ成立する。起点自身の冊数も含む。
+起点と候補の全ページを対象にし、同署名の判定は TX 内で memo 化する。
+
+候補発見は既存の意味を保ち、**non-common な起点ページからの近傍辺が3本以上**の本を選ぶ。
+異なる起点ページが3枚という条件へ変えない。1起点×3候補、3起点×1候補の両方を残す。
+各起点で hit row を重複排除し、本ごとの辺数は発見段階のみ3で飽和できる。
+発見時には候補側 common で辺を落とさない。候補 common の確定後、従来の反復署名の多重度を扱う。
+alignment では厳密な辺を再列挙できるようにし、発見用の飽和を流用しない。
+
+## 密な alignment のメモリ境界
+
+以下は正当性を検討した設計候補で、製品実装・oracle 一致・処理時間と TX 寿命・採用は未検証である。
+
+旧 Fenwick の tie と A/B 向き、実 page index、距離、出力順を保つ。
+例: X 対 XXX は A0-B2、X 対 XXXX は A0-B0。最短対角を任意に選ぶ実装へ変えない。
+
+O(N) の対角 shortcut は、eligible な両列が同じ長さで、実 index が順序付き一意、各k番目同士が
+半径32以内の完全な順序付き全単射に限る。長さ違い・欠落があれば通常経路へ戻す。
+shortcut でも params・同一本・署名幅・実 index 重複の入力検査を省略せず、N=0、最低一致数、
+coverage、Strong / Weak の分類は既存の計算を共有する。
+
+密な通常経路は全 E 辺や全 parent を保持しない。A group ごとの Fenwick score / stable tail を
+block 境界で checkpoint し、必要な block を replay して復元する。
+global B 圧縮は実際に辺へ参加する B のみ。`(a,b,d)` 順、重複の最小距離、A group の全 query 後に
+B 昇順 update、従来 tie を保つ。A/B を転置しない。
+復元時の A は厳密に減るため、各 block の再生は高々1回とする。
+目標メモリは `O(ceil(N/K)M + KM + N + M + output)`、辺は概ね2回走査＋checkpoint copy
+（B集合発見は別）。呼出元で全 E の Vec を作ったままにしない。
+最大1万×1万の同一署名は1億の真の辺になるため、正確性を維持したまま実測する。
+
+### 独立レビューで補足したcheckpointの条件
+
+checkpointはglobal圧縮Bの全Fenwick cellを、A groupの開始前に保存する。
+cellはmatched・u64 distance_sum・stable tailを含み、tailはglobalの実(a,b)で識別する。
+replay内の一時Vec offsetをblock外へ残さない。Kはpage_indexの数値幅でなく行group数で切る。
+既存score比較はmatched最大→distance_sum最小だけで、tail IDを比較しない。完全同点を決める
+update順とqueryのcell訪問順を維持する。同TXの(a,b,d)整列・同(a,b)最小距離への一意化を
+決定的に再生成すればstable tailから前blockのnode/parentを復元できる。
+小さいoracleにX対XXX/XXXX、辺無しB座標を挟む圧縮、距離優先、K境界を跨ぐparentを含める。
+全E保持の除去はclassifierのcandidatesだけでなく、PreparedCorpus.near_pairsや各Aの全近傍memoにも適用する。
+
+1万×1万、K約100ならcheckpoint約100万cellとblock約100万parentになる。
+entryが24〜32bytesの場合の両者合計48〜64MBは設計上の概算であり、実layout・一時allocation・MIH/base・
+候補行と全hitのページ帯を含むpeak RAMの実測値ではない。
+
+同長の全同署名だけでは対角shortcutへ入り、一般dense経路の検証にならない。
+pair-levelの追加反例はA=X×9999,Y、B=Y,X×9999、dist(X,Y)>32（quality等の適格条件を満たす）。
+対角shortcutを使えず約1億辺がある一方、最大9999一致の解は(i,i+1), i=0..9998に一意である。
+巨大な旧二乗oracleを実行せず、一般dense経路の厳密期待値・時間・memoryを検証できる。
+## 正確性 oracle と採用前の確認
+
+旧256 hit打切り照会や、候補列を `zip` するだけの比較は oracle にしない。
+独立した brute-force の同 TX common / 全候補 key 集合と突き合わせ、relation / matched / distinctive /
+coverage / alignment / strip を起点・候補 key で対応付ける。
+
+実本の pair certificate は A/B の全ページ（quality0と実 index も含む）と、true common を示す
+各9冊の実 witness を含める。false common は corpus の部分集合で増えない。witness を再帰的に展開しない。
+通常・短い実本で旧分類器と全 field を照合し、密な例は小さい入力で exhaustive oracle を使う。
+最大1万ページの certificate を旧二乗計算へそのまま流さず、構造化した期待値・証明と性能計測を使う。
+
+必須の回帰・計測:
+
+- 非推移性32/32/64、2冊300ページ、quality0置換、削除・delta・境界32/33、全候補 key と全分類 field。
+- 同 TX 中の更新・第三本追加、OFF後prune待ち、配列遅延・履歴欠落・store違い、ページ順修復。
+- A/B交互poll・同一本2client・park中完了・別client drop・連続refresh・取消/失敗後の自動次dispatch。
+- cold / warm p50・p95、総CPU、**peak RAM**、base/delta/65535件compactionと他owner保持分。
+- 実400ページ、短い本、最大1万、no-hit、多hit、near-white、反復署名。既存400ページ/7候補の
+  元ケースが特定できれば同条件も測る。1.69秒は目標であり、未測定の合格値にしない。
+- 最終 `scripts/test-full.ps1` と関連検査後に portable を作成し、利用者に従来と同条件で音声途切れを確認してもらう。
+
+試作v2は単署名 kernel の厳密集合と限定計測まで成功している。本照会全体、世代整合、公平性、peak RAM、
+最大密度の alignment、音声を含む採用条件の成功とは扱わない。
+試作と検証用入力の証跡は `target/review-fixes-bench-20260908/`、現合意の根拠・訂正履歴は元の修正記録を参照する。

@@ -135,6 +135,7 @@
 
 - [duplicate-detection-handoff-review-20260907.md](duplicate-detection-handoff-review-20260907.md) — `duplicate-detection` の引き継ぎ監査。実装状況、独立レビュー指摘、検証証跡、Astra/Sol体制への移行と統合条件。
 - [duplicate-detection-review-fixes-20260907.md](duplicate-detection-review-fixes-20260907.md) — R1〜R9の修正計画。所有境界、実装前検証、独立レビュー、既存データを保持するportable検証。
+- [duplicate-detection-book-query-review-fixes.md](duplicate-detection-book-query-review-fixes.md) — 未実装の本照会R1/R5/R6に関する現合意の実装引き継ぎ。viewer別の要求、同一read transaction、厳密検索、密な対応付け、採用前の正確性・負荷検証。
 - [review-v2.8.1/README.md](review-v2.8.1/README.md) — v2.8.1 前の全体点検。領域別の
   docs↔コード整合監査の結果 (不一致 / リファクタ候補 / バグ) と、文書ごとの信頼度。
   **文書を現行仕様として読む前に、ここで該当文書の信頼度を確認すること。**

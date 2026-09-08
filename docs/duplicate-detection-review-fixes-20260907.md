@@ -25,7 +25,7 @@
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
-| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotもテスト・独立目視承認済み。依存統合と最終gate準備中 | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate・新portable・実機は未完了 |
+| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
 | R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
@@ -1422,3 +1422,161 @@ target/r4-check-ui-glyphs-final1.logはexit0、no dangerous glyphs。
 親もdiff-checkとR2 staged100651 bytes/既定SHA256一致を再確認した。
 source編集をfreezeし、文書3件だけをpathspec commit、全source/artifactをcheckpoint化してから
 同sourceの最終full gateとportable buildへ進む。R2/native sourceのcommitと実機確認は後続。
+
+### R4 最終検証用source checkpoint確定
+
+文書3件を通常hookでcommit: f67b0b61734dd415de8f7b3928bf68dc78bd0fa2。
+正本: target/r4-verification-source-20260908/manifest.json。
+23 source filesを改行/BOM/PNGの生bytesで保存し、vendorは生成targetを除く109filesを保存。
+87 artifactsを再hash照合し、凍結中sourceとのbytes一致も検証した。
+- source-files.zip: 2403218 bytes、SHA256=19db5db916510191895745bdd826c79aa86cc585a9d201f9d95297561e875cc8。
+- vendor-egui.zip: 455410 bytes、SHA256=dbfb4cc41d95a511efba5da93d7583dee85d54245392a989240c3066e03068e6。
+- unstaged.patch: 371632 bytes、SHA256=ba14dcd67d17aa79cd113bb0cee8719da0b862ff9edd084a39b24c5b499e9760。
+- staged R2: 従来100651 bytes/SHA256=3adba6c9c6768c1540f3d8f0791d1dfefdc322acb270ec90966d5bca2131f42aのまま。
+
+source freezeを維持し、同sourceへ最終test-fullを実行する。これは実行開始指示の記録であり、
+full gate成功やportable完成の記録ではない。R1/R5/R6の製品修正は次段階に残る。
+
+### R4 full gate初回の環境失敗とfixture追随漏れ
+
+最初のtarget/r4-test-full-final1.logはworkspace compile中、複数rustcが数MiBのメモリ確保に失敗。
+OOMに伴う0xc0000409やmetadata形式エラーを記録した。test assertionは開始前で、製品テスト失敗とは分類しない。
+プロセス終了を確認し、ソース不変でCARGO_BUILD_JOBS=1を指定して同scripts/test-full.ps1を再実行した。
+ビルド並列だけを変更し、テストの選択・並列実行や要求を弱めない。
+
+再実行target/r4-test-full-final2-j1.logはcompile通過後、libが7680成功/10失敗/38ignored、411.95秒。
+10件すべてがui_fullscreen.rsの「fullscreen navigator input tracking must run at begin-pass」panicだった。
+app/testsの別窓bookmark/フォルダ移動7件とui_fullscreenのtouch/right-drag3件で、独自Contextに製品の
+begin-pass hookを登録していない。親・独立coreは製品lib.rsの登録と実update→描画の経路を照合し、
+R4で追加した入力初期化契約へのfixture追随漏れと確定した。最初に疑った5秒scan timeoutではない。
+
+workspaceの残suiteは完走し、失敗targetはlibのみ。scriptは失敗伝播によりvendor後段へ進まなかった。
+対象fixtureへ製品同hookを最初のpass前に登録する。productionのexpect/fallback、既存assertion、
+待機期限、テスト選択は変えない。修正後は狭域10件→fmt→再freeze/checkpoint→全体gateを再実行する。
+最初のsource checkpointと両失敗logは保持し、合格記録へ上書きしない。
+### R4 fixture追随と最終検証checkpoint v2
+
+10件は各Context生成直後へ製品のinstall_fs_navigator_input_trackingを1行ずつ追加した。
+狭域10実行はそれぞれ1成功/0失敗（target/r4-fullgate-fixture-*.log）。fmt/fmt-check/diff-checkもexit0。
+親と独立coreが前checkpointの生bytesと比較し、app/tests.rsの7行・ui_fullscreen.rsの3行以外の
+source/vendorが不変、assertion/timeout不変、初pass前の同Context登録を確認して承認した。
+
+再freeze正本: target/r4-verification-source-20260908-v2/manifest.json。
+HEADはf67b0b61734dd415de8f7b3928bf68dc78bd0fa2、23 source/109 vendor/99 artifacts。
+source-files.zipは2403400 bytes、SHA256=07de0729cd07a81f4334510c00f14bf00edd3724d66276b19f578f8e14b3fbe6。
+親が99 artifactsを再hash確認した。R2 staged100651 bytes/既定SHA256も不変。
+初回checkpointと失敗ログを保持し、CARGO_BUILD_JOBS=1で同full gateのfinal3へ進む。
+この時点ではfull gateと新portableの成功はまだ記録していない。
+
+### R4 final3で再現した初回DB openの競合調査
+
+final3-j1はPowerShell内部pipelineが通常cargo stderrをNativeCommandErrorへ変換し2.5秒で停止した。
+製品assertion未実行のrunner失敗として保存し、source不変で外側redirectのfinal3b-j1へ切り替えた。
+
+target/r4-test-full-final3b-j1.logはlib7689成功/1失敗/38ignored、429.39秒。
+前回の10fixtureは通過。失敗は既存indexer_manager::tests::similar_only_favorite_uses_existing_supervisor_watcherで、
+初回reconciliationの最終状態がFailed("similar.db open failed: database is locked")だった。
+workspace後続は完走、vendor後段へは失敗伝播で進まなかった。
+
+configureはschedulerのdb_for_workerとstart_memory_loadを並行起動し、両者が初回同じSimilarDb::open_atへ入る。
+R9の同Arc所有はscan/purge/prefillまでで、この独立open競合は対象外だった。
+既存の並行open回帰は事前にWAL化済みで初回競合を覆わない。親・Sol・独立coreがこの経路を確認した。
+ただし現ログはopen全体の失敗でSQL段階は未特定。診断用のpath限定Barrier/stage記録で旧経路を観測してから
+修正する。SQLiteのWAL切替はbusy handlerを呼ばないREAD→WRITE昇格競合があり、timeout延長だけを修正にしない。
+CatalogDbに存在する変換時だけの直列化・再確認を参考に、SimilarDb初期化の所有境界を検討する。
+
+### 初回open診断の観測と修正境界の承認
+
+一時cfg(test) seamでunique fresh pathだけを対象に、Connection::open直後で8 openerをBarrierへ揃えた。
+target/r4-similar-db-first-open-probe1.logはcompile2m14s、0.03秒、1成功/0失敗。
+観測値は `concurrent fresh open failures=1 stages=[JournalMode]`。この成功は旧経路の失敗段階を特定したもので、
+製品修正が成功したという意味ではない。元の全体失敗ログ自体にはSQL段階が無いことも区別する。
+診断seam/testを完全撤去し、src/similar_db.rsの事前SHA256=
+4f2fb28e3aa2625387f78594914e0e54b0c4e0e4804c9e7eb043ddb12fd635c5へ戻ったことを親も確認した。
+
+親・独立coreはSimilarDb private helperで初回WAL変換を所有する方針を承認した。
+既WALなら変換せず、読取statementを解放してから変換用mutexを取り、mutex内で再確認して必要な変換だけを行う。
+schema初期化は既存IMMEDIATE・180秒待機・lock取得後version再確認を維持する。
+helperからscheduler/roots/DB ownerを取得せず、全open_at入口を覆う。Catalog側への変更やworker全体の再設計は不要。
+別プロセス等の競合後に再確認してもWALでなければエラーを保持する。UI待機・retry/sleep・テスト期限延長を導入しない。
+製品helperと新規同時open、既WAL＋writer、schema/移行回帰の実装・検証へ進む。
+
+### WAL修正の狭域結果と最終fixture
+
+製品helperを変更せず、次の各狭域で実対象1件成功/0失敗を確認した。
+
+| ログ（target/） | 対象 | 実行時間 |
+| --- | --- | --- |
+| r4-similar-db-wal-fresh1.log | 新規8 stores ×8 concurrent open | 0.17秒 |
+| r4-similar-db-wal-existing-writer1.log | 既WAL・IMMEDIATE writer保持中のopen | 0.01秒 |
+| r4-similar-db-wal-existing-many1.log | 既WALの多数open/write | 0.12秒 |
+| r4-similar-db-wal-v1-migration1.log | 既存v1署名・行・store保持 | 0.02秒 |
+| r4-similar-db-wal-timeout1.log | busy_timeout設定値のみ | 0.01秒 |
+| r4-similar-db-wal-v1-wait4.log | v1 WAL writer解放後の実移行と行・署名・store・seq保持 | 0.14秒 |
+| r4-similar-index-integration-after-wal1.log | 元のsupervisor watcher結合回帰 | 1.30秒 |
+
+fresh回帰は初回openを実行するが、SQLite内の特定interleavingを必ず強制するテストではない。
+旧コードのstage診断でJournalMode失敗を観測した証跡とは区別する。
+v1待機fixtureの開始通知はopen_at直前なので、100ms未完了だけでSQLite内部の待機到達を断定しない。
+writerを保持した状態で開始し、解放後に実移行とデータ保持を確認する。最終fixtureは早期観測を保存し、
+rollback→terminalのResult保存→join→assertionの順で、失敗時もworkerを回収する。
+
+v1-wait1はfixtureの型比較によるcompile error、wait2はfilter不一致で0件、wait3は1成功だがtimeout側cleanup前。
+これらを最終成功の代わりに使わず、修正後wait4の実1成功を正本とする。
+cargo check coreはr4-similar-db-wal-check1.log、14.30秒、exit0。
+package fmt・fmt-check・全diff-checkはexit0。最終similar_db.rsのSHA256=
+3719842f08992d7ae4d6049c266040722cccbccc93429ee4e73ef5adb1ae6653。
+R2 stagedのbytes/hashは不変。WALだけのfocused commitとsource checkpoint後に、全体gateを再実行する。
+
+### WAL focused commitと最終source checkpoint v3
+
+独立coreが最終helper/fixture/hash/7狭域/core checkを照合し、追加指摘なしで最終承認した。
+WALだけをcommit: 48610d4d476dc4a3029ac58e548cfd9bdc808ef2
+(`fix(similar): serialize initial WAL conversion`)。src/similar_db.rsのみ147追加/1削除、通常fmt hook成功。
+master逆統合はせず、R2 stagedは既定100651 bytes/SHA256不変。
+
+正本: target/r4-verification-source-20260908-v3/manifest.json。
+24 source /109 vendor /112 artifactsを保存し、親が全artifact hashを再検証した。
+前v2の23 sourceは生bytes不変、focused commit済みsimilar_db.rsも生bytesを追加保存した。
+source-files.zip: 2424106 bytes、SHA256=4d07663c777281755664dd6f4305a8be179ac36cb799335594dbdf4ac042c71c。
+CARGO_BUILD_JOBS=1・PowerShell内部pipeline無しで同test-fullをfinal4-j1へ再実行する。
+このfreezeからfull gate・portable完了まで製品sourceとHEADを変更しない。
+後続R1の草稿はCargoから参照されないtarget内に限り準備できるが、製品接続/別cargo/負荷計測は後続とする。
+
+### R4 最終full gate成功
+
+target/r4-test-full-final4-j1.logはexit0、末尾[test-full] PASS。
+main lib 7693成功/0失敗/38ignored、352.25秒。workspace/既存snapshot群も成功し、後段vendor egui25、
+egui-wgpu9、eframe15もすべて成功した。ログは52 test-result行であり、重複を含み得る合計をunique件数と呼ばない。
+元のsupervisor watcherと前回の10fixtureも全体実行で通過した。
+
+親が24 sourceと109 vendorの生bytes/hash、HEAD、R2 stagedの不変を再確認した。
+full gate log: 812000 bytes、SHA256=406448c28196bf45f2b983aa22d4c4ca0467b8232bba56c96ea5090de1ee01a7。
+以前の320/375秒とは構成・環境が異なるため、この352.25秒だけからテスト時間の変動原因を断定しない。
+
+同source/HEADを固定してCARGO_BUILD_JOBS=1・build-portable.ps1 -KeepRunningを開始。
+親もdist package/zipの絶対pathがrepo配下、package25entriesにreparse無し、data/data-remote無し、
+前R2 immutable zip（264631167 bytes）保持を確認。利用者processの停止やportable-devの起動は行わない。
+portable build/update/hash照合と実機はまだ後続である。
+
+### R4 ポータブル成果物と利用者への引き渡し
+
+2026-09-08、build-portable.ps1 -KeepRunning がexit0。release core 25分03秒、remote 0.39秒。
+HEAD 48610d4d476dc4a3029ac58e548cfd9bdc808ef2 とsource checkpoint v3を固定したビルドである。
+正本はtarget/r4-portable-milestone-20260908/manifest.json。配布zip・build log・source manifest・
+full gate参照と更新前後の証跡を保存した。
+
+- r4-portable-verification.zip: 264207780 bytes、SHA256=71b037d893e2f788a673a3b6352587a856e3d94298ee7e0647297d7bb6c176cc。
+- mimageviewer.exe: 92667904 bytes、SHA256=7351fe1e4e7a5867c27aac23bd35ec2b48336a2257b5444e229e5c4d30e8e341。
+- build-portable.log: 11934 bytes、SHA256=2b83f32c120c74dcb2d3d328e0546043a55e279219c0dbd57ecc97d6fb5e3b88。
+
+packageにdata/data-remote無し、対象と親にreparse無し、更新先の正確なexe pathを使う稼働process無しを確認。
+update-portable-dev.ps1 -SkipBuildはexit0、runtime全24filesのSHAがpackageと一致した。
+data/data-remoteは存在・非reparse・creation/lastwrite/attributesが前後不変。内部データ走査は行っていない。
+親も配布24files・artifact6files・全体gate logのhashを独立照合して不一致0。アプリの起動・利用者process停止は行っていない。
+前R2 immutable zipとstaged patchも保持した。
+
+利用者へtarget/portable-dev/mimageviewer.exeの正確な起動コマンドと長押し解除・見開き/連続・pin・focusの
+実機シナリオを渡した。R2とR4の実機確認は返答待ちであり、成功とは扱わない。
+R4成果物を固定したためsource freezeを解除し、R1 slice1の独立owner/executorとmock回帰へ進む。
+既存query callerの切替、R1/R5/R6の製品計算・oracle・性能検証は未完了。
