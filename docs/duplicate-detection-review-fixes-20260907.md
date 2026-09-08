@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、17回帰/独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1580,3 +1580,57 @@ data/data-remoteは存在・非reparse・creation/lastwrite/attributesが前後�
 実機シナリオを渡した。R2とR4の実機確認は返答待ちであり、成功とは扱わない。
 R4成果物を固定したためsource freezeを解除し、R1 slice1の独立owner/executorとmock回帰へ進む。
 既存query callerの切替、R1/R5/R6の製品計算・oracle・性能検証は未完了。
+
+### R1 要求管理の第1区切り（製品caller未接続）
+
+src/similar_book_query.rsとlib登録を独立moduleとして実装した。要求key/世代・実行権・FIFO・取消・completion・
+worker lifecycleを型で所有し、Weak client再bind、owner Dropの非join、job panic後のruntime破棄/再作成を扱う。
+初回/再作成は共通create_runtime_if_liveでlock下にLiveを確認して承認し、guard解放後にfactoryを実行する。
+承認前の停止は初期化を始めず、承認後の停止はworker内で構築終了後executeせずdropする。
+
+初回tests1はtrait bound/型注釈のcompile error、tests2は8成功だが100yieldの待機を含むため最終証跡にしない。
+tests3は8成功。独立coreの差戻しでgetter製品公開、初期化race、同本2client、withdraw/Drop・global hard・
+init/restart Err/panicの回帰を補強し、tests4は17成功。tests5も17成功だがDrop返却200msという不要な
+scheduling条件を残していた。論理的な非join証明はbarrier未解放での返却なので、最終は3秒bounded待機へ揃えた。
+
+停止fixtureはDropを専用test threadへ渡し、観測結果保存→必ずbarrier解放/worker回収→最後にassertする。
+delayed spawnerの保留slotはWeakで失敗時のArc循環を防ぎ、client Dropはclients/fifoから対象IDが消えたことを確認する。
+100yield/try_recv Emptyだけを完了・誤dispatch不存在の証明には使わない。独立coreは以上の解消を確認し、追加指摘なし。
+
+最終: target/r1-book-query-owner-tests6.log、17成功/0失敗/0ignored、compile35.04秒、test0.00秒、exit0。
+log SHA256=ebcb0064fa4d8614ee60da2f232ec443a797515151f6bd57f826e35954fa615b。
+製品cfg checkはtarget/r1-book-query-owner-check1.log、32.26秒/exit0（その後はtest fixtureだけ変更）。
+package fmt-check/diff-check成功。module未接続由来のdead_code warningは抑制せず、後続接続で解消する。
+
+focused commit: 3109b60e6a7c569d4c91ff474ddf645fced723d9（2files、1544追加）。
+module生bytes SHA256=94d9e86150dff5b7a71696d23a618729e7301b804324a812db13aebc6b6e9805。
+lib.rsにR4登録が共存するため、一時GIT_INDEX_FILEでHEAD＋R1登録1行と新moduleだけを構成し、通常hook付きでcommit。
+real indexの当該2entryだけを同期し、R2 staged patchの100651bytes/SHA不変とworking source bytes不変を確認した。
+正本: target/r1-owner-slice1-commit-20260908/manifest.json。R4 portableは以前固定したartifactを維持している。
+
+これはDB計算やUI callerを切り替えた修正ではない。次の独立区切りは需要Active/Retained/Withdrawnとlock外notifier。
+その後の同TX reader・MIH・正確な分類/対応付け・性能/peak・最終gate/portableは未完了である。
+
+### R1 需要状態と結果通知の区切り（製品caller未接続）
+
+focused commit: be0075dc1818b6ac45e20ab4cc34e092c2feaf13。src/similar_book_query.rsだけを通常hook付きで保存した。
+Active / Retained / Withdrawnを単一の需要状態とし、非表示時は既に受理したjob・完成結果を保持する。
+Retained中のsoft更新はdesiredだけ更新し、新規refreshを投入しない。実queryで同一本を再受理すると旧Readyを保ってrefreshを投入し、
+別本ならhard取消する。scope/storeのhard失効はRetainedの完成結果も退役し、再投入はActiveだけに限る。
+結果完成・致命失敗・hardによる完成結果退役はowner lock解放後の注入notifierで通知する。egui依存はmoduleへ入れない。
+
+回帰はdemand-tests1で19成功/2失敗（旧Readyを即取得するfixture誤り）、tests2で21成功。
+別本再受付の回帰を追加しhard-switch1で1成功、製品hard通知と陰性owner状態検査を補強したtests3で22成功/0失敗。
+独立coreは製品差分を承認したが、hard通知testのtry_lockとidle workerの待機復帰が競合し得る点を指摘した。
+最終fixtureは別clientをMockRuntime::execute内で停止させてlock外callbackを検証し、取消後のterminal回収まで待つ。
+notifier2は回収前のstate assertが早すぎて1失敗。修正版target/r1-book-query-demand-hard-notifier3.logは対象1成功/exit0、compile1分24秒。
+最終test-only修正後の22件再実行はしていない。製品変更後のtarget/r1-book-query-demand-check1.logは28.85秒/exit0。
+package fmt-checkとdiff-check成功。source生bytes SHA256=7abace84c3d9d28f1dc455dde55fb0e2ae056dc536439a7f1f2b5b24e14d3f35。
+
+- tests3 log SHA256=724b35aadb8ffb6102829dc98dc79903b8b07c44163ac93710e1f493c5e2c319。
+- notifier3 log SHA256=07e9a7058a0e10251cf0d68d08bc1b221d5f1d4e77b8cf421d2539d4b533ef9e。
+- check1 log SHA256=57abe2661e04fe51a38f227056f5ba564a8ce55b3badaf9a5090fa18425dd5b3。
+
+commit前後でR2 staged patchは100651bytes、SHA256=3adba6c9c6768c1540f3d8f0791d1dfefdc322acb270ec90966d5bca2131f42aのまま。
+R4 portableは固定成果物を維持する。UIの需要遷移・ROOT repaint接続、global readiness gate、同TX reader、MIHと実分類は後続。
+次の区切りは実装前にMemory/schedulerの状態射影・通知ticket・guard解放順を具体化して独立レビューする。

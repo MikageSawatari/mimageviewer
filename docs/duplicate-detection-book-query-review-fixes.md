@@ -3,7 +3,8 @@
 2026-09-08。親 Astra / high が設計・進行、Sol / xhigh が実装・テスト、独立 Astra / high がレビューする。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
-R4 の全体テスト・portable 作成と更新照合が完了したため、独立owner/executorの第1区切りを実装中。
+R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
+需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
 既存query callerとDB/検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
@@ -80,6 +81,58 @@ viewer 撤回を一緒に接続する。旧分類器を一時的に executor へ
 純mock段階で公平性・supersede・withdraw/drop・失敗後dispatch・shutdown回収を検証する。
 旧query計算にはまだ取消点がないため、通知・viewer lifecycle・取消可能な実計算を揃えた後を製品caller切替の完成境界とする。
 
+### caller接続の追加監査と要求範囲の再評価
+
+独立UI監査で、current_item=Noneはmetadata panelのOption::mapでhelper自体を呼ばず、非対象itemは
+App helperでNotBookへ早期returnすることを確認した。可視Similarでこれらを受理する際は明示withdrawする。
+DB計算の完成結果NotBookは別で、同一起点の完成結果として保持する。
+通常true closeとfinish_fs_navigation_sequenceのViewerExitedは明示withdrawし、had_navigation_ownerの有無へ依存させない。
+旧ページを維持するscan失敗/Supersededは保持する。retire/build abortのpayload Dropは当該clientだけを退役する最後の保証。
+manager早期return前にbinding/desiredを更新する。
+
+hidden/Info中の物理viewer起点を常時追従する案は、元R1/R5/R6への追加要求だったため、親と独立coreが範囲を再評価した。
+要求originは**そのclientが最後に実際に受理したqueryの本**とする。非表示中の旧本完走は同じ論理要求の完了である。
+再表示の実queryでは既存shown_items.first()による最新keyを先に受理し、hard照合した戻り値だけを描く。
+これで別本のReadyを公開せず、非表示の全contextへshown-origin監視を追加する必要はない。
+
+現在のresolve_spread_pairはcache miss/recheckでrotation_db.get_manyへ到達し、全AtRest巡回へ広げると同期IOを増やす。
+旧layoutやSingleへのfallbackは起点の意味を変える。これらを新しい監視用に拡張・代用する案は採らない。
+物理item代入の瞬間からworker内部cacheの旧完了writeを禁止することも、最後に受理した要求を所有する契約には不要。
+
+ただし現executorの全client soft再投入をそのまま残すと、非表示中も索引更新のたびに仕事を作り、元挙動よりCPUを増やす。
+独立coreと次の需要型を合意した（第1sliceへの追加実装・UI需要境界の監査は後続）。
+
+- container_key OptionをDemand::{Withdrawn, Active{key}, Retained{key}}へ置換し、hidden boolを重ねない。
+- Retainedは既実行/既待機1件と完成cacheを保持する。softはdesired世代だけ更新し、新規enqueueしない。
+  Retainedのfinishもrefreshをenqueueしない。既待機のFIFO位置は変えない。
+- Active復帰は実queryで最新keyを受理してから行う。visible通知だけで古いkeyを再投入しない。
+  同keyなら旧Readyを取得しながら最新refresh1件を要求、新keyならhard切替する。
+- hard scope/storeはRetainedを含め既仕事取消・cache退役。置換jobはActiveだけをenqueueする。
+- trueclose/dropは需要に関係なく即withdraw。park/raw swap/AtRestへの格納は実UI非表示と同義ではないため、
+  それだけで需要状態を変更しない。client identity/cache/既受付仕事はbundleとともに保持する。
+  一方、実際にfrozen表示へ移る意味的passive化では旧panel判定が再実行されないためRetainedが必要。
+  既存transition_detached_window_stateでto=Parked/ParkedLive確定後、window_idの既存bindingから
+  当該clientへ到達してretainする。Closing経由もあるためfrom=Active限定にはしない。binding無しはno-op、
+  mounted clientへのfallbackはしない。Active/Resuming遷移だけでは需要を復帰させない。
+  snapshot失敗前にも走るreset_detached_pause_foreground_modesへ便乗しない。predicate/viewport/placementは
+  変更せず、接続時にdetached plan§11へ意味的遷移と所有境界を記録する。
+- 実panel/tab/windowの需要変更はIO不要のretain操作へつなぐ。描画されないframeを即非表示と誤認しない。
+  独立UI監査で、draw_metadata_panel_innerの実visibility false・tabs後Info、fullscreenの実panel選択blockが
+  metadataを抑止した場合、通常panel blockを通らないnative presenter委譲分岐をRetained入口として確認した。
+  音声/編集/分析/panoramaも実panel選択判断に合流する。native overlayへclient/commandを持ち込まない。
+  未描画frame/park/raw swap/一時borderless移行/startupの一時returnは無変更とする。
+- closeボタン後も同passのqueryまで流れる現経路に注意。tabs処理後・shown-origin解決前に現在の
+  fs_info_panelと既存visibility条件を再確認し、閉じた後の新query/Active復帰を防ぐ。
+  非需要時の同pass描画を維持する場合、同identityの既completed参照だけを許し、受付を起こさない。
+
+旧Ready保持中は現UIのPreparing限定request_repaint_after(200ms)が走らない。
+soft完了やworker致命失敗をlock解放後にUIへ通知する境界（依存注入notifier等）、またはrefresh状態の返却を
+adapterで接続し、操作待ちにならず新しい結果が表示されることを確認する。独立UIのsource監査では、
+ROOTへの一度のrequest_repaint_of(ROOT)がactive viewer更新→所有bundle mount→show_viewport_immediateの
+同期callbackを通り、可視detached本パネルにも届く。passive detachedはfrozen snapshotのみで別通知は不要。
+generic executorへFnを注入し、App/manager層でctx cloneを捕捉する。完成/致命失敗の公開とlock解放後に呼び、
+古いviewport IDや追加timer/loopを持たない。この経路はsource監査済みで、実行検証は後続。
+第1sliceの純executorへegui型を持ち込む必要はない。
 ### 未ロード時の受付と実storeの識別
 
 草稿でOriginへraw store_idを必須にすると、現Unloaded/LoadingでPreparingを返す受付と衝突する。
@@ -91,6 +144,28 @@ viewer 撤回を一緒に接続する。旧分類器を一時的に executor へ
 配列のstore不一致はsnapshot候補の棄却と同TX memory-only fallbackであり、既知の実DB store変更と区別する。
 shared base X・DB Yの反例では、Yを実storeとして確定後に旧base Xを見るたびhard世代を進めてはならない。
 それを行うとYの要求を永久に取消す。実DB storeの変更時だけhard失効し、配列選択はruntimeの整合条件で処理する。
+### 初期ロード待ちとglobal dispatch gate（第2区切り前提）
+
+独立core監査により、Preparingをcompleted terminalとして保存する案は採らない。
+初期A/BのFIFOを消費してから単にwakeすると再dispatchされず、Deferredを末尾へ戻す案も順序変更とlost wakeを招く。
+推奨境界はglobal gateとowner通知ticket。owner lock下でticket/FIFO/shutdownを読む→guard解放→readiness probe→
+ownerを再lockしticket不変なら待機、変更済みなら再probe。待機中はFIFOを消費しない。
+publisherは正本を更新し全guardを解放してからticket更新/wakeする。probe直後・wait直前のReady通知も取り逃さない。
+
+Memory Unloaded/Loadingでもloaderの開始・進行義務がある間は待つ。表示用IndexProgress::RunningはDB open/repair後に
+立つため、開始義務の判定にはscheduler worker_running等の実所有を照合する。probeからfallback loaderを始めない。
+初期open中にBookQueryFallbackが先行してMissingを公開すると、Unloaded限定の後続loader開始を妨げる反例がある。
+
+indexer終端後にもUnloadedでproducer不在なら、無条件の待機では進行しない。
+この限定終端では共有snapshotなしで照会可能として、同TX read-only readerとmemory-only fallbackへ進む方針。
+実DB無しはNotIndexed、読取失敗はFailedへ終端し、queryからmutable load_or_rebuild/pruneを始めない。
+具体的なMemory/scheduler状態射影は実装担当が着手前に検証し、暫定案の全Unloaded待機を再採用しない。
+
+通知はload Ready/Missing/Failed公開だけでなく、load spawn失敗、index worker正常/取消/失敗終端、
+finish_workerのDB open失敗等、spawn_worker失敗、scope configureのretain/unloadにも必要である。
+memory epoch更新とprogress/state確定を済ませ、scheduler/state→book ownerのnested通知を全guard解放後へ移す。
+旧epochのload結果を捨てる場合、旧結果として通知せず、その原因のscope変更側が再評価を通知する。
+FIFO保持、probe直後のReady通知、Unloadedでのindexer失敗終端、待機中hard cancel/dropを回帰で確認する。
 ## 同一 SQLite read transaction
 
 専用の read-only 接続を worker local に持つ。schema 更新を行う `SimilarDb::open_at` は照会 reader に使わない。
@@ -201,6 +276,33 @@ entryが24〜32bytesの場合の両者合計48〜64MBは設計上の概算であ
 pair-levelの追加反例はA=X×9999,Y、B=Y,X×9999、dist(X,Y)>32（quality等の適格条件を満たす）。
 対角shortcutを使えず約1億辺がある一方、最大9999一致の解は(i,i+1), i=0..9998に一意である。
 巨大な旧二乗oracleを実行せず、一般dense経路の厳密期待値・時間・memoryを検証できる。
+### 多候補の結果容量とページ帯consumer
+
+独立UI監査で、全Eを除去しても現BookRelationHit.pagesの候補数C×起点全長Nが残ることを確認した。
+独立した各起点署名に7別本×3同署名ページを対応させると、起点込み8冊なのでcommonでなく、候補発見の3辺を満たす。
+N署名で7N候補が成立する。各pairはmatched1/Unrelatedでもqueryは全Ok結果を保持し、UIは部分的な重なりとして表示する。
+候補truncateでは解決しない。採用前に以下の容量境界を実装・oracle・実測で確認する（型の具体実装は後続設計）。
+
+- effective ordinal順のorigin page keyとExcluded/Unmatched基底をimmutable Arcで1つ共有する。
+- hitはorigin slot順の一致overrideだけを保持し、Strong/Weak、対応page/target/item key/mtime/sizeを含める。
+- strip.len()は常に起点全長。target解決失敗でもStrong/Weakの一致overrideは残す。
+- 結果容量をO(N+C+Σalignment)にする。build_page_stripで基底を候補ごとに作らない。
+
+現summarize_page_stripは全hitで起点全長相当をfoldし、book行には可視判定/virtualizationがない。
+strip領域確保後にclip判定して画面外の集計/paintを省略し、全候補・scroll領域・divider・見える操作を維持する。
+同じ描画passで列幅ごとの基底集計を共有し、overrideから列の色rank最大と最初のtargetを合成する案を検証する。
+色rankはStrong>Weak>Unmatched>Excluded。click代表は最強のmatchでなく、その列で最初にtargetを持つorigin slot。
+列境界のstart=floor(cN/W), end=max(floor((c+1)N/W),start+1)を共有し、単純floor(slot*W/N)へ変えない。
+N=5,W=3,slot1で所属が変わる反例がある。[移動]はorigin順の最初のtarget、▼は起点全長に対する位置を維持する。
+
+小oracleはN=8、各署名7冊×3ページの56候補、各strip長8/alignment1、base8+override56。
+旧dense表現との全field等価、長短の帯、列境界、Weakが先/Strongが後、targetなし一致、Excluded、移動/▼を確認する。
+画面外にも全候補分の領域を保ち、集計回数が可視stripだけになる回帰を加える。
+現snapshot fixtureでは同一起点の先頭4ページが候補によりExcluded/Unmatchedと矛盾するため、一貫したfixtureへ直し
+意図したPNG差分として独立UIレビューを受ける。
+
+これは容量/consumerの設計監査であり、分類器全体のpeak・最終UI性能を達成した証明ではない。
+O(C)のlabel/行処理も残るので、多hitの実UI計測と合わせて採用判断する。
 ## 正確性 oracle と採用前の確認
 
 旧256 hit打切り照会や、候補列を `zip` するだけの比較は oracle にしない。
