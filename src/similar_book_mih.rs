@@ -23,6 +23,7 @@ const CANCEL_INTERVAL: usize = 1 << 10;
 pub(crate) struct MihHit {
     pub(crate) item_id: u64,
     pub(crate) revision: u32,
+    pub(crate) signature: [u8; 32],
     pub(crate) distance: u32,
 }
 
@@ -501,6 +502,7 @@ fn visit_postings<E>(
                 let hit = MihHit {
                     item_id: record.item_id,
                     revision: record.revision,
+                    signature: record.signature,
                     distance,
                 };
                 match visitor(hit).map_err(MihQueryError::Visitor)? {
@@ -735,6 +737,15 @@ mod tests {
                 actual.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
                 expected
             );
+            for hit in &actual {
+                let record = snapshot
+                    .base
+                    .records
+                    .iter()
+                    .find(|record| record.item_id == hit.item_id)
+                    .expect("each MIH hit must retain its source record");
+                assert_eq!(hit.signature, record.signature);
+            }
         }
 
         let zero_hits = query_all(&mut runtime, &[0; 32], 32).unwrap();

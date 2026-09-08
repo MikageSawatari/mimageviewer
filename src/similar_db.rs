@@ -258,6 +258,28 @@ pub(crate) struct BookReadSnapshot<'transaction> {
     metadata: BookReadMetadata,
 }
 
+/// Why a raw item-id hit can or cannot participate in a book query.
+///
+/// The row is retained for every present item so the query engine can distinguish a corrupt
+/// same-transaction MIH reference from a row that became ineligible by normal index lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BookHitEligibility {
+    Eligible,
+    HashMismatch,
+    ContainerNotComplete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BookHitResolution {
+    Missing {
+        item_id: u64,
+    },
+    Present {
+        row: SearchRow,
+        eligibility: BookHitEligibility,
+    },
+}
+
 /// Request-local projection of stale ZIP ordinals into the current viewer page order.
 ///
 /// The cache lives only for one [`BookReadSnapshot`]. It never writes the repaired order back to
@@ -452,6 +474,14 @@ impl BookReadSnapshot<'_> {
         resolve_pages_by_item_id_connection(self.conn, item_ids, hash_version, Some(self.cancel))
     }
 
+    pub(crate) fn resolve_book_hits_raw(
+        &self,
+        item_ids: &[u64],
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<BookHitResolution>> {
+        resolve_book_hits_raw_connection(self.conn, item_ids, hash_version, Some(self.cancel))
+    }
+
     pub(crate) fn page_order_resolver<Compare>(
         &self,
         compare: Compare,
@@ -528,6 +558,38 @@ where
         }
         self.snapshot.check_cancelled()?;
         Ok(rows)
+    }
+
+    pub(crate) fn resolve_book_hits_raw(
+        &mut self,
+        item_ids: &[u64],
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<BookHitResolution>> {
+        let mut hits = self
+            .snapshot
+            .resolve_book_hits_raw(item_ids, hash_version)?;
+        for hit in &mut hits {
+            self.snapshot.check_cancelled()?;
+            let BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::Eligible,
+            } = hit
+            else {
+                continue;
+            };
+            let Some(container_key) = row.item.container_key.as_deref() else {
+                continue;
+            };
+            if let Some(order) = self.effective_zip_order(container_key)? {
+                row.item.page_index = Some(order.get(&row.item_id).copied().ok_or_else(|| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        "eligible book hit was absent from its complete ZIP order".into(),
+                    )
+                })?);
+            }
+        }
+        self.snapshot.check_cancelled()?;
+        Ok(hits)
     }
 
     fn effective_zip_order(
@@ -2166,6 +2228,53 @@ fn resolve_pages_by_item_id_connection(
     Ok(rows)
 }
 
+fn resolve_book_hits_raw_connection(
+    conn: &Connection,
+    item_ids: &[u64],
+    hash_version: i64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Vec<BookHitResolution>> {
+    check_book_read_cancelled(cancel)?;
+    let mut statement = conn.prepare(
+        "SELECT i.item_id, i.revision, i.item_key, i.kind, i.container_key, i.page_index,
+                i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
+                i.width, i.height, i.format, c.scan_state
+         FROM item i LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.item_id = ?1",
+    )?;
+    let mut hits = Vec::with_capacity(item_ids.len());
+    for &item_id in item_ids {
+        check_book_read_cancelled(cancel)?;
+        let hit = statement
+            .query_row([i64::try_from(item_id).unwrap_or(i64::MAX)], |row| {
+                let search_row = row_to_search_row(row)?;
+                let scan_state = row
+                    .get::<_, Option<i64>>(14)?
+                    .map(ScanState::from_i64)
+                    .transpose()?;
+                let eligibility = if search_row.item.hash_version != hash_version {
+                    BookHitEligibility::HashMismatch
+                } else if search_row.item.container_key.is_some()
+                    && scan_state != Some(ScanState::Complete)
+                {
+                    BookHitEligibility::ContainerNotComplete
+                } else {
+                    BookHitEligibility::Eligible
+                };
+                Ok(BookHitResolution::Present {
+                    row: search_row,
+                    eligibility,
+                })
+            })
+            .optional()?
+            .unwrap_or(BookHitResolution::Missing { item_id });
+        hits.push(hit);
+    }
+    drop(statement);
+    check_book_read_cancelled(cancel)?;
+    Ok(hits)
+}
+
 fn i64_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
@@ -2516,6 +2625,90 @@ mod tests {
     }
 
     #[test]
+    fn book_reader_raw_hit_resolution_preserves_order_duplicates_and_ineligibility() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        publish_test_book(&db, "eligible", &[("eligible/page", 0x11)]);
+        publish_test_book(&db, "stale", &[("stale/page", 0x22)]);
+        publish_test_book(&db, "building", &[("building/page", 0x33)]);
+
+        let (eligible_id, stale_id, building_id) = {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            let id_for = |key: &str| {
+                conn.query_row(
+                    "SELECT item_id FROM item WHERE item_key = ?1",
+                    [key],
+                    |row| i64_to_u64(row.get(0)?, 0),
+                )
+                .unwrap()
+            };
+            let ids = (
+                id_for("eligible/page"),
+                id_for("stale/page"),
+                id_for("building/page"),
+            );
+            conn.execute(
+                "UPDATE item SET hash_version = ?1 WHERE item_id = ?2",
+                params![current_hash_version() - 1, i64::try_from(ids.1).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET scan_state = ?1 WHERE container_key = 'building'",
+                [ScanState::Building as i64],
+            )
+            .unwrap();
+            ids
+        };
+        let missing_id = u64::MAX - 1;
+        let requested = [eligible_id, missing_id, stale_id, building_id, eligible_id];
+
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let (raw, filtered) = reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                Ok((
+                    snapshot.resolve_book_hits_raw(&requested, current_hash_version())?,
+                    snapshot.resolve_pages_by_item_id(&requested, current_hash_version())?,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(raw.len(), requested.len());
+        assert!(matches!(
+            &raw[0],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::Eligible,
+            } if row.item_id == eligible_id && row.item.item_key == "eligible/page"
+        ));
+        assert_eq!(
+            raw[1],
+            BookHitResolution::Missing {
+                item_id: missing_id
+            }
+        );
+        assert!(matches!(
+            &raw[2],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::HashMismatch,
+            } if row.item_id == stale_id && row.item.item_key == "stale/page"
+        ));
+        assert!(matches!(
+            &raw[3],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::ContainerNotComplete,
+            } if row.item_id == building_id && row.item.item_key == "building/page"
+        ));
+        assert_eq!(raw[4], raw[0]);
+        assert_eq!(
+            filtered.iter().map(|row| row.item_id).collect::<Vec<_>>(),
+            vec![eligible_id, eligible_id]
+        );
+    }
+
+    #[test]
     fn book_reader_private_zip_order_matches_writer_repair_before_filtering() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("similar.db");
@@ -2541,7 +2734,7 @@ mod tests {
         let (old_id, same_a_id) = {
             let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
             conn.execute(
-                "UPDATE item SET hash_version = ?1 WHERE item_key = ?2",
+                "UPDATE item SET hash_version = ?1, page_index = 99 WHERE item_key = ?2",
                 params![current_hash_version() - 1, format!("{book}{separator}old")],
             )
             .unwrap();
@@ -2588,7 +2781,7 @@ mod tests {
         };
 
         let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
-        let (private_pages, private_targets) = reader
+        let (private_pages, private_targets, private_raw_targets) = reader
             .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
                 let mut resolver = snapshot.page_order_resolver(compare);
                 let pages = resolver.load_book_pages(book, current_hash_version())?;
@@ -2596,7 +2789,11 @@ mod tests {
                     &[same_a_id, old_id, pages[0].item_id],
                     current_hash_version(),
                 )?;
-                Ok((pages, targets))
+                let raw_targets = resolver.resolve_book_hits_raw(
+                    &[same_a_id, old_id, pages[0].item_id],
+                    current_hash_version(),
+                )?;
+                Ok((pages, targets, raw_targets))
             })
             .unwrap();
         let private_projection = private_pages
@@ -2633,6 +2830,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("same-a", Some(2)), ("a", Some(0))]
         );
+        assert!(matches!(
+            &private_raw_targets[0],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::Eligible,
+            } if row.item.item_key.ends_with("same-a") && row.item.page_index == Some(2)
+        ));
+        assert!(matches!(
+            &private_raw_targets[1],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::HashMismatch,
+            } if row.item.item_key.ends_with("old") && row.item.page_index == Some(99)
+        ));
+        assert!(matches!(
+            &private_raw_targets[2],
+            BookHitResolution::Present {
+                row,
+                eligibility: BookHitEligibility::Eligible,
+            } if row.item.item_key.ends_with('a') && row.item.page_index == Some(0)
+        ));
         assert_eq!(db.page_order_version().unwrap(), 0);
         assert_eq!(
             db.load_item_changes_after(0).unwrap().latest_seq,
