@@ -2,7 +2,7 @@
 
 2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
-Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実本5頁/400頁の独立oracleは成功、実engine cold/warm n3とCPU/peak pilotも記録済み。実行中の非同期取消composition、通常20標本/特殊大規模/世代更新/大規模UI、最終gate/portableは未完了。
+Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実本5頁/400頁の独立oracleは成功、実engine cold/warm n3とCPU/peak pilotも記録済み。実行中の非同期取消compositionは4件と独立Solレビューで検証済み。通常4条件のcold/warm各20標本も完了。特殊大規模/世代更新/大規模UI、最終gate/portableは未完了。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
@@ -619,13 +619,14 @@ byte/count/time は u64、sampling interval 0 は拒否。実際の dev-tools/po
 一時 fixture と独立 review が通った後、短本・代表400ページ各1標本で出力・priority・digest・入力不変・base再利用・観測負荷を確認する。
 その結果を見て各3標本、通常20標本と残りの条件へ進む。少数 pilot は性能採用の最終判定ではない。
 
-### 残る取消・UI 計測の最小境界（2026-09-08、独立 Sol、未実行）
+### 取消・UI 計測の最小境界（2026-09-08合意、取消は2026-09-09検証済み・UI未実行）
 
 現7file harnessへ追加の取消/UI機構を混ぜない。経過時間だけでcancelする大入力はphase途中の証拠にならないため、
 既存の取消load位置にinstance-local cfg(test) checkpoint/barrierを置く案を採る。MIH、body SQL、direct loop各1件で
 実進行→別threadから同じtoken取消→inner Cancelled→同engine次query成功を観測し、probeは新しい取消分岐を作らない。
 SQL raw-row loopで代用する場合はSQLite VM内interruptの証拠と称さない。実C runtimeまでの一体検証は代表1phaseだけで、
 取消されたAの結果非公開とUI pollなしのB進行を追加する。全interleavingやbusy待機中の即時取消を保証する検証ではない。
+2026-09-09に3engine phaseと実C代表の計4件を実装・検証し独立Sol承認。helperの無期限joinを期限付き結果受信へ直したfixed2を正本とする。詳細証跡はレビュー修正記録の取消composition節を参照。
 
 大量候補UIは実draw_similar_panel/ScrollAreaを通すheadless release補助計測を別区切りで行う。
 N=400/C=56と2800、N=10000/C=1を分け、top/middle/endのwall/thread CPU、row/visible strip/origin projectionを観測する。

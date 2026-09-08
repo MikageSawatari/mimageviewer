@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition、通常20標本/特殊大規模/世代更新、大規模UI、最終gate/portable・実機は未完了 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。特殊大規模/世代更新、大規模UI、最終gate/portable・実機は未完了 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -2018,3 +2018,48 @@ certificateは短本30855B/SHA8b8804ec93d2c00218397e903ff1d2f00bb960fa02e41fcc74
 正本target/r1-book-query-real-certificates-20260909/manifest.json（SHA29c6e54b6e9feeb7f876fb0af3c7f5eea532e05bc5918d562596071ceafb2557）。
 親はbuild2の2artifact・screeningの9artifact・certificateの8artifactをhash照合し、R2 cached不変も確認した。検証は再実行していない。
 この時間は独立oracleを含む検証全体で、query-core性能値ではない。通常20標本・特殊大規模/世代更新・途中取消結合・大量UI・最終gate/portableは別の未完了条件。
+
+## 実行途中の取消composition（2026-09-09、固定1・harness P2修正待ち）
+
+既存MIH visited_postings=1024のcancel load、metadata後にarmした既存SQLite progress_handler、direct候補slot=1024の既存loadへinstance-local cfg(test) probeを置いた。
+engine3件は実phase到達後に別threadから同じArc tokenを取消し、inner EngineError::Cancelledと同engine次query Readyを確認する。
+C代表1件は実manager/executorでSQL phase中にBを待機させ、A withdraw後にUI pollなしでBのterminal通知を受ける。A Withdrawn・B Ready・余分なA通知なしを確認する。
+probe/controlのdisconnectはテストassert unwind時にもworkerを解放する。製品のcancel/wait分岐は追加せず、新moduleとwiringはcfg(test)のみ。
+新規4件4/4成功（compile3分21秒、実行0.29秒）、product check22.09秒・fmt/diff成功。既存成功テストは再実行していない。
+最初のcombined fmt/diff shellはPowerShell構文によりfmtがbackground化しlog未作成、fmt-check2を実際に保存された初回fmt結果とする。
+正本target/r1-inflight-cancellation-composition-20260909/manifest.json SHAe3445ec3a172205eaa4f21467aaae8ff0238c3d853d7057d6c25248bb009aa51。
+review.patch22927B/SHA77070d861a20bbdd156e27d1b2715bd46008ace3846d7305d2dd82f17d9808cd。親は16artifact/現6sourceの一致とR2 cached不変を確認した。
+独立Solは製品/C経路に新規P1/P2なし。ただしengine共通test helperがphase解放後にworker.joinを無期限待機し、合意したbounded completionを証明しないP2を指摘した。
+結果をchannelで返しrecv_timeout成功後だけjoinする最小修正へ進む。この段階では取消検証全体を承認完了と扱わない。
+
+fixed2で共通helperは結果(engine/outcome)をchannelへ送ってreturnし、controllerはphase解放後5秒のrecv成功時だけjoinする。
+変更helperを通るengine3件のみ3/3成功、fmt/diff成功。変更していないC代表1件と製品cfg checkは固定1の成功証跡を引き継いだ。
+独立Solが増分を承認しP2解消、新規P1/P2なし。実行途中の取消compositionはこの範囲で検証完了とする。
+正本target/r1-inflight-cancellation-composition-fixed2-20260909/manifest.json SHA6f79738a63d2078b4ae73f8d3d288ae1bb8cb89caf6c4c991851caead9c5a8c7。
+fixed1-to-fixed2.patch1687B/SHAee4e2ee3407f99c7ca5634b32e6b6962114b5747d2c5ef4023b36010ed1cd702。親は10artifact/現6sourceの一致を照合した。
+全interleavingやSQLite busy待ち中の即時取消の証明ではない。次は通常4caseのcold/warm各20標本と大規模UI補助計測へ進む。
+
+## 通常4条件のcold/warm各20標本（2026-09-09、完了）
+
+凍結bench build2と同じprepared DB/base/rootsを使用し、既存成功rawを保持して不足分を追加した。計87 processのrawにcold80 query・warm80 query・warmup7 queryを記録。
+quantileはnearest-rank = sorted[ceil(p*n)-1]。偶数標本の平均中央値とは区別する。以下はquery-core wallで、setup/hash/handshake/digest/JSONを含めない。
+
+| 条件 | cold p50 / p95 / max (ms) | warm p50 / p95 / max (ms) |
+| --- | --- | --- |
+| 短1頁・候補0 | 790.55 / 941.72 / 993.10 | 2.33 / 2.94 / 3.15 |
+| 400頁・候補0 | 1891.67 / 2122.58 / 2191.39 | 1073.85 / 1173.08 / 1190.12 |
+| 短5頁・候補1 | 768.29 / 957.78 / 997.05 | 16.21 / 18.08 / 20.43 |
+| 400頁・候補1 | 2772.86 / 3102.63 / 3116.50 | 1819.53 / 2009.31 / 2054.34 |
+
+全runでpriority=-1、binary/input hash一致、DB/base前後不変、sidecar無し、caseごとのdigest一致、全warmでsnapshot owner再利用を確認。
+400頁positiveのworker/process CPU p50はcold2578.125/2609.375ms、warm1734.375/1750.000ms。
+短時間のWindows CPU counterには0や15.625ms単位の値があり、0をCPU消費なしと解釈しない。user/kernelのraw値も別々に保持する。
+全4条件のprocess lifetime最大WSは563228672B、private commitは570281984B。warmのlifetime high-waterにはwarmupを含む。
+phase sampled peakは別fieldに保持し、lifetimeの差分からwarm peakを作らない。
+既存n3を含む複数process/sessionの標本で、OS disk cacheをflushしたcoldではない。旧400頁/7候補とは比較不能のまま。
+同じ凍結binaryでもn3と追加標本に時間差がある。環境要因の原因切り分けはしておらず、コード変更による退行・改善とは断定しない。
+
+正本target/r1-book-query-normal-n20-20260909/summary-n20.json（120930B/SHA5ef54ed854508cf16dc31d88f45386af3c4157a65430c38fb98a05c89dcb2728）。
+manifest-n20.json（38940B/SHAda85e82fdc1e843cf9e836f7463c7b79eacc8d90960367c45af305eeb9a7f403）、run-manifest.json（26215B/SHA70bdbaa65bcfe44a01f3846408d04fb18b44bac56538e0a708503bf5961d7af1）は同dirに別名保存。
+親は161artifact hash、全query metricのn20/raw/nearest-rank整合、R2 cached不変を確認した。製品queryの再実行はしていない。
+残りは大規模engine/世代条件とUI補助計測、最終full gate/portable・実機。検証コードを共通test buildへまとめ、各測定は直列で行う。
