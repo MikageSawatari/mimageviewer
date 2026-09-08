@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::Sig;
 
@@ -196,6 +197,142 @@ pub fn classify_pair(
     PreparedCorpus::new(pages, params)?.classify(a, b)
 }
 
+/// One same-transaction page fact used by the streaming book classifier.
+///
+/// `common` is already resolved against the whole eligible library. The fixed
+/// signature width prevents the streaming path from accepting mixed-width
+/// input; the public generic classifier retains its existing validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedBookPage {
+    pub(crate) index: u32,
+    pub(crate) quality: u8,
+    pub(crate) common: bool,
+    pub(crate) signature: [u8; 32],
+}
+
+/// Validated page facts and exclusion statistics reusable across pair queries.
+#[derive(Debug)]
+pub(crate) struct PreparedBookSide {
+    book: u32,
+    params: Params,
+    pages: Box<[VerifiedBookPage]>,
+    distinctive_slots: Box<[usize]>,
+    stats: BookStats,
+}
+
+impl PreparedBookSide {
+    pub(crate) fn new(
+        book: u32,
+        mut pages: Vec<VerifiedBookPage>,
+        params: Params,
+    ) -> Result<Self, AnalyzeError> {
+        validate_params(params)?;
+        if params.radius > 256 {
+            return Err(AnalyzeError::RadiusExceedsBitWidth {
+                radius: params.radius,
+                bit_width: 256,
+            });
+        }
+        if pages.is_empty() {
+            return Err(AnalyzeError::UnknownBook(book));
+        }
+        pages.sort_by_key(|page| page.index);
+        if let Some(duplicate) = pages.windows(2).find(|pair| pair[0].index == pair[1].index) {
+            return Err(AnalyzeError::DuplicatePageIndex {
+                book,
+                index: duplicate[0].index,
+            });
+        }
+
+        let mut stats = BookStats {
+            book,
+            total_pages: 0,
+            distinctive_pages: 0,
+            featureless_pages: 0,
+            common_pages: 0,
+        };
+        let mut distinctive_slots = Vec::new();
+        for (slot, page) in pages.iter().enumerate() {
+            record_page_stats(&mut stats, page.quality, page.common, params.min_quality);
+            if page.quality >= params.min_quality && !page.common {
+                distinctive_slots.push(slot);
+            }
+        }
+        Ok(Self {
+            book,
+            params,
+            pages: pages.into_boxed_slice(),
+            distinctive_slots: distinctive_slots.into_boxed_slice(),
+            stats,
+        })
+    }
+
+    pub(crate) fn book(&self) -> u32 {
+        self.book
+    }
+
+    pub(crate) fn pages(&self) -> &[VerifiedBookPage] {
+        &self.pages
+    }
+
+    pub(crate) fn distinctive_slots(&self) -> &[usize] {
+        &self.distinctive_slots
+    }
+
+    pub(crate) fn stats(&self) -> &BookStats {
+        &self.stats
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeVisitControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeVisitCompletion {
+    Exhausted,
+    Stopped,
+}
+
+/// Re-enumerates every true edge from one prepared A slot into prepared B.
+///
+/// Discovery saturation or sampling must not be applied here. Repeated calls
+/// for the same slot and same read transaction must return the same edge set.
+pub(crate) trait ReenumeratedBookEdges {
+    type Error;
+
+    fn visit_a(
+        &mut self,
+        a_slot: usize,
+        visitor: &mut dyn FnMut(usize, u32) -> EdgeVisitControl,
+    ) -> Result<EdgeVisitCompletion, Self::Error>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReenumeratedPairError<E> {
+    Analyze(AnalyzeError),
+    Cancelled,
+    Source(E),
+    SourceStopped,
+    ParamsMismatch,
+    InvalidBookOrder { a: u32, b: u32 },
+    InvalidOriginSlot(usize),
+    DuplicateOriginSlot(usize),
+    ExcludedOriginSlot(usize),
+    InvalidCandidateSlot { a_slot: usize, b_slot: usize },
+    DistanceExceedsRadius { distance: u32, radius: u32 },
+    ArithmeticOverflow,
+    ReplayInvariant,
+}
+
+impl<E> From<AnalyzeError> for ReenumeratedPairError<E> {
+    fn from(value: AnalyzeError) -> Self {
+        Self::Analyze(value)
+    }
+}
+
 struct PreparedPage<'a> {
     page: &'a BookPage,
     bits: &'a [u8],
@@ -218,16 +355,11 @@ struct PreparedCorpus<'a> {
 
 impl<'a> PreparedCorpus<'a> {
     fn new(pages: &'a [BookPage], params: Params) -> Result<Self, AnalyzeError> {
-        if !params.coverage_threshold.is_finite()
-            || !(0.0..=1.0).contains(&params.coverage_threshold)
-        {
-            return Err(AnalyzeError::InvalidCoverage);
-        }
+        validate_params(params)?;
 
         let mut seen_page_indices = HashSet::new();
         let mut expected_bytes = None;
         let mut prepared = Vec::with_capacity(pages.len());
-        let mut stats = BTreeMap::<u32, BookStats>::new();
         for page in pages {
             if !seen_page_indices.insert((page.book, page.index)) {
                 return Err(AnalyzeError::DuplicatePageIndex {
@@ -258,18 +390,6 @@ impl<'a> PreparedCorpus<'a> {
                 }
             } else {
                 expected_bytes = Some(bits.len());
-            }
-            let book_stats = stats.entry(page.book).or_insert(BookStats {
-                book: page.book,
-                total_pages: 0,
-                distinctive_pages: 0,
-                featureless_pages: 0,
-                common_pages: 0,
-            });
-            book_stats.total_pages += 1;
-            let featureless = page.quality < params.min_quality;
-            if featureless {
-                book_stats.featureless_pages += 1;
             }
             prepared.push(PreparedPage {
                 page,
@@ -305,14 +425,22 @@ impl<'a> PreparedCorpus<'a> {
         for &index in &eligible {
             let is_common = neighborhood_books[index].len() as u32 > params.max_books_per_page;
             prepared[index].common = is_common;
-            let book_stats = stats
-                .get_mut(&prepared[index].page.book)
-                .expect("every prepared page has book stats");
-            if is_common {
-                book_stats.common_pages += 1;
-            } else {
-                book_stats.distinctive_pages += 1;
-            }
+        }
+        let mut stats = BTreeMap::<u32, BookStats>::new();
+        for page in &prepared {
+            let book_stats = stats.entry(page.page.book).or_insert(BookStats {
+                book: page.page.book,
+                total_pages: 0,
+                distinctive_pages: 0,
+                featureless_pages: 0,
+                common_pages: 0,
+            });
+            record_page_stats(
+                book_stats,
+                page.page.quality,
+                page.common,
+                params.min_quality,
+            );
         }
 
         Ok(Self {
@@ -331,17 +459,7 @@ impl<'a> PreparedCorpus<'a> {
         let stats_a = self.stats.get(&a).ok_or(AnalyzeError::UnknownBook(a))?;
         let stats_b = self.stats.get(&b).ok_or(AnalyzeError::UnknownBook(b))?;
         if stats_a.distinctive_pages == 0 || stats_b.distinctive_pages == 0 {
-            return Ok(BookPair {
-                a,
-                b,
-                matched: 0,
-                distinctive_a: stats_a.distinctive_pages,
-                distinctive_b: stats_b.distinctive_pages,
-                coverage_a: 0.0,
-                coverage_b: 0.0,
-                relation: Relation::Undecidable,
-                alignment: Vec::new(),
-            });
+            return Ok(finish_pair(a, b, stats_a, stats_b, self.params, Vec::new()));
         }
 
         let mut candidates = Vec::new();
@@ -367,37 +485,505 @@ impl<'a> PreparedCorpus<'a> {
             });
         }
         let alignment = weighted_monotonic_alignment(candidates);
-        let matched = alignment.len() as u32;
-        let coverage_a = matched as f32 / stats_a.distinctive_pages as f32;
-        let coverage_b = matched as f32 / stats_b.distinctive_pages as f32;
-        let covers_a = coverage_a >= self.params.coverage_threshold;
-        let covers_b = coverage_b >= self.params.coverage_threshold;
-        let relation = if matched < self.params.min_matched_pages {
-            Relation::Unrelated
-        } else {
-            match (covers_a, covers_b) {
-                (true, true) => Relation::Same,
-                (true, false) => Relation::Contains { whole: b },
-                (false, true) => Relation::Contains { whole: a },
-                (false, false) => Relation::Unrelated,
-            }
-        };
-        Ok(BookPair {
+        Ok(finish_pair(a, b, stats_a, stats_b, self.params, alignment))
+    }
+}
+
+fn validate_params(params: Params) -> Result<(), AnalyzeError> {
+    if !params.coverage_threshold.is_finite() || !(0.0..=1.0).contains(&params.coverage_threshold) {
+        Err(AnalyzeError::InvalidCoverage)
+    } else {
+        Ok(())
+    }
+}
+
+fn record_page_stats(stats: &mut BookStats, quality: u8, common: bool, min_quality: u8) {
+    stats.total_pages += 1;
+    if quality < min_quality {
+        stats.featureless_pages += 1;
+    } else if common {
+        stats.common_pages += 1;
+    } else {
+        stats.distinctive_pages += 1;
+    }
+}
+
+fn finish_pair(
+    a: u32,
+    b: u32,
+    stats_a: &BookStats,
+    stats_b: &BookStats,
+    params: Params,
+    alignment: Vec<(u32, u32)>,
+) -> BookPair {
+    if stats_a.distinctive_pages == 0 || stats_b.distinctive_pages == 0 {
+        return BookPair {
             a,
             b,
-            matched,
+            matched: 0,
             distinctive_a: stats_a.distinctive_pages,
             distinctive_b: stats_b.distinctive_pages,
-            coverage_a,
-            coverage_b,
-            relation,
-            alignment,
-        })
+            coverage_a: 0.0,
+            coverage_b: 0.0,
+            relation: Relation::Undecidable,
+            alignment: Vec::new(),
+        };
+    }
+
+    let matched = alignment.len() as u32;
+    let coverage_a = matched as f32 / stats_a.distinctive_pages as f32;
+    let coverage_b = matched as f32 / stats_b.distinctive_pages as f32;
+    let covers_a = coverage_a >= params.coverage_threshold;
+    let covers_b = coverage_b >= params.coverage_threshold;
+    let relation = if matched < params.min_matched_pages {
+        Relation::Unrelated
+    } else {
+        match (covers_a, covers_b) {
+            (true, true) => Relation::Same,
+            (true, false) => Relation::Contains { whole: b },
+            (false, true) => Relation::Contains { whole: a },
+            (false, false) => Relation::Unrelated,
+        }
+    };
+    BookPair {
+        a,
+        b,
+        matched,
+        distinctive_a: stats_a.distinctive_pages,
+        distinctive_b: stats_b.distinctive_pages,
+        coverage_a,
+        coverage_b,
+        relation,
+        alignment,
     }
 }
 
 fn ordered_pair(a: u32, b: u32) -> (u32, u32) {
     if a < b { (a, b) } else { (b, a) }
+}
+
+/// Classifies one already ordered pair from a repeatable same-transaction edge source.
+///
+/// `origin_edge_slots` is the complete, sorted, unique set of distinctive A slots
+/// that have at least one true edge into B. Discovery may saturate its per-book
+/// count, but it must continue recording these slots. This lets all candidate
+/// pairs share one prepared origin without querying every origin page per pair.
+pub(crate) fn classify_pair_reenumerated<S>(
+    a: &PreparedBookSide,
+    b: &PreparedBookSide,
+    origin_edge_slots: &[usize],
+    source: &mut S,
+    cancel: &AtomicBool,
+) -> Result<BookPair, ReenumeratedPairError<S::Error>>
+where
+    S: ReenumeratedBookEdges,
+{
+    if a.params != b.params {
+        return Err(ReenumeratedPairError::ParamsMismatch);
+    }
+    if a.book >= b.book {
+        return Err(ReenumeratedPairError::InvalidBookOrder {
+            a: a.book,
+            b: b.book,
+        });
+    }
+    validate_origin_edge_slots(a, origin_edge_slots)?;
+    check_stream_cancel(cancel)?;
+
+    if a.stats.distinctive_pages == 0 || b.stats.distinctive_pages == 0 {
+        return Ok(finish_pair(
+            a.book,
+            b.book,
+            &a.stats,
+            &b.stats,
+            a.params,
+            Vec::new(),
+        ));
+    }
+
+    // Equal-size distinctive sequences with every k-to-k edge have one possible
+    // full monotonic bijection. Check this before discovering global B values;
+    // a dense 10k x 10k equal-signature pair must remain O(N).
+    if let Some(alignment) = exact_diagonal_alignment(a, b, origin_edge_slots, cancel)? {
+        return Ok(finish_pair(
+            a.book, b.book, &a.stats, &b.stats, a.params, alignment,
+        ));
+    }
+
+    let mut b_values = BTreeSet::new();
+    for (position, &a_slot) in origin_edge_slots.iter().enumerate() {
+        check_stream_cancel_at(position, cancel)?;
+        let row = collect_reenumerated_row(a, b, a_slot, source, cancel)?;
+        for edge in row {
+            b_values.insert(edge.b_index);
+        }
+    }
+    let b_values = b_values.into_iter().collect::<Vec<_>>();
+    check_stream_cancel(cancel)?;
+    if b_values.is_empty() {
+        return Ok(finish_pair(
+            a.book,
+            b.book,
+            &a.stats,
+            &b.stats,
+            a.params,
+            Vec::new(),
+        ));
+    }
+
+    let block_rows = integer_sqrt_ceil(origin_edge_slots.len()).max(1);
+    let mut tree = vec![StreamAlignmentScore::default(); b_values.len() + 1];
+    let mut checkpoints = Vec::with_capacity(origin_edge_slots.len().div_ceil(block_rows));
+    for (row_position, &a_slot) in origin_edge_slots.iter().enumerate() {
+        check_stream_cancel_at(row_position, cancel)?;
+        if row_position % block_rows == 0 {
+            checkpoints.push(StreamCheckpoint {
+                row_position,
+                tree: copy_scores_checked(&tree, cancel)?.into_boxed_slice(),
+            });
+        }
+        apply_stream_row(a, b, a_slot, source, cancel, &b_values, &mut tree, None)?;
+    }
+    let best = stream_fenwick_query(&tree, b_values.len());
+    let alignment = restore_stream_alignment(
+        a,
+        b,
+        origin_edge_slots,
+        source,
+        cancel,
+        &b_values,
+        block_rows,
+        &checkpoints,
+        best.tail,
+    )?;
+    Ok(finish_pair(
+        a.book, b.book, &a.stats, &b.stats, a.params, alignment,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StreamEdgeKey {
+    a_index: u32,
+    b_index: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamRowEdge {
+    b_index: u32,
+    distance: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamAlignmentScore {
+    matched: u32,
+    distance_sum: u64,
+    tail: Option<StreamEdgeKey>,
+}
+
+struct StreamCheckpoint {
+    row_position: usize,
+    tree: Box<[StreamAlignmentScore]>,
+}
+
+fn validate_origin_edge_slots<E>(
+    a: &PreparedBookSide,
+    slots: &[usize],
+) -> Result<(), ReenumeratedPairError<E>> {
+    let mut previous = None;
+    for &slot in slots {
+        let Some(page) = a.pages.get(slot) else {
+            return Err(ReenumeratedPairError::InvalidOriginSlot(slot));
+        };
+        if previous == Some(slot) {
+            return Err(ReenumeratedPairError::DuplicateOriginSlot(slot));
+        }
+        if previous.is_some_and(|previous| previous > slot) {
+            return Err(ReenumeratedPairError::InvalidOriginSlot(slot));
+        }
+        if page.quality < a.params.min_quality || page.common {
+            return Err(ReenumeratedPairError::ExcludedOriginSlot(slot));
+        }
+        previous = Some(slot);
+    }
+    Ok(())
+}
+
+fn exact_diagonal_alignment<E>(
+    a: &PreparedBookSide,
+    b: &PreparedBookSide,
+    origin_edge_slots: &[usize],
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<(u32, u32)>>, ReenumeratedPairError<E>> {
+    if origin_edge_slots != a.distinctive_slots.as_ref()
+        || a.distinctive_slots.len() != b.distinctive_slots.len()
+    {
+        return Ok(None);
+    }
+    let mut alignment = Vec::with_capacity(a.distinctive_slots.len());
+    for (position, (&a_slot, &b_slot)) in a
+        .distinctive_slots
+        .iter()
+        .zip(b.distinctive_slots.iter())
+        .enumerate()
+    {
+        check_stream_cancel_at(position, cancel)?;
+        let a_page = &a.pages[a_slot];
+        let b_page = &b.pages[b_slot];
+        if hamming_bytes(&a_page.signature, &b_page.signature) > a.params.radius {
+            return Ok(None);
+        }
+        alignment.push((a_page.index, b_page.index));
+    }
+    Ok(Some(alignment))
+}
+
+fn collect_reenumerated_row<S>(
+    a: &PreparedBookSide,
+    b: &PreparedBookSide,
+    a_slot: usize,
+    source: &mut S,
+    cancel: &AtomicBool,
+) -> Result<Vec<StreamRowEdge>, ReenumeratedPairError<S::Error>>
+where
+    S: ReenumeratedBookEdges,
+{
+    check_stream_cancel(cancel)?;
+    let mut edges = Vec::new();
+    let mut invalid = None;
+    let mut visited = 0usize;
+    let mut cancelled_in_visitor = false;
+    let mut visitor = |b_slot: usize, distance: u32| {
+        if visited % 1024 == 0 && cancel.load(Ordering::Acquire) {
+            cancelled_in_visitor = true;
+            return EdgeVisitControl::Stop;
+        }
+        visited += 1;
+        let Some(page) = b.pages.get(b_slot) else {
+            invalid = Some(ReenumeratedPairError::InvalidCandidateSlot { a_slot, b_slot });
+            return EdgeVisitControl::Stop;
+        };
+        if distance > a.params.radius {
+            invalid = Some(ReenumeratedPairError::DistanceExceedsRadius {
+                distance,
+                radius: a.params.radius,
+            });
+            return EdgeVisitControl::Stop;
+        }
+        if page.quality >= b.params.min_quality && !page.common {
+            edges.push(StreamRowEdge {
+                b_index: page.index,
+                distance,
+            });
+        }
+        EdgeVisitControl::Continue
+    };
+    let completion = source
+        .visit_a(a_slot, &mut visitor)
+        .map_err(ReenumeratedPairError::Source)?;
+    if cancelled_in_visitor || cancel.load(Ordering::Acquire) {
+        return Err(ReenumeratedPairError::Cancelled);
+    }
+    if let Some(error) = invalid {
+        return Err(error);
+    }
+    if completion != EdgeVisitCompletion::Exhausted {
+        return Err(ReenumeratedPairError::SourceStopped);
+    }
+    check_stream_cancel(cancel)?;
+    edges.sort_by_key(|edge| (edge.b_index, edge.distance));
+    edges.dedup_by_key(|edge| edge.b_index);
+    Ok(edges)
+}
+
+fn apply_stream_row<S>(
+    a: &PreparedBookSide,
+    b: &PreparedBookSide,
+    a_slot: usize,
+    source: &mut S,
+    cancel: &AtomicBool,
+    b_values: &[u32],
+    tree: &mut [StreamAlignmentScore],
+    mut parents: Option<&mut HashMap<StreamEdgeKey, Option<StreamEdgeKey>>>,
+) -> Result<(), ReenumeratedPairError<S::Error>>
+where
+    S: ReenumeratedBookEdges,
+{
+    let a_index = a.pages[a_slot].index;
+    let edges = collect_reenumerated_row(a, b, a_slot, source, cancel)?;
+    let mut updates = Vec::with_capacity(edges.len());
+    for (position, edge) in edges.into_iter().enumerate() {
+        check_stream_cancel_at(position, cancel)?;
+        let b_position = b_values
+            .binary_search(&edge.b_index)
+            .map_err(|_| ReenumeratedPairError::ReplayInvariant)?;
+        let previous = stream_fenwick_query(tree, b_position);
+        let key = StreamEdgeKey {
+            a_index,
+            b_index: edge.b_index,
+        };
+        if let Some(parents) = parents.as_deref_mut() {
+            parents.insert(key, previous.tail);
+        }
+        updates.push((
+            b_position + 1,
+            StreamAlignmentScore {
+                matched: previous
+                    .matched
+                    .checked_add(1)
+                    .ok_or(ReenumeratedPairError::ArithmeticOverflow)?,
+                distance_sum: previous
+                    .distance_sum
+                    .checked_add(edge.distance as u64)
+                    .ok_or(ReenumeratedPairError::ArithmeticOverflow)?,
+                tail: Some(key),
+            },
+        ));
+    }
+    for (position, (b_position, score)) in updates.into_iter().enumerate() {
+        check_stream_cancel_at(position, cancel)?;
+        stream_fenwick_update(tree, b_position, score);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_stream_alignment<S>(
+    a: &PreparedBookSide,
+    b: &PreparedBookSide,
+    origin_edge_slots: &[usize],
+    source: &mut S,
+    cancel: &AtomicBool,
+    b_values: &[u32],
+    block_rows: usize,
+    checkpoints: &[StreamCheckpoint],
+    mut cursor: Option<StreamEdgeKey>,
+) -> Result<Vec<(u32, u32)>, ReenumeratedPairError<S::Error>>
+where
+    S: ReenumeratedBookEdges,
+{
+    let mut reverse = Vec::new();
+    let mut previous_block = None;
+    while let Some(mut target) = cursor {
+        check_stream_cancel(cancel)?;
+        let row_position = origin_edge_slots
+            .binary_search_by_key(&target.a_index, |&slot| a.pages[slot].index)
+            .map_err(|_| ReenumeratedPairError::ReplayInvariant)?;
+        let block = row_position / block_rows;
+        if previous_block.is_some_and(|previous| block >= previous) {
+            return Err(ReenumeratedPairError::ReplayInvariant);
+        }
+        previous_block = Some(block);
+        let checkpoint = checkpoints
+            .get(block)
+            .filter(|checkpoint| checkpoint.row_position == block * block_rows)
+            .ok_or(ReenumeratedPairError::ReplayInvariant)?;
+        let mut tree = copy_scores_checked(&checkpoint.tree, cancel)?;
+        let mut parents = HashMap::new();
+        for (offset, &a_slot) in origin_edge_slots[checkpoint.row_position..=row_position]
+            .iter()
+            .enumerate()
+        {
+            check_stream_cancel_at(offset, cancel)?;
+            apply_stream_row(
+                a,
+                b,
+                a_slot,
+                source,
+                cancel,
+                b_values,
+                &mut tree,
+                Some(&mut parents),
+            )?;
+        }
+
+        let block_start_a = a.pages[origin_edge_slots[checkpoint.row_position]].index;
+        loop {
+            reverse.push((target.a_index, target.b_index));
+            cursor = *parents
+                .get(&target)
+                .ok_or(ReenumeratedPairError::ReplayInvariant)?;
+            let Some(parent) = cursor else {
+                break;
+            };
+            if parent.a_index >= target.a_index {
+                return Err(ReenumeratedPairError::ReplayInvariant);
+            }
+            if parent.a_index < block_start_a {
+                break;
+            }
+            target = parent;
+        }
+    }
+    reverse.reverse();
+    Ok(reverse)
+}
+
+fn copy_scores_checked<E>(
+    scores: &[StreamAlignmentScore],
+    cancel: &AtomicBool,
+) -> Result<Vec<StreamAlignmentScore>, ReenumeratedPairError<E>> {
+    let mut copy = Vec::with_capacity(scores.len());
+    for (position, score) in scores.iter().copied().enumerate() {
+        check_stream_cancel_at(position, cancel)?;
+        copy.push(score);
+    }
+    Ok(copy)
+}
+
+fn integer_sqrt_ceil(value: usize) -> usize {
+    let mut root = 1usize;
+    while root.saturating_mul(root) < value {
+        root += 1;
+    }
+    root
+}
+
+fn stream_score_is_better(candidate: StreamAlignmentScore, current: StreamAlignmentScore) -> bool {
+    candidate.matched > current.matched
+        || (candidate.matched == current.matched && candidate.distance_sum < current.distance_sum)
+}
+
+fn stream_fenwick_query(tree: &[StreamAlignmentScore], mut end: usize) -> StreamAlignmentScore {
+    let mut best = StreamAlignmentScore::default();
+    while end > 0 {
+        if stream_score_is_better(tree[end], best) {
+            best = tree[end];
+        }
+        end &= end - 1;
+    }
+    best
+}
+
+fn stream_fenwick_update(
+    tree: &mut [StreamAlignmentScore],
+    mut position: usize,
+    score: StreamAlignmentScore,
+) {
+    while position < tree.len() {
+        if stream_score_is_better(score, tree[position]) {
+            tree[position] = score;
+        }
+        position += position & position.wrapping_neg();
+    }
+}
+
+fn check_stream_cancel<E>(cancel: &AtomicBool) -> Result<(), ReenumeratedPairError<E>> {
+    if cancel.load(Ordering::Acquire) {
+        Err(ReenumeratedPairError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_stream_cancel_at<E>(
+    position: usize,
+    cancel: &AtomicBool,
+) -> Result<(), ReenumeratedPairError<E>> {
+    if position % 1024 == 0 {
+        check_stream_cancel(cancel)
+    } else {
+        Ok(())
+    }
 }
 
 fn exact_near_pairs(
@@ -570,6 +1156,9 @@ fn fenwick_update(tree: &mut [AlignmentScore], mut position: usize, score: Align
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     fn params(radius: u32, max_books_per_page: u32) -> Params {
@@ -611,6 +1200,414 @@ mod tests {
             quality,
             sig: Sig::Bits(bytes.to_vec().into_boxed_slice()),
         }
+    }
+
+    fn fixed_content_sig(content: u32) -> [u8; 32] {
+        match content_sig(content) {
+            Sig::Bits(bits) => bits.as_ref().try_into().unwrap(),
+            Sig::Luma(_) => unreachable!(),
+        }
+    }
+
+    fn prepared_side(book: u32, contents: &[u32], params: Params) -> PreparedBookSide {
+        PreparedBookSide::new(
+            book,
+            contents
+                .iter()
+                .enumerate()
+                .map(|(index, &content)| VerifiedBookPage {
+                    index: index as u32,
+                    quality: 100,
+                    common: false,
+                    signature: fixed_content_sig(content),
+                })
+                .collect(),
+            params,
+        )
+        .unwrap()
+    }
+
+    struct MatrixEdgeSource {
+        rows: Vec<Vec<(usize, u32)>>,
+        calls: Vec<usize>,
+        fail_on: Option<usize>,
+        stop_on: Option<usize>,
+    }
+
+    impl MatrixEdgeSource {
+        fn from_sides(a: &PreparedBookSide, b: &PreparedBookSide) -> Self {
+            let rows = a
+                .pages
+                .iter()
+                .map(|a_page| {
+                    b.pages
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(b_slot, b_page)| {
+                            let distance = hamming_bytes(&a_page.signature, &b_page.signature);
+                            (distance <= a.params.radius).then_some((b_slot, distance))
+                        })
+                        .collect()
+                })
+                .collect();
+            Self {
+                rows,
+                calls: Vec::new(),
+                fail_on: None,
+                stop_on: None,
+            }
+        }
+
+        fn domain(&self, a: &PreparedBookSide) -> Vec<usize> {
+            self.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, edges)| {
+                    (!edges.is_empty()
+                        && a.pages[slot].quality >= a.params.min_quality
+                        && !a.pages[slot].common)
+                        .then_some(slot)
+                })
+                .collect()
+        }
+    }
+
+    impl ReenumeratedBookEdges for MatrixEdgeSource {
+        type Error = &'static str;
+
+        fn visit_a(
+            &mut self,
+            a_slot: usize,
+            visitor: &mut dyn FnMut(usize, u32) -> EdgeVisitControl,
+        ) -> Result<EdgeVisitCompletion, Self::Error> {
+            self.calls.push(a_slot);
+            if self.fail_on == Some(a_slot) {
+                return Err("edge source failed");
+            }
+            if self.stop_on == Some(a_slot) {
+                return Ok(EdgeVisitCompletion::Stopped);
+            }
+            for &(b_slot, distance) in self.rows.get(a_slot).into_iter().flatten() {
+                if visitor(b_slot, distance) == EdgeVisitControl::Stop {
+                    return Ok(EdgeVisitCompletion::Stopped);
+                }
+            }
+            Ok(EdgeVisitCompletion::Exhausted)
+        }
+    }
+
+    fn old_pair_for_sides(a: &PreparedBookSide, b: &PreparedBookSide) -> BookPair {
+        let pages = a
+            .pages
+            .iter()
+            .map(|page| BookPage {
+                book: a.book,
+                index: page.index,
+                quality: page.quality,
+                sig: Sig::Bits(Box::new(page.signature)),
+            })
+            .chain(b.pages.iter().map(|page| BookPage {
+                book: b.book,
+                index: page.index,
+                quality: page.quality,
+                sig: Sig::Bits(Box::new(page.signature)),
+            }))
+            .collect::<Vec<_>>();
+        classify_pair(&pages, a.params, a.book, b.book).unwrap()
+    }
+
+    fn streamed_pair_for_sides(
+        a: &PreparedBookSide,
+        b: &PreparedBookSide,
+    ) -> (BookPair, MatrixEdgeSource) {
+        let mut source = MatrixEdgeSource::from_sides(a, b);
+        let domain = source.domain(a);
+        let pair = classify_pair_reenumerated(a, b, &domain, &mut source, &AtomicBool::new(false))
+            .unwrap();
+        (pair, source)
+    }
+
+    #[test]
+    fn reenumerated_classifier_matches_existing_pair_fields() {
+        let params = params(0, 8);
+        let a = prepared_side(1, &[10, 20, 30], params);
+        let b = prepared_side(2, &[10, 20, 40, 50], params);
+        let expected = old_pair_for_sides(&a, &b);
+        let (actual, source) = streamed_pair_for_sides(&a, &b);
+        assert_eq!(actual, expected);
+        assert!(source.calls.iter().all(|slot| [0, 1].contains(slot)));
+    }
+
+    #[test]
+    fn full_diagonal_shortcut_precedes_edge_source_enumeration() {
+        let params = params(0, 8);
+        let a = prepared_side(1, &[1, 2, 3, 4], params);
+        let b = prepared_side(2, &[1, 2, 3, 4], params);
+        let mut source = MatrixEdgeSource::from_sides(&a, &b);
+        source.fail_on = Some(0);
+        let domain = vec![0, 1, 2, 3];
+        let pair =
+            classify_pair_reenumerated(&a, &b, &domain, &mut source, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(pair, old_pair_for_sides(&a, &b));
+        assert!(source.calls.is_empty());
+    }
+
+    #[test]
+    fn one_by_repeated_pages_preserves_existing_fenwick_ties() {
+        let params = params(0, 8);
+        for (b_len, expected_b) in [(3, 2), (4, 0)] {
+            let a = prepared_side(1, &[7], params);
+            let b = prepared_side(2, &vec![7; b_len], params);
+            let expected = old_pair_for_sides(&a, &b);
+            let (actual, _) = streamed_pair_for_sides(&a, &b);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.alignment, vec![(0, expected_b)]);
+        }
+    }
+
+    #[test]
+    fn checkpoint_replay_matches_dense_nonshortcut_oracle() {
+        let params = params(0, 8);
+        let mut a_contents = vec![7; 15];
+        a_contents.push(9);
+        let mut b_contents = vec![9];
+        b_contents.extend(vec![7; 15]);
+        let a = prepared_side(1, &a_contents, params);
+        let b = prepared_side(2, &b_contents, params);
+        let expected = old_pair_for_sides(&a, &b);
+        let (actual, source) = streamed_pair_for_sides(&a, &b);
+        assert_eq!(actual, expected);
+        assert!(source.calls.len() > a.pages.len() * 2);
+    }
+
+    #[test]
+    fn checkpoint_replay_crosses_blocks_and_ignores_b_pages_without_edges() {
+        let params = params(0, 8);
+        let a = prepared_side(1, &[1, 2, 3, 4, 5, 6, 7, 8, 9], params);
+        let b = prepared_side(2, &[1, 90, 2, 3, 4, 91, 5, 6, 7, 8, 9, 92], params);
+        let expected = old_pair_for_sides(&a, &b);
+        let (actual, _) = streamed_pair_for_sides(&a, &b);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.alignment.first(), Some(&(0, 0)));
+        assert_eq!(actual.alignment.last(), Some(&(8, 10)));
+    }
+
+    #[test]
+    fn sparse_same_length_pair_enumerates_only_its_complete_domain() {
+        let params = params(0, 8);
+        let a = prepared_side(1, &[1, 2, 3, 4], params);
+        let b = prepared_side(2, &[1, 20, 30, 40], params);
+        let expected = old_pair_for_sides(&a, &b);
+        let (actual, source) = streamed_pair_for_sides(&a, &b);
+        assert_eq!(actual, expected);
+        assert!(!source.calls.is_empty());
+        assert!(source.calls.iter().all(|&slot| slot == 0));
+    }
+
+    #[test]
+    fn weighted_stream_prefers_lower_total_distance() {
+        let params = params(32, 8);
+        let a = prepared_side(1, &[1, 2], params);
+        let b = prepared_side(2, &[3, 4, 5], params);
+        let mut source = MatrixEdgeSource {
+            rows: vec![vec![(0, 12), (1, 1)], vec![(2, 10)]],
+            calls: Vec::new(),
+            fail_on: None,
+            stop_on: None,
+        };
+        let pair =
+            classify_pair_reenumerated(&a, &b, &[0, 1], &mut source, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(pair.alignment, [(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn cancellation_inside_a_large_edge_callback_beats_source_stopped() {
+        struct CancellingSource<'a> {
+            cancel: &'a AtomicBool,
+            visited: &'a AtomicUsize,
+            observed_stop: &'a AtomicBool,
+        }
+
+        impl ReenumeratedBookEdges for CancellingSource<'_> {
+            type Error = Infallible;
+
+            fn visit_a(
+                &mut self,
+                _a_slot: usize,
+                visitor: &mut dyn FnMut(usize, u32) -> EdgeVisitControl,
+            ) -> Result<EdgeVisitCompletion, Self::Error> {
+                for edge in 0..2048 {
+                    if edge == 1024 {
+                        self.cancel.store(true, Ordering::Release);
+                    }
+                    self.visited.fetch_add(1, Ordering::Relaxed);
+                    if visitor(0, 0) == EdgeVisitControl::Stop {
+                        self.observed_stop.store(true, Ordering::Release);
+                        return Ok(EdgeVisitCompletion::Stopped);
+                    }
+                }
+                Ok(EdgeVisitCompletion::Exhausted)
+            }
+        }
+
+        let params = params(0, 8);
+        let a = prepared_side(1, &[1], params);
+        let b = prepared_side(2, &[1, 2], params);
+        let cancel = AtomicBool::new(false);
+        let visited = AtomicUsize::new(0);
+        let observed_stop = AtomicBool::new(false);
+        let mut source = CancellingSource {
+            cancel: &cancel,
+            visited: &visited,
+            observed_stop: &observed_stop,
+        };
+        assert_eq!(
+            classify_pair_reenumerated(&a, &b, &[0], &mut source, &cancel),
+            Err(ReenumeratedPairError::Cancelled)
+        );
+        assert!(observed_stop.load(Ordering::Acquire));
+        assert_eq!(visited.load(Ordering::Relaxed), 1025);
+    }
+
+    #[test]
+    fn one_row_deduplicates_repeated_edges_at_minimum_distance() {
+        let params = params(32, 8);
+        let a = prepared_side(1, &[1], params);
+        let b = prepared_side(2, &[2, 3], params);
+        let mut source = MatrixEdgeSource {
+            rows: vec![vec![(0, 12), (0, 3), (0, 8), (1, 9)]],
+            calls: Vec::new(),
+            fail_on: None,
+            stop_on: None,
+        };
+        let row =
+            collect_reenumerated_row(&a, &b, 0, &mut source, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            row.iter()
+                .map(|edge| (edge.b_index, edge.distance))
+                .collect::<Vec<_>>(),
+            [(0, 3), (1, 9)]
+        );
+    }
+
+    #[test]
+    fn source_failure_stop_cancel_and_invalid_edges_remain_distinct() {
+        let params = params(0, 8);
+        let a = prepared_side(1, &[1], params);
+        let b = prepared_side(2, &[2, 3], params);
+
+        let mut failed = MatrixEdgeSource {
+            rows: vec![vec![]],
+            calls: Vec::new(),
+            fail_on: Some(0),
+            stop_on: None,
+        };
+        assert_eq!(
+            classify_pair_reenumerated(&a, &b, &[0], &mut failed, &AtomicBool::new(false)),
+            Err(ReenumeratedPairError::Source("edge source failed"))
+        );
+
+        let mut stopped = MatrixEdgeSource {
+            rows: vec![vec![]],
+            calls: Vec::new(),
+            fail_on: None,
+            stop_on: Some(0),
+        };
+        assert_eq!(
+            classify_pair_reenumerated(&a, &b, &[0], &mut stopped, &AtomicBool::new(false)),
+            Err(ReenumeratedPairError::SourceStopped)
+        );
+
+        let mut cancelled_source = MatrixEdgeSource::from_sides(&a, &b);
+        assert_eq!(
+            classify_pair_reenumerated(&a, &b, &[], &mut cancelled_source, &AtomicBool::new(true)),
+            Err(ReenumeratedPairError::Cancelled)
+        );
+
+        let mut invalid = MatrixEdgeSource {
+            rows: vec![vec![(9, 0)]],
+            calls: Vec::new(),
+            fail_on: None,
+            stop_on: None,
+        };
+        assert_eq!(
+            classify_pair_reenumerated(&a, &b, &[0], &mut invalid, &AtomicBool::new(false)),
+            Err(ReenumeratedPairError::InvalidCandidateSlot {
+                a_slot: 0,
+                b_slot: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_side_binds_params_stats_and_sorted_slots_once() {
+        let params = params(32, 8);
+        let side = PreparedBookSide::new(
+            4,
+            vec![
+                VerifiedBookPage {
+                    index: 9,
+                    quality: 0,
+                    common: false,
+                    signature: [0; 32],
+                },
+                VerifiedBookPage {
+                    index: 2,
+                    quality: 100,
+                    common: true,
+                    signature: [0; 32],
+                },
+                VerifiedBookPage {
+                    index: 6,
+                    quality: 100,
+                    common: false,
+                    signature: [0; 32],
+                },
+            ],
+            params,
+        )
+        .unwrap();
+        assert_eq!(side.book(), 4);
+        assert_eq!(
+            side.pages()
+                .iter()
+                .map(|page| page.index)
+                .collect::<Vec<_>>(),
+            [2, 6, 9]
+        );
+        assert_eq!(side.distinctive_slots(), [1]);
+        assert_eq!(
+            side.stats(),
+            &BookStats {
+                book: 4,
+                total_pages: 3,
+                distinctive_pages: 1,
+                featureless_pages: 1,
+                common_pages: 1,
+            }
+        );
+        assert_eq!(
+            PreparedBookSide::new(
+                4,
+                vec![VerifiedBookPage {
+                    index: 0,
+                    quality: 1,
+                    common: false,
+                    signature: [0; 32],
+                }],
+                Params {
+                    radius: 257,
+                    ..params
+                },
+            )
+            .unwrap_err(),
+            AnalyzeError::RadiusExceedsBitWidth {
+                radius: 257,
+                bit_width: 256,
+            }
+        );
     }
 
     #[test]
