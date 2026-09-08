@@ -5,7 +5,7 @@
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-既存query callerとDB/検索計算はまだ切り替えていない。
+global dispatch gateもad2130581で保存済み（28件・製品check・独立レビュー成功）。既存query callerとDB/検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -166,13 +166,61 @@ finish_workerのDB open失敗等、spawn_worker失敗、scope configureのretain
 memory epoch更新とprogress/state確定を済ませ、scheduler/state→book ownerのnested通知を全guard解放後へ移す。
 旧epochのload結果を捨てる場合、旧結果として通知せず、その原因のscope変更側が再評価を通知する。
 FIFO保持、probe直後のReady通知、Unloadedでのindexer失敗終端、待機中hard cancel/dropを回帰で確認する。
+実コードの追加照合により、Missing/Failedをglobal gateのCompleteへ直接写像する案は撤回した。
+start_memory_loadはUnloaded以外で開始せず、array_update_loopもReady以外の配列を更新しない。
+ItemQueryFallbackが初期DB openより先にMissingを公開すると、indexerがDBを作成しても共有memoryにMissingが残り得る。
+Failedには派生baseの読込/保存失敗も含まれ、いずれも現在DBの不存在・読取失敗の証拠ではない。
+
+独立coreと合意した製品射影は次のとおり。
+
+| memory状態 | dispatch |
+| --- | --- |
+| Ready | Run。共有snapshotは候補としてTX整合を検証する |
+| Loading | Wait。実loaderの完了・失敗・epoch変更通知で再評価する |
+| Unloaded、実loader開始義務あり | Wait。表示用Runningではなくschedulerの実所有を読む |
+| Unloaded、producer不在 | Run。共有snapshotなしで同TX内のmemory-only fallbackを使う |
+| Missing / Failed | worker_runningにかかわらずRun。共有snapshotなしでDBを読み、実不存在はNotIndexed、実読取失敗はFailed |
+
+表示互換はcompletedと返却値を分ける。実NotIndexedをownerに保持し、有効keyかつ実scheduler稼働中の返却時だけPreparingへ投影する。
+Preparingをterminalとして保存したり、毎frame再投入したりしない。実Ready・実読取Failed・OFF対象のNotIndexedは補正しない。
+これは独立coreが承認した後続adapter接続の契約であり、先行generic gateはまだ製品UIを変更しない。
+
+共有loaderの再試行設計や単体画像検索は、この本照会の区切りで変更しない。
+runの正常/取消/失敗終端、finish_worker、spawn失敗はsoft失効とgate ticketを直接通知する。
+request_array_refreshだけではMissing/Failed時にpublishが起きず、private readerの完成結果も再計算されないため、代用しない。
+
+### generic gate先行区切りの実装合意
+
+BookQueryDispatchGate<T>はRun / Wait / Complete(BookQueryTerminal<T>)を返し、製品DB型を持たない。
+Weak通知口からownerのdispatch ticketを更新してwakeする。FIFO先頭はprobe前に消費せず、owner lock外でprobeし、
+再lock後にticket・head・lifecycleを再照合する。Waitは同じ述語でCondvar待機し、Completeはruntimeなしで先頭要求を終端する。
+Runが確定するまではruntime factoryも実行しない。worker localは未初期化/利用可/再生成待ちを単一enumで表し、製品callerはまだ切り替えない。
+
+独立coreの条件: head比較はclient IDだけでなくkey/hard generationも含めるか、hard/origin変更側でticketを進める。
+同clientのA→B→Aやglobal hardを取り逃さず、同じ要求の毎framepollではticketを進めない。
+signalだけではComplete済み結果のfreshnessは更新されない。MissingをComplete(NotIndexed)にした後、Ready公開がwakeだけだと旧結果が残る。
+soft_refresh / hard_invalidateは失効とdispatch ticketの更新を同じowner lock下で行い、製品publisherもこの統合通知を使う。
+soft更新とsignalを別呼び出しにして、その間の古いprobe Completeを新refresh世代として保存してはならない。
+古いComplete probeを停止→soft更新→再probeでRunとなる回帰を含める。signal単独は待機解除専用である。
+Runはsnapshot permitを保持しないため、runtimeの再captureでLoading/UnloadedになっていてもPreparingをterminalへ保存しない。
+hard取消なら破棄し、まだ有効なRunなら同TX read-onlyとmemory-only fallbackで実terminalまで進める。
+
+回帰対象は待機中A/BのFIFO保持、probe直後の通知、Complete後の次client、wait中hard/withdraw/drop/shutdown、
+Run前factory/executeが0、lazy化後のruntime init失敗・job panicからの再構築である。
+初回gate回帰は28成功。独立レビューでruntimeのOption＋restart boolを単一enumへ直し、probeを停止する3回帰の失敗時回収を補強した。最終tests3も28成功、check成功、独立再レビュー承認。
+probe停止中のsignal/soft/ABA操作は別threadで行い、bounded返却結果を保存してから必ずprobeを解放し、回収後にassertする。
+将来probeをowner lock中へ戻す誤修正があっても、テスト自体を停止させない。
+
 ## 同一 SQLite read transaction
 
 専用の read-only 接続を worker local に持つ。schema 更新を行う `SimilarDb::open_at` は照会 reader に使わない。
+DB不在と権限・破損・schema/read errorは区別し、is_file=falseやCannotOpenを一律NotIndexedへ畳まない。
 既存 SQL は private な `&Connection` helper へ共有し、旧 public wrapper の挙動を維持する。
 `BookReadSnapshot` は reader の transaction 期間だけを借用する。
 
 捕捉した配列・scope・要求から read TX を開始し、同 TX で store_id と変更連番を取得する。
+BEGIN DEFERREDだけでは読取snapshotは固定されず、最初のmetadata SELECTで固定される。
+先行実装はsimilar_db内のSQL helper共有・専用reader・with_snapshot要求scopeまでとし、MIH/classifier/manager callerは接続しない。
 変更連番 `read_seq` は履歴 prune 後も残る `sqlite_sequence` を読み、履歴の `MAX(seq)` で代用しない。
 配列を同 TX の連番まで delta 追随してから、起点・候補・common・ページ帯をすべて同じ時点で解決する。
 対象の identity、revision、signature、quality、Complete 状態、hash version、scope、page-order version も混在させない。
@@ -184,6 +232,22 @@ FIFO保持、probe直後のReady通知、Unloadedでのindexer失敗終端、待
   `renumber_container_pages` の commit 成功を `NoChange / Committed` 相当で通知する。
 - 修復対象 container が0でも order-version の commit があり得る。件数0を理由に通知を省略しない。
 - 同じ変更連番でも修復後の要求IDを更新し、起点・候補・common のページ順を同じ version へ揃える。
+
+### 専用SQL readerの取消境界
+
+ローカルrusqlite 0.31とbundled SQLiteの独立調査に基づき、hooks featureのprogress_handlerを専用readerへ付ける方針。
+Arc<AtomicBool>をAcquireで読み、追加の監視workerや共有writerへのhandler登録は行わない。
+get_interrupt_handleだけではidle時のinterruptが次SQLへ持ち越されず、flag確認からSQL開始までの取消を取り逃す。
+
+handler closureはConnectionが所有する。要求ごとのRAIIでerror/panicも含め解除し、旧cancel tokenを次要求へ残さない。
+statement/Rowsの終了、hook解除、readTX rollbackのborrow/drop順を具体的な実装で確認する。
+SQLITE_INTERRUPT/OperationInterruptedは当該cancel=trueなら取消、falseならFailedとして原因を保持する。
+SQL外のRustループには別途取消点が必要である。
+
+SQLiteのbusy待機はprogress handlerやinterrupt flagを見ない経路があるため、即取消の保証とはしない。
+新readerは接続既定の5秒を明示する案とし、schema移行用writerの180秒は流用しない。最終待ち時間と実測はreader採用時に記録する。
+busy handler用の別所有構造や監視workerは先行gate区切りには追加しない。
+隔離DBで長時間SELECT中の取消、同Connection次要求成功、error/panic後の解除、別writer非干渉を検証する。
 
 ### ページ順修復が失敗・未完了の場合
 

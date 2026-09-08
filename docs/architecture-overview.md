@@ -353,7 +353,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
-| `similar.db` / `similar.compact` | 別バージョン検索用。`similar.db` が唯一の正本で、お気に入り単位で有効化した PDQ-256、品質値、寸法・形式・保存場所と Complete な本 generation を保存する。`similar.compact` は検索用 44-byte record の再生成可能な派生 cache で、欠損・短縮・破損・DB 世代不一致なら無視する。ファイルの追加・変更・削除はアイテム索引と同じ favorite watcher から差分照合を要求する | `similar_db.rs` + `similar_index.rs` |
+| `similar.db` / `similar.base` | 別バージョン検索用。`similar.db` が唯一の正本で、item ID・revision・PDQ-256・品質・寸法・保存場所とCompleteな本generation、変更履歴を保存する。`similar.base` は1行48byteの不変baseとheaderを持つ派生配列で、store ID・形式version・順序・SHAを検証する。`similar.compact` は旧形式で現行検索には使わない。追加・変更・削除は既存favorite watcherから差分照合を要求する | `similar_db.rs` + `similar_search_array.rs` + `similar_index.rs` |
 | `adjustment.db` | ページ個別補正 (`page_params`)、お気に入り標準補正 (`favorite_params`)、お気に入り別表示状態 (`favorite_view_states`)。表示状態の行は独自状態を持つこと自体を表し、既存テーブルを変更せず追加テーブルとして共存する | `adjustment_db.rs` || `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
 | `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |

@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、17回帰/独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、28回帰/製品check/独立レビュー成功。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1634,3 +1634,30 @@ package fmt-checkとdiff-check成功。source生bytes SHA256=7abace84c3d9d28f1dc
 commit前後でR2 staged patchは100651bytes、SHA256=3adba6c9c6768c1540f3d8f0791d1dfefdc322acb270ec90966d5bca2131f42aのまま。
 R4 portableは固定成果物を維持する。UIの需要遷移・ROOT repaint接続、global readiness gate、同TX reader、MIHと実分類は後続。
 次の区切りは実装前にMemory/schedulerの状態射影・通知ticket・guard解放順を具体化して独立レビューする。
+
+### R1 global dispatch gateの区切り（製品caller未接続）
+
+focused commit: ad21305819f80662c28b6d6051ed97b0490f402c。src/similar_book_query.rsだけ、582追加/47削除。
+Run/Wait/Completeのprobeをowner lock外で実行し、ticket・先頭client/key/hard世代・lifecycle再照合後に採用する。
+Wait中はFIFO未消費、runtime未生成。soft/hard通知はfreshnessとticketを同じlock下で更新し、bare signalは待機解除だけを担う。
+worker local資源はWorkerRuntime Initial/Ready/Restartで所有し、取消/停止、init/restart失敗、job panic後の破棄を維持する。
+
+初回gate-tests1は28成功。独立レビューでOption＋restart boolを単一enumへ整理し、gate-tests2も28成功。
+probeを停止したままsignal/soft/ABAを操作する3fixtureは、製品がlock外probeを破った場合にもtestを停止させないよう補強した。
+operatorを別scoped threadで実行→3秒bounded返却結果保存→必ずprobe解放→operatorとworker回収→最後にlock非保持をassertする。
+このtest-only補強の初回tests3はHarness全体のcaptureでReceiver非SyncとなりE0277が2箇所発生した。
+実装担当が同名で再実行し、失敗log原本は上書き消失した。親toolのtail観測と担当報告はあるが、原本保存済みとは扱わない。
+修正はexecutor/client参照だけをcaptureするもの。以降は試行ごと別log名とする。
+
+最終target/r1-book-query-gate-tests3.logは28成功/0失敗/0ignored、compile1分25秒、test0.02秒、exit0。
+log SHA256=9796ac92bd55fb5c5e5231eebfad76d851c05b169323083abc05c00943306ad5。
+製品cfg target/r1-book-query-gate-check1.logは27.89秒/exit0、SHA256=237900c3ff1569ca4a4de70c9654a30636876b7687f70a2ef18f005341dc06f5。
+fmt-check/diff-check成功。source生bytes SHA256=0b4f52b9d73c8534812a6992c11c8c818ab4eba8d27f223b586ba0d8a096bb22。
+独立coreはこの最終SHAのenumと3fixtureを再確認し、追加指摘なしでgate単独差分を承認した。
+通常hook付きcommit後もsource SHAとR2 staged patchの100651bytes/3adba6c9...f42aは不変。
+
+後続reader設計は独立レビュー済み。Missing/Failedは派生loaderの過去状態なので本照会の固定terminalにはせず、readonly TXで実態を読む。
+実NotIndexedを保存し有効key＋scheduler稼働中の返却だけPreparingへ投影する。全終端通知は配列publishに依存せずsoftへ直結する。
+詳細とSQL取消/busy限界はbook-query-review-fixesを正本とする。共有loaderと単体画像検索の再設計には範囲を広げない。
+architecture-overviewの永続化表に旧similar.compact/44byteの説明が残っていたため、コードに一致するsimilar.base/48byteへ訂正した。
+R4 portableと実機確認待ちは維持。reader/MIH/classifier/実caller/本照会性能とpeak/最終gate/portableの完了を意味しない。
