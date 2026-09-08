@@ -4,10 +4,14 @@
 //! staging 表へ書き、最後の transaction でだけ公開世代と入れ替える。
 
 use std::collections::HashSet;
+use std::fmt;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 const SCHEMA_VERSION: i64 = 3;
 pub const HASH_ALGORITHM_VERSION: u32 = 1;
@@ -186,6 +190,67 @@ pub struct SimilarDb {
     conn: Mutex<Connection>,
 }
 
+/// Metadata captured by the first read in a book-query transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BookReadMetadata {
+    pub(crate) store_id: [u8; 16],
+    pub(crate) read_seq: u64,
+    pub(crate) page_order_version: i64,
+}
+
+/// A dedicated, worker-local connection for one-book queries.
+///
+/// This connection never creates or migrates the store. [`Self::open_at`] returns `Ok(None)` only
+/// when the path itself does not exist; permission, corruption, schema, and read failures remain
+/// errors for the caller to publish as `Failed`.
+pub(crate) struct SimilarBookReader {
+    conn: Connection,
+}
+
+/// Failure from the dedicated book reader.
+#[derive(Debug)]
+pub(crate) enum BookReadError {
+    Cancelled,
+    Io(std::io::Error),
+    Database(rusqlite::Error),
+    UnsupportedSchema { found: i64, expected: i64 },
+}
+
+impl fmt::Display for BookReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("book query was cancelled"),
+            Self::Io(error) => write!(formatter, "book query store access failed: {error}"),
+            Self::Database(error) => write!(formatter, "book query database read failed: {error}"),
+            Self::UnsupportedSchema { found, expected } => write!(
+                formatter,
+                "book query store schema {found} is not the supported schema {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BookReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Database(error) => Some(error),
+            Self::Cancelled | Self::UnsupportedSchema { .. } => None,
+        }
+    }
+}
+
+/// Borrowed access to the one SQLite read transaction used by a book query.
+pub(crate) struct BookReadSnapshot<'transaction> {
+    conn: &'transaction Connection,
+    cancel: &'transaction AtomicBool,
+    metadata: BookReadMetadata,
+}
+
+struct CancellableReadTransaction<'conn> {
+    transaction: Option<Transaction<'conn>>,
+}
+
 /// WAL への変換だけを直列化する。
 ///
 /// `PRAGMA journal_mode=WAL` は排他ロックへ昇格するため、同じ fresh DB を複数接続が同時に
@@ -217,6 +282,203 @@ fn ensure_wal_journal(conn: &Connection) -> rusqlite::Result<()> {
 fn journal_mode_is_wal(conn: &Connection) -> rusqlite::Result<bool> {
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     Ok(mode.eq_ignore_ascii_case("wal"))
+}
+
+const BOOK_READER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BOOK_READER_PROGRESS_OPS: i32 = 1_000;
+
+impl SimilarBookReader {
+    /// Opens an existing store without creating directories, changing journal settings, or
+    /// migrating schema. `None` means that the path did not exist at the metadata check.
+    pub(crate) fn open_at(path: &Path) -> Result<Option<Self>, BookReadError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(BookReadError::Io(error)),
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(BookReadError::Database)?;
+        // SQLite's busy wait does not run the progress handler. Keep the connection default
+        // explicit instead of inheriting the writer's 180-second migration timeout.
+        conn.busy_timeout(BOOK_READER_BUSY_TIMEOUT)
+            .map_err(BookReadError::Database)?;
+        Ok(Some(Self { conn }))
+    }
+
+    /// Runs `read` inside one deferred SQLite read transaction.
+    ///
+    /// `BEGIN DEFERRED` alone does not select a database snapshot. The metadata query below is the
+    /// first read and fixes the snapshot before any base, delta, page, or target lookup. The
+    /// progress handler belongs only to this request and is removed before commit/rollback so a
+    /// cancelled token cannot leak into the next request on the worker-local connection.
+    pub(crate) fn with_snapshot<R, F>(
+        &mut self,
+        cancel: Arc<AtomicBool>,
+        read: F,
+    ) -> Result<R, BookReadError>
+    where
+        F: for<'snapshot> FnOnce(&BookReadSnapshot<'snapshot>) -> rusqlite::Result<R>,
+    {
+        let transaction = self.conn.transaction().map_err(BookReadError::Database)?;
+        let progress_cancel = Arc::clone(&cancel);
+        transaction.progress_handler(
+            BOOK_READER_PROGRESS_OPS,
+            Some(move || progress_cancel.load(Ordering::Acquire)),
+        );
+        let transaction = CancellableReadTransaction {
+            transaction: Some(transaction),
+        };
+
+        let metadata = match book_read_metadata(&transaction, Some(cancel.as_ref())) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(classify_book_read_error(error, cancel.as_ref())),
+        };
+        let schema_version = match stored_schema_version(&transaction) {
+            Ok(version) => version,
+            Err(error) => return Err(classify_book_read_error(error, cancel.as_ref())),
+        };
+        if schema_version != SCHEMA_VERSION {
+            return Err(BookReadError::UnsupportedSchema {
+                found: schema_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+
+        let result = {
+            let snapshot = BookReadSnapshot {
+                conn: &transaction,
+                cancel: cancel.as_ref(),
+                metadata,
+            };
+            read(&snapshot)
+        };
+        match result {
+            Ok(value) => {
+                transaction.commit().map_err(BookReadError::Database)?;
+                Ok(value)
+            }
+            Err(error) => Err(classify_book_read_error(error, cancel.as_ref())),
+        }
+    }
+}
+
+impl BookReadSnapshot<'_> {
+    pub(crate) fn metadata(&self) -> BookReadMetadata {
+        self.metadata
+    }
+
+    pub(crate) fn check_cancelled(&self) -> rusqlite::Result<()> {
+        check_book_read_cancelled(Some(self.cancel))
+    }
+
+    pub(crate) fn load_base_search_rows(
+        &self,
+        hash_version: i64,
+    ) -> rusqlite::Result<BaseSearchRows> {
+        Ok(BaseSearchRows {
+            store_id: self.metadata.store_id,
+            applied_seq: self.metadata.read_seq,
+            records: load_base_search_records(self.conn, hash_version, Some(self.cancel))?,
+        })
+    }
+
+    pub(crate) fn load_item_changes_after(
+        &self,
+        after_seq: u64,
+    ) -> rusqlite::Result<ItemChangeBatch> {
+        load_item_changes_after_connection(
+            self.conn,
+            after_seq,
+            self.metadata.read_seq,
+            Some(self.cancel),
+        )
+    }
+
+    pub(crate) fn load_item(
+        &self,
+        item_key: &str,
+        hash_version: i64,
+    ) -> rusqlite::Result<Option<SearchRow>> {
+        self.check_cancelled()?;
+        let row = load_search_item_by_key(self.conn, item_key, hash_version)?;
+        self.check_cancelled()?;
+        Ok(row)
+    }
+
+    pub(crate) fn load_book_pages(
+        &self,
+        container_key: &str,
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        load_book_pages_connection(self.conn, container_key, hash_version, Some(self.cancel))
+    }
+
+    pub(crate) fn resolve_pages_by_item_id(
+        &self,
+        item_ids: &[u64],
+        hash_version: i64,
+    ) -> rusqlite::Result<Vec<SearchRow>> {
+        resolve_pages_by_item_id_connection(self.conn, item_ids, hash_version, Some(self.cancel))
+    }
+}
+
+impl Deref for CancellableReadTransaction<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.transaction
+            .as_ref()
+            .expect("book read transaction must exist")
+    }
+}
+
+impl CancellableReadTransaction<'_> {
+    fn commit(mut self) -> rusqlite::Result<()> {
+        let transaction = self
+            .transaction
+            .take()
+            .expect("book read transaction must exist");
+        transaction.progress_handler(0, None::<fn() -> bool>);
+        transaction.commit()
+    }
+}
+
+impl Drop for CancellableReadTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(transaction) = self.transaction.as_ref() {
+            // This runs before Transaction::drop attempts ROLLBACK. Keeping a true cancellation
+            // hook installed during rollback could interrupt cleanup, whose Drop error is ignored.
+            transaction.progress_handler(0, None::<fn() -> bool>);
+        }
+    }
+}
+
+fn classify_book_read_error(error: rusqlite::Error, cancel: &AtomicBool) -> BookReadError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::OperationInterrupted
+    ) && cancel.load(Ordering::Acquire)
+    {
+        BookReadError::Cancelled
+    } else {
+        BookReadError::Database(error)
+    }
+}
+
+fn check_book_read_cancelled(cancel: Option<&AtomicBool>) -> rusqlite::Result<()> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            Some("book query was cancelled".to_owned()),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 impl SimilarDb {
@@ -699,47 +961,7 @@ impl SimilarDb {
         let transaction = conn.transaction()?;
         let store_id = search_store_id(&transaction)?;
         let applied_seq = latest_change_seq(&transaction)?;
-        let count_i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM item i
-             LEFT JOIN container c ON c.container_key = i.container_key
-             WHERE i.hash_version = ?1
-               AND (i.container_key IS NULL OR c.scan_state = ?2)",
-            params![hash_version, ScanState::Complete as i64],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let count = usize::try_from(count_i64)
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count_i64))?;
-        let mut records = Vec::with_capacity(count);
-        let mut statement = transaction.prepare(
-            "SELECT i.item_id, i.pdq256, i.quality, i.revision
-             FROM item i
-             LEFT JOIN container c ON c.container_key = i.container_key
-             WHERE i.hash_version = ?1
-               AND (i.container_key IS NULL OR c.scan_state = ?2)
-             ORDER BY i.item_id",
-        )?;
-        let mut rows = statement.query(params![hash_version, ScanState::Complete as i64])?;
-        while let Some(row) = rows.next()? {
-            let item_id = i64_to_u64(row.get(0)?, 0)?;
-            let pdq = row.get_ref(1)?.as_blob()?;
-            let signature: [u8; 32] = pdq.try_into().map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    pdq.len(),
-                    rusqlite::types::Type::Blob,
-                    "pdq256 must contain 32 bytes".into(),
-                )
-            })?;
-            let quality_i64 = row.get::<_, i64>(2)?;
-            records.push(BaseSearchRow {
-                item_id,
-                signature,
-                quality: u8::try_from(quality_i64)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, quality_i64))?,
-                revision: i64_to_u32(row.get(3)?, 3)?,
-            });
-        }
-        drop(rows);
-        drop(statement);
+        let records = load_base_search_records(&transaction, hash_version, None)?;
         transaction.commit()?;
         Ok(BaseSearchRows {
             store_id,
@@ -758,29 +980,9 @@ impl SimilarDb {
         // 読み取り専用。ここで書くなら `write_transaction` に替えること。
         let transaction = conn.transaction()?;
         let latest_seq = latest_change_seq(&transaction)?;
-        let first_available_seq = transaction
-            .query_row("SELECT MIN(seq) FROM item_change", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })?
-            .map(|value| i64_to_u64(value, 0))
-            .transpose()?;
-        let after_i64 = i64::try_from(after_seq).map_err(|_| {
-            rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
-        })?;
-        let mut statement = transaction.prepare(
-            "SELECT seq, item_id, op, revision, pdq256, quality
-             FROM item_change WHERE seq > ?1 ORDER BY seq",
-        )?;
-        let changes = statement
-            .query_map([after_i64], row_to_item_change)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+        let batch = load_item_changes_after_connection(&transaction, after_seq, latest_seq, None)?;
         transaction.commit()?;
-        Ok(ItemChangeBatch {
-            latest_seq,
-            first_available_seq,
-            changes,
-        })
+        Ok(batch)
     }
 
     pub fn prune_item_changes_through(&self, through_seq: u64) -> rusqlite::Result<usize> {
@@ -1053,17 +1255,7 @@ impl SimilarDb {
         hash_version: i64,
     ) -> rusqlite::Result<Vec<SearchRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut statement = conn.prepare(&format!(
-            "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key = i.container_key
-             WHERE i.container_key = ?1 AND i.hash_version = ?2 AND c.scan_state = ?3
-             ORDER BY i.page_index"
-        ))?;
-        statement
-            .query_map(
-                params![container_key, hash_version, ScanState::Complete as i64],
-                row_to_search_row,
-            )?
-            .collect()
+        load_book_pages_connection(&conn, container_key, hash_version, None)
     }
 
     /// 配列が提案した item_id 群を、一つの読み取り snapshot で解決する。
@@ -1077,12 +1269,7 @@ impl SimilarDb {
     ) -> rusqlite::Result<Vec<SearchRow>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = conn.transaction()?;
-        let mut rows = Vec::with_capacity(item_ids.len());
-        for &item_id in item_ids {
-            if let Some(row) = load_search_item_by_id(&transaction, item_id, hash_version)? {
-                rows.push(row);
-            }
-        }
+        let rows = resolve_pages_by_item_id_connection(&transaction, item_ids, hash_version, None)?;
         transaction.commit()?;
         Ok(rows)
     }
@@ -1550,6 +1737,177 @@ fn row_to_item_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemChange> {
     })
 }
 
+fn book_read_metadata(
+    conn: &Connection,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<BookReadMetadata> {
+    check_book_read_cancelled(cancel)?;
+    // This is deliberately the first SELECT after BEGIN DEFERRED: it fixes the SQLite snapshot
+    // used by every subsequent lookup in BookReadSnapshot.
+    let (store_id, page_order_version, read_seq) = conn.query_row(
+        "SELECT store_id, page_order_version,
+                COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'item_change'), 0)
+           FROM search_content_state WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let store_id: [u8; 16] = store_id.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Blob,
+            "search content store_id must contain 16 bytes".into(),
+        )
+    })?;
+    let read_seq = i64_to_u64(read_seq, 2)?;
+    check_book_read_cancelled(cancel)?;
+    Ok(BookReadMetadata {
+        store_id,
+        read_seq,
+        page_order_version,
+    })
+}
+
+fn load_base_search_records(
+    conn: &Connection,
+    hash_version: i64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Vec<BaseSearchRow>> {
+    check_book_read_cancelled(cancel)?;
+    let count_i64 = conn.query_row(
+        "SELECT COUNT(*) FROM item i
+         LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.hash_version = ?1
+           AND (i.container_key IS NULL OR c.scan_state = ?2)",
+        params![hash_version, ScanState::Complete as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let count = usize::try_from(count_i64)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count_i64))?;
+    check_book_read_cancelled(cancel)?;
+
+    let mut records = Vec::with_capacity(count);
+    let mut statement = conn.prepare(
+        "SELECT i.item_id, i.pdq256, i.quality, i.revision
+         FROM item i
+         LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.hash_version = ?1
+           AND (i.container_key IS NULL OR c.scan_state = ?2)
+         ORDER BY i.item_id",
+    )?;
+    let mut rows = statement.query(params![hash_version, ScanState::Complete as i64])?;
+    while let Some(row) = rows.next()? {
+        check_book_read_cancelled(cancel)?;
+        let item_id = i64_to_u64(row.get(0)?, 0)?;
+        let pdq = row.get_ref(1)?.as_blob()?;
+        let signature: [u8; 32] = pdq.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                pdq.len(),
+                rusqlite::types::Type::Blob,
+                "pdq256 must contain 32 bytes".into(),
+            )
+        })?;
+        let quality_i64 = row.get::<_, i64>(2)?;
+        records.push(BaseSearchRow {
+            item_id,
+            signature,
+            quality: u8::try_from(quality_i64)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, quality_i64))?,
+            revision: i64_to_u32(row.get(3)?, 3)?,
+        });
+    }
+    drop(rows);
+    drop(statement);
+    check_book_read_cancelled(cancel)?;
+    Ok(records)
+}
+
+fn load_item_changes_after_connection(
+    conn: &Connection,
+    after_seq: u64,
+    latest_seq: u64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<ItemChangeBatch> {
+    check_book_read_cancelled(cancel)?;
+    let first_available_seq = conn
+        .query_row("SELECT MIN(seq) FROM item_change", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .map(|value| i64_to_u64(value, 0))
+        .transpose()?;
+    let after_i64 = i64::try_from(after_seq).map_err(|_| {
+        rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
+    })?;
+    let mut statement = conn.prepare(
+        "SELECT seq, item_id, op, revision, pdq256, quality
+         FROM item_change WHERE seq > ?1 ORDER BY seq",
+    )?;
+    let mut query = statement.query([after_i64])?;
+    let mut changes = Vec::new();
+    while let Some(row) = query.next()? {
+        check_book_read_cancelled(cancel)?;
+        changes.push(row_to_item_change(row)?);
+    }
+    drop(query);
+    drop(statement);
+    check_book_read_cancelled(cancel)?;
+    Ok(ItemChangeBatch {
+        latest_seq,
+        first_available_seq,
+        changes,
+    })
+}
+
+fn load_book_pages_connection(
+    conn: &Connection,
+    container_key: &str,
+    hash_version: i64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Vec<SearchRow>> {
+    check_book_read_cancelled(cancel)?;
+    let mut statement = conn.prepare(&format!(
+        "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key = i.container_key
+         WHERE i.container_key = ?1 AND i.hash_version = ?2 AND c.scan_state = ?3
+         ORDER BY i.page_index"
+    ))?;
+    let mut query = statement.query(params![
+        container_key,
+        hash_version,
+        ScanState::Complete as i64
+    ])?;
+    let mut pages = Vec::new();
+    while let Some(row) = query.next()? {
+        check_book_read_cancelled(cancel)?;
+        pages.push(row_to_search_row(row)?);
+    }
+    drop(query);
+    drop(statement);
+    check_book_read_cancelled(cancel)?;
+    Ok(pages)
+}
+
+fn resolve_pages_by_item_id_connection(
+    conn: &Connection,
+    item_ids: &[u64],
+    hash_version: i64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<Vec<SearchRow>> {
+    let mut rows = Vec::with_capacity(item_ids.len());
+    for &item_id in item_ids {
+        check_book_read_cancelled(cancel)?;
+        if let Some(row) = load_search_item_by_id(conn, item_id, hash_version)? {
+            rows.push(row);
+        }
+    }
+    check_book_read_cancelled(cancel)?;
+    Ok(rows)
+}
+
 fn i64_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
@@ -1823,6 +2181,251 @@ mod tests {
             height: 80,
             format: 1,
         }
+    }
+
+    fn publish_test_book(db: &SimilarDb, book: &str, pages: &[(&str, u8)]) {
+        let generation = db
+            .begin_container_build(book, ContainerKind::ImageFolder, pages.len() as u32, 1, 2)
+            .unwrap();
+        for (page_index, (key, marker)) in pages.iter().enumerate() {
+            db.stage_item(
+                generation,
+                &item(key, Some(book), Some(page_index as u32), *marker),
+            )
+            .unwrap();
+        }
+        db.complete_container(book, generation).unwrap();
+    }
+
+    #[test]
+    fn book_reader_keeps_metadata_base_delta_pages_and_targets_in_one_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        publish_test_book(&db, "book", &[("book/old", 0x11)]);
+
+        let old_base = db.load_base_search_rows(current_hash_version()).unwrap();
+        let old_changes = db.load_item_changes_after(0).unwrap();
+        let old_pages = db.load_book_pages("book", current_hash_version()).unwrap();
+        let old_item_id = old_pages[0].item_id;
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (metadata, base, changes, pages, targets, origin) = reader
+            .with_snapshot(Arc::clone(&cancel), |snapshot| {
+                let metadata = snapshot.metadata();
+                // The metadata SELECT above fixed this read snapshot. A separate WAL writer may
+                // publish a new complete generation without changing any later read in this TX.
+                publish_test_book(&db, "book", &[("book/new-a", 0x22), ("book/new-b", 0x33)]);
+                Ok((
+                    metadata,
+                    snapshot.load_base_search_rows(current_hash_version())?,
+                    snapshot.load_item_changes_after(0)?,
+                    snapshot.load_book_pages("book", current_hash_version())?,
+                    snapshot.resolve_pages_by_item_id(&[old_item_id], current_hash_version())?,
+                    snapshot.load_item("book/old", current_hash_version())?,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(metadata.store_id, old_base.store_id);
+        assert_eq!(metadata.read_seq, old_base.applied_seq);
+        assert_eq!(metadata.page_order_version, PAGE_ORDER_VERSION);
+        assert_eq!(base.store_id, old_base.store_id);
+        assert_eq!(base.applied_seq, old_base.applied_seq);
+        assert_eq!(base.records, old_base.records);
+        assert_eq!(changes, old_changes);
+        assert_eq!(pages, old_pages);
+        assert_eq!(targets, old_pages);
+        assert_eq!(origin, Some(old_pages[0].clone()));
+
+        let (next_metadata, next_pages) = reader
+            .with_snapshot(cancel, |snapshot| {
+                Ok((
+                    snapshot.metadata(),
+                    snapshot.load_book_pages("book", current_hash_version())?,
+                ))
+            })
+            .unwrap();
+        assert!(next_metadata.read_seq > metadata.read_seq);
+        assert_eq!(
+            next_pages
+                .iter()
+                .map(|page| page.item.item_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["book/new-a", "book/new-b"]
+        );
+    }
+
+    #[test]
+    fn book_reader_distinguishes_missing_corrupt_and_unsupported_stores() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing.db");
+        assert!(SimilarBookReader::open_at(&missing).unwrap().is_none());
+
+        let directory = tmp.path().join("directory.db");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            SimilarBookReader::open_at(&directory),
+            Err(BookReadError::Database(_))
+        ));
+
+        let corrupt = tmp.path().join("corrupt.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        match SimilarBookReader::open_at(&corrupt) {
+            Err(BookReadError::Database(_)) => {}
+            Ok(Some(mut reader)) => assert!(matches!(
+                reader.with_snapshot(Arc::new(AtomicBool::new(false)), |_| Ok(())),
+                Err(BookReadError::Database(_))
+            )),
+            Ok(None) | Err(BookReadError::Cancelled | BookReadError::Io(_)) => {
+                panic!("a present corrupt store was classified as absent or cancelled")
+            }
+            Err(BookReadError::UnsupportedSchema { .. }) => {
+                panic!("a corrupt store was classified as a valid alternate schema")
+            }
+        }
+
+        let unsupported = tmp.path().join("unsupported.db");
+        let db = SimilarDb::open_at(&unsupported).unwrap();
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(db);
+        let mut reader = SimilarBookReader::open_at(&unsupported).unwrap().unwrap();
+        assert!(matches!(
+            reader.with_snapshot(Arc::new(AtomicBool::new(false)), |_| Ok(())),
+            Err(BookReadError::UnsupportedSchema {
+                found,
+                expected: SCHEMA_VERSION
+            }) if found == SCHEMA_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn book_reader_sql_cancel_is_request_scoped_and_connection_is_reusable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let writer = SimilarDb::open_at(&path).unwrap();
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_weak = Arc::downgrade(&cancel);
+        let worker_cancel = Arc::clone(&cancel);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let interrupted = reader.with_snapshot(Arc::clone(&worker_cancel), |snapshot| {
+                started_tx.send(()).unwrap();
+                snapshot.conn.query_row(
+                    "WITH RECURSIVE count(value) AS (
+                         VALUES(0) UNION ALL SELECT value + 1 FROM count WHERE value < 100000000
+                     ) SELECT sum(value) FROM count",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(())
+            });
+            drop(worker_cancel);
+            (interrupted, reader)
+        });
+
+        let started = started_rx.recv_timeout(Duration::from_secs(3));
+        cancel.store(true, Ordering::Release);
+        let concurrent_write = writer.upsert_loose_item(&item("writer", None, None, 0x77));
+        let joined = worker.join();
+        assert!(
+            started.is_ok(),
+            "long reader query did not start: {started:?}"
+        );
+        let (interrupted, mut reader) = joined.expect("book reader worker panicked");
+        assert!(matches!(interrupted, Err(BookReadError::Cancelled)));
+        assert!(
+            concurrent_write.is_ok(),
+            "cancelled read transaction interfered with a separate WAL writer: {concurrent_write:?}"
+        );
+        assert!(
+            writer
+                .load_item("writer", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+        drop(cancel);
+        assert!(
+            cancel_weak.upgrade().is_none(),
+            "cancelled request hook retained its token"
+        );
+        assert!(
+            reader
+                .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                    Ok(snapshot.metadata())
+                })
+                .is_ok(),
+            "cancelled request left its read transaction active"
+        );
+
+        let error_token = Arc::new(AtomicBool::new(false));
+        let error_token_weak = Arc::downgrade(&error_token);
+        let failed = reader.with_snapshot(Arc::clone(&error_token), |snapshot| {
+            snapshot.conn.query_row(
+                "SELECT value FROM table_that_does_not_exist",
+                [],
+                |_| Ok(()),
+            )
+        });
+        assert!(matches!(failed, Err(BookReadError::Database(_))));
+        drop(error_token);
+        assert!(
+            error_token_weak.upgrade().is_none(),
+            "failed request hook retained its token"
+        );
+        assert!(
+            reader
+                .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                    Ok(snapshot.metadata())
+                })
+                .is_ok(),
+            "SQL error left the reader transaction or hook active"
+        );
+
+        let panic_token = Arc::new(AtomicBool::new(false));
+        let panic_token_weak = Arc::downgrade(&panic_token);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reader.with_snapshot(
+                Arc::clone(&panic_token),
+                |_snapshot| -> rusqlite::Result<()> {
+                    panic!("test panic after progress hook installation")
+                },
+            );
+        }));
+        assert!(panicked.is_err());
+        drop(panic_token);
+        assert!(
+            panic_token_weak.upgrade().is_none(),
+            "panicked request hook retained its token"
+        );
+        assert!(
+            reader
+                .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                    Ok(snapshot.metadata())
+                })
+                .is_ok(),
+            "panic left the reader transaction or hook active"
+        );
+    }
+
+    #[test]
+    fn book_reader_is_read_only_and_uses_the_bounded_busy_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        drop(SimilarDb::open_at(&path).unwrap());
+        let reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        let timeout_ms: i64 = reader
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout_ms, BOOK_READER_BUSY_TIMEOUT.as_millis() as i64);
+        assert!(reader.conn.execute("DELETE FROM item", []).is_err());
     }
 
     /// Step 5 より前の店を作る。移行が「同じ値を運べたか」を問えるように、DDL は当時のまま

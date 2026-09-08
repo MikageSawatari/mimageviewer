@@ -344,7 +344,7 @@ resvg = "0.45"
 kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 sha2 = "0.10"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }
