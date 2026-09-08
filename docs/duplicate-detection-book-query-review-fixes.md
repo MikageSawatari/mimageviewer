@@ -2,8 +2,8 @@
 
 2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
-Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実本5頁/400頁の独立oracleは成功、実engine cold/warm n3とCPU/peak pilotも記録済み。実行中の非同期取消compositionは4件と独立Solレビューで検証済み。通常4条件のcold/warm各20標本、大規模UIのrelease補助測定、特殊大規模/世代更新8条件の各3標本も完了。検証版への採用を承認。最終gate/portable・利用者実機は未完了。
-撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品への接続と大規模条件を検証し、検証版への採用を承認済み。最終配布前検証と利用者実機の受入は未完了**。
+Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実本5頁/400頁の独立oracleは成功、実engine cold/warm n3とCPU/peak pilotも記録済み。実行中の非同期取消compositionは4件と独立Solレビューで検証済み。通常4条件のcold/warm各20標本、大規模UIのrelease補助測定、特殊大規模/世代更新8条件の各3標本も完了。検証版への採用を承認し、最終gate（main7789成功）とportable更新・24files照合も完了。利用者実機は未完了。
+撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品への接続・大規模条件・最終全体gateを検証し、ポータブル検証版を更新済み。利用者実機の受入は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
 global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。疎result/UIはAの3fd01996fで実装・回帰・画像レビュー済み。B/Cで本検索計算と製品query callerを接続済み。性能と最終配布前検証を残す。

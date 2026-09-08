@@ -25,13 +25,13 @@
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
-| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。大規模UIのrelease補助測定と特殊大規模/世代更新8条件のcold/warm各3標本も完了。検証版への採用を承認。最終gate/portable・実機は未完了 |
+| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。R4時点gate（main7693/0/38ignored）とR1統合後の共通最終gate（main7789/0/42ignored、vendor25/9/15）成功。最終portable更新済み、実機確認待ち |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。大規模UIのrelease補助測定と特殊大規模/世代更新8条件のcold/warm各3標本も完了。検証版への採用を承認。最終gate成功（main7789/0/42ignored、vendor25/9/15）、最終portable更新・24files照合済み。利用者実機は未完了 |
 
-### 現在の残作業（2026-09-09、利用者への状況説明時点）
+### 現在の到達点と実機確認待ち（2026-09-09、最終引き継ぎ時点）
 
 製品の主要修正と独立レビューは完了し、通常4条件のcold/warm各20標本、実本2件の全field照合、実行途中取消4件も完了した。
-残る自動検証の範囲を次の4群に固定し、既存成功ケースの反復や新たな探索へ広げない。
+自動検証の範囲は次の4群に固定し、すべて完了した。既存成功ケースの反復や新たな探索へは広げていない。
 
 1. 400頁からの2800候補と実PDQ near-whiteの8冊/9冊境界。
 2. 1万頁の対角一致と一般dense対応。
@@ -39,10 +39,24 @@
 4. 実draw/ScrollArea経路の大量結果描画（releaseの補助測定）。
 
 共通release test compile、4のUI補助測定、1〜3の構造検証/8条件の性能計測まで成功。入力固定P2とfixture期待値を訂正し、独立Sol承認済み。
-これらは検証コードの不備であり、新たな製品バグの発見とは区別する。UI source不変のビルドはUI測定に再利用する。
-4群の結果を確認し、検証版への採用を承認した。現在は最終sourceでtest-full.ps1を実行し、成功後portableをbuild/updateする段階。
+これらは検証コードの不備であり、新たな製品バグの発見とは区別する。UI source不変のビルドはUI測定に再利用した。
+4群の結果を確認して検証版への採用を承認し、最終test-full.ps1、portable build/updateと24files照合まで成功した。
 最終portableでR2のロック、R4/R8の長押し・見開き、新engineの音声への影響は利用者の実機確認が残る。
 §9.2横断一覧、masterへの逆統合、pushは今回の残作業へ追加しない。
+
+検証版は `C:\home\mimageviewer-dupe\target\portable-dev\mimageviewer.exe`。既存data/data-remoteを保持し、エージェントによるアプリ起動・停止は行っていない。
+
+```powershell
+Start-Process -FilePath C:\home\mimageviewer-dupe\target\portable-dev\mimageviewer.exe
+```
+
+利用者の確認項目:
+
+1. 右パネルをロックし、類似候補または本のページ帯から移動してもパネルが閉じない。通常フォルダと普段使うZIP/PDFで確認する。
+2. 候補の長押しを解除/フォーカス移動した際に表示が戻る。見開き・連続表示、pinの状態と移動先が整合する。
+3. 音声再生中に類似タブを開き、以前解消した音声途切れが新engineでも再発しない。
+
+実機確認を要するR2/R4などの未コミット変更は保持している。自動検証成功を利用者実機の合格に置き換えない。
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -2140,3 +2154,31 @@ WS/commitはphase sampled値と別に記録したprocess lifetime最大値。war
 一般dense1万頁の約17秒は全頁がほぼ同じ特殊な上限条件の制約として明記する。構造期待の正確性、有界メモリ、既存の途中取消を維持しており、ページ間引き/打切りを導入しない。
 実463万件baseの約550MiB、旧baseを併せて保持する約760MiBは条件を分けて残す。通常400頁のn20と異なる入力なので直接の改善率は出さない。
 これは自動検証に基づく検証版への採用であり、音声・実UI応答やR2/R4の実機受入完了ではない。最終全体gateとportableの成功も後続で記録する。
+### 最終全体gateとportable引き継ぎ完了（2026-09-09）
+
+test-full-final1はexit0/[test-full] PASS。workspace main7789成功/0失敗/42ignored、374.71秒、vendor egui25・egui-wgpu9・eframe15も成功。
+正本logはtarget/r1-final-gate-20260909/test-full-final1.log、838562 bytes、SHA256 6439830ac75def601d156396122c39d218adfe056b1b6b3392fb29d4029ced78。
+最終sourceのfmt/diff確認を維持し、成功後に製品ソースを変更していない。
+
+build-portable.ps1 -KeepRunningは成功（release 27分05秒）、update-portable-dev.ps1 -SkipBuildも成功。Seedなし、アプリ起動・停止なし。
+ビルド前に再生成するdist packageの絶対パス/reparse/データ混入を検査。更新前後もpackageにdata/data-remoteなし、reparseなし、portable-devの対象process0を確認。
+packageのruntime全24filesは更新先とhash一致し、target-portable/package/portable-devのexeも一致した。
+exeは93371392 bytes、SHA256 fe30956a2404c2444c8f07c66bf12c5a4e285160621c87560a047adbc0b9c828。
+zipは267214736 bytes、SHA256 7edf02a5e4c7ba568fdb192d8497a39763d3d7aaf1f0ecf0330d202887cc7219、
+target/r1-final-portable-20260909/portable-verification.zipにも同一内容を保存した。旧R4のimmutable zip（71b037d893e2f788a673a3b6352587a856e3d94298ee7e0647297d7bb6c176cc）を保持。
+
+今回のデータ保持確認は、data4118 entries/data-remote1 entryのpath/type/size/属性/作成・更新時刻のメタデータを前後比較した。
+旧R4時点のdirectory自体だけの確認より深く列挙しているため、両者の検証範囲は同じではない。ユーザーデータ内容の読取り/hash計算/書込みは行っていない。
+全メタデータが前後一致し、再帰のreparseは0。詳細リストはprivateなpathを含み得るため、外部の説明へ内容を転載しない。
+更新script自体がdata-remoteを明示除外すると説明せず、packageへdata/data-remoteの両方がないことを検査した上でruntimeだけを更新した記録とする。
+
+最終manifestはtarget/r1-final-portable-20260909/manifest.json、9449 bytes、SHA256 a74df0861c69eab8a2d291ce57357b32d2900ca00c3b20946c8797ba57b84b3e。
+source-manifest.jsonは127562 bytes、SHA256 2b5632c558556f814d3ddf32946d2ca75e0e86ace25704f7bc7b0c4bafd5f763。
+成果物のsource HEADはd6089e3ab27be50f94b607f95bf52dd09d3a3029とdirty製品sourceで固定し、34 source/592 vendor filesをbuild/update後に再照合した。
+本節を含む後続docs-only commitは成果物へ含まれないが、製品sourceは同じである。
+R2 staged patchは100651 bytes、SHA256 522b17c567881cb2ba348d358e1b2069fb1ec947218606e3542525fbf23c8043のまま。
+親は最終manifest、起動対象exeを含む6主要artifact、zipサイズ、R2 patchを確認した。アプリ起動やユーザーデータの追加走査は行っていない。
+
+今回の修正・独立レビュー・自動検証・検証版作成は完了。残るのは利用者実機のR2/R4/音声受入と、それに依存する未コミット変更の確定である。
+1万頁一般denseの約17秒という制約と、旧400頁/7候補の1.69秒が元key不明で直接比較できない点を保持する。
+§9.2横断一覧、masterへの逆統合、pushは未実施で今回の引き継ぎ範囲外。
