@@ -1920,6 +1920,57 @@ guard-tests4は空SQLite fixtureのheader未生成による失敗。CREATE TABLE
 
 正本target/r1-book-query-performance-harness-fixed-20260908/manifest.json、SHA=b97c93798fb38a0d4826a69f1c8a9b50ec0ee13717525f81eb86db61eaefd6bc。
 review.patchは71642B、SHA=2b4d29dc7d2348a0139895b3175ac2aff08766b1b97c39233de8407b799a6528。
-親は27 artifact、現7sourceとfinalコピーの一致、R2 cached100651B/522b17...8043を照合した。独立Solがこの固定差分をレビュー中。
+親は27 artifact、現7sourceとfinalコピーの一致、R2 cached100651B/522b17...8043、harness外C5source不変を照合した。
+独立Solは入力保護/終了順/Arc共有/計測区間の設計を確認し、周期samplingのGetProcessMemoryInfo失敗を黙殺するP2を1件指摘した。
+active phaseの最初のerrorをEndまで保持して既存cleanup/guard検査へ流す最小修正と狭い回帰を行い、その増分だけ再レビューする。
+修正前sourceのrelease build1はCARGO_BUILD_JOBS=1で8分41秒成功。bin2774528B/SHA F8C5E0D75227EB42C87EC00BABAE9CF682B91C12426F107D1B31A78E9B6E8E83。
+このbinで性能採用値は測らず、P2修正後に再ビルドする。元source checkpointは上書きしない。
 元backupは通常file readでheader2/2、WAL0B/SHM32768Bを確認したのみ。DB接続・削除・変換をしていない。
 実計測前に別fresh copyを整合して準備し、そのコピーだけDELETEへ変換する。短本/400各1pilot、残る性能条件、取消/UI、最終gate/portableは未完了。
+
+harness fixed2のsampler増分は独立Sol承認、新規P1/P2なし。ActiveSampleが最初の周期取得失敗を保持しEnd Errへ返す。
+sampler-tests1は同production更新関数を通すtest-only SampleNowで1/1成功、compile1分41秒/実行0.00秒。release check5とfmt/check2も成功。
+固定2正本target/r1-book-query-performance-harness-fixed2-20260908/manifest.json、SHA=ebf7a20b6929042426dae2676a559380d70f52eb73dfdb377113cc53957ab98c。
+review.patchは74260B/SHA8022583c2a652bad5615a99185ef1a2653bfd375ec49826f41b6cf443b528775。親は32artifact/現7source/R2 cached一致を照合した。
+このsourceからrelease再buildし新exe SHAを固定した後、別fresh DELETE copyによる短本/400各1pilotへ進める。採用性能/最終gate/portable完了ではない。
+
+## 実engine最初のcold pilot（2026-09-08、各1標本・no-hit）
+
+fixed2 build2成功（58.05秒）、exe2775552B/SHA F45C55F94AC9C9D36B924BF43C60B02EB16BEAC7720A683A358E5493655C8EAA。
+準備2scriptは独立Sol承認。元main/WAL/SHM/base4を同時guard、WAL0で整合したmain/baseだけを新規コピーし、コピー側だけDELETE形式へ変換した。
+元4fileの前後hash一致、コピーquick_check/header1/1/sidecar無し、store/read_seq9852/order1・base seq0/bodySHAを記録した。
+入力の正本はtarget/r1-book-query-pilot-input-20260908/input-provenance.jsonとdestination-validation.json。
+
+| 条件 | query-core wall | worker / process CPU | process lifetime peak WS / private commit |
+| --- | --- | --- | --- |
+| 短本1頁・候補0 | 631.198ms | 578.125 / 578.125ms | 536.988 / 541.629MiB |
+| 400頁・候補0 | 1508.975ms | 1437.5 / 1453.125ms | 536.996 / 543.227MiB |
+
+両方BelowNormal=-1、release/dev-tools/portable、5ms sampling。全5 JSONL recordsとinitial/final入力一致を確認した。
+初回worker spawnからquery完了は短本771.796ms、400頁1647.020ms。query-coreは入力hash/DB・base setup/digest/JSONを含めない。
+process初回でありOS cacheのcoldではない。各1標本でp50/p95や採用合格を主張せず、旧400頁/7候補との同条件比較でもない。
+root c:/home・d:/homeはこの計測の選定scopeで、実利用favorite構成と同一とは確認していない。
+cache.records=4631186はSearchSnapshot::record_count（base全row+live delta）でありeffective unique件数ではない。prototypeとの差をDB変化と解釈しない。
+全field digestは再実行一致の証拠に使えるが、独立oracleの代わりにはならない。候補あり条件/実本certificateは後続。
+n1当時のmanifest SHAはe93e01fac9e3224f5ae5b1ff08c6669ed63fcdb8f9fde285a0ac975d6ab9f447、親は6artifactを照合した。
+実装担当がn3更新で同名manifestを上書きし、n1旧manifest bytesは未保存。n1 raw/plan/summaryは保持され再計測不要。
+この欠落を明記したmanifest-n1-reconstructed.jsonへ証跡を再構成した。原本復元と称さず、n3はmanifest-n3.jsonへ別名保存し以後上書きしない。
+既存cold1を保持して各2回追加（合計3）、別processでwarmup1+3へ進む。通常20標本と残case/取消/UI/最終gate/portableは未完了。
+
+cold合計3/warmup1+3も完了。8run全てBelowNormal、initial/final input一致、sidecar無し、同case digest一致、warm3件全てcompleted owner reuse=true。
+短1頁no-hitはcold [631.198,632.346,632.889]ms・median632.346ms、warm [2.024,2.097,1.795]ms・median2.024ms。
+400頁no-hitはcold [1508.975,1511.800,1570.331]ms・median1511.800ms、warm [913.578,920.072,924.013]ms・median920.072ms。
+warm sampled privateは短本約541.52MiB、400頁539.75〜540.26MiB。lifetime high-waterにはwarmupを含め、差分をwarm peakとしない。
+n3ではp95の安定性を主張しない。正本pilot-n3-summary.json SHA C6158A20E3A87227B595FAE4737F563D98856E81CB7349745CF5DBC88970A363、
+manifest-n3.json SHA b8ddb4076aa5e3b10353151ae43bec51f7ec2c80070fd80973b746e5f7c326e0（同dir）。親は20artifactを照合した。
+候補あり条件を探すため保存済み未測定400頁23件に各cold1 screeningを限定し、最初のReady/hit>0で止める。全件0なら範囲を広げず設計担当へ戻す。
+
+400頁screeningは保存順6件目のcase669ffde46830e57fでReady/hit1/override64となり停止（前5件hit0）。
+初回runnerは全候補d:/homeとのassertが計測前に失敗し、e:/shareも含む保存scopeへ訂正。失敗log/空dirは保持した。
+正本target/r1-book-query-pilot-screening-20260908-v2/manifest-screening.json SHA ca4f0254de4ef98034143f14744808ab68a512432389a3732d3b13e42272ab04、親は14artifactを照合。
+選定positiveはcold3回 [1.930,1.943,2.469]秒・median1.943秒、warm3回 [1.321,1.327,1.341]秒・median1.327秒。
+全7query（warmup含む）でhit1/override64/digest35388d4d...a4a9cd7dが一致、priority=-1、input初終一致、warm3件はowner再利用。
+private sampled peakはcold569577472〜570281984B、warm567009280〜567078912B。warm process生涯WS562987008B/commit569626624B（warmup含む）。
+同dirのselected-positive-n3-summary.json SHA5e20537984adb84d81054f7f3ed9a88d273be894787ea5baafc0158a744086e8、
+manifest-selected-positive-n3.json SHA1a7856bd894fbd37ec37fb0108ad7bfde00b0bfdfb6d1271da8b8b3d23b3953dへ別名保存した。
+これもn3でp95や旧400/7候補との比較を主張しない。全候補/分類/stripの独立oracleは別verifierの実装前照合へ進む。

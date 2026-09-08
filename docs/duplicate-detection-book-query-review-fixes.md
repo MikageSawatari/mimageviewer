@@ -631,3 +631,21 @@ SQL raw-row loopで代用する場合はSQLite VM内interruptの証拠と称さ�
 N=400/C=56と2800、N=10000/C=1を分け、top/middle/endのwall/thread CPU、row/visible strip/origin projectionを観測する。
 現A実装でclip後に省略するのは帯のfold/paint/hoverであり、名称・要約・button・layoutの全候補走査は残る。
 合成結果の準備はtimer外。絶対msをunit assertせずraw値を保存し、GPU/compositor/hover thumbnail/製品全体frame latencyの証拠とは区別する。
+
+### 実本oracleの独立境界（2026-09-08、独立Sol確認、実装前）
+
+計測CLIを変えず、測定後に別dev-tools verifierを同じguarded inputへ実行する案とする。
+実engineを同じorigin/roots/baseで再実行して測定digestと一致させ、そのowned結果をfull certificate DTOへ射影する。
+追加入口はdev-onlyなmetadata/origin全page/全hit key/BookPair全field/全overrideのDTOとguarded DB path程度に限定する。
+DB bytesがguard下で不変なので、後続oracleの別readonly transactionも同一snapshot相当であり、製品query TXへcertificate hookを足さない。
+
+oracleはMIH/stream classifier/製品strip builderを呼ばず、raw Complete/current-hash/scope内pageの直接SQLite走査とplain Hammingで検証する。
+commonは異なる実9冊のpage witness（book/item ID/effective index/quality/signature/distance）、rareは全走査後の8冊以下を記録する。
+originのrare辺数から独立した全候補key集合を作り、A/B全頁（quality0と実index/target metadata含む）とwitness unionをcertificateに保存する。
+通常規模はlegacy public classify_pairでA/Bだけを分類し全BookPair fieldを照合する。analyzeで無関係なwitness間pairまで分類しない。
+stripは簡単な独立mapでbaseline/override全fieldを照合する。witnessを再帰展開せず、subsetがfalse commonを増やさない性質を使う。
+証明書全体の頁数/密度にも予算を設け、1万denseを旧二乗oracleへ流さず、生成規則/構造化alignment期待値で別検証する。
+
+no-hit pilotのdigestは空候補集合の再現性であり、pair/stripの証明ではない。実hit通常本と3頁以上の実hit短本を別途1件ずつ選ぶ。
+raw全corpusを巨大な所有Vecへ複製する必要性は認めず、走査/署名ごとの小さなwitness・count・候補保持を設計してから実装する。
+具体ファイル境界、旧ZIP effective order/適格性の独立導出、資源予算は実装担当がAPIと照合して提示し、矛盾は親へ戻す。
