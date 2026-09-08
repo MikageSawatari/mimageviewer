@@ -1869,3 +1869,26 @@ B engine本体、C製品接続、実エンジンの性能測定、最終gate/por
 この区切りはd9673f57f8c5db6001ee1bb0fa461f9c66987708で保存した。
 正本target/r1-engine-b-raw-signature-20260908/manifest.jsonの8件を親が照合し一致。fmt/diffも成功。
 R2 cached差分100651bytes/522b17...8043とR4未コミット変更を保持した。
+
+## B同TX engine本体（2026-09-08、C製品接続は後続）
+
+similar_book_engine.rsを追加し、reader/MIHをworker-localに所有する本体を実装。metadata/store/scope/安価な早期終端→同TX配列追随→厳密common/候補抽出→直接辺の再列挙分類→疎結果を共通の処理として接続した。
+origin署名memoを共有しcandidate-only memoは1冊ごとに破棄。originのpage-index mapも一回だけ作る。旧製品callerは維持。
+独立Solレビューで発見した旧ZIP順mapの累積を、131072 ordinalsかつ64 entriesのFIFO cacheへ修正した。None/emptyはweight>=1。
+同TXでresolver1個を全署名に共有し、raw identity/eligibility/quality/loose/scope確認後だけordinalを補正する。
+単独予算超mapはcacheせず最大1冊分を使用中のみ保持するため、その条件では再sortし得る。速度・peakの合否は未測定。
+
+独立Solは最終製品差分と検証結果を承認、新規P1/P2なし。親も最終4sourceのSHAと成功logを照合した。
+engine SHA=2D53429F47E240AA9FA685B34BA0E905B94273567ADF3B1E700618A9D15ABDC4。
+DB SHA=66A3B3C4C8C013986DE39B806179904A78FCB0A91EB8787FF5818AFDD300E78F。
+検証正本target/r1-book-engine-B-body-tests5.logは14件成功（0.19秒）。cache-tests2は1件、reader suiteは6件、旧queryは1件成功。
+最終body-check3は12.93秒/exit0、fmt-check1は空log/exit0。先行check/test logも上書きせず保持する。
+14件には7N=56全候補、候補側nontransitive common、旧hash deltaとMissing/同距離別signature、旧ZIP ordinal、3edges両反復形、NotBook/Featureless準備省略を含む。
+300×300は600 MIH hitの64件chunk＋末尾を通し、matched/alignment/strip300を確認。mixed corpusはcommon witness9＋quality0＋base後deltaを含む2候補をdense analyze全BookPair field・手書きstripと照合した。
+TX metadata確定後のwriter置換は旧TXのSame/次TXのhit0を確認。取消はmetadata後・body先頭のinner Cancelledとreader再利用を確認した。
+これはMIH/SQL/direct loop途中の非同期取消compositionを実行した証拠ではない。その部分の既存component証跡と区別し、C/性能検証の残項目とする。
+実400/1万頁・peak RAM・時間・大規模UI・C caller公平性/終了通知・最終full gateとportable・利用者の音声実機確認は未完了。
+
+Bはbf7e7f3c9416f02df7b7409380a13a1f68ed3ff5で4files・1629追加/12削除として保存。
+正本target/r1-book-engine-B-body-20260908/manifest.jsonとpost-commit.json。親はmanifest13件とR2 cached基準を再照合し一致。
+R4のlib既存2行を含む未コミット内容は保持した。

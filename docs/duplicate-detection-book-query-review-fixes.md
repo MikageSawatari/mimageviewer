@@ -2,6 +2,7 @@
 
 2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
+Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。製品callerへの接続C、実行中の非同期取消composition、性能/peak/大規模UI、最終gate/portableは未完了。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
@@ -518,6 +519,17 @@ MIH hitは固定小chunkだけをSQLへ解決し、identity/revision/距離/qual
 9冊目確定時だけCommonでStopできる。MIH Exhausted後の最後のpartial chunkも必ずflushし、そこで9冊目に到達する場合もCommon。
 Rareは全flush込みのExhaustedだけで確定する。error/取消/incomplete Stopで未完成memoを保存しない。
 同署名の各origin slotには完成Rareを再適用し、count3後も完全domainの登録を続ける。
+保持期間はorigin_memoを要求全体で共有し、candidate-only memoを1冊のPreparedSide/分類終了時に破棄する。
+候補署名は先にorigin memoを参照し、未登録だけlocalへ保存する。総保持はO(U_origin + max U_candidate)、各Rare最大8冊。
+候補間で再登場するcandidate-only署名の再計算は許容し、同TX・完成memoだけを使う正確性は保つ。時間への影響は実測対象。
+この境界はB実装担当の現案にあり、新独立Solが2026-09-08に確認した。全候補の署名memoを要求終端まで累積しない。
+同レビューで別の保持経路を検出した。旧ZIP順のeffective_zip_ordersが触れた全冊分累積するため、Bで完成mapのordinal総数に上限を設ける。
+具体予算は131,072 ordinalsかつ64 entries、FIFO退役とする。None/emptyもweight=max(1,len)で数え、長いcontainer keyの本数も制限する。
+単独上限超のmapは使用中だけ保持し、cache上限と最大1冊の一時領域を区別する。1万頁×8冊のRareは予算内に収まる。
+resolverは同TXの全署名で1個を共有する。signatureごと再生成する初稿は独立Solの指摘で訂正し、予算内の完成mapを再利用する。
+raw identity/eligibility/quality/loose/scopeを先に検査し、必要な行だけeffective ordinalへ通す。9冊目確認後はchunk残りの順序補正を行わない。
+同TX内の再計算なので候補数・正確性は不変。signatureごと全cache破棄する案は巨大ZIPの反復sortを招くため採らない。
+cache予算の性能は後続測定で確認する。通常の1万ページ本が毎row再sortになる値は避け、単独上限超時の条件も記録する。
 
 scope外・loose・適格ordinal無し等の仕様上除外と、同TX追随済みhitのrevision/署名不一致・不意のID消失を分ける。
 後者はskipしてRareを返すと正確性が失われるためInvariant終端とする。shared候補のstore/seq不一致から同TX fallbackへ進む正常経路とは別である。
@@ -525,15 +537,15 @@ current resolverのitemごとSQL prepareは支配性を測定し、必要なら�
 巨大全row identity cacheや巨大IN句を追加しない。実runtime/callerへの接続はCで行い、B単独成功を製品採用完了と記録しない。
 独立engine入口でもoriginのimmutable roots所属を検査し、対象外はOutcome::NotIndexedとする。
 managerのhard取消だけに依存して、対象外originのFeatureless/Readyを計算しない。
-MihHitは現時点item_id/revision/distanceだけなので、同距離の別署名を検出するためBでsignature:[u8;32]を追加する。
+MihHitのsignature:[u8;32]射影はB先行d9673f57fで追加済み。同距離の別署名を区別するengine側の照合は本体で接続する。
 1hit/固定小chunkだけの値射影でDB rowとのexact署名一致を検査し、全PDQ配列や別の巨大lookup mapを複製しない。
-kernel射影fieldの狭域回帰もBに含める。このAPI穴と修正案は親・独立coreが合意した。
+kernel射影の回帰とMIH10件、raw resolver/reader6件はB先行で成功し、新独立Solが承認した。このAPI穴と修正案の着手前合意は親・旧独立coreによる。
 追加のsource監査で、filtered resolve_pages_by_item_idのNoneを直ちにID消失Invariantにする前提を訂正した。
 stage_item→complete_containerは旧hashを保存でき、item_changeはhash/stateを持たない。そのためcurrent base取得後に
 旧hashページをstage/completeしseq追随すると、旧hash Live deltaがMIHに入りfiltered resolverは正常にNoneを返す。
 これは通常の公開DB APIで構成できる反例であり、hash非適格と不意のID消失を区別するB専用APIが必要と独立coreが確認した。
 
-B専用hit resolverは同TXでitem IDのraw row＋LEFT JOIN container stateを読み、Missing / Present{row,eligibility}を返す。
+B先行d9673f57fの専用hit resolverは同TXでitem IDのraw row＋LEFT JOIN container stateを読み、Missing / Present{row,eligibility}を返す。
 eligibilityはEligible/HashMismatch/ContainerNotComplete等を区別し、raw rowを保持してrevision/署名検証を行えるようにする。
 Eligibleだけを既存effective ZIP orderへ通し、current hash/index Noneがprivate採番で有効になる挙動も維持する。
 既存load_search_item_by_id/public filtered wrapperは変更しない。小chunk内prepared statement共有で1ID1行を読み、巨大IN/全corpus cacheを追加しない。
