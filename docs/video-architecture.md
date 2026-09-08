@@ -925,7 +925,10 @@ failed bitset にだけ記録して永続化せず、残りの構築を継続す
 failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と音声 track なし
 だけはファイル単位の `Unavailable` として全体を止める。
 
-`AudioRangeDecoder::open` は FFI で音声以外の `AVStream.discard` を `AVDISCARD_ALL` にし、
+`AudioRangeDecoder::open` は共有 `audio_decode::discard_unselected_streams` で選択音声以外の
+`AVStream.discard` を `AVDISCARD_ALL` にする。同helperを動画ノーマライズの専用Inputでも使い、
+再生Inputや別workerへ影響させない。既存perf項目 `discarded_non_audio_streams` は互換のため
+名前を維持するが、実際には非選択の別音声trackも含む除外数である。
 永続 chunk の一括読み込みは `wave_coarse_cache`、chunk perf は `wave_coarse_chunk`、粗い列からの描画は
 `wave_coarse_serve` へ出す。従来窓の
 pre-roll bins は raster 前に捨て、全尺前提の beat grid は作らない。窓波形 raster の LRU は
