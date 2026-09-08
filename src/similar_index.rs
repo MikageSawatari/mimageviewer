@@ -1767,6 +1767,7 @@ fn query_book_ready_inner(
             .collect()
     };
 
+    let origin_page_slots = book_origin_page_slots(&origin_pages);
     let mut hits = Vec::new();
     for ((candidate_key, pages), candidate_matches) in candidates
         .into_iter()
@@ -1784,7 +1785,8 @@ fn query_book_ready_inner(
 
         match dupe::book::classify_pair(&corpus.pages, params, BOOK_ORIGIN, BOOK_CANDIDATE) {
             Ok(pair) => {
-                let overrides = build_page_strip_overrides(&origin_pages, pages, &pair);
+                let overrides =
+                    build_page_strip_overrides(&origin_pages, &origin_page_slots, pages, &pair);
                 let hit = match BookRelationHit::new(
                     candidate_key,
                     pages.len() as u32,
@@ -1910,16 +1912,22 @@ fn build_book_origin(
 /// 対応が取れたページは `alignment` に (起点ページ, 相手ページ) として並ぶ。距離は
 /// `alignment` に載っていないので、両方の署名から測り直して「ほぼ同一」と「別バージョン」を
 /// 分ける。単体画像の帯 (§9.5) と同じ切り方にして、2 か所で違う基準を持たない。
-fn build_page_strip_overrides(
+pub(crate) fn book_origin_page_slots(
     origin_pages: &[crate::similar_db::SearchRow],
-    candidate_pages: &[crate::similar_db::SearchRow],
-    pair: &dupe::book::BookPair,
-) -> Vec<BookPageMatch> {
-    let by_origin_page = origin_pages
+) -> HashMap<u32, usize> {
+    origin_pages
         .iter()
         .enumerate()
         .filter_map(|(slot, row)| row.item.page_index.map(|page| (page, slot)))
-        .collect::<HashMap<_, _>>();
+        .collect()
+}
+
+pub(crate) fn build_page_strip_overrides(
+    origin_pages: &[crate::similar_db::SearchRow],
+    by_origin_page: &HashMap<u32, usize>,
+    candidate_pages: &[crate::similar_db::SearchRow],
+    pair: &dupe::book::BookPair,
+) -> Vec<BookPageMatch> {
     let candidate_by_page = candidate_pages
         .iter()
         .filter_map(|row| row.item.page_index.map(|page| (page, row)))

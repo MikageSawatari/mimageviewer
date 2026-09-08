@@ -3,7 +3,7 @@
 //! `item` / `container` は検索に公開済みの世代だけを持つ。再索引中のページは
 //! staging 表へ書き、最後の transaction でだけ公開世代と入れ替える。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -287,8 +287,24 @@ pub(crate) enum BookHitResolution {
 pub(crate) struct BookPageOrderResolver<'snapshot, 'transaction, Compare> {
     snapshot: &'snapshot BookReadSnapshot<'transaction>,
     compare: Compare,
-    effective_zip_orders: BTreeMap<String, Option<Arc<BTreeMap<u64, u32>>>>,
+    effective_zip_orders: BTreeMap<String, CachedBookPageOrder>,
+    effective_zip_order_fifo: VecDeque<String>,
+    effective_zip_order_weight: usize,
+    effective_zip_order_weight_limit: usize,
+    effective_zip_order_entry_limit: usize,
 }
+
+#[derive(Clone)]
+struct CachedBookPageOrder {
+    order: Option<Arc<BTreeMap<u64, u32>>>,
+    weight: usize,
+}
+
+// This holds every stale order needed by an eight-book rare neighborhood plus its ninth-book
+// common cutoff inside the 10,000-page verification envelope. A single larger ZIP remains exact,
+// but lives only for the current call and can therefore be sorted again on a later lookup.
+const BOOK_PAGE_ORDER_CACHE_ORDINAL_LIMIT: usize = 1 << 17;
+const BOOK_PAGE_ORDER_CACHE_ENTRY_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ContainerPageKey {
@@ -493,6 +509,10 @@ impl BookReadSnapshot<'_> {
             snapshot: self,
             compare,
             effective_zip_orders: BTreeMap::new(),
+            effective_zip_order_fifo: VecDeque::new(),
+            effective_zip_order_weight: 0,
+            effective_zip_order_weight_limit: BOOK_PAGE_ORDER_CACHE_ORDINAL_LIMIT,
+            effective_zip_order_entry_limit: BOOK_PAGE_ORDER_CACHE_ENTRY_LIMIT,
         }
     }
 }
@@ -592,6 +612,26 @@ where
         Ok(hits)
     }
 
+    /// Applies the same private stale-ZIP ordinal used by full-book reads to one already validated
+    /// eligible hit. Callers can reject identity, lifecycle, quality, and scope first so unrelated
+    /// MIH hits do not populate the bounded page-order cache.
+    pub(crate) fn apply_eligible_book_hit_order(
+        &mut self,
+        row: &mut SearchRow,
+    ) -> rusqlite::Result<()> {
+        let Some(container_key) = row.item.container_key.as_deref() else {
+            return Ok(());
+        };
+        if let Some(order) = self.effective_zip_order(container_key)? {
+            row.item.page_index = Some(order.get(&row.item_id).copied().ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "eligible book hit was absent from its complete ZIP order".into(),
+                )
+            })?);
+        }
+        Ok(())
+    }
+
     fn effective_zip_order(
         &mut self,
         container_key: &str,
@@ -600,7 +640,7 @@ where
             return Ok(None);
         }
         if let Some(order) = self.effective_zip_orders.get(container_key) {
-            return Ok(order.clone());
+            return Ok(order.order.clone());
         }
 
         let order = load_complete_zip_page_keys(
@@ -618,8 +658,39 @@ where
             .map(Arc::new)
         })
         .transpose()?;
-        self.effective_zip_orders
-            .insert(container_key.to_owned(), order.clone());
+        let weight = order.as_ref().map_or(1, |order| order.len().max(1));
+        if weight <= self.effective_zip_order_weight_limit
+            && self.effective_zip_order_entry_limit > 0
+        {
+            while self.effective_zip_orders.len() >= self.effective_zip_order_entry_limit
+                || self.effective_zip_order_weight.saturating_add(weight)
+                    > self.effective_zip_order_weight_limit
+            {
+                let evicted = self
+                    .effective_zip_order_fifo
+                    .pop_front()
+                    .expect("non-empty page-order weight must have a FIFO entry");
+                let evicted = self
+                    .effective_zip_orders
+                    .remove(&evicted)
+                    .expect("page-order FIFO entry must have cached state");
+                self.effective_zip_order_weight = self
+                    .effective_zip_order_weight
+                    .checked_sub(evicted.weight)
+                    .expect("page-order cache weight must include each entry");
+            }
+            let key = container_key.to_owned();
+            self.effective_zip_order_fifo.push_back(key.clone());
+            self.effective_zip_order_weight += weight;
+            let replaced = self.effective_zip_orders.insert(
+                key,
+                CachedBookPageOrder {
+                    order: order.clone(),
+                    weight,
+                },
+            );
+            debug_assert!(replaced.is_none());
+        }
         Ok(order)
     }
 }
@@ -2923,6 +2994,93 @@ mod tests {
         assert!(
             matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::OperationInterrupted)
         );
+    }
+
+    #[test]
+    fn stale_zip_order_cache_has_a_weighted_fifo_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let separator = '\u{1f}';
+        for (book, page_count) in [("a.zip", 1), ("b.zip", 1), ("c.zip", 1), ("large.zip", 2)] {
+            let kind = if book == "large.zip" {
+                ContainerKind::Zip
+            } else {
+                ContainerKind::ImageFolder
+            };
+            let generation = db
+                .begin_container_build(book, kind, page_count, 1, 1)
+                .unwrap();
+            for page in 0..page_count {
+                let mut row = item(
+                    &format!("{book}{separator}{page}"),
+                    Some(book),
+                    Some(page),
+                    page as u8,
+                );
+                row.kind = if kind == ContainerKind::Zip {
+                    ItemKind::ZipPage
+                } else {
+                    ItemKind::Image
+                };
+                db.stage_item(generation, &row).unwrap();
+            }
+            db.complete_container(book, generation).unwrap();
+        }
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute(
+                "UPDATE search_content_state SET page_order_version = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        let mut reader = SimilarBookReader::open_at(&path).unwrap().unwrap();
+        reader
+            .with_snapshot(Arc::new(AtomicBool::new(false)), |snapshot| {
+                let mut resolver = snapshot.page_order_resolver(str::cmp);
+                resolver.effective_zip_order_weight_limit = usize::MAX;
+                resolver.effective_zip_order_entry_limit = 2;
+
+                resolver.load_book_pages("a.zip", current_hash_version())?;
+                resolver.load_book_pages("b.zip", current_hash_version())?;
+                // Cache hits do not alter FIFO insertion order.
+                resolver.load_book_pages("a.zip", current_hash_version())?;
+                assert_eq!(
+                    resolver
+                        .effective_zip_order_fifo
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    vec!["a.zip", "b.zip"]
+                );
+                assert_eq!(resolver.effective_zip_order_weight, 2);
+
+                resolver.load_book_pages("c.zip", current_hash_version())?;
+                assert_eq!(
+                    resolver
+                        .effective_zip_order_fifo
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    vec!["b.zip", "c.zip"]
+                );
+                assert_eq!(resolver.effective_zip_order_weight, 2);
+
+                resolver.effective_zip_orders.clear();
+                resolver.effective_zip_order_fifo.clear();
+                resolver.effective_zip_order_weight = 0;
+                resolver.effective_zip_order_weight_limit = 1;
+                resolver.effective_zip_order_entry_limit = usize::MAX;
+                let pages = resolver.load_book_pages("large.zip", current_hash_version())?;
+                assert_eq!(pages.len(), 2);
+                assert!(resolver.effective_zip_orders.is_empty());
+                assert!(resolver.effective_zip_order_fifo.is_empty());
+                assert_eq!(resolver.effective_zip_order_weight, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
