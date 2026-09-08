@@ -2,7 +2,7 @@
 
 2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
-Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。製品callerへの接続C、実行中の非同期取消composition、性能/peak/大規模UI、最終gate/portableは未完了。
+Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実行中の非同期取消composition、性能/peak/大規模UI、最終gate/portableは未完了。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
@@ -41,6 +41,7 @@ worker から manager への強参照循環や、Connection と Transaction の�
 - client の origin 変更・撤回・drop はその client だけを取消す。park / raw swap は client を失効させない。
 - 完了・失敗・取消の終了回収後は、UI polling を待たず次 client を実行する。
 - `query_book(client, container_key)` 相当へ接続する。公開 API の引数になる client は opaque な公開型にできることを確認する。
+- Cの独立Sol preflightでcrate-private aliasを公開引数にする不整合を検出。similar_indexの公開SimilarBookQueryClient wrapper（内部はBookQueryClient<Arc<BookQuery>>）とpublic Default/newへ訂正する。汎用executorは非公開のままに保つ。
 - `current_item == None` / NotBook の早期 return でも当該 client の要求を撤回する。
 - 起点は本の key。Item 用 `begin_origin` のページ key 変更を、そのまま本照会の取消キーにしない。
 - 既存 `last_ready` は ItemQuery 用。本の直前結果が既に保持されているという前提を置かない。
@@ -582,6 +583,7 @@ prototypeの再計測を実製品engineの計測に代用しない。明示し�
 portable相当featureで測る案を採る。dev-runtimeのopt2/LTO off/64やignored unit testの値は補助値として区別する。
 元の検証用backupを保持し、writer操作やdelta/compaction用データはさらに独立した測定用storeへ作る。
 cargo/build/測定を直列にし、source/lock/binary/input/roots/case識別のhashと環境を固定してraw結果を保存する。
+実callerと同じ低いworker thread priorityでengineを測定し、priorityも記録する。通常優先度の補助値を採用値へ混ぜない。
 
 最小case群は実400ページ・短本・no-hit、品質ありnear-white/反復、多hit7N、1万対角shortcut、1万一般dense。
 多hitは小N=8/56候補の全field oracleと性能用Nを区別する。世代更新は代表400条件へ現delta、delta65535、

@@ -1892,3 +1892,18 @@ TX metadata確定後のwriter置換は旧TXのSame/次TXのhit0を確認。取�
 Bはbf7e7f3c9416f02df7b7409380a13a1f68ed3ff5で4files・1629追加/12削除として保存。
 正本target/r1-book-engine-B-body-20260908/manifest.jsonとpost-commit.json。親はmanifest13件とR2 cached基準を再照合し一致。
 R4のlib既存2行を含む未コミット内容は保持した。
+
+## C製品接続（2026-09-08、性能/全体gate/portableは後続）
+
+viewer-owned opaque公開clientからscheduler唯一所有のexecutor/B engineへ接続し、旧per-query spawnを撤去した。
+factory/probe/runtimeはWeak、runtimeはVacant/Ready、DB不在/失敗は要求単位終端。scheduler寿命のObservedStoreで実store変更だけhardとする。
+memory/progress確定・全guard解放後に通知し、ROOT repaintをproduction constructorで一度注入。shutdownは非joinで完成結果も退役する。
+UI実query/Retained/Withdrawnを既存viewerの確定lifecycleへ投影し、AtRestはmountしない。詳細は本照会正本とdetached計画§11。
+独立Solは固定v2差分とApp test増分を承認、製品P1/P2なし。残ったUI証跡は実render/実window bindingの4件で補強した。
+park対象のみRetained・sibling非干渉、内部reopen保持、ViewerExited/trueclose/NotBook撤回、zoom/hidden/native抑止、Info実click、close実rect press/releaseと同pass再受付なし、currentNoneを確認。
+close fixture初回2回は座標が実buttonから外れて失敗。手動closeへ置換せずcfg(test)観測の実rectを使い、routes3で成功した。失敗logは保持。
+combined-tests1と2は各38成功/1ignored。2の再実行理由は独立レビュー後のcargo fmtによる機械的source変更に限定。
+最終check3は13.98秒/exit0、fmt-check1空log/exit0、diff-check clean。
+正本target/r1-book-query-C-final-20260908/manifest.json（SHA515EB142F44A5DE5437224E163F79D4E72178C4CDDB124218650789BD63B7212）。
+親は29 artifactと現7sourceの完全一致、R2 cached100651bytes/522b17...8043を照合した。CはR2/R4と共存する未コミットsourceとしてfreezeし、既存分を一括commitしていない。
+実engine性能/peak・大規模UI・loop途中の非同期取消、最終test-fullと新portable、利用者の実機確認は後続。性能修正で二重gateにならないよう最終全体検証を測定後にまとめる。

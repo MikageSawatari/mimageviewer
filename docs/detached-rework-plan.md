@@ -1454,6 +1454,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-08 別バージョン検索C: viewer別本照会の需要と終了（実装・関連回帰・独立Solレビュー済み、全体gate/実機は後続）**
+
+本タスクの最新利用者指定により、親Astra/mediumと独立Sol/xhighが設計を確認し、実装Sol/xhighを別担当とする。
+旧ClaudeCode/Codex担当指定からの移行は本タスク内に限定し、§2の症状パッチ禁止と実機・既存回帰条件は維持する。
+既存のViewerContextBundle内SimilarPanelStateがmove-onlyな本照会clientを所有し、確定したParked/ParkedLiveへの遷移で
+bindingからContextRefを取得してRetainedへ投影する。AtRestをmountせず、同じcontextの既受付仕事・結果を保持する。
+true close/ViewerExited/current無し/本でない入力はそのclientだけWithdrawnとし、復帰後の実queryでActiveになる。
+これは検索要求の所有を既存viewerの確定lifecycleへ接続する構造修正であり、detached述語、viewport配置/再生成、focusやgeometryの条件を追加しない。
+ROOT repaint通知を一度注入し、既存scheduler/render経路を利用する。新しいdetached bool/Option、時間窓、再試行による症状吸収は加えない。
+編集対象はapp/ui_metadata_panel/ui_fullscreenと検索manager/executor・lib生成境界。既存ContextRef accessorを使いregistry自体は変更しない。
+具体的な差分・検証・残項目は[本照会引き継ぎ](duplicate-detection-book-query-review-fixes.md)と[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡する。
 
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
