@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。大規模UIのrelease補助測定も完了。特殊大規模/世代更新、最終gate/portable・実機は未完了 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実本5頁/400頁の独立全field oracle成功。実engine cold/warm n3とCPU/peak pilot済み。実行途中の非同期取消composition4件と独立Solレビュー成功。通常4条件のcold/warm各20標本も完了。大規模UIのrelease補助測定と特殊大規模/世代更新8条件のcold/warm各3標本も完了。検証版への採用を承認。最終gate/portable・実機は未完了 |
 
 ### 現在の残作業（2026-09-09、利用者への状況説明時点）
 
@@ -38,9 +38,9 @@
 3. 実入力copyの差分65535/65536件、base再構築後と旧base保持時。
 4. 実draw/ScrollArea経路の大量結果描画（releaseの補助測定）。
 
-共通release test compileと4のUI補助測定は成功。生成fixtureの65535時点保存と最終hash/測定前照合に独立SolがP2を指摘し、増分修正中。
+共通release test compile、4のUI補助測定、1〜3の構造検証/8条件の性能計測まで成功。入力固定P2とfixture期待値を訂正し、独立Sol承認済み。
 これらは検証コードの不備であり、新たな製品バグの発見とは区別する。UI source不変のビルドはUI測定に再利用する。
-4群の結果を採用判断へ反映した後、最終sourceでtest-full.ps1を実行し、portableをbuild/updateする。
+4群の結果を確認し、検証版への採用を承認した。現在は最終sourceでtest-full.ps1を実行し、成功後portableをbuild/updateする段階。
 最終portableでR2のロック、R4/R8の長押し・見開き、新engineの音声への影響は利用者の実機確認が残る。
 §9.2横断一覧、masterへの逆統合、pushは今回の残作業へ追加しない。
 
@@ -2099,3 +2099,44 @@ default製品日本語fontの設定/OS I/Oはtimer外、fresh Contextのfirstは
 全候補行は走査するがvisible strip foldは多候補で3〜4、C1で1。N10000/C1はscroll範囲0なので3位置とも同じ表示位置である。
 thread CPUの0/15.625ms刻みはOS計時粒度であり、CPU消費なしとはしない。headless CPU/layoutの補助値で、GPU/compositor・hover thumbnail・アプリ全体のframe latencyを含まない。
 親はこの結果を追加の製品UI改修へ広げる根拠にしないと判断し、UI測定完了とする。残るengine/世代fixtureの修正・生成・release CLI測定へ進む。
+### 大規模fixtureの入力固定P2承認と初回期待値訂正（2026-09-09）
+
+fixed3-p2 manifestはtarget/r1-scale-ui-fixtures-fixed3-p2-20260909/manifest.json、SHA256 11921c6d30737dee68b2f60f3a5fb20df0e28e9ddb44d13b3ca6322f3b045a5e。
+独立Solは65535時点の独立copy、全fixtureの最終SHA/len、wrapperの前後照合/CreateNew出力を承認し、P2解消・新規P1/P2なし。
+最初のdebug engine generatorは2.13秒でaffine fixtureの期待値に失敗した。実alignmentは[(0,2)]、期待は[(0,0)]だった。
+既存oracleで確定しているX対XXXのstable tieはA0-B2なので、製品ではなくfixtureのexpected candidate page/override targetを2へ訂正する。
+run1 partialを保持し、run2のfresh入力へ進める。Sol確認は期待値と専用run pathの増分に限定する。
+残る大規模8条件はcold/warm各3標本を基本とし、n=3のp95がmax相当で安定したtailを確認した証拠ではないことを明示する。
+通常4条件のn20、成功したrelease UI測定、過去のoracleを繰り返さない。
+### 大規模8条件の計測完了・検証版への採用判断（2026-09-09）
+
+fixed4-tie-run2は独立Solが限定増分を承認。run2の生成/構造検証はengine 1件/174.10秒（affineと1万2shape）、
+near-white 1件/0.97秒、世代境界1件/286.32秒で成功。これらはdebugの生成・正しさ検証時間で、製品性能値ではない。
+世代fixtureはbase.seq9852を基準にread_seq75387/delta65535/should_compact=false、read_seq75388/delta65536/trueを確認。
+品質適格seed4096件（quality最小2）の新規loose itemを使用。全入力はDELETE/quick_check/no-sidecar確認とhash固定を通過した。
+
+性能正本はtarget/r1-book-query-scale-results-20260909/summary.json（26571 bytes、SHA256 146ee745936aa005de96d18287c4ee73740522b4d074ff3679123b1a44a4c01a）。
+manifest.jsonは18297 bytes、SHA256 d64ff40100f8bbbb16fe81ff190222e3292a40f3a76e53da34125432713fb356。
+32 processesでcold各3、warmup1後warm各3、計48測定queries。凍結release CLI SHA f45c55f94ac9c9d36b924bf43c60b02eb16beac7720a683a358e5493655c8eaaを使用。
+全wrapperの前後hash/len/header/sidecarと実worker priority=-1を確認。親は97 artifact hashと全8条件のrawからnearest-rank quantileを照合した。
+各n=3のp95はmax相当で、安定したtailの証拠ではない。coldでもOS disk cacheはflushしていない。warmはMIH/snapshot再利用で、完成照会cache hitではない。
+
+| 条件 | cold p50 / p95 ms | warm p50 / p95 ms | process lifetime最大 WS / commit MiB |
+| --- | --- | --- | --- |
+| affine N400 / 2800候補 | 92.84 / 93.41 | 93.27 / 95.63 | 27.19 / 31.18 |
+| N10000 対角一致 | 143.65 / 144.60 | 135.02 / 136.06 | 43.07 / 61.55 |
+| N10000 一般dense | 16489.73 / 16676.82 | 17306.48 / 17442.32 | 183.33 / 230.66 |
+| near-white 実8冊 / 7候補 | 35.12 / 43.48 | 30.05 / 36.70 | 24.57 / 29.93 |
+| near-white 実9冊 / Common | 10.18 / 11.82 | 3.06 / 3.29 | 24.01 / 29.33 |
+| 実base + delta65535 | 2290.89 / 2327.11 | 1557.70 / 1560.35 | 547.49 / 552.68 |
+| 実base + delta65536 | 2281.11 / 2325.48 | 1542.89 / 1582.43 | 548.62 / 553.80 |
+| 再構築base + 旧base保持 | 2209.54 / 2314.96 | 1562.32 / 1590.87 | 754.92 / 760.36 |
+
+WS/commitはphase sampled値と別に記録したprocess lifetime最大値。warmのlifetime値は同一processのwarmupも含む。
+世代3条件はすべてorigin400頁/1候補/64override。65535条件はread_seqが1古いためfull digestは異なり、形状の一致と区別する。
+同read_seq75388のdelta65536と再構築後はfull digestも一致。compaction作成処理の時間/peakを測ったとは扱わない。
+
+親の採用判断: 検証版への組込みを承認し、製品コードの追加修正へ広げず最終test-full/portableへ進む。
+一般dense1万頁の約17秒は全頁がほぼ同じ特殊な上限条件の制約として明記する。構造期待の正確性、有界メモリ、既存の途中取消を維持しており、ページ間引き/打切りを導入しない。
+実463万件baseの約550MiB、旧baseを併せて保持する約760MiBは条件を分けて残す。通常400頁のn20と異なる入力なので直接の改善率は出さない。
+これは自動検証に基づく検証版への採用であり、音声・実UI応答やR2/R4の実機受入完了ではない。最終全体gateとportableの成功も後続で記録する。
