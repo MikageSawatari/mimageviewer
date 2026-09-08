@@ -122,18 +122,21 @@ CJK フォントを自前で vendored するか `Noto Sans CJK` をインスト�
   スナップショットは現状対応外。メインビューポートと別管理のためハーネスで
   扱いづらい。必要になったら `Harness` の `run_steps` を複数サイクル回す方式で
   試す。
-- **画像コンテンツ**を描画する UI (グリッドセル等) は、画像パスが通らないため
-  スナップショット対象外。モックテクスチャを渡すテストは将来的に検討。
+- **実ファイルの読み込みを伴う画像 UI** (グリッドセル等) は、この純描画 harness の対象外。
+  読み込みを行わず固定の生成 texture を渡す純描画は検証できる。別バージョンの一時表示は
+  `src/ui_fullscreen.rs::tests::similar_preview_navigator_snapshot_dark` で geometry と navigator
+  paint を共有し、本文の clip と可視範囲枠を確認する。App・worker・native GPU の検証とは区別する。
 
-## lib (`tests/`) vs bin (`src/` 内 `#[cfg(test)]`) の使い分け
+## integration test と lib unit test の使い分け
 
-`tests/ui_snapshot.rs` は **lib crate** から見えるもの (`mimageviewer::*` の pub API)
-だけテストできる。`src/lib.rs` には bin 専属の `app` module を **stub だけ** 置いて
-あり、`App::draw_local_adjust_*` のような `pub(crate)` panel render 関数には届かない。
+`tests/ui_snapshot.rs` は外部の integration test なので、lib crate が公開する
+`mimageviewer::*` の pub API だけを利用できる。現在の `src/lib.rs` は実際の `app`
+module を含み、実行ファイルは薄い入口である。ただし `app` module は非公開で、
+`App::draw_local_adjust_*` のような `pub(crate)` 関数は integration test から直接呼べない。
 
-このため、bin (= App や `pub(crate) fn`) に閉じた UI のスナップショットを撮りたい
-ときは、**bin test (`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接
-`egui_kittest::Harness` を使う**:
+crate 内部の純粋な UI 描画をスナップショットしたいときは、**lib unit test
+(`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接 `egui_kittest::Harness` を使う**。
+これは App 全体を構築する snapshot を許可するものではなく、対象は上記の純粋な描画関数とする:
 
 ```rust
 // src/ui_adjustment_panel.rs::local_adjust_segmentation_tests 内
@@ -160,11 +163,11 @@ fn local_adjust_panel_snapshot_empty_layer_list() {
 }
 ```
 
-スナップショットは **同じ `tests/snapshots/<name>.png`** に保存される (lib テストと
-bin テストでディレクトリ共有)。**`UPDATE_SNAPSHOTS=1`** も同じ:
+スナップショットは **同じ `tests/snapshots/<name>.png`** に保存される (integration test と
+lib unit test でディレクトリ共有)。**`UPDATE_SNAPSHOTS=1`** も同じ:
 
 ```bash
-UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 ```
 
 実例: `src/ui_adjustment_panel.rs::local_adjust_segmentation_tests::local_adjust_panel_snapshot_*`

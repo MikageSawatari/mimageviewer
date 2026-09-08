@@ -25,7 +25,7 @@
 | R3 サムネイルとviewer所有 | `f0f5287e4`。独立Astra承認済み | 関連21件、check、fmt、共通full gate成功。実機は後続 |
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
-| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存APIは段階レビュー済み。Ready描画/実lifecycle回帰が残る | owner 15件・geometry 22件・GPU既存36件・paint寿命の新5群・navigator 54件＋補強各1件・capture 11件＋実Esc補強1件・vendor egui 25件成功。最終gate・実機は未完了 |
+| R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotもテスト・独立目視承認済み。依存統合と最終gate準備中 | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate・新portable・実機は未完了 |
 | R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。製品未採用 | 単署名集合oracle成功。本照会全体・世代整合・負荷/peak/fairnessは未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
@@ -1297,8 +1297,128 @@ portable更新、利用者実機確認も後続。R1/R5/R6の製品修正は引�
 ### R4 入力/captureの整形区切り
 
 cargo fmt -p mimageviewer成功後、cargo fmt --all -- --checkもexit0。
-記録はtarget/r4-cargo-fmt-stage2.metaとr4-cargo-fmt-check-stage2.{log,meta}。
+記録はtarget/r4-cargo-fmt-stage2.metaとr4-cargo-fmt-check-stage2.meta（正常終了時のstdout logは未生成）。
 vendor/egui/src/input_state/mod.rsの前後SHA256は
 866485bd3cb04f63639a1e6c142d85dab0689e28a471942ee1f9fa03fd942c0cで一致し、原本の一括整形はしていない。
 親がR2 staged patchを再確認し、100651 bytes/既定SHA256一致。source editを一時freezeして
 文書8件だけをpathspec commitし、入力/capture段階のsource checkpointを保存してから次回帰へ進む。
+### R4 入力/capture checkpoint確定
+
+文書8件を通常hookでcommit: 32fefa17fd21a6d251793b6439e046c6afed6ddf。
+正本artifactはtarget/r4-input-capture-stage2-20260908-v3/manifest.json。
+19 source filesの生bytesをsource-files.zipへ保存し、改行/BOMも含めて復元可能にした。
+source-files.zip SHA256=fd79bb2dfbcb3e9fdfe8b90ce41898886427a13675a2ac2b5e80cccf89c9ecee、2350069 bytes。
+unstaged-source.patch SHA256=a26a84584888652d4bde6bc698fd0f62045acc2d45a2006430f59b76b961e329。
+vendor106filesを生成targetなしで保存し、archive全entryを凍結中sourceとbytes照合、全20artifactsのhashも検証した。
+R2 staged patchは既定SHA256/100651 bytesのまま。native sourceはcommitしていない。
+初回/v2 backupは原本の1980年より古いtimestampと不存在の空fmt stdout logで保存scriptが失敗した不完全記録。
+source変更は無く、ZIP timestampの範囲設定とmeta参照に訂正したv3だけを利用する。
+このcheckpointは最終gate/portable/実機合格ではない。freezeを解除しReady描画/実lifecycle回帰へ再開した。
+
+### R4 Ready assetのhelper/owner統合回帰
+
+target/r4-similar-preview-render-tests1.logはcompile 1m55s、exit0、19成功/0失敗、0.67秒。
+新2件は実completion channel→asset_for_frame→body/nav描画helperを通し、3 layout modeの
+session resolverと、通常pin Aを保持したReady B描画→生release入力後のA slot identity/mode保持を確認した。
+独立coreはcompletion handleと回帰を承認したが、製品render_fullscreen_viewportのdispatcherを
+直接通らないため、Continuousの誤分岐やnavigator呼出欠落、release後のA再描画までは検出しない。
+helper/owner統合成功と製品dispatcher接続の残検証を区別し、既存snapshot harnessの適用を調査する。
+実park/close/source通知とMounted/AtRestの遅延完了回帰も継続する。
+
+### R4 context終端の狭域回帰
+
+target/r4-similar-preview-lifecycle-tests1.logは新fixtureのborrow競合E0502でcompile停止。
+password store cloneをmut borrow前に取るよう訂正後、tests2はcompile58.48秒、exit0、3成功/0失敗、0.47秒。
+実close_fullscreen→Mounted pollと、実pause_current_active_viewer_context→AtRest復元→背景pollは
+独立coreも根因を検出する回帰と確認した。poll前後のAtRestを検査し、試験中の確認mountとは区別する。
+source caseはfresh Ready hitのobserve_ready_hit以降であり、filesystem通知やmetadata panelの
+Ready受付loop全体を実行した証拠ではない。Ready/Preparing受付境界と、park時に無関係Bの
+pending completionが生き残ることを最小補強する。
+
+Ready実dispatcherは既存embedded fullscreen経路を通常unitで通す。App丸ごとsnapshotは
+ui-snapshot-policy.mdの対象外なので作らず、純navigator paintを共有する固定sceneのみに限定する。
+
+### R4 実embedded dispatcher回帰の成功
+
+製品コードを変えず、Windows unitのctx.run→render_fullscreen_viewport→embedded bodyを通す2件を追加。
+最初のdispatcher-tests1はfilterがPinnedNormalだけに一致し、1件成功だった。
+modes-tests1は元FsCache IDへの固定期待で失敗。実通常描画はprocessed textureを選べるため、
+release後のread-only resolve_fs_display_texから製品が選択したIDを取得して検証するよう訂正した。
+font/backgroundでも通るany mesh!=candidateの途中案は親が不承認とし、採用結果に含めない。
+modes-tests2/3はSpread LTRのsession失効。fixtureの寸法未確定時はDouble、横長cache投入後は
+既存ペアリング規則によりSingleとなるためで、縦長canonical寸法へ訂正し投入後sessionも照合した。
+modes-tests4はSingle/LTR/RTL通過後、Continuous通常復帰のnav期待で失敗。既存の
+flat_navigator_main_pagesはContinuousを対象外とするため、通常復帰は本文だけを要求する。
+候補中は固有navigatorを持ち、body/nav双方を引き続き要求する。製品機能の変更はない。
+
+最終狭域ログ:
+- target/r4-similar-preview-dispatcher-modes-tests5.log: compile42.77秒、1件内4mode全成功、0.61秒、exit0。
+- target/r4-similar-preview-dispatcher-pinned-tests2.log: compile0.65秒、1成功、0.16秒、exit0。
+
+候補exact TextureIdをbody/navで確認し、release後は製品resolverのexact IDとviewer-owned page
+geometryを確認する。Single/SpreadとPinnedNormalの復帰はbody/nav、Continuous復帰はbodyを検査。
+PinnedNormalはpin Aのslot identity/modeも保つ。実native GPU/windowの検証とは区別する。
+独立coreはこの判定境界と成功ログを照合し、dispatcher段階を最終承認した。
+
+### R4 実parkの別context非干渉補強
+
+既存park caseへ無関係なmounted root Bの実pending completionを追加した。
+Aを実pause→AtRestへ戻してから両completionを送り、同all-context pollでAの破棄/drainと
+Bのcache採用・gesture保持・pending終了を確認する。Aはpoll前後ともAtRestで、検査時だけmountする。
+target/r4-similar-preview-park-sibling-test1.logはcompile52.61秒、1成功/0失敗、0.24秒、exit0。
+独立coreがcode/logを照合し、別contextを空にした旧fixtureの検出不足が解消したと最終承認した。
+
+### R4 Ready受付の所有境界と最終狭域成功
+
+SimilarPreviewState::observe_query_resultへfresh ItemQueryの受付を集約し、個別hit入口はprivate化。
+UIはlast_ready fallbackの適用前にこの受付を呼ぶ。Readyの全hitだけが既存stamp照合へ進み、
+Preparing/空Ready/NotIndexed/NoIndex/Featureless/Failedは更新や削除の証拠にしない。
+
+- target/r4-similar-preview-query-boundary-test1.log: compile1m01s、1成功、0.00秒、exit0。
+- target/r4-similar-preview-source-query-lifecycle-test1.log: compile0.65秒、1成功、0.17秒、exit0。
+
+Ready更新時の旧要求Drainingと非Ready/空結果時のRunning保持、実Mounted pollでの旧completion
+破棄/drainを検査。独立coreは製品接続・テスト・両ログを照合し、この境界を最終承認した。
+これはindexed queryの更新受付であり、filesystem watcherを実行した検証とは表記しない。
+
+### R4 file-change入口を含むcontext suite成功
+
+実reset_fs_side_panel_runtime_for_file_change→旧completion送信→all-context pollのcaseを追加。
+親が製品入口の取消とDraining保持、pollによるcache非採用/回収を確認した。
+target/r4-similar-preview-lifecycle-tests3.logはcompile55.42秒、4成功/0失敗、0.63秒、exit0。
+Ready受付・true close・別context pendingを含むpark・file-changeを同最終suiteで実行済み。
+これで合意したReady描画とcontext実入口の回帰は揃った。純draw snapshot、依存graph/license/lock、
+最終fmt/glyph/full gate、portable build/updateと実機確認は引き続き後続である。
+
+### R4 純描画snapshotの追加・目視承認
+
+候補navigatorの既存paint部分をpaint_similar_preview_navigator_surfaceへ抽出。
+製品wrapperのgate/settings/geometry/resource寿命は不変で、色・枠・順序・clip保持を独立UIが承認した。
+Appを作らないlib unitの固定sceneは、4象限と白十字の生成texture、通常zoom/pan、実geometry解決、
+minimum-overlap補正を使い、補正後geometryを本文/navで共有する。
+初回fixtureのhost clipとnav配置域は製品と異なったため、本文body_rect clip・layoutのbody/body入力へ訂正した。
+
+正本: tests/snapshots/similar_preview_navigator_dark.png、640×360。
+SHA256=2c9830fb7116944ef5b79151e9aa65a03e1d078a1f1d7bd02329bf4b8968f9b4。
+- target/r4-similar-preview-navigator-snapshot-update3.log: compile39.55秒、1成功、0.90秒、exit0。
+- target/r4-similar-preview-navigator-snapshot-compare1.log: compile0.66秒、1成功、0.78秒、exit0。
+
+親・独立UIがそれぞれPNGを開き、本文右上の48px緑領域とnav左下黄枠、4象限方向、白十字、headerを確認。
+独立UIはcode/PNG/hash/logを照合し最終承認。実dispatcher・GPU/nativeの検証とは区別する。
+ui-snapshot-policy.mdの旧bin/stub説明を現lib構成へ訂正し、固定texture純描画の実例を記載した。
+
+### R4 依存統合と最終gate前のfreeze
+
+root/eframe/egui-wgpu/egui standaloneのcargo treeはすべて同local egui 0.33.3へ統一。
+target/r4-cargo-tree-{root-egui,eframe-egui,egui-wgpu-egui,egui-standalone}1.logを親・独立coreが確認した。
+既存3 Cargo.lockはegui registry source/checksumの2行除去だけでversion変更なし。
+原本106ファイルを再比較して変更はinput_state/mod.rsのみ。LICENSE-MIT/APACHEを既存vendorから
+byte copyし予定SHA256と一致。PATCHES.mdを含む追加3ファイル、計109ファイルで出典と本文を保持する。
+独立coreはmanifest/gate接続、graph/lock/licenseを最終承認。provenance詳細はvendor/egui/PATCHES.md。
+
+Solがcargo fmt、cargo fmt --check、git diff --checkをexit0で確認（fmt stdoutは空）。
+整形前後numstatはtarget/r4-final-fmt-{before,after}.numstat。
+target/r4-check-ui-glyphs-final1.logはexit0、no dangerous glyphs。
+親もdiff-checkとR2 staged100651 bytes/既定SHA256一致を再確認した。
+source編集をfreezeし、文書3件だけをpathspec commit、全source/artifactをcheckpoint化してから
+同sourceの最終full gateとportable buildへ進む。R2/native sourceのcommitと実機確認は後続。
