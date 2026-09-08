@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ClientId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +56,7 @@ type RuntimeFactory<T> =
     dyn Fn() -> Result<Box<dyn BookQueryRuntime<T>>, String> + Send + Sync + 'static;
 type ThreadJob = Box<dyn FnOnce() + Send + 'static>;
 type ThreadSpawner = dyn Fn(ThreadJob) -> Result<(), String> + Send + Sync + 'static;
+type ResultNotifier = dyn Fn() + Send + Sync + 'static;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BookQueryPoll<T> {
@@ -79,9 +80,31 @@ enum ClientWork {
     Running(RequestId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClientDemand {
+    Withdrawn,
+    Active { container_key: String },
+    Retained { container_key: String },
+}
+
+impl ClientDemand {
+    fn container_key(&self) -> Option<&str> {
+        match self {
+            Self::Withdrawn => None,
+            Self::Active { container_key } | Self::Retained { container_key } => {
+                Some(container_key)
+            }
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+}
+
 #[derive(Debug)]
 struct ClientState<T> {
-    container_key: Option<String>,
+    demand: ClientDemand,
     hard_generation: u64,
     desired_refresh: RefreshId,
     work: ClientWork,
@@ -142,6 +165,7 @@ struct ExecutorInner<T> {
     wake: Condvar,
     runtime_factory: Arc<RuntimeFactory<T>>,
     thread_spawner: Arc<ThreadSpawner>,
+    notify_result_change: Arc<ResultNotifier>,
 }
 
 static NEXT_EXECUTOR_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -184,8 +208,9 @@ where
         + Send
         + Sync
         + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        Self::with_spawner(runtime_factory, |job| {
+        Self::with_spawner(runtime_factory, notify_result_change, |job| {
             std::thread::Builder::new()
                 .name("similar-book-query".to_owned())
                 .spawn(job)
@@ -199,6 +224,7 @@ where
         + Send
         + Sync
         + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
         thread_spawner: impl Fn(ThreadJob) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -208,6 +234,7 @@ where
                 wake: Condvar::new(),
                 runtime_factory: Arc::new(runtime_factory),
                 thread_spawner: Arc::new(thread_spawner),
+                notify_result_change: Arc::new(notify_result_change),
             }),
         }
     }
@@ -230,6 +257,12 @@ where
         }
     }
 
+    pub(crate) fn retain(&self, client: &BookQueryClient<T>) {
+        if let Some(client_id) = client.id_for(&self.inner) {
+            self.inner.retain(client_id);
+        }
+    }
+
     /// Coalesces one environment notification. This id is owner-issued and deliberately unrelated
     /// to SQLite or array sequence numbers (page-order repair may change without either one).
     pub(crate) fn soft_refresh(&self) {
@@ -247,7 +280,10 @@ where
     }
 
     #[cfg(test)]
-    fn wait_for_ready(&self, client: &BookQueryClient<T>, container_key: &str) -> T {
+    fn wait_for_ready(&self, client: &BookQueryClient<T>, container_key: &str, expected: &T) -> T
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
         let client_id = client
             .id_for(&self.inner)
             .expect("test client is not bound to this executor");
@@ -263,13 +299,14 @@ where
                 && completion.request.hard_generation == client.hard_generation
                 && completion.request.container_key == container_key
                 && let BookQueryTerminal::Ready(value) = &completion.terminal
+                && value == expected
             {
                 return value.clone();
             }
             let now = std::time::Instant::now();
             assert!(
                 now < deadline,
-                "timed out waiting for Ready({container_key})"
+                "timed out waiting for Ready({container_key}, {expected:?})"
             );
             let (next, _) = self
                 .inner
@@ -363,6 +400,25 @@ impl<T: Clone + Send + 'static> BookQueryClient<T> {
             executor.withdraw(*client_id);
         }
     }
+
+    /// Marks a bound viewer as temporarily not requesting new work while preserving the latest
+    /// result and any work that was already accepted. Calling this before first bind is a no-op.
+    pub(crate) fn retain(&self) {
+        let binding = self
+            .binding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let ClientBinding::Bound {
+            executor,
+            executor_identity,
+            client_id,
+        } = &*binding
+            && let Some(executor) = executor.upgrade()
+            && executor.identity == *executor_identity
+        {
+            executor.retain(*client_id);
+        }
+    }
 }
 
 impl<T: Clone + Send + 'static> Drop for BookQueryClient<T> {
@@ -396,7 +452,7 @@ where
         state.clients.insert(
             client_id,
             ClientState {
-                container_key: None,
+                demand: ClientDemand::Withdrawn,
                 hard_generation: 0,
                 desired_refresh: refresh,
                 work: ClientWork::Idle,
@@ -418,7 +474,7 @@ where
         let Some(client) = state.clients.get(&client_id) else {
             return BookQueryPoll::Withdrawn;
         };
-        let origin_changed = client.container_key.as_deref() != Some(container_key);
+        let origin_changed = client.demand.container_key() != Some(container_key);
         if origin_changed {
             Self::remove_queued_locked(&mut state, client_id);
             if let Some(running) = state
@@ -430,11 +486,20 @@ where
             }
             let refresh = state.current_refresh;
             let client = state.clients.get_mut(&client_id).unwrap();
-            client.container_key = Some(container_key.to_owned());
+            client.demand = ClientDemand::Active {
+                container_key: container_key.to_owned(),
+            };
             client.hard_generation = client.hard_generation.wrapping_add(1);
             client.desired_refresh = refresh;
             client.work = ClientWork::Idle;
             client.completion = None;
+        } else if matches!(
+            &state.clients.get(&client_id).unwrap().demand,
+            ClientDemand::Retained { .. }
+        ) {
+            state.clients.get_mut(&client_id).unwrap().demand = ClientDemand::Active {
+                container_key: container_key.to_owned(),
+            };
         }
 
         let client = state.clients.get(&client_id).unwrap();
@@ -446,7 +511,11 @@ where
                     BookQueryTerminal::Failed(error) => BookQueryPoll::Failed(error.clone()),
                 })
         });
-        if visible.is_none() && matches!(client.work, ClientWork::Idle) {
+        let refresh_needed = client
+            .completion
+            .as_ref()
+            .is_some_and(|completion| client.desired_refresh > completion.request.refresh_id);
+        if matches!(client.work, ClientWork::Idle) && (visible.is_none() || refresh_needed) {
             Self::enqueue_locked(&mut state, client_id);
         }
         visible.unwrap_or(BookQueryPoll::Preparing)
@@ -459,16 +528,17 @@ where
         }
         state.current_refresh = RefreshId(state.current_refresh.0.saturating_add(1));
         let refresh = state.current_refresh;
-        let client_ids = state.clients.keys().copied().collect::<Vec<_>>();
+        let mut client_ids = state.clients.keys().copied().collect::<Vec<_>>();
+        client_ids.sort_unstable();
         for client_id in client_ids {
             let Some(client) = state.clients.get_mut(&client_id) else {
                 continue;
             };
-            if client.container_key.is_none() {
+            if matches!(&client.demand, ClientDemand::Withdrawn) {
                 continue;
             }
             client.desired_refresh = refresh;
-            if matches!(client.work, ClientWork::Idle) {
+            if client.demand.is_active() && matches!(client.work, ClientWork::Idle) {
                 Self::enqueue_locked(&mut state, client_id);
             }
             // Queued refreshes remain in place; repeated notifications update `desired_refresh`
@@ -486,16 +556,34 @@ where
         }
         state.fifo.clear();
         let refresh = state.current_refresh;
-        let client_ids = state.clients.keys().copied().collect::<Vec<_>>();
+        let mut client_ids = state.clients.keys().copied().collect::<Vec<_>>();
+        client_ids.sort_unstable();
+        let mut result_changed = false;
         for client_id in client_ids {
             let client = state.clients.get_mut(&client_id).unwrap();
             client.hard_generation = client.hard_generation.wrapping_add(1);
             client.desired_refresh = refresh;
             client.work = ClientWork::Idle;
-            client.completion = None;
-            if client.container_key.is_some() {
+            result_changed |= client.completion.take().is_some();
+            if client.demand.is_active() {
                 Self::enqueue_locked(&mut state, client_id);
             }
+        }
+        drop(state);
+        if result_changed {
+            self.notify_result_change();
+        }
+    }
+
+    fn retain(&self, client_id: ClientId) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(client) = state.clients.get_mut(&client_id) else {
+            return;
+        };
+        if let ClientDemand::Active { container_key } = &client.demand {
+            client.demand = ClientDemand::Retained {
+                container_key: container_key.clone(),
+            };
         }
     }
 
@@ -523,7 +611,7 @@ where
         if remove {
             state.clients.remove(&client_id);
         } else if let Some(client) = state.clients.get_mut(&client_id) {
-            client.container_key = None;
+            client.demand = ClientDemand::Withdrawn;
             client.hard_generation = client.hard_generation.wrapping_add(1);
             client.work = ClientWork::Idle;
             client.completion = None;
@@ -560,7 +648,7 @@ where
             if !matches!(client.work, ClientWork::Queued) {
                 continue;
             }
-            let Some(container_key) = client.container_key.clone() else {
+            let Some(container_key) = client.demand.container_key().map(str::to_owned) else {
                 client.work = ClientWork::Idle;
                 continue;
             };
@@ -602,8 +690,9 @@ where
         state.running = None;
 
         let mut enqueue_refresh = false;
+        let mut result_published = false;
         if let Some(client) = state.clients.get_mut(&running.client_id) {
-            let same_request = client.container_key.as_deref()
+            let same_request = client.demand.container_key()
                 == Some(running.request.container_key.as_str())
                 && client.hard_generation == running.request.hard_generation
                 && matches!(client.work, ClientWork::Running(id) if id == running.request.request_id);
@@ -614,14 +703,20 @@ where
                         request: running.request.clone(),
                         terminal,
                     });
+                    result_published = true;
                 }
-                enqueue_refresh = client.desired_refresh > running.request.refresh_id;
+                enqueue_refresh = client.demand.is_active()
+                    && client.desired_refresh > running.request.refresh_id;
             }
         }
         if enqueue_refresh {
             Self::enqueue_locked(&mut state, running.client_id);
         }
+        drop(state);
         self.wake.notify_one();
+        if result_published {
+            self.notify_result_change();
+        }
     }
 
     fn ensure_worker(self: &Arc<Self>) {
@@ -742,6 +837,7 @@ where
             state.worker = WorkerLifecycle::Stopped;
             state.running = None;
             state.fifo.clear();
+            drop(state);
             self.wake.notify_all();
             return;
         }
@@ -754,11 +850,17 @@ where
             client.work = ClientWork::Idle;
         }
         state.worker = WorkerLifecycle::Failed(error);
+        drop(state);
         self.wake.notify_all();
+        self.notify_result_change();
     }
 
     fn mark_worker_stopped(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let result_changed = matches!(
+            state.worker,
+            WorkerLifecycle::Dormant | WorkerLifecycle::Starting | WorkerLifecycle::Live
+        );
         if !matches!(state.worker, WorkerLifecycle::Failed(_)) {
             state.worker = WorkerLifecycle::Stopped;
         }
@@ -767,7 +869,17 @@ where
         for client in state.clients.values_mut() {
             client.work = ClientWork::Idle;
         }
+        drop(state);
         self.wake.notify_all();
+        if result_changed {
+            self.notify_result_change();
+        }
+    }
+
+    fn notify_result_change(&self) {
+        // Repaint notification is advisory. The process panic hook still records a callback panic,
+        // while the query worker and its already-published terminal remain usable.
+        let _ = catch_unwind(AssertUnwindSafe(|| (self.notify_result_change)()));
     }
 }
 
@@ -884,18 +996,29 @@ mod tests {
         + Sync
         + 'static,
     ) -> (BookQueryExecutor<i32>, Receiver<()>) {
+        executor_with_done_spawner_and_notifier(runtime_factory, || {})
+    }
+
+    fn executor_with_done_spawner_and_notifier(
+        runtime_factory: impl Fn() -> Result<Box<dyn BookQueryRuntime<i32>>, String>
+        + Send
+        + Sync
+        + 'static,
+        notify_result_change: impl Fn() + Send + Sync + 'static,
+    ) -> (BookQueryExecutor<i32>, Receiver<()>) {
         let (done_tx, done_rx) = channel();
-        let executor = BookQueryExecutor::with_spawner(runtime_factory, move |job| {
-            let done = done_tx.clone();
-            std::thread::Builder::new()
-                .name("similar-book-query-test".to_owned())
-                .spawn(move || {
-                    job();
-                    let _ = done.send(());
-                })
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        });
+        let executor =
+            BookQueryExecutor::with_spawner(runtime_factory, notify_result_change, move |job| {
+                let done = done_tx.clone();
+                std::thread::Builder::new()
+                    .name("similar-book-query-test".to_owned())
+                    .spawn(move || {
+                        job();
+                        let _ = done.send(());
+                    })
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
         (executor, done_rx)
     }
 
@@ -908,22 +1031,29 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_notifier(|| {})
+        }
+
+        fn with_notifier(notify_result_change: impl Fn() + Send + Sync + 'static) -> Self {
             let (command_tx, command_rx) = channel();
             let commands = Arc::new(Mutex::new(command_rx));
             let (event_tx, event_rx) = channel();
             let next_runtime_id = Arc::new(AtomicU64::new(1));
-            let executor = BookQueryExecutor::new({
-                let commands = Arc::clone(&commands);
-                let events = event_tx;
-                let ids = Arc::clone(&next_runtime_id);
-                move || {
-                    Ok(Box::new(MockRuntime {
-                        id: ids.fetch_add(1, Ordering::Relaxed),
-                        commands: Arc::clone(&commands),
-                        events: events.clone(),
-                    }))
-                }
-            });
+            let executor = BookQueryExecutor::new(
+                {
+                    let commands = Arc::clone(&commands);
+                    let events = event_tx;
+                    let ids = Arc::clone(&next_runtime_id);
+                    move || {
+                        Ok(Box::new(MockRuntime {
+                            id: ids.fetch_add(1, Ordering::Relaxed),
+                            commands: Arc::clone(&commands),
+                            events: events.clone(),
+                        }))
+                    }
+                },
+                notify_result_change,
+            );
             Self {
                 executor: Some(executor),
                 commands: command_tx,
@@ -952,6 +1082,53 @@ mod tests {
             match self.events.recv_timeout(Duration::from_secs(3)).unwrap() {
                 Event::RuntimeDropped(id) => assert_eq!(id, expected_runtime_id),
                 event => panic!("unexpected shutdown event: {event:?}"),
+            }
+        }
+
+        fn assert_not_scheduled(&self, client: &BookQueryClient<i32>) {
+            let client_id = client.id_for(&self.executor().inner).unwrap();
+            let state = self
+                .executor()
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(matches!(state.clients[&client_id].work, ClientWork::Idle));
+            assert!(!state.fifo.contains(&client_id));
+            assert_ne!(
+                state.running.as_ref().map(|running| running.client_id),
+                Some(client_id)
+            );
+        }
+
+        fn wait_until_not_scheduled(&self, client: &BookQueryClient<i32>) {
+            let client_id = client.id_for(&self.executor().inner).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut state = self
+                .executor()
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            loop {
+                let done = matches!(state.clients[&client_id].work, ClientWork::Idle)
+                    && !state.fifo.contains(&client_id)
+                    && state.running.as_ref().map(|running| running.client_id) != Some(client_id);
+                if done {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                assert!(
+                    now < deadline,
+                    "client remained scheduled after cancellation"
+                );
+                let (next, _) = self
+                    .executor()
+                    .inner
+                    .wake
+                    .wait_timeout(state, deadline - now)
+                    .unwrap_or_else(|error| error.into_inner());
+                state = next;
             }
         }
     }
@@ -986,7 +1163,198 @@ mod tests {
         harness.commands.send(Command::Complete(30)).unwrap();
         assert_eq!(harness.started().0, "b");
         harness.commands.send(Command::Complete(21)).unwrap();
-        assert_eq!(harness.executor().wait_for_ready(&a, "a"), 11);
+        assert_eq!(harness.executor().wait_for_ready(&a, "a", &11), 11);
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn retained_ready_stays_visible_without_new_work_until_query_reactivates_it() {
+        let harness = Harness::new();
+        let client = BookQueryClient::default();
+        // Retaining an unbound client must not create an executor registration.
+        client.retain();
+        harness.executor().retain(&client);
+
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &1), 1);
+
+        client.retain();
+        harness.executor().soft_refresh();
+        harness.executor().soft_refresh();
+        harness.executor().soft_refresh();
+        harness.assert_not_scheduled(&client);
+        assert!(matches!(
+            harness.events.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        // Reactivation returns the coherent cached value while scheduling exactly one latest
+        // refresh. No intermediate refresh id is dispatched.
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Ready(1)
+        );
+        let (key, refresh, _) = harness.started();
+        assert_eq!((key.as_str(), refresh), ("book", 3));
+        harness.commands.send(Command::Complete(2)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &2), 2);
+        assert!(matches!(
+            harness.events.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn retained_running_and_queued_work_finish_without_followup_refresh() {
+        let harness = Harness::new();
+        let running = BookQueryClient::default();
+        let queued = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&running, "running"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "running");
+        assert_eq!(
+            harness.executor().query(&queued, "queued"),
+            BookQueryPoll::Preparing
+        );
+        harness.executor().retain(&running);
+        harness.executor().retain(&queued);
+        harness.executor().soft_refresh();
+        harness.executor().soft_refresh();
+
+        harness.commands.send(Command::Complete(10)).unwrap();
+        let (key, refresh, _) = harness.started();
+        assert_eq!((key.as_str(), refresh), ("queued", 2));
+        harness.commands.send(Command::Complete(20)).unwrap();
+        assert_eq!(
+            harness.executor().wait_for_ready(&queued, "queued", &20),
+            20
+        );
+        harness.assert_not_scheduled(&running);
+        harness.assert_not_scheduled(&queued);
+        assert!(matches!(
+            harness.events.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        assert_eq!(
+            harness.executor().query(&running, "running"),
+            BookQueryPoll::Ready(10)
+        );
+        let (key, refresh, _) = harness.started();
+        assert_eq!((key.as_str(), refresh), ("running", 2));
+        harness.commands.send(Command::Complete(11)).unwrap();
+        assert_eq!(
+            harness.executor().wait_for_ready(&running, "running", &11),
+            11
+        );
+        assert_eq!(
+            harness.executor().query(&queued, "queued"),
+            BookQueryPoll::Ready(20)
+        );
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn hard_invalidation_clears_retained_cache_without_enqueuing_until_reactivation() {
+        let owner_slot = Arc::new(Mutex::new(None::<Weak<ExecutorInner<i32>>>));
+        let (notified_tx, notified_rx) = channel();
+        let harness = Harness::with_notifier({
+            let owner_slot = Arc::clone(&owner_slot);
+            move || {
+                if let Some(owner) = owner_slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    assert!(
+                        owner.state.try_lock().is_ok(),
+                        "hard-invalidation notifier ran while the owner state lock was held"
+                    );
+                }
+                notified_tx.send(()).unwrap();
+            }
+        });
+        *owner_slot.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(Arc::downgrade(&harness.executor().inner));
+        let client = BookQueryClient::default();
+        let blocker = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        notified_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &1), 1);
+        assert_eq!(
+            harness.executor().query(&blocker, "blocker"),
+            BookQueryPoll::Preparing
+        );
+        let (key, _, blocker_cancel) = harness.started();
+        assert_eq!(key, "blocker");
+        client.retain();
+        blocker.retain();
+
+        // `blocker` is inside MockRuntime::execute and therefore not holding owner state while
+        // hard invalidation synchronously invokes the callback below.
+        harness.executor().hard_invalidate();
+        notified_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(blocker_cancel.load(Ordering::Acquire));
+        harness.assert_not_scheduled(&client);
+        harness.commands.send(Command::Complete(99)).unwrap();
+        harness.wait_until_not_scheduled(&blocker);
+        {
+            let client_id = client.id_for(&harness.executor().inner).unwrap();
+            let state = harness
+                .executor()
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(state.clients[&client_id].completion.is_none());
+        }
+        assert!(matches!(
+            harness.events.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(2)).unwrap();
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn retained_client_querying_a_different_book_hard_cancels_the_old_request() {
+        let harness = Harness::new();
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "old"),
+            BookQueryPoll::Preparing
+        );
+        let (_, _, old_cancel) = harness.started();
+        client.retain();
+
+        assert_eq!(
+            harness.executor().query(&client, "new"),
+            BookQueryPoll::Preparing
+        );
+        assert!(old_cancel.load(Ordering::Acquire));
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.started().0, "new");
+        harness.commands.send(Command::Complete(2)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "new", &2), 2);
         harness.shutdown(1);
     }
 
@@ -1060,7 +1428,10 @@ mod tests {
             BookQueryPoll::Preparing
         );
         harness.commands.send(Command::Complete(20)).unwrap();
-        assert_eq!(harness.executor().wait_for_ready(&second, "shared"), 20);
+        assert_eq!(
+            harness.executor().wait_for_ready(&second, "shared", &20),
+            20
+        );
         assert_eq!(
             harness.executor().query(&first, "shared"),
             BookQueryPoll::Ready(10)
@@ -1088,7 +1459,10 @@ mod tests {
         harness.commands.send(Command::Complete(1)).unwrap();
         assert_eq!(harness.started().0, "sibling");
         harness.commands.send(Command::Complete(2)).unwrap();
-        assert_eq!(harness.executor().wait_for_ready(&sibling, "sibling"), 2);
+        assert_eq!(
+            harness.executor().wait_for_ready(&sibling, "sibling", &2),
+            2
+        );
         assert_eq!(
             harness.executor().query(&withdrawn, "withdrawn"),
             BookQueryPoll::Preparing
@@ -1126,7 +1500,10 @@ mod tests {
         }
 
         harness.commands.send(Command::Complete(4)).unwrap();
-        assert_eq!(harness.executor().wait_for_ready(&sibling, "sibling"), 4);
+        assert_eq!(
+            harness.executor().wait_for_ready(&sibling, "sibling", &4),
+            4
+        );
         harness.shutdown(1);
     }
 
@@ -1141,7 +1518,7 @@ mod tests {
         );
         assert_eq!(harness.started().0, "ready");
         harness.commands.send(Command::Complete(1)).unwrap();
-        assert_eq!(harness.executor().wait_for_ready(&ready, "ready"), 1);
+        assert_eq!(harness.executor().wait_for_ready(&ready, "ready", &1), 1);
         assert_eq!(
             harness.executor().query(&running, "running"),
             BookQueryPoll::Preparing
@@ -1173,7 +1550,9 @@ mod tests {
         refreshed.sort();
         assert_eq!(refreshed, ["ready", "running"]);
         assert_eq!(
-            harness.executor().wait_for_ready(&running, "running"),
+            harness
+                .executor()
+                .wait_for_ready(&running, "running", &running_value.unwrap(),),
             running_value.unwrap()
         );
         harness.shutdown(1);
@@ -1194,6 +1573,55 @@ mod tests {
             BookQueryPoll::Failed("failed-a".to_owned())
         );
         harness.commands.send(Command::Complete(2)).unwrap();
+        harness.shutdown(1);
+    }
+
+    #[test]
+    fn ready_and_refresh_completion_notify_after_releasing_the_owner_lock() {
+        let owner_slot = Arc::new(Mutex::new(None::<Weak<ExecutorInner<i32>>>));
+        let (notified_tx, notified_rx) = channel();
+        let harness = Harness::with_notifier({
+            let owner_slot = Arc::clone(&owner_slot);
+            move || {
+                if let Some(owner) = owner_slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    assert!(
+                        owner.state.try_lock().is_ok(),
+                        "result notifier ran while the owner state lock was held"
+                    );
+                }
+                notified_tx.send(()).unwrap();
+            }
+        });
+        *owner_slot.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(Arc::downgrade(&harness.executor().inner));
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        notified_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &1), 1);
+
+        harness.executor().soft_refresh();
+        assert_eq!(harness.started().0, "book");
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Ready(1)
+        );
+        harness.commands.send(Command::Complete(2)).unwrap();
+        notified_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &2), 2);
+        assert!(matches!(
+            notified_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         harness.shutdown(1);
     }
 
@@ -1246,6 +1674,7 @@ mod tests {
     fn spawn_failure_is_terminal_instead_of_permanent_preparing() {
         let executor: BookQueryExecutor<i32> = BookQueryExecutor::with_spawner(
             || panic!("runtime must not be created when spawning fails"),
+            || {},
             |_| Err("injected spawn failure".to_owned()),
         );
         let client = BookQueryClient::default();
@@ -1265,15 +1694,20 @@ mod tests {
             ),
             (true, "similar book query worker panicked"),
         ] {
-            let (executor, done) = executor_with_done_spawner(move || {
-                if panic_during_init {
-                    panic!("injected init panic");
-                }
-                Err("injected init failure".to_owned())
-            });
+            let (notified_tx, notified_rx) = channel();
+            let (executor, done) = executor_with_done_spawner_and_notifier(
+                move || {
+                    if panic_during_init {
+                        panic!("injected init panic");
+                    }
+                    Err("injected init failure".to_owned())
+                },
+                move || notified_tx.send(()).unwrap(),
+            );
             let client = BookQueryClient::default();
             assert_eq!(executor.query(&client, "a"), BookQueryPoll::Preparing);
             done.recv_timeout(Duration::from_secs(3)).unwrap();
+            notified_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             assert_eq!(
                 executor.query(&client, "a"),
                 BookQueryPoll::Failed(expected.to_owned())
@@ -1350,6 +1784,7 @@ mod tests {
                     }))
                 }
             },
+            || {},
             {
                 let pending_job = Arc::downgrade(&pending_job);
                 move |job| {
