@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。新engine/caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。Bはbf7e7f3c9、Cの製品接続はsource checkpoint済み。B/Cとも独立Sol承認 | Bの同TX engine14件、Cの要求所有・製品通知・実UI/lifecycle接続38件成功。実行途中の非同期取消composition、実データ負荷/peak、大規模UI、最終gate/portable・実機は未完了 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1907,3 +1907,19 @@ combined-tests1と2は各38成功/1ignored。2の再実行理由は独立レビ�
 正本target/r1-book-query-C-final-20260908/manifest.json（SHA515EB142F44A5DE5437224E163F79D4E72178C4CDDB124218650789BD63B7212）。
 親は29 artifactと現7sourceの完全一致、R2 cached100651bytes/522b17...8043を照合した。CはR2/R4と共存する未コミットsourceとしてfreezeし、既存分を一括commitしていない。
 実engine性能/peak・大規模UI・loop途中の非同期取消、最終test-fullと新portable、利用者の実機確認は後続。性能修正で二重gateにならないよう最終全体検証を測定後にまとめる。
+
+## 実engine性能harnessの固定レビュー境界（2026-09-08、独立レビュー/実測は進行中）
+
+dev-tools専用bin/facadeとbase/cache/priority観測の7fileに限定し、製品App/profile初期化を通さず実engineを呼ぶ。
+入力guard・明示CreateNew出力・worker/SQLiteとsamplerの終了後検査、query-core/setup/warmup/overall、worker/process CPU、phase sampled/lifetime peakを分離した。
+初回compileのAPI不一致とguard fixture失敗は修正、全試行logを保存した。guard-tests3ではheader2/2のreadonly query自身がWALを作る前提矛盾を実証。
+そのため入力をguard後raw header1/1へ限定し、2/2をengine open前に拒否する。製品readerのsemanticsは変えない。
+guard-tests4は空SQLite fixtureのheader未生成による失敗。CREATE TABLEでfixtureを成立させ、guard-tests5は3/3成功（compile43.72秒、実行0.82秒）。
+既存writer拒否、guard中write/delete拒否、output別名保護、WAL事前拒否、DELETE-mode query前後不変、active/retained同一Arcを確認した。
+最終release check4は12.78秒/exit0、fmt/fmt-check1は空log/exit0。
+
+正本target/r1-book-query-performance-harness-fixed-20260908/manifest.json、SHA=b97c93798fb38a0d4826a69f1c8a9b50ec0ee13717525f81eb86db61eaefd6bc。
+review.patchは71642B、SHA=2b4d29dc7d2348a0139895b3175ac2aff08766b1b97c39233de8407b799a6528。
+親は27 artifact、現7sourceとfinalコピーの一致、R2 cached100651B/522b17...8043を照合した。独立Solがこの固定差分をレビュー中。
+元backupは通常file readでheader2/2、WAL0B/SHM32768Bを確認したのみ。DB接続・削除・変換をしていない。
+実計測前に別fresh copyを整合して準備し、そのコピーだけDELETEへ変換する。短本/400各1pilot、残る性能条件、取消/UI、最終gate/portableは未完了。

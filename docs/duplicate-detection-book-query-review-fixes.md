@@ -6,7 +6,7 @@ Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビ�
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。疎result/UIはAの3fd01996fで実装・回帰・画像レビュー済み。既存query callerと本検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。疎result/UIはAの3fd01996fで実装・回帰・画像レビュー済み。B/Cで本検索計算と製品query callerを接続済み。性能と最終配布前検証を残す。
 
 ## 修正対象と維持する性質
 
@@ -597,3 +597,37 @@ process working-set peakとprivate commit peakを別々に保存する。warmの
 
 旧400ページ/7候補の元keyは記録上未特定。別の400本を同一条件や1.69秒の再現と称さず、特定できなければ比較不能と記録する。
 engine単独計測後もCの実caller公平性/通知と最終portableの音声実機確認は別の未完了条件である。
+
+### 計測 harness の事前合意（2026-09-08、独立 Sol）
+
+実装は dev-tools 専用 facade/bin と既存 engine/base の小さな観測 API に限定する。製品照会の C 接続は既存 checkpoint を保持する。
+全入力を canonical regular file として重複除去し、書込・置換を拒む共有 guard をすべて取得してから初回 SHA/長さと WAL/SHM 不在を確認する。
+既存 writer が handle を保持する場合の guard 取得失敗、および guard 中の書換・置換拒否は一時 fixture で検証する。
+終了時は engine/SQLite worker を drop+join し sampler を止めた後、guard 保持中に最終 SHA/長さと sidecar を再確認する。
+JSONL 出力は入力・sidecar と同じファイルを開かないことを open 前に確認し、明示された新規出力を CreateNew で作る。
+入力を誤って truncate する shell redirection を計測開始手順に使わない。元 backup を変更するケース生成も禁止する。
+元backupのheaderをSQLiteを開かず読んだ結果、write/read version=2/2（WAL）、既存WAL=0B・SHM=32768Bだった。
+readonly SQLite自身もWAL/SHMを作り得るため、元backup/sidecarは保持し、別の一貫したコピーだけをDELETE-modeへ整えて測定する。
+guard-tests3は2成功/1失敗。sidecar不在のheader2/2 fixtureでも製品readerのreadonly query後にWALが再生成された（952行、同名logを保持）。
+この反例に基づきguard後のraw header確認で1/1だけを受け付け、WAL2/2はengine open前に拒否する方針へ修正する。
+main単純copyを一般に一貫性保証としない。main/WALを同時guardして空WALを確認するか、online backup等の整合した準備を記録する。
+
+engine.query 区間の名称は query-core とし、DB open/base read/hash/worker・sampler handshake/digest/JSON 出力を含めない。
+setup、warmup、overall は別に記録し、query-core の cold を lazy open 込みの製品 cold と同一視しない。
+同じ canonical base を active/retained に指定した場合は一度だけ読み同一 Arc を共有する。retained は検索候補に追加しない。
+byte/count/time は u64、sampling interval 0 は拒否。実際の dev-tools/portable feature と worker priority を記録する。
+一時 fixture と独立 review が通った後、短本・代表400ページ各1標本で出力・priority・digest・入力不変・base再利用・観測負荷を確認する。
+その結果を見て各3標本、通常20標本と残りの条件へ進む。少数 pilot は性能採用の最終判定ではない。
+
+### 残る取消・UI 計測の最小境界（2026-09-08、独立 Sol、未実行）
+
+現7file harnessへ追加の取消/UI機構を混ぜない。経過時間だけでcancelする大入力はphase途中の証拠にならないため、
+既存の取消load位置にinstance-local cfg(test) checkpoint/barrierを置く案を採る。MIH、body SQL、direct loop各1件で
+実進行→別threadから同じtoken取消→inner Cancelled→同engine次query成功を観測し、probeは新しい取消分岐を作らない。
+SQL raw-row loopで代用する場合はSQLite VM内interruptの証拠と称さない。実C runtimeまでの一体検証は代表1phaseだけで、
+取消されたAの結果非公開とUI pollなしのB進行を追加する。全interleavingやbusy待機中の即時取消を保証する検証ではない。
+
+大量候補UIは実draw_similar_panel/ScrollAreaを通すheadless release補助計測を別区切りで行う。
+N=400/C=56と2800、N=10000/C=1を分け、top/middle/endのwall/thread CPU、row/visible strip/origin projectionを観測する。
+現A実装でclip後に省略するのは帯のfold/paint/hoverであり、名称・要約・button・layoutの全候補走査は残る。
+合成結果の準備はtimer外。絶対msをunit assertせずraw値を保存し、GPU/compositor/hover thumbnail/製品全体frame latencyの証拠とは区別する。
