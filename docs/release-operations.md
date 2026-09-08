@@ -89,6 +89,13 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 
 ## 3. テストゲート
 
+実アプリを起動・操作するperf/idle/page-turn/UI smokeは、非対話のテストゲートと分離する。
+リリース前に対象と所要時間をまとめて利用者へ提示し、**明示了承後だけ実行**する。
+会話中の「これから操作を控えて」という予告は了承の代わりにならない。
+[実アプリ検証の実行確認](interactive-release-verification.md)を、CLAUDE.md Phase 2の
+perf/idle検証および実アプリsmokeの実行前に適用する。必須検証を免除するものではない。
+通常の開発・buildからの自動起動は行わず、未了承・未実施はリリース記録へ残す。
+
 - **リリース直前に `scripts\test-full.ps1` を RUN する** (パイプ無し・real exit code を確認)。
   通常 workspace test に加え、`pack-build-tools` feature で単体テストを持つ補助 bin 2本も
   同じlib buildに含めて実行する。

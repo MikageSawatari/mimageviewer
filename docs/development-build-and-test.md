@@ -12,6 +12,7 @@
 | 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
+| 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
@@ -82,6 +83,11 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ドキュメント、テスト、build scriptだけの変更には実機確認用バイナリは不要。
 
 ### エージェントによる自動操作
+
+実アプリを起動・操作する検証は、原則リリース前の検証枠で、対象・所要時間・PC使用範囲を
+提示して利用者の明示了承を得てから行う。会話中の予告だけでは実行しない。
+通常は実装・非対話テスト・buildまで進め、実アプリ確認を検証待ちとして残す。
+詳細は[実アプリ検証の実行確認](interactive-release-verification.md)。
 
 エージェントはnormal-profileの開発・release・installed実行ファイルを起動しない。
 `prepare-portable-smoke.ps1 -TestScript`が準備した

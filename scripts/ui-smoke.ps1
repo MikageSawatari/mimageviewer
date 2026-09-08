@@ -1,3 +1,11 @@
+<#
+.SYNOPSIS
+Runs an isolated, diagnostic portable UI smoke scenario after explicit user approval.
+
+.PARAMETER InteractiveApproved
+Confirms that the user explicitly approved the scenario and expected duration.
+Automation must not pass this switch until that approval has been obtained.
+#>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
 # This runner has no executable or data-directory override. It prepares and
@@ -5,14 +13,24 @@
 # directory. The executable must carry the portable,test-script build manifest.
 #
 # NOTE: this file is ASCII-only for Windows PowerShell 5.1.
+# Running this script opens and controls the disposable portable application.
+# Use -InteractiveApproved only after the user has explicitly approved the
+# described scenario and its expected duration.
 
 [CmdletBinding()]
 param(
     [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'StillStripDrag')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
-    [int] $TimeoutSeconds = 120
+    [int] $TimeoutSeconds = 120,
+    [switch] $InteractiveApproved
 )
+
+if (-not $InteractiveApproved) {
+    [Console]::Error.WriteLine(
+        '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
+    exit 2
+}
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -360,6 +378,7 @@ function Save-UiSmokeEvidence {
         exit_code = $script:runExitCode
         timed_out = $script:timedOut
         skip_build = [bool]$SkipBuild
+        interactive_approved = [bool]$InteractiveApproved
         portable_validated_for_run = $script:portableValidatedForRun
         executable = $exe
         data_directory = $dataDir
