@@ -211,6 +211,7 @@ pub mod settings_restore;
 pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
+mod similar_book_mih;
 mod similar_book_query;
 pub mod similar_db;
 pub mod similar_image;
