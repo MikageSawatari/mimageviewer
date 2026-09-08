@@ -2,7 +2,7 @@
 
 2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
-Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実行中の非同期取消composition、性能/peak/大規模UI、最終gate/portableは未完了。
+Bの独立sameTX engineはbf7e7f3c9で保存し、14件回帰・独立Solレビュー済み。Cの製品caller接続も独立Sol承認・関連38件成功・source checkpoint済み。実本5頁/400頁の独立oracleは成功、実engine cold/warm n3とCPU/peak pilotも記録済み。実行中の非同期取消composition、通常20標本/特殊大規模/世代更新/大規模UI、最終gate/portableは未完了。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
@@ -667,3 +667,26 @@ target canonicalize-or-raw fallbackは同じread-only規約を独立導出する
 同じguarded DB/baseの前後hash一致、実優先度=-1、既定予算内。正本はtarget/r1-book-query-real-certificates-20260909/manifest.json。
 詳細値とビルド/入力/出力SHAはduplicate-detection-review-fixes-20260907.mdの「実本certificate完了」を参照する。
 実本2件の正しさを確認した段階であり、20標本の性能採用・大規模特殊条件・途中取消・大量UI・最終gate/portableを完了したとは扱わない。
+
+### 大規模fixtureと世代比較の具体境界（2026-09-09、独立Sol確認、未実行）
+
+新たな製品dev-tools入口は増やさず、cfg(test) ignoredの生成・構造化期待値検証から実DB/base APIでfresh storeを作る。
+生成後のDELETE形式・quick_check・hash固定を確認し、性能は既存の凍結release CLIで別実行する。生成テストの時間を採用性能値へ混ぜない。
+既存immutable入力への書込は禁止し、guard下コピー先だけを変更する。出力は新規専用directoryとCreateNew、失敗したpartialも保持する。
+
+- 7N: 256bitのaffine Boolean語f(x)=parity(a & x) xor b（a=0..255、b=0/1）512種から400種を選ぶ。
+  異なる語のHamming距離は128または256でradius32から分離する。originの各署名1頁に対し固有7冊×各3頁を対応させる。
+  同じ署名の実本数はorigin込み8冊なのでRare。全2800候補key・全BookPair field・stable alignment・override1/候補を構造期待として照合する。
+- 1万対角: 2冊A=B=X×10000。一般dense: A=X×9999,Y、B=Y,X×9999、dist(X,Y)>32、品質適格、実2冊。
+  後者は対角shortcutに入らず、矩形の規模は1億組。再列挙passもあるため総比較回数が1億ちょうどとは主張しない。
+  一意の最適対応9999組(i,i+1)、relation/coverage/distinctive/strip全fieldを照合する。巨大な旧二乗oracleは呼ばない。
+- near-white: 64×64 RGBAの白背景と中央1pixel黒を実proxy/PDQへ通し、生成したquality>0と反復署名同一を確認する。
+  手動quality付与や特定PDQ値の仮定はしない。400反復頁×総8冊（7候補/全400対角）と別storeの総9冊（Common/候補0）を分ける。
+- 世代比較: 実400条件のfresh copyで現snapshotを一度base化し、base.seq=9852を基準とする。
+  異なるitemへの変更を加えて65535件と65536件の2条件を作り、API1回=seq1と仮定せずbase_seq/read_seq/seq差/delta.lenを検査する。
+  463万件規模のbaseではthreshold=65536、should_compactはfalse→true。そのsnapshotからnewBaseを作りbase_seq=read_seq/delta0も確認する。
+  元base.seq0→read_seq9852の現実条件は既存測定として別に保持する。新しい基準baseの測定を元条件と同一視しない。
+  compaction後は既存CLIのretained-baseで旧実Arcを保持しquery peakを測る。compaction作成処理そのものの時間・peakを測ったとは扱わない。
+
+ケース生成の具体ファイル境界とデータ保護は実装担当が既存APIに照合してから着手する。追加狭域と凍結差分の独立レビューを行う。
+既存の成功済み小規模oracleは再実行せず、追加の構造期待を確認する。通常20標本の生値と巨大条件の標本数・限界を明記する。
