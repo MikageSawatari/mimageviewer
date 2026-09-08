@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60eで単独回帰・独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1760,3 +1760,35 @@ product check1は31.50秒/exit0、fmt-check1は空log/exit0、diff-check成功�
 module/lib生bytesとR2 staged patch100651bytes/3adba6c9...f42aは前後不変。正本target/r1-mih-kernel-commit-20260908/manifest.json。
 実common/候補集合/分類とalignment/疎な帯、同TX runtime/caller、実データの時間・peak RAM・最終gate・portable更新は未完了。
 次classifier入口と帯consumerの最小型案は独立source監査済み、book-query-review-fixesへ記録した。R4 portableと実機返答待ちは維持する。
+### R1/R5 再列挙classifierの区切り（実caller・大規模性能は未検証）
+
+focused commit: 44f25625373ef3986f464e01e65e3216d81a16e7、1file、1056追加/59削除。
+src/dupe/book.rsのみに新しいPreparedBookSide、完全domain付き行再列挙、checkpoint/replay alignmentを追加した。
+既存公開analyze/classify_pairを小規模oracleとして保持し、params検証・BookStats集計・全BookPair field確定を共有する。
+新入力の署名幅は[32bytes]固定で、radius>256もconstructorで拒否する。起点sideを全候補で共有し反復ページ数を畳まない。
+実global BのFenwick cellをblock前に保存、実(a,b)tailからblockを高々1回再生する。全Eと全parentを保持しない。
+完全な対角bijectionは全B発見より前のshortcutで返す。一般経路はdomain内の真辺を再列挙し、旧完全同点の選択順を維持する。
+
+先行レビューの3指摘（B発見の全E蓄積、shortcutのC*N復活、visitor内取消不足）を反映した。
+Bは発見時BTreeSetでunique化、shortcutは完全A domainを先に検査、visitorは1024辺周期で取消してStopを返す。
+小規模の旧全field oracle、X対XXX/XXXXの同点、辺のないB圧縮、距離優先、block跨ぎ、dense非shortcut、
+重複最小距離、source error/Stop/取消を検証した。手作りweighted sourceはpure score検証で、実PDQ corpus oracleと区別する。
+
+- 初回compile1は成功。tests1はtest helperの存在しないSig::Hash参照によるE0599で失敗し、Sig::Lumaへ訂正した。製品ロジックの失敗ではない。
+- tests2は18成功。レビュー3点と回帰追加後のtests3は21成功/0失敗/0ignored、compile50.93秒、test0.00秒。
+- 最後のcallback fixture補強後、cancel-test1の対象1件が成功。visited=1025とStop観測を明示し、最終Cancelledだけでなく列挙途中の停止を検証する。
+- 補強後のproduct check2は10.71秒/exit0、fmt-check2は空log/exit0、diff-checkも成功。21件全体は最終fixture補強後には再実行していない。
+
+証跡はtarget/r1-book-classifier-*。親は以下の最終source/log SHAを独立照合した。
+
+- source生bytes SHA256=b35a0946af69c9c1a62c8c32e5693c871a594fcaf44a7dece6294a433fa2937d、58,182bytes。
+- tests1失敗log SHA256=b185a82da2f003b6731cb072d11682173bea310bd8863fb80e2eb419f283ca11。
+- tests3 log SHA256=4e3fd8cb367523ec5a3411f6531aac13be32de8225146daeb1e8917ce2f7a4c3。
+- cancel-test1 log SHA256=50eacdca556d093324c8984c1cdfb294fc5043ad0ac4fc6809ea553af842185d。
+- check2 log SHA256=7f2f5a4fe2ce0e36a696c9ab3ca5a4be643104308384705bbbd47ec0c1bb7537。
+
+この区切りは分類器単独の正確性/取消とコード上の容量境界まで。実common/discovery/source接続、
+最大1万ページの時間・peak RAM、全体gate・新portableは後続。R4 portableと実機返答待ちは維持する。
+
+独立coreは最終fixture変更を逆適用すると前回承認source SHAへ完全一致することも確認し、最終SHAを承認した。
+通常hook付きのbook.rs限定commit後、source生bytesとR2 staged patch100651bytes/3adba6c9...f42a不変を確認した。

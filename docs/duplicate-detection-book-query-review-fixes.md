@@ -5,7 +5,7 @@
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60eで保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -81,6 +81,18 @@ viewer 撤回を一緒に接続する。旧分類器を一時的に executor へ
 純mock段階で公平性・supersede・withdraw/drop・失敗後dispatch・shutdown回収を検証する。
 旧query計算にはまだ取消点がないため、通知・viewer lifecycle・取消可能な実計算を揃えた後を製品caller切替の完成境界とする。
 
+### manager接続のconstructor所有（先行source監査済み）
+
+現executor constructorはfactory/probeを呼ばずlazyである。SimilarIndexSchedulerをArc::new_cyclicで構成し、
+schedulerだけがBookQueryExecutorを所有、factory/gate/runtimeにはWeak<Scheduler>を保存する最小接続が可能と独立coreが確認した。
+managerの旧book ArcMutexは撤去してscheduler.book_queryへ委譲する。Weak upgradeは一時参照だけにし、
+runtime fieldやidle中へArc<Scheduler>を保持しない。後付けOnceLock配線や第二ownerを作らない。
+managerDropの既存scheduler.shutdownからexecutorの明示shutdownを呼び、indexerがschedulerを保持中でもqueryを即取消する。
+明示shutdownとDropは同じinner.shutdownへ委譲し、scheduler/state/active_cancel guard解放後に通知する。
+現inner.shutdownはcompletedを保持するため、この接続時は同じshutdown正本で完成結果も退役させる。
+実store変更は同TXの観測結果を持ち帰り、TX/DB/memory/scope/scheduler guard解放後にknown storeを更新してhardを一度通知する。
+factoryの既存Fn() APIを拡張しなくても、runtimeがWeak schedulerを一時upgradeしてそのbook executorへ通知できる。
+具体な実装とshutdown/strong-cycle回帰はcaller接続時に行う。先行owner/kernel単独commitの完成には含めない。
 ### caller接続の追加監査と要求範囲の再評価
 
 独立UI監査で、current_item=Noneはmetadata panelのOption::mapでhelper自体を呼ばず、非対象itemは
@@ -390,7 +402,7 @@ entryが24〜32bytesの場合の両者合計48〜64MBは設計上の概算であ
 pair-levelの追加反例はA=X×9999,Y、B=Y,X×9999、dist(X,Y)>32（quality等の適格条件を満たす）。
 対角shortcutを使えず約1億辺がある一方、最大9999一致の解は(i,i+1), i=0..9998に一意である。
 巨大な旧二乗oracleを実行せず、一般dense経路の厳密期待値・時間・memoryを検証できる。
-### classifier入口の最小分離（source監査済み・具体実装は後続）
+### classifier入口の分離（単独実装・狭域検証済み、caller接続は後続）
 
 独立coreはdupe/book.rsを再照合し、既存公開classify_pair/analyzeと旧Fenwickをoracleとして維持できると確認した。
 新product用crate内入口は2冊の全page、同TXのcommon flags、a行単位の再列挙closureを受ける。
@@ -400,6 +412,37 @@ distinctiveはquality適格かつnoncommonな各ページ数であり、同署�
 classifierは1a行だけsort/dedup最小距離を持ち、B集合発見・forward・checkpoint replayへ同じ入口を使う。
 新経路からBookMatchSet.matched/BookCorpusBuilder.pages/PreparedCorpus.near_pairs/全candidates・predecessorの全E保持連鎖を外す。
 旧全E経路は小規模oracleとして残せる。これはAPI境界の監査で、checkpointの実装・実測を完了したものではない。
+具体preflightで、全Aを候補Cごとにkernel再照会するC*Nの負荷を避ける境界を追加した。
+同TX/scope/品質条件の厳密noncommonな起点slotは、自身を含め最大8冊にしか近傍を持たない。
+したがってdistinct(起点slot,他book)は全体で最大7N。discoveryは本別count3を飽和しても、
+近傍を持つ起点slot集合への記録は最後まで続ける。同署名でも別slotを畳まない。
+候補ごとの完全な昇順一意slot集合をalignmentのA group domainとし、集合外は真辺無しと証明済みとして省く。
+candidate commonでdomain内の行が空になることは許容する。全Eを保持せず、samplingも行わない。
+この上限と正確性は親・独立coreが確認した。密なdomain内の辺列挙時間は引き続き実測対象である。
+
+当該sliceはdupe/book.rsのみとした。VerifiedBookPageはindex/quality/common/fixed [u8;32]を所有し、
+PreparedBookSideは全page・distinctive slot列・stats・Paramsを一度準備して起点を全候補で共有する。
+Paramsをsideに束縛し、pair両側の一致をO(1)で確認する。固定署名幅は型で保証し、旧公開APIの幅/入力検証は維持する。
+新入口はdomain slotsとReenumeratedBookEdges::visit_a(a_slot,sink(b_slot,distance))を受ける。
+side内slotと実page indexを区別し、source/domainのA/Bは旧book ID昇順へ正本化済みの入力を要求する。
+逆順引数を黙ってswapしてdomainの意味を変えない。各A行だけ実B順sort/重複最小距離へ正規化する。
+対角shortcutはB集合発見passより前に置く。検証済み同長distinctive列の各k対kが半径内なら一意の最大全対応を返せる。
+先にB発見の全Eを走査すると1万同署名で1億辺を歩くためO(N)shortcutにならない。
+source契約は全真辺の完全再列挙であり任意部分グラフではない。error/取消fixtureは非shortcut経路で検証する。
+非shortcutはdomain A group数でblockを区切り、全Fenwick cellをcheckpoint、同group全query後のB順update、legacy tieを維持する。
+取消/source error/incomplete Stop/invariantを分ける。共有finish_pairで全BookPair fieldを固定し、旧oracleと照合する。
+この具体境界は親と独立coreが実装前に承認した。製品caller/疎な帯/discovery実装は後続。
+実装後の独立レビューで3点を訂正した。global B発見は全辺のbをVecへ貯めてからdedupせず、
+BTreeSetへ発見時unique化しO(M)だけ保持する。対角shortcutは完全A domainとの長さ・一致検査を
+距離loopより前に置き、疎候補でC*Nの判定を復活させない。row visitor内でも周期取消を確認してStopし、
+列挙後はCancelledをSourceStoppedより優先する。checkpointのstable tail・同A一括更新・旧tieの設計は維持する。
+製品callerは従来BOOK_ORIGIN=1/BOOK_CANDIDATE=2なので、origin=Aと旧ID昇順を同時に満たせる。
+alignment sourceはMIHを全蔵書へ繰り返し照会する必要がない。同TXで準備した候補のdistinctive全pageと、
+domainの起点1pageを直接256bit比較すれば完全な真辺を列挙できると親・独立coreが確認した。
+global common/discoveryはMIHで行い、alignmentだけこの直接列挙を使う具体案を次engine preflightへ渡す。
+比較量は各passでΣ(domain数×候補distinctive数)。候補common/quality/radiusと実indexの穴を保持し、
+直接loop内で取消とvisitor Stopを処理する。全Eのcacheを追加しない。global commonの冊数は実containerで数え、
+固定book IDはpair方向だけに使う。構造的正確性の承認であり、実時間の採用判断は後続計測とする。
 ### 多候補の結果容量とページ帯consumer
 
 独立UI監査で、全Eを除去しても現BookRelationHit.pagesの候補数C×起点全長Nが残ることを確認した。
