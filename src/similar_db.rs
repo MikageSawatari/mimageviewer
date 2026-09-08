@@ -186,6 +186,39 @@ pub struct SimilarDb {
     conn: Mutex<Connection>,
 }
 
+/// WAL への変換だけを直列化する。
+///
+/// `PRAGMA journal_mode=WAL` は排他ロックへ昇格するため、同じ fresh DB を複数接続が同時に
+/// 開くと `busy_timeout` では待たず `SQLITE_BUSY` を返す。mode は DB に永続するので、まず
+/// 読み取りだけで確認し、変換が必要な接続だけを process 内で直列化する。mutex を待つ前の
+/// statement は `journal_mode_is_wal` の return で解放済みであり、mutex 内でも再確認する。
+fn ensure_wal_journal(conn: &Connection) -> rusqlite::Result<()> {
+    if journal_mode_is_wal(conn)? {
+        return Ok(());
+    }
+
+    static CONVERT: Mutex<()> = Mutex::new(());
+    let _serialized = CONVERT.lock().unwrap_or_else(|error| error.into_inner());
+    if journal_mode_is_wal(conn)? {
+        return Ok(());
+    }
+
+    match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        Ok(()) => Ok(()),
+        Err(error) if journal_mode_is_wal(conn).unwrap_or(false) => {
+            // 別 process が先に変換を終えた場合も目的は達成済み。
+            let _ = error;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn journal_mode_is_wal(conn: &Connection) -> rusqlite::Result<bool> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    Ok(mode.eq_ignore_ascii_case("wal"))
+}
+
 impl SimilarDb {
     pub fn open() -> rusqlite::Result<Self> {
         Self::open_at(&Self::db_path())
@@ -196,12 +229,15 @@ impl SimilarDb {
             std::fs::create_dir_all(parent).ok();
         }
         let mut conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         // 既定の 5 秒では v1 からの一括移行を待ち切れない。実店 4,628,611 行の移行は 38.9 秒
         // かかり、その間に別 worker がこの店を開くと `init_schema` の DDL が書き込みロックを
         // 取れずに失敗する。開くのは常に worker なので、待つことで UI は止まらない。移行後の
         // 書き込みはどれも短いため、この時間が実際に使われるのは最初の一度だけになる。
         conn.busy_timeout(std::time::Duration::from_secs(180))?;
+        // timeout の位置だけでは journal mode の昇格競合は待てない。変換要否を読んでから、
+        // 必要な場合だけ上の専用 owner へ渡す。
+        ensure_wal_journal(&conn)?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         init_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1896,6 +1932,69 @@ mod tests {
         assert_eq!(key_a.item.width, 100);
     }
 
+    /// WAL 化済みの v1 store で既存 writer が移行を塞いでいる間は待機し、解放後に
+    /// 署名と行を保ったまま現行 schema へ移行する。
+    #[test]
+    fn v1_migration_waits_for_an_existing_wal_writer_and_preserves_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let store_id = [0x6bu8; 16];
+        create_v1_store(&path, store_id);
+
+        // WAL 変換と schema migration の待機を分ける。ここで WAL へ変換しておけば、
+        // opener は journal-mode writer ではなく既存 IMMEDIATE writer の解放を待つ。
+        let wal = Connection::open(&path).unwrap();
+        wal.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        drop(wal);
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let opener_path = path.clone();
+        let opener = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = SimilarDb::open_at(&opener_path)
+                .and_then(|db| db.load_base_search_rows(current_hash_version()));
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        let early = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        let (finished_while_held, terminal) = match early {
+            Ok(result) => (true, Ok(result)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
+                false,
+                result_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            ),
+            Err(error @ std::sync::mpsc::RecvTimeoutError::Disconnected) => (false, Err(error)),
+        };
+        let joined = opener.join();
+
+        assert!(joined.is_ok(), "v1 migration opener panicked");
+        assert!(
+            !finished_while_held,
+            "v1 migration completed while its IMMEDIATE writer was still held"
+        );
+        let base = terminal
+            .expect("v1 migration opener did not return a terminal result after writer release")
+            .unwrap();
+
+        assert_eq!(base.records.len(), 2);
+        assert_eq!(
+            base.records
+                .iter()
+                .map(|record| record.signature[0])
+                .collect::<Vec<_>>(),
+            vec![0x11, 0x22]
+        );
+        assert_eq!(base.store_id, store_id);
+        assert_eq!(base.applied_seq, 0);
+    }
+
     /// v2 の店を開き直したときに作り直されないこと。ここが逆になると、起動のたびに索引が
     /// 消える。`is_v1_layout` は形で判定するので、番号の一致だけに頼らず両方を確かめる。
     #[test]
@@ -1926,6 +2025,53 @@ mod tests {
         assert!(
             timeout_ms >= 120_000,
             "busy_timeout {timeout_ms} ms is shorter than a measured 38.9 s migration"
+        );
+    }
+
+    /// fresh DB の初回 WAL 変換へ複数 worker が同時に入っても、open 自体を失敗させない。
+    ///
+    /// 既存の並列回帰は先に一度 open していたため、全接続が既に WAL を読む定常経路しか覆わず、
+    /// index worker と memory loader の初回競合を検出できなかった。
+    #[test]
+    fn opening_fresh_stores_from_many_workers_at_once_never_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for round in 0..8 {
+            let path = tmp.path().join(format!("fresh-{round}")).join("similar.db");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SimilarDb::open_at(&path).map(|_| ())
+                    })
+                })
+                .collect::<Vec<_>>();
+            let errors = handles
+                .into_iter()
+                .filter_map(|handle| handle.join().unwrap().err())
+                .collect::<Vec<_>>();
+            assert!(errors.is_empty(), "round {round} failed: {errors:?}");
+        }
+    }
+
+    /// 既に WAL の store は active writer がいても journal mode の変換を試みない。
+    #[test]
+    fn opening_an_existing_wal_store_does_not_contend_with_its_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let owner = SimilarDb::open_at(&path).unwrap();
+        let owner_conn = owner.conn.lock().unwrap_or_else(|error| error.into_inner());
+        owner_conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let reopened = SimilarDb::open_at(&path);
+
+        owner_conn.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            reopened.is_ok(),
+            "an existing WAL store open tried to take the writer lock: {:?}",
+            reopened.err()
         );
     }
 
