@@ -1,11 +1,11 @@
 # 本照会 R1 / R5 / R6 の実装引き継ぎ
 
-2026-09-08。親 Astra / high が設計・進行、Sol / xhigh が実装・テスト、独立 Astra / high がレビューする。
+2026-09-08。最新の利用者指定によりB着手から、親 Astra / medium が設計・進行、Sol / xhigh が実装・テスト、別の Sol / xhigh が独立レビューを担当する。
 本書は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) に蓄積した現合意を整理したもの。
 撤回した案を再採用せず、矛盾は実装前に根拠とともに親へ戻す。**製品実装と採用判定は未完了**。
 R4 の全体テスト・portable 作成と更新照合が完了し、独立owner/executorの第1区切りは3109b60e6で保存済み。
 需要状態と完了通知もbe0075dc1で保存済み。22件成功後、通知fixtureだけ同期を補強し対象1件が成功した。独立coreレビュー通過。
-global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。既存query callerと本検索計算はまだ切り替えていない。
+global dispatch gateはad2130581、専用readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP effective orderは69f33e6a9、MIH kernel単独は2ffe3b60e、再列挙classifier単独は44f256253で保存済み。各狭域回帰・製品check・独立レビュー成功。疎result/UIはAの3fd01996fで実装・回帰・画像レビュー済み。既存query callerと本検索計算はまだ切り替えていない。
 
 ## 修正対象と維持する性質
 
@@ -91,8 +91,18 @@ managerDropの既存scheduler.shutdownからexecutorの明示shutdownを呼び�
 明示shutdownとDropは同じinner.shutdownへ委譲し、scheduler/state/active_cancel guard解放後に通知する。
 現inner.shutdownはcompletedを保持するため、この接続時は同じshutdown正本で完成結果も退役させる。
 実store変更は同TXの観測結果を持ち帰り、TX/DB/memory/scope/scheduler guard解放後にknown storeを更新してhardを一度通知する。
+known storeのUnobserved/Knownはscheduler/executor寿命へ束縛し、runtimeだけに置かない。
+store Xの別client Readyを保持→runtime panic→DB Y→新runtime Unknownという反例では、runtime-local ownerだとXの結果が退役しない。
+scheduler側の単一ownerで短時間更新し、guard解放後に実store変化だけglobal hardを通知する。
+普通のruntime再起動だけで全clientを無用に失効させず、manager新規作成ではUnobservedから始める。
 factoryの既存Fn() APIを拡張しなくても、runtimeがWeak schedulerを一時upgradeしてそのbook executorへ通知できる。
 具体な実装とshutdown/strong-cycle回帰はcaller接続時に行う。先行owner/kernel単独commitの完成には含めない。
+CのfactoryはWeak schedulerとEngineSlot::Vacantを持つ軽量adapterを返す。DB openはworkerのexecuteで行い、
+成功時だけReady(engine)としてreader/MIHを再利用する。DB無しNoneは当該NotIndexed、実open errorは当該Failedとし、
+両方ともVacantを保つ。factory Errへ載せるとgeneric executorがFIFOを消してFailedに固定され、soft更新も受けなくなるためである。
+この境界は親・独立coreが確認した。実soft更新による次要求で再試行し、dispatch signalだけやUI毎frameのopen retryへ置換しない。
+最小回帰はDB無し→NotIndexed→DB作成/soft通知→自動Ready、およびopen error後も別clientが進むこと。
+Missing/Failed gate→Runと、実worker_running時のNotIndexed→Preparing表示投影は既合意の意味を維持する。
 ### caller接続の追加監査と要求範囲の再評価
 
 独立UI監査で、current_item=Noneはmetadata panelのOption::mapでhelper自体を呼ばず、非対象itemは
@@ -364,7 +374,7 @@ alignment では厳密な辺を再列挙できるようにし、発見用の飽�
 
 ## 密な alignment のメモリ境界
 
-以下は正当性を検討した設計候補で、製品実装・oracle 一致・処理時間と TX 寿命・採用は未検証である。
+以下のclassifier単独実装は44f256253で小規模oracle・取消・独立レビューを確認した。本照会callerへの統合、最大規模の処理時間とpeak RAM、TX寿命、採用判断は未検証である。
 
 旧 Fenwick の tie と A/B 向き、実 page index、距離、出力順を保つ。
 例: X 対 XXX は A0-B2、X 対 XXXX は A0-B0。最短対角を任意に選ぶ実装へ変えない。
@@ -445,17 +455,17 @@ global common/discoveryはMIHで行い、alignmentだけこの直接列挙を使
 固定book IDはpair方向だけに使う。構造的正確性の承認であり、実時間の採用判断は後続計測とする。
 ### 多候補の結果容量とページ帯consumer
 
-独立UI監査で、全Eを除去しても現BookRelationHit.pagesの候補数C×起点全長Nが残ることを確認した。
+A着手前の独立UI監査で、全Eを除去しても旧BookRelationHit.pagesの候補数C×起点全長Nが残ることを確認した。
 独立した各起点署名に7別本×3同署名ページを対応させると、起点込み8冊なのでcommonでなく、候補発見の3辺を満たす。
 N署名で7N候補が成立する。各pairはmatched1/Unrelatedでもqueryは全Ok結果を保持し、UIは部分的な重なりとして表示する。
-候補truncateでは解決しない。採用前に以下の容量境界を実装・oracle・実測で確認する（型の具体実装は後続設計）。
+候補truncateでは解決しない。以下の容量境界はAで型/consumerを実装・小oracleで確認し、実engineと大規模計測はB/C以降で確認する。
 
 - effective ordinal順のorigin page keyとExcluded/Unmatched基底をimmutable Arcで1つ共有する。
 - hitはorigin slot順の一致overrideだけを保持し、Strong/Weak、対応page/target/item key/mtime/sizeを含める。
 - strip.len()は常に起点全長。target解決失敗でもStrong/Weakの一致overrideは残す。
 - 結果容量をO(N+C+Σalignment)にする。build_page_stripで基底を候補ごとに作らない。
 
-現summarize_page_stripは全hitで起点全長相当をfoldし、book行には可視判定/virtualizationがない。
+移行前のsummarize_page_stripは全hitで起点全長相当をfoldし、book行には可視判定/virtualizationがなかった。
 strip領域確保後にclip判定して画面外の集計/paintを省略し、全候補・scroll領域・divider・見える操作を維持する。
 同じ描画passで列幅ごとの基底集計を共有し、overrideから列の色rank最大と最初のtargetを合成する案を検証する。
 色rankはStrong>Weak>Unmatched>Excluded。click代表は最強のmatchでなく、その列で最初にtargetを持つorigin slot。
@@ -465,7 +475,7 @@ N=5,W=3,slot1で所属が変わる反例がある。[移動]はorigin順の最�
 小oracleはN=8、各署名7冊×3ページの56候補、各strip長8/alignment1、base8+override56。
 旧dense表現との全field等価、長短の帯、列境界、Weakが先/Strongが後、targetなし一致、Excluded、移動/▼を確認する。
 画面外にも全候補分の領域を保ち、集計回数が可視stripだけになる回帰を加える。
-現snapshot fixtureでは同一起点の先頭4ページが候補によりExcluded/Unmatchedと矛盾するため、一貫したfixtureへ直し
+旧snapshot fixtureでは同一起点の先頭4ページが候補によりExcluded/Unmatchedと矛盾していたため、一貫したfixtureへ直し
 意図したPNG差分として独立UIレビューを受ける。
 
 これは容量/consumerの設計監査であり、分類器全体のpeak・最終UI性能を達成した証明ではない。
@@ -481,7 +491,53 @@ hitはorigin_slot順のBox<[BookPageMatch]>をoverridesとして保持する。�
 全長表示/区画/▼/hoverはview.len()で換算し、first_targetはorigin順を維持する。
 UI snapshotの先頭4ページの基底矛盾を共通originへ直す。dense oracleはtest内だけに残し、strip列・移動fixtureと比較する。
 workspaceのcrates/tools/testsにこの公開型の外部consumerは見つからず、field互換のための重複全長Vecは不要と判断した。
-これは後続実装の具体案であり、Solの着手前照合と実装後レビューを省略しない。
+Solの着手前照合を経てA sliceとしてこの型・consumer移行を先行することを親が承認した。
+編集はsimilar_index.rsの結果型/旧builder/fixture、ui_metadata_panel.rsのconsumer/fixture、該当snapshotに限定する。
+旧query_book_readyも最終の疎型を生成するため、後続engineにdense表現を一時導入しない。
+R2 stagedとR4既存差分を着手前checkpointで保持し、sourceとPNGの独立UIレビュー後に保存可能な差分境界を確認する。
+順序はA:疎result/consumer、B:独立sameTX engine、C:readiness/通知/需要/真のcloseを含む最終adapter。
+Cまで旧callerを新engineへ暫定接続せず、新workerの取消・終了を含めて呼出先を置換する。
+Aは3fd01996fでsource/追加境界回帰/PNGの独立承認後に保存済み。既存R2/R4内容は保持し、R2 cached patchはblob IDだけ変わった新基準へ証跡付きで更新した。
+旧builder内の候補ごとのorigin map再構築はBで共有化する。実engine7N oracleと大規模UI/engine性能はA単独の成功へ含めない。
+## 同TX engineの具体preflight（A実装と並行して独立監査）
+
+B sliceの案はSimilarBookQueryEngineがreadonly readerとBookMihRuntimeをworker localに所有するもの。
+query入力はcontainer key・immutable roots・shared snapshot候補・取消。1つのwith_snapshot内で配列追随、
+MIH prepare、同BookPageOrderResolverによるorigin/candidate/近傍identity確定、common/discovery/分類/疎結果生成を完結する。
+
+処理順は親の再監査で訂正した。metadata→store差なら旧MIH clear→origin effective pages→NotBook/Featurelessの軽い判定を先に行い、
+有効なoriginがある場合だけsnapshot追随/MIH prepareへ進める。先にprepareすると未登録/特徴なし本でも巨大private base fallbackを行い、
+単一workerの後続を塞ぐため、旧queryのscan前終端を維持する。これは独立coreも承認した。
+同TX内なので世代/順序整合は変わらない。早期終端もmetadataをCへ返し、実store変更を観測できる。同storeの完成MIHは保持する。
+Rがnested Resultを保持し、closure外形はOk(body_result)を返せば、EngineErrorをSQLiteエラーに偽装せず既存reader APIへ接続できる。
+外側BookReadErrorと内側EngineErrorは明示flattenする。metadataはbody結果と別に保持し、body失敗時もCが実storeを観測できるようにする。
+readerはread-onlyなのでbody errorに対する外形commitは書込を公開せず、取消hook除去とtransaction解放を既存guardが所有する。
+
+同TX signature memoはCommonまたはRare{実container,辺count1..3の最大8冊}とする。全近傍rowや全Eは保持しない。
+MIH hitは固定小chunkだけをSQLへ解決し、identity/revision/距離/quality/Complete/hash/effective ordinal/scopeを確定後に冊数を数える。
+9冊目確定時だけCommonでStopできる。MIH Exhausted後の最後のpartial chunkも必ずflushし、そこで9冊目に到達する場合もCommon。
+Rareは全flush込みのExhaustedだけで確定する。error/取消/incomplete Stopで未完成memoを保存しない。
+同署名の各origin slotには完成Rareを再適用し、count3後も完全domainの登録を続ける。
+
+scope外・loose・適格ordinal無し等の仕様上除外と、同TX追随済みhitのrevision/署名不一致・不意のID消失を分ける。
+後者はskipしてRareを返すと正確性が失われるためInvariant終端とする。shared候補のstore/seq不一致から同TX fallbackへ進む正常経路とは別である。
+current resolverのitemごとSQL prepareは支配性を測定し、必要なら既存private SELECTのprepared statement共有を小さく行う。
+巨大全row identity cacheや巨大IN句を追加しない。実runtime/callerへの接続はCで行い、B単独成功を製品採用完了と記録しない。
+独立engine入口でもoriginのimmutable roots所属を検査し、対象外はOutcome::NotIndexedとする。
+managerのhard取消だけに依存して、対象外originのFeatureless/Readyを計算しない。
+MihHitは現時点item_id/revision/distanceだけなので、同距離の別署名を検出するためBでsignature:[u8;32]を追加する。
+1hit/固定小chunkだけの値射影でDB rowとのexact署名一致を検査し、全PDQ配列や別の巨大lookup mapを複製しない。
+kernel射影fieldの狭域回帰もBに含める。このAPI穴と修正案は親・独立coreが合意した。
+追加のsource監査で、filtered resolve_pages_by_item_idのNoneを直ちにID消失Invariantにする前提を訂正した。
+stage_item→complete_containerは旧hashを保存でき、item_changeはhash/stateを持たない。そのためcurrent base取得後に
+旧hashページをstage/completeしseq追随すると、旧hash Live deltaがMIHに入りfiltered resolverは正常にNoneを返す。
+これは通常の公開DB APIで構成できる反例であり、hash非適格と不意のID消失を区別するB専用APIが必要と独立coreが確認した。
+
+B専用hit resolverは同TXでitem IDのraw row＋LEFT JOIN container stateを読み、Missing / Present{row,eligibility}を返す。
+eligibilityはEligible/HashMismatch/ContainerNotComplete等を区別し、raw rowを保持してrevision/署名検証を行えるようにする。
+Eligibleだけを既存effective ZIP orderへ通し、current hash/index Noneがprivate採番で有効になる挙動も維持する。
+既存load_search_item_by_id/public filtered wrapperは変更しない。小chunk内prepared statement共有で1ID1行を読み、巨大IN/全corpus cacheを追加しない。
+Bの編集範囲にsimilar_db.rsの専用API/回帰を含め、実APIによる旧hash deltaと真のMissingの区別を検証する。
 ## 正確性 oracle と採用前の確認
 
 旧256 hit打切り照会や、候補列を `zip` するだけの比較は oracle にしない。
@@ -506,3 +562,24 @@ coverage / alignment / strip を起点・候補 key で対応付ける。
 試作v2は単署名 kernel の厳密集合と限定計測まで成功している。本照会全体、世代整合、公平性、peak RAM、
 最大密度の alignment、音声を含む採用条件の成功とは扱わない。
 試作と検証用入力の証跡は `target/review-fixes-bench-20260908/`、現合意の根拠・訂正履歴は元の修正記録を参照する。
+
+### 採用測定の実行境界（独立core監査済み、測定は後続）
+
+prototypeの再計測を実製品engineの計測に代用しない。明示した測定用DB/baseだけを読むopt-in harnessで、
+通常App/launcher/APPDATA/profile初期化を通さず実engineを呼ぶ。cfg(test)=false、release opt-level3/ThinLTO/codegen16、
+portable相当featureで測る案を採る。dev-runtimeのopt2/LTO off/64やignored unit testの値は補助値として区別する。
+元の検証用backupを保持し、writer操作やdelta/compaction用データはさらに独立した測定用storeへ作る。
+cargo/build/測定を直列にし、source/lock/binary/input/roots/case識別のhashと環境を固定してraw結果を保存する。
+
+最小case群は実400ページ・短本・no-hit、品質ありnear-white/反復、多hit7N、1万対角shortcut、1万一般dense。
+多hitは小N=8/56候補の全field oracleと性能用Nを区別する。世代更新は代表400条件へ現delta、delta65535、
+compaction/newBase＋別ownerの旧Arc保持を横断させる。実型のallocation/保持を含め、component容量の足算だけでpeakを代用しない。
+
+coldは新process/新engine cacheであり、OS disk cacheを冷やした意味ではない。warmも完成MIHを再利用して実queryを回し、
+完成BookQuery cacheのhitを測らない。標本数・quantile方式・全raw値を保存してp50/p95/max・wall・総CPU(user+kernel)を記録する。
+通常caseは各20標本を目安とし、巨大case等で標本を減らすときはnと限界を明記し、安定したp95を確認したと主張しない。
+process working-set peakとprivate commit peakを別々に保存する。warmの生涯high-waterにはwarmupが含まれると記録し、
+前後high-waterの差をwarm peak RAMと呼ばない。phase内sampled peakは補助値とする。
+
+旧400ページ/7候補の元keyは記録上未特定。別の400本を同一条件や1.69秒の再現と称さず、特定できなければ比較不能と記録する。
+engine単独計測後もCの実caller公平性/通知と最終portableの音声実機確認は別の未完了条件である。

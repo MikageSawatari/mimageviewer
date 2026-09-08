@@ -6,7 +6,7 @@
 
 ## 利用者指示と作業境界
 
-- 設計・進行管理は親 Astra / high、通常実装・テストは Sol / xhigh、独立レビューは Astra / high。
+- 最新の利用者指定によりB着手から、設計・進行管理は親 Astra / medium、通常実装・テストは Sol / xhigh、独立レビューは別の Sol / xhigh。
 - 実装担当は主要前提をコード・反例・測定で検証し、矛盾時は実装せず設計担当へ戻す。
 - 編集担当は一人ずつ割り当てる。親は本書と引き継ぎレビューを所有し、実装担当は合意したコード・回帰テストを所有する。
 - 音声途切れは利用者が解消を確認済み。高負荷走査の単純復活、ページ間引き、比較ボタン無効化による回避は採らない。
@@ -26,7 +26,7 @@
 | R7 完成キャッシュ / R9 prefillとscope | `3d42f4a98`。実装・独立Astra承認済み | 索引39成功/4ignored、DB16成功/1ignored、check/fmt・共通full gate成功。portable更新済み |
 | R2 類似移動でのパネルロック | 製品コード・テスト設計の独立Astra承認済み | 実handler/poll16件・legacy lock1件・resolver1件・追随3件成功。共通full gate成功。portable-dev更新済み、実機確認・R2 commit待ち |
 | R4/R8 長押しと見開き | 候補owner・geometry/描画identity・終端/paint寿命・navigator所有/ordered入力・capture・依存API・実Ready描画dispatcher・context非干渉/受付は段階レビュー済み。純draw snapshotと依存統合も独立承認済み。最終gateで再現した初回DB open競合も修正・独立承認済み。全体gate成功、portable更新・24files照合済み | owner・geometry・GPU寿命・入力/capture・実描画dispatcher・context終端/非干渉の狭域回帰成功（内訳は経過記録）。vendor egui 25件成功。最終gate成功（main7693/0/38ignored、vendor25/9/15）。新portable更新済み、実機確認待ち |
-| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。製品caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
+| R1/R5/R6 本照会 | 検索kernel試作v2の独立レビュー・限定計測完了。独立要求ownerは3109b60e6、需要/通知はbe0075dc1で独立レビュー済み。generic gateはad2130581、readonly reader第1区切りは5e0d2bd1b、配列追随・ZIP orderは69f33e6a9。狭域/既存DB・array・page-order回帰/製品check/独立レビュー成功。MIH製品kernelは2ffe3b60e、再列挙classifierは44f256253で単独回帰・独立レビュー済み。疎result/UIのAは3fd01996fで検証・独立承認済み。新engine/caller未接続 | 単署名集合oracle・owner mock回帰成功。本照会全体・世代整合・負荷/peak/実caller公平性は未検証 |
 
 ### R2: 類似候補への移動と閲覧終了を区別する
 
@@ -1792,3 +1792,63 @@ Bは発見時BTreeSetでunique化、shortcutは完全A domainを先に検査、v
 
 独立coreは最終fixture変更を逆適用すると前回承認source SHAへ完全一致することも確認し、最終SHAを承認した。
 通常hook付きのbook.rs限定commit後、source生bytesとR2 staged patch100651bytes/3adba6c9...f42a不変を確認した。
+
+### R1 結果容量とページ帯のA slice（検索engine切替は後続）
+
+focused commit: 3fd01996feee25a55c59dde19c8bd21a26b1601e、3files、989追加/186削除とPNG更新。
+BookRelationsが1つのArc<BookOrigin>を所有し、各hitは起点slot順の一致overrideだけを持つ形へ移行した。
+短命BookStripViewで全長・基底/一致状態・最初の移動先を借用投影する。旧query_book_readyもこの最終型を直接生成する。
+表示は同じdraw passでorigin列集計を共有し、各hitのoverrideを合成する。stripの領域を確保してからclipを確認し、
+画面外のfold/paint/hover仕事を省く。全行・scroll高さ・色rank・列範囲・最初target・現在位置▼と既存navigationを維持する。
+R3サムネイル需要とR4 preview freshness入力を変更しない。Aでは旧queryの分類方法・共通ページ判定は切り替えていない。
+
+独立UIレビューに残存P1/P2なし。親と独立UIはPNGも目視し、共有の対象外先頭・連続85一致・散発7一致・凡例/移動/▼を確認した。
+旧snapshot fixtureは同じ起点の先頭4ページが候補によりExcluded/Unmatchedと矛盾していたため統一し、散発の表示matchedも8→7へ合わせた。
+旧PNGとのcompare-before1は意図した149pixel差で失敗を保存、update1後のcompare2対象1件とsnapshot suite1全48件は成功した。
+
+追加回帰は旧dense stripのstate/対応index/実target/key/mtime/size比較、override sort/重複/範囲外拒否、
+共有baseline、N5W3 slot1の所属、Weak先target/後Strong/target無しStrongの色と移動先の分離、
+実drawのclip外row高保持・origin列未生成→次可視pass生成を確認する。clip testの空thumbnail assertだけでhover拒否を実証したとはしない。
+製品early returnがfold/paint/hover全体の前にあることはコードレビュー根拠として区別する。
+
+- book-test1: 初回compile1分44秒、対象1成功。unit-tests1: constructor対象1成功。
+- UI-tests2: 最終追加後23成功/0失敗、0.09秒。
+- similar-index-tests1: 40成功/0失敗/4ignored、0.05秒。最終test-only補強前の全module結果。
+- book-tests3: 最終dense実target比較を含む変更対象2成功/0失敗、0.01秒。40件全体は補強後に重複実行していない。
+- ui-snapshot-suite1: 48成功/0失敗、4.14秒。最終test-only補強前だが製品描画/PNGはその後不変。
+- 最終product check3: 13.31秒/exit0、fmt-check2空log/exit0、glyph-check2危険字形0、diff-check成功。
+
+親は最終source/PNG/log SHAを独立照合した。
+
+- working similar_index.rs: ba074fcfb3a4396d00074455ea04eec1be54ecde1604bf11b70519534e65eea1、218,889bytes。
+- working ui_metadata_panel.rs: a200792f3b9d730984f2996b056047cf24672cf5ee949c0c854658c732b6dafd、230,042bytes（R2/R4共存）。
+- PNG: b48daa7772229eb4ace08d2e5307cec2f0b46b538646567e7e05a49ccc0ac38f、44,349bytes。
+- UI-tests2 log: 5324e701b164dbc11c59226050fb48f1bc246013f71c7e22e409ea9bc7e8eb6e。
+- index-tests1 log: 906f312d54c2c726fc228178653e3f259b28e1de8fe23356180dfffbee7a11d4。
+- book-tests3 log: 34bde08c7df0fb29b7505273e5a44eda69d0959f6c62a77a8e4e96e8a06a7eea。
+- snapshot suite1 log: c1cc2ccc539cbeb4fca09ff11a7f464bb79a3b747f784f5cf99fe8dcb5075177。
+- check3 log: dc1297bc37fdf36c2dfa260e1a482f6f7888180c91fcb0c1ba8c9a2b94483361。
+
+A-only patchは3files・78,001bytes・677710fc96f4d03d8b9b80875d407a3732fc21bc9245c9dfae774bcad1ff3d74。
+着手前rawと最終rawの差分をHEAD f86640e96へtemporary indexで適用可能と確認した。正本target/r1-sparse-result-stageA-final-20260908/manifest.json。
+旧builderの候補ごとのby_origin_page再構築はAでは保持し、B最終engineで起点map1回共有へ移す。大規模UI/engine性能、
+7N実engine oracle、B/Cの接続、最終全体gateと新portableは未完了。従来R4 portableと実機返答待ちは維持する。
+
+A保存前にR2の保護hash基準を見直した。Aが同じui_metadata_panel.rsをcommitすると、R2 cached diffのindex blob IDが必然的に変わるため、
+SHA完全一致のままでは保存できない。これは親が置いた保護手段とGit基準更新の衝突であり、利用者の未コミット内容保持要件とは区別した。
+親・独立coreがold/new patchを実bytesで比較し、100,651bytes不変、index 49891cfb3..d41cadefd→3d77088bb..f7565bc79の1行だけと検証。
+独立coreはprospective indexからのdiff再取得も一致、R4残余14blockの削除/追加内容も全bytes不変、source/PNG不変を確認した。
+これを根拠に親が新R2基準522b17c567881cb2ba348d358e1b2069fb1ec947218606e3542525fbf23c8043への移行を承認した。
+旧基準と比較資料はtarget/r1-sparse-result-stageA-r2-transition-20260908/に保持する。利用者の未コミット修正を変更する許可へ拡張しない。
+
+A commit後の親再照合でも、tree e0eb9179e00c76a17c7a36376f5900bdb7bf7566、source/PNG生bytes不変、R2新基準100651bytes/522b17...8043一致を確認した。
+ui_metadata_panel.rsのR4 working残余70追加/244削除、R2 staged8件を保持している。
+
+## 2026-09-08 B着手時の担当モデル移行
+
+利用者の最新指示を旧指定より優先し、A完了・B実装前を切替境界にした。
+実装担当 merge_release360 を継続し、独立レビュー担当 review_sol を gpt-5.6-sol / xhigh 指定で新規起動した。
+起動呼出しは成功。親のGUI設定と既存実装担当の現在の内部設定は再照会できないため、確認済みとは断定しない。
+旧Astraレビュー担当へ新規依頼を追加せず、完了済みレビュー・判断根拠・未解決事項・差分・検証記録を本書と本照会引き継ぎ書から承継する。
+max/ultraは使用しない。既存レビューの全面やり直しや同一検査の重複は避け、新規差分と未解決の検証条件を対象とする。
+品質・実機確認・データ保護・一人だけのファイル編集・R2/R4未コミット保持の条件は変えない。
