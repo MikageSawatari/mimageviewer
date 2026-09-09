@@ -137,6 +137,7 @@
 
 ## 進行中のレビュー
 
+- [duplicate-detection-merge-v370-20260909.md](duplicate-detection-merge-v370-20260909.md) — v3.7.0 master の統合、未コミット変更保持、独立レビュー、全体 gate、portable 更新と手動確認待ち。
 - [duplicate-detection-handoff-review-20260907.md](duplicate-detection-handoff-review-20260907.md) — `duplicate-detection` の引き継ぎ監査。実装状況、独立レビュー指摘、検証証跡、Astra/Sol体制への移行と統合条件。
 - [duplicate-detection-review-fixes-20260907.md](duplicate-detection-review-fixes-20260907.md) — R1〜R9の修正計画。所有境界、実装前検証、独立レビュー、既存データを保持するportable検証。
 - [duplicate-detection-book-query-review-fixes.md](duplicate-detection-book-query-review-fixes.md) — 本照会R1/R5/R6の実装・採用検証。viewer別の要求、同一read transaction、厳密MIH、再列挙による対応付けと疎な表示結果は接続済み。実本oracle・途中取消・通常/大規模負荷・UI補助測定を検証済み。最終全体gateとportable更新も完了し、利用者実機確認待ち。
