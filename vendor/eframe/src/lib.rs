@@ -207,6 +207,16 @@ pub use native::file_storage::storage_dir;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
 
+/// mImageViewer test-script diagnostics for the actual native window that owns
+/// the current egui viewport callback.
+#[cfg(all(
+    target_os = "windows",
+    feature = "wgpu",
+    feature = "miv-test-script-window-witness"
+))]
+#[doc(hidden)]
+pub mod miv_test_script_window_witness;
+
 /// This is how you start a native (desktop) app.
 ///
 /// The first argument is name of your app, which is an identifier

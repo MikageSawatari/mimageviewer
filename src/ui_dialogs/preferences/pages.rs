@@ -1986,9 +1986,28 @@ pub(super) fn page_mouse_gesture_bindings(
     mouse_gesture_context_editor(ui, state, context);
 }
 
+pub(super) fn draw_video_normal_wheel_action_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画・音声の通常ホイール").strong());
+    let wheel_action = &mut settings.ring_shortcuts.video_normal_wheel_action;
+    egui::ComboBox::from_id_salt("video_normal_wheel_action")
+        .width(260.0)
+        .selected_text(wheel_action.label())
+        .show_ui(ui, |ui| {
+            for candidate in crate::ring_shortcut::VideoNormalWheelActionId::available() {
+                ui.selectable_value(wheel_action, *candidate, candidate.label());
+            }
+        });
+    ui.small("端パネル、シークストリップ、360度表示、拡大表示、タイル表示が使うホイールはこの割り当ての対象外です。");
+}
+
 pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.small("戻る/進むボタンは、リングショートカットと同じ単発アクションから選べます。");
     ui.small("割り当てはグリッド、画像フルスクリーン、動画フルスクリーンで別々に保存します。");
+    ui.add_space(8.0);
+    draw_video_normal_wheel_action_settings(ui, &mut state.settings);
 
     ui.add_space(8.0);
     for &context in RingShortcutContext::all() {
@@ -2147,8 +2166,10 @@ fn command_overview_rows(
             let mut mouse = Vec::new();
             let mut pad = Vec::new();
             for (context, ring_action) in ring_bindings {
+                let ring_for_context =
+                    ring_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action);
                 ring.extend(contextual_assignment_labels(
-                    ring_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action),
+                    ring_for_context,
                     context,
                     multi_context,
                 ));
@@ -2405,6 +2426,12 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::VideoBookmark => RingActionId::VideoBookmark,
         KeyAction::VideoMarkerPrev => RingActionId::VideoMarkerPrev,
         KeyAction::VideoMarkerNext => RingActionId::VideoMarkerNext,
+        KeyAction::VideoSeekBackSmall => RingActionId::VideoSeekBackSmall,
+        KeyAction::VideoSeekForwardSmall => RingActionId::VideoSeekForwardSmall,
+        KeyAction::VideoSeekBackMedium => RingActionId::VideoSeekBackMedium,
+        KeyAction::VideoSeekForwardMedium => RingActionId::VideoSeekForwardMedium,
+        KeyAction::VideoSeekBackLarge => RingActionId::VideoSeekBackLarge,
+        KeyAction::VideoSeekForwardLarge => RingActionId::VideoSeekForwardLarge,
         KeyAction::VideoTileMode => RingActionId::VideoTileMode,
         KeyAction::VideoExternalPlayer => RingActionId::VideoExternalPlayer,
         KeyAction::VideoCloseFullscreen => RingActionId::CloseFullscreen,
@@ -2956,14 +2983,25 @@ fn operation_assignment_tab_enabled(
     tab: OperationAssignmentTab,
 ) -> bool {
     match target {
-        OperationAssignmentTarget::Key(action) => {
-            tab == OperationAssignmentTab::Keyboard
-                || ring_binding_for_key_action(*action).is_some()
-        }
+        OperationAssignmentTarget::Key(action) => match tab {
+            OperationAssignmentTab::Keyboard => true,
+            OperationAssignmentTab::MouseButtons => ring_binding_for_key_action(*action)
+                .is_some_and(|(context, action)| {
+                    action.is_available_for_mouse_button_assignment(context)
+                }),
+            OperationAssignmentTab::RingPad | OperationAssignmentTab::MouseGesture => {
+                ring_binding_for_key_action(*action).is_some()
+            }
+        },
         OperationAssignmentTarget::Chord(_) => tab == OperationAssignmentTab::Keyboard,
-        OperationAssignmentTarget::Ring { .. } | OperationAssignmentTarget::RingSlot { .. } => {
-            tab != OperationAssignmentTab::Keyboard
-        }
+        OperationAssignmentTarget::Ring { context, action } => match tab {
+            OperationAssignmentTab::Keyboard => false,
+            OperationAssignmentTab::MouseButtons => {
+                action.is_available_for_mouse_button_assignment(*context)
+            }
+            OperationAssignmentTab::RingPad | OperationAssignmentTab::MouseGesture => true,
+        },
+        OperationAssignmentTarget::RingSlot { .. } => tab != OperationAssignmentTab::Keyboard,
         OperationAssignmentTarget::MouseButton { .. } => {
             tab == OperationAssignmentTab::MouseButtons
         }
@@ -3727,14 +3765,16 @@ fn mouse_assignment_labels(
 ) -> Vec<String> {
     let mut labels = Vec::new();
     let buttons = settings.mouse_button_profile(context);
-    if buttons.back == *action {
-        push_unique_label(&mut labels, "戻るボタン".to_string());
-    }
-    if buttons.forward == *action {
-        push_unique_label(&mut labels, "進むボタン".to_string());
-    }
-    if buttons.middle == *action {
-        push_unique_label(&mut labels, "ホイールクリック".to_string());
+    if action.is_available_for_mouse_button_assignment(context) {
+        if buttons.back == *action {
+            push_unique_label(&mut labels, "戻るボタン".to_string());
+        }
+        if buttons.forward == *action {
+            push_unique_label(&mut labels, "進むボタン".to_string());
+        }
+        if buttons.middle == *action {
+            push_unique_label(&mut labels, "ホイールクリック".to_string());
+        }
     }
 
     for &right_drag_context in RightDragContext::all() {
@@ -3756,6 +3796,17 @@ fn mouse_assignment_labels(
         }
     }
     labels
+}
+
+fn effective_mouse_button_action(
+    action: &RingActionId,
+    context: RingShortcutContext,
+) -> RingActionId {
+    if action.is_available_for_mouse_button_assignment(context) {
+        action.clone()
+    } else {
+        RingActionId::None
+    }
 }
 
 fn command_conflict_summary(
@@ -4854,8 +4905,9 @@ fn mouse_button_row(
         );
     }
     ui.label(slot.label());
-    ui.label(action.label_for_context(context))
-        .on_hover_text(ring_action_detail_label(&action, context));
+    let effective = effective_mouse_button_action(&action, context);
+    ui.label(effective.label_for_context(context))
+        .on_hover_text(ring_action_detail_label(&effective, context));
     ui.end_row();
 }
 
@@ -4882,9 +4934,12 @@ fn mouse_button_assignment_editor(
             MouseButtonSlot::Forward => &mut profile.forward,
             MouseButtonSlot::Middle => &mut profile.middle,
         };
+        let selected_text = effective_mouse_button_action(value, context)
+            .label_for_context(context)
+            .to_owned();
         egui::ComboBox::from_id_salt(("mouse_button_assignment_editor", context, slot))
             .width(300.0)
-            .selected_text(value.label_for_context(context))
+            .selected_text(selected_text)
             .show_ui(ui, |ui| {
                 for action in &available {
                     ui.selectable_value(value, action.clone(), action.label_for_context(context))
@@ -5174,7 +5229,7 @@ fn ring_action_mouse_button_editor(
     );
     ui.add_space(6.0);
 
-    if !action.is_valid_for_mouse_button_context(context) {
+    if !action.is_available_for_mouse_button_assignment(context) {
         ui.small("この操作はこの画面のマウスボタンには割り当てられません。");
         return;
     }
@@ -7111,6 +7166,33 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.label(egui::RichText::new("再生").strong());
         ui.add_space(4.0);
+        anchored(ui, state, "video/seek-steps", |ui, state| {
+            let s = &mut state.settings;
+            ui.label("相対シークの秒数");
+            ui.horizontal_wrapped(|ui| {
+                for (label, value) in [
+                    ("小", &mut s.video_seek_small_secs),
+                    ("中", &mut s.video_seek_medium_secs),
+                    ("大", &mut s.video_seek_large_secs),
+                ] {
+                    ui.label(label);
+                    ui.add(
+                        egui::DragValue::new(value)
+                            .range(
+                                crate::settings::VIDEO_SEEK_SECONDS_MIN
+                                    ..=crate::settings::VIDEO_SEEK_SECONDS_MAX,
+                            )
+                            .suffix(" 秒"),
+                    );
+                }
+            });
+            ui.small("キー、リング、マウスジェスチャ、ゲームパッド、動画の左右タップで選んだ小・中・大シークに共通です。");
+        });
+        ui.add_space(8.0);
+        anchored(ui, state, "video/normal-wheel", |ui, state| {
+            draw_video_normal_wheel_action_settings(ui, &mut state.settings);
+        });
+        ui.add_space(8.0);
         anchored(ui, state, "video/loop", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
@@ -7179,27 +7261,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-height", |ui, state| {
-            let s = &mut state.settings;
-            ui.horizontal(|ui| {
-                ui.label("シークストリップの高さ");
-                egui::ComboBox::from_id_salt("video_seek_strip_height")
-                    .selected_text(s.video_seek_strip_height.label())
-                    .show_ui(ui, |ui| {
-                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
-                            ui.selectable_value(
-                                &mut s.video_seek_strip_height,
-                                preset,
-                                preset.label(),
-                            );
-                        }
-                    });
-            });
-            ui.label(
-                egui::RichText::new(
-                    "低いほど画像は小さくなりますが、動画全体を表示したときに一度に並ぶ枚数が増えます。",
-                )
-                .small(),
-            );
+            draw_video_seek_strip_height_settings(ui, &mut state.settings);
         });
 
         ui.add_space(8.0);
@@ -8454,6 +8516,151 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
+pub(super) fn draw_video_seek_strip_height_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("シークストリップの高さ");
+        egui::ComboBox::from_id_salt("video_seek_strip_height")
+            .selected_text(settings.video_seek_strip_height.label())
+            .show_ui(ui, |ui| {
+                for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+                    ui.selectable_value(
+                        &mut settings.video_seek_strip_height,
+                        preset,
+                        preset.label(),
+                    );
+                }
+            });
+    });
+    ui.label(
+        egui::RichText::new(
+            "低いほど画像は小さくなりますが、動画全体を表示したときに一度に並ぶ枚数が増えます。",
+        )
+        .small(),
+    );
+    ui.add_space(4.0);
+    ui.label("各段階の高さ（100% 表示時の px 相当）");
+    let values = &mut settings.video_seek_strip_height_values;
+    for (preset, value) in [
+        (
+            crate::video::seek_strip_layout::SeekStripHeight::Maximum,
+            &mut values.maximum,
+        ),
+        (
+            crate::video::seek_strip_layout::SeekStripHeight::Large,
+            &mut values.large,
+        ),
+        (
+            crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            &mut values.medium,
+        ),
+        (
+            crate::video::seek_strip_layout::SeekStripHeight::Small,
+            &mut values.small,
+        ),
+        (
+            crate::video::seek_strip_layout::SeekStripHeight::Smallest,
+            &mut values.smallest,
+        ),
+    ] {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(preset.label());
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(
+                        crate::video::seek_strip_layout::VIDEO_SEEK_STRIP_HEIGHT_MIN_POINTS
+                            ..=crate::video::seek_strip_layout::VIDEO_SEEK_STRIP_HEIGHT_MAX_POINTS,
+                    )
+                    .suffix(" px"),
+            );
+        });
+    }
+    ui.small(
+        "Windows の表示倍率に合わせて画面上の高さも変わります。各段階は個別に設定でき、静止画の値には影響しません。",
+    );
+}
+
+pub(super) fn draw_still_seek_strip_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    let mut strip_visible = settings.still_seek_strip_visible;
+    if ui
+        .checkbox(&mut strip_visible, "ページシークバーにサムネイル列を表示")
+        .changed()
+    {
+        settings.set_still_seek_strip_visible(strip_visible);
+    }
+    let mut strip_locked = settings.still_bottom_lock().strip_locked();
+    if ui
+        .checkbox(&mut strip_locked, "サムネイル列を固定表示")
+        .changed()
+    {
+        settings.set_still_seek_strip_locked(strip_locked);
+    }
+
+    ui.add_enabled_ui(settings.still_seek_strip_visible, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("サムネイル列の高さ");
+            egui::ComboBox::from_id_salt("still_seek_strip_height")
+                .selected_text(settings.still_seek_strip_height.label())
+                .show_ui(ui, |ui| {
+                    for preset in crate::settings::StillSeekStripHeight::ALL {
+                        ui.selectable_value(
+                            &mut settings.still_seek_strip_height,
+                            preset,
+                            preset.label(),
+                        );
+                    }
+                });
+        });
+
+        ui.add_space(4.0);
+        ui.label("各段階の高さ（100% 表示時の px 相当）");
+        let values = &mut settings.still_seek_strip_height_values;
+        for (preset, value) in [
+            (
+                crate::settings::StillSeekStripHeight::Maximum,
+                &mut values.maximum,
+            ),
+            (
+                crate::settings::StillSeekStripHeight::Large,
+                &mut values.large,
+            ),
+            (
+                crate::settings::StillSeekStripHeight::Medium,
+                &mut values.medium,
+            ),
+            (
+                crate::settings::StillSeekStripHeight::Small,
+                &mut values.small,
+            ),
+            (
+                crate::settings::StillSeekStripHeight::Smallest,
+                &mut values.smallest,
+            ),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(preset.label());
+                ui.add(
+                    egui::DragValue::new(value)
+                        .range(
+                            crate::settings::STILL_SEEK_STRIP_HEIGHT_MIN_POINTS
+                                ..=crate::settings::STILL_SEEK_STRIP_HEIGHT_MAX_POINTS,
+                        )
+                        .suffix(" px"),
+                );
+            });
+        }
+        ui.small(
+            "Windows の表示倍率に合わせて画面上の高さも変わります。各段階は個別に設定できます。",
+        );
+    });
+    ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/side-panels", |ui, state| {
         let s = &mut state.settings;
@@ -8579,38 +8786,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
     });
     anchored(ui, state, "spread/seek-strip", |ui, state| {
-        let s = &mut state.settings;
-        let mut strip_visible = s.still_seek_strip_visible;
-        if ui
-            .checkbox(&mut strip_visible, "ページシークバーにサムネイル列を表示")
-            .changed()
-        {
-            s.set_still_seek_strip_visible(strip_visible);
-        }
-        let mut strip_locked = s.still_bottom_lock().strip_locked();
-        if ui
-            .checkbox(&mut strip_locked, "サムネイル列を固定表示")
-            .changed()
-        {
-            s.set_still_seek_strip_locked(strip_locked);
-        }
-        ui.horizontal(|ui| {
-            ui.label("サムネイル列の高さ");
-            ui.add_enabled_ui(s.still_seek_strip_visible, |ui| {
-                egui::ComboBox::from_id_salt("still_seek_strip_height")
-                    .selected_text(s.still_seek_strip_height.label())
-                    .show_ui(ui, |ui| {
-                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
-                            ui.selectable_value(
-                                &mut s.still_seek_strip_height,
-                                preset,
-                                preset.label(),
-                            );
-                        }
-                    });
-            });
-        });
-        ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
+        draw_still_seek_strip_settings(ui, &mut state.settings);
     });
     anchored(ui, state, "spread/seek-preview", |ui, state| {
         let s = &mut state.settings;
@@ -9199,14 +9375,18 @@ mod tests {
         OperationAssignmentTarget, PreferencesState, apply_command_editor, bake_stage_rows,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
         compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
-        external_tool_batch_behavior_note, external_tool_key_slot_label,
-        keyboard_picker_cell_width, keyboard_picker_label_width, keyboard_picker_main_rows,
-        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
-        ring_bindings_for_key_action,
+        effective_mouse_button_action, external_tool_batch_behavior_note,
+        external_tool_key_slot_label, keyboard_picker_cell_width, keyboard_picker_label_width,
+        keyboard_picker_main_rows, modifier_hold_editor_choice, mouse_assignment_labels,
+        natural_operation_label_cmp, open_operation_assignment_editor,
+        operation_assignment_tab_enabled, ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, KeyName, ModKind};
-    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    use crate::ring_shortcut::{
+        MouseGestureBinding, MouseGestureDirection, RightDragContext, RingActionId,
+        RingShortcutContext, RingShortcutSettings,
+    };
 
     #[test]
     fn single_export_bake_stage_row_updates_its_setting() {
@@ -9427,6 +9607,101 @@ mod tests {
                 RingActionId::OpenOperationCustomize,
             )]
         );
+    }
+
+    #[test]
+    fn video_seek_key_actions_map_to_matching_video_ring_actions_only() {
+        for (key, ring) in [
+            (
+                KeyAction::VideoSeekBackSmall,
+                RingActionId::VideoSeekBackSmall,
+            ),
+            (
+                KeyAction::VideoSeekForwardSmall,
+                RingActionId::VideoSeekForwardSmall,
+            ),
+            (
+                KeyAction::VideoSeekBackMedium,
+                RingActionId::VideoSeekBackMedium,
+            ),
+            (
+                KeyAction::VideoSeekForwardMedium,
+                RingActionId::VideoSeekForwardMedium,
+            ),
+            (
+                KeyAction::VideoSeekBackLarge,
+                RingActionId::VideoSeekBackLarge,
+            ),
+            (
+                KeyAction::VideoSeekForwardLarge,
+                RingActionId::VideoSeekForwardLarge,
+            ),
+        ] {
+            assert_eq!(
+                ring_bindings_for_key_action(key),
+                vec![(RingShortcutContext::VideoFullscreen, ring.clone())]
+            );
+            assert!(ring.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen));
+            assert!(
+                !ring
+                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "the ring/key mapping must not make video seek a v3.7 mouse-button candidate"
+            );
+            assert!(!operation_assignment_tab_enabled(
+                &OperationAssignmentTarget::Key(key),
+                OperationAssignmentTab::MouseButtons,
+            ));
+            assert!(operation_assignment_tab_enabled(
+                &OperationAssignmentTarget::Key(key),
+                OperationAssignmentTab::RingPad,
+            ));
+            assert!(operation_assignment_tab_enabled(
+                &OperationAssignmentTarget::Key(key),
+                OperationAssignmentTab::MouseGesture,
+            ));
+            assert!(!operation_assignment_tab_enabled(
+                &OperationAssignmentTarget::Ring {
+                    context: RingShortcutContext::VideoFullscreen,
+                    action: ring.clone(),
+                },
+                OperationAssignmentTab::MouseButtons,
+            ));
+        }
+    }
+
+    #[test]
+    fn deferred_video_seek_projects_to_none_only_for_physical_mouse_ui() {
+        let action = RingActionId::VideoSeekBackSmall;
+        let context = RingShortcutContext::VideoFullscreen;
+        let mut settings = RingShortcutSettings::default();
+        settings.mouse_button_profile_mut(context).back = action.clone();
+
+        assert_eq!(
+            effective_mouse_button_action(&action, context),
+            RingActionId::None,
+            "the saved value is shown as the existing unassigned choice"
+        );
+        assert!(
+            mouse_assignment_labels(&settings, context, &action).is_empty(),
+            "an unavailable physical assignment must not look active in the overview"
+        );
+        assert_eq!(
+            settings.mouse_button_profile(context).back,
+            action,
+            "effective UI projection must not mutate the stored value"
+        );
+
+        settings
+            .mouse_gesture_profile_mut(RightDragContext::VideoFullscreen)
+            .bindings
+            .push(MouseGestureBinding::new(
+                vec![MouseGestureDirection::Up],
+                action.clone(),
+            ));
+        let labels = mouse_assignment_labels(&settings, context, &action);
+        assert_eq!(labels.len(), 1);
+        assert!(labels[0].contains('↑'));
+        assert!(!labels[0].contains("戻るボタン"));
     }
 
     #[test]

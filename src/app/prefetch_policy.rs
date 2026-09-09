@@ -217,7 +217,7 @@ pub(crate) struct FsPrefetchIndicator {
 
 impl FsPrefetchIndicator {
     /// 先読み枚数の設定上限は前後とも 10 枚。ここを 8 にすると上限まで増やしても
-    /// 数値へ畳まれるのは 2 枚だけで、行が長いままになる。4 なら既定 (後方 1 / 前方 2)
+    /// 数値へ畳まれるのは 2 枚だけで、行が長いままになる。4 なら既定 (後方 2 / 前方 3)
     /// では全部が点のまま出て、増やしたときだけ遠方が数値へ退く。
     pub(crate) const MAX_DOTS_PER_SIDE: usize = 4;
 

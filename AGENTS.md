@@ -133,6 +133,22 @@ always-active guidance.
 
 ## Verification Build Handoff
 
+- Interactive application tests belong in a planned pre-release verification
+  session, not ordinary development iteration. Before a live test launches the
+  application, switches foreground windows, or sends input into a running UI, present the
+  concrete scenarios, expected duration, desktop/input use, and disposable data
+  scope, then wait for the user's explicit approval for that run or suite.
+  A commentary announcement, silence, an earlier choice of mouse-input method,
+  or a general request to continue development is not approval. Do not start
+  another run outside the approved scope. Continue noninteractive checks and
+  builds (including headless unit, snapshot, and fake-input tests) while recording
+  live checks as pending. See
+  `docs/interactive-release-verification.md`.
+- `scripts/ui-smoke.ps1 -InteractiveApproved` may be used only after that
+  approval. The flag is an execution assertion, not a way to obtain consent.
+  Keep desktop-interactive tests separate from automatic `test-full.ps1` and
+  build gates. Existing normal-profile launch prohibitions still apply.
+
 - After completing a user-requested application or runtime behavior change,
   run the relevant automated checks, then build a user-runnable verification
   binary with `.\scripts\build-dev.ps1` before the final handoff. Do not stop

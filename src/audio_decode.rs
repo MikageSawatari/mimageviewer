@@ -234,7 +234,7 @@ impl AudioRangeDecoder {
     pub(crate) fn open(path: &Path) -> Result<Self, AudioDecodeOpenError> {
         let mut inner = open_audio_decode(path)?;
         let discarded_non_audio_streams =
-            discard_non_audio_streams(&mut inner.ictx, inner.stream_index);
+            discard_unselected_streams(&mut inner.ictx, inner.stream_index);
         Ok(Self {
             inner,
             discarded_non_audio_streams,
@@ -375,38 +375,50 @@ impl AudioRangeDecoder {
     }
 }
 
-/// Exclude every non-audio stream from range-decoder demux selection.
+/// Exclude every stream except the selected audio stream from demux selection.
 ///
 /// `ffmpeg-the-third` exposes only a discard getter. The stream array belongs to `ictx` and remains
 /// valid for its lifetime; validate the context, array, and each stream pointer before writing the
 /// one FFmpeg-owned field.
-fn discard_non_audio_streams(
+pub(crate) fn discard_unselected_streams(
     ictx: &mut ffmpeg::format::context::Input,
-    audio_stream_index: usize,
+    selected_stream_index: usize,
 ) -> usize {
-    unsafe {
-        let format_context = ictx.as_mut_ptr();
-        if format_context.is_null() || audio_stream_index >= (*format_context).nb_streams as usize {
-            return 0;
-        }
-        let streams = (*format_context).streams;
-        if streams.is_null() {
-            return 0;
-        }
-        let mut discarded = 0;
-        for index in 0..(*format_context).nb_streams as usize {
-            if index == audio_stream_index {
-                continue;
-            }
-            let stream = *streams.add(index);
-            if stream.is_null() {
-                continue;
-            }
-            (*stream).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
-            discarded += 1;
-        }
-        discarded
+    unsafe { discard_unselected_streams_raw(ictx.as_mut_ptr(), selected_stream_index) }
+}
+
+/// Apply `AVDISCARD_ALL` within one FFmpeg-owned format context.
+///
+/// Kept separate so the pointer validation and context isolation can be covered without opening a
+/// media file. The caller must pass a live, exclusively borrowed `AVFormatContext`.
+unsafe fn discard_unselected_streams_raw(
+    format_context: *mut ffmpeg::ffi::AVFormatContext,
+    selected_stream_index: usize,
+) -> usize {
+    if format_context.is_null()
+        || selected_stream_index >= unsafe { (*format_context).nb_streams as usize }
+    {
+        return 0;
     }
+    let streams = unsafe { (*format_context).streams };
+    if streams.is_null() {
+        return 0;
+    }
+    let mut discarded = 0;
+    for index in 0..unsafe { (*format_context).nb_streams as usize } {
+        if index == selected_stream_index {
+            continue;
+        }
+        let stream = unsafe { *streams.add(index) };
+        if stream.is_null() {
+            continue;
+        }
+        unsafe {
+            (*stream).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
+        }
+        discarded += 1;
+    }
+    discarded
 }
 
 fn analysis_resampler(decoder: &ffmpeg::decoder::Audio) -> Result<ResampleContext, String> {
@@ -887,6 +899,62 @@ fn append_resampled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestFormatContext(*mut ffmpeg::ffi::AVFormatContext);
+
+    impl TestFormatContext {
+        fn with_streams(count: usize) -> Self {
+            let context = unsafe { ffmpeg::ffi::avformat_alloc_context() };
+            assert!(!context.is_null());
+            for _ in 0..count {
+                let stream = unsafe { ffmpeg::ffi::avformat_new_stream(context, std::ptr::null()) };
+                assert!(!stream.is_null());
+            }
+            Self(context)
+        }
+
+        unsafe fn discard_at(&self, index: usize) -> ffmpeg::ffi::AVDiscard {
+            unsafe { (**(*self.0).streams.add(index)).discard }
+        }
+    }
+
+    impl Drop for TestFormatContext {
+        fn drop(&mut self) {
+            unsafe {
+                ffmpeg::ffi::avformat_free_context(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn discard_unselected_streams_preserves_selected_and_other_context() {
+        ensure_ffmpeg_init();
+        let selected_context = TestFormatContext::with_streams(3);
+        let untouched_context = TestFormatContext::with_streams(3);
+        let selected_before = unsafe { selected_context.discard_at(1) };
+        let untouched_before = (0..3)
+            .map(|index| unsafe { untouched_context.discard_at(index) })
+            .collect::<Vec<_>>();
+
+        let discarded = unsafe { discard_unselected_streams_raw(selected_context.0, 1) };
+
+        assert_eq!(discarded, 2);
+        assert_eq!(unsafe { selected_context.discard_at(1) }, selected_before);
+        assert_eq!(
+            unsafe { selected_context.discard_at(0) },
+            ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+        );
+        assert_eq!(
+            unsafe { selected_context.discard_at(2) },
+            ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+        );
+        assert_eq!(
+            (0..3)
+                .map(|index| unsafe { untouched_context.discard_at(index) })
+                .collect::<Vec<_>>(),
+            untouched_before
+        );
+    }
 
     #[test]
     fn partial_threshold_is_geometric() {

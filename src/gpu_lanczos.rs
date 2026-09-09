@@ -120,11 +120,15 @@ pub(crate) struct FullscreenPaintSourceGeneration {
 pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
+        #[cfg(all(windows, feature = "test-script"))]
+        test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
     Resampleable {
         page_idx: usize,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
+        #[cfg(all(windows, feature = "test-script"))]
+        test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
     Lanczos {
         page_idx: usize,
@@ -132,12 +136,18 @@ pub(crate) enum FullscreenPaintResource {
         generation: FullscreenPaintSourceGeneration,
         smoothing_percent: u32,
         output: Arc<LanczosOutput>,
+        #[cfg(all(windows, feature = "test-script"))]
+        test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
 }
 
 impl FullscreenPaintResource {
     pub(crate) fn direct(source: egui::TextureHandle) -> Self {
-        Self::Direct { source }
+        Self::Direct {
+            source,
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_content_proof: None,
+        }
     }
 
     pub(crate) fn resampleable(
@@ -149,12 +159,14 @@ impl FullscreenPaintResource {
             page_idx,
             source,
             generation,
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_content_proof: None,
         }
     }
 
     pub(crate) fn source_texture(&self) -> &egui::TextureHandle {
         match self {
-            Self::Direct { source }
+            Self::Direct { source, .. }
             | Self::Resampleable { source, .. }
             | Self::Lanczos { source, .. } => source,
         }
@@ -175,7 +187,7 @@ impl FullscreenPaintResource {
     pub(crate) fn paint_texture_id(&self) -> egui::TextureId {
         match self {
             Self::Lanczos { output, .. } => output.texture_id(),
-            Self::Direct { source } | Self::Resampleable { source, .. } => source.id(),
+            Self::Direct { source, .. } | Self::Resampleable { source, .. } => source.id(),
         }
     }
 
@@ -202,6 +214,48 @@ impl FullscreenPaintResource {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn with_test_script_content_proof(
+        mut self,
+        proof: crate::test_script::TestScriptContentProof,
+    ) -> Self {
+        match &mut self {
+            Self::Direct {
+                test_script_content_proof,
+                ..
+            }
+            | Self::Resampleable {
+                test_script_content_proof,
+                ..
+            }
+            | Self::Lanczos {
+                test_script_content_proof,
+                ..
+            } => *test_script_content_proof = Some(proof),
+        }
+        self
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_content_proof(
+        &self,
+    ) -> Option<&crate::test_script::TestScriptContentProof> {
+        match self {
+            Self::Direct {
+                test_script_content_proof,
+                ..
+            }
+            | Self::Resampleable {
+                test_script_content_proof,
+                ..
+            }
+            | Self::Lanczos {
+                test_script_content_proof,
+                ..
+            } => test_script_content_proof.as_ref(),
+        }
+    }
+
     fn resampleable_parts(
         &self,
     ) -> Option<(usize, &egui::TextureHandle, FullscreenPaintSourceGeneration)> {
@@ -210,6 +264,7 @@ impl FullscreenPaintResource {
                 page_idx,
                 source,
                 generation,
+                ..
             }
             | Self::Lanczos {
                 page_idx,
@@ -228,7 +283,14 @@ impl FullscreenPaintResource {
                 source,
                 generation,
                 ..
-            } => Self::resampleable(*page_idx, source.clone(), *generation),
+            } => {
+                let original = Self::resampleable(*page_idx, source.clone(), *generation);
+                #[cfg(all(windows, feature = "test-script"))]
+                if let Some(proof) = self.test_script_content_proof().cloned() {
+                    return original.with_test_script_content_proof(proof);
+                }
+                original
+            }
             Self::Direct { .. } | Self::Resampleable { .. } => self.clone(),
         }
     }
@@ -241,6 +303,8 @@ impl FullscreenPaintResource {
             generation,
             smoothing_percent,
             output,
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_content_proof: self.test_script_content_proof().cloned(),
         }
     }
 }
@@ -764,7 +828,10 @@ pub(crate) struct LanczosOutput {
     size: [u32; 2],
     scale_branch: FullscreenPaintScaleBranch,
     source_region: LanczosSourceRegionKey,
+    #[cfg(not(test))]
     _texture: wgpu::Texture,
+    #[cfg(test)]
+    _texture: Option<wgpu::Texture>,
 }
 
 impl LanczosOutput {
@@ -784,7 +851,10 @@ impl LanczosOutput {
             size,
             scale_branch,
             source_region,
+            #[cfg(not(test))]
             _texture: texture,
+            #[cfg(test)]
+            _texture: Some(texture),
         }
     }
 
@@ -2663,6 +2733,62 @@ mod tests {
         fn free_texture(&self, _texture_id: egui::TextureId) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_content_proof_survives_all_paint_resource_forms() {
+        let context = egui::Context::default();
+        let source = context.load_texture(
+            "test-script-proof-source",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let proof = crate::test_script::TestScriptContentProof {
+            context_serial: 12,
+            items_generation: 34,
+            page_index: 5,
+            item_identity: "proof-item".to_owned(),
+            source_texture_id: source.id(),
+            source_kind: crate::test_script::TestScriptPaintSourceKind::FullOrProcessed,
+        };
+
+        let direct = FullscreenPaintResource::direct(source.clone())
+            .with_test_script_content_proof(proof.clone());
+        assert_eq!(direct.test_script_content_proof(), Some(&proof));
+
+        let generation = FullscreenPaintSourceGeneration {
+            items: 34,
+            input: 7,
+        };
+        let resampleable = FullscreenPaintResource::resampleable(5, source, generation)
+            .with_test_script_content_proof(proof.clone());
+        assert_eq!(resampleable.test_script_content_proof(), Some(&proof));
+
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let output = Arc::new(LanczosOutput {
+            texture_id_lease: NativeTextureIdLease {
+                texture_id: egui::TextureId::User(8128),
+                releaser: releaser.clone(),
+            },
+            size: [1, 1],
+            scale_branch: FullscreenPaintScaleBranch::DownscaleLanczos,
+            source_region: LanczosSourceRegionKey::Full,
+            _texture: None,
+        });
+        let lanczos = resampleable.with_lanczos(output, 0);
+        assert_eq!(lanczos.test_script_content_proof(), Some(&proof));
+
+        let restored = lanczos.original_resampleable();
+        assert_eq!(restored.test_script_content_proof(), Some(&proof));
+        assert!(matches!(
+            restored,
+            FullscreenPaintResource::Resampleable {
+                page_idx: 5,
+                generation: restored_generation,
+                ..
+            } if restored_generation == generation
+        ));
     }
 
     #[test]

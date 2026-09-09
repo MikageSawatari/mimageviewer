@@ -1915,6 +1915,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `thumb_idle_upgrade` | bool | true | アイドル時にキャッシュ由来サムネイルを高画質化 |
 | `prefetch_back` | usize | 4 | フルスクリーン先読み（前方枚数） |
 | `prefetch_forward` | usize | 12 | フルスクリーン先読み（後方枚数） |
+| `ai_upscale_prefetch_back` | usize | 2 | ページ単位表示で final AI / final effect を現在ページより後方へ先読みする画像枚数。v3.7.0 では新規・未保存時の既定だけを 1 から 2 へ変更し、保存済みの値 (0 / 1 を含む) は移行しない |
+| `ai_upscale_prefetch_forward` | usize | 3 | ページ単位表示で final AI / final effect を現在ページより前方へ先読みする画像枚数。v3.7.0 境界で旧既定 2 だけを一度 3 へ移行する。0 / 1 / 3 以上は維持し、移行後に 2 を選び直した場合も再移行しない |
 | `retained_final_ai_cache_max_entries` | usize | 10 | フルスクリーンを閉じた後も保持する final AI 結果 (アップスケール / ノイズ除去後 pixels) の最大枚数。`0` で保持しない。環境設定では 0〜20 |
 | `retained_final_ai_cache_max_mib` | u64 | 512 | 上記保持キャッシュの **CPU メモリ (RAM)** 上限 (MiB)。GPU メモリ予算には含めない。`0` で保持しない。環境設定では 0〜8192 MB。枚数とメモリのどちらかを超えると LRU で古い結果から破棄する |
 

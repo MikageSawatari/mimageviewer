@@ -61,7 +61,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
@@ -85,7 +86,8 @@ use crate::video::native_window::{
     NativeCursorOwnershipEdge, NativeVideoKeyEvent, NativeVideoMouseButton,
     NativeVideoMouseButtonEvent, NativeVideoMouseEvent, NativeVideoMouseWheelEvent,
     NativeVideoWindowEvent, NativeVideoWindowEventSink, NativeVideoWindowSource,
-    cancel_hud_touch_streams, handle_hud_pointer_message, should_discard_promoted_touch_mouse,
+    cancel_hud_touch_streams, handle_hud_pointer_message, native_xbutton_message_handled,
+    should_discard_promoted_touch_mouse,
 };
 
 /// HUD overlay HWND の生成設定。
@@ -858,6 +860,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     y: pt.y,
                     shift: mouse_shift(wparam),
                     ctrl: mouse_ctrl(wparam),
+                    alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0,
                 };
                 state
                     .event_sink
@@ -978,22 +981,19 @@ unsafe extern "system" fn hud_wnd_proc(
                     }
                 }
             }
-            // WM_XBUTTONUP は MouseButton(Extra1/Extra2) で既に進む/戻るを処理済み。
-            // DefWindowProc に流すと Windows が APPCOMMAND_BROWSER_BACKWARD/FORWARD を
-            // 合成し、本ファイル下の WM_APPCOMMAND handler が再度 KeyDown(0xA6/0xA7) を
-            // 生成して 1 押下 = 2 ナビになるため、TRUE を返して抑止 (Codex 2 周目 P2)。
-            if msg == WM_XBUTTONUP {
+            // MouseButton(Extra1/Extra2) として decode 済みの XButton message は、この
+            // HWND が DOWN / UP / DBLCLK を一括所有する。2 回目の物理押下を表す DBLCLK も
+            // 自前 route へ流しているため、Win32 の処理済み契約に従って全種で TRUE を返す。
+            if native_xbutton_message_handled(msg) {
                 return LRESULT(1);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_APPCOMMAND => {
-            // 通常は HUD の WM_XBUTTONUP 後に `DefWindowProcW` が APPCOMMAND を生成し、
-            // 親 (presenter) HWND へ昇格して presenter wndproc 側で拾われる。ただし
-            // pathological case として、mouse driver が HUD HWND へ `SendMessage(WM_APPCOMMAND, ...)`
-            // を直接送ってくる経路がありうる (= HUD は sibling top-level なので親への
-            // 自動 forward は起きない)。その際にも UI 側にナビゲーションを届けるため、
+            // Raw XButton は上の branch が全 message を所有する。mouse driver / AHK が
+            // HUD HWND へ `SendMessage(WM_APPCOMMAND, ...)` を直接送る独立経路では、
+            // UI 側にナビゲーションを届けるため、
             // ここで合成 KeyDown(0xA6/0xA7) に変換して bounded route に流す
             // (= presenter 側のハンドラと同一の経路、Codex P2)。
             let cmd_word = ((lparam.0 >> 16) & 0xFFFF) as u32;

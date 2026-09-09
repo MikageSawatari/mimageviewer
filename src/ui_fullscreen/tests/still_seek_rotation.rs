@@ -36,7 +36,9 @@ fn load_textures(app: &mut crate::app::App, ctx: &egui::Context, rotations: &[Ro
                 source_dims: Some((tex.size()[0] as u32, tex.size()[1] as u32)),
                 layout_dims: None,
                 rendered_at_px: 120,
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 120,
+                },
                 from_edit_preview: false,
                 tex,
             }
@@ -90,8 +92,8 @@ fn overlay_output(
 
 fn preview_output(app: &mut crate::app::App, ctx: &egui::Context) -> egui::FullOutput {
     overlay_output(app, ctx, None);
-    let geometry = app.still_seek_geometry_for_idx(3, false);
     let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    let geometry = app.still_seek_geometry_for_idx(full, 3, false);
     let strip = geometry.strip_rect(full).unwrap();
     let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
     let center = egui::pos2(
@@ -658,7 +660,7 @@ fn still_seek_f6_real_overlay_rotation_snapshots() {
                         }
                         app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
                         let strip = app
-                            .still_seek_geometry_for_idx(3, false)
+                            .still_seek_geometry_for_idx(full, 3, false)
                             .strip_rect(full)
                             .unwrap();
                         let lock =

@@ -692,6 +692,12 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    /// この編集ダイアログを開いた時点の通常ホイール割り当て。
+    ///
+    /// `ring_shortcuts` の他項目は操作カスタマイズが所有するため、OK 前に live から
+    /// 取り込む。同じ項目を両ダイアログで編集できるため、現在のダイアログで実際に
+    /// 変更したかを区別し、未変更なら他方の新しい値を保つ編集 session の基準値。
+    initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
     /// 現在選択中のページ
     pub selected: PreferencesPage,
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
@@ -1234,6 +1240,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
             right_panel_scroll_generation: 0,
             search_query: String::new(),
@@ -1871,6 +1878,41 @@ pub(crate) fn prepare_preferences_settings_for_commit(
         .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
 }
 
+fn prepare_preferences_edited_settings_for_commit(
+    edited: &mut crate::settings::Settings,
+    initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
+    live: &mut crate::settings::Settings,
+) {
+    let edited_normal_wheel_action = edited.ring_shortcuts.video_normal_wheel_action;
+    let resolved_normal_wheel_action = resolve_dialog_edited_value(
+        initial_video_normal_wheel_action,
+        edited_normal_wheel_action,
+        live.ring_shortcuts.video_normal_wheel_action,
+    );
+
+    prepare_preferences_settings_for_commit(edited, live);
+
+    // `overwrite_non_preferences_from` は、別ダイアログで編集する ring_shortcuts 全体を
+    // live から取り込む。Video ページでこの一項目を変更した場合は編集値、変更して
+    // いない場合は操作カスタマイズ側の新しい値を採用する。
+    edited.ring_shortcuts.video_normal_wheel_action = resolved_normal_wheel_action;
+}
+
+fn resolve_dialog_edited_value<T: Copy + Eq>(initial: T, edited: T, live: T) -> T {
+    if edited == initial { live } else { edited }
+}
+
+fn prepare_preferences_state_settings_for_commit(
+    state: &mut PreferencesState,
+    live: &mut crate::settings::Settings,
+) {
+    prepare_preferences_edited_settings_for_commit(
+        &mut state.settings,
+        state.initial_video_normal_wheel_action,
+        live,
+    );
+}
+
 impl App {
     pub(crate) fn open_preferences_page(&mut self, page: PreferencesPage) {
         self.open_preferences_request(PreferencesOpenRequest::page(page));
@@ -1887,7 +1929,11 @@ impl App {
         };
         let mut edited = state.settings.clone();
         let mut live = self.settings.clone();
-        edited.overwrite_non_preferences_from(&mut live);
+        prepare_preferences_edited_settings_for_commit(
+            &mut edited,
+            state.initial_video_normal_wheel_action,
+            &mut live,
+        );
         !settings_equal_for_close_prompt(&edited, &self.settings)
     }
 
@@ -1897,6 +1943,11 @@ impl App {
         };
         let mut edited_ring = state.settings.ring_shortcuts.clone();
         edited_ring.sanitize();
+        edited_ring.video_normal_wheel_action = resolve_dialog_edited_value(
+            state.initial_video_normal_wheel_action,
+            edited_ring.video_normal_wheel_action,
+            self.settings.ring_shortcuts.video_normal_wheel_action,
+        );
         // 編集した項目をここへ足し忘れると、変更が「未保存」と見なされず、
         // 閉じるときの確認も出ないまま黙って捨てられる。
         state.settings.keymap != self.settings.keymap
@@ -2318,7 +2369,7 @@ impl App {
                 // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
                 // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
                 // Settings に追加した場合はここにも追記が必要。
-                prepare_preferences_settings_for_commit(&mut state.settings, &mut self.settings);
+                prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
                 self.settings = state.settings;
                 #[cfg(windows)]
                 if old_video_seek_strip_min_interval_secs.to_bits()
@@ -2845,6 +2896,11 @@ impl App {
         );
         bundle.keymap = state.settings.keymap;
         bundle.ring_shortcuts = state.settings.ring_shortcuts;
+        bundle.ring_shortcuts.video_normal_wheel_action = resolve_dialog_edited_value(
+            state.initial_video_normal_wheel_action,
+            bundle.ring_shortcuts.video_normal_wheel_action,
+            self.settings.ring_shortcuts.video_normal_wheel_action,
+        );
         bundle.gamepad_enabled = state.settings.gamepad_enabled;
         self.apply_operation_customize_bundle(bundle);
     }
@@ -3262,6 +3318,18 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 mod tests {
     use super::*;
 
+    fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
+        PreferencesState::from_settings(
+            settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        )
+    }
+
     /// 操作カスタマイズで切った設定が、OK で本体へ届く。
     ///
     /// この経路は編集した `Settings` を丸ごと採用せず、**bundle へ写した項目だけ**を
@@ -3293,6 +3361,335 @@ mod tests {
         let state = app.operation_customize_state.take().unwrap();
         app.apply_operation_customize_state(state);
         assert!(!app.settings.gamepad_enabled, "OK で本体へ届く");
+    }
+
+    #[test]
+    fn video_normal_wheel_setting_survives_both_settings_dialog_commit_paths() {
+        use crate::ring_shortcut::VideoNormalWheelActionId;
+
+        let mut app = crate::app::setup_app_for_test();
+        let mut operation_state = preferences_state_for_test(&app.settings);
+        operation_state
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
+        app.apply_operation_customize_state(operation_state);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "操作カスタマイズの OK 経路は通常ホイール設定を本体へ渡す"
+        );
+
+        let mut preferences_state = preferences_state_for_test(&app.settings);
+        preferences_state
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
+        app.pref_state = Some(preferences_state);
+        assert!(
+            app.preferences_dialog_has_unsaved_changes(),
+            "Videoページで変えた通常ホイール設定は未保存変更として扱う"
+        );
+        let mut preferences_state = app.pref_state.take().unwrap();
+        prepare_preferences_state_settings_for_commit(&mut preferences_state, &mut app.settings);
+        assert_eq!(
+            preferences_state
+                .settings
+                .ring_shortcuts
+                .video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems,
+            "環境設定の全体差し替え前処理は、Videoページで編集した値を保持する"
+        );
+        app.settings = preferences_state.settings;
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems,
+            "環境設定の OK 経路は通常ホイール設定を本体へ渡す"
+        );
+
+        let mut unchanged_preferences = preferences_state_for_test(&app.settings);
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::AdjustVolume;
+        prepare_preferences_state_settings_for_commit(
+            &mut unchanged_preferences,
+            &mut app.settings,
+        );
+        assert_eq!(
+            unchanged_preferences
+                .settings
+                .ring_shortcuts
+                .video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "Videoページで未変更なら、操作カスタマイズ側の新しい値を巻き戻さない"
+        );
+    }
+
+    #[test]
+    fn normal_wheel_three_way_merge_is_symmetric_between_both_dialogs() {
+        use crate::ring_shortcut::VideoNormalWheelActionId;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::NavigateItems;
+        app.settings.ring_shortcuts.mouse_ring_help_visible = true;
+
+        // 操作カスタマイズを先に開き、環境設定が同じ項目を保存したあとで、別の
+        // ring 項目だけを変更して OK にする。通常ホイールは新しい live 値を保つ。
+        let mut operation_state = preferences_state_for_test(&app.settings);
+        operation_state
+            .settings
+            .ring_shortcuts
+            .mouse_ring_help_visible = false;
+        operation_state
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
+        operation_state
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::AdjustVolume;
+        app.operation_customize_state = Some(operation_state);
+        assert!(
+            app.operation_customize_dialog_has_unsaved_changes(),
+            "別の ring 項目の編集は未保存のまま数える"
+        );
+        let operation_state = app.operation_customize_state.take().unwrap();
+        app.apply_operation_customize_state(operation_state);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "操作カスタマイズで未変更または元へ戻した通常ホイールは live 値を保つ"
+        );
+        assert!(
+            !app.settings.ring_shortcuts.mouse_ring_help_visible,
+            "操作カスタマイズで実際に変えた別の ring 項目は保存する"
+        );
+
+        // 逆向きも同じ。環境設定を開いたあとで操作カスタマイズが ring の別項目を
+        // 保存しても、Video ページで明示変更した通常ホイールだけが勝つ。
+        let mut preferences_state = preferences_state_for_test(&app.settings);
+        preferences_state
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
+        app.settings.ring_shortcuts.mouse_ring_help_visible = true;
+        prepare_preferences_state_settings_for_commit(&mut preferences_state, &mut app.settings);
+        app.settings = preferences_state.settings;
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems,
+            "環境設定で明示変更した通常ホイールは OK 時に勝つ"
+        );
+        assert!(
+            app.settings.ring_shortcuts.mouse_ring_help_visible,
+            "環境設定が所有しない別の ring 項目は live 値を保つ"
+        );
+    }
+
+    #[test]
+    fn normal_wheel_unchanged_cancel_and_reopen_use_each_dialog_session_base() {
+        use crate::ring_shortcut::VideoNormalWheelActionId;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::NavigateItems;
+
+        let untouched_operation = preferences_state_for_test(&app.settings);
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::AdjustVolume;
+        app.operation_customize_state = Some(untouched_operation);
+        assert!(
+            !app.operation_customize_dialog_has_unsaved_changes(),
+            "他方のダイアログだけが変更した値を、操作カスタマイズの未保存変更にしない"
+        );
+        let untouched_operation = app.operation_customize_state.take().unwrap();
+        app.apply_operation_customize_state(untouched_operation);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume
+        );
+
+        let mut cancelled_preferences = preferences_state_for_test(&app.settings);
+        cancelled_preferences
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
+        drop(cancelled_preferences);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "キャンセルは live 設定を変えない"
+        );
+
+        let mut reopened_preferences = preferences_state_for_test(&app.settings);
+        assert_eq!(
+            reopened_preferences.initial_video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "開き直した編集 session は現在の live 値を基準にする"
+        );
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::NavigateItems;
+        app.pref_state = Some(reopened_preferences);
+        assert!(
+            !app.preferences_dialog_has_unsaved_changes(),
+            "他方のダイアログだけが変更した値を、環境設定の未保存変更にしない"
+        );
+        reopened_preferences = app.pref_state.take().unwrap();
+        prepare_preferences_state_settings_for_commit(&mut reopened_preferences, &mut app.settings);
+        assert_eq!(
+            reopened_preferences
+                .settings
+                .ring_shortcuts
+                .video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems,
+            "開き直し後も、その session で未変更なら新しい live 値を保つ"
+        );
+
+        let mut cancelled_operation = preferences_state_for_test(&app.settings);
+        cancelled_operation
+            .settings
+            .ring_shortcuts
+            .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
+        drop(cancelled_operation);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems,
+            "操作カスタマイズのキャンセルも live 設定を変えない"
+        );
+
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::AdjustVolume;
+        let reopened_operation = preferences_state_for_test(&app.settings);
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::NavigateItems;
+        app.operation_customize_state = Some(reopened_operation);
+        assert!(
+            !app.operation_customize_dialog_has_unsaved_changes(),
+            "操作カスタマイズの再表示も、その session の基準値で外部変更を判定する"
+        );
+        let reopened_operation = app.operation_customize_state.take().unwrap();
+        app.apply_operation_customize_state(reopened_operation);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems
+        );
+
+        let mut imported =
+            crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                &app.settings,
+            );
+        imported.ring_shortcuts.video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
+        app.apply_operation_customize_bundle(imported);
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            VideoNormalWheelActionId::AdjustVolume,
+            "編集 session の基準値を持たない明示bundle適用には3-way解決を適用しない"
+        );
+    }
+
+    #[test]
+    fn deferred_video_mouse_seek_survives_open_cancel_and_unrelated_commit() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
+
+        let context = RingShortcutContext::VideoFullscreen;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(context)
+            .back = RingActionId::VideoSeekBackLarge;
+
+        let mut cancelled = preferences_state_for_test(&app.settings);
+        cancelled
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(context)
+            .sanitize(context);
+        cancelled
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(context)
+            .back = RingActionId::VideoMute;
+        drop(cancelled);
+        assert_eq!(
+            app.settings
+                .ring_shortcuts
+                .mouse_button_profile(context)
+                .action(MouseButtonSlot::Back),
+            RingActionId::VideoSeekBackLarge,
+            "Cancel must leave the saved deferred value untouched"
+        );
+
+        let reopened = preferences_state_for_test(&app.settings);
+        assert_eq!(
+            reopened
+                .settings
+                .ring_shortcuts
+                .mouse_button_profile(context)
+                .action(MouseButtonSlot::Back),
+            RingActionId::VideoSeekBackLarge,
+            "reopening must show the saved deferred value"
+        );
+
+        let mut unrelated_commit = preferences_state_for_test(&app.settings);
+        unrelated_commit
+            .settings
+            .ring_shortcuts
+            .mouse_ring_help_visible = !app.settings.ring_shortcuts.mouse_ring_help_visible;
+        app.apply_operation_customize_state(unrelated_commit);
+        assert_eq!(
+            app.settings
+                .ring_shortcuts
+                .mouse_button_profile(context)
+                .action(MouseButtonSlot::Back),
+            RingActionId::VideoSeekBackLarge,
+            "an unrelated OK must not sanitize the saved value to None"
+        );
+
+        let mut replacement = preferences_state_for_test(&app.settings);
+        replacement
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(context)
+            .back = RingActionId::VideoMute;
+        app.apply_operation_customize_state(replacement);
+        assert_eq!(
+            app.settings
+                .ring_shortcuts
+                .mouse_button_profile(context)
+                .action(MouseButtonSlot::Back),
+            RingActionId::VideoMute,
+            "the user can replace a deferred value with an available action"
+        );
+    }
+
+    #[test]
+    fn normal_wheel_merge_preserves_existing_preferences_commit_routing() {
+        use crate::ring_shortcut::VideoNormalWheelActionId;
+
+        let mut live = crate::settings::Settings::default();
+        let standard = preference_view_state_variant(0);
+        let active = preference_view_state_variant(1);
+        standard.apply_to_settings(&mut live);
+        live.apply_favorite_view_overlay(uuid::Uuid::from_u128(42), &active);
+
+        let mut state = preferences_state_for_test(&live);
+        state.settings.ring_shortcuts.video_normal_wheel_action =
+            VideoNormalWheelActionId::AdjustVolume;
+
+        let mut expected = state.settings.clone();
+        let mut expected_live = live.clone();
+        prepare_preferences_settings_for_commit(&mut expected, &mut expected_live);
+        expected.ring_shortcuts.video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
+
+        let mut actual_live = live;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut actual_live);
+        assert_eq!(
+            serde_json::to_value(&state.settings).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "通常ホイールの3-way解決以外は既存の環境設定commit routingと同一"
+        );
     }
 
     #[test]
@@ -3518,6 +3915,90 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_viewer_notice_visibility");
+    }
+
+    fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
+        use egui_kittest::Harness;
+
+        let mut settings = crate::settings::Settings {
+            still_seek_strip_visible: true,
+            ..crate::settings::Settings::default()
+        };
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_still_seek_strip_settings(ui, &mut settings);
+                    });
+            });
+        });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn preferences_still_seek_strip_height_settings_snapshot_regular_width() {
+        still_seek_strip_height_settings_snapshot(
+            egui::vec2(520.0, 430.0),
+            "preferences_still_seek_strip_height_regular",
+        );
+    }
+
+    #[test]
+    fn preferences_still_seek_strip_height_settings_snapshot_narrow_width() {
+        still_seek_strip_height_settings_snapshot(
+            egui::vec2(280.0, 500.0),
+            "preferences_still_seek_strip_height_narrow",
+        );
+    }
+
+    fn video_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
+        use egui_kittest::Harness;
+
+        let mut settings = crate::settings::Settings::default();
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder().with_size(size).build_ui(|ui| {
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ui.ctx());
+                fonts_ready = true;
+            }
+            egui::CentralPanel::default().show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_video_seek_strip_height_settings(ui, &mut settings);
+                    });
+            });
+        });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn preferences_video_seek_strip_height_settings_snapshot_regular_width() {
+        video_seek_strip_height_settings_snapshot(
+            egui::vec2(520.0, 430.0),
+            "preferences_video_seek_strip_height_regular",
+        );
+    }
+
+    #[test]
+    fn preferences_video_seek_strip_height_settings_snapshot_narrow_width() {
+        video_seek_strip_height_settings_snapshot(
+            egui::vec2(280.0, 500.0),
+            "preferences_video_seek_strip_height_narrow",
+        );
     }
 
     fn assert_selection_bar_matches_details(settings: &crate::settings::Settings) {

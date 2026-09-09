@@ -100,6 +100,41 @@ impl std::fmt::Display for NormalizeScanError {
 
 impl std::error::Error for NormalizeScanError {}
 
+struct PreparedNormalizeAudio {
+    stream_idx: usize,
+    stream_tb: ffmpeg::Rational,
+    decoder: ffmpeg::decoder::Audio,
+}
+
+/// Select and own the decoder state before excluding every other stream from this scanner's input.
+/// The packet loop retains its stream-index check as a defensive boundary.
+fn prepare_normalize_audio_stream(
+    input: &mut ffmpeg::format::context::Input,
+) -> Result<PreparedNormalizeAudio, NormalizeScanError> {
+    let (stream_idx, stream_tb, codec_context) = {
+        let audio_stream = input
+            .streams()
+            .best(MediaType::Audio)
+            .ok_or(NormalizeScanError::NoAudio)?;
+        let stream_idx = audio_stream.index();
+        let stream_tb = audio_stream.time_base();
+        let codec_context =
+            ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())
+                .map_err(|e| NormalizeScanError::Ffmpeg(format!("codec context: {e}")))?;
+        (stream_idx, stream_tb, codec_context)
+    };
+    let decoder = codec_context
+        .decoder()
+        .audio()
+        .map_err(|e| NormalizeScanError::Ffmpeg(format!("audio decoder: {e}")))?;
+    crate::audio_decode::discard_unselected_streams(input, stream_idx);
+    Ok(PreparedNormalizeAudio {
+        stream_idx,
+        stream_tb,
+        decoder,
+    })
+}
+
 /// メイン関数。
 ///
 /// `target_lufs_milli` は LUFS の千分の一単位 (例 `-14000` = -14.000 LUFS)。
@@ -161,19 +196,11 @@ fn scan_audio_loudness_impl(
     }
 
     // ── audio stream 選択 ──
-    let audio_stream = input
-        .streams()
-        .best(MediaType::Audio)
-        .ok_or(NormalizeScanError::NoAudio)?;
-    let stream_idx = audio_stream.index();
-    let stream_tb = audio_stream.time_base();
-    let params = audio_stream.parameters();
-    let ctx = ffmpeg::codec::context::Context::from_parameters(params)
-        .map_err(|e| NormalizeScanError::Ffmpeg(format!("codec context: {e}")))?;
-    let mut decoder = ctx
-        .decoder()
-        .audio()
-        .map_err(|e| NormalizeScanError::Ffmpeg(format!("audio decoder: {e}")))?;
+    let PreparedNormalizeAudio {
+        stream_idx,
+        stream_tb,
+        mut decoder,
+    } = prepare_normalize_audio_stream(&mut input)?;
 
     let in_fmt = decoder.format();
     let in_rate = decoder.rate();
@@ -525,6 +552,95 @@ fn duration_to_secs(duration: i64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn assert_normalize_result_near(left: NormalizeResult, right: NormalizeResult) {
+        assert_eq!(left.target_lufs_milli, right.target_lufs_milli);
+        assert!(
+            (left.gain_db - right.gain_db).abs() <= 1.0e-4,
+            "gain differs: {left:?} vs {right:?}"
+        );
+        assert!(
+            (left.integrated_lufs - right.integrated_lufs).abs() <= 1.0e-4,
+            "integrated LUFS differs: {left:?} vs {right:?}"
+        );
+        assert!(
+            (left.true_peak_db - right.true_peak_db).abs() <= 1.0e-4,
+            "true peak differs: {left:?} vs {right:?}"
+        );
+    }
+
+    fn run_ffmpeg(ffmpeg_exe: &std::ffi::OsStr, args: &[&std::ffi::OsStr]) {
+        let output = Command::new(ffmpeg_exe)
+            .args(args)
+            .output()
+            .expect("start ffmpeg fixture generator");
+        assert!(
+            output.status.success(),
+            "ffmpeg fixture generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn generated_multistream_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let multi = temp.path().join("video-two-audio.mkv");
+        let selected_audio = temp.path().join("selected-audio.mka");
+        let ffmpeg_exe = std::env::var_os("MIV_TEST_FFMPEG")
+            .unwrap_or_else(|| std::ffi::OsString::from("ffmpeg.exe"));
+        let multi_args = [
+            std::ffi::OsStr::new("-hide_banner"),
+            std::ffi::OsStr::new("-loglevel"),
+            std::ffi::OsStr::new("error"),
+            std::ffi::OsStr::new("-y"),
+            std::ffi::OsStr::new("-f"),
+            std::ffi::OsStr::new("lavfi"),
+            std::ffi::OsStr::new("-i"),
+            std::ffi::OsStr::new("testsrc2=size=64x64:rate=1:duration=40"),
+            std::ffi::OsStr::new("-f"),
+            std::ffi::OsStr::new("lavfi"),
+            std::ffi::OsStr::new("-i"),
+            std::ffi::OsStr::new("sine=frequency=440:sample_rate=48000:duration=40,volume=0.10"),
+            std::ffi::OsStr::new("-f"),
+            std::ffi::OsStr::new("lavfi"),
+            std::ffi::OsStr::new("-i"),
+            std::ffi::OsStr::new("sine=frequency=997:sample_rate=48000:duration=40,volume=0.70"),
+            std::ffi::OsStr::new("-map"),
+            std::ffi::OsStr::new("0:v:0"),
+            std::ffi::OsStr::new("-map"),
+            std::ffi::OsStr::new("1:a:0"),
+            std::ffi::OsStr::new("-map"),
+            std::ffi::OsStr::new("2:a:0"),
+            std::ffi::OsStr::new("-c:v"),
+            std::ffi::OsStr::new("mpeg4"),
+            std::ffi::OsStr::new("-q:v"),
+            std::ffi::OsStr::new("10"),
+            std::ffi::OsStr::new("-c:a"),
+            std::ffi::OsStr::new("pcm_s16le"),
+            std::ffi::OsStr::new("-disposition:a:0"),
+            std::ffi::OsStr::new("0"),
+            std::ffi::OsStr::new("-disposition:a:1"),
+            std::ffi::OsStr::new("default"),
+            multi.as_os_str(),
+        ];
+        run_ffmpeg(&ffmpeg_exe, &multi_args);
+        let selected_args = [
+            std::ffi::OsStr::new("-hide_banner"),
+            std::ffi::OsStr::new("-loglevel"),
+            std::ffi::OsStr::new("error"),
+            std::ffi::OsStr::new("-y"),
+            std::ffi::OsStr::new("-i"),
+            multi.as_os_str(),
+            std::ffi::OsStr::new("-map"),
+            std::ffi::OsStr::new("0:a:1"),
+            std::ffi::OsStr::new("-c:a"),
+            std::ffi::OsStr::new("copy"),
+            selected_audio.as_os_str(),
+        ];
+        run_ffmpeg(&ffmpeg_exe, &selected_args);
+        (temp, multi, selected_audio)
+    }
 
     #[test]
     fn duration_to_secs_handles_no_pts() {
@@ -615,5 +731,139 @@ mod tests {
         );
         assert!(emitted_flag);
         assert_eq!(emitted.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires the FFmpeg CLI to generate a multi-stream fixture"]
+    fn normalize_discard_preserves_selected_audio_results_and_cancellation() {
+        ffmpeg::init().expect("ffmpeg init");
+        let (_temp, multi, selected_audio) = generated_multistream_fixture();
+
+        let fresh_input = ffmpeg::format::input(&multi).expect("open fresh fixture input");
+        let fresh_discards = fresh_input
+            .streams()
+            .map(|stream| stream.discard())
+            .collect::<Vec<_>>();
+        let fresh_selected_idx = fresh_input
+            .streams()
+            .best(MediaType::Audio)
+            .expect("best audio in fresh fixture")
+            .index();
+
+        let mut prepared_input =
+            ffmpeg::format::input(&multi).expect("open prepared fixture input");
+        let prepared = prepare_normalize_audio_stream(&mut prepared_input).expect("prepare audio");
+        assert_eq!(prepared.stream_idx, fresh_selected_idx);
+        assert_eq!(
+            prepared.stream_idx, 2,
+            "the second audio stream must be selected"
+        );
+        for stream in prepared_input.streams() {
+            if stream.index() == prepared.stream_idx {
+                assert_eq!(stream.discard(), fresh_discards[stream.index()]);
+            } else {
+                assert_eq!(
+                    stream.discard(),
+                    ffmpeg::ffi::AVDiscard::AVDISCARD_ALL.into(),
+                    "stream {} was not discarded",
+                    stream.index()
+                );
+            }
+        }
+        assert_eq!(
+            fresh_input
+                .streams()
+                .map(|stream| stream.discard())
+                .collect::<Vec<_>>(),
+            fresh_discards,
+            "preparing a separate input changed the fresh context"
+        );
+
+        let full_multi_progress = Arc::new(NormalizeScanProgress::default());
+        let full_multi = scan_audio_loudness(
+            &multi,
+            -14000,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&full_multi_progress),
+        )
+        .expect("scan multi-stream fixture");
+        let full_selected = scan_audio_loudness(
+            &selected_audio,
+            -14000,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(NormalizeScanProgress::default()),
+        )
+        .expect("scan selected audio fixture");
+        assert_normalize_result_near(full_multi, full_selected);
+        assert!(
+            full_multi_progress.pts_processed_ms.load(Ordering::Acquire) >= 39_000,
+            "full scan did not publish progress near the end of the 40 second fixture"
+        );
+        assert!(
+            full_multi_progress.duration_ms.load(Ordering::Acquire) >= 39_000,
+            "fixture duration was not published"
+        );
+
+        let mut provisional_multi = Vec::new();
+        let provisional_multi_final = scan_audio_loudness_with_provisional(
+            &multi,
+            -14000,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(NormalizeScanProgress::default()),
+            0.5,
+            &mut |result| provisional_multi.push(result),
+        )
+        .expect("scan multi-stream fixture with provisional result");
+        let mut provisional_selected = Vec::new();
+        let provisional_selected_final = scan_audio_loudness_with_provisional(
+            &selected_audio,
+            -14000,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(NormalizeScanProgress::default()),
+            0.5,
+            &mut |result| provisional_selected.push(result),
+        )
+        .expect("scan selected audio fixture with provisional result");
+        assert_eq!(provisional_multi.len(), 1);
+        assert_eq!(provisional_selected.len(), 1);
+        assert_normalize_result_near(provisional_multi[0], provisional_selected[0]);
+        assert_normalize_result_near(full_multi, provisional_multi_final);
+        assert_normalize_result_near(provisional_multi_final, provisional_selected_final);
+
+        let pre_cancel = Arc::new(AtomicBool::new(true));
+        let mut pre_cancel_provisional = Vec::new();
+        let pre_cancel_result = scan_audio_loudness_with_provisional(
+            &multi,
+            -14000,
+            pre_cancel,
+            Arc::new(NormalizeScanProgress::default()),
+            0.5,
+            &mut |result| pre_cancel_provisional.push(result),
+        );
+        assert!(matches!(
+            pre_cancel_result,
+            Err(NormalizeScanError::Cancelled)
+        ));
+        assert!(pre_cancel_provisional.is_empty());
+
+        let callback_cancel = Arc::new(AtomicBool::new(false));
+        let callback_cancel_from_provisional = Arc::clone(&callback_cancel);
+        let mut callback_cancel_provisional = Vec::new();
+        let callback_cancel_result = scan_audio_loudness_with_provisional(
+            &multi,
+            -14000,
+            callback_cancel,
+            Arc::new(NormalizeScanProgress::default()),
+            0.5,
+            &mut |result| {
+                callback_cancel_provisional.push(result);
+                callback_cancel_from_provisional.store(true, Ordering::Release);
+            },
+        );
+        assert!(matches!(
+            callback_cancel_result,
+            Err(NormalizeScanError::Cancelled)
+        ));
+        assert_eq!(callback_cancel_provisional.len(), 1);
     }
 }

@@ -1645,8 +1645,8 @@ fn paint_native_video_touch_first_run_help(
 
     let label_y = layout.center_tap_rect.center().y;
     for (label_x, title, detail) in [
-        (layout.left_label_x, "左をタップ", "5 秒戻る"),
-        (layout.right_label_x, "右をタップ", "5 秒進む"),
+        (layout.left_label_x, "左をタップ", "中シークで戻る"),
+        (layout.right_label_x, "右をタップ", "中シークで進む"),
     ] {
         paint_native_video_touch_side_label(painter, egui::pos2(label_x, label_y), title, detail);
     }
@@ -2317,10 +2317,10 @@ pub(super) fn draw_native_top_button(
     tooltip: &str,
     command: NativeOverlayCommand,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> egui::Rect {
     draw_native_top_button_enabled(
         ui, painter, x, y, width, height, gap, id, glyph, active, true, tooltip, command, commands,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2339,7 +2339,7 @@ fn draw_native_top_button_enabled(
     tooltip: &str,
     command: NativeOverlayCommand,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> egui::Rect {
     let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
     let sense = if enabled {
         egui::Sense::click()
@@ -2384,6 +2384,7 @@ fn draw_native_top_button_enabled(
         commands.push(command);
     }
     *x -= width + gap;
+    resp.rect
 }
 
 fn draw_overlay_video_zoom_icon(painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
@@ -2440,7 +2441,7 @@ pub(super) fn draw_native_bar_lock_button(
     tooltip: &'static str,
     bar: crate::video::NativeVideoBar,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> egui::Rect {
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), locked);
     crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
@@ -2456,6 +2457,7 @@ pub(super) fn draw_native_bar_lock_button(
     if resp.clicked() {
         commands.push(NativeOverlayCommand::ToggleBarLock { bar });
     }
+    resp.rect
 }
 
 pub(super) fn native_top_bar_lock_button_rect(overlay_width_points: f32) -> egui::Rect {
@@ -2468,24 +2470,45 @@ pub(super) fn native_top_bar_lock_button_rect(overlay_width_points: f32) -> egui
     )
 }
 
+#[allow(dead_code)] // Normal-size compatibility wrapper; fitted HUD callers use the `_in` form.
 pub(super) fn native_seek_bar_lock_button_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
     bottom_bar_height: f32,
 ) -> egui::Rect {
-    let button_size = 28.0;
-    let side_pad = 10.0;
     let seek_row_height =
         (bottom_bar_height - crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT).max(0.0);
     let controls_top = (overlay_height_points - bottom_bar_height + seek_row_height).max(0.0);
-    let y = controls_top
-        + (crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT - button_size) * 0.5;
+    native_seek_bar_lock_button_rect_in(
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, controls_top),
+            egui::pos2(
+                overlay_width_points,
+                (controls_top + crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT)
+                    .min(overlay_height_points),
+            ),
+        ),
+        28.0,
+    )
+}
+
+pub(super) fn native_seek_bar_lock_button_rect_in(
+    controls_rect: egui::Rect,
+    requested_button_size: f32,
+) -> egui::Rect {
+    let button_size = requested_button_size
+        .max(0.0)
+        .min(controls_rect.width().max(0.0))
+        .min(controls_rect.height().max(0.0));
+    let side_pad = 10.0_f32.min((controls_rect.width() - button_size).max(0.0));
+    let y = controls_rect.center().y - button_size * 0.5;
     egui::Rect::from_min_size(
-        egui::pos2(overlay_width_points - side_pad - button_size, y),
+        egui::pos2(controls_rect.max.x - side_pad - button_size, y),
         egui::vec2(button_size, button_size),
     )
 }
 
+#[allow(dead_code)] // Normal-size compatibility wrapper; fitted HUD callers use the `_in` form.
 pub(super) fn native_seek_strip_selector_button_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
@@ -2496,6 +2519,10 @@ pub(super) fn native_seek_strip_selector_button_rect(
         overlay_height_points,
         bottom_bar_height,
     );
+    native_seek_strip_selector_button_rect_in(lock)
+}
+
+pub(super) fn native_seek_strip_selector_button_rect_in(lock: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(lock.min.x - lock.width() - 8.0, lock.min.y),
         lock.size(),
@@ -4029,27 +4056,100 @@ pub(super) fn native_hud_dim_color() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 86)
 }
 
+const NATIVE_TOP_BAR_TEXT_LEFT: f32 = 14.0;
+const NATIVE_TOP_BAR_TEXT_RIGHT_GAP: f32 = 8.0;
+const NATIVE_TOP_BAR_RIGHT_PAD: f32 = 12.0;
+
+#[derive(Clone, Debug)]
+// The render routes return this witness so layout tests exercise their actual control responses.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct NativeTopBarLayout {
+    pub(super) controls_rect: Option<egui::Rect>,
+    pub(super) text_rect: egui::Rect,
+    pub(super) title_rect: Option<egui::Rect>,
+    pub(super) subtitle_rect: Option<egui::Rect>,
+    pub(super) title_galley: Option<std::sync::Arc<egui::Galley>>,
+    pub(super) subtitle_galley: Option<std::sync::Arc<egui::Galley>>,
+}
+
+fn include_native_top_bar_control(bounds: &mut Option<egui::Rect>, rect: egui::Rect) {
+    *bounds = Some(bounds.map_or(rect, |bounds| bounds.union(rect)));
+}
+
+fn native_top_bar_text_rect(
+    overlay_width_points: f32,
+    controls_rect: Option<egui::Rect>,
+) -> egui::Rect {
+    let right = controls_rect
+        .map(|rect| rect.min.x - NATIVE_TOP_BAR_TEXT_RIGHT_GAP)
+        .unwrap_or(overlay_width_points - NATIVE_TOP_BAR_RIGHT_PAD)
+        .max(NATIVE_TOP_BAR_TEXT_LEFT);
+    egui::Rect::from_min_max(
+        egui::pos2(NATIVE_TOP_BAR_TEXT_LEFT, 0.0),
+        egui::pos2(right, crate::video::native_presenter::HUD_TOP_HEIGHT),
+    )
+}
+
 pub(super) fn draw_top_bar_text_lines(
     painter: &egui::Painter,
+    overlay_width_points: f32,
+    controls_rect: Option<egui::Rect>,
     title_text: &str,
     sub_text: &str,
-    name_truncate: usize,
-    sub_truncate: usize,
-) {
-    painter.text(
-        egui::pos2(14.0, 20.0),
-        egui::Align2::LEFT_CENTER,
-        truncate_overlay_text(title_text, name_truncate),
+    title_soft_char_cap: usize,
+    subtitle_soft_char_cap: usize,
+) -> NativeTopBarLayout {
+    let text_rect = native_top_bar_text_rect(overlay_width_points, controls_rect);
+    let clipped = painter.with_clip_rect(text_rect);
+    let max_width = text_rect.width();
+    let title_color = egui::Color32::from_rgb(240, 240, 240);
+    let subtitle_color = egui::Color32::from_rgb(190, 190, 190);
+
+    let title = layout_truncated_to_width(
+        &clipped,
+        title_text,
         egui::FontId::proportional(15.0),
-        egui::Color32::from_rgb(240, 240, 240),
-    );
-    painter.text(
-        egui::pos2(14.0, 39.0),
-        egui::Align2::LEFT_CENTER,
-        truncate_overlay_text(sub_text, sub_truncate),
-        crate::ui_fonts::hud_text_font(12.0),
-        egui::Color32::from_rgb(190, 190, 190),
-    );
+        title_color,
+        max_width,
+        title_soft_char_cap,
+    )
+    .map(|galley| {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(text_rect.min.x, 20.0 - galley.size().y * 0.5),
+            galley.size(),
+        );
+        clipped.galley(rect.min, galley.clone(), title_color);
+        (rect, galley)
+    });
+    let subtitle = (!sub_text.is_empty())
+        .then(|| {
+            layout_truncated_to_width(
+                &clipped,
+                sub_text,
+                crate::ui_fonts::hud_text_font(12.0),
+                subtitle_color,
+                max_width,
+                subtitle_soft_char_cap,
+            )
+        })
+        .flatten()
+        .map(|galley| {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(text_rect.min.x, 39.0 - galley.size().y * 0.5),
+                galley.size(),
+            );
+            clipped.galley(rect.min, galley.clone(), subtitle_color);
+            (rect, galley)
+        });
+
+    NativeTopBarLayout {
+        controls_rect,
+        text_rect,
+        title_rect: title.as_ref().map(|(rect, _)| *rect),
+        subtitle_rect: subtitle.as_ref().map(|(rect, _)| *rect),
+        title_galley: title.map(|(_, galley)| galley),
+        subtitle_galley: subtitle.map(|(_, galley)| galley),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4191,13 +4291,13 @@ pub(super) fn draw_native_top_bar(
     top_bar_locked: bool,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> NativeTopBarLayout {
     *panorama_projection_popup_rect_out = None;
     if panorama_pose.is_none() || audio_only {
         *panorama_projection_popup_open = false;
     }
     let mut panorama_projection_button_rect = None;
-    egui::Area::new(egui::Id::new("native_video_top_bar"))
+    let layout = egui::Area::new(egui::Id::new("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -4250,15 +4350,14 @@ pub(super) fn draw_native_top_bar(
                     format_overlay_time(duration_secs)
                 )
             };
-            draw_top_bar_text_lines(&painter, name, &sub, 88, 120);
-
             let btn_size = 28.0;
             let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
             let shortcuts = metadata.map(|m| &m.shortcuts);
+            let mut controls_rect = None;
 
-            draw_native_top_button(
+            let close_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4273,8 +4372,9 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::CloseFullscreen,
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, close_rect);
             let lock_rect = native_top_bar_lock_button_rect(overlay_width_points);
-            draw_native_bar_lock_button(
+            let lock_rect = draw_native_bar_lock_button(
                 ui,
                 &painter,
                 lock_rect,
@@ -4288,8 +4388,9 @@ pub(super) fn draw_native_top_bar(
                 crate::video::NativeVideoBar::Top,
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, lock_rect);
             x -= btn_size + gap;
-            draw_native_top_button(
+            let window_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4307,6 +4408,7 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, window_rect);
             let panorama_detection = metadata.and_then(|metadata| metadata.panorama_detection);
             let panorama_enabled = matches!(panorama_detection, Some(Ok(_)));
             let panorama_active = panorama_enabled && panorama_pose.is_some();
@@ -4334,7 +4436,7 @@ pub(super) fn draw_native_top_bar(
                     shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
                 ),
             };
-            draw_native_top_button_enabled(
+            let panorama_rect = draw_native_top_button_enabled(
                 ui,
                 &painter,
                 &mut x,
@@ -4354,6 +4456,7 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::TogglePanorama,
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, panorama_rect);
             if let Some(pose) = panorama_pose.filter(|_| panorama_active) {
                 let panorama_controls_enabled = !audio_only;
                 let projection_tooltip = if panorama_controls_enabled {
@@ -4393,11 +4496,12 @@ pub(super) fn draw_native_top_bar(
                 );
                 let projection_resp = projection_resp.hover_tip_dark(&projection_tooltip);
                 panorama_projection_button_rect = Some(projection_resp.rect);
+                include_native_top_bar_control(&mut controls_rect, projection_resp.rect);
                 if panorama_controls_enabled && projection_resp.clicked() {
                     *panorama_projection_popup_open = !*panorama_projection_popup_open;
                 }
                 x -= btn_size + gap;
-                draw_native_top_button_enabled(
+                let reset_rect = draw_native_top_button_enabled(
                     ui,
                     &painter,
                     &mut x,
@@ -4417,9 +4521,10 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ResetPanorama,
                     commands,
                 );
+                include_native_top_bar_control(&mut controls_rect, reset_rect);
             }
             if let Some(scale) = video_zoom_scale.filter(|_| video_zoom_active) {
-                draw_native_top_button_enabled(
+                let reset_rect = draw_native_top_button_enabled(
                     ui,
                     &painter,
                     &mut x,
@@ -4435,6 +4540,7 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ResetVideoZoom,
                     commands,
                 );
+                include_native_top_bar_control(&mut controls_rect, reset_rect);
                 let scale_width = 48.0;
                 let scale_rect = egui::Rect::from_min_size(
                     egui::pos2(x + btn_size - scale_width, y),
@@ -4447,6 +4553,7 @@ pub(super) fn draw_native_top_bar(
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
+                include_native_top_bar_control(&mut controls_rect, scale_rect);
                 x -= scale_width + gap;
             }
             let side_panel_mode = side_panel_mode.normalized();
@@ -4456,7 +4563,7 @@ pub(super) fn draw_native_top_bar(
                 side_panel_mode.label(),
                 side_panel_mode.toggled().label()
             );
-            draw_native_top_button(
+            let side_panel_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4471,11 +4578,12 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleSidePanelMode,
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, side_panel_rect);
             // タイル一覧 / Perf グラフ / 音声モードは動画専用。音声のみ native シェルでは出さない
             // (music Inc 6 ②、音楽ビュー上バーと内容を揃える)。
             if !audio_only {
                 // 音声モード (Inc 7): 映像を切って音楽ビュー (DJ 波形 + spectrum) へ。音声は無中断。
-                draw_native_top_button(
+                let audio_mode_rect = draw_native_top_button(
                     ui,
                     &painter,
                     &mut x,
@@ -4493,7 +4601,8 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleAudioMode,
                     commands,
                 );
-                draw_native_top_button_enabled(
+                include_native_top_bar_control(&mut controls_rect, audio_mode_rect);
+                let tile_rect = draw_native_top_button_enabled(
                     ui,
                     &painter,
                     &mut x,
@@ -4517,7 +4626,8 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleTileMode,
                     commands,
                 );
-                draw_native_top_button(
+                include_native_top_bar_control(&mut controls_rect, tile_rect);
+                let perf_rect = draw_native_top_button(
                     ui,
                     &painter,
                     &mut x,
@@ -4535,9 +4645,10 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::TogglePerfOverlay,
                     commands,
                 );
+                include_native_top_bar_control(&mut controls_rect, perf_rect);
             }
             if vst3_available {
-                draw_native_top_button(
+                let vst3_rect = draw_native_top_button(
                     ui,
                     &painter,
                     &mut x,
@@ -4552,10 +4663,21 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
+                include_native_top_bar_control(&mut controls_rect, vst3_rect);
             }
+            let layout = draw_top_bar_text_lines(
+                &painter,
+                overlay_width_points,
+                controls_rect,
+                name,
+                &sub,
+                88,
+                120,
+            );
             if dimmed {
                 painter.rect_filled(rect, 0.0, native_hud_dim_color());
             }
+            layout
         });
 
     if let (Some(button_rect), Some(pose)) = (panorama_projection_button_rect, panorama_pose) {
@@ -4574,6 +4696,7 @@ pub(super) fn draw_native_top_bar(
     } else {
         *panorama_projection_popup_open = false;
     }
+    layout.inner
 }
 
 pub(super) fn draw_native_top_bar_tile(
@@ -4583,7 +4706,7 @@ pub(super) fn draw_native_top_bar_tile(
     tile_state: &NativeOverlayTileOverlay,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> NativeTopBarLayout {
     egui::Area::new(egui::Id::new("native_video_tile_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -4659,19 +4782,18 @@ pub(super) fn draw_native_top_bar_tile(
                 )
             };
 
-            draw_top_bar_text_lines(&painter, title_text, &sub_text, 70, 95);
-
             let btn_size = 28.0;
             let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
+            let mut controls_rect = None;
             let shortcuts = metadata.map(|m| &m.shortcuts);
             let return_shortcut = native_joined_shortcuts(&[
                 shortcuts.and_then(|s| s.tile_mode.as_deref()),
                 Some("Esc"),
             ]);
 
-            draw_native_top_button(
+            let close_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4686,7 +4808,8 @@ pub(super) fn draw_native_top_bar_tile(
                 NativeOverlayCommand::ToggleTileMode,
                 commands,
             );
-            draw_native_top_button(
+            include_native_top_bar_control(&mut controls_rect, close_rect);
+            let more_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4701,7 +4824,8 @@ pub(super) fn draw_native_top_bar_tile(
                 NativeOverlayCommand::TileColumnsDelta { delta: 1 },
                 commands,
             );
-            draw_native_top_button(
+            include_native_top_bar_control(&mut controls_rect, more_rect);
+            let less_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4716,10 +4840,22 @@ pub(super) fn draw_native_top_bar_tile(
                 NativeOverlayCommand::TileColumnsDelta { delta: -1 },
                 commands,
             );
+            include_native_top_bar_control(&mut controls_rect, less_rect);
+            let layout = draw_top_bar_text_lines(
+                &painter,
+                overlay_width_points,
+                controls_rect,
+                title_text,
+                &sub_text,
+                70,
+                95,
+            );
             if dimmed {
                 painter.rect_filled(rect, 0.0, native_hud_dim_color());
             }
-        });
+            layout
+        })
+        .inner
 }
 
 /// 切替中のプレビュー画像を置く矩形。**映像が出る場所と同じ**でなければならない。
@@ -4749,7 +4885,7 @@ pub(super) fn draw_native_navigation_preview(
     preview: &NativeOverlayNavigationPreview,
     preview_texture_id: Option<egui::TextureId>,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> NativeTopBarLayout {
     egui::Area::new(egui::Id::new("native_video_navigation_preview"))
         .order(egui::Order::Background)
         .fixed_pos(egui::Pos2::ZERO)
@@ -4805,13 +4941,11 @@ pub(super) fn draw_native_navigation_preview(
             } else {
                 preview.file_name.as_str()
             };
-            draw_top_bar_text_lines(&painter, title, &preview.subtitle, 88, 120);
-
             let btn_size = 28.0;
             let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
-            draw_native_top_button(
+            let close_rect = draw_native_top_button(
                 ui,
                 &painter,
                 &mut x,
@@ -4826,7 +4960,17 @@ pub(super) fn draw_native_navigation_preview(
                 NativeOverlayCommand::CloseFullscreen,
                 commands,
             );
-        });
+            draw_top_bar_text_lines(
+                &painter,
+                overlay_width_points,
+                Some(close_rect),
+                title,
+                &preview.subtitle,
+                88,
+                120,
+            )
+        })
+        .inner
 }
 
 /// Returns the actual drawn rect (after user drag). `compute_hud_regions` uses this to
@@ -7315,11 +7459,8 @@ pub(super) fn layout_wrapped_with_max_lines(
     }
 }
 
-/// 単一行で max_width を超えたら末尾 `…` で省略する従来 helper。
-/// `layout_wrapped_with_max_lines` の導入後、jump panel のタイトルは multi-line
-/// 経路に移行したため、現在は呼び出し元なしだが、将来 1 行 truncate が必要な場面
-/// (HUD 上部のファイル名等) で再利用できるよう残す。
-#[allow(dead_code)]
+/// 単一行で max_width を超えたら末尾 `…` で省略する helper。
+/// HUD 上部のファイル名 / メタ情報行と、幅が限られた単一行ラベルで使う。
 pub(super) fn layout_truncated_to_width(
     painter: &egui::Painter,
     text: &str,
@@ -7373,6 +7514,456 @@ pub(super) fn layout_truncated_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_normal_top_bar_layout(
+        width_points: f32,
+        pixels_per_point: f32,
+        title: &str,
+        audio_only: bool,
+        vst3_available: bool,
+        top_bar_locked: bool,
+        dimmed: bool,
+        pointer: Option<egui::Pos2>,
+    ) -> NativeTopBarLayout {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width_points, 80.0),
+            )),
+            events: pointer
+                .map(|pos| vec![egui::Event::PointerMoved(pos)])
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        if let Some(viewport) = input.viewports.get_mut(&egui::ViewportId::ROOT) {
+            viewport.native_pixels_per_point = Some(pixels_per_point);
+        }
+        let mut layout = None;
+        let mut projection_popup_open = false;
+        let mut projection_popup_rect = None;
+        let mut commands = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            layout = Some(draw_native_top_bar(
+                ctx,
+                width_points,
+                80.0,
+                0.0,
+                100.0,
+                None,
+                None,
+                None,
+                &mut projection_popup_open,
+                &mut projection_popup_rect,
+                title,
+                false,
+                vst3_available,
+                false,
+                audio_only,
+                crate::settings::FsSidePanelMode::Hover,
+                top_bar_locked,
+                dimmed,
+                &mut commands,
+            ));
+        });
+        layout.expect("the native top bar must publish its drawn layout")
+    }
+
+    fn test_overlay_metadata(
+        title: String,
+        panorama_detection: Result<
+            crate::video::spherical_metadata::VideoPanoramaTrigger,
+            crate::video::spherical_metadata::VideoPanoramaRejection,
+        >,
+    ) -> NativeOverlayMetadata {
+        NativeOverlayMetadata {
+            item_key: "test-video".to_owned(),
+            file_name: "test-video.mp4".to_owned(),
+            title: Some(title),
+            artist: None,
+            original_url: None,
+            description: None,
+            probe_info_available: true,
+            rating: 0,
+            current_tags: Vec::new(),
+            shortcut_tags: Arc::<[NativeOverlayTagDef]>::from([]),
+            tag_choices: Arc::<[NativeOverlayTagDef]>::from([]),
+            width: 1920,
+            height: 1080,
+            duration_secs: 100.0,
+            video_codec: "h264".to_owned(),
+            video_decoder: "test".to_owned(),
+            audio_codec: Some("aac".to_owned()),
+            audio_bit_rate_bps: 192_000,
+            avg_fps: 23.976,
+            bit_rate_bps: 4_000_000,
+            chapter_count: 0,
+            hw_decode_active: true,
+            gpu_path_active: true,
+            d3d11va_supported: true,
+            deinterlace_mode: crate::settings::VideoDeinterlaceMode::Auto,
+            last_present_path: crate::video::decoder::PresentPathSnapshot::Gpu,
+            deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Inactive,
+            interlace_detected: false,
+            touch_video_chrome_learned: true,
+            panorama_detection: Some(panorama_detection),
+            shortcuts: NativeOverlayShortcutLabels::default(),
+            shortcut_help: Arc::new(NativeOverlayShortcutHelp::default()),
+        }
+    }
+
+    fn test_conditional_top_bar_layout(
+        metadata: &NativeOverlayMetadata,
+        panorama_pose: Option<crate::panorama::PanoPose>,
+        video_zoom_scale: Option<f32>,
+    ) -> NativeTopBarLayout {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let mut layout = None;
+        let mut projection_popup_open = false;
+        let mut projection_popup_rect = None;
+        let mut commands = Vec::new();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_200.0, 80.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                layout = Some(draw_native_top_bar(
+                    ctx,
+                    1_200.0,
+                    80.0,
+                    0.0,
+                    metadata.duration_secs,
+                    Some(metadata),
+                    panorama_pose,
+                    video_zoom_scale,
+                    &mut projection_popup_open,
+                    &mut projection_popup_rect,
+                    &metadata.file_name,
+                    false,
+                    true,
+                    false,
+                    false,
+                    crate::settings::FsSidePanelMode::Hover,
+                    false,
+                    false,
+                    &mut commands,
+                ));
+            },
+        );
+        layout.expect("conditional native top bar must publish its drawn layout")
+    }
+
+    fn assert_top_bar_text_clears_controls(layout: &NativeTopBarLayout) {
+        let controls = layout
+            .controls_rect
+            .expect("every native top bar route has at least one control");
+        assert!(
+            layout.text_rect.max.x <= controls.min.x - NATIVE_TOP_BAR_TEXT_RIGHT_GAP + 0.01,
+            "text reservation {:?} overlaps controls {:?}",
+            layout.text_rect,
+            controls
+        );
+        for text in [layout.title_rect, layout.subtitle_rect]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                text.max.x <= layout.text_rect.max.x + 0.01,
+                "drawn text {:?} escapes reservation {:?}",
+                text,
+                layout.text_rect
+            );
+        }
+    }
+
+    #[test]
+    fn native_top_bar_long_title_is_ellipsized_before_actual_video_controls() {
+        // 88 文字未満でも CJK の実幅ではボタン列へ届く、報告と同型の入力。
+        let title = "【配信クリップ】魔法の姉妹ルルットリリィ・ライブシーン".repeat(3);
+        assert!(title.chars().count() < 88);
+        let layout =
+            test_normal_top_bar_layout(1_444.0, 1.0, &title, false, true, false, false, None);
+
+        assert_top_bar_text_clears_controls(&layout);
+        let drawn = layout.title_galley.as_ref().expect("title remains visible");
+        assert_ne!(drawn.text(), title);
+        assert!(drawn.text().ends_with('…'));
+    }
+
+    #[test]
+    fn native_top_bar_short_text_keeps_content_and_alignment() {
+        let layout = test_normal_top_bar_layout(
+            1_444.0,
+            1.0,
+            "short-video.mp4",
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
+
+        assert_top_bar_text_clears_controls(&layout);
+        assert_eq!(
+            layout.title_galley.as_ref().unwrap().text(),
+            "short-video.mp4"
+        );
+        assert_eq!(
+            layout.subtitle_galley.as_ref().unwrap().text(),
+            format!(
+                "{} / {}",
+                format_overlay_time(0.0),
+                format_overlay_time(100.0)
+            )
+        );
+        assert_eq!(layout.title_rect.unwrap().min.x, NATIVE_TOP_BAR_TEXT_LEFT);
+        assert!((layout.title_rect.unwrap().center().y - 20.0).abs() < 0.01);
+        assert!((layout.subtitle_rect.unwrap().center().y - 39.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn native_top_bar_narrow_width_drops_only_text_and_preserves_control_response_extent() {
+        let wide = test_normal_top_bar_layout(
+            1_444.0,
+            1.0,
+            "short-video.mp4",
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
+        let narrow = test_normal_top_bar_layout(
+            300.0,
+            1.0,
+            "short-video.mp4",
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(narrow.text_rect.width(), 0.0);
+        assert!(narrow.title_rect.is_none());
+        assert!(narrow.subtitle_rect.is_none());
+        assert_eq!(
+            narrow.controls_rect.unwrap().size(),
+            wide.controls_rect.unwrap().size(),
+            "title starvation must not hide or shrink any response rect"
+        );
+        assert_eq!(narrow.controls_rect.unwrap().max.x, 300.0 - 12.0);
+    }
+
+    #[test]
+    fn native_top_bar_text_and_controls_remain_separate_across_dpi_scales() {
+        let physical_width = 1_440.0;
+        for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+            let width_points = physical_width / pixels_per_point;
+            let layout = test_normal_top_bar_layout(
+                width_points,
+                pixels_per_point,
+                &"長い動画ファイル名".repeat(12),
+                false,
+                true,
+                false,
+                false,
+                None,
+            );
+            assert_top_bar_text_clears_controls(&layout);
+            let text_right_px = layout.text_rect.max.x * pixels_per_point;
+            let controls_left_px = layout.controls_rect.unwrap().min.x * pixels_per_point;
+            assert!(
+                text_right_px
+                    <= controls_left_px - NATIVE_TOP_BAR_TEXT_RIGHT_GAP * pixels_per_point + 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn native_top_bar_locked_dimmed_and_hovered_keep_the_same_layout() {
+        let baseline =
+            test_normal_top_bar_layout(1_200.0, 1.0, "video.mp4", false, true, false, false, None);
+        let hovered_locked = test_normal_top_bar_layout(
+            1_200.0,
+            1.0,
+            "video.mp4",
+            false,
+            true,
+            true,
+            false,
+            Some(egui::pos2(1_174.0, 27.0)),
+        );
+        let dimmed =
+            test_normal_top_bar_layout(1_200.0, 1.0, "video.mp4", false, true, false, true, None);
+
+        for layout in [&hovered_locked, &dimmed] {
+            assert_eq!(layout.controls_rect, baseline.controls_rect);
+            assert_eq!(layout.text_rect, baseline.text_rect);
+            assert_eq!(layout.title_rect, baseline.title_rect);
+            assert_eq!(layout.subtitle_rect, baseline.subtitle_rect);
+        }
+    }
+
+    #[test]
+    fn native_top_bar_active_panorama_and_video_zoom_reserve_every_conditional_control() {
+        let long_title = "条件付きコントロールでも重ならない長い動画タイトル".repeat(8);
+        let panorama_metadata = test_overlay_metadata(
+            long_title.clone(),
+            Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto),
+        );
+        let panorama = test_conditional_top_bar_layout(
+            &panorama_metadata,
+            Some(crate::panorama::PanoPose::new(
+                0.0,
+                0.0,
+                crate::panorama::FOV_DEFAULT,
+                crate::panorama::PanoProjection::Perspective,
+            )),
+            None,
+        );
+        let zoom_metadata = test_overlay_metadata(
+            long_title,
+            Err(crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic),
+        );
+        let zoom = test_conditional_top_bar_layout(&zoom_metadata, None, Some(1.5));
+
+        for layout in [&panorama, &zoom] {
+            assert_top_bar_text_clears_controls(layout);
+            assert!(layout.title_galley.as_ref().unwrap().text().ends_with('…'));
+        }
+        // Baseline video row is 316pt wide. Panorama adds projection + reset (72pt),
+        // while zoom adds reset (36pt) + its 48pt readout and two 8pt gaps (92pt).
+        assert_eq!(panorama.controls_rect.unwrap().width(), 388.0);
+        assert_eq!(zoom.controls_rect.unwrap().width(), 408.0);
+    }
+
+    #[test]
+    fn native_top_bar_audio_tile_and_navigation_use_their_actual_control_extents() {
+        let long_title = "長い動画ファイル名とタイトル".repeat(12);
+        let audio =
+            test_normal_top_bar_layout(900.0, 1.0, &long_title, true, true, false, false, None);
+
+        let tile_ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&tile_ctx);
+        let mut tile_layout = None;
+        let mut tile_commands = Vec::new();
+        let tile_state = NativeOverlayTileOverlay::preparing_with_filename(long_title.clone());
+        let _ = tile_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 80.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                tile_layout = Some(draw_native_top_bar_tile(
+                    ctx,
+                    900.0,
+                    None,
+                    &tile_state,
+                    false,
+                    &mut tile_commands,
+                ));
+            },
+        );
+        let tile = tile_layout.unwrap();
+
+        let preview_ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&preview_ctx);
+        let mut preview_layout = None;
+        let mut preview_commands = Vec::new();
+        let preview = NativeOverlayNavigationPreview {
+            file_name: long_title,
+            subtitle: "次の動画を準備中".to_owned(),
+            thumbnail: None,
+        };
+        let _ = preview_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 80.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                preview_layout = Some(draw_native_navigation_preview(
+                    ctx,
+                    900.0,
+                    80.0,
+                    egui::Rect::from_min_size(
+                        egui::pos2(0.0, crate::video::native_presenter::HUD_TOP_HEIGHT),
+                        egui::vec2(900.0, 80.0 - crate::video::native_presenter::HUD_TOP_HEIGHT),
+                    ),
+                    &preview,
+                    None,
+                    &mut preview_commands,
+                ));
+            },
+        );
+        let preview = preview_layout.unwrap();
+
+        for layout in [&audio, &tile, &preview] {
+            assert_top_bar_text_clears_controls(layout);
+            assert!(layout.title_galley.as_ref().unwrap().text().ends_with('…'));
+        }
+        assert_eq!(audio.controls_rect.unwrap().width(), 208.0);
+        assert_eq!(tile.controls_rect.unwrap().width(), 100.0);
+        assert_eq!(preview.controls_rect.unwrap().width(), 28.0);
+    }
+
+    #[test]
+    fn native_top_bar_long_title_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let title = "【配信クリップ】魔法の姉妹ルルットリリィ・ライブシーン".repeat(3);
+        let mut projection_popup_open = false;
+        let mut projection_popup_rect = None;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(720.0, 64.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |_| {});
+                let mut commands = Vec::new();
+                let _ = draw_native_top_bar(
+                    ctx,
+                    720.0,
+                    64.0,
+                    71.0,
+                    100.0,
+                    None,
+                    None,
+                    None,
+                    &mut projection_popup_open,
+                    &mut projection_popup_rect,
+                    &title,
+                    false,
+                    true,
+                    false,
+                    false,
+                    crate::settings::FsSidePanelMode::Hover,
+                    false,
+                    false,
+                    &mut commands,
+                );
+            });
+        harness.run();
+        harness.snapshot("native_video_top_bar_long_title");
+    }
 
     #[test]
     fn native_bar_lock_button_click_emits_the_selected_toggle_command() {
@@ -7775,17 +8366,20 @@ mod tests {
 
         let overlay_w = 1920.0_f32;
         let overlay_h = 1080.0_f32;
-        let (top, bottom) = video_bar_reserved_points(VideoVisualLayout {
-            compact: false,
-            pixels_per_point: 1.0,
-            top_bar_locked: true,
-            bottom_lock: BottomBarLock::BarAndStrip,
-            bottom_bar_height: HUD_BOTTOM_HEIGHT,
-            seek_strip_visible_points: crate::video::seek_strip_layout::SeekStripHeight::Large
-                .points(),
-            fixed_bar_gap_px: 0,
-            info_panel_reserved: false,
-        });
+        let (top, bottom) = video_bar_reserved_points(
+            VideoVisualLayout {
+                compact: false,
+                pixels_per_point: 1.0,
+                top_bar_locked: true,
+                bottom_lock: BottomBarLock::BarAndStrip,
+                bottom_bar_height: HUD_BOTTOM_HEIGHT,
+                seek_strip_visible_points: crate::video::seek_strip_layout::SeekStripHeight::Large
+                    .points(),
+                fixed_bar_gap_px: 0,
+                info_panel_reserved: false,
+            },
+            overlay_h,
+        );
         assert!(top > 0.0 && bottom > 0.0, "この設定では上下とも確保される");
 
         let content_rect = egui::Rect::from_min_max(

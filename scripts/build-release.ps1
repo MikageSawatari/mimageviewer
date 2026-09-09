@@ -12,11 +12,14 @@
 # Usage:
 #   PS> scripts\build-release.ps1
 #   PS> scripts\build-release.ps1 --features foo
+#   PS> scripts\build-release.ps1 -PreserveRuntime
 
 [CmdletBinding()]
 param(
     [switch] $SkipVst3Bridge,
     [switch] $Sign,
+    # Never stop mImageViewer processes or modify its APPDATA cache.
+    [switch] $PreserveRuntime,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CargoArgs
 )
@@ -96,6 +99,32 @@ function Invoke-ReleaseCargo {
 }
 
 $repoRoot = (Get-Location).Path
+$expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ($PreserveRuntime) {
+    if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-release] -PreserveRuntime must be run from the repository root: $expectedRepoRoot"
+    }
+    $expectedTarget = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target'))
+    $configuredTarget = if ($env:CARGO_TARGET_DIR) {
+        $targetCandidate = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+            $env:CARGO_TARGET_DIR
+        } else {
+            Join-Path $repoRoot $env:CARGO_TARGET_DIR
+        }
+        [System.IO.Path]::GetFullPath($targetCandidate)
+    } else {
+        $expectedTarget
+    }
+    if (-not $configuredTarget.Equals($expectedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-release] -PreserveRuntime refuses a Cargo target outside the repository target directory: $configuredTarget"
+    }
+    if (Test-Path -LiteralPath $expectedTarget) {
+        $targetItem = Get-Item -LiteralPath $expectedTarget -Force
+        if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "[build-release] -PreserveRuntime refuses a reparse-point Cargo target: $($targetItem.FullName)"
+        }
+    }
+}
 # Append a trailing separator for path-boundary scoping. Without this, sibling
 # directories like `C:\home\mimageviewer-old` would also match (StartsWith on
 # `C:\home\mimageviewer` is too permissive).
@@ -185,7 +214,10 @@ foreach ($p in $candidates) {
     }
 }
 
-if ($toKill.Count -eq 0) {
+if ($PreserveRuntime -and $candidates.Count -gt 0) {
+    $list = ($candidates | ForEach-Object { "{0}({1})" -f $_.Name, $_.Id }) -join ', '
+    throw ("[build-release] mImageViewer is running: {0}. -PreserveRuntime refuses to stop it; close it and retry." -f $list)
+} elseif ($toKill.Count -eq 0) {
     Write-Host "[build-release] no running mimageviewer process found"
 } else {
     $failedPids = @()
@@ -369,13 +401,17 @@ if ($Sign) {
 
 $extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 $extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'
-foreach ($path in @($extractedBridge, $extractedBridgeHash)) {
-    if (Test-Path $path) {
-        try {
-            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-            Write-Host ("[build-release] removed stale extracted VST3 bridge cache: {0}" -f $path)
-        } catch {
-            Write-Warning ("[build-release] failed to remove {0}: {1}" -f $path, $_)
+if ($PreserveRuntime) {
+    Write-Host '[build-release] preserving extracted VST3 bridge cache (-PreserveRuntime)'
+} else {
+    foreach ($path in @($extractedBridge, $extractedBridgeHash)) {
+        if (Test-Path $path) {
+            try {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                Write-Host ("[build-release] removed stale extracted VST3 bridge cache: {0}" -f $path)
+            } catch {
+                Write-Warning ("[build-release] failed to remove {0}: {1}" -f $path, $_)
+            }
         }
     }
 }

@@ -691,7 +691,7 @@ fn run_bench(
             let idx = msg.idx;
             requested.remove(&idx);
             completed.insert(idx);
-            if msg.from_cache {
+            if msg.origin.from_cache() {
                 cache_hits += 1;
             } else {
                 cache_misses += 1;

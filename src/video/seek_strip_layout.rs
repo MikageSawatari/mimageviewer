@@ -40,14 +40,15 @@ impl SeekStripSpan {
 
 /// ストリップの高さプリセット。
 ///
-/// egui の UI は DPI に応じた論理座標なので、設定名には px 数を出さず「大 / 中 / 小 / 最小」で
-/// 選ばせる。`Large` は従来の固定値そのままで、既存の見た目を変えない。
+/// egui の UI は DPI に応じた論理座標なので、設定名には px 数を出さず段階名で選ばせる。
+/// `Large` 以下は従来の固定値そのままで、既存の見た目を変えない。
 ///
 /// `Smallest` は実機確認で足した段 (2026-09-01)。全体表示の枚数はセルの高さで決まるので、
 /// 「小」でも思ったほど並ばない、という利用者の報告への答えがこれ。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SeekStripHeight {
+    Maximum,
     #[default]
     Large,
     Medium,
@@ -55,12 +56,13 @@ pub enum SeekStripHeight {
     Smallest,
 }
 
-/// 帯の高さ (points)。`Large` は 2 段化リデザイン以来の値。
-const SEEK_STRIP_HEIGHT_LARGE: f32 = 104.0;
-const SEEK_STRIP_HEIGHT_MEDIUM: f32 = 72.0;
-const SEEK_STRIP_HEIGHT_SMALL: f32 = 48.0;
-/// 鍵ボタン (28pt + 上の余白 4pt) が収まる下限に近い。これ以上詰めるとボタンが帯からはみ出す。
-const SEEK_STRIP_HEIGHT_SMALLEST: f32 = 36.0;
+pub const VIDEO_SEEK_STRIP_HEIGHT_MIN_POINTS: u32 = 36;
+pub const VIDEO_SEEK_STRIP_HEIGHT_MAX_POINTS: u32 = 320;
+pub const VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS: u32 = 36;
+pub const VIDEO_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS: u32 = 48;
+pub const VIDEO_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS: u32 = 72;
+pub const VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS: u32 = 104;
+pub const VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS: u32 = 144;
 
 /// 周辺表示のセル幅 (points)。
 ///
@@ -70,6 +72,68 @@ const SEEK_STRIP_CELL_WIDTH_LARGE: f32 = 152.0;
 const SEEK_STRIP_CELL_WIDTH_MEDIUM: f32 = 102.0;
 const SEEK_STRIP_CELL_WIDTH_SMALL: f32 = 64.0;
 const SEEK_STRIP_CELL_WIDTH_SMALLEST: f32 = 45.0;
+
+/// 動画・音声シークストリップのプリセット別高さ (100% 表示時の logical point)。
+///
+/// 保存値は利用者が入力したまま保持し、実レイアウトへ解決するときだけ 36..=320 へ
+/// 制限する。将来の版が書いた値を旧版が読み書きしても、勝手に丸めて失わないため。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekStripHeightValues {
+    #[serde(default = "default_video_seek_strip_height_smallest_points")]
+    pub smallest: u32,
+    #[serde(default = "default_video_seek_strip_height_small_points")]
+    pub small: u32,
+    #[serde(default = "default_video_seek_strip_height_medium_points")]
+    pub medium: u32,
+    #[serde(default = "default_video_seek_strip_height_large_points")]
+    pub large: u32,
+    #[serde(default = "default_video_seek_strip_height_maximum_points")]
+    pub maximum: u32,
+}
+
+const fn default_video_seek_strip_height_smallest_points() -> u32 {
+    VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS
+}
+const fn default_video_seek_strip_height_small_points() -> u32 {
+    VIDEO_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS
+}
+const fn default_video_seek_strip_height_medium_points() -> u32 {
+    VIDEO_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS
+}
+const fn default_video_seek_strip_height_large_points() -> u32 {
+    VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS
+}
+const fn default_video_seek_strip_height_maximum_points() -> u32 {
+    VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS
+}
+
+impl Default for SeekStripHeightValues {
+    fn default() -> Self {
+        Self {
+            smallest: VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS,
+            small: VIDEO_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS,
+            medium: VIDEO_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS,
+            large: VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS,
+            maximum: VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS,
+        }
+    }
+}
+
+impl SeekStripHeightValues {
+    pub fn points(self, preset: SeekStripHeight) -> f32 {
+        let stored = match preset {
+            SeekStripHeight::Maximum => self.maximum,
+            SeekStripHeight::Large => self.large,
+            SeekStripHeight::Medium => self.medium,
+            SeekStripHeight::Small => self.small,
+            SeekStripHeight::Smallest => self.smallest,
+        };
+        stored.clamp(
+            VIDEO_SEEK_STRIP_HEIGHT_MIN_POINTS,
+            VIDEO_SEEK_STRIP_HEIGHT_MAX_POINTS,
+        ) as f32
+    }
+}
 
 /// 帯の高さとセルの高さの差 (上下の余白の合計)。
 pub(crate) const SEEK_STRIP_CELL_VERTICAL_INSET: f32 = 10.0;
@@ -81,12 +145,17 @@ const SEEK_STRIP_LOCK_TOP_INSET: f32 = 4.0;
 
 /// ストリップ右上の鍵ボタン位置。動画と静止画で描画・当たり判定を同じ座標へ揃える。
 pub(crate) fn seek_strip_lock_button_rect(strip_rect: egui::Rect) -> egui::Rect {
+    let size = SEEK_STRIP_LOCK_BUTTON_SIZE
+        .min(strip_rect.width().max(0.0))
+        .min(strip_rect.height().max(0.0));
+    let right_inset = SEEK_STRIP_LOCK_RIGHT_INSET.min((strip_rect.width() - size).max(0.0));
+    let top_inset = SEEK_STRIP_LOCK_TOP_INSET.min((strip_rect.height() - size).max(0.0));
     egui::Rect::from_min_size(
         egui::pos2(
-            strip_rect.max.x - SEEK_STRIP_LOCK_RIGHT_INSET - SEEK_STRIP_LOCK_BUTTON_SIZE,
-            strip_rect.min.y + SEEK_STRIP_LOCK_TOP_INSET,
+            strip_rect.max.x - right_inset - size,
+            strip_rect.min.y + top_inset,
         ),
-        egui::vec2(SEEK_STRIP_LOCK_BUTTON_SIZE, SEEK_STRIP_LOCK_BUTTON_SIZE),
+        egui::vec2(size, size),
     )
 }
 
@@ -98,15 +167,17 @@ const SEEK_STRIP_WHOLE_CELL_GAP: f32 = 1.0;
 impl SeekStripHeight {
     pub const fn points(self) -> f32 {
         match self {
-            Self::Large => SEEK_STRIP_HEIGHT_LARGE,
-            Self::Medium => SEEK_STRIP_HEIGHT_MEDIUM,
-            Self::Small => SEEK_STRIP_HEIGHT_SMALL,
-            Self::Smallest => SEEK_STRIP_HEIGHT_SMALLEST,
+            Self::Maximum => VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS as f32,
+            Self::Large => VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS as f32,
+            Self::Medium => VIDEO_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS as f32,
+            Self::Small => VIDEO_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS as f32,
+            Self::Smallest => VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS as f32,
         }
     }
 
-    pub const fn window_cell_width_points(self) -> f32 {
+    pub fn window_cell_width_points(self) -> f32 {
         match self {
+            Self::Maximum => window_cell_width_points(self.points()),
             Self::Large => SEEK_STRIP_CELL_WIDTH_LARGE,
             Self::Medium => SEEK_STRIP_CELL_WIDTH_MEDIUM,
             Self::Small => SEEK_STRIP_CELL_WIDTH_SMALL,
@@ -116,6 +187,7 @@ impl SeekStripHeight {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Maximum => "最大",
             Self::Large => "大",
             Self::Medium => "中",
             Self::Small => "小",
@@ -123,7 +195,19 @@ impl SeekStripHeight {
         }
     }
 
-    pub const ALL: [Self; 4] = [Self::Large, Self::Medium, Self::Small, Self::Smallest];
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+}
+
+/// 周辺表示のセル幅。出荷済み 4 段の 152/102/64/45 を保つ同じ内寸比で求める。
+fn window_cell_width_points(strip_height: f32) -> f32 {
+    let inner_height = (strip_height - SEEK_STRIP_CELL_VERTICAL_INSET).max(0.0);
+    (inner_height * 148.0 / 94.0).round() + SEEK_STRIP_WINDOW_CELL_GAP
 }
 
 /// 表示内容と表示範囲の組。非表示は [`SeekStripView`] 側が持つ。
@@ -350,33 +434,32 @@ pub(crate) struct SeekStripLayout {
 impl SeekStripLayout {
     /// 帯の矩形と寸法を解決する。
     ///
-    /// `overlay_size` と `bottom_bar_height` は points。`aspect` は表示上の動画の縦横比で、
-    /// 分かっていない間は 16:9 を使う (セル数が 1 度決まればあとは実測値で作り直す)。
+    /// `rect` は HUD 全体の geometry が overlay 内へ収めた実効矩形。`aspect` は表示上の
+    /// 動画の縦横比で、分かっていない間は 16:9 を使う。
     pub(crate) fn resolve(
-        overlay_size: egui::Vec2,
-        bottom_bar_height: f32,
+        rect: egui::Rect,
         height: SeekStripHeight,
+        height_values: SeekStripHeightValues,
         span: SeekStripSpan,
         aspect: Option<f32>,
     ) -> Self {
-        let overlay_w = overlay_size.x.max(0.0);
-        let overlay_h = overlay_size.y.max(0.0);
-        let strip_height = height.points().min(overlay_h);
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(
-                0.0,
-                (overlay_h - bottom_bar_height - height.points()).max(0.0),
-            ),
-            egui::vec2(overlay_w, strip_height),
-        );
-        let cell_height = (strip_height - SEEK_STRIP_CELL_VERTICAL_INSET).max(1.0);
+        let strip_height = rect.height().max(0.0);
+        let vertical_inset = SEEK_STRIP_CELL_VERTICAL_INSET.min((strip_height - 1.0).max(0.0));
+        let cell_height = (strip_height - vertical_inset).max(0.0);
         match span {
             SeekStripSpan::Window => Self {
                 rect,
                 span,
-                cell_width: height.window_cell_width_points(),
+                cell_width: window_cell_width_points(
+                    strip_height.min(height_values.points(height)),
+                )
+                .max(1.0),
                 cell_height,
-                cell_gap: SEEK_STRIP_WINDOW_CELL_GAP,
+                cell_gap: SEEK_STRIP_WINDOW_CELL_GAP.min(
+                    (window_cell_width_points(strip_height.min(height_values.points(height)))
+                        - 1.0)
+                        .max(0.0),
+                ),
                 whole_cell_count: None,
             },
             SeekStripSpan::Whole => {
@@ -386,7 +469,8 @@ impl SeekStripLayout {
                     span,
                     cell_width: rect.width() / count as f32,
                     cell_height,
-                    cell_gap: SEEK_STRIP_WHOLE_CELL_GAP,
+                    cell_gap: SEEK_STRIP_WHOLE_CELL_GAP
+                        .min((rect.width() / count as f32 - f32::EPSILON).max(0.0)),
                     whole_cell_count: Some(count),
                 }
             }
@@ -446,13 +530,20 @@ mod tests {
 
     const HUD_BOTTOM: f32 = 64.0;
 
+    fn strip_rect(height: f32) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(0.0, 1080.0 - HUD_BOTTOM - height),
+            egui::vec2(1920.0, height),
+        )
+    }
+
     #[test]
     fn every_height_preset_keeps_the_band_above_the_bottom_bar() {
         for height in SeekStripHeight::ALL {
             let layout = SeekStripLayout::resolve(
-                egui::vec2(1920.0, 1080.0),
-                HUD_BOTTOM,
+                strip_rect(height.points()),
                 height,
+                SeekStripHeightValues::default(),
                 SeekStripSpan::Window,
                 None,
             );
@@ -469,9 +560,9 @@ mod tests {
     #[test]
     fn the_large_preset_reproduces_the_shipped_geometry() {
         let layout = SeekStripLayout::resolve(
-            egui::vec2(1280.0, 720.0),
-            HUD_BOTTOM,
+            egui::Rect::from_min_size(egui::pos2(0.0, 552.0), egui::vec2(1280.0, 104.0)),
             SeekStripHeight::Large,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Window,
             None,
         );
@@ -484,9 +575,9 @@ mod tests {
     #[test]
     fn whole_cells_fill_the_band_without_a_leftover_gap() {
         let layout = SeekStripLayout::resolve(
-            egui::vec2(1920.0, 1080.0),
-            HUD_BOTTOM,
+            strip_rect(SeekStripHeight::Small.points()),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         );
@@ -504,11 +595,11 @@ mod tests {
     /// この順序が崩れると「もっと並べたいから小さくする」が成り立たなくなる。
     #[test]
     fn each_step_down_is_shorter_and_fits_more_whole_cells() {
-        let cells = |height| {
+        let cells = |height: SeekStripHeight| {
             SeekStripLayout::resolve(
-                egui::vec2(1920.0, 1080.0),
-                HUD_BOTTOM,
+                strip_rect(height.points()),
                 height,
+                SeekStripHeightValues::default(),
                 SeekStripSpan::Whole,
                 Some(16.0 / 9.0),
             )
@@ -536,16 +627,16 @@ mod tests {
     #[test]
     fn taller_whole_cells_are_wider_and_therefore_fewer() {
         let small = SeekStripLayout::resolve(
-            egui::vec2(1920.0, 1080.0),
-            HUD_BOTTOM,
+            strip_rect(SeekStripHeight::Small.points()),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         );
         let large = SeekStripLayout::resolve(
-            egui::vec2(1920.0, 1080.0),
-            HUD_BOTTOM,
+            strip_rect(SeekStripHeight::Large.points()),
             SeekStripHeight::Large,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         );

@@ -83,6 +83,17 @@ perf log の `session.start.pid` と一致するプロセスを選ぶ。背面�
 4. サムネイルが多いフォルダを開き、読込完了前に閉じてトレイへ格納したまま静止
    (`tray-residency`)
 
+通常画像の前面・背面測定には、884×444のような横長画像と、要求長辺374px付近の条件を
+含める（§1.198）。既存の整数比率選択では374px要求が247×124になり、400px要求なら
+400×201になるため、400pxのケースだけでは同一要求の反復を検出できない。
+比率「自動(3:4)」・7列は発見時の設定であり、DPIや窓幅によって要求pxは変わる。
+修正後も出力247×124は既存品質仕様として残るが、同一要求の再decodeは収束することが必要。
+サイズを大きくしたときに高画質化が再開することも、静止測定とは別に確認する。
+
+`thumb/ready`は初回Loaded化の計装であり、Loaded→Loadedの高画質化では出ない。
+ready件数0や`load_phases.should_save=false`だけで結果破棄と判断せず、生成結果・
+要求サイズ・UI消費・`idle_upgrade_enqueue`の反復を合わせて調べる。
+
 `tray-residency` は Enter 前に手動で close-to-tray を行う。**トレイ常駐は既定 OFF** なので、
 先に環境設定 →「タスクトレイ常駐」→「アプリを閉じる代わりに、タスクトレイに常駐する」を
 ON にしてから `[×]` で閉じる。**最小化では成立しない** — Win32 では最小化したウィンドウも
@@ -150,6 +161,11 @@ pin / keep-range を測るシナリオで `VideoPlayer` を生成しないため
 
 - `thumb.idle_upgrade_enqueue`: 最終 `skip_cache=true` で upgrade queue へ進む
 - `thumb.idle_upgrade_ineligible`: 完成済み派生キャッシュのため対象外
+
+Sourceの`thumb.decode_end`には、実際に生成へ使った`evaluated_display_px`と、
+`display_output_width`/`display_output_height`を記録する。§1.198の再確認では、
+374px要求から247×124が生成されたことと、その後同一要求が反復しないことを併せて見る。
+`thumb.ready`は初回Loaded化だけなので、Loaded→Loadedの生成完了数の代用にはしない。
 
 どちらも `key`、`idx`、`items_gen` を持つ。同じ identity が入力・items 世代変更なしに
 繰り返されると `idle-health` が失敗する。ただし `idle_upgrade_ineligible` は memo により

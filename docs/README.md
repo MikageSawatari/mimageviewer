@@ -13,7 +13,11 @@
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
+| [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
 | [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
+| [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、動画の実OSマウス入力の段階と検証範囲 |
+| [interactive-release-verification.md](interactive-release-verification.md) | 実アプリ起動・操作テストはリリース前等の検証枠で、内容・所要時間を示し利用者の明示了承後に実行する運用 |
+| [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) | **設計合意済み・未実装**。書庫の高速ページ送りが詰まる問題 (§1.174) の正本。ページ読み込みの受付・待機・実行・取消中・終了を上限つきで所有する `FsPageLoadScheduler`、ZIP 中央目次の再利用、アニメーション通知の分離 |

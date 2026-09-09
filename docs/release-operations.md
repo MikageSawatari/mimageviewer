@@ -32,6 +32,13 @@
 
 ---
 
+エージェントから配布ビルドする場合は `scripts/build-dist.ps1 -PreserveRuntime` を使う。
+稼働アプリとの競合は停止せず拒否し、APPDATAのVST3キャッシュを保持する。
+必須テスト・clean・埋め込み前の署名順は維持する。子の `test-full.ps1` 内でのみ
+クラッシュダイアログを抑止し、失敗の終了コードは保持する。
+通常データを使うアプリの起動や実機操作は、このビルド指定に含まれない。
+詳細は [開発ビルドとテスト](development-build-and-test.md) を参照。
+
 ## 2. ビルドの信頼性
 
 ### 2.1 stale core cache (最重要・過去に stale 出荷しかけた)
@@ -68,6 +75,12 @@
 
 ### 2.3 3 段ビルドの正しいコマンド (順序不変: core → remote → launcher)
 
+署名時の補足: SimplySignログイン済みでも、制限された実行環境のsigntoolが
+`No certificates were found that met all the given criteria`で失敗する場合がある。
+v3.7.0では証明書一覧が見えていても非昇格の署名は失敗し、同一コマンドを承認済みの
+昇格環境で実行すると成功した。ログイン切れや秘密鍵故障と即断せず、実行hostと権限条件を照合する。
+証明書の選択条件を緩めたり、署名を省いたりしない。通常データ保持には`-PreserveRuntime`を維持する。
+
 ```
 # 本体 (package "mimageviewer" 内の bin なので -p 不要)
 cargo build --release --bin mimageviewer-core
@@ -88,6 +101,13 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 ---
 
 ## 3. テストゲート
+
+実アプリを起動・操作するperf/idle/page-turn/UI smokeは、非対話のテストゲートと分離する。
+リリース前に対象と所要時間をまとめて利用者へ提示し、**明示了承後だけ実行**する。
+会話中の「これから操作を控えて」という予告は了承の代わりにならない。
+[実アプリ検証の実行確認](interactive-release-verification.md)を、CLAUDE.md Phase 2の
+perf/idle検証および実アプリsmokeの実行前に適用する。必須検証を免除するものではない。
+通常の開発・buildからの自動起動は行わず、未了承・未実施はリリース記録へ残す。
 
 - **リリース直前に `scripts\test-full.ps1` を RUN する** (パイプ無し・real exit code を確認)。
   通常 workspace test に加え、`pack-build-tools` feature で単体テストを持つ補助 bin 2本も

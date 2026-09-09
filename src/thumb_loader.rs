@@ -201,22 +201,29 @@ pub struct ThumbEditPreviewAdjustment {
 /// UI へ渡すサムネイル画像の生成元。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThumbLoadOrigin {
-    /// 元画像 / ZIP entry / PDF render / 動画 Shell API から得た完成画像。
-    Source,
+    /// 元画像 / ZIP entry / PDF render を、表示要求の上限を評価して生成した画像。
+    ///
+    /// `evaluated_display_px` は実際の出力寸法ではなく、この生成処理が満たそうと
+    /// 評価した表示要求。整数アスペクト比の制約で出力が小さくなっても、同じ要求を
+    /// 再実行して結果が変わらないことを UI 側で判定するために保持する。
+    SourceGenerated { evaluated_display_px: u32 },
+    /// 動画 Shell API など、一覧の表示要求に対する source resize ではない完成画像。
+    /// この variant は表示要求を満たしたという coverage を持たない。
+    SourceIntrinsic,
     /// 通常の WebP cache hit。元ソースからの idle quality-upgrade が可能。
     UpgradeableCache,
     /// 編集 preview、drive-list、再帰 pin 伝播など、WebP 自体を完成ソースとして扱う画像。
-    /// UI は `from_cache=true` として保持するが、idle quality-upgrade へ再投入しない。
+    /// `from_cache()` は true を返すが、idle quality-upgrade へ再投入しない。
     FinalCache,
 }
 
 impl ThumbLoadOrigin {
     pub fn from_cache(self) -> bool {
-        !matches!(self, Self::Source)
+        matches!(self, Self::UpgradeableCache | Self::FinalCache)
     }
 
     pub fn blocks_idle_upgrade(self) -> bool {
-        matches!(self, Self::FinalCache)
+        matches!(self, Self::SourceIntrinsic | Self::FinalCache)
     }
 }
 
@@ -935,7 +942,7 @@ fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &
     let _ = tx.send(ThumbMsg {
         idx: req.idx,
         image: None,
-        origin: ThumbLoadOrigin::Source,
+        origin: ThumbLoadOrigin::SourceIntrinsic,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
@@ -1006,7 +1013,7 @@ fn send_pinned_only_cached(
 /// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
 ///   (`ThumbLoadOrigin::UpgradeableCache`)
 /// - ミスまたは `SourceOnly`: `load_one_cached` に委譲してフルデコード
-///   (`ThumbLoadOrigin::Source`、段階 E のアップグレード経路)
+///   (`ThumbLoadOrigin::SourceGenerated`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
     req: &LoadRequest,
@@ -1278,7 +1285,7 @@ pub fn process_load_request(
                 let _ = tx.send(ThumbMsg {
                     idx: req.idx,
                     image: None,
-                    origin: ThumbLoadOrigin::Source,
+                    origin: ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -1357,7 +1364,7 @@ pub fn process_load_request(
                 let _ = tx.send(ThumbMsg {
                     idx: req.idx,
                     image: None,
-                    origin: ThumbLoadOrigin::Source,
+                    origin: ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -1393,7 +1400,7 @@ pub fn process_load_request(
                 let _ = tx.send(ThumbMsg {
                     idx: req.idx,
                     image: None,
-                    origin: ThumbLoadOrigin::Source,
+                    origin: ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -1446,7 +1453,7 @@ pub fn process_load_request(
             let _ = tx.send(ThumbMsg {
                 idx: req.idx,
                 image: None,
-                origin: ThumbLoadOrigin::Source,
+                origin: ThumbLoadOrigin::SourceIntrinsic,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -1579,7 +1586,7 @@ pub fn process_load_request(
             let _ = tx.send(ThumbMsg {
                 idx: req.idx,
                 image: None,
-                origin: ThumbLoadOrigin::Source,
+                origin: ThumbLoadOrigin::SourceIntrinsic,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -2934,7 +2941,7 @@ pub fn load_one_cached(
                 let _ = tx.send(ThumbMsg {
                     idx,
                     image: None,
-                    origin: ThumbLoadOrigin::Source,
+                    origin: ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -2951,7 +2958,7 @@ pub fn load_one_cached(
             let _ = tx.send(ThumbMsg {
                 idx,
                 image: None,
-                origin: ThumbLoadOrigin::Source,
+                origin: ThumbLoadOrigin::SourceIntrinsic,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
@@ -3027,6 +3034,7 @@ pub fn load_one_cached(
         Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
         None => display_ci,
     };
+    let [display_output_width, display_output_height] = display_ci.size;
     let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
     // 第 1 シグナル: display ColorImage を UI に送る。UI は Loaded 化するが、
     // from_cache=false のこの経路では `requested` を抜かない (下の cache save が
@@ -3036,7 +3044,9 @@ pub fn load_one_cached(
     let _ = tx.send(ThumbMsg {
         idx,
         image: Some(display_ci),
-        origin: ThumbLoadOrigin::Source,
+        origin: ThumbLoadOrigin::SourceGenerated {
+            evaluated_display_px: display_px,
+        },
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims,
@@ -3169,7 +3179,7 @@ pub fn load_one_cached(
     let _ = tx.send(ThumbMsg {
         idx,
         image: None,
-        origin: ThumbLoadOrigin::Source,
+        origin: ThumbLoadOrigin::SourceIntrinsic,
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
@@ -3231,6 +3241,15 @@ pub fn load_one_cached(
             ("decode_parts", serde_json::Value::Object(decode_parts)),
             ("should_save", serde_json::Value::from(should_save)),
             ("skip_cache", serde_json::Value::from(skip_cache)),
+            ("evaluated_display_px", serde_json::Value::from(display_px)),
+            (
+                "display_output_width",
+                serde_json::Value::from(display_output_width),
+            ),
+            (
+                "display_output_height",
+                serde_json::Value::from(display_output_height),
+            ),
             ("pdf_page", serde_json::Value::from(pdf_page)),
             ("idx", serde_json::Value::from(idx)),
             ("input_seq", serde_json::Value::from(input_seq)),

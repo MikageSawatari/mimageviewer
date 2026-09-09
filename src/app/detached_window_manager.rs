@@ -753,6 +753,15 @@ impl DetachedWindowManager {
         (was_pending, runtime.state)
     }
 
+    /// Read-only arbitration probe used before a test-script activation joins the
+    /// production intent queue. Closing and in-flight right-drag states count too:
+    /// none of them may be overtaken by an automation request.
+    pub(super) fn has_activation_intent(&self) -> bool {
+        self.runtimes
+            .values()
+            .any(|runtime| runtime.activation_intent.is_some())
+    }
+
     pub(super) fn queue_right_drag_command(
         &mut self,
         window_id: u64,
@@ -1024,6 +1033,7 @@ mod tests {
     fn activate_only_intent_keeps_plain_deferred_activation_behavior() {
         let mut manager = DetachedWindowManager::new();
         assert_eq!(manager.queue_deferred_activation(7, false).0, false);
+        assert!(manager.has_activation_intent());
         assert!(matches!(
             manager.activation_intent(7),
             Some(DetachedActivationIntent::ActivateOnly)
@@ -1035,6 +1045,21 @@ mod tests {
         assert_eq!(dispatch.window_id, 7);
         assert!(dispatch.command.is_none());
         assert!(manager.activation_intent(7).is_none());
+        assert!(!manager.has_activation_intent());
+    }
+
+    #[test]
+    fn activation_arbitration_observes_an_intent_owned_by_a_closing_runtime() {
+        let mut manager = DetachedWindowManager::new();
+        manager.queue_deferred_activation(8, false);
+        manager.transition_state(8, DetachedWindowState::Closing, false);
+
+        assert!(manager.has_activation_intent());
+        assert!(manager.take_pending_deferred_activation().is_none());
+        assert!(
+            manager.has_activation_intent(),
+            "a closing runtime still owns its undrained intent"
+        );
     }
 
     #[test]
@@ -1046,6 +1071,7 @@ mod tests {
                 .queue_right_drag_command(9, command.clone(), false)
                 .0
         );
+        assert!(manager.has_activation_intent());
         assert!(matches!(
             manager.activation_intent(9),
             Some(DetachedActivationIntent::RightDrag(
@@ -1064,6 +1090,7 @@ mod tests {
             ))
         ));
         assert!(manager.mark_right_drag_pending_execution(9, command.clone()));
+        assert!(manager.has_activation_intent());
         assert!(matches!(
             manager.activation_intent(9),
             Some(DetachedActivationIntent::RightDrag(
@@ -1072,6 +1099,7 @@ mod tests {
         ));
         assert_eq!(manager.take_pending_right_drag_execution(9), Some(command));
         assert!(manager.activation_intent(9).is_none());
+        assert!(!manager.has_activation_intent());
     }
 
     #[test]

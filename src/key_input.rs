@@ -10,6 +10,9 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(all(windows, any(test, feature = "test-script")))]
+use std::sync::mpsc;
+
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
@@ -237,6 +240,914 @@ pub enum SyntheticInputIssue {
         raw_input_time: Option<f64>,
         event_count: usize,
     },
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    PointerOwnerMismatch {
+        handle: SyntheticPointerCancelHandle,
+        detail: String,
+    },
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    PointerPhysicalInputMixed {
+        handle: SyntheticPointerCancelHandle,
+    },
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    PointerViewportNotRendered {
+        handle: SyntheticPointerCancelHandle,
+        viewport: egui::ViewportId,
+    },
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    MissingPointerShowTail {
+        handle: SyntheticPointerCancelHandle,
+        viewport: egui::ViewportId,
+    },
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyntheticPointerRegion {
+    StillSeekStripRow,
+    StillSeekTrack,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyntheticPointerOwner {
+    pub(crate) identity: crate::test_script::TestScriptWindowIdentity,
+    pub(crate) items_generation: u64,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyntheticPointerModeSignature {
+    pub(crate) spread_mode: String,
+    pub(crate) reading_flow: String,
+    pub(crate) strip_rtl: bool,
+    pub(crate) seek_bar_rtl: bool,
+    pub(crate) strip_visible: bool,
+    pub(crate) strip_locked: bool,
+    pub(crate) bar_locked: bool,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SyntheticPointerLatch {
+    pub(crate) transaction_id: u64,
+    pub(crate) owner: SyntheticPointerOwner,
+    pub(crate) region: SyntheticPointerRegion,
+    pub(crate) mode: SyntheticPointerModeSignature,
+    pub(crate) region_geometry_token: u64,
+    pub(crate) press_page_index: usize,
+    pub(crate) press_item_identity: String,
+    pub(crate) widget_id: egui::Id,
+    pub(crate) press_rect: egui::Rect,
+    pub(crate) coordinate_frame: egui::Rect,
+    pub(crate) press_pixels_per_point: f32,
+    pub(crate) press_point: egui::Pos2,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SyntheticPointerDownRequest {
+    pub(crate) owner: SyntheticPointerOwner,
+    pub(crate) region: SyntheticPointerRegion,
+    pub(crate) mode: SyntheticPointerModeSignature,
+    pub(crate) region_geometry_token: u64,
+    pub(crate) press_page_index: usize,
+    pub(crate) press_item_identity: String,
+    pub(crate) widget_id: egui::Id,
+    pub(crate) press_rect: egui::Rect,
+    pub(crate) coordinate_frame: egui::Rect,
+    pub(crate) press_pixels_per_point: f32,
+    pub(crate) press_point: egui::Pos2,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyntheticPointerCancelHandle {
+    pub(crate) transaction_id: u64,
+    pub(crate) step_id: u64,
+    pub(crate) owner: SyntheticPointerOwner,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SyntheticPointerHeldSnapshot {
+    pub(crate) cancel_handle: SyntheticPointerCancelHandle,
+    pub(crate) latch: SyntheticPointerLatch,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SyntheticPointerStepKind {
+    Down {
+        point: egui::Pos2,
+    },
+    Move {
+        held_before: egui::Pos2,
+        point: egui::Pos2,
+    },
+    Up {
+        held_before: egui::Pos2,
+        final_point: egui::Pos2,
+    },
+    CleanupUp {
+        final_point: egui::Pos2,
+    },
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl SyntheticPointerStepKind {
+    fn point_after_delivery(self) -> egui::Pos2 {
+        match self {
+            Self::Down { point } | Self::Move { point, .. } => point,
+            Self::Up { final_point, .. } | Self::CleanupUp { final_point } => final_point,
+        }
+    }
+
+    fn held_before(self) -> Option<egui::Pos2> {
+        match self {
+            Self::Move { held_before, .. } | Self::Up { held_before, .. } => Some(held_before),
+            Self::Down { .. } | Self::CleanupUp { .. } => None,
+        }
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyntheticPointerHandlerEffect {
+    Pressed,
+    StripCenter(usize),
+    TrackTarget(Option<usize>),
+    ReleasedStripCenter(usize),
+    ReleasedTrackTarget(Option<usize>),
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyntheticPointerCompletion {
+    pub(crate) step_id: u64,
+    pub(crate) effect: SyntheticPointerHandlerEffect,
+    pub(crate) page_before: usize,
+    pub(crate) page_after: usize,
+    /// Catalog revision published for the handler's own show. A subsequent paint proof must have
+    /// a strictly greater revision.
+    pub(crate) after_revision: u64,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyntheticPointerHandlerProof {
+    Success(SyntheticPointerCompletion),
+    Missing,
+    Contradiction(String),
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+pub(crate) struct SyntheticPointerShowTail {
+    pub(crate) step: SyntheticPointerStep,
+    pub(crate) primary_down: bool,
+    pub(crate) handler: SyntheticPointerHandlerProof,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyntheticPointerFailure {
+    Busy,
+    NotHeld,
+    WrongStep,
+    ContradictoryReceipt,
+    MissingHandlerProof,
+    PointerLevelMismatch,
+    Cancelled,
+    TargetLostDuringCleanup,
+    CleanupDidNotRelease,
+    MissingShowTail,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl SyntheticPointerFailure {
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Busy => "a synthetic pointer transaction is already active",
+            Self::NotHeld => "synthetic pointer is not held",
+            Self::WrongStep => "synthetic pointer step did not match the transaction phase",
+            Self::ContradictoryReceipt => "synthetic pointer handler proof was contradictory",
+            Self::MissingHandlerProof => "synthetic pointer reached no supported widget",
+            Self::PointerLevelMismatch => "synthetic pointer primary level did not match the step",
+            Self::Cancelled => "synthetic pointer input was cancelled",
+            Self::TargetLostDuringCleanup => {
+                "synthetic pointer target was lost before cleanup completed"
+            }
+            Self::CleanupDidNotRelease => "synthetic pointer cleanup did not release primary",
+            Self::MissingShowTail => "synthetic pointer show ended without its callback tail",
+        }
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+pub(crate) struct SyntheticPointerStep {
+    pub(crate) step_id: u64,
+    pub(crate) latch: SyntheticPointerLatch,
+    pub(crate) kind: SyntheticPointerStepKind,
+    completion: Option<mpsc::SyncSender<Result<SyntheticPointerCompletion, String>>>,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl SyntheticPointerStep {
+    pub(crate) fn same_payload(&self, other: &Self) -> bool {
+        self.step_id == other.step_id && self.latch == other.latch && self.kind == other.kind
+    }
+
+    fn complete(&mut self, result: Result<SyntheticPointerCompletion, String>) {
+        if let Some(reply) = self.completion.take() {
+            let _ = reply.send(result);
+        }
+    }
+
+    fn cancel_handle(&self) -> SyntheticPointerCancelHandle {
+        SyntheticPointerCancelHandle {
+            transaction_id: self.latch.transaction_id,
+            step_id: self.step_id,
+            owner: self.latch.owner.clone(),
+        }
+    }
+
+    fn egui_events(&self) -> Vec<egui::Event> {
+        let (point, pressed) = match self.kind {
+            SyntheticPointerStepKind::Down { point } => (point, Some(true)),
+            SyntheticPointerStepKind::Move { point, .. } => (point, None),
+            SyntheticPointerStepKind::Up { final_point, .. }
+            | SyntheticPointerStepKind::CleanupUp { final_point } => (final_point, Some(false)),
+        };
+        let mut events = vec![egui::Event::PointerMoved(point)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        events
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSyntheticPointerStep {
+    pub(crate) raw_frame: u64,
+    pub(crate) raw_time_bits: u64,
+    pub(crate) step: SyntheticPointerStep,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl PreparedSyntheticPointerStep {
+    pub(crate) fn same_payload(&self, other: &Self) -> bool {
+        self.raw_frame == other.raw_frame
+            && self.raw_time_bits == other.raw_time_bits
+            && self.step.same_payload(&other.step)
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl PartialEq for PreparedSyntheticPointerStep {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_payload(other)
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SyntheticPointerRequestedHeldStep {
+    Move { point: egui::Pos2 },
+    Up { final_point: egui::Pos2 },
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyntheticPointerHeldPhase {
+    Move,
+    Up,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+enum SyntheticPointerCancelPhase {
+    Queued(SyntheticPointerStep),
+    Prepared(SyntheticPointerStep),
+    AwaitingOriginalTail(SyntheticPointerStep),
+    DeliveredCleanupAwaitingTail(SyntheticPointerStep),
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+enum SyntheticPointerTransaction {
+    Idle,
+    Queued(SyntheticPointerStep),
+    Prepared(SyntheticPointerStep),
+    DeliveredAwaitingTail(SyntheticPointerStep),
+    Held {
+        latch: SyntheticPointerLatch,
+        last_point: egui::Pos2,
+        next_step_id: u64,
+    },
+    Cancelling(SyntheticPointerCancelPhase),
+    TerminalFailure {
+        handle: SyntheticPointerCancelHandle,
+        failure: SyntheticPointerFailure,
+    },
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreparedPointerDeliveryDisposition {
+    Delivered,
+    Rejected(SyntheticPointerCancelHandle),
+    Stale,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl Default for SyntheticPointerTransaction {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+impl SyntheticPointerTransaction {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn is_terminal_failure(&self, expected: &SyntheticPointerCancelHandle) -> bool {
+        matches!(self, Self::TerminalFailure { handle, .. } if handle == expected)
+    }
+
+    fn owner(&self) -> Option<&SyntheticPointerOwner> {
+        match self {
+            Self::Queued(step)
+            | Self::Prepared(step)
+            | Self::DeliveredAwaitingTail(step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::Queued(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                Some(&step.latch.owner)
+            }
+            Self::Held { latch, .. } => Some(&latch.owner),
+            Self::TerminalFailure { handle, .. } => Some(&handle.owner),
+            Self::Idle => None,
+        }
+    }
+
+    fn held_latch(&self) -> Option<&SyntheticPointerLatch> {
+        match self {
+            Self::Held { latch, .. } => Some(latch),
+            _ => None,
+        }
+    }
+
+    fn matches_cancel_handle(&self, handle: &SyntheticPointerCancelHandle) -> bool {
+        let (latch, step_matches) = match self {
+            Self::Queued(step) | Self::Prepared(step) | Self::DeliveredAwaitingTail(step) => {
+                (&step.latch, step.step_id == handle.step_id)
+            }
+            Self::Held {
+                latch,
+                next_step_id,
+                ..
+            } => (latch, *next_step_id == handle.step_id.wrapping_add(1)),
+            Self::Cancelling(SyntheticPointerCancelPhase::Queued(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                (&step.latch, true)
+            }
+            Self::Idle | Self::TerminalFailure { .. } => return false,
+        };
+        step_matches && latch.transaction_id == handle.transaction_id && latch.owner == handle.owner
+    }
+
+    fn cancel_handle(&mut self, handle: &SyntheticPointerCancelHandle) -> bool {
+        if !self.matches_cancel_handle(handle) {
+            return false;
+        }
+        self.cancel();
+        true
+    }
+
+    fn held_snapshot(&self) -> Option<SyntheticPointerHeldSnapshot> {
+        let Self::Held {
+            latch,
+            next_step_id,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(SyntheticPointerHeldSnapshot {
+            cancel_handle: SyntheticPointerCancelHandle {
+                transaction_id: latch.transaction_id,
+                // A handle names the last completed step while Held. A subsequently queued held
+                // step gets `next_step_id` and returns its own handle.
+                step_id: next_step_id.wrapping_sub(1),
+                owner: latch.owner.clone(),
+            },
+            latch: latch.clone(),
+        })
+    }
+
+    fn fail_physical_input_mixed(
+        &mut self,
+        viewport: egui::ViewportId,
+    ) -> Option<SyntheticPointerCancelHandle> {
+        if self.owner()?.identity.viewport_id() != viewport {
+            return None;
+        }
+        let (handle, pending) = match self {
+            Self::Queued(step)
+            | Self::Prepared(step)
+            | Self::DeliveredAwaitingTail(step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::Queued(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                (step.cancel_handle(), Some(step))
+            }
+            Self::Held {
+                latch,
+                next_step_id,
+                ..
+            } => (
+                SyntheticPointerCancelHandle {
+                    transaction_id: latch.transaction_id,
+                    step_id: *next_step_id,
+                    owner: latch.owner.clone(),
+                },
+                None,
+            ),
+            Self::Idle | Self::TerminalFailure { .. } => return None,
+        };
+        if let Some(step) = pending {
+            step.complete(Err(SyntheticPointerFailure::PointerLevelMismatch
+                .describe()
+                .to_string()));
+        }
+        *self = Self::TerminalFailure {
+            handle: handle.clone(),
+            failure: SyntheticPointerFailure::PointerLevelMismatch,
+        };
+        Some(handle)
+    }
+
+    fn fail_owner_lost(
+        &mut self,
+        owner: &SyntheticPointerOwner,
+    ) -> Option<SyntheticPointerCancelHandle> {
+        if self.owner() != Some(owner) {
+            return None;
+        }
+        let (handle, pending) = match self {
+            Self::Queued(step)
+            | Self::Prepared(step)
+            | Self::DeliveredAwaitingTail(step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::Queued(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                (step.cancel_handle(), Some(step))
+            }
+            Self::Held {
+                latch,
+                next_step_id,
+                ..
+            } => (
+                SyntheticPointerCancelHandle {
+                    transaction_id: latch.transaction_id,
+                    step_id: *next_step_id,
+                    owner: latch.owner.clone(),
+                },
+                None,
+            ),
+            Self::Idle | Self::TerminalFailure { .. } => return None,
+        };
+        if let Some(step) = pending {
+            step.complete(Err(SyntheticPointerFailure::TargetLostDuringCleanup
+                .describe()
+                .to_string()));
+        }
+        *self = Self::TerminalFailure {
+            handle: handle.clone(),
+            failure: SyntheticPointerFailure::TargetLostDuringCleanup,
+        };
+        Some(handle)
+    }
+
+    fn observable_delivered_step(&self) -> Option<&SyntheticPointerStep> {
+        match self {
+            Self::DeliveredAwaitingTail(step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                Some(step)
+            }
+            _ => None,
+        }
+    }
+
+    fn queue_down(&mut self, step: SyntheticPointerStep) -> Result<(), String> {
+        if !matches!(step.kind, SyntheticPointerStepKind::Down { .. }) {
+            return Err("first synthetic pointer step must be Down".to_string());
+        }
+        if !matches!(self, Self::Idle) {
+            return Err("a synthetic pointer transaction is already active".to_string());
+        }
+        *self = Self::Queued(step);
+        Ok(())
+    }
+
+    fn queue_held(
+        &mut self,
+        request: SyntheticPointerRequestedHeldStep,
+        completion: mpsc::SyncSender<Result<SyntheticPointerCompletion, String>>,
+    ) -> Result<u64, String> {
+        let Self::Held {
+            latch,
+            last_point,
+            next_step_id,
+        } = self
+        else {
+            return Err("synthetic pointer is not held".to_string());
+        };
+        let step_id = *next_step_id;
+        let kind = match request {
+            SyntheticPointerRequestedHeldStep::Move { point } => SyntheticPointerStepKind::Move {
+                held_before: *last_point,
+                point,
+            },
+            SyntheticPointerRequestedHeldStep::Up { final_point } => SyntheticPointerStepKind::Up {
+                held_before: *last_point,
+                final_point,
+            },
+        };
+        *self = Self::Queued(SyntheticPointerStep {
+            step_id,
+            latch: latch.clone(),
+            kind,
+            completion: Some(completion),
+        });
+        Ok(step_id)
+    }
+
+    fn prepare(&mut self) -> Option<SyntheticPointerStep> {
+        match self {
+            Self::Queued(step) => {
+                let prepared = step.clone();
+                *self = Self::Prepared(prepared.clone());
+                Some(prepared)
+            }
+            Self::Cancelling(SyntheticPointerCancelPhase::Queued(step)) => {
+                let prepared = step.clone();
+                *self = Self::Cancelling(SyntheticPointerCancelPhase::Prepared(prepared.clone()));
+                Some(prepared)
+            }
+            _ => None,
+        }
+    }
+
+    fn mark_delivered(&mut self, delivered: &SyntheticPointerStep) -> bool {
+        match self {
+            Self::Prepared(step) if step.same_payload(delivered) => {
+                *self = Self::DeliveredAwaitingTail(step.clone());
+                true
+            }
+            Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+                if step.same_payload(delivered) =>
+            {
+                *self = Self::Cancelling(
+                    SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step.clone()),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn fail_delivered(
+        &mut self,
+        expected: &SyntheticPointerCancelHandle,
+        failure: SyntheticPointerFailure,
+        detail: String,
+    ) -> bool {
+        if self.is_terminal_failure(expected) {
+            return true;
+        }
+        let step =
+            match self {
+                Self::DeliveredAwaitingTail(step)
+                | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+                | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(
+                    step,
+                )) if step.cancel_handle() == *expected => step,
+                _ => return false,
+            };
+        step.complete(Err(detail));
+        *self = Self::TerminalFailure {
+            handle: expected.clone(),
+            failure,
+        };
+        true
+    }
+
+    fn queue_cleanup(&mut self, step: &SyntheticPointerStep, final_point: egui::Pos2) {
+        *self = Self::Cancelling(SyntheticPointerCancelPhase::Queued(SyntheticPointerStep {
+            step_id: step.step_id.wrapping_add(1),
+            latch: step.latch.clone(),
+            kind: SyntheticPointerStepKind::CleanupUp { final_point },
+            completion: None,
+        }));
+    }
+
+    fn finish_show(&mut self, tail: SyntheticPointerShowTail) -> Result<(), String> {
+        let Self::DeliveredAwaitingTail(step) = self else {
+            return Err(SyntheticPointerFailure::WrongStep.describe().to_string());
+        };
+        if !step.same_payload(&tail.step) {
+            return Err(SyntheticPointerFailure::ContradictoryReceipt
+                .describe()
+                .to_string());
+        }
+        let mut step = step.clone();
+        let completion = match tail.handler {
+            SyntheticPointerHandlerProof::Success(completion)
+                if completion.step_id == step.step_id =>
+            {
+                completion
+            }
+            SyntheticPointerHandlerProof::Success(_)
+            | SyntheticPointerHandlerProof::Contradiction(_) => {
+                let failure = SyntheticPointerFailure::ContradictoryReceipt;
+                let detail = failure.describe().to_string();
+                step.complete(Err(detail.clone()));
+                if tail.primary_down {
+                    let final_point = step.kind.point_after_delivery();
+                    self.queue_cleanup(&step, final_point);
+                } else {
+                    *self = Self::Idle;
+                }
+                return Err(detail);
+            }
+            SyntheticPointerHandlerProof::Missing => {
+                let failure = SyntheticPointerFailure::MissingHandlerProof;
+                let detail = failure.describe().to_string();
+                step.complete(Err(detail.clone()));
+                if tail.primary_down {
+                    let final_point = step.kind.point_after_delivery();
+                    self.queue_cleanup(&step, final_point);
+                } else {
+                    *self = Self::Idle;
+                }
+                return Err(detail);
+            }
+        };
+
+        match step.kind {
+            SyntheticPointerStepKind::Down { .. } | SyntheticPointerStepKind::Move { .. }
+                if tail.primary_down =>
+            {
+                let last_point = step.kind.point_after_delivery();
+                let next_step_id = step.step_id.wrapping_add(1);
+                let latch = step.latch.clone();
+                step.complete(Ok(completion));
+                *self = Self::Held {
+                    latch,
+                    last_point,
+                    next_step_id,
+                };
+                Ok(())
+            }
+            SyntheticPointerStepKind::Up { .. } if !tail.primary_down => {
+                step.complete(Ok(completion));
+                *self = Self::Idle;
+                Ok(())
+            }
+            SyntheticPointerStepKind::Down { .. } | SyntheticPointerStepKind::Move { .. } => {
+                let failure = SyntheticPointerFailure::PointerLevelMismatch;
+                let detail = failure.describe().to_string();
+                step.complete(Err(detail.clone()));
+                *self = Self::Idle;
+                Err(detail)
+            }
+            SyntheticPointerStepKind::Up { .. } => {
+                let failure = SyntheticPointerFailure::CleanupDidNotRelease;
+                let detail = failure.describe().to_string();
+                step.complete(Err(detail.clone()));
+                let final_point = step.kind.point_after_delivery();
+                self.queue_cleanup(&step, final_point);
+                Err(detail)
+            }
+            SyntheticPointerStepKind::CleanupUp { .. } => {
+                Err(SyntheticPointerFailure::WrongStep.describe().to_string())
+            }
+        }
+    }
+
+    fn finish_cancellation_show(&mut self, tail: SyntheticPointerShowTail) -> Result<(), String> {
+        match self {
+            Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step)) => {
+                if !step.same_payload(&tail.step) {
+                    return Err(SyntheticPointerFailure::ContradictoryReceipt
+                        .describe()
+                        .to_string());
+                }
+                let step = step.clone();
+                if tail.primary_down {
+                    let final_point = step.kind.point_after_delivery();
+                    self.queue_cleanup(&step, final_point);
+                } else {
+                    *self = Self::Idle;
+                }
+                Ok(())
+            }
+            Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                if !step.same_payload(&tail.step)
+                    || !matches!(step.kind, SyntheticPointerStepKind::CleanupUp { .. })
+                {
+                    return Err(SyntheticPointerFailure::ContradictoryReceipt
+                        .describe()
+                        .to_string());
+                }
+                if tail.primary_down {
+                    let failure = SyntheticPointerFailure::CleanupDidNotRelease;
+                    let detail = failure.describe().to_string();
+                    *self = Self::TerminalFailure {
+                        handle: step.cancel_handle(),
+                        failure,
+                    };
+                    Err(detail)
+                } else {
+                    *self = Self::Idle;
+                    Ok(())
+                }
+            }
+            _ => Err(SyntheticPointerFailure::WrongStep.describe().to_string()),
+        }
+    }
+
+    fn finish_delivered_show(&mut self, tail: SyntheticPointerShowTail) -> Result<(), String> {
+        match self {
+            Self::DeliveredAwaitingTail(_) => self.finish_show(tail),
+            Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(_))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(_)) => {
+                self.finish_cancellation_show(tail)
+            }
+            _ => Err(SyntheticPointerFailure::WrongStep.describe().to_string()),
+        }
+    }
+
+    fn cancel(&mut self) {
+        match self {
+            Self::Idle | Self::Cancelling(_) | Self::TerminalFailure { .. } => {}
+            Self::Queued(step) | Self::Prepared(step)
+                if matches!(step.kind, SyntheticPointerStepKind::Down { .. }) =>
+            {
+                step.complete(Err("synthetic pointer input was cancelled".to_string()));
+                *self = Self::Idle;
+            }
+            Self::Queued(step) | Self::Prepared(step) => {
+                step.complete(Err("synthetic pointer input was cancelled".to_string()));
+                let Some(point) = step.kind.held_before() else {
+                    *self = Self::Idle;
+                    return;
+                };
+                let cleanup = SyntheticPointerStep {
+                    step_id: step.step_id.wrapping_add(1),
+                    latch: step.latch.clone(),
+                    kind: SyntheticPointerStepKind::CleanupUp { final_point: point },
+                    completion: None,
+                };
+                *self = Self::Cancelling(SyntheticPointerCancelPhase::Queued(cleanup));
+            }
+            Self::DeliveredAwaitingTail(step) => {
+                step.complete(Err("synthetic pointer input was cancelled".to_string()));
+                *self = Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(
+                    step.clone(),
+                ));
+            }
+            Self::Held {
+                latch,
+                last_point,
+                next_step_id,
+            } => {
+                let cleanup = SyntheticPointerStep {
+                    step_id: *next_step_id,
+                    latch: latch.clone(),
+                    kind: SyntheticPointerStepKind::CleanupUp {
+                        final_point: *last_point,
+                    },
+                    completion: None,
+                };
+                *self = Self::Cancelling(SyntheticPointerCancelPhase::Queued(cleanup));
+            }
+        }
+    }
+
+    fn fail_missing_show_tail(&mut self, expected: &SyntheticPointerStep) -> bool {
+        let matches = self
+            .observable_delivered_step()
+            .is_some_and(|step| step.same_payload(expected));
+        if !matches {
+            return false;
+        }
+        if let Some(step) = match self {
+            Self::DeliveredAwaitingTail(step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step)) => {
+                Some(step)
+            }
+            _ => None,
+        } {
+            step.complete(Err(SyntheticPointerFailure::MissingShowTail
+                .describe()
+                .to_string()));
+        }
+        *self = Self::TerminalFailure {
+            handle: expected.cancel_handle(),
+            failure: SyntheticPointerFailure::MissingShowTail,
+        };
+        true
+    }
+
+    fn fail_undelivered(&mut self, expected: &SyntheticPointerStep) -> bool {
+        match self {
+            Self::Prepared(step) if step.same_payload(expected) => {
+                let mut step = step.clone();
+                step.complete(Err(
+                    "synthetic pointer target viewport was not rendered".into()
+                ));
+                if matches!(step.kind, SyntheticPointerStepKind::Down { .. }) {
+                    // An un-delivered Down cannot have changed egui's primary level.
+                    *self = Self::Idle;
+                } else {
+                    *self = Self::TerminalFailure {
+                        handle: step.cancel_handle(),
+                        failure: SyntheticPointerFailure::TargetLostDuringCleanup,
+                    };
+                }
+                true
+            }
+            Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+                if step.same_payload(expected) =>
+            {
+                *self = Self::TerminalFailure {
+                    handle: step.cancel_handle(),
+                    failure: SyntheticPointerFailure::TargetLostDuringCleanup,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn acknowledge_terminal_failure(&mut self, expected: &SyntheticPointerCancelHandle) -> bool {
+        if self.is_terminal_failure(expected) {
+            *self = Self::Idle;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Classify and consume a prepared transport under the same timeline lock. A cache entry can
+    /// survive waiter cancellation; only the exact still-prepared step may mutate the transaction
+    /// or report an environment failure.
+    fn resolve_prepared_delivery(
+        &mut self,
+        expected: &SyntheticPointerStep,
+        reject: bool,
+    ) -> PreparedPointerDeliveryDisposition {
+        let is_current = matches!(
+            self,
+            Self::Prepared(step) if step.same_payload(expected)
+        ) || matches!(
+            self,
+            Self::Cancelling(SyntheticPointerCancelPhase::Prepared(step))
+                if step.same_payload(expected)
+        );
+        if !is_current {
+            return PreparedPointerDeliveryDisposition::Stale;
+        }
+        if reject {
+            let handle = expected.cancel_handle();
+            let changed = self.fail_undelivered(expected);
+            debug_assert!(changed);
+            PreparedPointerDeliveryDisposition::Rejected(handle)
+        } else {
+            let changed = self.mark_delivered(expected);
+            debug_assert!(changed);
+            PreparedPointerDeliveryDisposition::Delivered
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -538,6 +1449,10 @@ struct SyntheticTimeline {
     next_sequence: u64,
     repeat_delay: Duration,
     repeat_interval: Duration,
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    pointer: SyntheticPointerTransaction,
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    next_pointer_transaction_id: u64,
 }
 
 impl Default for SyntheticTimeline {
@@ -549,6 +1464,10 @@ impl Default for SyntheticTimeline {
             next_sequence: 0,
             repeat_delay: DEFAULT_REPEAT_DELAY,
             repeat_interval: DEFAULT_REPEAT_INTERVAL,
+            #[cfg(all(windows, any(test, feature = "test-script")))]
+            pointer: SyntheticPointerTransaction::Idle,
+            #[cfg(all(windows, any(test, feature = "test-script")))]
+            next_pointer_transaction_id: 1,
         }
     }
 }
@@ -581,7 +1500,105 @@ impl SyntheticTimeline {
 
     #[cfg(any(test, feature = "test-script"))]
     fn is_idle(&self) -> bool {
-        self.commands.is_empty() && self.held.is_empty()
+        let key_idle = self.commands.is_empty() && self.held.is_empty();
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        let pointer_idle = self.pointer.is_idle();
+        #[cfg(not(all(windows, any(test, feature = "test-script"))))]
+        let pointer_idle = true;
+        key_idle && pointer_idle
+    }
+
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    fn queue_pointer_down(
+        &mut self,
+        request: SyntheticPointerDownRequest,
+        completion: mpsc::SyncSender<Result<SyntheticPointerCompletion, String>>,
+    ) -> Result<SyntheticPointerCancelHandle, String> {
+        if !self.armed {
+            return Err("synthetic input is not armed".to_string());
+        }
+        let transaction_id = self.next_pointer_transaction_id;
+        self.next_pointer_transaction_id = self.next_pointer_transaction_id.wrapping_add(1).max(1);
+        let step_id = transaction_id.wrapping_shl(32);
+        let owner = request.owner.clone();
+        self.pointer.queue_down(SyntheticPointerStep {
+            step_id,
+            latch: SyntheticPointerLatch {
+                transaction_id,
+                owner: request.owner,
+                region: request.region,
+                mode: request.mode,
+                region_geometry_token: request.region_geometry_token,
+                press_page_index: request.press_page_index,
+                press_item_identity: request.press_item_identity,
+                widget_id: request.widget_id,
+                press_rect: request.press_rect,
+                coordinate_frame: request.coordinate_frame,
+                press_pixels_per_point: request.press_pixels_per_point,
+                press_point: request.press_point,
+            },
+            kind: SyntheticPointerStepKind::Down {
+                point: request.press_point,
+            },
+            completion: Some(completion),
+        })?;
+        Ok(SyntheticPointerCancelHandle {
+            transaction_id,
+            step_id,
+            owner,
+        })
+    }
+
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    fn queue_pointer_held(
+        &mut self,
+        request: SyntheticPointerRequestedHeldStep,
+        completion: mpsc::SyncSender<Result<SyntheticPointerCompletion, String>>,
+    ) -> Result<u64, String> {
+        if !self.armed {
+            return Err("synthetic input is not armed".to_string());
+        }
+        self.pointer.queue_held(request, completion)
+    }
+
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    fn queue_pointer_held_normalized(
+        &mut self,
+        expected_owner: &SyntheticPointerOwner,
+        phase: SyntheticPointerHeldPhase,
+        normalized: [f32; 2],
+        completion: mpsc::SyncSender<Result<SyntheticPointerCompletion, String>>,
+    ) -> Result<SyntheticPointerCancelHandle, String> {
+        let latch = self
+            .pointer
+            .held_latch()
+            .cloned()
+            .ok_or_else(|| SyntheticPointerFailure::NotHeld.describe().to_string())?;
+        if latch.owner != *expected_owner {
+            self.pointer.cancel();
+            return Err(format!(
+                "selected pointer owner/catalog changed during gesture: latched={} selected={}",
+                latch.owner.identity.describe(),
+                expected_owner.identity.describe()
+            ));
+        }
+        let rect = latch.press_rect;
+        let point = egui::pos2(
+            egui::lerp(rect.x_range(), normalized[0]),
+            egui::lerp(rect.y_range(), normalized[1]),
+        );
+        let request = match phase {
+            SyntheticPointerHeldPhase::Move => SyntheticPointerRequestedHeldStep::Move { point },
+            SyntheticPointerHeldPhase::Up => {
+                SyntheticPointerRequestedHeldStep::Up { final_point: point }
+            }
+        };
+        let step_id = self.queue_pointer_held(request, completion)?;
+        Ok(SyntheticPointerCancelHandle {
+            transaction_id: latch.transaction_id,
+            step_id,
+            owner: latch.owner,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1106,7 +2123,7 @@ struct SyntheticViewportBatch {
     events: Vec<egui::Event>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PreparedSyntheticFrame {
     #[cfg_attr(not(feature = "test-script"), allow(dead_code))]
     frame_nr: u64,
@@ -1121,6 +2138,16 @@ struct PreparedSyntheticFrame {
     delivered_viewports: Vec<egui::ViewportId>,
     final_modifiers: egui::Modifiers,
     armed: bool,
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    pointer_delivery: PreparedSyntheticPointerDelivery,
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+#[derive(Clone, Debug)]
+enum PreparedSyntheticPointerDelivery {
+    Absent,
+    Pending(PreparedSyntheticPointerStep),
+    Delivered(PreparedSyntheticPointerStep),
 }
 
 #[derive(Default)]
@@ -1139,7 +2166,9 @@ impl SyntheticInputPlugin {
     }
 
     fn record_undelivered_previous_frame(&mut self) {
-        let Some(prepared) = self.prepared.as_ref() else {
+        // Clone the immutable one-frame transport before recording issues, because issue
+        // recording mutates the plugin queue.
+        let Some(prepared) = self.prepared.clone() else {
             return;
         };
         let misses: Vec<_> = prepared
@@ -1159,6 +2188,43 @@ impl SyntheticInputPlugin {
         for miss in misses {
             self.record_issue(miss);
         }
+
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        match prepared.pointer_delivery.clone() {
+            PreparedSyntheticPointerDelivery::Absent => {}
+            PreparedSyntheticPointerDelivery::Pending(pointer) => {
+                let viewport = pointer.step.latch.owner.identity.viewport_id();
+                let failed = state().lock().ok().and_then(|mut guard| {
+                    guard
+                        .synthetic
+                        .pointer
+                        .fail_undelivered(&pointer.step)
+                        .then(|| pointer.step.cancel_handle())
+                });
+                if let Some(handle) = failed {
+                    self.record_issue(SyntheticInputIssue::PointerViewportNotRendered {
+                        handle,
+                        viewport,
+                    });
+                }
+            }
+            PreparedSyntheticPointerDelivery::Delivered(pointer) => {
+                let viewport = pointer.step.latch.owner.identity.viewport_id();
+                let failed = state().lock().ok().and_then(|mut guard| {
+                    guard
+                        .synthetic
+                        .pointer
+                        .fail_missing_show_tail(&pointer.step)
+                        .then(|| pointer.step.cancel_handle())
+                });
+                if let Some(handle) = failed {
+                    self.record_issue(SyntheticInputIssue::MissingPointerShowTail {
+                        handle,
+                        viewport,
+                    });
+                }
+            }
+        }
     }
 
     fn prepare_root(&mut self, input: &egui::RawInput) {
@@ -1174,18 +2240,25 @@ impl SyntheticInputPlugin {
         self.record_undelivered_previous_frame();
         let frame_nr = self.next_frame_nr;
         self.next_frame_nr = self.next_frame_nr.saturating_add(1);
-        let materialized = state()
+        let (materialized, pointer_step) = state()
             .lock()
             .map(|mut guard| {
-                guard.materialize_synthetic(Instant::now(), |viewport| {
+                let materialized = guard.materialize_synthetic(Instant::now(), |viewport| {
                     if viewport == input.viewport_id {
                         Some(input.focused)
                     } else {
                         input.viewports.get(&viewport).and_then(|info| info.focused)
                     }
-                })
+                });
+                #[cfg(all(windows, any(test, feature = "test-script")))]
+                let pointer_step = input.time.and_then(|_| guard.synthetic.pointer.prepare());
+                #[cfg(not(all(windows, any(test, feature = "test-script"))))]
+                let pointer_step = None::<()>;
+                (materialized, pointer_step)
             })
-            .unwrap_or_else(|_| SyntheticMaterialization::disarmed());
+            .unwrap_or_else(|_| (SyntheticMaterialization::disarmed(), None));
+        #[cfg(not(all(windows, any(test, feature = "test-script"))))]
+        let _ = pointer_step;
         debug_assert!(
             materialized
                 .events
@@ -1233,6 +2306,19 @@ impl SyntheticInputPlugin {
             delivered_viewports: Vec::new(),
             final_modifiers: materialized.final_modifiers.to_egui(),
             armed: materialized.armed,
+            #[cfg(all(windows, any(test, feature = "test-script")))]
+            pointer_delivery: pointer_step
+                .map(|step| {
+                    PreparedSyntheticPointerDelivery::Pending(PreparedSyntheticPointerStep {
+                        raw_frame: frame_nr,
+                        raw_time_bits: input
+                            .time
+                            .expect("pointer preparation requires RawInput.time")
+                            .to_bits(),
+                        step,
+                    })
+                })
+                .unwrap_or(PreparedSyntheticPointerDelivery::Absent),
         });
     }
 
@@ -1254,6 +2340,102 @@ impl SyntheticInputPlugin {
         input.events.extend(batch.events.iter().cloned());
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
             prepared.delivered_viewports.push(input.viewport_id);
+        }
+    }
+
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    fn reject_physical_pointer_mix(&mut self, input: &egui::RawInput) {
+        let has_physical_pointer = input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerMoved(_)
+                    | egui::Event::PointerButton { .. }
+                    | egui::Event::PointerGone
+            )
+        });
+        if !has_physical_pointer {
+            return;
+        }
+        let handle = state().lock().ok().and_then(|mut guard| {
+            guard
+                .synthetic
+                .pointer
+                .fail_physical_input_mixed(input.viewport_id)
+        });
+        if let Some(handle) = handle {
+            self.record_issue(SyntheticInputIssue::PointerPhysicalInputMixed { handle });
+        }
+    }
+
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    fn inject_prepared_pointer(&mut self, input: &mut egui::RawInput) {
+        let Some(pointer) =
+            self.prepared
+                .as_ref()
+                .and_then(|frame| match &frame.pointer_delivery {
+                    PreparedSyntheticPointerDelivery::Pending(pointer) => Some(pointer.clone()),
+                    PreparedSyntheticPointerDelivery::Absent
+                    | PreparedSyntheticPointerDelivery::Delivered(_) => None,
+                })
+        else {
+            return;
+        };
+        if pointer.step.latch.owner.identity.viewport_id() != input.viewport_id {
+            return;
+        }
+
+        let owner_matches =
+            crate::test_script::pointer_input::active_show_matches(&pointer.step.latch.owner);
+        let witness_matches =
+            eframe::miv_test_script_window_witness::active().is_some_and(|witness| {
+                pointer
+                    .step
+                    .latch
+                    .owner
+                    .identity
+                    .matches_backend_witness(witness)
+            });
+        let rejection = if !owner_matches || !witness_matches {
+            Some("prepared pointer did not join the active lexical child show".to_string())
+        } else if input.time.is_none() {
+            Some("pointer child RawInput had no delivery-time witness".to_string())
+        } else {
+            None
+        };
+        let disposition = state()
+            .lock()
+            .map(|mut guard| {
+                guard
+                    .synthetic
+                    .pointer
+                    .resolve_prepared_delivery(&pointer.step, rejection.is_some())
+            })
+            .unwrap_or(PreparedPointerDeliveryDisposition::Stale);
+        match disposition {
+            PreparedPointerDeliveryDisposition::Stale => {
+                // Timeout/cancellation can outlive the immutable transport cache. A cache whose
+                // exact step is no longer Prepared has no obligation and must not poison a later
+                // host or inject the old Down.
+                return;
+            }
+            PreparedPointerDeliveryDisposition::Rejected(handle) => {
+                self.record_issue(SyntheticInputIssue::PointerOwnerMismatch {
+                    handle,
+                    detail: rejection.expect("rejected delivery has a reason"),
+                });
+                return;
+            }
+            PreparedPointerDeliveryDisposition::Delivered => {}
+        }
+        input.events.extend(pointer.step.egui_events());
+        crate::test_script::pointer_input::record_delivery_proof(&pointer, input);
+        if let Some(prepared_frame) = self.prepared.as_mut()
+            && matches!(
+                &prepared_frame.pointer_delivery,
+                PreparedSyntheticPointerDelivery::Pending(cached) if cached.same_payload(&pointer)
+            )
+        {
+            prepared_frame.pointer_delivery = PreparedSyntheticPointerDelivery::Delivered(pointer);
         }
     }
 }
@@ -1347,7 +2529,11 @@ impl egui::Plugin for SyntheticInputPlugin {
         if input.viewport_id == egui::ViewportId::ROOT {
             self.prepare_root(input);
         }
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        self.reject_physical_pointer_mix(input);
         self.inject_prepared(input);
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        self.inject_prepared_pointer(input);
     }
 }
 
@@ -1482,6 +2668,166 @@ pub fn enqueue_synthetic_command(command: SyntheticKeyCommand) -> bool {
         .is_ok()
 }
 
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn enqueue_synthetic_pointer_down(
+    request: SyntheticPointerDownRequest,
+) -> Result<
+    (
+        SyntheticPointerCancelHandle,
+        mpsc::Receiver<Result<SyntheticPointerCompletion, String>>,
+    ),
+    String,
+> {
+    let (reply, completion) = mpsc::sync_channel(1);
+    let cancel_handle = state()
+        .lock()
+        .map_err(|_| "synthetic input state is poisoned".to_string())?
+        .synthetic
+        .queue_pointer_down(request, reply)?;
+    Ok((cancel_handle, completion))
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn enqueue_synthetic_pointer_held(
+    expected_owner: &SyntheticPointerOwner,
+    phase: SyntheticPointerHeldPhase,
+    normalized: [f32; 2],
+) -> Result<
+    (
+        SyntheticPointerCancelHandle,
+        mpsc::Receiver<Result<SyntheticPointerCompletion, String>>,
+    ),
+    String,
+> {
+    let (reply, completion) = mpsc::sync_channel(1);
+    let cancel_handle = state()
+        .lock()
+        .map_err(|_| "synthetic input state is poisoned".to_string())?
+        .synthetic
+        .queue_pointer_held_normalized(expected_owner, phase, normalized, reply)?;
+    Ok((cancel_handle, completion))
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn cancel_synthetic_pointer_step(handle: &SyntheticPointerCancelHandle) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| guard.synthetic.pointer.cancel_handle(handle))
+        .unwrap_or(false)
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn synthetic_pointer_held_snapshot() -> Option<SyntheticPointerHeldSnapshot> {
+    state()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.synthetic.pointer.held_snapshot())
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn synthetic_pointer_obligates_owner(owner: &SyntheticPointerOwner) -> bool {
+    state()
+        .lock()
+        .map(|guard| guard.synthetic.pointer.owner() == Some(owner))
+        .unwrap_or(false)
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn finish_synthetic_pointer_show(tail: SyntheticPointerShowTail) -> Result<(), String> {
+    state()
+        .lock()
+        .map_err(|_| "synthetic input state is poisoned".to_string())?
+        .synthetic
+        .pointer
+        .finish_delivered_show(tail)
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn fail_synthetic_pointer_delivered(
+    expected: &SyntheticPointerCancelHandle,
+    detail: String,
+) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| {
+            guard.synthetic.pointer.fail_delivered(
+                expected,
+                SyntheticPointerFailure::TargetLostDuringCleanup,
+                detail,
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn fail_synthetic_pointer_owner_lost(
+    owner: &SyntheticPointerOwner,
+) -> Option<SyntheticPointerCancelHandle> {
+    state()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.synthetic.pointer.fail_owner_lost(owner))
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+pub(crate) fn acknowledge_synthetic_pointer_terminal_issue(
+    expected: &SyntheticPointerCancelHandle,
+) -> bool {
+    state()
+        .lock()
+        .map(|mut guard| {
+            guard
+                .synthetic
+                .pointer
+                .acknowledge_terminal_failure(expected)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn prepared_synthetic_pointer_step_for_test(
+    step_id: u64,
+    latch: SyntheticPointerLatch,
+    kind: SyntheticPointerStepKind,
+    raw_frame: u64,
+    raw_time_bits: u64,
+) -> PreparedSyntheticPointerStep {
+    PreparedSyntheticPointerStep {
+        raw_frame,
+        raw_time_bits,
+        step: SyntheticPointerStep {
+            step_id,
+            latch,
+            kind,
+            completion: None,
+        },
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn install_synthetic_pointer_terminal_for_test(handle: SyntheticPointerCancelHandle) {
+    let mut guard = state().lock().expect("key input state poisoned");
+    guard.synthetic.armed = true;
+    guard.synthetic.pointer = SyntheticPointerTransaction::TerminalFailure {
+        handle,
+        failure: SyntheticPointerFailure::CleanupDidNotRelease,
+    };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn install_synthetic_pointer_delivered_for_test(
+    mut prepared: PreparedSyntheticPointerStep,
+) -> mpsc::Receiver<Result<SyntheticPointerCompletion, String>> {
+    let (reply, completion) = mpsc::sync_channel(1);
+    prepared.step.completion = Some(reply);
+    state()
+        .lock()
+        .expect("synthetic input state is poisoned")
+        .synthetic
+        .pointer = SyntheticPointerTransaction::DeliveredAwaitingTail(prepared.step);
+    completion
+}
+
 #[cfg(any(test, feature = "test-script"))]
 pub fn set_synthetic_repeat(delay: Duration, hz: f64) -> bool {
     state()
@@ -1508,6 +2854,8 @@ pub fn cancel_synthetic_input(at: Instant) -> bool {
         .map(|mut guard| {
             guard.synthetic.commands.clear();
             guard.synthetic.enqueue(SyntheticKeyCommand::cancel_all(at));
+            #[cfg(all(windows, any(test, feature = "test-script")))]
+            guard.synthetic.pointer.cancel();
         })
         .is_ok()
 }
@@ -2073,6 +3421,15 @@ mod tests {
         physical_key_down_from, pressed_key_down, register_test_synthetic_target,
         resolve_synthetic_routing_target, set_test_frame, set_test_routed_frame,
         set_test_synthetic_repeat, state,
+    };
+    #[cfg(windows)]
+    use super::{
+        PreparedPointerDeliveryDisposition, PreparedSyntheticFrame,
+        PreparedSyntheticPointerDelivery, PreparedSyntheticPointerStep,
+        SyntheticPointerCancelPhase, SyntheticPointerHandlerProof, SyntheticPointerLatch,
+        SyntheticPointerModeSignature, SyntheticPointerOwner, SyntheticPointerRegion,
+        SyntheticPointerShowTail, SyntheticPointerStep, SyntheticPointerStepKind,
+        SyntheticPointerTransaction,
     };
     use std::time::{Duration, Instant};
 
@@ -2775,5 +4132,205 @@ mod tests {
             issue,
             SyntheticInputIssue::FocusLost { viewport: lost } if *lost == viewport
         )));
+    }
+
+    #[cfg(windows)]
+    fn pointer_owner(
+        viewport: egui::ViewportId,
+        context_serial: u64,
+        backend_token: u64,
+    ) -> SyntheticPointerOwner {
+        SyntheticPointerOwner {
+            identity: crate::test_script::TestScriptWindowIdentity::Detached {
+                window_id: context_serial,
+                context_serial,
+                viewport_id: viewport,
+                host_incarnation: context_serial,
+                hwnd: 0x5000 + context_serial,
+                backend_token,
+            },
+            items_generation: 7,
+        }
+    }
+
+    #[cfg(windows)]
+    fn pointer_step(
+        owner: SyntheticPointerOwner,
+        transaction_id: u64,
+        step_id: u64,
+        kind: SyntheticPointerStepKind,
+    ) -> SyntheticPointerStep {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+        SyntheticPointerStep {
+            step_id,
+            latch: SyntheticPointerLatch {
+                transaction_id,
+                owner,
+                region: SyntheticPointerRegion::StillSeekTrack,
+                mode: SyntheticPointerModeSignature {
+                    spread_mode: "Single".to_string(),
+                    reading_flow: "Paged".to_string(),
+                    strip_rtl: false,
+                    seek_bar_rtl: false,
+                    strip_visible: true,
+                    strip_locked: true,
+                    bar_locked: true,
+                },
+                region_geometry_token: 11,
+                press_page_index: 2,
+                press_item_identity: "page-2".to_string(),
+                widget_id: egui::Id::new("pointer-track"),
+                press_rect: rect,
+                coordinate_frame: rect,
+                press_pixels_per_point: 1.0,
+                press_point: rect.center(),
+            },
+            kind,
+            completion: None,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_terminal_failure_accepts_only_its_exact_post_environment_ack() {
+        let viewport = egui::ViewportId::from_hash_of("pointer-terminal-owner");
+        let step = pointer_step(
+            pointer_owner(viewport, 17, 23),
+            5,
+            5_u64 << 32 | 1,
+            SyntheticPointerStepKind::CleanupUp {
+                final_point: egui::pos2(80.0, 30.0),
+            },
+        );
+        let handle = step.cancel_handle();
+        let mut timeline = SyntheticPointerTransaction::Cancelling(
+            SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(step.clone()),
+        );
+        let error = timeline
+            .finish_delivered_show(SyntheticPointerShowTail {
+                step,
+                primary_down: true,
+                handler: SyntheticPointerHandlerProof::Missing,
+            })
+            .expect_err("cleanup with primary still down must fail");
+        assert!(error.contains("did not release"));
+        assert!(timeline.is_terminal_failure(&handle));
+
+        let mut wrong = handle.clone();
+        wrong.transaction_id += 1;
+        assert!(!timeline.acknowledge_terminal_failure(&wrong));
+        assert!(timeline.fail_delivered(
+            &handle,
+            super::SyntheticPointerFailure::CleanupDidNotRelease,
+            error,
+        ));
+        assert!(timeline.acknowledge_terminal_failure(&handle));
+        assert!(timeline.is_idle());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_down_transport_is_stale_in_a_different_live_show() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _cleanup = ClearSyntheticInput;
+        let viewport = egui::ViewportId::from_hash_of("pointer-stale-transport");
+        let old_step = pointer_step(
+            pointer_owner(viewport, 19, 29),
+            7,
+            7_u64 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        let prepared = PreparedSyntheticPointerStep {
+            raw_frame: 3,
+            raw_time_bits: 1.0_f64.to_bits(),
+            step: old_step.clone(),
+        };
+        {
+            let mut input_state = state().lock().expect("key input state poisoned");
+            input_state.synthetic.pointer = SyntheticPointerTransaction::Prepared(old_step);
+            input_state.synthetic.pointer.cancel();
+            assert!(input_state.synthetic.pointer.is_idle());
+        }
+
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(PreparedSyntheticFrame {
+                frame_nr: 3,
+                time_key: super::RawInputTimeKey::from(Some(1.0)),
+                raw_input_time: Some(1.0),
+                batches: Vec::new(),
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                pointer_delivery: PreparedSyntheticPointerDelivery::Pending(prepared),
+            }),
+            ..Default::default()
+        };
+        let context = egui::Context::default();
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&context, viewport, 0x7000);
+        let active_witness = eframe::miv_test_script_window_witness::active()
+            .expect("fixture must publish an active backend witness");
+        let other_owner = pointer_owner(viewport, 20, active_witness.token());
+        let _show = crate::test_script::pointer_input::enter_show(Some(
+            crate::test_script::pointer_input::ShowOwner {
+                identity: other_owner.identity,
+                items_generation: other_owner.items_generation,
+            },
+        ));
+        let mut input = raw_input(viewport, 1.005, true);
+        plugin.inject_prepared_pointer(&mut input);
+
+        assert!(input.events.is_empty());
+        assert!(plugin.issues.is_empty());
+        assert!(matches!(
+            state()
+                .lock()
+                .expect("key input state poisoned")
+                .synthetic
+                .pointer,
+            SyntheticPointerTransaction::Idle
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_delivery_rejects_only_the_current_exact_step() {
+        let viewport = egui::ViewportId::from_hash_of("pointer-delivery-disposition");
+        let current = pointer_step(
+            pointer_owner(viewport, 21, 31),
+            9,
+            9_u64 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        let stale = pointer_step(
+            pointer_owner(viewport, 22, 32),
+            10,
+            10_u64 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        let mut timeline = SyntheticPointerTransaction::Prepared(current.clone());
+        assert_eq!(
+            timeline.resolve_prepared_delivery(&stale, true),
+            PreparedPointerDeliveryDisposition::Stale
+        );
+        assert!(matches!(timeline, SyntheticPointerTransaction::Prepared(_)));
+        assert_eq!(
+            timeline.resolve_prepared_delivery(&current, true),
+            PreparedPointerDeliveryDisposition::Rejected(current.cancel_handle())
+        );
+        assert!(
+            timeline.is_idle(),
+            "an undelivered Down cannot leave a hold"
+        );
     }
 }

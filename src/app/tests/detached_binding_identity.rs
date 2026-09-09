@@ -214,7 +214,13 @@ fn install_detached_item(app: &mut App, ctx: &egui::Context, media: bool) -> u64
             egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         ),
-        from_cache: false,
+        origin: if media {
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
+        } else {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 2,
+            }
+        },
         from_edit_preview: false,
         rendered_at_px: 2,
         source_dims: Some((2, 2)),

@@ -620,10 +620,14 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "漫画",
             "サムネイル",
             "高さ",
+            "最大",
             "大",
             "中",
             "小",
-            "最小"
+            "最小",
+            "個別",
+            "px",
+            "表示倍率"
         ]
     ),
     entry!(
@@ -847,6 +851,37 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "サムネイルストリップ表示中の通常シークバー"
         ]
     ),
+    entry!(
+        "video/seek-steps",
+        Video,
+        "相対シークの秒数",
+        [
+            "動画",
+            "音声",
+            "小",
+            "中",
+            "大",
+            "キー",
+            "マウスボタン",
+            "ゲームパッド",
+            "タップ",
+            "seek"
+        ]
+    ),
+    entry!(
+        "video/normal-wheel",
+        Video,
+        "動画・音声の通常ホイール",
+        [
+            "マウス",
+            "ホイール",
+            "前後のファイル",
+            "音量",
+            "割り当て",
+            "wheel",
+            "volume"
+        ]
+    ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
     entry!(
         "video/start-muted",
@@ -870,7 +905,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "video/seek-strip-height",
         Video,
         "シークストリップの高さ",
-        ["動画", "サムネイル", "大きさ", "枚数", "seek"]
+        ["動画", "最大", "px", "カスタマイズ", "seek"]
     ),
     entry!(
         "video/seek-strip-cycle",
@@ -1229,5 +1264,33 @@ mod tests {
             .expect("the moved recycle-bin setting must remain searchable");
         assert_eq!(result.page, PreferencesPage::Folder);
         assert_eq!(result.page.label(), "フォルダ・ファイル");
+    }
+
+    #[test]
+    fn new_seek_and_wheel_settings_are_searchable_at_their_real_pages() {
+        let seek_steps = search_preferences("シーク 秒数", test_tree_position)
+            .into_iter()
+            .find(|entry| entry.anchor == "video/seek-steps")
+            .expect("相対シークの秒数が検索できる");
+        assert_eq!(seek_steps.page, PreferencesPage::Video);
+
+        let normal_wheel = search_preferences("通常ホイール 音量", test_tree_position)
+            .into_iter()
+            .find(|entry| entry.anchor == "video/normal-wheel")
+            .expect("動画・音声の通常ホイールが検索できる");
+        assert_eq!(normal_wheel.page, PreferencesPage::Video);
+        assert!(PAGES_SOURCE.contains("anchored(ui, state, \"video/normal-wheel\""));
+
+        let video_height = search_preferences("動画 最大 px カスタマイズ", test_tree_position)
+            .into_iter()
+            .find(|entry| entry.anchor == "video/seek-strip-height")
+            .expect("動画シークストリップの段階別高さが検索できる");
+        assert_eq!(video_height.page, PreferencesPage::Video);
+
+        let still_height = search_preferences("サムネイル 高さ 最大", test_tree_position)
+            .into_iter()
+            .find(|entry| entry.anchor == "spread/seek-strip")
+            .expect("静止画サムネイル列の最大高さが検索できる");
+        assert_eq!(still_height.page, PreferencesPage::SpreadMode);
     }
 }

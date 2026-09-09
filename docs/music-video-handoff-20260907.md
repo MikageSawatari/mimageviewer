@@ -1,6 +1,6 @@
 # 音楽ビデオ開発の引き継ぎ監査（2026-09-07）
 
-この文書の §1〜§6 は監査時点の記録、§7 は v3.6.0 取り込みと検証の記録である。
+この文書の §1〜§6 は監査時点の記録、§7 は v3.6.0、§8 は v3.7.0 取り込みと検証の記録である。
 その後のユーザー承認による修正は [編集整合性の実装指示・検証記録](brief-musicvideo-edit-integrity.md)
 を参照。保存・選択は `4ba3b7932`、素材履歴基盤は `91326ca8d`、素材復元・読込中の編集保護は
 `0c24a453e` で修正。歌詞の行対応は `8e12458e4` で実装・独立レビュー・全体テストが完了し、
@@ -187,6 +187,64 @@ Susie はローカル `testdata` が存在するため共有 testdata への fal
 ユーザーが確認する場合は installed/tray 常駐版を終了してから、次を実行する。
 通常の `%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。
 確認対象は本体音楽ビューの鍵盤・横長スペクトラム表示と、音声の再生/seek。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+## 8. v3.7.0 master の取り込み（2026-09-09）
+
+ユーザー依頼により `musicvideo` へローカル master を取り込む。取り込み元は
+`dd997b538e1621f555e4c121ee061a1440ac8e68` で、確認時の master と `v3.7.0^{commit}` は一致した。
+取り込み前は `2a2c5cca90b0b5bdd199b2045bea662b3a989db5`。master への逆マージ・push は行わない。
+
+競合なし。両系統の変更が重なるのは `Cargo.toml`、`Cargo.lock`、`docs/README.md`、
+`src/video/mod.rs` の 4 ファイルで、音楽ビデオの workspace member・依存・CLI・
+`mvexport` 公開と、v3.7.0 の版番号・test-script feature・本体変更が共存することを確認した。
+音楽ビデオ固有の実装は取り込み前と同一。変更のない既存実装の全面再レビューは行わない。
+
+今回の検証担当と独立レビュー担当は別々の GPT-5.6 Sol / xhigh。
+独立レビューは統合設計・自動マージ結果に blocking 指摘なし。従来の Astra レビュー担当へ
+新規依頼は追加していない。親の Astra / medium はユーザー指定であり、実行設定は確認不能。
+既存の指摘・判断・検証記録を継承し、過去の担当モデル記録は履歴として保持する。
+
+未追跡の `out.mp4`（142,988,076 bytes、SHA-256
+`DB5C30F72EB3C69AE920084F2D9AF40D96BF3F62BB06AA511DA7394B1361E165`）は保持し、コミットに含めない。
+アプリ起動・実設定の操作は行わない。取り込んだ `AGENTS.md` と
+[実アプリ検証ルール](interactive-release-verification.md) に従い、実機操作は具体的な検証枠への
+明示承認後に実施する。v3.7.0 リリース時の性能計測 waiver を将来の検証へ拡張しない。
+
+検証ログ: `target/musicvideo-v370-merge-verification/`。
+
+| 統合後の検証 | 結果 |
+| --- | --- |
+| musicvideo core / UI / lab | 73 / 87 / 45 件成功 |
+| 本体 core / mvexport_cli の cargo check | ともに exit 0 |
+| fmt / UI glyph | 成功 / dangerous 0 |
+| test-full.ps1 -SuppressCrashDialogs | exit 0 / PASS、667.69 秒 |
+| 全体ゲート内の本体 lib | 7,638 成功 / 失敗 0 / 34 ignored |
+| UI snapshot / vendored egui-wgpu / eframe | 45 / 9 / 15 件成功 |
+
+全体ゲートの workspace・integration・doctest を含めて失敗なし。今回追加のコード修正なし。
+上記は v3.7.0 単体のリリース記録の転記ではなく、音楽ビデオとの統合ツリーでの新規検証。
+実音声・IME・GPU/表示・操作感は実機未確認であり、自動テスト成功と区別する。
+過去の無変調ハッシュ `077ad307e7676c3b` の再取得は今回も行っていない。
+
+確認用ビルドも成功した（いずれもエージェント未起動）。
+
+- `cargo build --release -p musicvideo_lab`: exit 0、40.53 秒。
+- `.\scripts\build-dev.ps1`: exit 0 / DONE、366.65 秒。normal feature set の core / remote を生成。
+
+ラボの確認対象は画像・音声差し替えと Undo/Redo、歌詞編集・IME、レイヤーとキーフレームの選択。
+
+```powershell
+cd C:\home\mimageviewer-musicvideo
+Start-Process -FilePath .\target\release\musicvideo_lab.exe
+```
+
+本体の確認対象は音楽ビューの鍵盤・横長スペクトラムと再生/seek。installed/tray 版を終了してから
+次を起動する。単一起動の仕組みを共有し、通常の `%APPDATA%\mimageviewer` を使うため
+実設定・データを更新し得る。
 
 ```powershell
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe

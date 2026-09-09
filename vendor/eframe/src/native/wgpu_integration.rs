@@ -763,7 +763,23 @@ impl WgpuWinitRunning<'_> {
 
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
-        let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        let callback_window = shared
+            .borrow()
+            .viewports
+            .get(&viewport_id)
+            .and_then(|viewport| viewport.window.clone());
+        let full_output = {
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
+                &integration.egui_ctx,
+                viewport_id,
+                callback_window.as_ref(),
+            );
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            drop(callback_window);
+            integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input)
+        };
 
         // ------------------------------------------------------------
 
@@ -1188,6 +1204,12 @@ fn render_immediate_viewport(
     let input_max_tex = input.max_texture_side;
     let input_ms = t_all.elapsed().as_secs_f64() * 1000.0;
     let egui_ctx = shared.borrow().egui_ctx.clone();
+    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+    let callback_window = shared
+        .borrow()
+        .viewports
+        .get(&ids.this)
+        .and_then(|viewport| viewport.window.clone());
 
     // ------------------------------------------
 
@@ -1202,6 +1224,14 @@ fn render_immediate_viewport(
         viewport_output,
     } = {
         let t_run = Instant::now();
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
+            &egui_ctx,
+            ids.this,
+            callback_window.as_ref(),
+        );
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        drop(callback_window);
         let output = egui_ctx.run(input, |ctx| {
             viewport_ui_cb(ctx);
         });

@@ -28,6 +28,10 @@ pub struct VersionHighlights {
 /// テーブルと移行判定が別々の版文字列を持たないための単一の定義元。
 pub const GRID_CLICK_SELECTION_EXPLORER_VERSION: &str = "2.9.0";
 
+/// 見開きの final pipeline 先読み既定値を広げる告知エントリの版。
+/// テーブルと移行判定が別々の版文字列を持たないための単一の定義元。
+pub const AI_PREFETCH_SPREAD_DEFAULT_VERSION: &str = "3.7.0";
+
 /// バージョン文字列を `(major, minor, patch)` に緩くパースする。
 /// `v` 接頭辞と `-pre` / `+meta` 接尾辞は無視する。パースできなければ `None`
 /// (= 呼び出し側は fail-safe にスキップする)。
@@ -94,6 +98,14 @@ pub fn grid_click_selection_explorer_upgrade_required(prev: Option<&str>, curren
     highlights_to_show(prev, current, table())
         .iter()
         .any(|entry| entry.version == GRID_CLICK_SELECTION_EXPLORER_VERSION)
+}
+
+/// v3.7.0 の告知と同じ更新範囲に入った初回起動かを返す。
+/// 独自の版比較は持たず、実際に表示対象となるエントリ集合から直接導出する。
+pub fn ai_prefetch_spread_default_upgrade_required(prev: Option<&str>, current: &str) -> bool {
+    highlights_to_show(prev, current, table())
+        .iter()
+        .any(|entry| entry.version == AI_PREFETCH_SPREAD_DEFAULT_VERSION)
 }
 
 /// 指定バージョン (= 通常は現行版) のエントリを返す。ヘルプメニューからの再表示用。
@@ -779,6 +791,14 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: AI_PREFETCH_SPREAD_DEFAULT_VERSION,
+        must_read: &[HighlightItem {
+            title: "見開きの AI・カラー化先読みを広げました",
+            body: "次の見開きの両ページを準備できるよう、先読みの既定値を前方 3・後方 2 へ変更しました。旧既定の前方 2 は更新時に一度 3 へ変わります。保存済みの後方値は変更しません。前方 2 へ戻す場合は、環境設定 → パフォーマンス → 先読みで変更できます。",
+        }],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -920,6 +940,44 @@ mod tests {
                 "prev={prev:?}, current={current}"
             );
         }
+    }
+
+    #[test]
+    fn v3_7_ai_prefetch_upgrade_uses_the_highlight_selection_condition() {
+        for (prev, current) in [
+            (None, "3.7.0"),
+            (Some("3.6.0"), "3.6.0"),
+            (Some("3.6.0"), "3.7.0"),
+            (Some("3.6.0"), "3.8.0"),
+            (Some("3.7.0"), "3.8.0"),
+            (Some("3.8.0"), "3.7.0"),
+            (Some("invalid"), "3.7.0"),
+        ] {
+            let highlight_selected = highlights_to_show(prev, current, table())
+                .iter()
+                .any(|entry| entry.version == AI_PREFETCH_SPREAD_DEFAULT_VERSION);
+            assert_eq!(
+                ai_prefetch_spread_default_upgrade_required(prev, current),
+                highlight_selected,
+                "prev={prev:?}, current={current}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_table_contains_v3_7_ai_prefetch_must_read_entry() {
+        let entries = for_version(AI_PREFETCH_SPREAD_DEFAULT_VERSION, table());
+        assert_eq!(versions(&entries), [AI_PREFETCH_SPREAD_DEFAULT_VERSION]);
+        let entry = entries[0];
+        assert!(entry.highlights.is_empty());
+        let notice = entry
+            .must_read
+            .iter()
+            .find(|item| item.title.contains("AI・カラー化先読み"))
+            .expect("v3.7.0 must announce the final-pipeline prefetch default change");
+        assert!(notice.body.contains("前方 3・後方 2"));
+        assert!(notice.body.contains("旧既定の前方 2"));
+        assert!(notice.body.contains("保存済みの後方値は変更しません"));
     }
 
     #[test]
