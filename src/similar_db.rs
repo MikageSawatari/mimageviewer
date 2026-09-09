@@ -216,6 +216,8 @@ pub(crate) struct BookReadMetadata {
 /// errors for the caller to publish as `Failed`.
 pub(crate) struct SimilarBookReader {
     conn: Connection,
+    #[cfg(test)]
+    phase_probe: Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>>,
 }
 
 /// Failure from the dedicated book reader.
@@ -371,7 +373,19 @@ impl SimilarBookReader {
         // explicit instead of inheriting the writer's 180-second migration timeout.
         conn.busy_timeout(BOOK_READER_BUSY_TIMEOUT)
             .map_err(BookReadError::Database)?;
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            #[cfg(test)]
+            phase_probe: None,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_phase_probe(
+        &mut self,
+        probe: Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>,
+    ) {
+        self.phase_probe = Some(probe);
     }
 
     /// Runs `read` inside one deferred SQLite read transaction.
@@ -390,9 +404,19 @@ impl SimilarBookReader {
     {
         let transaction = self.conn.transaction().map_err(BookReadError::Database)?;
         let progress_cancel = Arc::clone(&cancel);
+        #[cfg(test)]
+        let phase_probe = self.phase_probe.clone();
         transaction.progress_handler(
             BOOK_READER_PROGRESS_OPS,
-            Some(move || progress_cancel.load(Ordering::Acquire)),
+            Some(move || {
+                #[cfg(test)]
+                if let Some(probe) = phase_probe.as_ref() {
+                    probe.checkpoint(
+                        crate::similar_book_query_test_probe::BookQueryTestPhase::SqlProgress,
+                    );
+                }
+                progress_cancel.load(Ordering::Acquire)
+            }),
         );
         let transaction = CancellableReadTransaction {
             transaction: Some(transaction),

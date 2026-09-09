@@ -1327,6 +1327,15 @@ impl App {
                 "state_active_entry",
             );
         }
+        if matches!(
+            transition.to,
+            DetachedWindowState::Parked | DetachedWindowState::ParkedLive
+        ) && let Some((owner, _)) = self.locate_window_context(window_id)
+        {
+            let _ = self.with_viewer_context_ref(owner, |context| {
+                context.similar_panel().retain_book_query();
+            });
+        }
     }
 
     pub(crate) fn detached_window_state(&self, window_id: u64) -> Option<DetachedWindowState> {
@@ -3340,12 +3349,6 @@ pub(crate) struct PinnedCompareSlot {
     pub(crate) source_size: [usize; 2],
 }
 
-/// 類似パネルの「長押し表示」で覗き見している対象と、離したときに戻す表示状態。
-pub(crate) struct SimilarPeek {
-    pub(crate) item_key: String,
-    pub(crate) restore_mode: CompareViewMode,
-}
-
 pub(crate) struct ComparePinResult {
     pub(crate) basename: String,
     pub(crate) width: u32,
@@ -4450,6 +4453,18 @@ pub(crate) struct FolderPaneOpenPending {
     purpose: FolderOpenScanPurpose,
 }
 
+impl FolderPaneOpenPending {
+    /// Cancel the scan and retire any diagnostic span owned by its typed purpose.
+    /// The worker and the trace have the same lifetime; dropping either one separately
+    /// leaves an admitted Similar-panel action without a terminal event.
+    pub(crate) fn cancel_with_diagnostic(&mut self, reason: &'static str) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(trace) = self.purpose.take_diagnostic_trace() {
+            trace.terminal(reason);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CurrentViewOrderSnapshot {
     sort_order: crate::settings::SortOrder,
@@ -4486,12 +4501,41 @@ pub(crate) enum FolderOpenScanPurpose {
     RequiredFullscreenTarget {
         target: crate::snapshot::SnapshotTarget,
         history_trigger: HistoryTrigger,
+        navigation_purpose: FsNavigationPurpose,
     },
     /// 現在の物理フォルダを、変更済みの表示順設定で再構築するための事前走査。
     /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
     CurrentViewOrderRefresh {
         order: CurrentViewOrderSnapshot,
     },
+}
+
+impl FolderOpenScanPurpose {
+    fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
+        match self {
+            Self::RequiredFullscreenTarget {
+                navigation_purpose, ..
+            } => navigation_purpose.diagnostic_trace(),
+            Self::PaneNavigation
+            | Self::GridFolderCandidate
+            | Self::DetachedFolder
+            | Self::DetachedImage { .. }
+            | Self::CurrentViewOrderRefresh { .. } => None,
+        }
+    }
+
+    fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
+        match self {
+            Self::RequiredFullscreenTarget {
+                navigation_purpose, ..
+            } => navigation_purpose.take_diagnostic_trace(),
+            Self::PaneNavigation
+            | Self::GridFolderCandidate
+            | Self::DetachedFolder
+            | Self::DetachedImage { .. }
+            | Self::CurrentViewOrderRefresh { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4506,6 +4550,14 @@ pub(crate) struct FolderPaneOpenReady {
     path: PathBuf,
     scan: std::io::Result<ScannedDir>,
     purpose: FolderOpenScanPurpose,
+}
+
+impl FolderPaneOpenReady {
+    fn finish_diagnostic(&mut self, reason: &'static str) {
+        if let Some(trace) = self.purpose.take_diagnostic_trace() {
+            trace.terminal(reason);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -8259,6 +8311,17 @@ impl FsHoldover {
         }
     }
 
+    pub(crate) fn take_navigation_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
+        self.navigation_sequence_mut()
+            .and_then(|sequence| sequence.purpose.take_diagnostic_trace())
+    }
+
+    pub(crate) fn finish_navigation_diagnostic(&mut self, reason: &'static str) {
+        if let Some(trace) = self.take_navigation_diagnostic_trace() {
+            trace.terminal(reason);
+        }
+    }
+
     pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
             Self::FolderNavigation(_)
@@ -8364,9 +8427,277 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
 pub(crate) struct FsNavigationSequence {
     /// None is permitted only when the viewer genuinely had no material to hold.
     pub(crate) previous: Option<FsDisplayUnitHoldover>,
+    /// Display chrome that belonged to the accepted source presentation. Geometry and mutable
+    /// panel state are deliberately excluded: every deferred draw resolves those from its own
+    /// current viewport and the live viewer context.
+    pub(crate) chrome: FsNavigationChromeContinuation,
+    /// Why this display target was accepted. Similar-book visits carry their exact source and
+    /// destination until the renderer proves the destination was presented; ordinary navigation
+    /// is committed against the live page only after the same presentation boundary.
+    pub(crate) purpose: FsNavigationPurpose,
     /// When this accepted navigation target began waiting to be presented.
     pub(crate) opened_at: std::time::Instant,
     pub(crate) target: FsNavigationSequenceTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsNavigationPurpose {
+    Ordinary,
+    SimilarBookVisit(SimilarBookNavigationIntent),
+}
+
+impl FsNavigationPurpose {
+    pub(crate) fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
+        match self {
+            Self::Ordinary => None,
+            Self::SimilarBookVisit(intent) => intent.diagnostic_trace.as_ref(),
+        }
+    }
+
+    pub(crate) fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
+        match self {
+            Self::Ordinary => None,
+            Self::SimilarBookVisit(intent) => intent.diagnostic_trace.take(),
+        }
+    }
+}
+
+static NEXT_SIMILAR_MOVE_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+static SIMILAR_MOVE_TERMINALS_FOR_TEST: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(u64, &'static str)>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SimilarMoveSource {
+    BookButton,
+    ItemCard,
+    ItemButton,
+    HistoryButton,
+}
+
+impl SimilarMoveSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BookButton => "book_button",
+            Self::ItemCard => "item_card",
+            Self::ItemButton => "item_button",
+            Self::HistoryButton => "history_button",
+        }
+    }
+}
+
+/// One opt-in diagnostic span for an explicit move from the Similar panel.
+///
+/// It is created only while the perf log is enabled. The digest is an opaque, path-free token
+/// for correlating the pointer, dispatch, asynchronous load and final presentation events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SimilarMoveTrace {
+    pub(crate) id: u64,
+    pub(crate) source: SimilarMoveSource,
+    pub(crate) target_digest: [u8; 16],
+}
+
+impl SimilarMoveTrace {
+    /// Allocate one path-free correlation token. Callers gate this with one panel-frame
+    /// `perf::is_enabled` read so disabled diagnostics add no hashing or clock work per row.
+    pub(crate) fn digest_for_target(target: Option<&crate::snapshot::SnapshotTarget>) -> [u8; 16] {
+        use sha2::{Digest, Sha256};
+
+        fn add_part(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        match target {
+            Some(crate::snapshot::SnapshotTarget::Fs(path)) => {
+                add_part(&mut hasher, b"fs");
+                add_part(
+                    &mut hasher,
+                    crate::search_index_db::normalize_path(path).as_bytes(),
+                );
+            }
+            Some(crate::snapshot::SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            }) => {
+                add_part(&mut hasher, b"zip");
+                add_part(
+                    &mut hasher,
+                    crate::search_index_db::normalize_path(zip_path).as_bytes(),
+                );
+                add_part(&mut hasher, entry_name.as_bytes());
+            }
+            Some(crate::snapshot::SnapshotTarget::PdfPage { pdf_path, page_num }) => {
+                add_part(&mut hasher, b"pdf");
+                add_part(
+                    &mut hasher,
+                    crate::search_index_db::normalize_path(pdf_path).as_bytes(),
+                );
+                add_part(&mut hasher, &page_num.to_le_bytes());
+            }
+            Some(crate::snapshot::SnapshotTarget::ConvertibleArchive { path, format }) => {
+                add_part(&mut hasher, b"convertible");
+                add_part(
+                    &mut hasher,
+                    crate::search_index_db::normalize_path(path).as_bytes(),
+                );
+                add_part(&mut hasher, format!("{format:?}").as_bytes());
+            }
+            None => add_part(&mut hasher, b"unavailable"),
+        }
+        let digest = hasher.finalize();
+        let mut target_digest = [0_u8; 16];
+        target_digest.copy_from_slice(&digest[..16]);
+        target_digest
+    }
+
+    pub(crate) fn new(
+        source: SimilarMoveSource,
+        target: Option<&crate::snapshot::SnapshotTarget>,
+    ) -> Self {
+        Self {
+            id: NEXT_SIMILAR_MOVE_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+            source,
+            target_digest: Self::digest_for_target(target),
+        }
+    }
+
+    pub(crate) fn emit(&self, kind: &'static str, extras: &[(&str, serde_json::Value)]) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let digest = self
+            .target_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut fields = Vec::with_capacity(extras.len() + 2);
+        fields.push(("source", serde_json::Value::from(self.source.as_str())));
+        fields.push(("target_token", serde_json::Value::from(digest)));
+        fields.extend_from_slice(extras);
+        crate::perf::event("similar_move", kind, None, self.id, &fields);
+    }
+
+    pub(crate) fn terminal(self, reason: &'static str) {
+        self.emit("terminal", &[("reason", serde_json::Value::from(reason))]);
+        #[cfg(test)]
+        SIMILAR_MOVE_TERMINALS_FOR_TEST
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((self.id, reason));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_reasons_for_test(id: u64) -> Vec<&'static str> {
+        SIMILAR_MOVE_TERMINALS_FOR_TEST
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(recorded_id, reason)| (*recorded_id == id).then_some(*reason))
+            .collect()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SimilarBookNavigationIntent {
+    pub(crate) origin: SimilarBookLocation,
+    pub(crate) destination: SimilarBookLocation,
+    pub(crate) diagnostic_trace: Option<SimilarMoveTrace>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SimilarBookLocation {
+    pub(crate) container_key: String,
+    pub(crate) page: crate::snapshot::SnapshotTarget,
+}
+
+impl SimilarBookLocation {
+    pub(crate) fn from_grid_item(item: &crate::grid_item::GridItem) -> Option<Self> {
+        Some(Self {
+            container_key: similar_index_container_key(item)?,
+            page: crate::snapshot::snapshot_target_from_grid_item(item)?,
+        })
+    }
+
+    pub(crate) fn from_destination(page: crate::snapshot::SnapshotTarget) -> Option<Self> {
+        let container_path = match &page {
+            crate::snapshot::SnapshotTarget::Fs(path) => path.parent()?,
+            crate::snapshot::SnapshotTarget::ZipImage { zip_path, .. } => zip_path,
+            crate::snapshot::SnapshotTarget::PdfPage { pdf_path, .. } => pdf_path,
+            crate::snapshot::SnapshotTarget::ConvertibleArchive { .. } => return None,
+        };
+        Some(Self {
+            container_key: crate::search_index_db::normalize_path(container_path),
+            page,
+        })
+    }
+
+    pub(crate) fn matches_grid_item(&self, item: &crate::grid_item::GridItem) -> bool {
+        similar_index_container_key(item).as_deref() == Some(self.container_key.as_str())
+            && snapshot_target_matches_grid_item(&self.page, item)
+    }
+}
+
+fn snapshot_target_matches_grid_item(
+    target: &crate::snapshot::SnapshotTarget,
+    item: &crate::grid_item::GridItem,
+) -> bool {
+    use crate::grid_item::GridItem;
+    use crate::snapshot::SnapshotTarget;
+
+    match (target, item) {
+        (SnapshotTarget::Fs(expected), GridItem::Image(actual) | GridItem::Video(actual)) => {
+            crate::folder_tree::path_eq(expected, actual)
+        }
+        (
+            SnapshotTarget::ZipImage {
+                zip_path: expected_path,
+                entry_name: expected_entry,
+            },
+            GridItem::ZipImage {
+                zip_path: actual_path,
+                entry_name: actual_entry,
+            },
+        ) => {
+            crate::folder_tree::path_eq(expected_path, actual_path)
+                && expected_entry == actual_entry
+        }
+        (
+            SnapshotTarget::PdfPage {
+                pdf_path: expected_path,
+                page_num: expected_page,
+            },
+            GridItem::PdfPage {
+                pdf_path: actual_path,
+                page_num: actual_page,
+                ..
+            },
+        ) => {
+            crate::folder_tree::path_eq(expected_path, actual_path) && expected_page == actual_page
+        }
+        (SnapshotTarget::Fs(_), _)
+        | (SnapshotTarget::ZipImage { .. }, _)
+        | (SnapshotTarget::PdfPage { .. }, _)
+        | (SnapshotTarget::ConvertibleArchive { .. }, _) => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsNavigationChromeContinuation {
+    None,
+    Still(FsNavigationStillChromeInputs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FsNavigationStillChromeInputs {
+    pub(crate) top_bar_eligible: bool,
+    pub(crate) seek_eligible: bool,
+    pub(crate) strip_has_content: bool,
+    pub(crate) info_panel_eligible: bool,
 }
 
 impl FsNavigationSequence {
@@ -8457,7 +8788,10 @@ pub(crate) enum FsNavigationSequenceTarget {
 pub(crate) enum FsNavigationSequenceFinish {
     /// A newer viewer-internal request replaces this sequence, so panel ownership continues.
     Superseded,
-    /// No replacement viewer will open; this is the real end of the viewer lifetime.
+    /// The accepted target failed or was cancelled. Viewer-owned work stops, while completed
+    /// similar-book history remains attached to this context until a later presentation or close.
+    RequestFailed,
+    /// The user or owning context explicitly ended this viewer session.
     ViewerExited,
 }
 
@@ -11315,6 +11649,9 @@ pub struct App {
     /// entry はこの bundle の items_generation を刻み、全参照で照合する。
     pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
     pub(crate) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
+    /// Persistent flat/panorama navigator input belongs to the mounted viewer context.
+    pub(crate) fullscreen_navigator_interaction:
+        crate::ui_fullscreen::FullscreenNavigatorInteractionOwner,
     /// raw Static 画素の近モノクロ要約。TextureId が source identity を兼ねるため、
     /// 再デコードや PDF 再レンダ後の古い値は lookup 時に自然に stale になる。
     pub(crate) colorize_mono_summary_cache: std::collections::HashMap<usize, ColorizeMonoSummary>,
@@ -11813,8 +12150,6 @@ pub struct App {
     /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
-    /// 類似パネルの「長押し表示」で覗き見している最中の状態。押している間だけ Some。
-    pub(crate) similar_peek: Option<SimilarPeek>,
     pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
     pub(crate) compare_preparation: ComparePreparationState,
@@ -14570,8 +14905,16 @@ impl App {
     }
 
     pub fn new_from_settings_with_load_meta(
+        settings: crate::settings::Settings,
+        load_meta: crate::settings::SettingsLoadMeta,
+    ) -> Self {
+        Self::new_from_settings_with_load_meta_and_book_query_repaint(settings, load_meta, || {})
+    }
+
+    pub(crate) fn new_from_settings_with_load_meta_and_book_query_repaint(
         mut settings: crate::settings::Settings,
         load_meta: crate::settings::SettingsLoadMeta,
+        notify_book_query_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
         // VST3 を強制 OFF にする。設定 DB に true が残っていても (例: 通常版の設定を流用)
@@ -15087,6 +15430,8 @@ impl App {
             native_video_parked_live_activation_requests: Vec::new(),
             fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
+            fullscreen_navigator_interaction:
+                crate::ui_fullscreen::FullscreenNavigatorInteractionOwner::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
             view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
@@ -15179,7 +15524,10 @@ impl App {
             fav_add_auto_index_thumbs: false,
             fav_add_auto_index_similar: false,
             indexer_manager,
-            similar_index: crate::similar_index::SimilarIndexManager::new(crate::data_dir::get()),
+            similar_index: crate::similar_index::SimilarIndexManager::new_with_book_query_notifier(
+                crate::data_dir::get(),
+                notify_book_query_change,
+            ),
             name_index_supervisors: std::collections::HashMap::new(),
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
@@ -15273,7 +15621,6 @@ impl App {
             folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
-            similar_peek: None,
             compare_pin_load_pending: None,
             compare_pin_pending: None,
             compare_preparation: ComparePreparationState::Unprepared,
@@ -21009,10 +21356,12 @@ impl App {
         &self,
         item: &GridItem,
     ) -> std::sync::Arc<crate::similar_index::BookQuery> {
+        let client = self.similar_panel.book_query_client();
         let Some(key) = similar_index_container_key(item) else {
+            self.similar_index.withdraw_book_query(client);
             return std::sync::Arc::new(crate::similar_index::BookQuery::NotBook);
         };
-        self.similar_index.query_book(&key)
+        self.similar_index.query_book(client, &key)
     }
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
@@ -23440,7 +23789,7 @@ impl App {
             // 放置すると grid 抑止 / holdover 維持が永続化するので明示的に破棄する
             // (PDF 側 cancel ガードと対称)。
             self.fs_nav_after_pdf_enumerate = None;
-            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
             return;
         }
         let result = match pending.rx.try_recv() {
@@ -23451,7 +23800,7 @@ impl App {
                 self.zip_enumerate_pending = None;
                 // ワーカー切断ではフルスクリーン復帰が起きない: defer フラグを破棄。
                 self.fs_nav_after_pdf_enumerate = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -23488,7 +23837,7 @@ impl App {
                 // (line 6142 の `.take()` には到達しない早期 return パス)。
                 self.fs_nav_after_pdf_enumerate = None;
                 self.archive_auto_fs_paint_trace = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -24392,10 +24741,10 @@ impl App {
         match outcome {
             DeferredFsOpenOutcome::Opened => {}
             DeferredFsOpenOutcome::NoPlayableItem => {
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
             }
             DeferredFsOpenOutcome::RequiredTargetMissing => {
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 self.show_feedback_toast("移動先の画像が見つかりません".to_string());
             }
         }
@@ -24508,7 +24857,7 @@ impl App {
             // `poll_fs_nav_lock` の defer 経路がフラグを見て永続的に grid を抑止する
             // (= UI フリーズに見える)。明示的に破棄する。
             self.fs_nav_after_pdf_enumerate = None;
-            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
             return;
         }
 
@@ -24521,7 +24870,7 @@ impl App {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 self.start_loading_items(
                     path,
                     Vec::new(),
@@ -24550,7 +24899,7 @@ impl App {
                 // cancel 経路でもフルスクリーン復帰はもう起きないので defer フラグを破棄する。
                 // 残すと grid 抑止 / holdover 維持が永続化して UI フリーズに見える。
                 self.fs_nav_after_pdf_enumerate = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 return;
             }
         }
@@ -24729,7 +25078,7 @@ impl App {
                 // グリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
                 self.start_loading_items(
                     pdf_path,
                     Vec::new(),
@@ -24765,7 +25114,7 @@ impl App {
         // が `items_generation <= locked_gen` で永久にロック解除しない
         // (= holdover が居座る)。明示オープン由来の reopen は残す場合でも、
         // パスワード入力中の nav lock はここで解放する。
-        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
     }
 
     pub(crate) fn pdf_password_dialog_path(&self) -> Option<PathBuf> {
@@ -24840,7 +25189,7 @@ impl App {
         }
         self.pdf_password_pending_save = None;
         self.fs_nav_after_pdf_enumerate = None;
-        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
         self.restore_rating_filter_suppression();
         true
     }
@@ -37301,20 +37650,22 @@ impl App {
         folder_path: PathBuf,
         target: crate::snapshot::SnapshotTarget,
         history_trigger: HistoryTrigger,
+        navigation_purpose: FsNavigationPurpose,
     ) {
         self.start_folder_open_scan(
             folder_path,
             FolderOpenScanPurpose::RequiredFullscreenTarget {
                 target,
                 history_trigger,
+                navigation_purpose,
             },
         );
     }
 
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
-        if let Some(prev) = self.folder_pane_open_pending.take() {
-            prev.cancel.store(true, Ordering::Relaxed);
+        if let Some(mut prev) = self.folder_pane_open_pending.take() {
+            prev.cancel_with_diagnostic("scan_replaced");
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -37342,13 +37693,23 @@ impl App {
             rx,
             purpose,
         });
+        if let Some(trace) = self
+            .folder_pane_open_pending
+            .as_ref()
+            .and_then(|pending| pending.purpose.diagnostic_trace())
+        {
+            trace.emit(
+                "route_admitted",
+                &[("route", serde_json::Value::from("physical_scan"))],
+            );
+        }
     }
 
     /// 進行中のフォルダペイン open scan をキャンセルして破棄する。
     /// 別の nav 源 (アドレスバー / Ctrl+↑↓ / グリッド) が勝ったときに呼ぶ。
     fn cancel_folder_pane_open(&mut self) {
-        if let Some(prev) = self.folder_pane_open_pending.take() {
-            prev.cancel.store(true, Ordering::Relaxed);
+        if let Some(mut prev) = self.folder_pane_open_pending.take() {
+            prev.cancel_with_diagnostic("scan_cancelled");
         }
     }
 
@@ -37403,15 +37764,40 @@ impl App {
                 // Normal cancellation takes the pending owner before the sender disappears.
                 // A still-owned disconnected channel is therefore an abnormal worker exit and
                 // must complete an exact fullscreen request through its normal failure boundary.
-                let pending = self.folder_pane_open_pending.take().unwrap();
+                let mut pending = self.folder_pane_open_pending.take().unwrap();
                 if matches!(
                     pending.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
                 ) {
+                    if let Some(trace) = pending.purpose.take_diagnostic_trace() {
+                        trace.terminal("scan_disconnected");
+                    }
                     self.finish_required_fullscreen_folder_scan_failure();
                 }
                 None
             }
+        }
+    }
+
+    /// The embedded fullscreen path returns before the ordinary main-navigation tail. Complete
+    /// only its exact Similar-panel scan here, after the fullscreen renderer has given same-frame
+    /// close and page navigation their normal opportunity to cancel or supersede it.
+    ///
+    /// Pane/grid/refresh scans remain owned by the ordinary tail so this early-return seam cannot
+    /// change their navigation priority. An empty receiver requests another ROOT repaint through
+    /// `poll_folder_pane_open`, keeping the worker completion pump alive without a second wake flag.
+    #[cfg(windows)]
+    fn poll_main_embedded_required_fullscreen_folder_open(&mut self, ctx: &egui::Context) {
+        if !matches!(
+            self.folder_pane_open_pending
+                .as_ref()
+                .map(|pending| &pending.purpose),
+            Some(FolderOpenScanPurpose::RequiredFullscreenTarget { .. })
+        ) {
+            return;
+        }
+        if let Some(ready) = self.poll_folder_pane_open(ctx) {
+            let _ = self.resolve_main_folder_open_ready(ctx, ready);
         }
     }
 
@@ -37450,6 +37836,9 @@ impl App {
                     &ready.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
                 ) {
+                    if let Some(trace) = ready.purpose.diagnostic_trace().cloned() {
+                        trace.terminal("scan_error");
+                    }
                     self.finish_required_fullscreen_folder_scan_failure();
                 }
                 return None;
@@ -37510,6 +37899,7 @@ impl App {
             FolderOpenScanPurpose::RequiredFullscreenTarget {
                 target,
                 history_trigger,
+                navigation_purpose,
             } => {
                 self.open_required_fullscreen_from_completed_scan(
                     ctx,
@@ -37517,6 +37907,7 @@ impl App {
                     scan,
                     target,
                     history_trigger,
+                    navigation_purpose,
                 );
                 None
             }
@@ -37569,6 +37960,9 @@ impl App {
                     ready.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
                 ) {
+                    if let Some(trace) = ready.purpose.diagnostic_trace().cloned() {
+                        trace.terminal("scan_error");
+                    }
                     self.finish_required_fullscreen_folder_scan_failure();
                 }
                 return DetachedPhysicalFolderOpenPoll::Failed;
@@ -37635,6 +38029,7 @@ impl App {
             FolderOpenScanPurpose::RequiredFullscreenTarget {
                 target,
                 history_trigger,
+                navigation_purpose,
             } => {
                 self.open_required_fullscreen_from_completed_scan(
                     ctx,
@@ -37642,6 +38037,7 @@ impl App {
                     scan,
                     target,
                     history_trigger,
+                    navigation_purpose,
                 );
                 DetachedPhysicalFolderOpenPoll::Applied
             }
@@ -40078,6 +40474,9 @@ impl App {
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
+        self.invalidate_similar_preview();
+        self.fullscreen_navigator_interaction
+            .end_pointer_gesture_for_park();
         self.clear_fullscreen_tag_picker_state();
 
         self.deactivate_compare_view();
@@ -54567,6 +54966,9 @@ impl App {
                     if !sequence.continues_viewer_during_content_teardown()
             )
         {
+            if let Some(holdover) = self.fs_holdover_tex.as_mut() {
+                holdover.finish_navigation_diagnostic("navigation_released");
+            }
             self.fs_holdover_tex = None;
         }
         let closing_for_folder_nav_reopen =
@@ -54594,6 +54996,10 @@ impl App {
         // `release_fs_nav_lock()` が走って None になるので、本当の終了として扱われる。
         if !closing_for_folder_nav_reopen {
             self.fs_info_panel.on_fullscreen_exit();
+            if cf_was_open {
+                self.similar_panel.withdraw_book_query();
+                self.similar_panel.clear_book_history();
+            }
         }
         self.fullscreen_idx = None;
         self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
@@ -63261,6 +63667,8 @@ impl App {
         // 変わるこの境界が持つ。Hover パネル外で mouse-up した場合や、同フレームに
         // ナビゲーションした場合も旧ページの dirty 値を確定してから idx を切り替える。
         self.persist_pending_view_trim_state();
+        self.invalidate_similar_preview();
+        self.fullscreen_navigator_interaction.invalidate();
         self.close_fs_side_panel_runtime();
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
     }
@@ -71285,6 +71693,7 @@ impl App {
                     self.poll_zip_enumerate();
                     self.poll_fs_nav_lock(ctx);
                 }
+                self.poll_main_embedded_required_fullscreen_folder_open(ctx);
                 if self.archive_convert.is_some() {
                     self.show_archive_convert_dialog(ctx);
                 }
@@ -72003,6 +72412,9 @@ impl App {
                 // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで
                 // 固まるのを防ぐ)。同期 load はせず、完了後に通常 nav 優先順位で裁定する。
                 // 対象は実ディレクトリ前提。
+                if let Some(mut replaced) = folder_pane_open_ready.take() {
+                    replaced.finish_diagnostic("ready_replaced");
+                }
                 self.start_folder_pane_open(p);
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
@@ -72607,6 +73019,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
+        self.poll_similar_preview_workers_in_all_contexts(ctx);
         self.update_frame(ctx, frame);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::finish_action_pass(ctx);
@@ -74503,6 +74916,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 mod similar_navigation_tests;
+#[cfg(all(test, windows))]
+mod similar_preview_context_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

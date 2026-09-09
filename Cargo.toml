@@ -17,10 +17,16 @@ members = [
     "tools/seek_strip_probe",
     "tools/viewer_context_audit",
 ]
-exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
+exclude = [
+    "crates/unrar-patched",
+    "vendor/eframe",
+    "vendor/egui",
+    "vendor/egui-wgpu",
+]
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
+egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
@@ -151,6 +157,20 @@ required-features = ["dev-tools"]
 name = "clockless_transcode_bench"
 path = "src/bin/clockless_transcode_bench.rs"
 test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_bench"
+path = "src/bin/similar_book_query_bench.rs"
+test = true
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_verify"
+path = "src/bin/similar_book_query_verify.rs"
+test = true
 bench = false
 required-features = ["dev-tools"]
 

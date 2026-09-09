@@ -247,6 +247,8 @@ impl QueryScratch {
 pub(crate) struct BookMihRuntime {
     cache: MihCacheState,
     scratch: QueryScratch,
+    #[cfg(test)]
+    phase_probe: Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>>,
 }
 
 impl BookMihRuntime {
@@ -257,6 +259,21 @@ impl BookMihRuntime {
     pub(crate) fn clear(&mut self) {
         self.cache = MihCacheState::Empty;
         self.scratch.discard_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_phase_probe(
+        &mut self,
+        probe: Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>,
+    ) {
+        self.phase_probe = Some(probe);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_phase_probe(
+        &self,
+    ) -> Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>> {
+        self.phase_probe.clone()
     }
 
     /// Returns a worker-local candidate for the next snapshot selection.
@@ -415,6 +432,8 @@ impl BookMihRuntime {
             signature,
             radius,
             cancelled,
+            #[cfg(test)]
+            self.phase_probe.as_deref(),
             |row| {
                 if derived.snapshot.base_record_is_superseded(row) {
                     None
@@ -435,6 +454,8 @@ impl BookMihRuntime {
             signature,
             radius,
             cancelled,
+            #[cfg(test)]
+            self.phase_probe.as_deref(),
             |row| {
                 derived
                     .snapshot
@@ -464,6 +485,9 @@ fn visit_postings<E>(
     query: &[u8; 32],
     radius: u32,
     cancelled: &mut impl FnMut() -> bool,
+    #[cfg(test)] phase_probe: Option<
+        &crate::similar_book_query_test_probe::BookQueryTestPhaseProbe,
+    >,
     mut record_at: impl FnMut(usize) -> Option<SearchRecord>,
     visitor: &mut impl FnMut(MihHit) -> Result<MihVisitControl, E>,
 ) -> Result<MihVisitCompletion, MihQueryError<E>> {
@@ -483,8 +507,16 @@ fn visit_postings<E>(
                 .ok_or(MihQueryError::CorruptIndex)?;
             for &row in rows {
                 visited_postings += 1;
-                if visited_postings % CANCEL_INTERVAL == 0 && cancelled() {
-                    return Err(MihQueryError::Cancelled);
+                if visited_postings % CANCEL_INTERVAL == 0 {
+                    #[cfg(test)]
+                    if let Some(probe) = phase_probe {
+                        probe.checkpoint(
+                            crate::similar_book_query_test_probe::BookQueryTestPhase::MihPostingScan,
+                        );
+                    }
+                    if cancelled() {
+                        return Err(MihQueryError::Cancelled);
+                    }
                 }
                 let row = row as usize;
                 let mark = marks.get_mut(row).ok_or(MihQueryError::CorruptIndex)?;

@@ -319,9 +319,9 @@ fn metadata_panel_similar_results_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_similar_results_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        // わざと内容より低くして**スクロールする側**を撮る。情報タブ側は収まるので、
-        // 2 枚でバーの有無を跨いだ幅の一致が押さえられる。
-        egui::vec2(400.0, 400.0),
+        // スクロール領域を保ちつつ、本名・識別用パス・明示的な [移動]・帯と次の候補まで
+        // 一枚で確認できる高さにする。情報タブ側は収まるため、2 枚で溝の有無も比較できる。
+        egui::vec2(400.0, 800.0),
         None,
         |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
     );

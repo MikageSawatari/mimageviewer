@@ -1083,6 +1083,18 @@ pub(super) fn apply_normalize_gain_with_perf(
             0,
             &[
                 ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                (
+                    "stream_id",
+                    player
+                        .audio_stream_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    player
+                        .native_source_epoch()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
                 ("gain_db", serde_json::Value::from(new_gain_db as f64)),
                 ("reason", serde_json::Value::from(reason)),
                 ("now", serde_json::Value::from(player.position())),
@@ -1106,6 +1118,18 @@ pub(super) fn apply_normalize_gain_with_perf(
             0,
             &[
                 ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                (
+                    "stream_id",
+                    player
+                        .audio_stream_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    player
+                        .native_source_epoch()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
                 ("now", serde_json::Value::from(player.position())),
             ],
         );
@@ -1113,6 +1137,204 @@ pub(super) fn apply_normalize_gain_with_perf(
 }
 
 impl App {
+    #[cfg(windows)]
+    fn emit_audio_output_binding(
+        &self,
+        fs_idx: usize,
+        reason: &'static str,
+        presentation: ViewerPresentation,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let Some(stream_id) = player.audio_stream_id() else {
+            return;
+        };
+        let source_key = crate::path_key::normalize_keep_drive(player.path());
+        let ui_state = self
+            .normalize_ui_states
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(crate::video::normalize_types::NormalizeUiState::Off);
+        let normalize_state = match ui_state {
+            crate::video::normalize_types::NormalizeUiState::Off => "off",
+            crate::video::normalize_types::NormalizeUiState::OnApplied { .. } => "applied",
+            crate::video::normalize_types::NormalizeUiState::ProvisionalApplied { .. } => {
+                "provisional"
+            }
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured => "unmeasured",
+            crate::video::normalize_types::NormalizeUiState::Scanning => "scanning",
+        };
+        let source_epoch = player.native_source_epoch();
+        let native_placement = source_epoch.map(|_| {
+            format!(
+                "{:?}",
+                Self::viewer_presentation_to_native_video_placement(presentation)
+            )
+        });
+        let scan_active = self.normalize_state.as_ref().is_some_and(|state| {
+            state.fs_idx == fs_idx
+                && crate::path_key::eq_keep_drive(&state.file_path, player.path())
+        });
+        crate::perf::event(
+            "audio_out",
+            "bind",
+            Some(&source_key),
+            self.input_seq,
+            &[
+                ("stream_id", serde_json::Value::from(stream_id)),
+                (
+                    "viewer_context_id",
+                    serde_json::Value::from(self.projected_viewer_context_id().serial()),
+                ),
+                (
+                    "window_id",
+                    self.detached_viewer_window_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                ("fs_idx", serde_json::Value::from(fs_idx as u64)),
+                ("reason", serde_json::Value::from(reason)),
+                (
+                    "presentation",
+                    serde_json::Value::from(format!("{presentation:?}")),
+                ),
+                (
+                    "native_placement",
+                    native_placement.map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "placement_generation",
+                    player
+                        .native_committed_generation()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    source_epoch.map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "seek_serial",
+                    serde_json::Value::from(player.current_seek_serial()),
+                ),
+                (
+                    "engine_state",
+                    serde_json::Value::from(player.engine_state_name()),
+                ),
+                (
+                    "intent_playing",
+                    serde_json::Value::from(player.intent_playing()),
+                ),
+                (
+                    "playback_speed",
+                    serde_json::Value::from(player.playback_speed()),
+                ),
+                (
+                    "normalize_enabled",
+                    serde_json::Value::from(self.settings.audio_normalize_enabled),
+                ),
+                ("normalize_state", serde_json::Value::from(normalize_state)),
+                (
+                    "normalize_scan_active",
+                    serde_json::Value::from(scan_active),
+                ),
+                (
+                    "normalize_target_lufs_milli",
+                    serde_json::Value::from(
+                        self.settings.clamped_audio_normalize_target_lufs_milli(),
+                    ),
+                ),
+                (
+                    "normalize_gain_linear",
+                    serde_json::Value::from(player.normalize_gain()),
+                ),
+                (
+                    "normalize_gain_db",
+                    serde_json::Value::from(ui_state.applied_gain_db() as f64),
+                ),
+                (
+                    "vst_configured",
+                    serde_json::Value::from(!self.settings.vst3_plugins.is_empty()),
+                ),
+                (
+                    "vst_enabled",
+                    serde_json::Value::from(self.settings.vst3_enabled),
+                ),
+                (
+                    "vst_bridge_enabled",
+                    serde_json::Value::from(self.dsp_bridge.is_enabled()),
+                ),
+                (
+                    "vst_active_slots",
+                    serde_json::Value::from(self.dsp_bridge.active_slot_count() as u64),
+                ),
+            ],
+        );
+    }
+
+    #[cfg(windows)]
+    fn emit_normalize_scan_diagnostic(
+        &self,
+        fs_idx: usize,
+        source_path: &std::path::Path,
+        event: &'static str,
+        status: &'static str,
+        gain_db: Option<f32>,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let source_key = crate::path_key::normalize_keep_drive(source_path);
+        let current_player = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if crate::path_key::eq_keep_drive(player.path(), source_path) =>
+            {
+                Some(player.as_ref())
+            }
+            _ => None,
+        });
+        crate::perf::event(
+            "video",
+            event,
+            Some(&source_key),
+            self.input_seq,
+            &[
+                ("fs_idx", serde_json::Value::from(fs_idx as u64)),
+                ("status", serde_json::Value::from(status)),
+                (
+                    "stream_id",
+                    current_player
+                        .and_then(crate::video::VideoPlayer::audio_stream_id)
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    current_player
+                        .and_then(crate::video::VideoPlayer::native_source_epoch)
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "viewer_context_id",
+                    serde_json::Value::from(self.projected_viewer_context_id().serial()),
+                ),
+                (
+                    "gain_db",
+                    gain_db.map_or(serde_json::Value::Null, |gain| {
+                        serde_json::Value::from(gain as f64)
+                    }),
+                ),
+                (
+                    "target_lufs_milli",
+                    serde_json::Value::from(
+                        self.settings.clamped_audio_normalize_target_lufs_milli(),
+                    ),
+                ),
+            ],
+        );
+    }
+
     #[cfg(windows)]
     pub(crate) fn sync_native_video_grade(&mut self) {
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -1935,10 +2157,14 @@ impl App {
                 request,
                 candidate_generation,
             } => {
-                if let Some(idx) = self.native_video_presentation_switch_source() {
+                let source_idx = self.native_video_presentation_switch_source();
+                if let Some(idx) = source_idx {
                     self.bump_native_video_committed_generation(idx, candidate_generation);
                 }
                 self.apply_video_presentation_switched(request.target);
+                if let Some(idx) = source_idx {
+                    self.emit_audio_output_binding(idx, "placement_switched", request.target);
+                }
                 if request.announce_main_hint
                     && request.target != ViewerPresentation::DetachedWindow
                 {
@@ -5914,6 +6140,13 @@ impl App {
         }
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
+            self.emit_normalize_scan_diagnostic(
+                state.fs_idx,
+                &state.file_path,
+                "normalize_scan_terminal",
+                "user_cancelled",
+                state.provisional_result.map(|result| result.gain_db),
+            );
             self.normalize_auto_scan_suppressed.insert(state.fs_idx);
             // 元再生状態に復帰
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
@@ -5938,6 +6171,13 @@ impl App {
         use crate::video::normalize_types::NormalizeUiState;
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
+            self.emit_normalize_scan_diagnostic(
+                state.fs_idx,
+                &state.file_path,
+                "normalize_scan_terminal",
+                "normalize_disabled",
+                state.provisional_result.map(|result| result.gain_db),
+            );
             if state.was_playing {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
                     if player.path() == state.file_path.as_path() {
@@ -6140,6 +6380,13 @@ impl App {
         // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
+            self.emit_normalize_scan_diagnostic(
+                prev.fs_idx,
+                &prev.file_path,
+                "normalize_scan_terminal",
+                "superseded",
+                prev.provisional_result.map(|result| result.gain_db),
+            );
             let prev_still_current = matches!(
                 self.fs_cache.get(&prev.fs_idx),
                 Some(FsCacheEntry::Video { player, .. }) if player.path() == prev.file_path.as_path()
@@ -6196,6 +6443,13 @@ impl App {
             Ok(j) => j,
             Err(e) => {
                 crate::logger::log(format!("normalize-scan thread spawn failed: {e}"));
+                self.emit_normalize_scan_diagnostic(
+                    fs_idx,
+                    &path,
+                    "normalize_scan_terminal",
+                    "spawn_error",
+                    None,
+                );
                 // Codex P2: spawn 失敗時は元再生状態に戻し、UI 状態も OnUnmeasured に
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -6209,6 +6463,7 @@ impl App {
                 return;
             }
         };
+        self.emit_normalize_scan_diagnostic(fs_idx, &path, "normalize_scan_start", "running", None);
         self.normalize_state = Some(crate::app::normalize::NormalizeScanState {
             fs_idx,
             cancel,
@@ -6278,6 +6533,13 @@ impl App {
                     }
                 }
             }
+            self.emit_normalize_scan_diagnostic(
+                fs_idx,
+                &file_path,
+                "normalize_scan_provisional",
+                if still_valid { "applied" } else { "stale" },
+                Some(result.gain_db),
+            );
             return;
         }
         // 2. 完了確定: state を所有してから後処理
@@ -6322,6 +6584,13 @@ impl App {
                     );
                 }
                 let _ = target_milli; // suppress unused warning
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    if still_valid { "done" } else { "done_stale" },
+                    Some(result.gain_db),
+                );
             }
             Some(Ok(crate::app::normalize::NormalizeMessage::Cancelled))
             | Some(Ok(crate::app::normalize::NormalizeMessage::Error(_)))
@@ -6329,6 +6598,12 @@ impl App {
                 if let Some(Ok(crate::app::normalize::NormalizeMessage::Error(ref m))) = msg {
                     crate::logger::log(format!("normalize-scan error: {m}"));
                 }
+                let status = match &msg {
+                    Some(Ok(crate::app::normalize::NormalizeMessage::Cancelled)) => "cancelled",
+                    Some(Ok(crate::app::normalize::NormalizeMessage::Error(_))) => "error",
+                    Some(Err(())) => "disconnected",
+                    _ => "unknown",
+                };
                 self.normalize_auto_scan_suppressed.insert(state.fs_idx);
                 // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
                 if still_valid {
@@ -6352,6 +6627,17 @@ impl App {
                             .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
                     }
                 }
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    if still_valid {
+                        status
+                    } else {
+                        "stale_terminal"
+                    },
+                    state.provisional_result.map(|result| result.gain_db),
+                );
             }
             Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(_))) => {
                 // Provisional は上で state を残したまま処理済み。ここには通常到達しない。
@@ -6376,6 +6662,13 @@ impl App {
         if should_drop {
             if let Some(state) = self.normalize_state.take() {
                 state.cancel();
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    "owner_cleanup",
+                    state.provisional_result.map(|result| result.gain_db),
+                );
             }
         }
     }
@@ -6412,6 +6705,11 @@ impl App {
             NormalizeUiState::Off
         };
         self.normalize_ui_states.insert(fs_idx, ui_state);
+        self.emit_audio_output_binding(
+            fs_idx,
+            "normalize_state_initialized",
+            self.viewer_presentation,
+        );
     }
 
     /// native overlay にノーマライズ UI 状態 + 進捗 snapshot を配信する。

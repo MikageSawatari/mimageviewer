@@ -79,6 +79,31 @@ finally {
 
 $records = @(Get-MivSourceFingerprintRecords $repoRoot)
 $fingerprint = Get-MivSourceFingerprint $repoRoot
+$eguiCargoPrefix = "vendor/egui/Cargo.toml`t"
+if ($records.Where({ $_.StartsWith($eguiCargoPrefix, [System.StringComparison]::Ordinal) }).Count -ne 1) {
+    throw 'vendor/egui/Cargo.toml is missing from the portable source fingerprint'
+}
+
+$eguiProbe = Join-Path $repoRoot ("vendor\egui\.miv-source-fingerprint-{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
+try {
+    [System.IO.File]::WriteAllText(
+        $eguiProbe,
+        'fingerprint-probe',
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    $changedFingerprint = Get-MivSourceFingerprint $repoRoot
+    if ([System.StringComparer]::Ordinal.Equals($fingerprint, $changedFingerprint)) {
+        throw 'a vendor/egui source change did not change the portable source fingerprint'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $eguiProbe -PathType Leaf) {
+        Remove-Item -LiteralPath $eguiProbe -Force
+    }
+}
+if (-not [System.StringComparer]::Ordinal.Equals($fingerprint, (Get-MivSourceFingerprint $repoRoot))) {
+    throw 'portable source fingerprint did not return to its original value after the probe'
+}
 if ($Probe) {
     if (-not $ProbeOutput) {
         throw '-ProbeOutput is required with -Probe'

@@ -157,6 +157,15 @@ impl SimilarBookQueryEngine {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_phase_probe(
+        &mut self,
+        probe: Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>,
+    ) {
+        self.reader.set_test_phase_probe(Arc::clone(&probe));
+        self.mih.set_test_phase_probe(probe);
+    }
+
     fn query_after_metadata<F>(
         &mut self,
         container_key: &str,
@@ -170,9 +179,15 @@ impl SimilarBookQueryEngine {
     {
         let reader = &mut self.reader;
         let mih = &mut self.mih;
+        #[cfg(test)]
+        let phase_probe = mih.test_phase_probe();
         reader.with_snapshot(Arc::clone(&cancel), |read| {
             let metadata = read.metadata();
             after_metadata(metadata);
+            #[cfg(test)]
+            if let Some(probe) = phase_probe.as_ref() {
+                probe.arm_after_metadata();
+            }
             if mih
                 .preferred_base()
                 .is_some_and(|base| base.store_id != metadata.store_id)
@@ -203,6 +218,11 @@ impl SimilarBookQueryEngine {
 
     pub(crate) fn clear(&mut self) {
         self.mih.clear();
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn benchmark_cached_snapshot(&self) -> Option<Arc<SearchSnapshot>> {
+        self.mih.cached_snapshot_candidate()
     }
 }
 
@@ -377,6 +397,8 @@ fn query_snapshot(
             candidate: prepared_candidate.pages(),
             radius: BOOK_RADIUS,
             cancel,
+            #[cfg(test)]
+            phase_probe: mih.test_phase_probe(),
         };
         let pair = classify_pair_reenumerated(
             &prepared_origin,
@@ -597,6 +619,8 @@ struct DirectBookEdges<'a> {
     candidate: &'a [VerifiedBookPage],
     radius: u32,
     cancel: &'a AtomicBool,
+    #[cfg(test)]
+    phase_probe: Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>>,
 }
 
 impl ReenumeratedBookEdges for DirectBookEdges<'_> {
@@ -611,6 +635,14 @@ impl ReenumeratedBookEdges for DirectBookEdges<'_> {
             return Err(DirectEdgeError::InvalidOriginSlot(a_slot));
         };
         for (candidate_slot, candidate) in self.candidate.iter().enumerate() {
+            #[cfg(test)]
+            if candidate_slot > 0 && candidate_slot % DIRECT_EDGE_CANCEL_INTERVAL == 0 {
+                if let Some(probe) = self.phase_probe.as_ref() {
+                    probe.checkpoint(
+                        crate::similar_book_query_test_probe::BookQueryTestPhase::DirectCandidateSlot,
+                    );
+                }
+            }
             if candidate_slot % DIRECT_EDGE_CANCEL_INTERVAL == 0
                 && self.cancel.load(Ordering::Acquire)
             {
@@ -798,6 +830,53 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap()
+    }
+
+    fn cancel_query_at_phase_and_reuse_engine(
+        mut engine: SimilarBookQueryEngine,
+        container_key: String,
+        candidates: Vec<Arc<SearchSnapshot>>,
+        phase: crate::similar_book_query_test_probe::BookQueryTestPhase,
+    ) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (probe, mut phase_control) =
+            crate::similar_book_query_test_probe::BookQueryTestPhaseProbe::new(phase);
+        engine.set_test_phase_probe(probe);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_key = container_key.clone();
+        let worker_candidates = candidates.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = engine.query(
+                &worker_key,
+                &[ROOT.to_owned()],
+                &worker_candidates,
+                worker_cancel,
+            );
+            let _ = completed_tx.send((engine, result));
+        });
+
+        phase_control.wait_reached();
+        let cancel_for_thread = Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            cancel_for_thread.store(true, Ordering::Release);
+        });
+        canceller.join().unwrap();
+        phase_control.release();
+
+        let completed = completed_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if completed.is_ok() {
+            worker.join().unwrap();
+        }
+        let (mut engine, cancelled_result) =
+            completed.expect("cancelled query did not finish within the bounded wait");
+        let cancelled_observation = cancelled_result.unwrap();
+        assert!(matches!(
+            cancelled_observation.outcome,
+            Err(EngineError::Cancelled)
+        ));
+        let next = query(&mut engine, &container_key, &candidates);
+        assert!(matches!(next.outcome, Ok(BookQuery::Ready(_))));
     }
 
     fn params() -> crate::dupe::book::Params {
@@ -1291,6 +1370,82 @@ mod tests {
     }
 
     #[test]
+    fn inflight_cancellation_during_mih_posting_scan_is_typed_and_engine_is_reusable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let candidate_key = format!("{ROOT}/candidate");
+        publish_book(
+            &db,
+            &origin_key,
+            &vec![signature(0); 3],
+            current_hash_version(),
+        );
+        publish_book(
+            &db,
+            &candidate_key,
+            &vec![signature(0); 70],
+            current_hash_version(),
+        );
+        let shared = snapshot(&db);
+        drop(db);
+
+        cancel_query_at_phase_and_reuse_engine(
+            SimilarBookQueryEngine::open_at(&path).unwrap().unwrap(),
+            origin_key,
+            vec![shared],
+            crate::similar_book_query_test_probe::BookQueryTestPhase::MihPostingScan,
+        );
+    }
+
+    #[test]
+    fn inflight_cancellation_inside_body_sql_progress_is_typed_and_engine_is_reusable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        publish_book(
+            &db,
+            &origin_key,
+            &vec![signature(0x55); 1_500],
+            current_hash_version(),
+        );
+        let shared = snapshot(&db);
+        drop(db);
+
+        cancel_query_at_phase_and_reuse_engine(
+            SimilarBookQueryEngine::open_at(&path).unwrap().unwrap(),
+            origin_key,
+            vec![shared],
+            crate::similar_book_query_test_probe::BookQueryTestPhase::SqlProgress,
+        );
+    }
+
+    #[test]
+    fn inflight_cancellation_at_direct_candidate_slot_is_typed_and_engine_is_reusable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let candidate_key = format!("{ROOT}/candidate");
+        let origin = [signature(0), signature(1), signature(2)];
+        let mut candidate = vec![signature(0xff); 1_100];
+        candidate[..origin.len()].copy_from_slice(&origin);
+        publish_book(&db, &origin_key, &origin, current_hash_version());
+        publish_book(&db, &candidate_key, &candidate, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+
+        cancel_query_at_phase_and_reuse_engine(
+            SimilarBookQueryEngine::open_at(&path).unwrap().unwrap(),
+            origin_key,
+            vec![shared],
+            crate::similar_book_query_test_probe::BookQueryTestPhase::DirectCandidateSlot,
+        );
+    }
+
+    #[test]
     fn metadata_read_fixes_the_database_snapshot_before_a_writer_update() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("similar.db");
@@ -1445,6 +1600,274 @@ mod tests {
                 hit.overrides(),
                 brute_strip_overrides(&origin_rows, &candidate_rows, &expected_pair)
             );
+        }
+    }
+
+    fn prepared_scale_fixture_dir(name: &str) -> std::path::PathBuf {
+        use std::os::windows::fs::MetadataExt;
+
+        let run = std::env::var_os("MIV_BOOK_QUERY_SCALE_RUN_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set MIV_BOOK_QUERY_SCALE_RUN_DIR to the prepared fresh run directory");
+        let run = std::fs::canonicalize(&run).expect("scale run directory must already exist");
+        let directory = std::fs::canonicalize(run.join(name)).unwrap_or_else(|error| {
+            panic!("prepared fixture directory {name} is missing: {error}")
+        });
+        assert_eq!(
+            directory.parent(),
+            Some(run.as_path()),
+            "fixture directory must be a direct child of the prepared run directory"
+        );
+        for ancestor in directory.ancestors() {
+            let metadata = std::fs::symlink_metadata(ancestor).unwrap();
+            assert_eq!(
+                metadata.file_attributes() & 0x400,
+                0,
+                "fixture ancestors must not be reparse points: {}",
+                ancestor.display()
+            );
+            if ancestor == run {
+                break;
+            }
+        }
+        assert!(
+            std::fs::read_dir(&directory).unwrap().next().is_none(),
+            "synthetic fixture directory must be empty: {}",
+            directory.display()
+        );
+        directory
+    }
+
+    fn affine_signature(code: usize) -> [u8; 32] {
+        assert!(code < 512);
+        let a = (code / 2) as u8;
+        let b = (code & 1) != 0;
+        let mut signature = [0u8; 32];
+        for x in 0u16..256 {
+            let bit = ((a & x as u8).count_ones() & 1 != 0) ^ b;
+            if bit {
+                signature[usize::from(x / 8)] |= 1 << (x % 8);
+            }
+        }
+        signature
+    }
+
+    fn signature_distance(left: &[u8; 32], right: &[u8; 32]) -> u32 {
+        left.iter()
+            .zip(right)
+            .map(|(&left, &right)| (left ^ right).count_ones())
+            .sum()
+    }
+
+    fn scale_fixture_input(role: &str, path: &Path) -> serde_json::Value {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read as _;
+
+        let metadata = std::fs::metadata(path).unwrap();
+        assert!(metadata.is_file());
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        serde_json::json!({
+            "role": role,
+            "file": path.file_name().unwrap().to_string_lossy(),
+            "bytes": metadata.len(),
+            "sha256": format!("{:x}", digest.finalize()),
+        })
+    }
+
+    #[test]
+    fn affine_scale_signatures_are_unique_and_outside_the_book_radius() {
+        let signatures = (0..400).map(affine_signature).collect::<Vec<_>>();
+        for left in 0..signatures.len() {
+            for right in (left + 1)..signatures.len() {
+                assert!(signature_distance(&signatures[left], &signatures[right]) > BOOK_RADIUS);
+            }
+        }
+    }
+
+    fn finish_scale_fixture(
+        directory: &Path,
+        label: &str,
+        origin_key: &str,
+        pages: usize,
+        candidates: usize,
+    ) {
+        let path = directory.join("similar.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let journal: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "delete");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        drop(connection);
+        assert!(!path.with_file_name("similar.db-wal").exists());
+        assert!(!path.with_file_name("similar.db-shm").exists());
+        let inputs = [
+            scale_fixture_input("database", &path),
+            scale_fixture_input("base", &directory.join("similar.base")),
+        ];
+        let manifest = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("fixture.json"))
+            .unwrap();
+        serde_json::to_writer_pretty(
+            manifest,
+            &serde_json::json!({
+                "schema": 1,
+                "fixture": label,
+                "origin_key": origin_key,
+                "origin_pages": pages,
+                "candidate_count": candidates,
+                "database": "similar.db",
+                "base": "similar.base",
+                "inputs": inputs,
+                "journal_mode": "delete",
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "generates persistent 7N and 10,000-page scale stores in a prepared fresh directory"]
+    fn generate_and_verify_large_book_engine_fixtures() {
+        let signatures = (0..400).map(affine_signature).collect::<Vec<_>>();
+
+        let directory = prepared_scale_fixture_dir("affine-7n-400");
+        let path = directory.join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin-affine-400");
+        publish_book(&db, &origin_key, &signatures, current_hash_version());
+        for (origin_slot, &signature) in signatures.iter().enumerate() {
+            for witness in 0..7 {
+                let key = format!("{ROOT}/candidate-{origin_slot:03}-{witness}");
+                publish_book(
+                    &db,
+                    &key,
+                    &[signature, signature, signature],
+                    current_hash_version(),
+                );
+            }
+        }
+        let snapshot = Arc::new(
+            crate::similar_search_array::rebuild_from_sqlite(&db, &directory.join("similar.base"))
+                .unwrap(),
+        );
+        drop(db);
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let observation = query(&mut engine, &origin_key, &[snapshot]);
+        let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
+            panic!("affine 7N fixture must be Ready");
+        };
+        assert_eq!(relations.origin.pages.len(), 400);
+        assert_eq!(relations.hits.len(), 2_800);
+        for (index, hit) in relations.hits.iter().enumerate() {
+            let origin_slot = index / 7;
+            let witness = index % 7;
+            assert_eq!(
+                hit.other_container_key,
+                format!("{ROOT}/candidate-{origin_slot:03}-{witness}")
+            );
+            assert_eq!(hit.other_page_count, 3);
+            assert_eq!(hit.pair.a, BOOK_ORIGIN);
+            assert_eq!(hit.pair.b, BOOK_CANDIDATE);
+            assert_eq!(hit.pair.matched, 1);
+            assert_eq!(hit.pair.distinctive_a, 400);
+            assert_eq!(hit.pair.distinctive_b, 3);
+            assert_eq!(hit.pair.coverage_a, 1.0 / 400.0);
+            assert_eq!(hit.pair.coverage_b, 1.0 / 3.0);
+            assert_eq!(hit.pair.relation, dupe::book::Relation::Unrelated);
+            // Keep the legacy complete-tie visit order: X versus XXX chooses A0-B2.
+            assert_eq!(hit.pair.alignment, vec![(origin_slot as u32, 2)]);
+            assert_eq!(hit.overrides().len(), 1);
+            assert_eq!(hit.overrides()[0].origin_slot, origin_slot);
+            assert_eq!(hit.overrides()[0].other_page_index, 2);
+        }
+        drop(engine);
+        finish_scale_fixture(&directory, "affine-7n-400", &origin_key, 400, 2_800);
+
+        let x = affine_signature(2);
+        let y = affine_signature(4);
+        assert!(signature_distance(&x, &y) > BOOK_RADIUS);
+        for (name, origin, candidate, expected_alignment) in [
+            (
+                "dense-diagonal-10000",
+                vec![x; 10_000],
+                vec![x; 10_000],
+                (0..10_000)
+                    .map(|index| (index as u32, index as u32))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "dense-general-10000",
+                {
+                    let mut pages = vec![x; 10_000];
+                    pages[9_999] = y;
+                    pages
+                },
+                {
+                    let mut pages = vec![x; 10_000];
+                    pages[0] = y;
+                    pages
+                },
+                (0..9_999)
+                    .map(|index| (index as u32, index as u32 + 1))
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let directory = prepared_scale_fixture_dir(name);
+            let path = directory.join("similar.db");
+            let db = SimilarDb::open_at(&path).unwrap();
+            let origin_key = format!("{ROOT}/{name}-origin");
+            let candidate_key = format!("{ROOT}/{name}-candidate");
+            publish_book(&db, &origin_key, &origin, current_hash_version());
+            publish_book(&db, &candidate_key, &candidate, current_hash_version());
+            let snapshot = Arc::new(
+                crate::similar_search_array::rebuild_from_sqlite(
+                    &db,
+                    &directory.join("similar.base"),
+                )
+                .unwrap(),
+            );
+            drop(db);
+            let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+            let observation = query(&mut engine, &origin_key, &[snapshot]);
+            let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
+                panic!("{name} fixture must be Ready");
+            };
+            assert_eq!(relations.hits.len(), 1);
+            let hit = &relations.hits[0];
+            assert_eq!(hit.other_container_key, candidate_key);
+            assert_eq!(hit.other_page_count, 10_000);
+            assert_eq!(hit.pair.a, BOOK_ORIGIN);
+            assert_eq!(hit.pair.b, BOOK_CANDIDATE);
+            assert_eq!(hit.pair.distinctive_a, 10_000);
+            assert_eq!(hit.pair.distinctive_b, 10_000);
+            assert_eq!(hit.pair.matched as usize, expected_alignment.len());
+            assert_eq!(hit.pair.alignment, expected_alignment);
+            assert_eq!(hit.pair.coverage_a, hit.pair.matched as f32 / 10_000.0);
+            assert_eq!(hit.pair.coverage_b, hit.pair.matched as f32 / 10_000.0);
+            assert_eq!(hit.pair.relation, dupe::book::Relation::Same);
+            assert_eq!(hit.overrides().len(), hit.pair.matched as usize);
+            for (override_page, &(origin_page, candidate_page)) in
+                hit.overrides().iter().zip(&hit.pair.alignment)
+            {
+                assert_eq!(override_page.origin_slot, origin_page as usize);
+                assert_eq!(override_page.other_page_index, candidate_page);
+            }
+            drop(engine);
+            finish_scale_fixture(&directory, name, &origin_key, 10_000, 1);
         }
     }
 }

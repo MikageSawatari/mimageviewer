@@ -92,12 +92,22 @@ fn begin_required_physical_scan(
     );
 }
 
-fn install_navigation_sequence(app: &mut App, target: FsNavigationSequenceTarget) {
+fn install_navigation_sequence_with_purpose(
+    app: &mut App,
+    target: FsNavigationSequenceTarget,
+    purpose: FsNavigationPurpose,
+) {
     app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
         previous: None,
+        chrome: FsNavigationChromeContinuation::None,
+        purpose,
         opened_at: std::time::Instant::now(),
         target,
     }));
+}
+
+fn install_navigation_sequence(app: &mut App, target: FsNavigationSequenceTarget) {
+    install_navigation_sequence_with_purpose(app, target, FsNavigationPurpose::Ordinary);
 }
 
 fn install_awaiting_password_sequence(app: &mut App) {
@@ -120,15 +130,125 @@ fn install_folder_items_sequence(app: &mut App) {
     );
 }
 
-fn install_rendition_failed_sequence(app: &mut App, pages: Vec<usize>) {
+fn install_rendition_failed_sequence(
+    app: &mut App,
+    pages: Vec<usize>,
+    purpose: FsNavigationPurpose,
+) {
     let items_generation = app.items_generation;
-    install_navigation_sequence(
+    install_navigation_sequence_with_purpose(
         app,
         FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation,
             pages,
             phase: FsNavigationTargetPhase::RenditionFailed,
         }),
+        purpose,
+    );
+}
+
+fn similar_navigation_purpose_with_trace(
+    trace: SimilarMoveTrace,
+    destination: PathBuf,
+) -> FsNavigationPurpose {
+    FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+        origin: SimilarBookLocation::from_destination(SnapshotTarget::Fs(PathBuf::from(
+            r"C:\trace\origin\001.jpg",
+        )))
+        .unwrap(),
+        destination: SimilarBookLocation::from_destination(SnapshotTarget::Fs(destination))
+            .unwrap(),
+        diagnostic_trace: Some(trace),
+    })
+}
+
+#[test]
+fn similar_move_p2_trace_terminals_when_navigation_lock_is_released() {
+    let destination = PathBuf::from(r"C:\trace\released\001.jpg");
+    let trace = SimilarMoveTrace::new(
+        SimilarMoveSource::HistoryButton,
+        Some(&SnapshotTarget::Fs(destination.clone())),
+    );
+    let trace_id = trace.id;
+    let mut app = setup_app_for_test();
+    let accepted_generation = app.items_generation;
+    install_navigation_sequence_with_purpose(
+        &mut app,
+        FsNavigationSequenceTarget::FolderItems {
+            accepted_generation,
+        },
+        similar_navigation_purpose_with_trace(trace, destination),
+    );
+    app.fs_nav_locked_gen = Some(accepted_generation);
+
+    app.release_fs_nav_lock();
+
+    assert!(app.fs_holdover_tex.is_none());
+    assert!(!app.fs_nav_is_locked());
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(trace_id),
+        vec!["navigation_released"]
+    );
+}
+
+#[test]
+fn similar_move_p2_trace_terminals_when_materialized_navigation_fails() {
+    let destination = PathBuf::from(r"C:\trace\failed\001.jpg");
+    let trace = SimilarMoveTrace::new(
+        SimilarMoveSource::ItemButton,
+        Some(&SnapshotTarget::Fs(destination.clone())),
+    );
+    let trace_id = trace.id;
+    let mut app = setup_app_for_test();
+    let items_generation = app.items_generation;
+    install_navigation_sequence_with_purpose(
+        &mut app,
+        FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+            items_generation,
+            pages: vec![0],
+            phase: FsNavigationTargetPhase::Ready(FsNavigationPresentation::Failure),
+        }),
+        similar_navigation_purpose_with_trace(trace, destination),
+    );
+    app.fs_nav_locked_gen = Some(items_generation);
+
+    assert!(app.fs_nav_holdover_for_draw().is_none());
+
+    assert!(app.fs_holdover_tex.is_none());
+    assert!(!app.fs_nav_is_locked());
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(trace_id),
+        vec!["navigation_failed"]
+    );
+}
+
+#[test]
+fn similar_move_p2_completed_scan_terminals_when_ready_is_replaced() {
+    let destination = PathBuf::from(r"C:\trace\ready-replaced\001.jpg");
+    let trace = SimilarMoveTrace::new(
+        SimilarMoveSource::BookButton,
+        Some(&SnapshotTarget::Fs(destination.clone())),
+    );
+    let trace_id = trace.id;
+    let mut ready = FolderPaneOpenReady {
+        path: destination.parent().unwrap().to_path_buf(),
+        scan: Ok(image_scan(std::slice::from_ref(&destination))),
+        purpose: FolderOpenScanPurpose::RequiredFullscreenTarget {
+            target: SnapshotTarget::Fs(destination.clone()),
+            history_trigger: HistoryTrigger::UserChosen,
+            navigation_purpose: similar_navigation_purpose_with_trace(trace, destination),
+        },
+    };
+
+    ready.finish_diagnostic("ready_replaced");
+
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(trace_id),
+        vec!["ready_replaced"]
+    );
+    assert!(
+        ready.purpose.diagnostic_trace().is_none(),
+        "the discarded ready value can no longer drop a live trace"
     );
 }
 
@@ -184,6 +304,536 @@ fn similar_file_hit(path: PathBuf) -> crate::similar_index::QueryHit {
     )
 }
 
+fn book_query_with_physical_target(
+    origin: &Path,
+    target: &Path,
+) -> crate::similar_index::BookQuery {
+    use crate::similar_index::{
+        BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
+        BookRelationHit, BookRelations, SimilarItemTarget,
+    };
+
+    let origin = Arc::new(BookOrigin {
+        pages: vec![BookOriginPage {
+            item_key: crate::similar_index::item_key_for_file(origin),
+            baseline: BookPageBaseline::Unmatched,
+        }]
+        .into_boxed_slice(),
+    });
+    let target_item_key = crate::similar_index::item_key_for_file(target);
+    let hit = BookRelationHit::new(
+        crate::search_index_db::normalize_path(target.parent().unwrap()),
+        2,
+        crate::dupe::book::BookPair {
+            a: 1,
+            b: 2,
+            matched: 1,
+            distinctive_a: 1,
+            distinctive_b: 1,
+            coverage_a: 1.0,
+            coverage_b: 1.0,
+            relation: crate::dupe::book::Relation::Same,
+            alignment: vec![(0, 0)],
+        },
+        vec![BookPageMatch {
+            origin_slot: 0,
+            state: BookPageMatchState::Strong,
+            other_page_index: 0,
+            other_target: Some(SimilarItemTarget::File(target.to_path_buf())),
+            other_item_key: target_item_key,
+            other_mtime: 1,
+            other_file_size: 1,
+        }],
+        origin.pages.len(),
+    )
+    .unwrap();
+    crate::similar_index::BookQuery::Ready(BookRelations {
+        origin,
+        hits: vec![hit],
+    })
+}
+
+fn pointer_input(screen: egui::Rect, pos: egui::Pos2, pressed: bool) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+fn root_update_input(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 800.0),
+        )),
+        time: Some(time),
+        events,
+        ..Default::default()
+    };
+    input
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .focused = Some(true);
+    input
+}
+
+#[cfg(windows)]
+fn run_root_app_update(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut eframe::Frame,
+    input: egui::RawInput,
+) -> egui::FullOutput {
+    ctx.run(input, |ctx| {
+        <App as eframe::App>::update(app, ctx, frame);
+    })
+}
+
+#[cfg(windows)]
+fn settle_root_app_update_fixture(app: &mut App, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    app.startup_done = true;
+    app.startup_init = None;
+    crate::ui_fonts::configure_fonts(ctx);
+    let _ = run_root_app_update(app, ctx, frame, root_update_input(Vec::new(), 0.0));
+}
+
+#[cfg(windows)]
+fn plain_key_press(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+#[cfg(windows)]
+struct SimilarNavigationKeyInputGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(windows)]
+impl Drop for SimilarNavigationKeyInputGuard {
+    fn drop(&mut self) {
+        crate::key_input::clear_test_frame();
+    }
+}
+
+#[cfg(windows)]
+fn similar_navigation_key_input_guard() -> SimilarNavigationKeyInputGuard {
+    let serial = crate::key_input::TEST_INPUT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("fullscreen key-input test lock poisoned");
+    crate::key_input::clear_test_frame();
+    SimilarNavigationKeyInputGuard { _serial: serial }
+}
+
+#[cfg(windows)]
+fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[PathBuf]) {
+    app.startup_done = true;
+    app.startup_init = None;
+    crate::ui_fonts::configure_fonts(ctx);
+    seed_images(app, pages);
+    let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::DARK_BLUE));
+    let texture = ctx.load_texture(
+        "embedded_similar_move_update_scene",
+        Arc::clone(&pixels),
+        egui::TextureOptions::LINEAR,
+    );
+    app.fs_cache.insert(
+        0,
+        FsCacheEntry::Static {
+            tex: texture,
+            pixels,
+            source_dims: Some([4, 6]),
+            load_seq: 1,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.native_video_in_window_active = true;
+    app.settings.video_in_window_mode = true;
+    app.viewer_presentation = ViewerPresentation::MainWindow;
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(ctx);
+}
+
+#[cfg(windows)]
+#[test]
+fn book_relation_move_button_reaches_the_exact_physical_target() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    let old_folder = app.tmp.path().join("__new").join("266707");
+    let target_folder = app.tmp.path().join("__new5").join("266707");
+    std::fs::create_dir_all(&old_folder).unwrap();
+    std::fs::create_dir_all(&target_folder).unwrap();
+    let old = old_folder.join("1.jpg");
+    let first = target_folder.join("0.jpg");
+    let requested = target_folder.join("1.jpg");
+    std::fs::write(&old, b"old").unwrap();
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::write(&requested, b"requested").unwrap();
+    seed_images(&mut app, std::slice::from_ref(&old));
+    let accepted_generation = app.items_generation;
+    install_navigation_sequence_with_purpose(
+        &mut app,
+        FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+            items_generation: accepted_generation,
+            pages: vec![0],
+            phase: FsNavigationTargetPhase::Awaiting {
+                accept_rendition: true,
+            },
+        }),
+        FsNavigationPurpose::Ordinary,
+    );
+
+    let query = book_query_with_physical_target(&old, &requested);
+    let mut panel = crate::ui_metadata_panel::SimilarPanelState::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 320.0));
+    assert!(
+        crate::ui_metadata_panel::draw_book_move_action_for_test(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            &query,
+            &mut panel,
+        )
+        .is_none()
+    );
+    let button = crate::ui_metadata_panel::take_book_move_button_rect_for_test()
+        .expect("production book result must expose its move button")
+        .center();
+    assert!(
+        crate::ui_metadata_panel::draw_book_move_action_for_test(
+            &ctx,
+            pointer_input(screen, button, true),
+            &query,
+            &mut panel,
+        )
+        .is_none(),
+        "press alone must not navigate"
+    );
+    let action = crate::ui_metadata_panel::draw_book_move_action_for_test(
+        &ctx,
+        pointer_input(screen, button, false),
+        &query,
+        &mut panel,
+    )
+    .expect("release on the same production button must emit its owned target");
+
+    app.dispatch_similar_book_move_for_test(&ctx, action);
+    let (tx, _) = control_required_scan(&mut app);
+    assert!(matches!(
+        app.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| &sequence.purpose),
+        Some(FsNavigationPurpose::Ordinary)
+    ));
+    tx.send(Ok(image_scan(&[first, requested.clone()])))
+        .unwrap();
+    let ready = app
+        .poll_folder_pane_open(&ctx)
+        .expect("controlled scan ready");
+    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+
+    let opened = app
+        .fullscreen_idx
+        .and_then(|idx| app.items.get(idx))
+        .expect("requested book page opened");
+    assert!(
+        matches!(opened, GridItem::Image(path) if crate::folder_tree::path_eq(path, &requested))
+    );
+    assert!(app.bind_fs_navigation_sequence_to_current_target());
+    let sequence = app
+        .fs_holdover_tex
+        .as_ref()
+        .and_then(FsHoldover::navigation_sequence)
+        .expect("the actual button route owns the destination presentation");
+    assert!(matches!(
+        (&sequence.purpose, &sequence.target),
+        (
+            FsNavigationPurpose::SimilarBookVisit(intent),
+            FsNavigationSequenceTarget::Display(target)
+        ) if intent.destination.page == SnapshotTarget::Fs(requested)
+            && target.pages.contains(&app.fullscreen_idx.unwrap())
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_similar_move_update_pump_materializes_controlled_physical_scan() {
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut app = setup_app_for_test();
+    settle_root_app_update_fixture(&mut app, &ctx, &mut frame);
+    let origin_folder = app.tmp.path().join("embedded-update-origin");
+    let target_folder = app.tmp.path().join("embedded-update-target");
+    std::fs::create_dir_all(&origin_folder).unwrap();
+    std::fs::create_dir_all(&target_folder).unwrap();
+    let origin = origin_folder.join("1.jpg");
+    let first = target_folder.join("0.jpg");
+    let requested = target_folder.join("1.jpg");
+    std::fs::write(&origin, b"origin").unwrap();
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::write(&requested, b"requested").unwrap();
+    install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&origin));
+    let hit = similar_file_hit(requested.clone());
+    app.open_similar_hit_for_test(&ctx, &hit);
+    let (controlled_tx, controlled_cancel) = control_required_scan(&mut app);
+    let empty = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(Vec::new(), 0.1),
+    );
+    assert!(
+        matches!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .map(|pending| &pending.purpose),
+            Some(FolderOpenScanPurpose::RequiredFullscreenTarget { .. })
+        ),
+        "Empty pass unexpectedly retired its owner: cancelled={} fs_idx={:?} presentation={:?} in_window={} items={}",
+        controlled_cancel.load(Ordering::Relaxed),
+        app.fullscreen_idx,
+        app.viewer_presentation,
+        app.native_video_in_window_active,
+        app.items.len()
+    );
+    assert_eq!(
+        empty
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay),
+        Some(std::time::Duration::ZERO),
+        "an empty controlled scan must keep the ROOT update pump awake"
+    );
+
+    controlled_tx
+        .send(Ok(image_scan(&[first, requested.clone()])))
+        .unwrap();
+    let _ = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(Vec::new(), 0.2),
+    );
+
+    assert!(app.folder_pane_open_pending.is_none());
+    let opened = app
+        .fullscreen_idx
+        .and_then(|idx| app.items.get(idx))
+        .expect("embedded update pump must materialize the requested target");
+    assert!(
+        matches!(opened, GridItem::Image(path) if crate::folder_tree::path_eq(path, &requested))
+    );
+    assert!(matches!(
+        app.fs_holdover_tex,
+        Some(FsHoldover::NavigationSequence(_))
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_similar_move_update_pump_gives_same_frame_escape_priority() {
+    let _input_guard = similar_navigation_key_input_guard();
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut app = setup_app_for_test();
+    settle_root_app_update_fixture(&mut app, &ctx, &mut frame);
+    let origin_folder = app.tmp.path().join("embedded-escape-origin");
+    let target_folder = app.tmp.path().join("embedded-escape-target");
+    std::fs::create_dir_all(&origin_folder).unwrap();
+    std::fs::create_dir_all(&target_folder).unwrap();
+    let origin = origin_folder.join("1.jpg");
+    let requested = target_folder.join("1.jpg");
+    std::fs::write(&origin, b"origin").unwrap();
+    std::fs::write(&requested, b"requested").unwrap();
+    install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&origin));
+    app.open_similar_hit_for_test(&ctx, &similar_file_hit(requested.clone()));
+    let (controlled_tx, controlled_cancel) = control_required_scan(&mut app);
+    controlled_tx
+        .send(Ok(image_scan(std::slice::from_ref(&requested))))
+        .unwrap();
+
+    let _ = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(vec![plain_key_press(egui::Key::Escape)], 0.1),
+    );
+
+    assert!(controlled_cancel.load(Ordering::Relaxed));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.fullscreen_idx.is_none());
+    assert!(matches!(
+        app.items.as_slice(),
+        [GridItem::Image(path)] if crate::folder_tree::path_eq(path, &origin)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_similar_move_update_pump_gives_same_frame_page_navigation_priority() {
+    let _input_guard = similar_navigation_key_input_guard();
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut app = setup_app_for_test();
+    settle_root_app_update_fixture(&mut app, &ctx, &mut frame);
+    let origin_folder = app.tmp.path().join("embedded-page-nav-origin");
+    let target_folder = app.tmp.path().join("embedded-page-nav-target");
+    std::fs::create_dir_all(&origin_folder).unwrap();
+    std::fs::create_dir_all(&target_folder).unwrap();
+    let page0 = origin_folder.join("0.jpg");
+    let page1 = origin_folder.join("1.jpg");
+    let requested = target_folder.join("1.jpg");
+    for path in [&page0, &page1, &requested] {
+        std::fs::write(path, b"image").unwrap();
+    }
+    install_embedded_update_scene(&mut app, &ctx, &[page0.clone(), page1.clone()]);
+    app.spread_mode = crate::settings::SpreadMode::Single;
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+    app.open_similar_hit_for_test(&ctx, &similar_file_hit(requested.clone()));
+    let (controlled_tx, controlled_cancel) = control_required_scan(&mut app);
+    controlled_tx
+        .send(Ok(image_scan(std::slice::from_ref(&requested))))
+        .unwrap();
+
+    let _ = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(vec![plain_key_press(egui::Key::ArrowDown)], 0.1),
+    );
+
+    assert!(controlled_cancel.load(Ordering::Relaxed));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(matches!(
+        app.items.as_slice(),
+        [GridItem::Image(first), GridItem::Image(second)]
+            if crate::folder_tree::path_eq(first, &page0)
+                && crate::folder_tree::path_eq(second, &page1)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_similar_move_update_pump_leaves_non_required_scan_for_normal_tail() {
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut app = setup_app_for_test();
+    settle_root_app_update_fixture(&mut app, &ctx, &mut frame);
+    let origin = app.tmp.path().join("embedded-pane-origin").join("1.jpg");
+    let pane_folder = app.tmp.path().join("embedded-pane-target");
+    std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&pane_folder).unwrap();
+    std::fs::write(&origin, b"origin").unwrap();
+    install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&origin));
+    let (pane_tx, pane_rx) = mpsc::channel();
+    let pane_cancel = Arc::new(AtomicBool::new(false));
+    app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+        path: pane_folder,
+        cancel: Arc::clone(&pane_cancel),
+        rx: pane_rx,
+        purpose: FolderOpenScanPurpose::PaneNavigation,
+    });
+    pane_tx.send(Ok(image_scan(&[]))).unwrap();
+
+    let _ = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(Vec::new(), 0.1),
+    );
+
+    assert!(matches!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .map(|pending| &pending.purpose),
+        Some(FolderOpenScanPurpose::PaneNavigation)
+    ));
+    assert!(!pane_cancel.load(Ordering::Relaxed));
+    assert!(matches!(
+        app.items.as_slice(),
+        [GridItem::Image(path)] if crate::folder_tree::path_eq(path, &origin)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_similar_move_update_pump_does_not_consume_a_passive_context_scan() {
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut app = setup_app_for_test();
+    settle_root_app_update_fixture(&mut app, &ctx, &mut frame);
+    let main_page = app.tmp.path().join("embedded-main-owner").join("1.jpg");
+    let sibling_folder = app.tmp.path().join("embedded-passive-target");
+    let sibling_page = sibling_folder.join("1.jpg");
+    std::fs::create_dir_all(main_page.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&sibling_folder).unwrap();
+    std::fs::write(&main_page, b"main").unwrap();
+    std::fs::write(&sibling_page, b"sibling").unwrap();
+    install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&main_page));
+    let (sibling_tx, sibling_rx) = mpsc::channel();
+    let sibling_cancel = Arc::new(AtomicBool::new(false));
+    let sibling_cancel_for_context = Arc::clone(&sibling_cancel);
+    let sibling_folder_for_context = sibling_folder.clone();
+    let sibling_page_for_context = sibling_page.clone();
+    let sibling = app.push_window_context_for_test(&ctx, 9901, move |context| {
+        context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: sibling_folder_for_context,
+            cancel: sibling_cancel_for_context,
+            rx: sibling_rx,
+            purpose: FolderOpenScanPurpose::RequiredFullscreenTarget {
+                target: SnapshotTarget::Fs(sibling_page_for_context),
+                history_trigger: HistoryTrigger::UserChosen,
+                navigation_purpose: FsNavigationPurpose::Ordinary,
+            },
+        });
+    });
+    sibling_tx
+        .send(Ok(image_scan(std::slice::from_ref(&sibling_page))))
+        .unwrap();
+
+    let _ = run_root_app_update(
+        &mut app,
+        &ctx,
+        &mut frame,
+        root_update_input(Vec::new(), 0.1),
+    );
+
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    app.with_viewer_context(sibling, |context| {
+        assert!(matches!(
+            context
+                .folder_pane_open_pending
+                .as_ref()
+                .map(|pending| &pending.purpose),
+            Some(FolderOpenScanPurpose::RequiredFullscreenTarget { .. })
+        ));
+    })
+    .unwrap();
+    assert!(matches!(
+        app.items.as_slice(),
+        [GridItem::Image(path)] if crate::folder_tree::path_eq(path, &main_page)
+    ));
+}
+
 #[cfg(windows)]
 #[test]
 fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
@@ -208,7 +858,12 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
     app.activate_snapshot(SnapshotSourceLabel::Mixed);
 
     let hit = similar_file_hit(requested.clone());
-    app.open_similar_hit_for_test(&ctx, &hit);
+    let trace = crate::app::SimilarMoveTrace::new(
+        crate::app::SimilarMoveSource::ItemCard,
+        Some(&SnapshotTarget::Fs(requested.clone())),
+    );
+    let trace_id = trace.id;
+    app.open_similar_hit_with_trace_for_test(&ctx, &hit, trace);
     assert!(
         app.is_snapshot_active(),
         "scan admission must preserve the snapshot"
@@ -217,6 +872,14 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
         app.fullscreen_idx,
         Some(0),
         "old page stays visible while scanning"
+    );
+    assert_eq!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .and_then(|pending| pending.purpose.diagnostic_trace())
+            .map(|trace| trace.id),
+        Some(trace_id),
+        "the physical scan owns the same diagnostic trace"
     );
 
     let (tx, _) = control_required_scan(&mut app);
@@ -246,6 +909,46 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
         app.fs_holdover_tex,
         Some(FsHoldover::NavigationSequence(_))
     ));
+    assert!(
+        app.bind_fs_navigation_sequence_to_current_target(),
+        "the first renderer poll binds the accepted folder to its display unit"
+    );
+    assert_eq!(
+        app.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| sequence.purpose.diagnostic_trace())
+            .map(|trace| trace.id),
+        Some(trace_id),
+        "scan completion moves the trace into the typed display owner"
+    );
+    let presented_pages = {
+        let sequence = app
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+            .expect("successful scan keeps the typed presentation owner");
+        let FsNavigationSequenceTarget::Display(target) = &mut sequence.target else {
+            panic!("required target must bind to a display sequence");
+        };
+        target.phase =
+            FsNavigationTargetPhase::Presenting(crate::app::FsNavigationPresentation::Rendition);
+        target.pages.clone()
+    };
+    app.observe_fs_navigation_pages_for_test(&presented_pages);
+    assert!(
+        app.fs_holdover_tex.is_none(),
+        "exact all-live presentation consumes the diagnostic owner"
+    );
+    let (history, current) = app
+        .similar_panel
+        .book_history_snapshot_for_test()
+        .expect("exact live target commits the visit");
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        current,
+        crate::search_index_db::normalize_path(&target_folder)
+    );
 }
 
 #[cfg(windows)]
@@ -274,8 +977,34 @@ fn failed_physical_scan_keeps_existing_snapshot_page_and_panel_but_retires_old_d
         app.fs_holdover_tex,
         Some(FsHoldover::FolderNavigation(None))
     ));
+    let current = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
+    app.similar_panel
+        .complete_similar_book_visit(SimilarBookNavigationIntent {
+            origin: SimilarBookLocation::from_destination(SnapshotTarget::Fs(PathBuf::from(
+                r"C:\history\earlier\001.jpg",
+            )))
+            .unwrap(),
+            destination: current.clone(),
+            diagnostic_trace: None,
+        });
+    let history_before = app
+        .similar_panel
+        .book_history_snapshot_for_test()
+        .expect("completed origin history");
+    let target = SnapshotTarget::Fs(requested.clone());
+    let navigation_purpose = FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+        origin: current,
+        destination: SimilarBookLocation::from_destination(target.clone()).unwrap(),
+        diagnostic_trace: None,
+    });
 
-    begin_required_physical_scan(&mut app, &ctx, target_folder, requested);
+    app.open_required_fullscreen_location_with_purpose(
+        &ctx,
+        target_folder,
+        target,
+        HistoryTrigger::UserChosen,
+        navigation_purpose,
+    );
     let (tx, _) = control_required_scan(&mut app);
     tx.send(Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -297,6 +1026,127 @@ fn failed_physical_scan_keeps_existing_snapshot_page_and_panel_but_retires_old_d
     );
     assert!(app.fs_holdover_tex.is_none());
     assert!(!app.fs_nav_is_locked());
+    assert_eq!(
+        app.similar_panel.book_history_snapshot_for_test(),
+        Some(history_before),
+        "a failed scan cannot publish its unpresented destination"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn request_failure_retains_completed_history_until_presentation_or_true_close() {
+    use crate::similar_book_query::BookQueryDemandSnapshot;
+
+    let mut app = viewer_with_images(&[PathBuf::from(r"C:\history\b\010.jpg")]);
+    let origin = SimilarBookLocation::from_destination(SnapshotTarget::Fs(PathBuf::from(
+        r"C:\history\a\001.jpg",
+    )))
+    .unwrap();
+    let destination = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
+    app.similar_panel
+        .complete_similar_book_visit(SimilarBookNavigationIntent {
+            origin: origin.clone(),
+            destination: destination.clone(),
+            diagnostic_trace: None,
+        });
+    let retained = app
+        .similar_panel
+        .book_history_snapshot_for_test()
+        .expect("completed history");
+    let current_item = app.items[0].clone();
+    let _ = app.query_similar_book(&current_item);
+    assert!(matches!(
+        app.similar_panel.book_query_demand_for_test(),
+        BookQueryDemandSnapshot::Active(_)
+    ));
+    let accepted_generation = app.items_generation;
+    install_navigation_sequence_with_purpose(
+        &mut app,
+        FsNavigationSequenceTarget::FolderItems {
+            accepted_generation,
+        },
+        FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+            origin: destination,
+            destination: SimilarBookLocation::from_destination(SnapshotTarget::Fs(PathBuf::from(
+                r"C:\history\pending\099.jpg",
+            )))
+            .unwrap(),
+            diagnostic_trace: None,
+        }),
+    );
+
+    app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+
+    assert!(app.fs_holdover_tex.is_none(), "failed intent is retired");
+    assert_eq!(
+        app.similar_panel.book_history_snapshot_for_test(),
+        Some(retained.clone()),
+        "only completed visits remain"
+    );
+    assert_eq!(
+        app.similar_panel.book_query_demand_for_test(),
+        BookQueryDemandSnapshot::Withdrawn
+    );
+    assert!(
+        !app.fs_info_panel.locked,
+        "failed viewer owner exits the panel"
+    );
+
+    app.fullscreen_idx = None;
+    app.close_fullscreen_now();
+    assert_eq!(
+        app.similar_panel.book_history_snapshot_for_test(),
+        Some(retained),
+        "generic no-viewer cleanup must not become an explicit session close"
+    );
+
+    seed_images(&mut app, &[PathBuf::from(r"C:\history\b\011.jpg")]);
+    app.observe_fs_navigation_pages_for_test(&[0]);
+    let (entries, current) = app
+        .similar_panel
+        .book_history_snapshot_for_test()
+        .expect("same book can resume the completed session");
+    assert_eq!(current, "c:/history/b");
+    assert_eq!(
+        entries[1].page,
+        SnapshotTarget::Fs(PathBuf::from(r"C:\history\b\011.jpg"))
+    );
+
+    seed_images(&mut app, &[PathBuf::from(r"C:\history\unrelated\001.jpg")]);
+    app.observe_fs_navigation_pages_for_test(&[0]);
+    assert!(
+        app.similar_panel.book_history_snapshot_for_test().is_none(),
+        "the first live page in another book starts a different session"
+    );
+
+    let unrelated = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
+    app.similar_panel
+        .complete_similar_book_visit(SimilarBookNavigationIntent {
+            origin: origin.clone(),
+            destination: unrelated,
+            diagnostic_trace: None,
+        });
+    app.handle_fullscreen_close_request();
+    assert!(
+        app.similar_panel.book_history_snapshot_for_test().is_none(),
+        "an explicit close clears history without a pending sequence"
+    );
+
+    seed_images(&mut app, &[PathBuf::from(r"C:\history\b\012.jpg")]);
+    let reopened = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
+    app.similar_panel
+        .complete_similar_book_visit(SimilarBookNavigationIntent {
+            origin,
+            destination: reopened,
+            diagnostic_trace: None,
+        });
+    install_folder_items_sequence(&mut app);
+    app.handle_fullscreen_close_request();
+    assert!(
+        app.similar_panel.book_history_snapshot_for_test().is_none(),
+        "an explicit close clears history with a pending sequence"
+    );
 }
 
 #[cfg(windows)]
@@ -321,6 +1171,7 @@ fn detached_required_scan_failure_without_a_page_exits_the_password_wait_owner()
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
         purpose: FolderOpenScanPurpose::RequiredFullscreenTarget {
+            navigation_purpose: FsNavigationPurpose::Ordinary,
             target: SnapshotTarget::Fs(folder.join("missing.jpg")),
             history_trigger: HistoryTrigger::UserChosen,
         },
@@ -352,6 +1203,7 @@ fn disconnected_required_scan_uses_the_same_terminal_failure_boundary() {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
         purpose: FolderOpenScanPurpose::RequiredFullscreenTarget {
+            navigation_purpose: FsNavigationPurpose::Ordinary,
             target: SnapshotTarget::Fs(app.tmp.path().join("worker-disconnected/p.jpg")),
             history_trigger: HistoryTrigger::UserChosen,
         },
@@ -495,7 +1347,7 @@ fn continuous_reanchor_supersedes_scan_when_only_the_page_slice_changes() {
 }
 
 #[test]
-fn rendition_failed_does_not_block_the_snapshot_ctrl_navigation_handler() {
+fn similar_move_p2_rendition_failed_does_not_block_and_supersedes_old_trace() {
     let ctx = egui::Context::default();
     let mut app = viewer_with_images(&[
         PathBuf::from(r"C:\snapshot\a.jpg"),
@@ -503,13 +1355,166 @@ fn rendition_failed_does_not_block_the_snapshot_ctrl_navigation_handler() {
     ]);
     app.activate_snapshot(SnapshotSourceLabel::Mixed);
     app.fullscreen_idx = Some(0);
-    install_rendition_failed_sequence(&mut app, vec![0]);
+    let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\snapshot\a.jpg"));
+    let old_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&old_target));
+    let old_trace_id = old_trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0],
+        similar_navigation_purpose_with_trace(old_trace, PathBuf::from(r"C:\snapshot\a.jpg")),
+    );
     app.fs_nav_locked_gen = None;
 
     app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
 
     assert_eq!(app.fullscreen_idx, Some(1));
     assert!(app.fs_info_panel.locked);
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_direct_fullscreen_open_supersedes_stale_display_trace() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[
+        PathBuf::from(r"C:\direct\a.jpg"),
+        PathBuf::from(r"C:\direct\b.jpg"),
+    ]);
+    let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\direct\a.jpg"));
+    let old_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemCard, Some(&old_target));
+    let old_trace_id = old_trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0],
+        similar_navigation_purpose_with_trace(old_trace, PathBuf::from(r"C:\direct\a.jpg")),
+    );
+
+    app.open_fullscreen_from_fs_navigation(&ctx, 1, HistoryTrigger::UserChosen);
+
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_continuous_reanchor_supersedes_stale_display_trace() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[
+        PathBuf::from(r"C:\reanchor\a.jpg"),
+        PathBuf::from(r"C:\reanchor\b.jpg"),
+    ]);
+    let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\reanchor\a.jpg"));
+    let old_trace = SimilarMoveTrace::new(SimilarMoveSource::HistoryButton, Some(&old_target));
+    let old_trace_id = old_trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0],
+        similar_navigation_purpose_with_trace(old_trace, PathBuf::from(r"C:\reanchor\a.jpg")),
+    );
+
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0],
+        1,
+        1,
+        crate::page_split::PageSlice::Full,
+        HistoryTrigger::UserChosen,
+    );
+
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_target_aware_open_preserves_the_new_display_trace() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[
+        PathBuf::from(r"C:\same-target\a.jpg"),
+        PathBuf::from(r"C:\same-target\b.jpg"),
+    ]);
+    let target = SnapshotTarget::Fs(PathBuf::from(r"C:\same-target\b.jpg"));
+    let trace = SimilarMoveTrace::new(SimilarMoveSource::BookButton, Some(&target));
+    let trace_id = trace.id;
+    assert!(app.begin_similar_book_page_navigation_sequence(
+        &ctx,
+        0,
+        1,
+        similar_navigation_purpose_with_trace(trace, PathBuf::from(r"C:\same-target\b.jpg")),
+    ));
+
+    app.open_fullscreen_from_fs_navigation(&ctx, 1, HistoryTrigger::UserChosen);
+
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        app.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| sequence.purpose.diagnostic_trace())
+            .map(|trace| trace.id),
+        Some(trace_id)
+    );
+    assert!(SimilarMoveTrace::terminal_reasons_for_test(trace_id).is_empty());
+    app.release_fs_nav_lock();
+}
+
+#[test]
+fn similar_move_p2_same_index_in_a_new_generation_supersedes_the_old_trace() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[PathBuf::from(r"C:\generation\a.jpg")]);
+    let target = SnapshotTarget::Fs(PathBuf::from(r"C:\generation\a.jpg"));
+    let trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&target));
+    let trace_id = trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0],
+        similar_navigation_purpose_with_trace(trace, PathBuf::from(r"C:\generation\a.jpg")),
+    );
+    app.items_generation = app.items_generation.wrapping_add(1);
+
+    app.open_fullscreen_from_fs_navigation(&ctx, 0, HistoryTrigger::UserChosen);
+
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_folder_items_setup_survives_the_reopen_accept_boundary() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[PathBuf::from(r"C:\folder-setup\a.jpg")]);
+    let target = SnapshotTarget::Fs(PathBuf::from(r"C:\folder-setup\a.jpg"));
+    let trace = SimilarMoveTrace::new(SimilarMoveSource::HistoryButton, Some(&target));
+    let trace_id = trace.id;
+    let accepted_generation = app.items_generation;
+    install_navigation_sequence_with_purpose(
+        &mut app,
+        FsNavigationSequenceTarget::FolderItems {
+            accepted_generation,
+        },
+        similar_navigation_purpose_with_trace(trace, PathBuf::from(r"C:\folder-setup\a.jpg")),
+    );
+
+    app.open_fullscreen_from_fs_navigation(&ctx, 0, HistoryTrigger::UserChosen);
+
+    assert_eq!(
+        app.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| sequence.purpose.diagnostic_trace())
+            .map(|trace| trace.id),
+        Some(trace_id)
+    );
+    assert!(SimilarMoveTrace::terminal_reasons_for_test(trace_id).is_empty());
+    app.release_fs_nav_lock();
 }
 
 #[test]

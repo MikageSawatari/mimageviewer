@@ -134,6 +134,7 @@ function Get-MivSourceFingerprintRecords {
         'crates',
         'assets',
         'vendor/eframe',
+        'vendor/egui',
         'vendor/egui-wgpu',
         'vendor/twemoji'
     )

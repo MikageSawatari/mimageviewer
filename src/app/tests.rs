@@ -15328,6 +15328,7 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
 fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
     let folder = app.tmp.path().join("image-book");
     std::fs::create_dir_all(&folder).expect("create image book");
     std::fs::write(folder.join("page-001.jpg"), []).expect("create page");
@@ -28369,6 +28370,125 @@ mod favorite_adjustment_defaults_tests {
         .unwrap();
     }
 
+    #[test]
+    fn book_query_demand_park_transitions_retain_only_the_bound_window_clients() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let main_item = GridItem::Image(PathBuf::from(r"C:\books\main\page.jpg"));
+        let _ = app.query_similar_book(&main_item);
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        for (window_id, page) in [
+            (701, r"C:\books\parked\page.jpg"),
+            (702, r"C:\books\parked-live\page.jpg"),
+        ] {
+            app.push_window_context_for_test(&ctx, window_id, |window| {
+                let item = GridItem::Image(PathBuf::from(page));
+                let _ = window.query_similar_book(&item);
+                assert!(matches!(
+                    window.similar_panel.book_query_demand_for_test(),
+                    BookQueryDemandSnapshot::Active(_)
+                ));
+            });
+        }
+
+        app.transition_detached_window_state(701, DetachedWindowState::Parked, "test_query_retain");
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+        app.with_window_viewer_context(701, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Retained(_)
+            ));
+        })
+        .expect("Parked query owner must remain mounted");
+        app.with_window_viewer_context(702, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Active(_)
+            ));
+        })
+        .expect("unrelated window query remains active");
+
+        app.transition_detached_window_state(
+            702,
+            DetachedWindowState::ParkedLive,
+            "test_query_retain_live",
+        );
+        app.with_window_viewer_context(702, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Retained(_)
+            ));
+        })
+        .expect("ParkedLive query owner must remain mounted");
+    }
+
+    #[test]
+    fn book_query_demand_viewer_exit_withdraws_but_internal_reopen_preserves_it() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let mut app = setup_app();
+        let item = GridItem::Image(PathBuf::from(r"C:\books\exit\page.jpg"));
+        app.items = vec![item.clone()];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        let _ = app.query_similar_book(&item);
+
+        app.capture_fs_nav_holdover(0);
+        app.close_fullscreen();
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+
+        let _ = app.query_similar_book(&item);
+        app.close_fullscreen();
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+    }
+
+    #[test]
+    fn book_query_demand_nonbook_input_withdraws_the_previous_book() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let app = setup_app();
+        let _ =
+            app.query_similar_book(&GridItem::Image(PathBuf::from(r"C:\books\active\page.jpg")));
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        assert!(matches!(
+            app.query_similar_book(&GridItem::Folder(PathBuf::from(r"C:\books\folder")))
+                .as_ref(),
+            crate::similar_index::BookQuery::NotBook
+        ));
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+    }
+
     /// ロック中は前後移動でパネルを閉じないが、**フルスクリーンを出たら解除する**。
     ///
     /// `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるので、「ロック中は reset を
@@ -36140,6 +36260,8 @@ mod pipeline_cache_refactor_tests {
         app.fullscreen_idx = Some(target_idx);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
@@ -40553,6 +40675,7 @@ mod still_window_mode_key_tests {
     fn detached_context_polls_its_own_fs_nav_lock() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let window_id = 31u64;
 
         app.settings.detached_viewer_open_images_in_window = true;
@@ -40660,6 +40783,7 @@ mod still_window_mode_key_tests {
     fn detached_ctrl_nav_can_repeat_after_previous_nav_completed() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let first = temp.path().join("01");
         let second = temp.path().join("02");
@@ -44374,6 +44498,7 @@ mod still_window_mode_key_tests {
     fn virtual_c_a_image_open_builds_detached_physical_a_b_c_before_ctrl_nav() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let first = temp.path().join("01");
         std::fs::create_dir_all(&first).unwrap();
@@ -45838,6 +45963,7 @@ mod still_window_mode_key_tests {
     fn detached_image_open_resolves_windows_path_case_without_fallback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let folder = temp.path().join("physical");
         std::fs::create_dir_all(&folder).unwrap();
@@ -46333,6 +46459,7 @@ mod still_window_mode_key_tests {
     fn active_detached_update_polls_only_its_bundle_folder_nav_result() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let image = PathBuf::from(r"C:\main\keep.jpg");
         app.items = vec![GridItem::Image(image)];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -47089,6 +47216,7 @@ mod still_window_mode_key_tests {
     fn detached_folder_nav_boundary_keeps_current_pdf_and_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let window_id = 28u64;
 
         app.settings.detached_viewer_open_images_in_window = true;
@@ -57392,6 +57520,8 @@ mod still_window_mode_key_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation: app.items_generation,

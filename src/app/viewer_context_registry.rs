@@ -679,6 +679,14 @@ impl<P> ContextTable<P> {
             Some(Slot::Retiring(_)) | None => None,
         }
     }
+
+    fn at_rest_mut(&mut self, id: ViewerContextId) -> Option<&mut P> {
+        assert!(self.pending.is_none());
+        match self.slots.get_mut(&id) {
+            Some(Slot::AtRest(payload)) => Some(payload),
+            Some(Slot::Retiring(_)) | None => None,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -884,6 +892,8 @@ pub(in crate::app) struct ViewerContextBundle {
     view_trim_save_pending: bool,
     fs_cache: ItemsGenerationMap<FsCacheEntry>,
     fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
+    fullscreen_navigator_interaction: crate::ui_fullscreen::FullscreenNavigatorInteractionOwner,
+    fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
     fs_pending: ItemsGenerationMap<FsPendingValue>,
@@ -1140,6 +1150,13 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn similar_panel(self) -> &'a crate::ui_metadata_panel::SimilarPanelState {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.similar_panel,
+            ContextRefSource::AtRest(bundle) => &bundle.similar_panel,
+        }
+    }
+
     pub(in crate::app) fn selected(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.selected,
@@ -1222,7 +1239,7 @@ impl ViewerContextBundle {
     /// thumbnail pool だけは condvar 待ちで残留し得るため notify まで必要。その他は有限の
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
-    fn cancel_all_context_work(&self) {
+    fn cancel_all_context_work(&mut self) {
         self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
             q.1.notify_all();
@@ -1245,8 +1262,11 @@ impl ViewerContextBundle {
         if let Some(pending) = self.folder_nav_pending.as_ref() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        if let Some(pending) = self.folder_pane_open_pending.as_ref() {
-            pending.cancel.store(true, Ordering::Relaxed);
+        if let Some(pending) = self.folder_pane_open_pending.as_mut() {
+            pending.cancel_with_diagnostic("context_retired");
+        }
+        if let Some(holdover) = self.fs_holdover_tex.as_mut() {
+            holdover.finish_navigation_diagnostic("context_retired");
         }
         for pending in self.final_effect_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -1445,6 +1465,10 @@ impl ViewerContextBundle {
             view_trim_save_pending: false,
             fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
+            fullscreen_navigator_interaction:
+                crate::ui_fullscreen::FullscreenNavigatorInteractionOwner::default(),
+            fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout::default(
+            ),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
@@ -1575,6 +1599,9 @@ impl App {
         self.pending_return_to_parent = false;
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
+        if let Some(holdover) = self.fs_holdover_tex.as_mut() {
+            holdover.finish_navigation_diagnostic("context_parked");
+        }
         self.fs_holdover_tex = None;
         self.fs_nav_dropped_block_signature = None;
         self.fs_nav_dropped_block_count = 0;
@@ -1584,8 +1611,8 @@ impl App {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        if let Some(pending) = self.folder_pane_open_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
+        if let Some(mut pending) = self.folder_pane_open_pending.take() {
+            pending.cancel_with_diagnostic("context_parked");
         }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
@@ -1784,6 +1811,8 @@ impl App {
             view_trim_save_pending,
             fs_cache,
             fs_lanczos_cache,
+            fullscreen_navigator_interaction,
+            fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -2034,6 +2063,8 @@ impl App {
         swap_field!(view_trim_save_pending);
         swap_field!(fs_cache);
         swap_field!(fs_lanczos_cache);
+        swap_field!(fullscreen_navigator_interaction);
+        swap_field!(fullscreen_page_layout);
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
@@ -2322,6 +2353,8 @@ impl App {
             view_trim_save_pending,
             fs_cache,
             fs_lanczos_cache,
+            fullscreen_navigator_interaction,
+            fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -2533,6 +2566,8 @@ impl App {
             analysis_guide_drag,
             fs_cache,
             fs_lanczos_cache,
+            fullscreen_navigator_interaction,
+            fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
@@ -2970,6 +3005,21 @@ impl App {
     /// Every context except the one currently projected onto `App`. See `ContextTable::other_ids`.
     pub(in crate::app) fn other_viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.other_ids()
+    }
+
+    /// Poll only the viewer-owned Similar preview workers without mounting parked contexts.
+    pub(crate) fn poll_similar_preview_workers_in_all_contexts(&mut self, ctx: &egui::Context) {
+        let passwords = self.pdf_passwords.clone();
+        self.similar_panel.preview.poll_background(ctx, &passwords);
+        for id in self.viewer_contexts.table.other_ids() {
+            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
+                continue;
+            };
+            bundle
+                .similar_panel
+                .preview
+                .poll_background(ctx, &passwords);
+        }
     }
 
     pub(in crate::app) fn with_viewer_context_ref<R>(
@@ -3424,6 +3474,121 @@ mod tests {
         ));
         assert!(state.apply_drag(drag, region, source));
         state
+    }
+
+    #[cfg(windows)]
+    fn similar_navigation_purpose(trace: SimilarMoveTrace, suffix: &str) -> FsNavigationPurpose {
+        FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+            origin: SimilarBookLocation {
+                container_key: "c:/trace/origin".to_owned(),
+                page: crate::snapshot::SnapshotTarget::Fs(PathBuf::from("c:/trace/origin/001.jpg")),
+            },
+            destination: SimilarBookLocation {
+                container_key: format!("c:/trace/{suffix}"),
+                page: crate::snapshot::SnapshotTarget::Fs(PathBuf::from(format!(
+                    "c:/trace/{suffix}/001.jpg"
+                ))),
+            },
+            diagnostic_trace: Some(trace),
+        })
+    }
+
+    #[cfg(windows)]
+    fn similar_trace_owners(
+        accepted_generation: u64,
+        pending_trace: SimilarMoveTrace,
+        navigation_trace: SimilarMoveTrace,
+        cancel: Arc<AtomicBool>,
+    ) -> (FolderPaneOpenPending, FsHoldover) {
+        let (_tx, rx) = mpsc::channel();
+        (
+            FolderPaneOpenPending {
+                path: PathBuf::from("c:/trace/pending"),
+                cancel,
+                rx,
+                purpose: FolderOpenScanPurpose::RequiredFullscreenTarget {
+                    target: crate::snapshot::SnapshotTarget::Fs(PathBuf::from(
+                        "c:/trace/pending/001.jpg",
+                    )),
+                    history_trigger: HistoryTrigger::UserChosen,
+                    navigation_purpose: similar_navigation_purpose(pending_trace, "pending"),
+                },
+            },
+            FsHoldover::NavigationSequence(FsNavigationSequence {
+                previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: similar_navigation_purpose(navigation_trace, "navigation"),
+                opened_at: std::time::Instant::now(),
+                target: FsNavigationSequenceTarget::FolderItems {
+                    accepted_generation,
+                },
+            }),
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn similar_move_p2_trace_owners_terminal_when_mounted_context_is_parked() {
+        let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from("c:/trace/pending/001.jpg"));
+        let pending_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&target));
+        let pending_id = pending_trace.id;
+        let navigation_trace =
+            SimilarMoveTrace::new(SimilarMoveSource::HistoryButton, Some(&target));
+        let navigation_id = navigation_trace.id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = crate::app::setup_app_for_test();
+        let accepted_generation = app.items_generation;
+        let (pending, holdover) = similar_trace_owners(
+            accepted_generation,
+            pending_trace,
+            navigation_trace,
+            Arc::clone(&cancel),
+        );
+        app.folder_pane_open_pending = Some(pending);
+        app.fs_holdover_tex = Some(holdover);
+
+        app.pause_mounted_background_work_keep_current_frame();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(pending_id),
+            vec!["context_parked"]
+        );
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
+            vec!["context_parked"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn similar_move_p2_trace_owners_terminal_when_context_bundle_is_dropped() {
+        let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from("c:/trace/pending/001.jpg"));
+        let pending_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&target));
+        let pending_id = pending_trace.id;
+        let navigation_trace =
+            SimilarMoveTrace::new(SimilarMoveSource::HistoryButton, Some(&target));
+        let navigation_id = navigation_trace.id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut bundle = ViewerContextBundle::empty();
+        let (pending, holdover) =
+            similar_trace_owners(0, pending_trace, navigation_trace, Arc::clone(&cancel));
+        bundle.folder_pane_open_pending = Some(pending);
+        bundle.fs_holdover_tex = Some(holdover);
+
+        drop(bundle);
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(pending_id),
+            vec!["context_retired"]
+        );
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
+            vec!["context_retired"]
+        );
     }
 
     #[cfg(windows)]

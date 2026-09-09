@@ -14,6 +14,18 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
+
+#[cfg(test)]
+thread_local! {
+    static LAST_METADATA_CLOSE_BUTTON_RECT: std::cell::Cell<Option<egui::Rect>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_metadata_close_button_rect_for_test() -> Option<egui::Rect> {
+    LAST_METADATA_CLOSE_BUTTON_RECT.with(|rect| rect.take())
+}
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 /// スクロール領域の内容幅を、**バーの有無にかかわらず**同じにする。
 ///
@@ -35,6 +47,16 @@ const SIMILAR_THUMB_CACHE_LIMIT: usize = 512;
 /// work and cancelled work that is still draining inside one fixed budget per viewer context.
 const SIMILAR_THUMB_WORKER_LIMIT: usize = 4;
 type SimilarThumbDemand = std::collections::HashMap<String, u64>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum SimilarBookVisitHistory {
+    #[default]
+    Inactive,
+    Active {
+        entries: Vec<crate::app::SimilarBookLocation>,
+        current_container_key: String,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MetadataPanelTab {
@@ -98,6 +120,19 @@ struct SimilarThumbJob {
 pub(crate) struct SimilarPanelState {
     tab: MetadataPanelTab,
     origin_key: Option<String>,
+    /// Viewer-local, nonpersistent completed visits. Unresolved navigation intent belongs to the
+    /// scan/navigation request instead, so cancellation cannot create a ghost entry here.
+    book_history: SimilarBookVisitHistory,
+    /// Only an in-progress primary press lives across frames. Once egui reports a click, the
+    /// trace moves with the action into the navigation request; it never remains as panel state.
+    move_trace_pressed: std::cell::RefCell<Option<SimilarMovePressedTrace>>,
+    book_query_client: crate::similar_index::SimilarBookQueryClient,
+    #[cfg(test)]
+    book_query_override: Option<std::sync::Arc<crate::similar_index::BookQuery>>,
+    #[cfg(test)]
+    item_query_override: Option<std::sync::Arc<crate::similar_index::ItemQuery>>,
+    #[cfg(test)]
+    results_are_stale_override: Option<bool>,
     thumbnails: std::collections::HashMap<String, SimilarThumbEntry>,
     /// 受け付けた順。上限を超えた分をここから古い順に落とす。
     thumb_order: std::collections::VecDeque<String>,
@@ -113,6 +148,7 @@ pub(crate) struct SimilarPanelState {
     /// を spinner に差し替えると、ページを送るたびに内容が消えて戻る。**古い内容を出したまま
     /// 差し替える方が読める。** 出している間は「更新中」と明記する。
     last_ready: Vec<Option<std::sync::Arc<crate::similar_index::ItemQuery>>>,
+    pub(crate) preview: crate::similar_preview::SimilarPreviewState,
     thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
     thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
 }
@@ -123,6 +159,15 @@ impl Default for SimilarPanelState {
         Self {
             tab: MetadataPanelTab::Info,
             origin_key: None,
+            book_history: SimilarBookVisitHistory::Inactive,
+            move_trace_pressed: std::cell::RefCell::new(None),
+            book_query_client: crate::similar_index::SimilarBookQueryClient::default(),
+            #[cfg(test)]
+            book_query_override: None,
+            #[cfg(test)]
+            item_query_override: None,
+            #[cfg(test)]
+            results_are_stale_override: None,
             thumbnails: std::collections::HashMap::new(),
             thumb_order: std::collections::VecDeque::new(),
             thumb_jobs: std::collections::VecDeque::new(),
@@ -131,6 +176,7 @@ impl Default for SimilarPanelState {
             thumb_next_request_id: 1,
             thumb_last_upload_frame: None,
             last_ready: Vec::new(),
+            preview: crate::similar_preview::SimilarPreviewState::default(),
             thumb_tx,
             thumb_rx,
         }
@@ -138,6 +184,128 @@ impl Default for SimilarPanelState {
 }
 
 impl SimilarPanelState {
+    #[cfg(test)]
+    pub(crate) fn set_book_query_override_for_test(
+        &mut self,
+        query: crate::similar_index::BookQuery,
+    ) {
+        self.book_query_override = Some(std::sync::Arc::new(query));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_item_query_override_for_test(
+        &mut self,
+        query: crate::similar_index::ItemQuery,
+        results_are_stale: bool,
+    ) {
+        self.item_query_override = Some(std::sync::Arc::new(query));
+        self.results_are_stale_override = Some(results_are_stale);
+    }
+
+    fn upsert_history_entry(
+        entries: &mut Vec<crate::app::SimilarBookLocation>,
+        location: crate::app::SimilarBookLocation,
+    ) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.container_key == location.container_key)
+        {
+            existing.page = location.page;
+        } else {
+            entries.push(location);
+        }
+    }
+
+    pub(crate) fn complete_similar_book_visit(
+        &mut self,
+        intent: crate::app::SimilarBookNavigationIntent,
+    ) {
+        let destination_key = intent.destination.container_key.clone();
+        match &mut self.book_history {
+            SimilarBookVisitHistory::Inactive => {
+                let mut entries = Vec::with_capacity(2);
+                Self::upsert_history_entry(&mut entries, intent.origin);
+                Self::upsert_history_entry(&mut entries, intent.destination);
+                self.book_history = SimilarBookVisitHistory::Active {
+                    entries,
+                    current_container_key: destination_key,
+                };
+            }
+            SimilarBookVisitHistory::Active {
+                entries,
+                current_container_key,
+            } => {
+                Self::upsert_history_entry(entries, intent.origin);
+                Self::upsert_history_entry(entries, intent.destination);
+                *current_container_key = destination_key;
+            }
+        }
+    }
+
+    pub(crate) fn observe_ordinary_book_page(&mut self, location: crate::app::SimilarBookLocation) {
+        let keep = matches!(
+            &self.book_history,
+            SimilarBookVisitHistory::Active {
+                current_container_key,
+                ..
+            } if current_container_key == &location.container_key
+        );
+        if !keep {
+            self.book_history = SimilarBookVisitHistory::Inactive;
+            return;
+        }
+        if let SimilarBookVisitHistory::Active { entries, .. } = &mut self.book_history {
+            Self::upsert_history_entry(entries, location);
+        }
+    }
+
+    pub(crate) fn clear_book_history(&mut self) {
+        self.book_history = SimilarBookVisitHistory::Inactive;
+    }
+
+    fn book_history_snapshot(&self) -> Option<(Vec<crate::app::SimilarBookLocation>, String)> {
+        match &self.book_history {
+            SimilarBookVisitHistory::Inactive => None,
+            SimilarBookVisitHistory::Active {
+                entries,
+                current_container_key,
+            } => Some((entries.clone(), current_container_key.clone())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn book_history_snapshot_for_test(
+        &self,
+    ) -> Option<(Vec<crate::app::SimilarBookLocation>, String)> {
+        self.book_history_snapshot()
+    }
+
+    pub(crate) fn book_query_client(&self) -> &crate::similar_index::SimilarBookQueryClient {
+        &self.book_query_client
+    }
+
+    pub(crate) fn retain_book_query(&self) {
+        self.finish_pressed_move_trace("panel_retained");
+        self.book_query_client.retain();
+    }
+
+    pub(crate) fn withdraw_book_query(&self) {
+        self.finish_pressed_move_trace("panel_withdrawn");
+        self.book_query_client.withdraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn book_query_demand_for_test(
+        &self,
+    ) -> crate::similar_book_query::BookQueryDemandSnapshot {
+        self.book_query_client.demand_snapshot_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_similar_tab_for_test(&mut self) {
+        self.tab = MetadataPanelTab::Similar;
+    }
+
     /// 起点が変わっても**サムネイルは捨てない**。
     ///
     /// 本を読み進めると起点は 1 ページごとに変わるが、候補も帯のページも同じ画像を指し続ける
@@ -147,7 +315,18 @@ impl SimilarPanelState {
         if self.origin_key == origin_key {
             return;
         }
+        self.finish_pressed_move_trace("origin_changed");
         self.origin_key = origin_key;
+    }
+
+    fn finish_pressed_move_trace(&self, reason: &'static str) {
+        if let Some(pressed) = self.move_trace_pressed.borrow_mut().take() {
+            pressed.trace.terminal(reason);
+        }
+    }
+
+    fn clear_pressed_move_trace(&self) {
+        self.move_trace_pressed.borrow_mut().take();
     }
 
     fn begin_thumbnail_frame(&mut self) {
@@ -464,6 +643,7 @@ impl Drop for SimilarPanelState {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
 
+        self.finish_pressed_move_trace("panel_dropped");
         for entry in self.thumbnails.values() {
             if let SimilarThumbEntryState::Pending { cancel } = &entry.state {
                 cancel.store(true, Ordering::Relaxed);
@@ -662,16 +842,220 @@ struct SimilarPageView<'a> {
     showing_previous: bool,
 }
 
+struct TracedSimilarAction<T> {
+    value: T,
+    trace: Option<crate::app::SimilarMoveTrace>,
+}
+
+fn replace_traced_similar_action<T>(
+    slot: &mut Option<TracedSimilarAction<T>>,
+    action: TracedSimilarAction<T>,
+) {
+    if let Some(replaced) = slot.replace(action)
+        && let Some(trace) = replaced.trace
+    {
+        trace.terminal("action_replaced");
+    }
+}
+
+struct SimilarMovePressedTrace {
+    response_id: egui::Id,
+    trace: crate::app::SimilarMoveTrace,
+}
+
+#[derive(Clone, Copy)]
+struct SimilarMovePointerEvent {
+    pos: egui::Pos2,
+    pressed: bool,
+}
+
+struct SimilarMoveFrameInput {
+    enabled: bool,
+    focused: bool,
+    primary_down: bool,
+    events: Vec<SimilarMovePointerEvent>,
+}
+
+impl SimilarMoveFrameInput {
+    fn capture(ctx: &egui::Context, state: &SimilarPanelState) -> Self {
+        let enabled = crate::perf::is_enabled();
+        if !enabled {
+            state.clear_pressed_move_trace();
+            return Self {
+                enabled: false,
+                focused: true,
+                primary_down: false,
+                events: Vec::new(),
+            };
+        }
+        let (focused, primary_down, events) = ctx.input(|input| {
+            let events = input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        ..
+                    } => Some(SimilarMovePointerEvent {
+                        pos: *pos,
+                        pressed: *pressed,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            (
+                input.viewport().focused.unwrap_or(true),
+                input.pointer.primary_down(),
+                events,
+            )
+        });
+        if !focused {
+            state.finish_pressed_move_trace("viewport_focus_lost");
+        }
+        Self {
+            enabled,
+            focused,
+            primary_down,
+            events,
+        }
+    }
+
+    fn saw_release(&self) -> bool {
+        self.events.iter().any(|event| !event.pressed)
+    }
+}
+
+fn observe_similar_move_response(
+    state: &SimilarPanelState,
+    frame: &SimilarMoveFrameInput,
+    response: &egui::Response,
+    source: crate::app::SimilarMoveSource,
+    target: impl FnOnce() -> Option<crate::snapshot::SnapshotTarget>,
+) -> Option<crate::app::SimilarMoveTrace> {
+    if !frame.enabled || !frame.focused || frame.events.is_empty() {
+        return None;
+    }
+    let pending_matches_response = state
+        .move_trace_pressed
+        .borrow()
+        .as_ref()
+        .is_some_and(|pressed| pressed.response_id == response.id);
+    let has_press_inside = frame
+        .events
+        .iter()
+        .any(|event| event.pressed && response.rect.contains(event.pos));
+    let has_release_for_response = pending_matches_response && frame.saw_release();
+    if !has_press_inside && !has_release_for_response {
+        return None;
+    }
+
+    let target = target();
+    for event in &frame.events {
+        if event.pressed && response.rect.contains(event.pos) {
+            if state.move_trace_pressed.borrow().is_none() {
+                let trace = crate::app::SimilarMoveTrace::new(source, target.as_ref());
+                trace.emit(
+                    "pointer_press",
+                    &[
+                        ("inside", serde_json::Value::from(true)),
+                        (
+                            "response_hovered",
+                            serde_json::Value::from(response.hovered()),
+                        ),
+                        (
+                            "response_down",
+                            serde_json::Value::from(response.is_pointer_button_down_on()),
+                        ),
+                        (
+                            "target_available",
+                            serde_json::Value::from(target.is_some()),
+                        ),
+                    ],
+                );
+                *state.move_trace_pressed.borrow_mut() = Some(SimilarMovePressedTrace {
+                    response_id: response.id,
+                    trace,
+                });
+            }
+            continue;
+        }
+        if event.pressed {
+            continue;
+        }
+        let matches = state
+            .move_trace_pressed
+            .borrow()
+            .as_ref()
+            .is_some_and(|pressed| {
+                pressed.response_id == response.id
+                    && pressed.trace.source == source
+                    && pressed.trace.target_digest
+                        == crate::app::SimilarMoveTrace::digest_for_target(target.as_ref())
+            });
+        if !matches {
+            continue;
+        }
+        let trace = state
+            .move_trace_pressed
+            .borrow_mut()
+            .take()
+            .expect("matching similar move press")
+            .trace;
+        trace.emit(
+            "pointer_release",
+            &[
+                (
+                    "inside",
+                    serde_json::Value::from(response.rect.contains(event.pos)),
+                ),
+                (
+                    "response_clicked",
+                    serde_json::Value::from(response.clicked()),
+                ),
+                (
+                    "response_hovered",
+                    serde_json::Value::from(response.hovered()),
+                ),
+                (
+                    "response_down",
+                    serde_json::Value::from(response.is_pointer_button_down_on()),
+                ),
+            ],
+        );
+        if response.clicked() {
+            trace.emit("action_selected", &[]);
+            return Some(trace);
+        }
+        trace.terminal("gesture_not_clicked");
+    }
+    None
+}
+
+fn finish_similar_move_frame(state: &SimilarPanelState, frame: &SimilarMoveFrameInput) {
+    if !frame.enabled || !frame.focused {
+        return;
+    }
+    if frame.saw_release() {
+        state.finish_pressed_move_trace("release_without_response");
+    } else if !frame.primary_down {
+        state.finish_pressed_move_trace("pointer_stream_lost");
+    }
+}
+
 #[derive(Default)]
 struct SimilarPanelActions {
     open_favorites: bool,
-    open_hit: Option<crate::similar_index::QueryHit>,
+    open_hit: Option<TracedSimilarAction<crate::similar_index::QueryHit>>,
     pin_hit: Option<crate::similar_index::QueryHit>,
-    /// このフレームで「長押し表示」ボタンが押されたままの候補。押していないフレームは
-    /// `None` になり、消費側が覗き見の終了を判定する。
-    peek_held: Option<crate::similar_index::QueryHit>,
+    /// 「長押し表示」で新しく始まった primary press。held level からgestureを再生成せず、
+    /// release/focus終端は所有viewportの入力段が処理する。
+    peek_press: Option<crate::similar_preview::SimilarPreviewCandidate>,
     /// ページ帯から選ばれた相手の本のページ。
-    open_page: Option<(String, crate::similar_index::SimilarItemTarget)>,
+    open_page: Option<TracedSimilarAction<(String, crate::similar_index::SimilarItemTarget)>>,
+    /// A completed visit selected from this viewer's transient similar-book history.
+    open_history: Option<TracedSimilarAction<crate::snapshot::SnapshotTarget>>,
     /// このフレームで実際に clip 内へ描いたサムネイル request。worker dispatch と GPU
     /// upload はこの需要を優先し、スクロール外の旧要求で新しい表示を待たせない。
     thumbnail_demand: SimilarThumbDemand,
@@ -1042,100 +1426,31 @@ fn similar_open_location(
     }
 }
 
+fn similar_snapshot_open_location(target: &crate::snapshot::SnapshotTarget) -> Option<PathBuf> {
+    match target {
+        crate::snapshot::SnapshotTarget::Fs(path) => path.parent().map(Path::to_path_buf),
+        crate::snapshot::SnapshotTarget::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+        crate::snapshot::SnapshotTarget::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
+        crate::snapshot::SnapshotTarget::ConvertibleArchive { .. } => None,
+    }
+}
+
 fn prepare_similar_compare_result(
     hit: crate::similar_index::QueryHit,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
 ) -> Result<crate::app::ComparePinResult, String> {
-    let target = crate::similar_index::target_for_hit(&hit)
-        .cloned()
-        .ok_or_else(|| "比較画像の場所を解決できません".to_string())?;
-    let (display_name, pixels) = match target {
-        crate::similar_index::SimilarItemTarget::File(path) => {
-            let display_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("?")
-                .to_string();
-            let decoded = crate::canonical_image_loader::decode_canonical_image(
-                crate::canonical_image_loader::CanonicalImageSource::File {
-                    path: &path,
-                    verified_bytes: None,
-                },
-                crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
-                    crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
-                ),
-            )
-            .map_err(|error| error.to_string())?;
-            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
-                return Err("動画は比較画像に設定できません".to_string());
-            };
-            (display_name, image.into_gpu_raster().pixels)
-        }
-        crate::similar_index::SimilarItemTarget::ZipPage {
-            zip_path,
-            entry_name: _,
-        } => {
-            let entry_name = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
-                .map_err(|error| error.to_string())?
-                .entries
-                .into_iter()
-                .find(|entry| {
-                    crate::similar_index::item_key_for_zip_page(&zip_path, &entry.entry_name)
-                        == hit.item_key
-                })
-                .map(|entry| entry.entry_name)
-                .ok_or_else(|| "ZIP内の比較画像が見つかりません".to_string())?;
-            let display_name = crate::zip_loader::entry_basename(&entry_name).to_string();
-            let decoded = crate::canonical_image_loader::decode_canonical_image(
-                crate::canonical_image_loader::CanonicalImageSource::ArchiveEntry {
-                    archive_path: &zip_path,
-                    entry_name: &entry_name,
-                },
-                crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
-                    crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
-                ),
-            )
-            .map_err(|error| error.to_string())?;
-            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
-                return Err("動画は比較画像に設定できません".to_string());
-            };
-            (display_name, image.into_gpu_raster().pixels)
-        }
-        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
-            let pdf_password = pdf_passwords.get(&pdf_path);
-            let display_name = format!(
-                "{} - Page {}",
-                pdf_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("PDF"),
-                page_num + 1
-            );
-            let rendered = crate::pdf_loader::render_page_for_display(
-                &pdf_path,
-                page_num,
-                pdf_viewport,
-                false,
-                pdf_password.as_deref(),
-                None,
-                crate::pdf_loader::JobPriority::Critical,
-                crate::pdf_loader::current_render_context_epoch(),
-                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-            )
-            .map_err(|error| error.to_string())?;
-            let image = crate::canonical_image_loader::clamp_dynamic_for_gpu(rendered.image);
-            (
-                display_name,
-                crate::canonical_image_loader::dynamic_image_to_color_image(&image),
-            )
-        }
-    };
+    let stamp =
+        crate::similar_preview::SimilarPreviewStamp::for_hit(&hit, &pdf_passwords, pdf_viewport)
+            .ok_or_else(|| "比較画像の場所を解決できません".to_string())?;
+    let asset = crate::similar_preview::load_similar_preview_pixels(
+        &stamp,
+        &pdf_passwords,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        crate::pdf_loader::current_render_context_epoch(),
+    )?;
     crate::ui_fullscreen::prepare_compare_pin_result(
-        crate::capture::CapturePixelJob::already_adjusted(
-            display_name,
-            std::sync::Arc::new(pixels),
-        ),
+        crate::capture::CapturePixelJob::already_adjusted(asset.display_name, asset.pixels),
     )
 }
 
@@ -1168,23 +1483,190 @@ impl TagPanelRow {
 }
 
 impl App {
-    fn open_similar_hit(&mut self, ctx: &egui::Context, hit: &crate::similar_index::QueryHit) {
-        if let Some(index) = self.items.iter().position(|item| {
-            crate::app::similar_index_item_key(item).as_deref() == Some(hit.item_key.as_str())
-        }) {
+    fn dispatch_similar_panel_open_actions(
+        &mut self,
+        ctx: &egui::Context,
+        actions: &mut SimilarPanelActions,
+    ) {
+        if let Some(action) = actions.open_hit.take() {
+            self.open_similar_hit(ctx, &action.value, action.trace);
+        }
+        if let Some(action) = actions.open_page.take() {
+            let (item_key, target) = action.value;
+            self.open_similar_book_page(ctx, &item_key, target, action.trace);
+        }
+        if let Some(action) = actions.open_history.take() {
+            self.open_similar_book_history_page(ctx, action.value, action.trace);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_similar_book_move_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        action: (String, crate::similar_index::SimilarItemTarget),
+    ) {
+        let mut actions = SimilarPanelActions {
+            open_page: Some(TracedSimilarAction {
+                value: action,
+                trace: None,
+            }),
+            ..Default::default()
+        };
+        self.dispatch_similar_panel_open_actions(ctx, &mut actions);
+    }
+
+    fn similar_book_navigation_purpose(
+        &self,
+        destination: &crate::snapshot::SnapshotTarget,
+        mut diagnostic_trace: Option<crate::app::SimilarMoveTrace>,
+    ) -> Option<crate::app::FsNavigationPurpose> {
+        let origin = self
+            .fullscreen_idx
+            .and_then(|idx| self.items.get(idx))
+            .and_then(crate::app::SimilarBookLocation::from_grid_item);
+        let destination = crate::app::SimilarBookLocation::from_destination(destination.clone());
+        let (Some(origin), Some(destination)) = (origin, destination) else {
+            if let Some(trace) = diagnostic_trace.take() {
+                trace.terminal("navigation_identity_unavailable");
+            }
+            return None;
+        };
+        Some(crate::app::FsNavigationPurpose::SimilarBookVisit(
+            crate::app::SimilarBookNavigationIntent {
+                origin,
+                destination,
+                diagnostic_trace,
+            },
+        ))
+    }
+
+    fn open_similar_snapshot_target(
+        &mut self,
+        ctx: &egui::Context,
+        item_key: Option<&str>,
+        location: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        diagnostic_trace: Option<crate::app::SimilarMoveTrace>,
+    ) {
+        let key_index = item_key.and_then(|key| {
+            self.items
+                .iter()
+                .position(|item| crate::app::similar_index_item_key(item).as_deref() == Some(key))
+        });
+        let destination = crate::app::SimilarBookLocation::from_destination(target.clone());
+        let target_index = destination.as_ref().and_then(|destination| {
+            self.items
+                .iter()
+                .position(|item| destination.matches_grid_item(item))
+        });
+        // Preserve the original union-minimum selection exactly. In particular,
+        // key_index.or(target_index) would change behavior when the two identities disagree.
+        let existing_index = self.items.iter().position(|item| {
+            item_key
+                .is_some_and(|key| crate::app::similar_index_item_key(item).as_deref() == Some(key))
+                || destination
+                    .as_ref()
+                    .is_some_and(|destination| destination.matches_grid_item(item))
+        });
+        if let Some(trace) = diagnostic_trace.as_ref() {
+            let selected_by = existing_index.map_or("none", |index| {
+                match (key_index == Some(index), target_index == Some(index)) {
+                    (true, true) => "both",
+                    (true, false) => "item_key",
+                    (false, true) => "target",
+                    (false, false) => "union_other",
+                }
+            });
+            trace.emit(
+                "dispatch",
+                &[
+                    ("key_found", serde_json::Value::from(key_index.is_some())),
+                    (
+                        "target_found",
+                        serde_json::Value::from(target_index.is_some()),
+                    ),
+                    (
+                        "identity_mismatch",
+                        serde_json::Value::from(
+                            key_index.is_some()
+                                && target_index.is_some()
+                                && key_index != target_index,
+                        ),
+                    ),
+                    ("selected_by", serde_json::Value::from(selected_by)),
+                    (
+                        "viewport",
+                        serde_json::Value::from(format!("{:?}", ctx.viewport_id())),
+                    ),
+                    (
+                        "selected_current",
+                        serde_json::Value::from(existing_index == self.fullscreen_idx),
+                    ),
+                ],
+            );
+        }
+        let navigation_purpose = self.similar_book_navigation_purpose(&target, diagnostic_trace);
+        if let Some(index) = existing_index {
             self.supersede_required_fullscreen_folder_open();
+            match (self.fullscreen_idx, navigation_purpose) {
+                (Some(current_idx), Some(purpose)) => {
+                    if !self.begin_similar_book_page_navigation_sequence(
+                        ctx,
+                        current_idx,
+                        index,
+                        purpose,
+                    ) {
+                        return;
+                    }
+                }
+                (None, Some(mut purpose)) => {
+                    if let Some(trace) = purpose.take_diagnostic_trace() {
+                        trace.terminal("current_view_unavailable");
+                    }
+                }
+                (_, None) => {}
+            }
             self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
             return;
         }
+        if let Some(purpose) = navigation_purpose {
+            self.open_required_fullscreen_location_with_purpose(
+                ctx,
+                location,
+                target,
+                crate::app::HistoryTrigger::UserChosen,
+                purpose,
+            );
+        } else {
+            self.open_required_fullscreen_location(
+                ctx,
+                location,
+                target,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+        }
+    }
+
+    fn open_similar_hit(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &crate::similar_index::QueryHit,
+        diagnostic_trace: Option<crate::app::SimilarMoveTrace>,
+    ) {
         let Some((location, target)) = similar_open_target(hit) else {
+            if let Some(trace) = diagnostic_trace {
+                trace.terminal("target_unavailable");
+            }
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;
         };
-        self.open_required_fullscreen_location(
+        self.open_similar_snapshot_target(
             ctx,
+            Some(&hit.item_key),
             location,
             target,
-            crate::app::HistoryTrigger::UserChosen,
+            diagnostic_trace,
         );
     }
 
@@ -1194,7 +1676,17 @@ impl App {
         ctx: &egui::Context,
         hit: &crate::similar_index::QueryHit,
     ) {
-        self.open_similar_hit(ctx, hit);
+        self.open_similar_hit(ctx, hit, None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_similar_hit_with_trace_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &crate::similar_index::QueryHit,
+        trace: crate::app::SimilarMoveTrace,
+    ) {
+        self.open_similar_hit(ctx, hit, Some(trace));
     }
 
     /// ページ帯から相手の本のページを開く。
@@ -1206,26 +1698,32 @@ impl App {
         ctx: &egui::Context,
         item_key: &str,
         target: crate::similar_index::SimilarItemTarget,
+        diagnostic_trace: Option<crate::app::SimilarMoveTrace>,
     ) {
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|item| crate::app::similar_index_item_key(item).as_deref() == Some(item_key))
-        {
-            self.supersede_required_fullscreen_folder_open();
-            self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
-            return;
-        }
         let Some((location, target)) = similar_open_location(target) else {
+            if let Some(trace) = diagnostic_trace {
+                trace.terminal("target_unavailable");
+            }
             self.show_feedback_toast("ページの場所を開けません".to_string());
             return;
         };
-        self.open_required_fullscreen_location(
-            ctx,
-            location,
-            target,
-            crate::app::HistoryTrigger::UserChosen,
-        );
+        self.open_similar_snapshot_target(ctx, Some(item_key), location, target, diagnostic_trace);
+    }
+
+    fn open_similar_book_history_page(
+        &mut self,
+        ctx: &egui::Context,
+        target: crate::snapshot::SnapshotTarget,
+        diagnostic_trace: Option<crate::app::SimilarMoveTrace>,
+    ) {
+        let Some(location) = similar_snapshot_open_location(&target) else {
+            if let Some(trace) = diagnostic_trace {
+                trace.terminal("target_unavailable");
+            }
+            self.show_feedback_toast("履歴のページを開けません".to_string());
+            return;
+        };
+        self.open_similar_snapshot_target(ctx, None, location, target, diagnostic_trace);
     }
 
     #[cfg(test)]
@@ -1235,7 +1733,7 @@ impl App {
         item_key: &str,
         target: crate::similar_index::SimilarItemTarget,
     ) {
-        self.open_similar_book_page(ctx, item_key, target);
+        self.open_similar_book_page(ctx, item_key, target, None);
     }
 
     fn pin_similar_hit(
@@ -1257,102 +1755,6 @@ impl App {
         self.start_external_compare_pin_job(ctx, hit.item_key.clone(), move || {
             prepare_similar_compare_result(job_hit, pdf_passwords, viewport)
         });
-    }
-
-    /// 「長押し表示」の 1 フレームぶんの状態遷移。
-    ///
-    /// `held` はこのフレームでボタンが押されたままの候補。押している間は比較画像として
-    /// 表示し、離したら元の表示に戻す。比較画像がまだその候補でない場合はここで設定を始め、
-    /// 読み込めた次のフレームから表示へ切り替わる。押しっぱなしのまま設定が終わらなければ
-    /// 何も映らないが、そのときも設定は残るので 2 回目は即座に映る。
-    fn update_similar_peek(
-        &mut self,
-        ctx: &egui::Context,
-        held: Option<crate::similar_index::QueryHit>,
-        full_rect: egui::Rect,
-    ) {
-        let transition = decide_similar_peek(
-            self.similar_peek
-                .as_ref()
-                .map(|peek| peek.item_key.as_str()),
-            held.as_ref().map(|hit| hit.item_key.as_str()),
-        );
-        if matches!(transition, SimilarPeekTransition::Idle) {
-            return;
-        }
-        if matches!(
-            transition,
-            SimilarPeekTransition::Stop | SimilarPeekTransition::Switch
-        ) && let Some(peek) = self.similar_peek.take()
-        {
-            self.end_similar_peek(ctx, peek);
-        }
-        let Some(hit) = held else {
-            return;
-        };
-        if matches!(
-            transition,
-            SimilarPeekTransition::Start | SimilarPeekTransition::Switch
-        ) {
-            self.similar_peek = Some(crate::app::SimilarPeek {
-                item_key: hit.item_key.clone(),
-                restore_mode: self.compare_view_mode,
-            });
-        }
-        self.advance_similar_peek(ctx, &hit, full_rect);
-    }
-
-    /// 押されている間、毎フレーム呼ばれる。比較画像が揃っていなければ設定を始めるだけで、
-    /// 揃っていれば表示へ入る。どちらの場合も同じ経路を通るので、待ち時間の有無で分岐しない。
-    fn advance_similar_peek(
-        &mut self,
-        ctx: &egui::Context,
-        hit: &crate::similar_index::QueryHit,
-        full_rect: egui::Rect,
-    ) {
-        let pinned = self
-            .pinned_compare_slot
-            .as_ref()
-            .and_then(|slot| slot.external_item_key.as_deref())
-            == Some(hit.item_key.as_str());
-        if !pinned {
-            if self.compare_pin_pending.is_none() {
-                self.pin_similar_hit(ctx, hit, full_rect);
-            }
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            return;
-        }
-        if !matches!(
-            self.compare_view_mode,
-            crate::app::CompareViewMode::PinnedNormal
-        ) {
-            self.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
-            self.compare_wipe_dragging = false;
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.clear_compare_gpu_pair();
-                self.ensure_compare_prepared_pair(ctx, fs_idx);
-            }
-        }
-    }
-
-    /// 覗き見の終了。押す前の表示状態へ戻す。
-    fn end_similar_peek(&mut self, ctx: &egui::Context, peek: crate::app::SimilarPeek) {
-        if !matches!(
-            self.compare_view_mode,
-            crate::app::CompareViewMode::PinnedNormal
-        ) {
-            return;
-        }
-        match peek.restore_mode {
-            crate::app::CompareViewMode::PinnedNormal => {}
-            crate::app::CompareViewMode::Off => self.hide_compare_pinned_view(),
-            other => {
-                self.compare_view_mode = other;
-                if let Some(fs_idx) = self.fullscreen_idx {
-                    self.ensure_compare_prepared_pair(ctx, fs_idx);
-                }
-            }
-        }
     }
 
     /// Update the transient right-panel hover latch for the current fullscreen frame.
@@ -1403,6 +1805,36 @@ impl App {
     /// 右パネルは常に上部バーの下から開始する。
     ///
     /// 戻り値: 右パネルが表示中なら true（上部バーの強制表示に使う）
+    fn begin_similar_preview_from_panel(
+        &mut self,
+        ctx: &egui::Context,
+        candidate: &crate::similar_preview::SimilarPreviewCandidate,
+        full_rect: egui::Rect,
+    ) {
+        // The metadata button owns this press. Retire a still-active region selection before
+        // deriving the preview session; the ordered capture reducer has already committed any
+        // preceding canvas release from this same input frame.
+        self.capture_region_selection = None;
+        let Some(session) = self.similar_preview_session(ctx) else {
+            return;
+        };
+        let viewport = self.fs_pdf_display_target.unwrap_or_else(|| {
+            crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                full_rect.width(),
+                full_rect.height(),
+                ctx.pixels_per_point(),
+                crate::pdf_loader::PdfDisplayFitMode::Page,
+            )
+        });
+        self.similar_panel.preview.begin_candidate_press(
+            ctx,
+            candidate,
+            &self.pdf_passwords,
+            viewport,
+            session,
+        );
+    }
+
     pub(crate) fn draw_metadata_panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -1414,21 +1846,21 @@ impl App {
         self.draw_metadata_panel_inner(ui, ctx, full_rect, lock_effective, seek_height)
     }
 
-    fn draw_metadata_panel_inner(
+    /// Draw the item-independent frame shared by a live metadata panel and a deferred
+    /// navigation shell. The caller owns the body so an unresolved target cannot accidentally
+    /// read metadata or start work for the capture-time item.
+    fn begin_metadata_panel_frame(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         lock_effective: bool,
         seek_height: f32,
-    ) -> bool {
+        tag_picker_open: bool,
+        navigator_exclusion: Option<egui::Rect>,
+    ) -> Option<egui::Rect> {
         let panel_rect =
             crate::ui_fullscreen::metadata_panel_rect_with_seek_height(full_rect, seek_height);
-
-        // Most frames update this before image-input consumption in ui_fullscreen. Keep the draw
-        // boundary idempotently current as well because capture-selection and other modal paths
-        // can bypass the general image-input handler while this panel is still rendered.
-        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         self.update_metadata_panel_hover_latch(
             ctx,
             full_rect,
@@ -1436,24 +1868,19 @@ impl App {
             navigator_exclusion,
             seek_height,
         );
-        // 表示するかの答えは `FullscreenInfoPanelState` だけが出す。ロックは実効値を使う。
         let mut panel_state = self.fs_info_panel;
         panel_state.locked = lock_effective;
         let explicit = panel_state.explicit_shown(self.settings.fullscreen_side_panel_mode);
-        if !panel_state.visible(
-            self.settings.fullscreen_side_panel_mode,
-            self.fullscreen_tag_picker_open,
-        ) {
-            return false;
+        if !panel_state.visible(self.settings.fullscreen_side_panel_mode, tag_picker_open) {
+            self.similar_panel.retain_book_query();
+            return None;
         }
 
-        // パネル背景
         ui.painter().rect_filled(
             panel_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(18, 18, 22, 230),
         );
-        // 左端に区切り線
         ui.painter().line_segment(
             [panel_rect.left_top(), panel_rect.left_bottom()],
             egui::Stroke::new(
@@ -1461,24 +1888,19 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
             ),
         );
-
-        // パネルのクリックイベントを消費
         let _ = ui.interact(
             panel_rect,
             egui::Id::new("metadata_panel_bg"),
             egui::Sense::click(),
         );
 
-        // ── タイトルバー (ピン留めボタン付き) ──
         let title_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), TITLE_BAR_H));
-        // タイトルバー背景 (やや明るめ)
         ui.painter().rect_filled(
             title_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(30, 30, 38, 240),
         );
-        // 下端の区切り線
         ui.painter().line_segment(
             [
                 egui::pos2(title_rect.min.x, title_rect.max.y),
@@ -1489,8 +1911,6 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
             ),
         );
-
-        // タイトルテキスト
         ui.painter().text(
             egui::pos2(title_rect.min.x + 10.0, title_rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -1499,8 +1919,6 @@ impl App {
             egui::Color32::from_gray(200),
         );
 
-        // 鍵ボタン。ON では画像へ重ねず、右にパネル幅の領域を確保する (backlog §1.158)。
-        // 閉じるボタンの左隣に置き、ロック中は閉じるボタンを出さない (閉じるのは解錠が先)。
         let button_size = 22.0;
         let button_margin = 5.0;
         let lock_rect = egui::Rect::from_min_size(
@@ -1524,8 +1942,6 @@ impl App {
             egui::Color32::TRANSPARENT
         };
         ui.painter().rect_filled(lock_rect, 3.0, lock_bg);
-        // 鍵の形は静止画・動画の固定バーと**同じベクター**を使う。ここで描き直さない
-        // (docs/video-architecture.md「各バーとシークストリップには固定状態を示す鍵ボタン」)。
         crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
             ui.painter(),
             lock_rect.center(),
@@ -1540,12 +1956,10 @@ impl App {
         if lock_resp.on_hover_text(lock_hint).clicked() {
             self.fs_info_panel.locked = !locked_now;
             if !self.fs_info_panel.locked {
-                // 解錠したら、その場の明示 open として残す (パネルが消えると操作を見失う)。
                 self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
             }
         }
 
-        // pointer / touch handle で明示的に開いた右パネルを閉じるボタン。
         if explicit && !locked_now {
             let close_size = 22.0;
             let close_margin = 5.0 + button_size + 4.0;
@@ -1556,6 +1970,8 @@ impl App {
                 ),
                 egui::vec2(close_size, close_size),
             );
+            #[cfg(test)]
+            LAST_METADATA_CLOSE_BUTTON_RECT.with(|rect| rect.set(Some(close_rect)));
             let close_resp = ui.interact(
                 close_rect,
                 egui::Id::new("metadata_close_btn"),
@@ -1583,10 +1999,79 @@ impl App {
             }
         }
 
-        // ── コンテンツ領域 (タイトルバーの下) ──
-        let content_top = title_rect.max.y;
-        let content_rect =
-            egui::Rect::from_min_max(egui::pos2(panel_rect.min.x, content_top), panel_rect.max);
+        Some(egui::Rect::from_min_max(
+            egui::pos2(panel_rect.min.x, title_rect.max.y),
+            panel_rect.max,
+        ))
+    }
+
+    pub(crate) fn draw_metadata_panel_navigation_shell(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        lock_effective: bool,
+        seek_height: f32,
+    ) -> bool {
+        let Some(content_rect) = self.begin_metadata_panel_frame(
+            ui,
+            ctx,
+            full_rect,
+            lock_effective,
+            seek_height,
+            false,
+            None,
+        ) else {
+            return false;
+        };
+        self.similar_panel.retain_book_query();
+        let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
+        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
+        child_ui.set_clip_rect(content_rect);
+        apply_metadata_panel_dark_widget_style(&mut child_ui);
+        child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::vertical()
+            .id_salt("metadata_navigation_shell_scroll")
+            .auto_shrink([false, false])
+            .show(&mut child_ui, |ui| {
+                ui.set_width(metadata_scroll_content_width(ui, inner_rect.width()));
+                draw_metadata_panel_tabs(ui, &mut self.similar_panel.tab);
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("移動先を読み込んでいます")
+                            .color(TEXT_COLOR)
+                            .size(12.0),
+                    );
+                });
+            });
+        true
+    }
+
+    fn draw_metadata_panel_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        lock_effective: bool,
+        seek_height: f32,
+    ) -> bool {
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let tag_picker_open = self.fullscreen_tag_picker_open;
+        let Some(content_rect) = self.begin_metadata_panel_frame(
+            ui,
+            ctx,
+            full_rect,
+            lock_effective,
+            seek_height,
+            tag_picker_open,
+            navigator_exclusion,
+        ) else {
+            return false;
+        };
 
         let ai_metadata = self.get_current_ai_metadata();
         let exif_info = self.get_current_exif();
@@ -1694,7 +2179,18 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
 
-                if self.similar_panel.tab == MetadataPanelTab::Similar {
+                // The close button above changes the live panel state but this draw closure still
+                // runs for the current pass. Recheck demand before accepting a fresh book query.
+                let book_query_demanded = self.similar_panel.tab == MetadataPanelTab::Similar
+                    && self.fs_info_panel.visible(
+                        self.settings.fullscreen_side_panel_mode,
+                        self.fullscreen_tag_picker_open,
+                    );
+                if !book_query_demanded {
+                    self.similar_panel.retain_book_query();
+                }
+
+                if book_query_demanded {
                     // 見開き中は**両方のページ**を見ている。片方だけ調べると、もう片方に
                     // 別バージョンがあっても気付けない。補正パネルが左右を切り替えるのは
                     // 編集が一度に 1 ページだからで、閲覧側にその制約はない。
@@ -1718,12 +2214,50 @@ impl App {
                         .collect();
                     let queries: Vec<std::sync::Arc<crate::similar_index::ItemQuery>> = shown_items
                         .iter()
-                        .map(|item| self.query_similar_item(item))
+                        .map(|item| {
+                            #[cfg(test)]
+                            if let Some(query) = self.similar_panel.item_query_override.clone() {
+                                return query;
+                            }
+                            self.query_similar_item(item)
+                        })
                         .collect();
-                    let book = current_item
-                        .as_ref()
-                        .map(|item| self.query_similar_book(item));
-                    let results_are_stale = self.similar_query_results_are_stale();
+                    let book = current_item.as_ref().map_or_else(
+                        || {
+                            self.similar_panel.withdraw_book_query();
+                            None
+                        },
+                        |item| {
+                            #[cfg(test)]
+                            if let Some(query) = self.similar_panel.book_query_override.clone() {
+                                return Some(query);
+                            }
+                            Some(self.query_similar_book(item))
+                        },
+                    );
+                    let mut results_are_stale = self.similar_query_results_are_stale();
+                    #[cfg(test)]
+                    if let Some(override_value) = self.similar_panel.results_are_stale_override {
+                        results_are_stale = override_value;
+                    }
+                    // Fresh Ready results are the only indexed freshness signal for a preview.
+                    // Preparing falls back to last_ready below, and a missing hit is not proof that
+                    // the underlying resource was deleted.
+                    let preview_pdf_viewport = self.fs_pdf_display_target.unwrap_or_else(|| {
+                        crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                            full_rect.width(),
+                            full_rect.height(),
+                            ctx.pixels_per_point(),
+                            crate::pdf_loader::PdfDisplayFitMode::Page,
+                        )
+                    });
+                    for query in &queries {
+                        self.similar_panel.preview.observe_query_result(
+                            query.as_ref(),
+                            &self.pdf_passwords,
+                            preview_pdf_viewport,
+                        );
+                    }
                     // 照会が返るまでの数フレームだけ、直前の結果を出し続ける。面ごとに覚える
                     // ので、見開きでも左右それぞれが空白にならない。
                     self.similar_panel.last_ready.resize(queries.len(), None);
@@ -1938,16 +2472,13 @@ impl App {
         if let Some(hit) = similar_actions.pin_hit.take() {
             self.pin_similar_hit(ctx, &hit, full_rect);
         }
-        self.update_similar_peek(ctx, similar_actions.peek_held.take(), full_rect);
+        if let Some(hit) = similar_actions.peek_press.take() {
+            self.begin_similar_preview_from_panel(ctx, &hit, full_rect);
+        }
         if similar_actions.open_favorites {
             self.show_favorites_editor = true;
         }
-        if let Some(hit) = similar_actions.open_hit {
-            self.open_similar_hit(ctx, &hit);
-        }
-        if let Some((item_key, target)) = similar_actions.open_page {
-            self.open_similar_book_page(ctx, &item_key, target);
-        }
+        self.dispatch_similar_panel_open_actions(ctx, &mut similar_actions);
 
         // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。
         if let (Some(idx), Some(new_stars)) = (rating_idx, set_rating) {
@@ -2882,6 +3413,8 @@ fn draw_similar_panel(
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
+    let move_frame = SimilarMoveFrameInput::capture(ctx, state);
+    draw_similar_book_history(ui, state, &move_frame, actions);
     if results_are_stale
         && views.iter().any(|view| {
             !matches!(
@@ -2916,6 +3449,7 @@ fn draw_similar_panel(
             cache_decision,
             pdf_passwords,
             ctx,
+            &move_frame,
             actions,
         );
     }
@@ -2943,9 +3477,81 @@ fn draw_similar_panel(
             pinned_item_key,
             compare_pin_preparing,
             ctx,
+            &move_frame,
             actions,
         );
     }
+    finish_similar_move_frame(state, &move_frame);
+}
+
+fn draw_similar_book_history(
+    ui: &mut egui::Ui,
+    state: &SimilarPanelState,
+    move_frame: &SimilarMoveFrameInput,
+    actions: &mut SimilarPanelActions,
+) {
+    let Some((entries, current_container_key)) = state.book_history_snapshot() else {
+        return;
+    };
+    ui.label(
+        egui::RichText::new("類似の閲覧履歴")
+            .color(egui::Color32::WHITE)
+            .size(14.0)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    for entry in entries {
+        let is_current = entry.container_key == current_container_key;
+        ui.horizontal_top(|ui| {
+            let name = book_relation_name(&entry.container_key);
+            let text_width = (ui.available_width() - 52.0).max(80.0);
+            ui.vertical(|ui| {
+                ui.set_max_width(text_width);
+                ui.label(
+                    egui::RichText::new(name)
+                        .color(if is_current {
+                            egui::Color32::from_rgb(220, 238, 255)
+                        } else {
+                            TEXT_COLOR
+                        })
+                        .strong(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&entry.container_key)
+                            .color(DIM_COLOR)
+                            .size(10.0),
+                    )
+                    .wrap(),
+                );
+            });
+            if is_current {
+                ui.label(egui::RichText::new("現在").color(DIM_COLOR).size(11.0));
+            } else {
+                let move_button = ui.small_button("移動");
+                let trace = observe_similar_move_response(
+                    state,
+                    move_frame,
+                    &move_button,
+                    crate::app::SimilarMoveSource::HistoryButton,
+                    || Some(entry.page.clone()),
+                );
+                if move_button.clicked() {
+                    replace_traced_similar_action(
+                        &mut actions.open_history,
+                        TracedSimilarAction {
+                            value: entry.page,
+                            trace,
+                        },
+                    );
+                }
+            }
+        });
+        ui.add_space(3.0);
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(8.0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2960,6 +3566,7 @@ fn draw_similar_page_results(
     pinned_item_key: Option<&str>,
     compare_pin_preparing: bool,
     ctx: &egui::Context,
+    move_frame: &SimilarMoveFrameInput,
     actions: &mut SimilarPanelActions,
 ) {
     let compare_state = |hit: &crate::similar_index::QueryHit| {
@@ -3102,14 +3709,107 @@ fn draw_similar_page_results(
                         ui.close();
                     }
                 });
+                let trace = observe_similar_move_response(
+                    state,
+                    move_frame,
+                    &response,
+                    crate::app::SimilarMoveSource::ItemCard,
+                    || {
+                        crate::similar_index::target_for_hit(hit)
+                            .cloned()
+                            .and_then(similar_open_location)
+                            .map(|(_, target)| target)
+                    },
+                );
                 if response.clicked() {
-                    actions.open_hit = Some(hit.clone());
+                    replace_traced_similar_action(
+                        &mut actions.open_hit,
+                        TracedSimilarAction {
+                            value: hit.clone(),
+                            trace,
+                        },
+                    );
                 }
-                draw_similar_hit_buttons(ui, hit, compare_state(hit), actions);
+                draw_similar_hit_buttons(ui, hit, compare_state(hit), state, move_frame, actions);
                 ui.add_space(6.0);
             }
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BookDrawProbe {
+    rows_visited: u64,
+    visible_strip_folds: u64,
+    origin_projections: u64,
+    final_row_reached: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BOOK_DRAW_PROBE: std::cell::RefCell<Option<BookDrawProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static LAST_BOOK_MOVE_BUTTON_RECT: std::cell::Cell<Option<egui::Rect>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn book_draw_probe_begin() {
+    BOOK_DRAW_PROBE.with(|probe| *probe.borrow_mut() = Some(BookDrawProbe::default()));
+}
+
+#[cfg(test)]
+fn book_draw_probe_update(update: impl FnOnce(&mut BookDrawProbe)) {
+    BOOK_DRAW_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow_mut().as_mut() {
+            update(probe);
+        }
+    });
+}
+
+#[cfg(test)]
+fn book_draw_probe_finish() -> BookDrawProbe {
+    BOOK_DRAW_PROBE
+        .with(|probe| probe.borrow_mut().take())
+        .expect("book draw probe was not started")
+}
+
+#[cfg(test)]
+pub(crate) fn take_book_move_button_rect_for_test() -> Option<egui::Rect> {
+    LAST_BOOK_MOVE_BUTTON_RECT.with(|rect| rect.take())
+}
+
+#[cfg(test)]
+pub(crate) fn draw_book_move_action_for_test(
+    ctx: &egui::Context,
+    input: egui::RawInput,
+    book: &crate::similar_index::BookQuery,
+    state: &mut SimilarPanelState,
+) -> Option<(String, crate::similar_index::SimilarItemTarget)> {
+    let mut actions = SimilarPanelActions::default();
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let move_frame = SimilarMoveFrameInput::capture(ctx, state);
+            draw_book_relations(
+                ui,
+                book,
+                &[],
+                state,
+                72,
+                85,
+                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                None,
+                ctx,
+                &move_frame,
+                &mut actions,
+            );
+            finish_similar_move_frame(state, &move_frame);
+        });
+    });
+    actions.open_page.map(|action| action.value)
 }
 
 /// 「この本と重なる本」。
@@ -3128,6 +3828,7 @@ fn draw_book_relations(
     cache_decision: crate::thumb_loader::CacheDecision,
     pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
     ctx: &egui::Context,
+    move_frame: &SimilarMoveFrameInput,
     actions: &mut SimilarPanelActions,
 ) {
     use crate::similar_index::BookQuery;
@@ -3188,11 +3889,23 @@ fn draw_book_relations(
                 .collect::<Vec<_>>();
             let mut origin_columns = None;
             for hit in &relations.hits {
+                #[cfg(test)]
+                book_draw_probe_update(|probe| probe.rows_visited += 1);
                 let strip = crate::similar_index::BookStripView::new(&relations.origin, hit);
                 ui.label(
                     egui::RichText::new(book_relation_name(&hit.other_container_key))
                         .color(TEXT_COLOR)
                         .size(11.0),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(crate::ui_dialogs::context_menu::native_path_text(
+                            Path::new(&hit.other_container_key),
+                        ))
+                        .color(DIM_COLOR)
+                        .size(10.0),
+                    )
+                    .wrap(),
                 );
                 ui.label(
                     egui::RichText::new(book_relation_line(hit, strip.len()))
@@ -3202,13 +3915,34 @@ fn draw_book_relations(
                 ui.add_space(3.0);
                 // 単体画像の結果と同じ語彙にする。あちらに [移動] があってこちらに無いと、
                 // 本へ移る手段が帯のクリックだけになり、操作が別物に見える。
-                if ui
+                let move_button = ui
                     .small_button("移動")
-                    .on_hover_text("重なりが始まるページを、相手の本で開く")
-                    .clicked()
-                    && let Some(opened) = book_open_target(strip)
-                {
-                    actions.open_page = Some(opened);
+                    .on_hover_text("重なりが始まるページを、相手の本で開く");
+                #[cfg(test)]
+                LAST_BOOK_MOVE_BUTTON_RECT.with(|last| last.set(Some(move_button.rect)));
+                let trace = observe_similar_move_response(
+                    state,
+                    move_frame,
+                    &move_button,
+                    crate::app::SimilarMoveSource::BookButton,
+                    || {
+                        book_open_target(strip)
+                            .and_then(|(_, target)| similar_open_location(target))
+                            .map(|(_, target)| target)
+                    },
+                );
+                if move_button.clicked() {
+                    if let Some(opened) = book_open_target(strip) {
+                        replace_traced_similar_action(
+                            &mut actions.open_page,
+                            TracedSimilarAction {
+                                value: opened,
+                                trace,
+                            },
+                        );
+                    } else if let Some(trace) = trace {
+                        trace.terminal("target_unavailable");
+                    }
                 }
                 ui.add_space(3.0);
                 draw_page_strip(
@@ -3226,6 +3960,8 @@ fn draw_book_relations(
                 );
                 ui.add_space(8.0);
             }
+            #[cfg(test)]
+            book_draw_probe_update(|probe| probe.final_row_reached = true);
         }
     }
     ui.add_space(4.0);
@@ -3368,6 +4104,8 @@ fn origin_strip_columns(
     strip: crate::similar_index::BookStripView<'_>,
     columns: usize,
 ) -> OriginStripColumns {
+    #[cfg(test)]
+    book_draw_probe_update(|probe| probe.origin_projections += 1);
     let mut ranges = Vec::with_capacity(columns);
     let mut strongest = Vec::with_capacity(columns);
     for column in 0..columns {
@@ -3449,6 +4187,16 @@ fn summarize_page_strip(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAST_BOOK_STRIP_RECT: std::cell::Cell<Option<egui::Rect>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn take_book_strip_rect_for_test() -> Option<egui::Rect> {
+    LAST_BOOK_STRIP_RECT.with(|rect| rect.take())
+}
+
 /// 1 冊分のページを 1 行の帯にする。
 ///
 /// 200〜600 ページを 300 px 弱に収めるので 1 ページが 1 px を切る。1 コマに複数ページが
@@ -3476,11 +4224,15 @@ fn draw_page_strip(
         egui::vec2(width, STRIP_HEIGHT + STRIP_MARKER_HEIGHT),
         egui::Sense::click(),
     );
+    #[cfg(test)]
+    LAST_BOOK_STRIP_RECT.with(|last| last.set(Some(outer)));
     // Keep the row's full layout height, but do no folding, painting, hover thumbnail work, or
     // input resolution when the scroll clip cannot show it.
     if !ui.is_rect_visible(outer) {
         return;
     }
+    #[cfg(test)]
+    book_draw_probe_update(|probe| probe.visible_strip_folds += 1);
     let rect = egui::Rect::from_min_size(
         egui::pos2(outer.left(), outer.top() + STRIP_MARKER_HEIGHT),
         egui::vec2(width, STRIP_HEIGHT),
@@ -3611,10 +4363,12 @@ fn draw_page_strip(
             }
         }
     });
-    if response.clicked()
-        && let Some(target) = entry.other_target.clone()
+    if response.is_pointer_button_down_on()
+        && ui.input(|input| input.pointer.primary_pressed())
+        && let Some(candidate) =
+            crate::similar_preview::SimilarPreviewCandidate::for_book_match(entry)
     {
-        actions.open_page = Some((item_key, target));
+        actions.peek_press = Some(candidate);
     }
 }
 
@@ -3638,28 +4392,6 @@ fn strip_page_center(width: f32, pages: usize, page: usize) -> f32 {
 /// ホバー時に出すページの一辺。行のサムネイル (72px) より大きくして、飛ぶ前に中身が分かる
 /// 程度にする。
 const STRIP_PREVIEW_SIZE: f32 = 180.0;
-
-/// 「長押し表示」が 1 フレームでどう動くか。押している対象は key で見分ける。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimilarPeekTransition {
-    /// 覗いておらず、押されてもいない。
-    Idle,
-    Start,
-    Continue,
-    Stop,
-    /// 押したまま別の候補へ移った。前の表示を戻してから新しい方を覗く。
-    Switch,
-}
-
-fn decide_similar_peek(current: Option<&str>, held: Option<&str>) -> SimilarPeekTransition {
-    match (current, held) {
-        (None, None) => SimilarPeekTransition::Idle,
-        (None, Some(_)) => SimilarPeekTransition::Start,
-        (Some(current), Some(held)) if current == held => SimilarPeekTransition::Continue,
-        (Some(_), Some(_)) => SimilarPeekTransition::Switch,
-        (Some(_), None) => SimilarPeekTransition::Stop,
-    }
-}
 
 /// 索引が無い / 対象外のときに出す案内。
 ///
@@ -3694,25 +4426,39 @@ fn draw_similar_state_message(ui: &mut egui::Ui, headline: &str, detail: Option<
 fn draw_similar_hit_buttons(
     ui: &mut egui::Ui,
     hit: &crate::similar_index::QueryHit,
-    state: SimilarCompareState,
+    compare_state: SimilarCompareState,
+    panel_state: &SimilarPanelState,
+    move_frame: &SimilarMoveFrameInput,
     actions: &mut SimilarPanelActions,
 ) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        if ui
-            .small_button("移動")
-            .on_hover_text("この画像を開く")
-            .clicked()
-        {
-            actions.open_hit = Some(hit.clone());
+        let move_button = ui.small_button("移動").on_hover_text("この画像を開く");
+        let trace = observe_similar_move_response(
+            panel_state,
+            move_frame,
+            &move_button,
+            crate::app::SimilarMoveSource::ItemButton,
+            || {
+                crate::similar_index::target_for_hit(hit)
+                    .cloned()
+                    .and_then(similar_open_location)
+                    .map(|(_, target)| target)
+            },
+        );
+        if move_button.clicked() {
+            replace_traced_similar_action(
+                &mut actions.open_hit,
+                TracedSimilarAction {
+                    value: hit.clone(),
+                    trace,
+                },
+            );
         }
 
-        let (label, hover) = match state {
-            SimilarCompareState::Pinned => (
-                "比較解除",
-                "比較画像の設定を解除する".to_owned(),
-            ),
+        let (label, hover) = match compare_state {
+            SimilarCompareState::Pinned => ("比較解除", "比較画像の設定を解除する".to_owned()),
             SimilarCompareState::Preparing => ("準備中", "比較画像を準備しています".to_owned()),
             SimilarCompareState::Idle => (
                 "比較に設定",
@@ -3720,7 +4466,7 @@ fn draw_similar_hit_buttons(
             ),
         };
         let pin = ui.add_enabled(
-            !matches!(state, SimilarCompareState::Preparing),
+            !matches!(compare_state, SimilarCompareState::Preparing),
             egui::Button::new(label).small(),
         );
         if pin.on_hover_text(hover).clicked() {
@@ -3729,9 +4475,11 @@ fn draw_similar_hit_buttons(
 
         let peek = ui
             .add(egui::Button::new("長押し表示").small())
-            .on_hover_text("押している間だけこの画像を表示する。まだ比較画像でない場合は、読み込めた時点で表示に切り替わる");
-        if peek.is_pointer_button_down_on() {
-            actions.peek_held = Some(hit.clone());
+            .on_hover_text(
+                "押している間だけこの画像を表示する。準備が終わる前に離した場合は元の画像を保つ",
+            );
+        if peek.is_pointer_button_down_on() && ui.input(|input| input.pointer.primary_pressed()) {
+            actions.peek_press = crate::similar_preview::SimilarPreviewCandidate::for_hit(hit);
         }
     });
 }
@@ -3850,6 +4598,7 @@ pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
             let mut actions = SimilarPanelActions::default();
             let mut state = SimilarPanelState::default();
             let ctx = ui.ctx().clone();
+            let move_frame = SimilarMoveFrameInput::capture(&ctx, &state);
             for model in [
                 SimilarPanelModel::NoIndex,
                 SimilarPanelModel::NotIndexed,
@@ -3873,6 +4622,7 @@ pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
                     None,
                     false,
                     &ctx,
+                    &move_frame,
                     &mut actions,
                 );
                 ui.add_space(10.0);
@@ -3975,6 +4725,24 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                         hits,
                     };
                     let mut state = SimilarPanelState::default();
+                    state.complete_similar_book_visit(crate::app::SimilarBookNavigationIntent {
+                        origin: crate::app::SimilarBookLocation {
+                            container_key: r"c:\books\最初に見ていた短い本".to_string(),
+                            page: crate::snapshot::SnapshotTarget::Fs(PathBuf::from(
+                                r"C:\books\最初に見ていた短い本\001.png",
+                            )),
+                        },
+                        destination: crate::app::SimilarBookLocation::from_destination(
+                            crate::snapshot::SnapshotTarget::ZipImage {
+                                zip_path: PathBuf::from(
+                                    r"D:\archive\作品名が長い比較対象の本 2026年特別編集版.zip",
+                                ),
+                                entry_name: "pages/060.png".to_string(),
+                            },
+                        )
+                        .expect("ZIP snapshot history location"),
+                        diagnostic_trace: None,
+                    });
                     state.insert_failed_snapshot_thumbnail(
                         matches.origin.item_key.clone(),
                         matches.origin.target.clone(),
@@ -4874,14 +5642,477 @@ mod similar_panel_tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        SIMILAR_THUMB_CACHE_LIMIT, SIMILAR_THUMB_WORKER_LIMIT, SimilarPanelModel,
-        SimilarPanelState, SimilarPeekTransition, SimilarThumbResult, SimilarThumbState,
-        decide_similar_peek, similar_copy_path_text, similar_difference_line,
-        similar_location_line, similar_panel_model, summarize_page_strip,
+        SIMILAR_THUMB_CACHE_LIMIT, SIMILAR_THUMB_WORKER_LIMIT, SimilarMoveFrameInput,
+        SimilarMovePointerEvent, SimilarPanelModel, SimilarPanelState, SimilarThumbResult,
+        SimilarThumbState, TracedSimilarAction, finish_similar_move_frame,
+        observe_similar_move_response, replace_traced_similar_action, similar_copy_path_text,
+        similar_difference_line, similar_location_line, similar_panel_model, summarize_page_strip,
     };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
     use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
+
+    fn history_location(container: &str, page: &str) -> crate::app::SimilarBookLocation {
+        crate::app::SimilarBookLocation {
+            container_key: container.to_string(),
+            page: crate::snapshot::SnapshotTarget::Fs(PathBuf::from(page)),
+        }
+    }
+
+    #[test]
+    fn similar_move_token_uses_full_normalized_target_identity() {
+        let current =
+            crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"E:\share\root\book\1.jpg"));
+        let same_case_variant =
+            crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"e:\SHARE\ROOT\BOOK\1.JPG"));
+        let different_parent =
+            crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"E:\share\root-2\book\1.jpg"));
+        assert_eq!(
+            crate::app::SimilarMoveTrace::digest_for_target(Some(&current)),
+            crate::app::SimilarMoveTrace::digest_for_target(Some(&same_case_variant))
+        );
+        assert_ne!(
+            crate::app::SimilarMoveTrace::digest_for_target(Some(&current)),
+            crate::app::SimilarMoveTrace::digest_for_target(Some(&different_parent))
+        );
+    }
+
+    #[test]
+    fn similar_move_gesture_moves_pressed_trace_only_after_real_click() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let state = SimilarPanelState::default();
+        let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\other\book\001.jpg"));
+        let mut rect = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    rect = Some(
+                        ui.push_id("similar-move", |ui| ui.small_button("移動"))
+                            .inner
+                            .rect,
+                    );
+                });
+            },
+        );
+        let pos = rect.expect("neutral move button").center();
+
+        let mut press_trace = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui
+                        .push_id("similar-move", |ui| ui.small_button("移動"))
+                        .inner;
+                    press_trace = observe_similar_move_response(
+                        &state,
+                        &SimilarMoveFrameInput {
+                            enabled: true,
+                            focused: true,
+                            primary_down: true,
+                            events: vec![SimilarMovePointerEvent { pos, pressed: true }],
+                        },
+                        &response,
+                        crate::app::SimilarMoveSource::BookButton,
+                        || Some(target.clone()),
+                    );
+                });
+            },
+        );
+        assert!(press_trace.is_none());
+        assert!(state.move_trace_pressed.borrow().is_some());
+
+        let mut click_trace = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui
+                        .push_id("similar-move", |ui| ui.small_button("移動"))
+                        .inner;
+                    click_trace = observe_similar_move_response(
+                        &state,
+                        &SimilarMoveFrameInput {
+                            enabled: true,
+                            focused: true,
+                            primary_down: false,
+                            events: vec![SimilarMovePointerEvent {
+                                pos,
+                                pressed: false,
+                            }],
+                        },
+                        &response,
+                        crate::app::SimilarMoveSource::BookButton,
+                        || Some(target.clone()),
+                    );
+                });
+            },
+        );
+        assert!(
+            click_trace.is_some(),
+            "the trace moves only with egui's click"
+        );
+        assert!(state.move_trace_pressed.borrow().is_none());
+    }
+
+    #[test]
+    fn similar_move_p2_release_is_consumed_only_by_the_pressed_response_id() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let state = SimilarPanelState::default();
+        let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\same\book\001.jpg"));
+        let mut second_rect = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.push_id("first", |ui| ui.small_button("移動"));
+                    second_rect = Some(
+                        ui.push_id("second", |ui| ui.small_button("移動"))
+                            .inner
+                            .rect,
+                    );
+                });
+            },
+        );
+        let pos = second_rect.expect("second move button").center();
+
+        let mut second_response_id = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for id in ["first", "second"] {
+                        let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
+                        if id == "second" {
+                            second_response_id = Some(response.id);
+                        }
+                        assert!(
+                            observe_similar_move_response(
+                                &state,
+                                &SimilarMoveFrameInput {
+                                    enabled: true,
+                                    focused: true,
+                                    primary_down: true,
+                                    events: vec![SimilarMovePointerEvent { pos, pressed: true }],
+                                },
+                                &response,
+                                crate::app::SimilarMoveSource::BookButton,
+                                || Some(target.clone()),
+                            )
+                            .is_none()
+                        );
+                    }
+                });
+            },
+        );
+        let pressed_id = state
+            .move_trace_pressed
+            .borrow()
+            .as_ref()
+            .expect("second response owns the press")
+            .trace
+            .id;
+        assert_eq!(
+            state
+                .move_trace_pressed
+                .borrow()
+                .as_ref()
+                .map(|pressed| pressed.response_id),
+            second_response_id
+        );
+
+        let mut release_results = Vec::new();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for id in ["first", "second"] {
+                        let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
+                        release_results.push(observe_similar_move_response(
+                            &state,
+                            &SimilarMoveFrameInput {
+                                enabled: true,
+                                focused: true,
+                                primary_down: false,
+                                events: vec![SimilarMovePointerEvent {
+                                    pos,
+                                    pressed: false,
+                                }],
+                            },
+                            &response,
+                            crate::app::SimilarMoveSource::BookButton,
+                            || Some(target.clone()),
+                        ));
+                    }
+                });
+            },
+        );
+        assert!(release_results[0].is_none());
+        let trace = release_results[1]
+            .take()
+            .expect("the pressed response must carry the click trace");
+        assert_eq!(trace.id, pressed_id);
+        assert!(state.move_trace_pressed.borrow().is_none());
+        assert!(crate::app::SimilarMoveTrace::terminal_reasons_for_test(pressed_id).is_empty());
+        trace.terminal("test_cleanup");
+    }
+
+    #[test]
+    fn similar_move_p2_reused_response_id_does_not_retarget_the_pressed_trace() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let state = SimilarPanelState::default();
+        let original = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\old\book\001.jpg"));
+        let replacement =
+            crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\new\book\001.jpg"));
+        let mut button_rect = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button_rect = Some(
+                        ui.push_id("stable-row", |ui| ui.small_button("移動"))
+                            .inner
+                            .rect,
+                    );
+                });
+            },
+        );
+        let pos = button_rect.expect("move button").center();
+        let mut pressed_response_id = None;
+        let press_frame = SimilarMoveFrameInput {
+            enabled: true,
+            focused: true,
+            primary_down: true,
+            events: vec![SimilarMovePointerEvent { pos, pressed: true }],
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
+                    pressed_response_id = Some(response.id);
+                    assert!(
+                        observe_similar_move_response(
+                            &state,
+                            &press_frame,
+                            &response,
+                            crate::app::SimilarMoveSource::BookButton,
+                            || Some(original.clone()),
+                        )
+                        .is_none()
+                    );
+                });
+            },
+        );
+        let trace_id = state
+            .move_trace_pressed
+            .borrow()
+            .as_ref()
+            .expect("stable response owns the press")
+            .trace
+            .id;
+
+        let release_frame = SimilarMoveFrameInput {
+            enabled: true,
+            focused: true,
+            primary_down: false,
+            events: vec![SimilarMovePointerEvent {
+                pos,
+                pressed: false,
+            }],
+        };
+        let mut release_response_id = None;
+        let mut release_trace = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
+                    release_response_id = Some(response.id);
+                    release_trace = observe_similar_move_response(
+                        &state,
+                        &release_frame,
+                        &response,
+                        crate::app::SimilarMoveSource::BookButton,
+                        || Some(replacement.clone()),
+                    );
+                });
+            },
+        );
+        assert_eq!(pressed_response_id, release_response_id);
+        assert!(
+            release_trace.is_none(),
+            "the replacement target owns no old trace"
+        );
+        finish_similar_move_frame(&state, &release_frame);
+        assert!(state.move_trace_pressed.borrow().is_none());
+        assert_eq!(
+            crate::app::SimilarMoveTrace::terminal_reasons_for_test(trace_id),
+            vec!["release_without_response"]
+        );
+    }
+
+    #[test]
+    fn similar_move_p2_replacing_same_frame_action_terminals_the_displaced_trace() {
+        let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\slot\book\001.jpg"));
+        let first = crate::app::SimilarMoveTrace::new(
+            crate::app::SimilarMoveSource::ItemButton,
+            Some(&target),
+        );
+        let first_id = first.id;
+        let second = crate::app::SimilarMoveTrace::new(
+            crate::app::SimilarMoveSource::ItemButton,
+            Some(&target),
+        );
+        let second_id = second.id;
+        let mut slot = Some(TracedSimilarAction {
+            value: 1_u8,
+            trace: Some(first),
+        });
+
+        replace_traced_similar_action(
+            &mut slot,
+            TracedSimilarAction {
+                value: 2,
+                trace: Some(second),
+            },
+        );
+
+        assert_eq!(
+            crate::app::SimilarMoveTrace::terminal_reasons_for_test(first_id),
+            vec!["action_replaced"]
+        );
+        let current = slot.as_mut().expect("last action wins");
+        assert_eq!(current.value, 2);
+        let current_trace = current
+            .trace
+            .take()
+            .expect("last trace stays with its action");
+        assert_eq!(current_trace.id, second_id);
+        assert!(crate::app::SimilarMoveTrace::terminal_reasons_for_test(second_id).is_empty());
+        current_trace.terminal("test_cleanup");
+    }
+
+    #[test]
+    fn similar_book_history_deduplicates_and_tracks_only_presented_books() {
+        let mut state = SimilarPanelState::default();
+        let a1 = history_location("c:/books/a", "c:/books/a/001.png");
+        let a2 = history_location("c:/books/a", "c:/books/a/002.png");
+        let a3 = history_location("c:/books/a", "c:/books/a/003.png");
+        let b1 = history_location("c:/books/b", "c:/books/b/010.png");
+        let b2 = history_location("c:/books/b", "c:/books/b/011.png");
+
+        assert!(state.book_history_snapshot().is_none());
+        state.complete_similar_book_visit(crate::app::SimilarBookNavigationIntent {
+            origin: a1,
+            destination: b1,
+            diagnostic_trace: None,
+        });
+        state.complete_similar_book_visit(crate::app::SimilarBookNavigationIntent {
+            origin: b2.clone(),
+            destination: a2.clone(),
+            diagnostic_trace: None,
+        });
+
+        let (entries, current) = state.book_history_snapshot().expect("active history");
+        assert_eq!(current, "c:/books/a");
+        assert_eq!(entries.len(), 2, "revisiting a book must not duplicate it");
+        assert_eq!(entries[0], a2);
+        assert_eq!(entries[1], b2);
+
+        state.observe_ordinary_book_page(a3.clone());
+        let (entries, current) = state.book_history_snapshot().expect("same-book page turn");
+        assert_eq!(current, "c:/books/a");
+        assert_eq!(entries[0], a3);
+
+        state.observe_ordinary_book_page(history_location(
+            "c:/books/unrelated",
+            "c:/books/unrelated/001.png",
+        ));
+        assert!(
+            state.book_history_snapshot().is_none(),
+            "a presented ordinary cross-book move starts a new viewer session"
+        );
+    }
 
     #[derive(Clone, Copy)]
     struct TestStripPage {
@@ -5342,6 +6573,424 @@ mod similar_panel_tests {
         );
         assert!(state.thumbnails.is_empty());
         assert!(actions.thumbnail_demand.is_empty());
+    }
+
+    #[test]
+    fn book_strip_press_previews_but_release_never_navigates() {
+        use crate::similar_index::BookPageState;
+
+        let relations = test_book_relations(vec![strip_page(BookPageState::Strong, Some(7))]);
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let mut state = SimilarPanelState::default();
+        let mut origin_columns = None;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                let mut actions = super::SimilarPanelActions::default();
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut actions,
+                    );
+                });
+            },
+        );
+        let strip_center = super::take_book_strip_rect_for_test()
+            .expect("the production strip must expose its actual response rect")
+            .center();
+
+        let mut press_actions = super::SimilarPanelActions::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(strip_center),
+                    egui::Event::PointerButton {
+                        pos: strip_center,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut press_actions,
+                    );
+                });
+            },
+        );
+        let candidate = press_actions
+            .peek_press
+            .as_ref()
+            .expect("the press edge must enter the shared hold-preview owner");
+        assert_eq!(candidate.item_key, "c:/other.png");
+        assert!(press_actions.open_page.is_none());
+
+        let mut release_actions = super::SimilarPanelActions::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: strip_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut release_actions,
+                    );
+                });
+            },
+        );
+        assert!(release_actions.peek_press.is_none());
+        assert!(
+            release_actions.open_page.is_none(),
+            "the completed click belongs only to the explicit move button"
+        );
+    }
+
+    #[test]
+    fn targetless_book_strip_match_cannot_start_a_preview() {
+        let page = crate::similar_index::BookPageMatch {
+            origin_slot: 0,
+            state: crate::similar_index::BookPageMatchState::Strong,
+            other_page_index: 1,
+            other_target: None,
+            other_item_key: "c:/missing-target.png".to_owned(),
+            other_mtime: 1,
+            other_file_size: 2,
+        };
+        assert!(crate::similar_preview::SimilarPreviewCandidate::for_book_match(&page).is_none());
+    }
+
+    #[cfg(windows)]
+    fn current_thread_cpu_100ns() -> u64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .expect("GetThreadTimes failed");
+        let ticks = |value: FILETIME| {
+            (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+        };
+        ticks(kernel) + ticks(user)
+    }
+
+    #[cfg(not(windows))]
+    fn current_thread_cpu_100ns() -> u64 {
+        0
+    }
+
+    fn measured_book_relations(
+        origin_pages: usize,
+        candidates: usize,
+        dense_alignment: bool,
+    ) -> crate::similar_index::BookRelations {
+        use crate::similar_index::{
+            BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
+            BookRelationHit, BookRelations, SimilarItemTarget,
+        };
+
+        let origin = std::sync::Arc::new(BookOrigin {
+            pages: (0..origin_pages)
+                .map(|slot| BookOriginPage {
+                    item_key: format!("c:/ui-scale/origin/{slot:05}.png"),
+                    baseline: BookPageBaseline::Unmatched,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+        let hits = (0..candidates)
+            .map(|candidate| {
+                let slots = if dense_alignment {
+                    (0..origin_pages.saturating_sub(1)).collect::<Vec<_>>()
+                } else {
+                    vec![candidate % origin_pages]
+                };
+                let overrides = slots
+                    .iter()
+                    .copied()
+                    .map(|slot| BookPageMatch {
+                        origin_slot: slot,
+                        state: BookPageMatchState::Strong,
+                        other_page_index: u32::try_from(slot).unwrap(),
+                        other_target: Some(SimilarItemTarget::File(PathBuf::from(format!(
+                            "c:/ui-scale/candidate-{candidate:04}/{slot:05}.png"
+                        )))),
+                        other_item_key: format!(
+                            "c:/ui-scale/candidate-{candidate:04}/{slot:05}.png"
+                        ),
+                        other_mtime: 1,
+                        other_file_size: 1,
+                    })
+                    .collect::<Vec<_>>();
+                let matched = u32::try_from(overrides.len()).unwrap();
+                BookRelationHit::new(
+                    format!("c:/ui-scale/candidate-{candidate:04}"),
+                    u32::try_from(origin_pages).unwrap(),
+                    crate::dupe::book::BookPair {
+                        a: 1,
+                        b: 2,
+                        matched,
+                        distinctive_a: u32::try_from(origin_pages).unwrap(),
+                        distinctive_b: u32::try_from(origin_pages).unwrap(),
+                        coverage_a: matched as f32 / origin_pages as f32,
+                        coverage_b: matched as f32 / origin_pages as f32,
+                        relation: crate::dupe::book::Relation::Unrelated,
+                        alignment: slots
+                            .into_iter()
+                            .map(|slot| {
+                                let page = u32::try_from(slot).unwrap();
+                                (page, page)
+                            })
+                            .collect(),
+                    },
+                    overrides,
+                    origin_pages,
+                )
+                .unwrap()
+            })
+            .collect();
+        BookRelations { origin, hits }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MeasuredScrollPosition {
+        Top,
+        Middle,
+        End,
+    }
+
+    impl MeasuredScrollPosition {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Top => "top",
+                Self::Middle => "middle",
+                Self::End => "end",
+            }
+        }
+
+        fn offset(self, max_scroll: f32) -> f32 {
+            match self {
+                Self::Top => 0.0,
+                Self::Middle => max_scroll / 2.0,
+                Self::End => max_scroll,
+            }
+        }
+    }
+
+    fn measure_book_draw(
+        ctx: &egui::Context,
+        state: &mut SimilarPanelState,
+        book: &crate::similar_index::BookQuery,
+        scroll_offset: f32,
+    ) -> (u64, u64, super::BookDrawProbe, f32, f32) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 420.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut max_scroll = 0.0f32;
+        let mut actual_scroll = 0.0f32;
+        super::book_draw_probe_begin();
+        let cpu_before = current_thread_cpu_100ns();
+        let started = std::time::Instant::now();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                let output = egui::ScrollArea::vertical()
+                    .id_salt("large-book-relations-measurement")
+                    .vertical_scroll_offset(scroll_offset)
+                    .show(ui, |ui| {
+                        let mut actions = super::SimilarPanelActions::default();
+                        super::draw_similar_panel(
+                            ui,
+                            &[],
+                            Some(book),
+                            false,
+                            state,
+                            72,
+                            85,
+                            crate::thumb_loader::CacheDecision::without_thumbnail(),
+                            None,
+                            None,
+                            false,
+                            ctx,
+                            &mut actions,
+                        );
+                        assert!(actions.thumbnail_demand.is_empty());
+                    });
+                max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                actual_scroll = output.state.offset.y;
+            });
+        });
+        let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap();
+        let cpu_100ns = current_thread_cpu_100ns().saturating_sub(cpu_before);
+        (
+            wall_ns,
+            cpu_100ns,
+            super::book_draw_probe_finish(),
+            max_scroll,
+            actual_scroll,
+        )
+    }
+
+    fn configured_book_measurement_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        // Match the product's default Japanese-capable font set. Configuration and any
+        // font-source I/O stay outside the timed draw; the first draw still includes
+        // the configured context's initial text layout and atlas preparation.
+        crate::ui_fonts::configure_fonts(&ctx);
+        ctx
+    }
+
+    #[test]
+    #[ignore = "release-only headless auxiliary measurement of large book relation scrolling"]
+    fn measure_large_book_relation_scroll_draws() {
+        let cases = [
+            ("n400-c56-sparse1", 400usize, 56usize, false),
+            ("n400-c2800-sparse1", 400, 2_800, false),
+            ("n10000-c1-dense9999", 10_000, 1, true),
+        ];
+        for (case, origin_pages, candidates, dense_alignment) in cases {
+            let book = crate::similar_index::BookQuery::Ready(measured_book_relations(
+                origin_pages,
+                candidates,
+                dense_alignment,
+            ));
+            let sizing_ctx = configured_book_measurement_context();
+            let mut sizing_state = SimilarPanelState::default();
+            let (_, _, _, max_scroll, _) =
+                measure_book_draw(&sizing_ctx, &mut sizing_state, &book, 0.0);
+            assert_eq!(max_scroll > 0.0, candidates > 1);
+            for position in [
+                MeasuredScrollPosition::Top,
+                MeasuredScrollPosition::Middle,
+                MeasuredScrollPosition::End,
+            ] {
+                let ctx = configured_book_measurement_context();
+                let mut state = SimilarPanelState::default();
+                let requested_scroll = position.offset(max_scroll);
+                let (first_wall_ns, first_cpu_100ns, first_probe, _, first_scroll) =
+                    measure_book_draw(&ctx, &mut state, &book, requested_scroll);
+                let _ = measure_book_draw(&ctx, &mut state, &book, requested_scroll);
+                let mut warm_wall_ns = Vec::with_capacity(10);
+                let mut warm_cpu_100ns = Vec::with_capacity(10);
+                let mut warm_probes = Vec::with_capacity(10);
+                let mut warm_scroll_offsets = Vec::with_capacity(10);
+                for _ in 0..10 {
+                    let (wall, cpu, probe, _, actual_scroll) =
+                        measure_book_draw(&ctx, &mut state, &book, requested_scroll);
+                    warm_wall_ns.push(wall);
+                    warm_cpu_100ns.push(cpu);
+                    warm_probes.push(probe);
+                    warm_scroll_offsets.push(actual_scroll);
+                }
+
+                for probe in std::iter::once(&first_probe).chain(&warm_probes) {
+                    assert_eq!(probe.rows_visited, candidates as u64);
+                    assert!(probe.final_row_reached);
+                    assert!(probe.visible_strip_folds <= probe.rows_visited);
+                    assert_eq!(
+                        probe.origin_projections,
+                        u64::from(probe.visible_strip_folds > 0)
+                    );
+                }
+                for probe in &warm_probes {
+                    assert!(
+                        probe.visible_strip_folds > 0,
+                        "the settled scroll position must expose at least one strip"
+                    );
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "record": "large_book_relation_ui_aux",
+                        "case": case,
+                        "position": position.label(),
+                        "origin_pages": origin_pages,
+                        "candidates": candidates,
+                        "dense_alignment": dense_alignment,
+                        "max_scroll": max_scroll,
+                        "requested_scroll": requested_scroll,
+                        "first_actual_scroll": first_scroll,
+                        "first_wall_ns": first_wall_ns,
+                        "first_thread_cpu_100ns": first_cpu_100ns,
+                        "first_probe": {
+                            "rows_visited": first_probe.rows_visited,
+                            "visible_strip_folds": first_probe.visible_strip_folds,
+                            "origin_projections": first_probe.origin_projections,
+                            "final_row_reached": first_probe.final_row_reached,
+                        },
+                        "warm_wall_ns": warm_wall_ns,
+                        "warm_thread_cpu_100ns": warm_cpu_100ns,
+                        "warm_actual_scroll": warm_scroll_offsets,
+                        "warm_probes": warm_probes.iter().map(|probe| serde_json::json!({
+                            "rows_visited": probe.rows_visited,
+                            "visible_strip_folds": probe.visible_strip_folds,
+                            "origin_projections": probe.origin_projections,
+                            "final_row_reached": probe.final_row_reached,
+                        })).collect::<Vec<_>>(),
+                        "font_boundary": "product default Japanese-capable fonts configured before timing; first draw includes initial text layout/atlas preparation but excludes font configuration I/O",
+                        "limits": "headless egui CPU/layout auxiliary; excludes GPU compositor, pointer hover thumbnails, and full application frame latency",
+                    })
+                );
+            }
+        }
     }
 
     /// 本の [移動] は重なりが始まるページを開く。相手の 1 ページ目を開くと、総集編の
@@ -5884,6 +7533,7 @@ mod similar_panel_tests {
                         showing_previous: false,
                     };
                     let mut actions = super::SimilarPanelActions::default();
+                    let move_frame = super::SimilarMoveFrameInput::capture(ctx, state);
                     super::draw_similar_page_results(
                         ui,
                         &view,
@@ -5895,6 +7545,7 @@ mod similar_panel_tests {
                         None,
                         false,
                         ctx,
+                        &move_frame,
                         &mut actions,
                     );
                 });
@@ -5925,30 +7576,6 @@ mod similar_panel_tests {
         assert_eq!(
             second_frame, first_frame,
             "a second frame must reuse visible requests instead of cycling all 600 rows"
-        );
-    }
-
-    /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を
-    /// 戻してから新しい方へ移る。ここで Switch を Continue と同じに扱うと、離しても
-    /// 最初の候補の restore_mode が残り、元の表示へ戻れなくなる。
-    #[test]
-    fn holding_a_peek_button_starts_continues_and_stops() {
-        assert_eq!(decide_similar_peek(None, None), SimilarPeekTransition::Idle);
-        assert_eq!(
-            decide_similar_peek(None, Some("a")),
-            SimilarPeekTransition::Start
-        );
-        assert_eq!(
-            decide_similar_peek(Some("a"), Some("a")),
-            SimilarPeekTransition::Continue
-        );
-        assert_eq!(
-            decide_similar_peek(Some("a"), Some("b")),
-            SimilarPeekTransition::Switch
-        );
-        assert_eq!(
-            decide_similar_peek(Some("a"), None),
-            SimilarPeekTransition::Stop
         );
     }
 

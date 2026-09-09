@@ -29,9 +29,54 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+static NEXT_AUDIO_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+fn atomic_fetch_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub struct AudioDiagnostics {
     /// 起動時刻。`wall_ns_now()` の基準。
     started_at: Instant,
+
+    /// Process-monotonic identity of the actual CPAL output stream. Zero means that stream
+    /// construction has not succeeded and must never be presented as a live stream.
+    pub audio_stream_id: AtomicU64,
+
+    /// RT callback cadence and time spent around the one existing audio-buffer lock. These are
+    /// updated only when perf diagnostics were enabled before the callback was installed.
+    pub callback_count: AtomicU64,
+    pub callback_latest_wall_ns: AtomicU64,
+    pub callback_expected_period_ns: AtomicU64,
+    pub callback_interval_latest_ns: AtomicU64,
+    pub callback_interval_max_ns: AtomicU64,
+    pub callback_late_max_ns: AtomicU64,
+    pub callback_late_count: AtomicU64,
+    pub buffer_lock_wait_max_ns: AtomicU64,
+    pub fill_duration_max_ns: AtomicU64,
+    pub callback_seek_serial: AtomicU64,
+    pub callback_engine_state: AtomicU64,
+
+    /// CPAL error callback writes only these atomics. Formatting and logging happen on audio-pump.
+    pub device_error_count: AtomicU64,
+    pub device_error_category: AtomicU64,
+    pub device_error_wall_ns: AtomicU64,
+
+    /// Rare RT-side events formerly logged directly from `fill_output`.
+    pub stale_clear_seq: AtomicU64,
+    pub stale_clear_pump_serial: AtomicU64,
+    pub stale_clear_live_serial: AtomicU64,
+    pub stale_clear_processed_secs_bits: AtomicU64,
+    pub stale_clear_raw_pending_secs_bits: AtomicU64,
+    pub pdc_change_seq: AtomicU64,
+    pub pdc_change_delta_secs_bits: AtomicU64,
+    pub pdc_change_pts_secs_bits: AtomicU64,
 
     /// 直近 present 時の drift (ms) を `f64::to_bits` で保持 (video_pts − master_clock)。
     /// **video pacing の健全性指標**で、ユーザー体感の音映像差ではない (= 値が小さくても
@@ -89,6 +134,29 @@ impl AudioDiagnostics {
     pub fn new(started_at: Instant) -> Self {
         Self {
             started_at,
+            audio_stream_id: AtomicU64::new(0),
+            callback_count: AtomicU64::new(0),
+            callback_latest_wall_ns: AtomicU64::new(0),
+            callback_expected_period_ns: AtomicU64::new(0),
+            callback_interval_latest_ns: AtomicU64::new(0),
+            callback_interval_max_ns: AtomicU64::new(0),
+            callback_late_max_ns: AtomicU64::new(0),
+            callback_late_count: AtomicU64::new(0),
+            buffer_lock_wait_max_ns: AtomicU64::new(0),
+            fill_duration_max_ns: AtomicU64::new(0),
+            callback_seek_serial: AtomicU64::new(0),
+            callback_engine_state: AtomicU64::new(0),
+            device_error_count: AtomicU64::new(0),
+            device_error_category: AtomicU64::new(0),
+            device_error_wall_ns: AtomicU64::new(0),
+            stale_clear_seq: AtomicU64::new(0),
+            stale_clear_pump_serial: AtomicU64::new(0),
+            stale_clear_live_serial: AtomicU64::new(0),
+            stale_clear_processed_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            stale_clear_raw_pending_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            pdc_change_seq: AtomicU64::new(0),
+            pdc_change_delta_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            pdc_change_pts_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
             av_drift_ms_bits: AtomicU64::new(0.0_f64.to_bits()),
             audio_audible_pts_bits: AtomicU64::new(f64::NAN.to_bits()),
             audio_audible_pts_valid: AtomicBool::new(false),
@@ -106,6 +174,105 @@ impl AudioDiagnostics {
             audio_pts_jump_wall_ns: AtomicU64::new(0),
             audio_pts_jump_seq: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn allocate_stream_id() -> u64 {
+        NEXT_AUDIO_STREAM_ID.fetch_add(1, Ordering::Relaxed).max(1)
+    }
+
+    pub(crate) fn publish_stream_id(&self, id: u64) {
+        debug_assert_ne!(id, 0);
+        self.audio_stream_id.store(id, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stream_id(&self) -> Option<u64> {
+        match self.audio_stream_id.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    pub(crate) fn record_callback_entry(
+        &self,
+        wall_ns: u64,
+        interval_ns: Option<u64>,
+        expected_period_ns: u64,
+        seek_serial: u64,
+        engine_state: u8,
+    ) {
+        self.callback_count.fetch_add(1, Ordering::Relaxed);
+        self.callback_latest_wall_ns
+            .store(wall_ns, Ordering::Relaxed);
+        self.callback_expected_period_ns
+            .store(expected_period_ns, Ordering::Relaxed);
+        self.callback_seek_serial
+            .store(seek_serial, Ordering::Relaxed);
+        self.callback_engine_state
+            .store(engine_state as u64, Ordering::Relaxed);
+        if let Some(interval_ns) = interval_ns {
+            self.callback_interval_latest_ns
+                .store(interval_ns, Ordering::Relaxed);
+            atomic_fetch_max(&self.callback_interval_max_ns, interval_ns);
+            atomic_fetch_max(
+                &self.callback_late_max_ns,
+                interval_ns.saturating_sub(expected_period_ns),
+            );
+            if interval_ns > expected_period_ns {
+                self.callback_late_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn record_buffer_lock_wait(&self, ns: u64) {
+        atomic_fetch_max(&self.buffer_lock_wait_max_ns, ns);
+    }
+
+    pub(crate) fn record_fill_duration(&self, ns: u64) {
+        atomic_fetch_max(&self.fill_duration_max_ns, ns);
+    }
+
+    pub(crate) fn take_interval_maxima_ns(&self) -> (u64, u64, u64, u64) {
+        (
+            self.callback_interval_max_ns.swap(0, Ordering::AcqRel),
+            self.callback_late_max_ns.swap(0, Ordering::AcqRel),
+            self.buffer_lock_wait_max_ns.swap(0, Ordering::AcqRel),
+            self.fill_duration_max_ns.swap(0, Ordering::AcqRel),
+        )
+    }
+
+    pub(crate) fn record_device_error(&self, category: u64) {
+        self.device_error_category
+            .store(category, Ordering::Relaxed);
+        self.device_error_wall_ns
+            .store(self.wall_ns_now(), Ordering::Release);
+        self.device_error_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn record_stale_clear(
+        &self,
+        pump_serial: u64,
+        live_serial: u64,
+        processed_secs: f64,
+        raw_pending_secs: f64,
+    ) {
+        self.stale_clear_pump_serial
+            .store(pump_serial, Ordering::Relaxed);
+        self.stale_clear_live_serial
+            .store(live_serial, Ordering::Relaxed);
+        self.stale_clear_processed_secs_bits
+            .store(processed_secs.to_bits(), Ordering::Relaxed);
+        self.stale_clear_raw_pending_secs_bits
+            .store(raw_pending_secs.to_bits(), Ordering::Relaxed);
+        self.stale_clear_seq.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn record_pdc_change(&self, delta_secs: f64, pts_secs: f64) {
+        self.pdc_change_delta_secs_bits
+            .store(delta_secs.to_bits(), Ordering::Relaxed);
+        self.pdc_change_pts_secs_bits
+            .store(pts_secs.to_bits(), Ordering::Relaxed);
+        self.pdc_change_seq.fetch_add(1, Ordering::Release);
     }
 
     /// 起動時刻からの ns 経過を u64 で返す。`u64::MAX` で clamp (= 約 584 年、実用上問題なし)。
@@ -327,5 +494,74 @@ mod tests {
         let raw_bits = diag.audio_audible_pts_bits.load(Ordering::Acquire);
         let raw = f64::from_bits(raw_bits);
         assert!(raw.is_nan(), "bits should be NaN after clear, got {raw}");
+    }
+
+    #[test]
+    fn stream_ids_are_nonzero_and_process_monotonic() {
+        let first = AudioDiagnostics::new(Instant::now());
+        let second = AudioDiagnostics::new(Instant::now());
+        assert_eq!(first.stream_id(), None);
+        let first_id = AudioDiagnostics::allocate_stream_id();
+        let second_id = AudioDiagnostics::allocate_stream_id();
+        assert_ne!(first_id, 0);
+        assert!(second_id > first_id);
+        assert_eq!(first.stream_id(), None);
+        assert_eq!(second.stream_id(), None);
+        first.publish_stream_id(first_id);
+        second.publish_stream_id(second_id);
+        assert_eq!(first.stream_id(), Some(first_id));
+        assert_eq!(second.stream_id(), Some(second_id));
+    }
+
+    #[test]
+    fn callback_metrics_exclude_first_interval_and_exchange_maxima() {
+        let diag = AudioDiagnostics::new(Instant::now());
+        diag.record_callback_entry(10, None, 4, 7, 2);
+        assert_eq!(diag.callback_count.load(Ordering::Acquire), 1);
+        assert_eq!(diag.callback_interval_latest_ns.load(Ordering::Acquire), 0);
+
+        diag.record_callback_entry(22, Some(12), 10, 8, 3);
+        diag.record_callback_entry(31, Some(9), 10, 9, 4);
+        diag.record_buffer_lock_wait(6);
+        diag.record_buffer_lock_wait(4);
+        diag.record_fill_duration(15);
+        diag.record_fill_duration(11);
+
+        assert_eq!(diag.callback_count.load(Ordering::Acquire), 3);
+        assert_eq!(diag.callback_interval_latest_ns.load(Ordering::Acquire), 9);
+        assert_eq!(diag.callback_seek_serial.load(Ordering::Acquire), 9);
+        assert_eq!(diag.callback_engine_state.load(Ordering::Acquire), 4);
+        assert_eq!(diag.callback_late_count.load(Ordering::Acquire), 1);
+        assert_eq!(diag.take_interval_maxima_ns(), (12, 2, 6, 15));
+        assert_eq!(diag.take_interval_maxima_ns(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn device_and_rare_rt_events_preserve_counts_and_latest_payload() {
+        let diag = AudioDiagnostics::new(Instant::now());
+        diag.record_device_error(1);
+        diag.record_device_error(2);
+        assert_eq!(diag.device_error_count.load(Ordering::Acquire), 2);
+        assert_eq!(diag.device_error_category.load(Ordering::Acquire), 2);
+
+        diag.record_stale_clear(3, 4, 1.25, 2.5);
+        diag.record_stale_clear(5, 6, 3.25, 4.5);
+        assert_eq!(diag.stale_clear_seq.load(Ordering::Acquire), 2);
+        assert_eq!(diag.stale_clear_pump_serial.load(Ordering::Acquire), 5);
+        assert_eq!(diag.stale_clear_live_serial.load(Ordering::Acquire), 6);
+        assert_eq!(
+            f64::from_bits(
+                diag.stale_clear_raw_pending_secs_bits
+                    .load(Ordering::Acquire)
+            ),
+            4.5
+        );
+
+        diag.record_pdc_change(-0.012, 7.0);
+        assert_eq!(diag.pdc_change_seq.load(Ordering::Acquire), 1);
+        assert_eq!(
+            f64::from_bits(diag.pdc_change_delta_secs_bits.load(Ordering::Acquire)),
+            -0.012
+        );
     }
 }

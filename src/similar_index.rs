@@ -9,6 +9,11 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::dupe::{self, Algo, Sig};
+use crate::similar_book_engine::{EngineError as BookEngineError, SimilarBookQueryEngine};
+use crate::similar_book_query::{
+    BookQueryClient, BookQueryDispatchDecision, BookQueryExecutor, BookQueryPoll, BookQueryRequest,
+    BookQueryRuntime, BookQueryTerminal,
+};
 use crate::similar_db::{
     CandidateIdentity, CompletedIndexStats, ContainerKind, Freshness, ItemKind, SimilarDb,
     StoredItem, current_hash_version,
@@ -33,6 +38,11 @@ pub const BOOK_MIN_QUALITY: u8 = 1;
 // 32 並列では 85.2 / 111.7 MB/s へ低下した。複数ドライブが同時に走っても各 16 が
 // 合計 32 にならないよう、ボリューム単位はピークの一段手前である 8 に制限する。
 const INDEX_GLOBAL_OUTSTANDING_LIMIT: usize = 16;
+
+fn next_similar_query_trace_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
 const INDEX_PER_VOLUME_OUTSTANDING_LIMIT: usize = 8;
 // 操作中も差分照合を完全には止めず、既存 ActivityGate の状態で新規開始を 1 本へ絞る。
 const INDEX_ACTIVE_GLOBAL_OUTSTANDING_LIMIT: usize = 1;
@@ -377,6 +387,38 @@ pub enum BookQuery {
     Failed(String),
 }
 
+/// Move-only viewer identity for the global similar-book query owner.
+///
+/// The generic scheduler binding stays private so public callers cannot forge or share its
+/// internal client id.
+#[derive(Default)]
+pub struct SimilarBookQueryClient(BookQueryClient<Arc<BookQuery>>);
+
+impl SimilarBookQueryClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn inner(&self) -> &BookQueryClient<Arc<BookQuery>> {
+        &self.0
+    }
+
+    pub(crate) fn retain(&self) {
+        self.0.retain();
+    }
+
+    pub(crate) fn withdraw(&self) {
+        self.0.withdraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn demand_snapshot_for_test(
+        &self,
+    ) -> crate::similar_book_query::BookQueryDemandSnapshot {
+        self.0.demand_snapshot_for_test()
+    }
+}
+
 pub struct SimilarIndexManager {
     data_dir: PathBuf,
     progress: Arc<Mutex<IndexProgress>>,
@@ -384,7 +426,6 @@ pub struct SimilarIndexManager {
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
     item_query: Arc<Mutex<ItemQueryCache>>,
-    book_query: Arc<Mutex<BookQueryState>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
     scheduler: Arc<SimilarIndexScheduler>,
     #[cfg(test)]
@@ -401,27 +442,64 @@ struct ItemQueryTestHook {
 impl SimilarIndexManager {
     /// DB を開かない軽量 constructor。起動時 I/O を増やさない。
     pub fn new(data_dir: PathBuf) -> Self {
+        Self::new_with_book_query_notifier(data_dir, || {})
+    }
+
+    pub(crate) fn new_with_book_query_notifier(
+        data_dir: PathBuf,
+        notify_book_query_change: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let progress = Arc::new(Mutex::new(IndexProgress::Idle));
         let memory = Arc::new(Mutex::new(MemoryState::Unloaded));
         let summary = Arc::new(Mutex::new(SummaryState::Unloaded));
         let memory_epoch = Arc::new(AtomicU64::new(0));
         let item_query = Arc::new(Mutex::new(ItemQueryCache::default()));
-        let book_query = Arc::new(Mutex::new(BookQueryState::Idle));
         let enabled_roots = Arc::new(RwLock::new(Vec::new()));
-        let scheduler = Arc::new(SimilarIndexScheduler {
-            data_dir: data_dir.clone(),
-            progress: Arc::clone(&progress),
-            memory: Arc::clone(&memory),
-            summary: Arc::clone(&summary),
-            memory_epoch: Arc::clone(&memory_epoch),
-            item_query: Arc::clone(&item_query),
-            book_query: Arc::clone(&book_query),
-            prefill_db: Arc::new(Mutex::new(None)),
-            enabled_roots: Arc::clone(&enabled_roots),
-            active_cancel: Mutex::new(None),
-            state: Mutex::new(SchedulerState::default()),
-            array_update: Mutex::new(ArrayUpdateState::default()),
-            compaction_running: AtomicBool::new(false),
+        let scheduler = Arc::new_cyclic(|scheduler| {
+            let runtime_scheduler = scheduler.clone();
+            let probe_scheduler = scheduler.clone();
+            let book_query = BookQueryExecutor::with_dispatch_gate(
+                move || {
+                    // The old book scan pool lowered all query CPU work. The new executor owns
+                    // the whole query, so lower its one worker when each runtime is initialized.
+                    lower_current_thread_priority();
+                    Ok(Box::new(SchedulerBookQueryRuntime {
+                        scheduler: runtime_scheduler.clone(),
+                        engine: BookEngineSlot::Vacant,
+                    }))
+                },
+                notify_book_query_change,
+                move || {
+                    probe_scheduler.upgrade().map_or_else(
+                        || {
+                            BookQueryDispatchDecision::Complete(BookQueryTerminal::Failed(
+                                "similar book query scheduler is unavailable".to_owned(),
+                            ))
+                        },
+                        |scheduler: Arc<SimilarIndexScheduler>| {
+                            scheduler.book_query_dispatch_decision()
+                        },
+                    )
+                },
+            );
+            SimilarIndexScheduler {
+                data_dir: data_dir.clone(),
+                progress: Arc::clone(&progress),
+                memory: Arc::clone(&memory),
+                summary: Arc::clone(&summary),
+                memory_epoch: Arc::clone(&memory_epoch),
+                item_query: Arc::clone(&item_query),
+                book_query,
+                #[cfg(test)]
+                book_query_phase_probe: Mutex::new(None),
+                known_book_store: Mutex::new(ObservedBookStore::Unobserved),
+                prefill_db: Arc::new(Mutex::new(None)),
+                enabled_roots: Arc::clone(&enabled_roots),
+                active_cancel: Mutex::new(None),
+                state: Mutex::new(SchedulerState::default()),
+                array_update: Mutex::new(ArrayUpdateState::default()),
+                compaction_running: AtomicBool::new(false),
+            }
         });
         Self {
             data_dir,
@@ -430,12 +508,23 @@ impl SimilarIndexManager {
             summary,
             memory_epoch,
             item_query,
-            book_query,
             enabled_roots,
             scheduler,
             #[cfg(test)]
             item_query_test_hook: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn set_book_query_test_phase_probe(
+        &self,
+        probe: Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>,
+    ) {
+        *self
+            .scheduler
+            .book_query_phase_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(probe);
     }
 
     /// `auto_index_similar` が有効なお気に入りを、索引の完全な対象 snapshot として反映する。
@@ -542,6 +631,28 @@ impl SimilarIndexManager {
         let spawn_result = std::thread::Builder::new()
             .name("similar-item-query".to_owned())
             .spawn(move || {
+                let perf_started = crate::perf::is_enabled().then(std::time::Instant::now);
+                let cpu_started = perf_started.and_then(|_| current_thread_cpu_100ns());
+                let trace_id = perf_started.map_or(0, |_| next_similar_query_trace_id());
+                if perf_started.is_some() {
+                    crate::perf::event(
+                        "similar_item",
+                        "start",
+                        Some(&query_key),
+                        trace_id,
+                        &[
+                            ("memory_epoch", serde_json::Value::from(epoch)),
+                            (
+                                "snapshot_records",
+                                serde_json::Value::from(index.record_count() as u64),
+                            ),
+                            (
+                                "priority",
+                                serde_json::Value::from(current_thread_priority()),
+                            ),
+                        ],
+                    );
+                }
                 #[cfg(test)]
                 if let Some(hook) = test_hook.as_ref() {
                     let _ = hook.started.send(());
@@ -556,12 +667,49 @@ impl SimilarIndexManager {
                     let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                     hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
                 }
-                if epoch_guard.load(Ordering::Acquire) == epoch {
+                let terminal = item_query_terminal_label(&result);
+                let hit_count = perf_started.map_or(0, |_| match &result {
+                    ItemQuery::Ready(matches) => matches.hits.len(),
+                    _ => 0,
+                });
+                let active = if epoch_guard.load(Ordering::Acquire) == epoch {
                     replace_cached_item_query_if_current(
                         &cache,
                         &query_key,
                         epoch,
                         Arc::new(result),
+                    )
+                } else {
+                    false
+                };
+                if let Some(started) = perf_started {
+                    let cpu_ms = cpu_started
+                        .zip(current_thread_cpu_100ns())
+                        .map(|(before, after)| after.saturating_sub(before) as f64 / 10_000.0);
+                    crate::perf::event(
+                        "similar_item",
+                        "end",
+                        Some(&query_key),
+                        trace_id,
+                        &[
+                            ("memory_epoch", serde_json::Value::from(epoch)),
+                            (
+                                "wall_ms",
+                                serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                            (
+                                "thread_cpu_ms",
+                                cpu_ms.map_or(serde_json::Value::Null, serde_json::Value::from),
+                            ),
+                            (
+                                "priority",
+                                serde_json::Value::from(current_thread_priority()),
+                            ),
+                            ("active", serde_json::Value::from(active)),
+                            ("stale", serde_json::Value::from(!active)),
+                            ("terminal", serde_json::Value::from(terminal)),
+                            ("hit_count", serde_json::Value::from(hit_count as u64)),
+                        ],
                     );
                 }
                 #[cfg(test)]
@@ -630,86 +778,37 @@ impl SimilarIndexManager {
 
     /// `container_key` で引く。**ページではなく本で引くこと** — ページごとに引き直すと、
     /// 本を読み進めるあいだ 1 ページごとに数秒の照会が走る。
-    pub fn query_book(&self, container_key: &str) -> Arc<BookQuery> {
-        let item_key = container_key;
-        if !self.item_is_enabled(item_key) {
-            return Arc::new(BookQuery::NotIndexed);
+    pub fn query_book(
+        &self,
+        client: &SimilarBookQueryClient,
+        container_key: &str,
+    ) -> Arc<BookQuery> {
+        let result = match self
+            .scheduler
+            .book_query
+            .query(client.inner(), container_key)
+        {
+            BookQueryPoll::Preparing => Arc::new(BookQuery::Preparing),
+            BookQueryPoll::Ready(result) => result,
+            BookQueryPoll::Failed(error) => Arc::new(BookQuery::Failed(error)),
+            BookQueryPoll::Withdrawn => Arc::new(BookQuery::NotIndexed),
+            BookQueryPoll::ExecutorStopped => Arc::new(BookQuery::Failed(
+                "similar book query executor stopped".to_owned(),
+            )),
+        };
+        // Keep the completed NotIndexed value in the owner. During an active index run only the
+        // presentation is Preparing; the next terminal publisher schedules a soft refresh.
+        if matches!(result.as_ref(), BookQuery::NotIndexed)
+            && self.item_is_enabled(container_key)
+            && self.scheduler.worker_is_running()
+        {
+            return Arc::new(BookQuery::Preparing);
         }
-        let running = matches!(self.progress(), IndexProgress::Running(_));
-        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        match &*memory {
-            MemoryState::Unloaded => {
-                if running {
-                    return Arc::new(BookQuery::Preparing);
-                }
-                drop(memory);
-                start_memory_load(
-                    &self.data_dir,
-                    &self.memory,
-                    &self.memory_epoch,
-                    &self.item_query,
-                    MemoryLoadTrigger::BookQueryFallback,
-                    Some(Arc::downgrade(&self.scheduler)),
-                );
-                return Arc::new(BookQuery::Preparing);
-            }
-            MemoryState::Missing if running => return Arc::new(BookQuery::Preparing),
-            MemoryState::Missing => return Arc::new(BookQuery::NotIndexed),
-            MemoryState::Loading => return Arc::new(BookQuery::Preparing),
-            MemoryState::Failed(error) => return Arc::new(BookQuery::Failed(error.clone())),
-            MemoryState::Ready(_) => {}
-        };
-        let MemoryState::Ready(snapshot) = &*memory else {
-            unreachable!("every other memory state returned above");
-        };
-        let snapshot = Arc::clone(snapshot);
-        drop(memory);
-        let mut query = self.book_query.lock().unwrap_or_else(|e| e.into_inner());
-        match &*query {
-            BookQueryState::Loading { item_key: active } if active == item_key => {
-                return Arc::new(BookQuery::Preparing);
-            }
-            BookQueryState::Ready {
-                item_key: active,
-                result,
-            } if active == item_key => return Arc::clone(result),
-            _ => {}
-        }
-        *query = BookQueryState::Loading {
-            item_key: item_key.to_owned(),
-        };
-        let query_state = Arc::clone(&self.book_query);
-        let enabled_roots = Arc::clone(&self.enabled_roots);
-        let query_key = item_key.to_owned();
-        let epoch = self.memory_epoch.load(Ordering::Acquire);
-        let epoch_guard = Arc::clone(&self.memory_epoch);
-        let db_path = SimilarDb::db_path_at(&self.data_dir);
-        std::thread::spawn(move || {
-            // 常駐配列で候補を出し、identity は SQLite から引く。照会のために全行を読み直さない。
-            let mut result = SimilarDb::open_at(&db_path).map_or_else(
-                |error| BookQuery::Failed(db_error(error)),
-                |db| query_book_ready(&db, &snapshot, &query_key),
-            );
-            if let BookQuery::Ready(relations) = &mut result {
-                let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
-                relations
-                    .hits
-                    .retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
-            }
-            if epoch_guard.load(Ordering::Acquire) == epoch {
-                let mut state = query_state.lock().unwrap_or_else(|e| e.into_inner());
-                if matches!(
-                    &*state,
-                    BookQueryState::Loading { item_key } if item_key == &query_key
-                ) {
-                    *state = BookQueryState::Ready {
-                        item_key: query_key,
-                        result: Arc::new(result),
-                    };
-                }
-            }
-        });
-        Arc::new(BookQuery::Preparing)
+        result
+    }
+
+    pub(crate) fn withdraw_book_query(&self, client: &SimilarBookQueryClient) {
+        self.scheduler.book_query.withdraw(client.inner());
     }
 
     fn item_is_enabled(&self, item_key: &str) -> bool {
@@ -770,6 +869,7 @@ fn start_memory_load(
     let state = Arc::clone(memory);
     let epoch_guard = Arc::clone(memory_epoch);
     let cache = Arc::clone(item_query);
+    let worker_scheduler = scheduler.clone();
     let spawn_result = std::thread::Builder::new()
         .name("similar-index-load".to_owned())
         .spawn(move || {
@@ -812,13 +912,19 @@ fn start_memory_load(
             drop(state);
             cache.lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
             epoch_guard.fetch_add(1, Ordering::AcqRel);
-            if let Some(scheduler) = scheduler.and_then(|scheduler| scheduler.upgrade()) {
+            if let Some(scheduler) = worker_scheduler.and_then(|scheduler| scheduler.upgrade()) {
                 scheduler.request_array_refresh();
+                scheduler.book_query.soft_refresh();
             }
         });
     if let Err(error) = spawn_result {
-        *memory.lock().unwrap_or_else(|e| e.into_inner()) =
-            MemoryState::Failed(format!("similar index load worker start failed: {error}"));
+        {
+            *memory.lock().unwrap_or_else(|e| e.into_inner()) =
+                MemoryState::Failed(format!("similar index load worker start failed: {error}"));
+        }
+        if let Some(scheduler) = scheduler.and_then(|scheduler| scheduler.upgrade()) {
+            scheduler.book_query.soft_refresh();
+        }
     }
 }
 
@@ -827,7 +933,6 @@ enum MemoryLoadTrigger {
     Configure,
     IndexRunOpen,
     QueryFallback,
-    BookQueryFallback,
 }
 
 impl MemoryLoadTrigger {
@@ -871,13 +976,209 @@ struct SimilarIndexScheduler {
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
     item_query: Arc<Mutex<ItemQueryCache>>,
-    book_query: Arc<Mutex<BookQueryState>>,
+    book_query: BookQueryExecutor<Arc<BookQuery>>,
+    #[cfg(test)]
+    book_query_phase_probe:
+        Mutex<Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>>>,
+    known_book_store: Mutex<ObservedBookStore>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
     active_cancel: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<SchedulerState>,
     array_update: Mutex<ArrayUpdateState>,
     compaction_running: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedBookStore {
+    Unobserved,
+    Known([u8; 16]),
+}
+
+enum BookEngineSlot {
+    Vacant,
+    Ready(SimilarBookQueryEngine),
+}
+
+struct SchedulerBookQueryRuntime {
+    scheduler: Weak<SimilarIndexScheduler>,
+    engine: BookEngineSlot,
+}
+
+impl BookQueryRuntime<Arc<BookQuery>> for SchedulerBookQueryRuntime {
+    fn execute(
+        &mut self,
+        request: BookQueryRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> BookQueryTerminal<Arc<BookQuery>> {
+        let perf_started = crate::perf::is_enabled().then(std::time::Instant::now);
+        let cpu_started = perf_started.and_then(|_| current_thread_cpu_100ns());
+        let trace_id = perf_started.map_or(0, |_| next_similar_query_trace_id());
+        if perf_started.is_some() {
+            crate::perf::event(
+                "similar_book",
+                "start",
+                Some(request.container_key()),
+                trace_id,
+                &[(
+                    "priority",
+                    serde_json::Value::from(current_thread_priority()),
+                )],
+            );
+        }
+        let terminal = self.execute_inner(&request, Arc::clone(&cancel));
+        if let Some(started) = perf_started {
+            let (hit_count, override_count) = book_query_result_counts(&terminal);
+            let cancelled = cancel.load(Ordering::Acquire);
+            let cpu_ms = cpu_started
+                .zip(current_thread_cpu_100ns())
+                .map(|(before, after)| after.saturating_sub(before) as f64 / 10_000.0);
+            crate::perf::event(
+                "similar_book",
+                "end",
+                Some(request.container_key()),
+                trace_id,
+                &[
+                    (
+                        "wall_ms",
+                        serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "thread_cpu_ms",
+                        cpu_ms.map_or(serde_json::Value::Null, serde_json::Value::from),
+                    ),
+                    (
+                        "priority",
+                        serde_json::Value::from(current_thread_priority()),
+                    ),
+                    ("cancelled", serde_json::Value::from(cancelled)),
+                    ("active", serde_json::Value::from(!cancelled)),
+                    ("stale", serde_json::Value::from(cancelled)),
+                    (
+                        "terminal",
+                        serde_json::Value::from(book_query_terminal_label(&terminal)),
+                    ),
+                    ("hit_count", serde_json::Value::from(hit_count as u64)),
+                    (
+                        "override_count",
+                        serde_json::Value::from(override_count as u64),
+                    ),
+                ],
+            );
+        }
+        terminal
+    }
+}
+
+impl SchedulerBookQueryRuntime {
+    fn execute_inner(
+        &mut self,
+        request: &BookQueryRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> BookQueryTerminal<Arc<BookQuery>> {
+        let Some(scheduler) = self.scheduler.upgrade() else {
+            return BookQueryTerminal::Failed(
+                "similar book query scheduler is unavailable".to_owned(),
+            );
+        };
+        let shared_snapshot = {
+            let memory = scheduler.memory.lock().unwrap_or_else(|e| e.into_inner());
+            match &*memory {
+                MemoryState::Ready(snapshot) => Some(Arc::clone(snapshot)),
+                MemoryState::Unloaded
+                | MemoryState::Loading
+                | MemoryState::Missing
+                | MemoryState::Failed(_) => None,
+            }
+        };
+        let roots = scheduler
+            .enabled_roots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let db_path = SimilarDb::db_path_at(&scheduler.data_dir);
+
+        if matches!(self.engine, BookEngineSlot::Vacant) {
+            match SimilarBookQueryEngine::open_at(&db_path) {
+                Ok(Some(engine)) => self.engine = BookEngineSlot::Ready(engine),
+                Ok(None) => {
+                    return BookQueryTerminal::Ready(Arc::new(BookQuery::NotIndexed));
+                }
+                Err(error) => {
+                    return BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(format!(
+                        "similar book query database open failed: {error}"
+                    ))));
+                }
+            }
+        }
+
+        let BookEngineSlot::Ready(engine) = &mut self.engine else {
+            unreachable!("book query engine slot did not become ready")
+        };
+        #[cfg(test)]
+        if let Some(probe) = scheduler
+            .book_query_phase_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            engine.set_test_phase_probe(probe);
+        }
+        let candidates = shared_snapshot.into_iter().collect::<Vec<_>>();
+        let result = engine.query(request.container_key(), &roots, &candidates, cancel);
+        match result {
+            Ok(observation) => {
+                scheduler.observe_book_store(observation.metadata.store_id);
+                match observation.outcome {
+                    Ok(query) => BookQueryTerminal::Ready(Arc::new(query)),
+                    Err(error) => BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(
+                        book_engine_error(error),
+                    ))),
+                }
+            }
+            Err(error) => BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(format!(
+                "similar book query database read failed: {error}"
+            )))),
+        }
+    }
+}
+
+fn item_query_terminal_label(query: &ItemQuery) -> &'static str {
+    match query {
+        ItemQuery::Preparing => "preparing",
+        ItemQuery::Ready(_) => "ready",
+        ItemQuery::Featureless => "featureless",
+        ItemQuery::NotIndexed => "not_indexed",
+        ItemQuery::NoIndex => "no_index",
+        ItemQuery::Failed(_) => "failed",
+    }
+}
+
+fn book_query_terminal_label(terminal: &BookQueryTerminal<Arc<BookQuery>>) -> &'static str {
+    match terminal {
+        BookQueryTerminal::Ready(query) => match query.as_ref() {
+            BookQuery::Preparing => "preparing",
+            BookQuery::Ready(_) => "ready",
+            BookQuery::Featureless => "featureless",
+            BookQuery::NotIndexed => "not_indexed",
+            BookQuery::NotBook => "not_book",
+            BookQuery::Failed(_) => "failed",
+        },
+        BookQueryTerminal::Failed(_) => "executor_failed",
+    }
+}
+
+fn book_query_result_counts(terminal: &BookQueryTerminal<Arc<BookQuery>>) -> (usize, usize) {
+    let BookQueryTerminal::Ready(query) = terminal else {
+        return (0, 0);
+    };
+    let BookQuery::Ready(relations) = query.as_ref() else {
+        return (0, 0);
+    };
+    (
+        relations.hits.len(),
+        relations.hits.iter().map(|hit| hit.overrides().len()).sum(),
+    )
 }
 
 /// 既存の favorite watcher が所有する通知口。ファイル監視は増やさない。
@@ -908,6 +1209,57 @@ impl SimilarIndexNotifier {
 }
 
 impl SimilarIndexScheduler {
+    fn book_query_dispatch_decision(&self) -> BookQueryDispatchDecision<Arc<BookQuery>> {
+        let (shutdown, worker_running) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.shutdown, state.worker_running)
+        };
+        if shutdown {
+            return BookQueryDispatchDecision::Complete(BookQueryTerminal::Failed(
+                "similar book query scheduler stopped".to_owned(),
+            ));
+        }
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        match &*memory {
+            MemoryState::Loading => BookQueryDispatchDecision::Wait,
+            MemoryState::Unloaded if worker_running => BookQueryDispatchDecision::Wait,
+            MemoryState::Unloaded
+            | MemoryState::Missing
+            | MemoryState::Failed(_)
+            | MemoryState::Ready(_) => BookQueryDispatchDecision::Run,
+        }
+    }
+
+    fn worker_is_running(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .worker_running
+    }
+
+    fn observe_book_store(&self, store_id: [u8; 16]) {
+        let changed = {
+            let mut observed = self
+                .known_book_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match *observed {
+                ObservedBookStore::Unobserved => {
+                    *observed = ObservedBookStore::Known(store_id);
+                    false
+                }
+                ObservedBookStore::Known(current) if current == store_id => false,
+                ObservedBookStore::Known(_) => {
+                    *observed = ObservedBookStore::Known(store_id);
+                    true
+                }
+            }
+        };
+        if changed {
+            self.book_query.hard_invalidate();
+        }
+    }
+
     fn configure(
         self: &Arc<Self>,
         mut roots: Vec<PathBuf>,
@@ -925,27 +1277,36 @@ impl SimilarIndexScheduler {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = normalized;
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.shutdown {
-            return;
-        }
-        let had_roots = state
-            .config
-            .as_ref()
-            .is_some_and(|config| !config.roots.is_empty());
-        let roots_changed = state
-            .config
-            .as_ref()
-            .is_none_or(|config| config.roots != roots);
-        let has_roots = !roots.is_empty();
-        state.config = Some(SchedulerConfig {
-            roots,
-            pdf_passwords,
-            activity_gate,
-        });
-        if !roots_changed {
-            return;
-        }
+        let (roots_changed, should_start) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown {
+                return;
+            }
+            let had_roots = state
+                .config
+                .as_ref()
+                .is_some_and(|config| !config.roots.is_empty());
+            let roots_changed = state
+                .config
+                .as_ref()
+                .is_none_or(|config| config.roots != roots);
+            let has_roots = !roots.is_empty();
+            state.config = Some(SchedulerConfig {
+                roots,
+                pdf_passwords,
+                activity_gate,
+            });
+            if !roots_changed {
+                return;
+            }
+            state.revision = state.revision.wrapping_add(1);
+            let should_start = !state.worker_running && (had_roots || has_roots);
+            if should_start {
+                state.worker_running = true;
+            }
+            (roots_changed, should_start)
+        };
+        debug_assert!(roots_changed);
         self.retain_loaded_snapshot_during_run();
         // 対象変更時だけ現在の旧 snapshot 走査を止める。watcher 通知は coalesce し、
         // 進行中の一巡を完了させてから最新状態をもう一度照合する。
@@ -957,12 +1318,7 @@ impl SimilarIndexScheduler {
         {
             cancel.store(true, Ordering::Relaxed);
         }
-        state.revision = state.revision.wrapping_add(1);
-        let should_start = !state.worker_running && (had_roots || has_roots);
-        if should_start {
-            state.worker_running = true;
-        }
-        drop(state);
+        self.book_query.hard_invalidate();
         if should_start {
             self.spawn_worker();
         }
@@ -1020,12 +1376,15 @@ impl SimilarIndexScheduler {
             .name("similar-index".to_owned())
             .spawn(move || scheduler.worker_loop())
         {
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .worker_running = false;
+            {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .worker_running = false;
+            }
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::Failed(format!("similar index worker start failed: {error}"));
+            self.book_query.soft_refresh();
         }
     }
 
@@ -1125,9 +1484,9 @@ impl SimilarIndexScheduler {
             *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
             drop(state);
             *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
-            *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
             self.request_array_refresh();
+            self.book_query.soft_refresh();
             return;
         }
     }
@@ -1152,7 +1511,6 @@ impl SimilarIndexScheduler {
     fn retain_loaded_snapshot_during_run(&self) {
         self.memory_epoch.fetch_add(1, Ordering::AcqRel);
         retain_ready_memory_or_unload(&mut self.memory.lock().unwrap_or_else(|e| e.into_inner()));
-        *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
     }
 
     fn request_array_refresh(self: &Arc<Self>) {
@@ -1172,11 +1530,14 @@ impl SimilarIndexScheduler {
                 .name("similar-array-update".to_owned())
                 .spawn(move || scheduler.array_update_loop())
             {
-                self.array_update
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .running = false;
+                {
+                    self.array_update
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .running = false;
+                }
                 crate::logger::log(format!("similar array update worker start failed: {error}"));
+                self.book_query.soft_refresh();
             }
         }
     }
@@ -1296,7 +1657,7 @@ impl SimilarIndexScheduler {
                 .unwrap_or_else(|e| e.into_inner())
                 .entries
                 .clear();
-            *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
+            self.book_query.soft_refresh();
         }
         published
     }
@@ -1380,17 +1741,22 @@ impl SimilarIndexScheduler {
     }
 
     fn finish_worker(&self, progress: IndexProgress) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.worker_running = false;
+        }
         *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        state.worker_running = false;
         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+        self.book_query.soft_refresh();
     }
 
     fn shutdown(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .shutdown = true;
+        {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown = true;
+        }
         if let Some(cancel) = self
             .active_cancel
             .lock()
@@ -1399,6 +1765,7 @@ impl SimilarIndexScheduler {
         {
             cancel.store(true, Ordering::Relaxed);
         }
+        self.book_query.shutdown();
     }
 }
 
@@ -1420,17 +1787,6 @@ enum SummaryState {
     Missing,
     Ready(IndexSummary),
     Failed(String),
-}
-
-enum BookQueryState {
-    Idle,
-    Loading {
-        item_key: String,
-    },
-    Ready {
-        item_key: String,
-        result: Arc<BookQuery>,
-    },
 }
 
 /// 単体照会の結果置き場。
@@ -1490,16 +1846,17 @@ fn replace_cached_item_query_if_current(
     item_key: &str,
     memory_epoch: u64,
     result: Arc<ItemQuery>,
-) {
+) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = cache
         .entries
         .iter_mut()
         .find(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
     else {
-        return;
+        return false;
     };
     entry.result = result;
+    true
 }
 
 fn retain_ready_memory_or_unload(state: &mut MemoryState) {
@@ -2027,7 +2384,7 @@ fn book_scan_pool() -> Option<&'static rayon::ThreadPool> {
 ///
 /// `THREAD_MODE_BACKGROUND_BEGIN` は I/O まで大きく絞るので使わない。ここで読むのは
 /// 在メモリの配列で、利用者はパネルの答えを待っている。CPU の順番だけを譲る。
-fn lower_current_thread_priority() {
+pub(crate) fn lower_current_thread_priority() {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::System::Threading::{
@@ -2037,6 +2394,47 @@ fn lower_current_thread_priority() {
             crate::logger::log("similar book scan: SetThreadPriority(BelowNormal) failed");
         }
     }
+}
+
+#[cfg(windows)]
+fn current_thread_priority() -> i32 {
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        GetThreadPriority(GetCurrentThread())
+    }
+}
+
+#[cfg(not(windows))]
+fn current_thread_priority() -> i32 {
+    0
+}
+
+#[cfg(windows)]
+fn current_thread_cpu_100ns() -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    let ticks =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    Some(ticks(kernel).saturating_add(ticks(user)))
+}
+
+#[cfg(not(windows))]
+fn current_thread_cpu_100ns() -> Option<u64> {
+    None
 }
 
 /// 何冊ぶんかのページを、常駐配列への **1 回の走査**でまとめて照合する。
@@ -3504,6 +3902,10 @@ fn db_error(error: rusqlite::Error) -> String {
     format!("similar.db: {error}")
 }
 
+fn book_engine_error(error: BookEngineError) -> String {
+    error.to_string()
+}
+
 fn extension_lower(path: &Path) -> String {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -4456,12 +4858,12 @@ mod tests {
             7,
             Arc::new(ItemQuery::Ready(empty_matches())),
         );
-        replace_cached_item_query_if_current(
+        assert!(!replace_cached_item_query_if_current(
             &cache,
             "origin-a",
             7,
             Arc::new(ItemQuery::Featureless),
-        );
+        ));
 
         assert!(matches!(
             cached_item_query(&cache, "origin-b", 7).as_deref(),
@@ -5298,6 +5700,256 @@ mod tests {
         db.complete_container(container_key, generation).unwrap();
     }
 
+    fn wait_for_book_terminal(
+        manager: &SimilarIndexManager,
+        client: &SimilarBookQueryClient,
+        container_key: &str,
+    ) -> Arc<BookQuery> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = manager.query_book(client, container_key);
+            if !matches!(result.as_ref(), BookQuery::Preparing) {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "book query did not reach a terminal for {container_key}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn product_book_query_missing_store_retries_after_soft_publication_without_ui_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
+        let manager = SimilarIndexManager::new_with_book_query_notifier(
+            temp.path().to_path_buf(),
+            move || {
+                let _ = notify_tx.send(());
+            },
+        );
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        let client = SimilarBookQueryClient::new();
+
+        assert_eq!(
+            wait_for_book_terminal(&manager, &client, "c:/library/book").as_ref(),
+            &BookQuery::NotIndexed
+        );
+        while notify_rx.try_recv().is_ok() {}
+
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        publish_book(
+            &db,
+            "c:/library/book",
+            &[book_page("c:/library/book", 0, 7)],
+        );
+        manager.scheduler.book_query.soft_refresh();
+
+        notify_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("soft publication must finish and repaint without another UI poll");
+        assert!(matches!(
+            manager.query_book(&client, "c:/library/book").as_ref(),
+            BookQuery::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn product_book_query_open_failure_is_per_request_and_does_not_stop_the_executor() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(SimilarDb::db_path_at(temp.path())).unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        let first = SimilarBookQueryClient::new();
+        let second = SimilarBookQueryClient::new();
+
+        let first_result = wait_for_book_terminal(&manager, &first, "c:/library/a");
+        let second_result = wait_for_book_terminal(&manager, &second, "c:/library/b");
+        let BookQuery::Failed(first_error) = first_result.as_ref() else {
+            panic!("open failure must be a typed per-request failure: {first_result:?}");
+        };
+        let BookQuery::Failed(second_error) = second_result.as_ref() else {
+            panic!("the next client must also reach its own terminal: {second_result:?}");
+        };
+        assert!(first_error.contains("database open failed"));
+        assert!(second_error.contains("database open failed"));
+        assert!(!second_error.contains("executor stopped"));
+    }
+
+    #[test]
+    fn product_book_query_loading_gate_keeps_request_until_terminal_memory_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        publish_book(
+            &db,
+            "c:/library/book",
+            &[book_page("c:/library/book", 0, 9)],
+        );
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        *manager.memory.lock().unwrap() = MemoryState::Loading;
+        let client = SimilarBookQueryClient::new();
+
+        assert_eq!(
+            manager.query_book(&client, "c:/library/book").as_ref(),
+            &BookQuery::Preparing
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            manager.query_book(&client, "c:/library/book").as_ref(),
+            &BookQuery::Preparing
+        );
+
+        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        manager.scheduler.book_query.soft_refresh();
+        assert!(matches!(
+            wait_for_book_terminal(&manager, &client, "c:/library/book").as_ref(),
+            BookQuery::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn product_book_query_store_change_retires_retained_ready_and_requeues_only_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = SimilarDb::db_path_at(temp.path());
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        publish_book(
+            &db,
+            "c:/library/book",
+            &[book_page("c:/library/book", 0, 11)],
+        );
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        let retained = SimilarBookQueryClient::new();
+        let active = SimilarBookQueryClient::new();
+
+        assert!(matches!(
+            wait_for_book_terminal(&manager, &retained, "c:/library/book").as_ref(),
+            BookQuery::Ready(_)
+        ));
+        retained.retain();
+        assert!(matches!(
+            wait_for_book_terminal(&manager, &active, "c:/library/book").as_ref(),
+            BookQuery::Ready(_)
+        ));
+        let old_store = match *manager.scheduler.known_book_store.lock().unwrap() {
+            ObservedBookStore::Known(store) => store,
+            ObservedBookStore::Unobserved => panic!("completed query did not observe its store"),
+        };
+        let mut new_store = old_store;
+        new_store[0] ^= 0xff;
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer
+            .execute(
+                "UPDATE search_content_state SET store_id = ?1 WHERE singleton = 1",
+                [new_store.as_slice()],
+            )
+            .unwrap();
+        drop(writer);
+
+        manager.scheduler.book_query.soft_refresh();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = *manager.scheduler.known_book_store.lock().unwrap();
+            if observed == ObservedBookStore::Known(new_store)
+                && matches!(
+                    manager.query_book(&active, "c:/library/book").as_ref(),
+                    BookQuery::Ready(_)
+                )
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "store transition did not settle on the active client"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            manager.query_book(&retained, "c:/library/book").as_ref(),
+            &BookQuery::Preparing,
+            "global hard invalidation must retire a retained client's old Ready"
+        );
+        assert!(matches!(
+            wait_for_book_terminal(&manager, &retained, "c:/library/book").as_ref(),
+            BookQuery::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn product_book_query_inflight_cancellation_hides_a_and_dispatches_b_without_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        let origin_a = "c:/library/a";
+        let origin_b = "c:/library/b";
+        let pages_a = (0..1_500)
+            .map(|page| book_page(origin_a, page, 0x55))
+            .collect::<Vec<_>>();
+        publish_book(&db, origin_a, &pages_a);
+        publish_book(&db, origin_b, &[book_page(origin_b, 0, 0xaa)]);
+        drop(db);
+
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
+        let manager = SimilarIndexManager::new_with_book_query_notifier(
+            temp.path().to_path_buf(),
+            move || {
+                let _ = notify_tx.send(());
+            },
+        );
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        let (probe, mut phase_control) =
+            crate::similar_book_query_test_probe::BookQueryTestPhaseProbe::new(
+                crate::similar_book_query_test_probe::BookQueryTestPhase::SqlProgress,
+            );
+        manager.set_book_query_test_phase_probe(probe);
+        let client_a = SimilarBookQueryClient::new();
+        let client_b = SimilarBookQueryClient::new();
+
+        assert_eq!(
+            manager.query_book(&client_a, origin_a).as_ref(),
+            &BookQuery::Preparing
+        );
+        phase_control.wait_reached();
+        assert_eq!(
+            manager.query_book(&client_b, origin_b).as_ref(),
+            &BookQuery::Preparing
+        );
+
+        let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let withdraw = scope.spawn(|| {
+                client_a.withdraw();
+                let _ = withdrawn_tx.send(());
+            });
+            let withdraw_result = withdrawn_rx.recv_timeout(Duration::from_secs(5));
+            phase_control.release();
+            let join_result = withdraw.join();
+            withdraw_result.expect("withdrawing A blocked behind the query worker");
+            join_result.unwrap();
+        });
+
+        notify_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("B did not publish a terminal without another UI poll");
+        assert_eq!(
+            client_a.demand_snapshot_for_test(),
+            crate::similar_book_query::BookQueryDemandSnapshot::Withdrawn,
+            "the cancelled A request must remain unpublished"
+        );
+        assert!(matches!(
+            manager.query_book(&client_b, origin_b).as_ref(),
+            BookQuery::Ready(_)
+        ));
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "the cancelled A request must not publish a result notification"
+        );
+    }
+
     fn book_page(container: &str, page: u32, marker: u8) -> StoredItem {
         StoredItem {
             item_key: format!("{container}/{page}"),
@@ -5720,6 +6372,244 @@ mod tests {
             db.page_order_version().unwrap(),
             crate::similar_db::PAGE_ORDER_VERSION
         );
+    }
+
+    fn prepared_scale_fixture_dir(name: &str) -> PathBuf {
+        use std::os::windows::fs::MetadataExt;
+
+        let run = std::env::var_os("MIV_BOOK_QUERY_SCALE_RUN_DIR")
+            .map(PathBuf::from)
+            .expect("set MIV_BOOK_QUERY_SCALE_RUN_DIR to the prepared fresh run directory");
+        let run = std::fs::canonicalize(&run).expect("scale run directory must already exist");
+        let directory = std::fs::canonicalize(run.join(name)).unwrap_or_else(|error| {
+            panic!("prepared fixture directory {name} is missing: {error}")
+        });
+        assert_eq!(directory.parent(), Some(run.as_path()));
+        for ancestor in directory.ancestors() {
+            let metadata = std::fs::symlink_metadata(ancestor).unwrap();
+            assert_eq!(
+                metadata.file_attributes() & 0x400,
+                0,
+                "fixture ancestors must not be reparse points: {}",
+                ancestor.display()
+            );
+            if ancestor == run {
+                break;
+            }
+        }
+        assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
+        directory
+    }
+
+    fn near_white_page_prototype() -> StoredItem {
+        let mut raster = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]));
+        raster.put_pixel(32, 32, image::Rgba([0, 0, 0, 255]));
+        let raster = image::DynamicImage::ImageRgba8(raster);
+        let make = || {
+            let canonical = proxy_from_source(
+                ProxySource::Raster {
+                    image: &raster,
+                    source_dims: (64, 64),
+                    format: SimilarImageFormat::Png,
+                },
+                None,
+            )
+            .unwrap();
+            stored_from_proxy(
+                "c:/library/prototype.png",
+                ItemKind::Image,
+                Some("c:/library/prototype"),
+                Some(0),
+                &FileCandidate {
+                    path: PathBuf::from("c:/library/prototype.png"),
+                    mtime: 1,
+                    file_size: 1,
+                },
+                canonical,
+            )
+            .unwrap()
+        };
+        let first = make();
+        let second = make();
+        assert!(
+            first.quality > 0,
+            "the real near-white PDQ proxy must be eligible"
+        );
+        assert_eq!(first.pdq256, second.pdq256);
+        assert_eq!(first.quality, second.quality);
+        first
+    }
+
+    #[test]
+    fn near_white_scale_raster_uses_a_repeatable_eligible_real_pdq_proxy() {
+        let prototype = near_white_page_prototype();
+        assert!(prototype.quality > 0);
+        assert_ne!(prototype.pdq256, [0; 32]);
+    }
+
+    fn scale_fixture_input(role: &str, path: &Path) -> serde_json::Value {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read as _;
+
+        let metadata = std::fs::metadata(path).unwrap();
+        assert!(metadata.is_file());
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        serde_json::json!({
+            "role": role,
+            "file": path.file_name().unwrap().to_string_lossy(),
+            "bytes": metadata.len(),
+            "sha256": format!("{:x}", digest.finalize()),
+        })
+    }
+
+    fn publish_repeated_near_white_book(
+        db: &SimilarDb,
+        prototype: &StoredItem,
+        container_key: &str,
+        pages: usize,
+    ) {
+        let items = (0..pages)
+            .map(|page| {
+                let mut item = prototype.clone();
+                item.item_key = format!("{container_key}/{page:05}.png");
+                item.container_key = Some(container_key.to_owned());
+                item.page_index = Some(page as u32);
+                item.mtime = 1 + page as i64;
+                item
+            })
+            .collect::<Vec<_>>();
+        publish_book(db, container_key, &items);
+    }
+
+    fn finish_near_white_fixture(
+        directory: &Path,
+        label: &str,
+        origin_key: &str,
+        pages: usize,
+        candidates: usize,
+        signature: [u8; 32],
+        quality: u8,
+    ) {
+        let path = directory.join("similar.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let journal: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "delete");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        drop(connection);
+        assert!(!directory.join("similar.db-wal").exists());
+        assert!(!directory.join("similar.db-shm").exists());
+        let inputs = [
+            scale_fixture_input("database", &path),
+            scale_fixture_input("base", &directory.join("similar.base")),
+        ];
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("fixture.json"))
+            .unwrap();
+        serde_json::to_writer_pretty(
+            file,
+            &serde_json::json!({
+                "schema": 1,
+                "fixture": label,
+                "origin_key": origin_key,
+                "origin_pages": pages,
+                "candidate_count": candidates,
+                "pdq256_hex": signature.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "quality": quality,
+                "inputs": inputs,
+                "journal_mode": "delete",
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "generates persistent real-proxy near-white 8-book and 9-book scale stores"]
+    fn generate_and_verify_near_white_common_boundary_fixtures() {
+        let prototype = near_white_page_prototype();
+        let root = "c:/library";
+        for (name, total_books, expected_hits, common) in [
+            ("near-white-rare-8", 8usize, 7usize, false),
+            ("near-white-common-9", 9usize, 0usize, true),
+        ] {
+            let directory = prepared_scale_fixture_dir(name);
+            let path = directory.join("similar.db");
+            let db = SimilarDb::open_at(&path).unwrap();
+            let origin_key = format!("{root}/{name}-origin");
+            publish_repeated_near_white_book(&db, &prototype, &origin_key, 400);
+            for candidate in 0..(total_books - 1) {
+                publish_repeated_near_white_book(
+                    &db,
+                    &prototype,
+                    &format!("{root}/{name}-candidate-{candidate:02}"),
+                    400,
+                );
+            }
+            let snapshot = Arc::new(
+                similar_search_array::rebuild_from_sqlite(&db, &directory.join("similar.base"))
+                    .unwrap(),
+            );
+            drop(db);
+            let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+            let observation = engine
+                .query(
+                    &origin_key,
+                    &[root.to_owned()],
+                    &[snapshot],
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
+                panic!("{name} must be Ready");
+            };
+            assert_eq!(relations.origin.pages.len(), 400);
+            assert_eq!(relations.hits.len(), expected_hits);
+            assert_eq!(
+                relations
+                    .origin
+                    .pages
+                    .iter()
+                    .filter(|page| page.baseline == BookPageBaseline::Excluded)
+                    .count(),
+                if common { 400 } else { 0 }
+            );
+            for hit in &relations.hits {
+                assert_eq!(hit.other_page_count, 400);
+                assert_eq!(hit.pair.matched, 400);
+                assert_eq!(hit.pair.distinctive_a, 400);
+                assert_eq!(hit.pair.distinctive_b, 400);
+                assert_eq!(hit.pair.coverage_a, 1.0);
+                assert_eq!(hit.pair.coverage_b, 1.0);
+                assert_eq!(hit.pair.relation, dupe::book::Relation::Same);
+                assert_eq!(hit.pair.alignment.len(), 400);
+                assert_eq!(hit.overrides().len(), 400);
+            }
+            drop(engine);
+            finish_near_white_fixture(
+                &directory,
+                name,
+                &origin_key,
+                400,
+                expected_hits,
+                prototype.pdq256,
+                prototype.quality,
+            );
+        }
     }
 
     /// 半径を超えたと分かった時点で打ち切っても、半径内の距離は完全一致する。

@@ -1540,14 +1540,43 @@ impl App {
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        self.open_required_fullscreen_location_with_purpose(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            crate::app::FsNavigationPurpose::Ordinary,
+        );
+    }
+
+    pub(crate) fn open_required_fullscreen_location_with_purpose(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
         if matches!(target, crate::snapshot::SnapshotTarget::Fs(_)) {
             // Accepting the new scan supersedes any old ZIP/PDF enumerate or password retry.
             // The current viewer remains intact until this physical scan succeeds.
+            self.finish_similar_move_diagnostic("async_replaced");
             self.retire_superseded_required_fullscreen_async_request();
-            self.start_required_fullscreen_folder_open(folder_path, target, history_trigger);
+            self.start_required_fullscreen_folder_open(
+                folder_path,
+                target,
+                history_trigger,
+                navigation_purpose,
+            );
             return;
         }
-        self.open_required_fullscreen_from_location_load(ctx, folder_path, target, history_trigger);
+        self.open_required_fullscreen_from_location_load(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            navigation_purpose,
+        );
     }
 
     fn retire_superseded_required_fullscreen_async_request(&mut self) {
@@ -1569,7 +1598,7 @@ impl App {
         let finish = if self.fullscreen_idx.is_some() {
             crate::app::FsNavigationSequenceFinish::Superseded
         } else {
-            crate::app::FsNavigationSequenceFinish::ViewerExited
+            crate::app::FsNavigationSequenceFinish::RequestFailed
         };
         self.finish_fs_navigation_sequence(finish);
     }
@@ -1591,8 +1620,12 @@ impl App {
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
     }
 
-    fn prepare_required_fullscreen_navigation(&mut self, ctx: &egui::Context) -> bool {
-        if !self.supersede_and_begin_fs_folder_navigation_sequence(ctx) {
+    fn prepare_required_fullscreen_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) -> bool {
+        if !self.supersede_and_begin_fs_folder_navigation_sequence(ctx, navigation_purpose) {
             return false;
         }
         // The new typed owner has replaced the old request. Retire the old async payload without
@@ -1626,7 +1659,7 @@ impl App {
         }
         let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
             self.finish_fs_navigation_sequence(
-                crate::app::FsNavigationSequenceFinish::ViewerExited,
+                crate::app::FsNavigationSequenceFinish::RequestFailed,
             );
             self.show_feedback_toast("移動先の画像が見つかりません".to_string());
             return;
@@ -1643,8 +1676,9 @@ impl App {
         folder_path: PathBuf,
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
-        if !self.prepare_required_fullscreen_navigation(ctx) {
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;
         }
@@ -1661,8 +1695,9 @@ impl App {
         scan: crate::app::ScannedDir,
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
-        if !self.prepare_required_fullscreen_navigation(ctx) {
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;
         }

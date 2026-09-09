@@ -100,6 +100,15 @@ enum ClientDemand {
     Retained { container_key: String },
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BookQueryDemandSnapshot {
+    Unbound,
+    Withdrawn,
+    Active(String),
+    Retained(String),
+}
+
 impl ClientDemand {
     fn container_key(&self) -> Option<&str> {
         match self {
@@ -376,6 +385,12 @@ where
         self.inner.wake.notify_one();
     }
 
+    /// Stops accepting work, cancels the running request, and retires every cached completion.
+    /// The worker observes the lifecycle change and drops its runtime without being joined here.
+    pub(crate) fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
     #[cfg(test)]
     fn wait_for_ready(&self, client: &BookQueryClient<T>, container_key: &str, expected: &T) -> T
     where
@@ -514,6 +529,44 @@ impl<T: Clone + Send + 'static> BookQueryClient<T> {
             && executor.identity == *executor_identity
         {
             executor.retain(*client_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn demand_snapshot_for_test(&self) -> BookQueryDemandSnapshot {
+        let binding = self
+            .binding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ClientBinding::Bound {
+            executor,
+            executor_identity,
+            client_id,
+        } = &*binding
+        else {
+            return BookQueryDemandSnapshot::Unbound;
+        };
+        let Some(executor) = executor
+            .upgrade()
+            .filter(|executor| executor.identity == *executor_identity)
+        else {
+            return BookQueryDemandSnapshot::Unbound;
+        };
+        let state = executor
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(client) = state.clients.get(client_id) else {
+            return BookQueryDemandSnapshot::Unbound;
+        };
+        match &client.demand {
+            ClientDemand::Withdrawn => BookQueryDemandSnapshot::Withdrawn,
+            ClientDemand::Active { container_key } => {
+                BookQueryDemandSnapshot::Active(container_key.clone())
+            }
+            ClientDemand::Retained { container_key } => {
+                BookQueryDemandSnapshot::Retained(container_key.clone())
+            }
         }
     }
 }
@@ -1110,6 +1163,7 @@ impl<T> ExecutorInner<T> {
             if matches!(client.work, ClientWork::Queued) {
                 client.work = ClientWork::Idle;
             }
+            client.completion = None;
         }
         state.worker = match state.worker {
             WorkerLifecycle::Dormant => WorkerLifecycle::Stopped,
@@ -1118,6 +1172,7 @@ impl<T> ExecutorInner<T> {
             WorkerLifecycle::Stopped => WorkerLifecycle::Stopped,
             WorkerLifecycle::Failed(ref error) => WorkerLifecycle::Failed(error.clone()),
         };
+        drop(state);
         self.wake.notify_all();
     }
 }
@@ -1666,6 +1721,39 @@ mod tests {
         probed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         drop(executor);
         done.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+
+    #[test]
+    fn explicit_shutdown_retires_cached_completions_without_joining() {
+        let harness = Harness::new();
+        let client = BookQueryClient::default();
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::Preparing
+        );
+        assert_eq!(harness.started().0, "book");
+        harness.commands.send(Command::Complete(1)).unwrap();
+        assert_eq!(harness.executor().wait_for_ready(&client, "book", &1), 1);
+
+        harness.executor().shutdown();
+        {
+            let client_id = client.id_for(&harness.executor().inner).unwrap();
+            let state = harness
+                .executor()
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(state.clients[&client_id].completion.is_none());
+        }
+        assert_eq!(
+            harness.executor().query(&client, "book"),
+            BookQueryPoll::ExecutorStopped
+        );
+        match harness.events.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Event::RuntimeDropped(1) => {}
+            event => panic!("unexpected shutdown event: {event:?}"),
+        }
     }
 
     #[test]

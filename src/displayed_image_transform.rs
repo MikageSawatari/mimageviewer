@@ -112,10 +112,42 @@ pub(crate) struct DisplayedImageTransformInput {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
+impl DisplayedImageTransformInput {
+    pub(crate) fn without_page(self) -> DisplayedImageGeometryInput {
+        DisplayedImageGeometryInput {
+            viewport_rect: self.viewport_rect,
+            source_size: self.source_size,
+            texture_size: self.texture_size,
+            rotation: self.rotation,
+            free_rotation_rad: self.free_rotation_rad,
+            content_bbox: self.content_bbox,
+            fit_mode: self.fit_mode,
+            fit_scale_limits: self.fit_scale_limits,
+            pixels_per_point: self.pixels_per_point,
+            placement: self.placement,
+            pixel_fit: self.pixel_fit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DisplayedImageGeometryInput {
+    pub(crate) viewport_rect: egui::Rect,
+    pub(crate) source_size: egui::Vec2,
+    pub(crate) texture_size: egui::Vec2,
+    pub(crate) rotation: Rotation,
+    pub(crate) free_rotation_rad: f32,
+    pub(crate) content_bbox: Option<egui::Rect>,
+    pub(crate) fit_mode: FullscreenFitMode,
+    pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
+    pub(crate) pixels_per_point: f32,
+    pub(crate) placement: ResolvedDisplayPlacement,
+    pub(crate) pixel_fit: RectPixelFit,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
-pub(crate) struct DisplayedImageTransform {
-    pub(crate) page_idx: usize,
+pub(crate) struct DisplayedImageGeometry {
     pub(crate) source_size: egui::Vec2,
     pub(crate) texture_size: egui::Vec2,
     pub(crate) viewport_rect: egui::Rect,
@@ -143,8 +175,23 @@ pub(crate) struct DisplayedImageTransform {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
-impl DisplayedImageTransform {
-    pub(crate) fn resolve(input: DisplayedImageTransformInput) -> Option<Self> {
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct DisplayedImageTransform {
+    pub(crate) page_idx: usize,
+    geometry: DisplayedImageGeometry,
+}
+
+impl std::ops::Deref for DisplayedImageTransform {
+    type Target = DisplayedImageGeometry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.geometry
+    }
+}
+
+impl DisplayedImageGeometry {
+    pub(crate) fn resolve(input: DisplayedImageGeometryInput) -> Option<Self> {
         if !rect_is_valid(input.viewport_rect)
             || !size_is_valid(input.source_size)
             || !size_is_valid(input.texture_size)
@@ -210,7 +257,7 @@ impl DisplayedImageTransform {
 
     /// 見開き・連結読みのレイアウトが先に確定させた画像全体矩形から transform を構築する。
     pub(crate) fn from_resolved_rect(
-        input: DisplayedImageTransformInput,
+        input: DisplayedImageGeometryInput,
         full_image_rect: egui::Rect,
     ) -> Option<Self> {
         if !rect_is_valid(input.viewport_rect)
@@ -264,7 +311,6 @@ impl DisplayedImageTransform {
         )
         .intersect(input.viewport_rect);
         Some(Self {
-            page_idx: input.page_idx,
             source_size: input.source_size,
             texture_size: input.texture_size,
             viewport_rect: input.viewport_rect,
@@ -522,6 +568,39 @@ impl DisplayedImageTransform {
             full_uv_rect(),
             tint,
         );
+    }
+}
+
+impl DisplayedImageTransform {
+    pub(crate) fn from_geometry(page_idx: usize, geometry: DisplayedImageGeometry) -> Self {
+        Self { page_idx, geometry }
+    }
+
+    pub(crate) fn resolve(input: DisplayedImageTransformInput) -> Option<Self> {
+        let page_idx = input.page_idx;
+        DisplayedImageGeometry::resolve(input.without_page())
+            .map(|geometry| Self { page_idx, geometry })
+    }
+
+    pub(crate) fn from_resolved_rect(
+        input: DisplayedImageTransformInput,
+        full_image_rect: egui::Rect,
+    ) -> Option<Self> {
+        let page_idx = input.page_idx;
+        DisplayedImageGeometry::from_resolved_rect(input.without_page(), full_image_rect)
+            .map(|geometry| Self { page_idx, geometry })
+    }
+
+    pub(crate) fn translated_by(self, offset: egui::Vec2) -> Self {
+        Self {
+            page_idx: self.page_idx,
+            geometry: self.geometry.translated_by(offset),
+        }
+    }
+
+    pub(crate) fn with_coordinate_source_size(mut self, source_size: egui::Vec2) -> Self {
+        self.geometry.source_size = source_size;
+        self
     }
 }
 
@@ -2339,5 +2418,39 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn page_wrapper_and_identity_free_geometry_resolve_to_the_same_result() {
+        let page_input = input(
+            FullscreenFitMode::Width,
+            Rotation::Cw90,
+            Some(egui::Rect::from_min_max(
+                egui::pos2(0.1, 0.2),
+                egui::pos2(0.85, 0.9),
+            )),
+        );
+        let page = DisplayedImageTransform::resolve(page_input).unwrap();
+        let geometry = DisplayedImageGeometry::resolve(page_input.without_page()).unwrap();
+
+        assert_eq!(page.page_idx, 7);
+        assert_eq!(format!("{:?}", page.geometry), format!("{:?}", geometry));
+        let offset = egui::vec2(11.0, -6.0);
+        let translated_page = page.translated_by(offset);
+        let translated_geometry = geometry.translated_by(offset);
+        assert_eq!(translated_page.page_idx, 7);
+        assert_eq!(
+            format!("{:?}", translated_page.geometry),
+            format!("{:?}", translated_geometry)
+        );
+
+        let coordinate_size = egui::vec2(4096.0, 3072.0);
+        let coordinate_override = page.with_coordinate_source_size(coordinate_size);
+        assert_eq!(coordinate_override.page_idx, 7);
+        assert_eq!(coordinate_override.source_size, coordinate_size);
+        assert_eq!(coordinate_override.full_image_rect, page.full_image_rect);
+        assert_eq!(coordinate_override.paint_rect, page.paint_rect);
+        assert_eq!(coordinate_override.uv_rect, page.uv_rect);
+        assert_eq!(coordinate_override.total_scale, page.total_scale);
     }
 }
