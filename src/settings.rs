@@ -4261,6 +4261,9 @@ pub struct Settings {
     /// 縦/横連結読みで、次のページまたは次の見開きユニットまで空ける間隔 (画面 px)。
     #[serde(default = "default_continuous_reading_gap_px")]
     pub continuous_reading_gap_px: u32,
+    /// 静止画・本のフルスクリーンで、画像の外側に表示する RGB 色。
+    #[serde(default = "default_fullscreen_image_margin_color")]
+    pub fullscreen_image_margin_color: [u8; 3],
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
@@ -5929,6 +5932,7 @@ pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_MIN: f32 = 160.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_MAX: f32 = 520.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_DEFAULT: f32 = 260.0;
+pub const FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT: [u8; 3] = [0, 0, 0];
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN: usize = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX: usize = 20;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
@@ -6034,6 +6038,9 @@ fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
 
 fn default_fullscreen_navigator_size() -> f32 {
     FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+}
+fn default_fullscreen_image_margin_color() -> [u8; 3] {
+    FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
 }
 pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
     0.22
@@ -6430,6 +6437,7 @@ impl Default for Settings {
             default_reading_direction: ReadingDirection::default(),
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
+            fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
             fullscreen_fit_mode: FullscreenFitMode::default(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
@@ -12080,6 +12088,10 @@ mod tests {
         assert!(s.thumb_idle_upgrade);
         assert_eq!(s.spread_page_gap_px, 4);
         assert_eq!(s.continuous_reading_gap_px, 20);
+        assert_eq!(
+            s.fullscreen_image_margin_color,
+            FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
+        );
         assert_eq!(s.slideshow_interval_secs, 3.0);
         assert_eq!(s.slideshow_continuous_wait_secs, 1.5);
         assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
@@ -14817,6 +14829,27 @@ mod tests {
             assert!(!loaded.fullscreen_boundary_notice_visible);
             assert!(!loaded.fullscreen_processing_status_visible);
             assert!(!loaded.fullscreen_prefetch_status_visible);
+        }
+
+        #[test]
+        fn fullscreen_image_margin_color_defaults_and_settings_db_roundtrips() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(
+                missing.fullscreen_image_margin_color,
+                FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
+            );
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.fullscreen_image_margin_color = [17, 34, 51];
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.fullscreen_image_margin_color, [17, 34, 51]);
         }
 
         /// 連続操作中の保存先送りは「変えた時点の世代」と現在の世代を比べて決める。

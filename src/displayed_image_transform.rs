@@ -190,6 +190,39 @@ impl std::ops::Deref for DisplayedImageTransform {
     }
 }
 
+/// The final screen-space quad occupied by the painted image.
+///
+/// `local_size` stays in the unrotated page coordinate system. Repeating image
+/// underlays use it for page-local UVs while the four positions rotate together
+/// with the image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ImagePaintQuad {
+    pub(crate) positions: [egui::Pos2; 4],
+    pub(crate) local_size: egui::Vec2,
+}
+
+impl ImagePaintQuad {
+    pub(crate) fn from_rect(
+        rect: egui::Rect,
+        rotation_center: egui::Pos2,
+        free_rotation_rad: f32,
+    ) -> Self {
+        let mut positions = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ];
+        for position in &mut positions {
+            *position = rotate_about(*position, rotation_center, free_rotation_rad);
+        }
+        Self {
+            positions,
+            local_size: rect.size(),
+        }
+    }
+}
+
 impl DisplayedImageGeometry {
     pub(crate) fn resolve(input: DisplayedImageGeometryInput) -> Option<Self> {
         if !rect_is_valid(input.viewport_rect)
@@ -519,19 +552,7 @@ impl DisplayedImageGeometry {
         tint: egui::Color32,
     ) {
         let display_uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-        let mut positions = [
-            self.paint_rect.left_top(),
-            self.paint_rect.right_top(),
-            self.paint_rect.right_bottom(),
-            self.paint_rect.left_bottom(),
-        ];
-        for position in &mut positions {
-            *position = rotate_about(
-                *position,
-                self.full_image_rect.center(),
-                self.free_rotation_rad,
-            );
-        }
+        let positions = self.paint_quad().positions;
         let mut mesh = egui::Mesh::with_texture(texture_id);
         for (index, (u, v)) in display_uvs.into_iter().enumerate() {
             let (source_u, source_v) = inverse_uv(self.rotation, u, v);
@@ -546,6 +567,16 @@ impl DisplayedImageGeometry {
         }
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Return the same final quad used by [`Self::paint_texture`]. Image-local
+    /// underlays must use this instead of the axis-aligned hit rectangle.
+    pub(crate) fn paint_quad(&self) -> ImagePaintQuad {
+        ImagePaintQuad::from_rect(
+            self.paint_rect,
+            self.full_image_rect.center(),
+            self.free_rotation_rad,
+        )
     }
 
     /// Paint a texture representing only `source_uv_rect` at the matching place
@@ -1570,6 +1601,11 @@ mod tests {
         close(a.bottom(), b.bottom());
     }
 
+    fn pos_close(a: egui::Pos2, b: egui::Pos2) {
+        close(a.x, b.x);
+        close(a.y, b.y);
+    }
+
     fn page_transform(page_idx: usize, rect: egui::Rect) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -1797,6 +1833,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn image_paint_quad_uses_the_trimmed_rect_for_every_saved_rotation() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.15, 0.20), egui::pos2(0.85, 0.75));
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let transform = DisplayedImageTransform::resolve(input(
+                FullscreenFitMode::Page,
+                rotation,
+                Some(trim),
+            ))
+            .unwrap();
+            let quad = transform.paint_quad();
+            assert_eq!(quad.local_size, transform.paint_rect.size());
+            for (actual, expected) in quad.positions.into_iter().zip([
+                transform.paint_rect.left_top(),
+                transform.paint_rect.right_top(),
+                transform.paint_rect.right_bottom(),
+                transform.paint_rect.left_bottom(),
+            ]) {
+                pos_close(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn image_paint_quad_rotates_page_local_corners_instead_of_using_the_aabb() {
+        let mut value = input(FullscreenFitMode::Page, Rotation::None, None);
+        value.free_rotation_rad = 0.37;
+        let transform = DisplayedImageTransform::resolve(value).unwrap();
+        let quad = transform.paint_quad();
+        let expected = [
+            transform.paint_rect.left_top(),
+            transform.paint_rect.right_top(),
+            transform.paint_rect.right_bottom(),
+            transform.paint_rect.left_bottom(),
+        ]
+        .map(|position| {
+            rotate_about(
+                position,
+                transform.full_image_rect.center(),
+                transform.free_rotation_rad,
+            )
+        });
+        for (actual, expected) in quad.positions.into_iter().zip(expected) {
+            pos_close(actual, expected);
+        }
+        assert!(
+            quad.positions
+                .into_iter()
+                .all(|position| position != transform.hit_rect.left_top())
+        );
+        assert_eq!(quad.local_size, transform.paint_rect.size());
     }
 
     #[test]

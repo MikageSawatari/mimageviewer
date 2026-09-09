@@ -427,10 +427,7 @@ impl App {
 
     /// 単一ページ表示用に状態を初期化する ([`App::enter_page_edit_single_view`] の別名)。
     fn set_single_page_view(&mut self, idx: usize) {
-        self.spread_mode = crate::settings::SpreadMode::Single;
-        self.fullscreen_idx = Some(idx);
-        self.fs_zoom = 1.0;
-        self.fs_pan = egui::Vec2::ZERO;
+        self.enter_page_edit_single_view(idx);
     }
 
     /// 見開き消しゴム中に「左ページ」「右ページ」ボタンで編集対象を切り替える。

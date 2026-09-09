@@ -37,6 +37,7 @@ struct Anime4kParams {
     inverse_y: vec2<f32>,
     inverse_offset: vec2<f32>,
     _padding: vec2<f32>,
+    outside_color: vec4<f32>,
 }
 
 @group(0) @binding(0) var input_0: texture_2d<f32>;
@@ -992,7 +993,7 @@ fn fs_anime4k_resolve(@builtin(position) position: vec4<f32>) -> @location(0) ve
     );
     if any(oriented_source_position < vec2<f32>(-0.5))
         || any(oriented_source_position >= oriented_size - vec2<f32>(0.5)) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return params.outside_color;
     }
     let source_position = oriented_source_position.x * params.inverse_x
         + oriented_source_position.y * params.inverse_y

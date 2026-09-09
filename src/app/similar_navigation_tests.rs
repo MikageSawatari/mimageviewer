@@ -136,12 +136,16 @@ fn install_rendition_failed_sequence(
     purpose: FsNavigationPurpose,
 ) {
     let items_generation = app.items_generation;
+    let anchor_idx = *pages
+        .first()
+        .expect("rendition failure target has an anchor");
     install_navigation_sequence_with_purpose(
         app,
         FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation,
-            pages,
-            phase: FsNavigationTargetPhase::RenditionFailed,
+            anchor_idx,
+            accept_rendition: true,
+            phase: FsNavigationTargetPhase::RenditionFailed { pages },
         }),
         purpose,
     );
@@ -200,13 +204,18 @@ fn similar_move_p2_trace_terminals_when_materialized_navigation_fails() {
     );
     let trace_id = trace.id;
     let mut app = setup_app_for_test();
+    app.fullscreen_idx = Some(0);
     let items_generation = app.items_generation;
     install_navigation_sequence_with_purpose(
         &mut app,
         FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation,
-            pages: vec![0],
-            phase: FsNavigationTargetPhase::Ready(FsNavigationPresentation::Failure),
+            anchor_idx: 0,
+            accept_rendition: true,
+            phase: FsNavigationTargetPhase::Ready {
+                pages: vec![0],
+                presentation: FsNavigationPresentation::Failure,
+            },
         }),
         similar_navigation_purpose_with_trace(trace, destination),
     );
@@ -490,10 +499,9 @@ fn book_relation_move_button_reaches_the_exact_physical_target() {
         &mut app,
         FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation: accepted_generation,
-            pages: vec![0],
-            phase: FsNavigationTargetPhase::Awaiting {
-                accept_rendition: true,
-            },
+            anchor_idx: 0,
+            accept_rendition: true,
+            phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
         }),
         FsNavigationPurpose::Ordinary,
     );
@@ -569,7 +577,7 @@ fn book_relation_move_button_reaches_the_exact_physical_target() {
             FsNavigationPurpose::SimilarBookVisit(intent),
             FsNavigationSequenceTarget::Display(target)
         ) if intent.destination.page == SnapshotTarget::Fs(requested)
-            && target.pages.contains(&app.fullscreen_idx.unwrap())
+            && target.pages().contains(&app.fullscreen_idx.unwrap())
     ));
 }
 
@@ -931,9 +939,12 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
         let FsNavigationSequenceTarget::Display(target) = &mut sequence.target else {
             panic!("required target must bind to a display sequence");
         };
-        target.phase =
-            FsNavigationTargetPhase::Presenting(crate::app::FsNavigationPresentation::Rendition);
-        target.pages.clone()
+        let pages = target.pages().to_vec();
+        target.phase = FsNavigationTargetPhase::Presenting {
+            pages: pages.clone(),
+            presentation: crate::app::FsNavigationPresentation::Rendition,
+        };
+        pages
     };
     app.observe_fs_navigation_pages_for_test(&presented_pages);
     assert!(
@@ -1394,6 +1405,58 @@ fn similar_move_p2_direct_fullscreen_open_supersedes_stale_display_trace() {
     app.open_fullscreen_from_fs_navigation(&ctx, 1, HistoryTrigger::UserChosen);
 
     assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_direct_open_of_partner_page_supersedes_anchor_owned_trace() {
+    let ctx = egui::Context::default();
+    let mut app = viewer_with_images(&[
+        PathBuf::from(r"C:\partner\anchor.jpg"),
+        PathBuf::from(r"C:\partner\spread-partner.jpg"),
+    ]);
+    let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\partner\anchor.jpg"));
+    let old_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemCard, Some(&old_target));
+    let old_trace_id = old_trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0, 1],
+        similar_navigation_purpose_with_trace(old_trace, PathBuf::from(r"C:\partner\anchor.jpg")),
+    );
+
+    app.open_fullscreen_from_fs_navigation(&ctx, 1, HistoryTrigger::UserChosen);
+
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
+        vec!["navigation_superseded"]
+    );
+}
+
+#[test]
+fn similar_move_p2_display_target_cancel_boundary_marks_trace_superseded_once() {
+    let mut app = viewer_with_images(&[
+        PathBuf::from(r"C:\cancel-boundary\anchor.jpg"),
+        PathBuf::from(r"C:\cancel-boundary\replacement.jpg"),
+    ]);
+    let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\cancel-boundary\anchor.jpg"));
+    let old_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&old_target));
+    let old_trace_id = old_trace.id;
+    install_rendition_failed_sequence(
+        &mut app,
+        vec![0],
+        similar_navigation_purpose_with_trace(
+            old_trace,
+            PathBuf::from(r"C:\cancel-boundary\anchor.jpg"),
+        ),
+    );
+
+    app.cancel_superseded_fs_navigation_display_target(1);
+
+    assert!(app.fs_holdover_tex.is_none());
     assert_eq!(
         SimilarMoveTrace::terminal_reasons_for_test(old_trace_id),
         vec!["navigation_superseded"]

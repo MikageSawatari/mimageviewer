@@ -546,6 +546,22 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["サイドパネル", "ホバー", "クリック"]
     ),
     entry!(
+        "spread/image-margin-color",
+        SpreadMode,
+        "画像・動画の余白色",
+        [
+            "フルスクリーン",
+            "背景色",
+            "余白",
+            "レターボックス",
+            "サムネイル",
+            "黒",
+            "灰",
+            "白",
+            "RGB"
+        ]
+    ),
+    entry!(
         "spread/boundary-notice",
         SpreadMode,
         "先頭 / 末尾の案内を表示",

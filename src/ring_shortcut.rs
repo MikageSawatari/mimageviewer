@@ -1462,27 +1462,11 @@ impl RingActionId {
 
     /// Whether this action may be selected for a physical Back / Forward / Middle button.
     ///
-    /// This is intentionally separate from [`Self::is_valid_for_mouse_button_context`]. The
-    /// latter is the serialized-data contract used by `MouseButtonProfile::sanitize`; keeping
-    /// the six video seek values valid lets a future version restore the feature without erasing
-    /// an existing user's choice. v3.7 does not offer or execute those choices because some mouse
-    /// drivers deliver one physical press through more than one browser-navigation producer.
+    /// Assignment and execution share the serialized context-validity contract. Video seek is
+    /// exposed for the next-version verification build while producer provenance remains opt-in;
+    /// this policy must not add route-specific filtering or erase an existing user's choice.
     pub fn is_available_for_mouse_button_assignment(&self, context: RingShortcutContext) -> bool {
         self.is_valid_for_mouse_button_context(context)
-            && !(context == RingShortcutContext::VideoFullscreen
-                && self.is_configurable_video_seek_action())
-    }
-
-    pub fn is_configurable_video_seek_action(&self) -> bool {
-        matches!(
-            self,
-            Self::VideoSeekBackSmall
-                | Self::VideoSeekForwardSmall
-                | Self::VideoSeekBackMedium
-                | Self::VideoSeekForwardMedium
-                | Self::VideoSeekBackLarge
-                | Self::VideoSeekForwardLarge
-        )
     }
 
     pub fn is_valid_for_right_drag_context(&self, context: RightDragContext) -> bool {
@@ -3719,7 +3703,7 @@ mod tests {
             RingActionId::VideoSeekBackLarge,
             RingActionId::VideoSeekForwardLarge,
         ] {
-            assert!(!video.contains(&seek));
+            assert!(video.contains(&seek));
             assert!(seek.is_valid_for_context(RingShortcutContext::VideoFullscreen));
             assert!(
                 seek.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen),
@@ -3727,9 +3711,8 @@ mod tests {
                 seek.as_str()
             );
             assert!(
-                !seek
-                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
-                "v3.7 must not offer video seek for a physical mouse button: {}",
+                seek.is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "the next-version build must offer video seek for a physical mouse button: {}",
                 seek.as_str()
             );
             assert!(!seek.is_valid_for_context(RingShortcutContext::Grid));
@@ -3742,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_video_mouse_seek_values_survive_sanitize_and_serde_round_trip() {
+    fn video_mouse_seek_values_survive_sanitize_and_serde_round_trip() {
         for (slot, seek) in [
             (MouseButtonSlot::Back, RingActionId::VideoSeekBackSmall),
             (
@@ -3768,7 +3751,7 @@ mod tests {
                     .mouse_button_profile(RingShortcutContext::VideoFullscreen)
                     .action(slot),
                 seek,
-                "sanitize must preserve deferred value"
+                "sanitize must preserve the configured value"
             );
 
             let json = serde_json::to_string(&settings).unwrap();
@@ -3779,7 +3762,7 @@ mod tests {
                     .mouse_button_profile(RingShortcutContext::VideoFullscreen)
                     .action(slot),
                 seek,
-                "save/reopen must preserve deferred value"
+                "save/reopen must preserve the configured value"
             );
         }
     }

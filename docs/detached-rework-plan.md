@@ -1470,6 +1470,144 @@ ROOT repaint通知を一度注入し、既存scheduler/render経路を利用す�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-10 次版統合: display topology・native seek・別バージョン検索の所有境界統合:**
+
+親Codex、実装Sol、独立Solは、master側で既にレビュー済みのdisplay topology / native mouse seek /
+画像geometry・余白修正と、別バージョン検索側で既にレビュー済みのviewer-owned navigator /
+capture / similar panel修正を、双方のtyped ownerと取消・終端規則を保持したまま統合する方針に合意した。
+これは既存の構造修正同士を同じtarget rebind、navigation sequence、context mount / park / retire、
+image geometry境界へ接続するものであり、detached predicate、viewport生成、placement、focus、時間guardを
+追加する症状パッチではない。display targetはgenerationとstable anchorを持ち、phase-owned canonical pagesを
+rebindする。候補ナビゲータと入力captureはviewport contextに属し、native mouse hold、similar query / worker、
+paint resourceも同じbundleのlifecycleで保持・解放する。画像余白とunderlayは共通の最終paint geometryを使う。
+双方の既存回帰を残し、統合後のshared pathを独立Solレビューと全体gateで確認する。
+native seek stripの次版実機確認はこの統合で完了扱いにせず、既存計画どおり保留する。
+
+**2026-09-09 §1.204: 後着した見開き topology とページ送り target の再 binding:**
+
+3.7.0 実機で、寸法未確定時に `[1, 2]` として受理したページ送り target が、2 ページ目の
+landscape 寸法到着後に canonical `[1]` へ変わっても旧 page set を保持し続けた。renderer は
+`[1]` だけを提示する一方、navigation sequence の exact presentation 条件は `[1, 2]` のため、
+sequence と holdover が解放されず後続入力を block した。loader / UI thread の停止ではなく、
+target identity と動的 display-unit topology の所有境界不一致だった。
+
+親Astra・実装Sol・独立Solは、`Display` target が同一 viewer context / items generation 内の安定した
+anchor と元の rendition 許可方針を所有し、phase が現在検証中または検証済みの canonical page set を
+所有する構造に合意した。寸法・回転・見開き設定で unit が変われば Ready / Presenting /
+RenditionFailed を含む全 phase から Awaiting へ戻して全ページを再検証し、旧表示 unit と開始時刻は
+保持する。async 完了を取り込んだ後に解決した同じ SpreadPair を binding、readiness、holdover、
+paint、exact Live presentation まで共有する。同一 frame の decision cache も rebound state へ更新する。
+timeout、強制 unlock、page set の部分一致、追加 pending flag は導入しない。navigation sequence と
+spread/page-dims cache は既存どおり mounted bundle に属し、generation/anchor 不一致と兄弟 context は
+変更しない。連結読みは従来どおりページ送り Display sequence を作らず、folder bind は着地時の
+current page を安定 anchor として同じ構造へ移す。
+同一 bundle の common open、ページ編集 pivot、連結読み seek / scroll reanchor が別 anchor へ
+retarget するときは、旧 Display intent と lock / holdover を代入前に破棄する。items generation の変更も
+旧 index identity の Display intent だけを generation owner で解放し、folder install を跨ぐ FolderItems は
+bind のため保持する。一方、detached の context activation は fullscreen index / generation / sequence /
+holdover を同じ bundle として swap する ownership 移動なので、この cancellation を跨いで別 context の
+intent を破棄しない。
+
+**2026-09-09 §1.203: 静止画・本の画像余白色と透明下地 geometry:**
+
+次版の画像余白色は `Settings::fullscreen_image_margin_color: [u8; 3]` を global な唯一の
+永続所有者とし、static passive の deferred view へ現在値を毎フレーム投影する。画像内の
+透明下地は黒 / 白 / 市松へ必ず不透明に解決し、paused single / spread / continuous の
+snapshot ごとに一度だけ capture する。
+
+描画では `DisplayedImageTransform` が実画像に使う最終四辺形を共通 helper から取得し、
+solid / checker / image を同じ clip と頂点で描く。市松の UV は page-local の幅・高さを
+16 px で割った repeat 範囲を使うため、任意角度回転でも画像と一緒に回る。keepalive
+backstop の live still は ad hoc contain painter を廃止し、paged は既存の typed display-unit、
+continuous は通常の visible-pages painter へ接続する。これにより rotation / trim / spread /
+continuous の geometry 所有者を通常描画と共通化する。
+
+paged の見開きは両側を capture できた場合に typed display-unit を使い、片側が未準備かつ
+navigation holdover が無い場合だけ typed `CurrentSpread { left, right }` から canonical spread
+painter へ接続する。読み込み済み側を centered single として描く別 geometry は作らない。
+passive frozen single の direct texture も source-region mesh へ統一し、保存済み回転 + trim で
+透明下地と画像の quad / clip / trim UV を一致させる。general keepalive / embedded deferred は
+typed static unit がある場合だけ current margin を使い、unit の無い media transition は黒にする。
+静止画 viewport 入場は専用 setter / predicate が static canvas owner を保証するため current margin を
+維持する。
+
+既存の detached predicate、viewport ID / recreate、runtime / host、placement / focus、window
+lifecycle は変更しない。親 Codex と独立レビューは、表示 payload と paint geometry の重複を
+正本へ接続する構造修正であり、§2 が禁じる症状パッチではないと実装前に合意した。詳細と
+受け入れ条件は [画像余白色の実装計画](next-version-background-color-plan.md) に記録する。
+
+**2026-09-09 §1.203 追加仕様: native 動画余白と静止画 seek strip 空欄:**
+
+利用者の実機確認後、同じ `Settings::fullscreen_image_margin_color` を native 動画の letterbox / source 外
+画素と、静止画 seek strip のセル外空欄へ広げた。動画は `NativeVideoOutputConfig` の birth snapshot と
+独立した coalesced command で各 mounted / active detached / ParkedLive player へ現在値を投影し、
+DComp root 最下層 canvas と Resample / NIS / Anime4K の source 外定数だけを更新する。純音声と動画の
+音声モードは黒を渡し、動画画素、素材内の黒帯、字幕、HUD / 左右パネル、panorama 無効画素は変更しない。
+静止画側は共通 strip painter の `strip_content` を先に不透明 RGB で塗り、cell の暗色を維持する。
+追加の実機確認に基づき、`strip_content` は layout / request / paint の全幅正本とし、列固定ボタンと、通常バーを
+隠したときの表示切替ボタンをセル上の overlay にした。body input は control 起点を除外し、body 起点 drag は
+release まで継続する。main / active detached は同じ painter / gesture owner を使い、predicate や viewport lifecycle は
+変更しない。利用者の実機比較後、native seek strip は場面サムネイル / 波形の両表示とも canvas RGB から
+切り離し、v3.5.0 の暗色 body、セル backing / border、notice、range / marker 配色へ戻した。波形は不透明な暗色
+raster、白 texture tint、曲外 shade も維持する。range 文字は同じ fitted galley の影と前景へ別の override 色を
+与え、同色で 1 pt ずれて二重に見える描画を解消する。`NativeEguiOverlay` は canvas RGB snapshot を持たず、
+RGB は worker / cache key へ入らないため、余白色変更で overlay redraw や再解析を起こさない。この補正は既存
+`SeekStripCenter` から描画方針を導出し、新しい state owner を追加しない。
+
+App は既存 `poll_video` の context mount 境界から値を投影し、同色 command は output-local atomic で
+除外する。visible held frame は既存 visual-change 再 present、hidden は既存 show 再 present を使い、
+新しい pending field を追加しない。detached predicate、viewport ID / recreate、runtime / host ownership、
+placement / focus、window lifecycle は変更しない。親 Codex と独立レビューは、全 window の current
+player と既存 native canvas / shader owner へ同じ設定 snapshot を届ける構造的な表示 payload 拡張であり、
+§2 が禁じる症状パッチではないと実装前に合意した。native seek strip 両表示の固定暗色復旧と range 文字の
+色適用修正も predicate / viewport / runtime / host / placement / focus / lifecycle を変えない共通 paint policy として、
+親 Codex と独立 reviewer が構造的に合意した。
+
+**2026-09-09 §4.2: 標準 raw XButton の context-owned seek hold:**
+
+fresh provenance trace で、AHK 有効時は scan 付き browser key DOWN / UP と direct AppCommand が
+別 receipt として各1回配送される一方、AHK無効時の標準機器は Extra1 / Extra2 の raw DOWN / UP /
+DBLCLKだけを一意に配送すると確定した。標準routeの欠落は重複除去ではなく、release付きraw holdを
+反復へ展開するownerが無いことだった。
+
+親Codex・実装Sol・独立Solは、2 slotのtyped holdを`ViewerContextBundle`へ置き、通常frame間のAtRest
+depositでは保持し、同じcontextをmountした次frameにViewerContextId / fs_idx / source epoch / committed
+generation / presenterまたはHUD HWND / press時割当を再検証する構造に合意した。context retire、別session
+へのtransfer / ParkedLive、native output close、source swap、placement replace、fullscreen item change、
+remote / audio / VSTへの所有交代だけをterminal clearにする。native event batch後のtickは1 button / frame
+最大1回で、Windows keyboard cadenceをarm時にだけsampleし、期限超過分をburstしない。
+
+Extra1 / Extra2の通常UPとcapture / cancel / destroy由来synthetic UPは、DOWN後にoverlay ownershipが
+変わっても既存generation-stamped lossless routeからAppへ届く。presenter / HUDはreported buttonと
+capture-owned buttonを分離し、複数buttonの最後のcapture-owned releaseだけがReleaseCaptureする。
+App-global state、別thread / side channel、時間debounce、scan 0 / AppCommand破棄、detached predicate、
+viewport ID / recreate、runtime / host / placement / focus lifecycleは変更しない。AHK / browser-key /
+direct AppCommandの未解決producer契約は別stageへ残す。これはmain / F12共通bundleとWin32 HWNDの
+既存owner境界を型で結ぶ構造修正であり、§2が禁じる症状patchではないと実装前に合意した。
+
+最初の確認用 build は自動回帰を通過したが、実機では初期 presenter event generation 1 に対して
+`committed_generation` が placement commit 前の stale floor 0であり、完全一致判定が全hold armを棄却した。
+fixtureもfloor accessorをevent identityへ流用してgeneration 0を作り、この境界を隠していた。修正は既存
+`native_video_close_generation_is_current` と同じ `owner_generation >= committed_generation` をhold検証へ
+再利用し、現在のPresenter / HUD HWND、context / fs_idx / source epoch、visibility / routing / assignmentの
+厳密照合を維持する。新state、predicate、viewport / registry / recreate、runtime / host / placement / focus / lifecycle
+変更を追加せず、初期1/0、同値1/1、stale1/2をproduction handler回帰で固定するため、元の§2合意範囲内である。
+
+**2026-09-09 §1.206: 動画 V の複数入力入口を共通 display-mode consumer へ統一:**
+
+native presenter HWND / native overlay と、in-window・起動直後 / close 後の focus handoff・main root が受ける
+egui fullscreen fallback は、いずれも正規の動画キー入口である。従来は native 側だけが `FsPanorama` を
+360 動画の panorama / 通常動画の zoom へ選択し、generic 側は後段の静止画 panorama 条件だけを評価したため、
+同じ動画でもキー owner が egui の frame では V が no-op になった。
+
+`App::toggle_native_video_display_mode_for_input` を selection + apply の唯一の consumer とし、current
+`fullscreen_idx`、Video item、既存 `native_video_view_input_available` を確認した後だけ panorama / zoom を選ぶ。
+native key / overlay と generic `handle_video_input` をそこへ合流し、generic は no-repeat consume 後に return
+して同じ pass の静止画 handler へ二重配送しない。音声モード、同項目の VST、sibling context は no-op、
+still の V / Shift+V と既存 keymap は維持する。新しい App state / predicate / pending、viewport ID / recreate、
+runtime / host ownership、placement / focus / HWND routing、window lifecycle は変更しない。親 Codex と独立
+レビューは、正規入口間で分裂していた意味処理を既存 owner gate の内側へ集約する根本修正であり、
+§2 が禁じる focus guard や症状 fallback ではないと実装前に合意した。
 **2026-09-08 別バージョン検索レビューR4/R8: 一時候補表示のviewer所有と描画identity
 （実装前の構造合意。実装・検証は[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡）:**
 
@@ -3199,6 +3337,8 @@ foreground ownership を扱う際の観測として残す。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
+| 2026-09-09 | fresh traceで標準raw XButtonをAHK変換経路から分離し、Extra1 / Extra2の6種seekだけにcontext-owned長押し反復を追加 | `src/video/native_window.rs` / `hud_window.rs`のtyped HWND owner・reported/capture-owned button・lossless UP terminal、`src/video/mod.rs`のoverlay後UP転送、`src/app/native_video.rs` / `gamepad_input.rs`のtyped dispatch・2-slot hold・event後tick、`src/app.rs` / `viewer_context_registry.rs`の既存bundle投影とsemantic terminal。detached predicate、viewport ID / registry / recreate、runtime / host ownership、placement / focus routing、window lifecycleは変更なし | 利用者のAHK無効実測でraw DOWN / UPが各receipt1回、holdも1組と確定。親と独立reviewerは、通常AtRestを同contextの保存形として継続し、retire / transfer / ParkedLive / close / source・placement・item交代をterminalにするtyped state ownerへ合意した。初回実行済み6 seekだけarmし、Windows cadence・1 frame 1回・no catch-up、複数button、capture失敗 / cleanup / overlay変化後UPをowner-level testsで固定する。App-global fallback、time debounce、scan0 / direct AppCommand discardを追加せず、AHK経路を別課題に保つため§2適合 |
+| 2026-09-09 | 利用者の明示指示により、根因未確定を表示した検証用 build で動画の物理 Back / Forward / Middle ボタンへ小・中・大シーク 6 候補を再公開 | `src/ring_shortcut.rs` の既存 context-validity / availability policy、`src/app/gamepad_input.rs` の共有 `apply_mouse_button`、操作カスタマイズ UI と回帰テスト、入力計画・仕様・manual。native producer、receipt、WndProc、counter、repeat/release、focus、epoch/generation、detached predicate、viewport ID / registry / recreate、runtime / host ownership、placement、window lifecycle は変更なし | v3.7.0 の抑止は保存 schema ではなく候補 / 実行 policy だけで、利用者が未解決を承知した実機検証のため再公開を明示指示した。親と独立 reviewer は action-first / slot-first UI と共有 resolver を同じ正本から戻す限定 rollback に合意。時間 debounce、scan 0 一律破棄、hold/release 推測を追加せず、typed provenance trace が未取得で根因修正を表明しないため detached 症状 guard や lifecycle 変更ではない。main / F12 は既存の同一 App/context resolver を通る |
 | 2026-08-30 | detached 静止画スナップショットの**貼り先と倍率**を、layout が対で返す 1 つの答えから取る (backlog §1.0e の最後の未達経路)。UV を取るためだけの transform は `Proportional` を宣言して二重の寄せをやめる | [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の `fs_image_draw_rect_for_size` → `fs_image_draw_geometry_for_size` (矩形単体 → `(rect, scale)`) と `detached_single_image_snapshot_layout` の戻り値、[src/app.rs](../src/app.rs) の `build_active_snapshot` から自前 `min()` の削除と UV 用 transform の `pixel_fit`、[src/gpu_lanczos.rs](../src/gpu_lanczos.rs) の回帰テスト。detached 述語、viewport ID / 登録 / recreate、runtime / host ownership、placement、focus routing、window lifecycle は変更なし | ClaudeCode が数値で再現 (子が貼る 1440 物理 px に対しリサンプラ出力 1439、`[1249,2272]` では 1438。DPI 125% / 150% でも同型)。原因は `resolve()` が丸め**前**の情報から決めた `total_scale` を捨て、丸め**後**の矩形から `min()` で逆算していたこと。Codex も source inspection で「情報を一度捨ててから復元しようとしているのが根因」と一致し、双方が構造的修正と合意 (R4 待ちは不要 — R4 は viewport / 描画入口の統合であって paint geometry 契約の前提ではない)。新規 App bool / Option、時間窓、retry は無し。旧実装と同じ再導出を戻すと落ちる回帰テストを追加し、**丸めてから比較しない** (0.44px のずれでも GPU はバイリニアを掛けるため)。Codex が指摘した Z モードの `Texels → Texels` 二重 resolve は別種 (貼り先と倍率が同じ transform 由来なので今回のボケではない) なので、backlog §1.0h として分離 |
 | 2026-08-28 | F11 borderless と対になる restore placement の所有範囲を OS host instance から、同じ viewer content の detached presentation intent へ訂正し、F12 host migration で保持 | `src/app.rs` の borderless/restore write 境界と F12 toggle、`src/app/tests.rs` の通常・always-new media round-trip / builder / F11-off / write-path audit、backlog §1.139。builder、viewport ID / host registry、runtime placement、focus / activation、1.139 instrumentation は変更なし。新しい App state、guard、timeout、retry なし | Codex の修正前 unit 再現で、F12 OFF の `toggle_detached_viewer_mode_disabled` が `true/Some(...)` を `false/None` にし、`f12_to_non_detached` が重ねて clear する probe output を確認した。F12 は host runtime を terminal remove する一方、同じ viewer presentation intent を main に移送して再び detached へ戻す操作なので、host の寿命を intent の寿命にしていた所有境界が原因。真の viewer close、F11 OFF、genuinely new stable window の reset、別 passive window の adopt は intent の終了または owner 交代なので clear を維持した。症状を見て復元する guard ではなく、対の唯一の write path と terminal authority を正し、再生成 builder と F11-off consumer まで unit test で固定する構造的修正として §2 に適合すると Codex と ClaudeCode が合意 (ClaudeCode は F12 clear の復元 2 系統と builder の borderless 無効化の計 3 変異を独立に実行し、いずれも対応するテストが拒否することを確認) |
 | 2026-08-27 | ParkedLive の HUD クリック分類器 `native_video_output_event_is_parked_live_hud_click_activation` から catch-all `_ => true` を撤去し、`NativeVideoOutputEvent` 77 variant すべてを網羅 match で分類した = backlog §1.132 (ClaudeCode / Codex 双方が構造的修正と合意) | [src/app/native_video.rs](../src/app/native_video.rs) の当該述語のみ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、placement / focus、window lifecycle、activation 要求の生成・消費経路は変更なし。App state の追加なし、時間窓・guard・retry・repaint の追加なし | 実機ログ (`MIV_DETACHED_WINDOW_DEBUG=1`) で、描画経路が layout 変化のたびに出す `RequestSeekStripWindow` が「利用者の HUD クリック」と分類され、利用者が活性化した別窓を 13ms で降ろしていたことを確定。原因は個別イベントの登録漏れではなく **「未分類のイベント = 利用者のクリック」という open-world の既定**であり、シークストリップが 10 個足して 3 個しか分類されなかったのはその帰結。網羅 match 化は新 variant の分類をコンパイラに強制し、誤分類の発生境界そのものを閉じるため症状パッチではない。Codex は方針に同意したうえで一次分類案に 5 件の反例を出し (`TouchChromeLearned` は利用者タップ由来 / `CloseSeekStrip` は cause 依存で `HudHidden` は描画由来 / `SetVst3PanelPos` は自動 clamp でも発火 / `SetVst3PanelVisible` は producer 不在 / `TileColumnsDelta` は入力源が 2 つ)、ClaudeCode が全件を emit 元で裏取りして反映した。`CloseSeekStrip` は既存の `SeekStripCloseCause::is_user_dismissal()` を使うだけで payload 変更を伴わない。`TileColumnsDelta` の provenance 分離と、活性化要求の**寿命・順序**問題 (消費側が「まだ望まれている要求か」を問うていない) は §2 規則 7 に従いスコープ外とし、backlog §1.132 に残した |

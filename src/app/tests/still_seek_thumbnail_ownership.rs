@@ -52,6 +52,7 @@ fn cached_all_items_are_images(app: &mut App) -> bool {
 }
 
 fn navigation_sequence(items_generation: u64, pages: Vec<usize>) -> FsHoldover {
+    let anchor_idx = *pages.first().expect("test target has an anchor");
     FsHoldover::NavigationSequence(FsNavigationSequence {
         previous: None,
         chrome: FsNavigationChromeContinuation::None,
@@ -59,10 +60,9 @@ fn navigation_sequence(items_generation: u64, pages: Vec<usize>) -> FsHoldover {
         opened_at: std::time::Instant::now(),
         target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation,
-            pages,
-            phase: FsNavigationTargetPhase::Awaiting {
-                accept_rendition: true,
-            },
+            anchor_idx,
+            accept_rendition: true,
+            phase: FsNavigationTargetPhase::Awaiting { pages },
         }),
     })
 }

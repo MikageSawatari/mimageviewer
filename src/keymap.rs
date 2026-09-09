@@ -12467,6 +12467,7 @@ mod tests {
         let _guard = native_video_shortcut_test_guard();
         Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0xBF,
             scan_code: 0,
             extended: false,
@@ -12495,6 +12496,7 @@ mod tests {
         keymap.install_global_native_video_shortcuts();
 
         let shift_slash = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key: 0xBF,
             scan_code: 0,
             extended: false,
@@ -12506,6 +12508,7 @@ mod tests {
         assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
 
         let f1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(3),
             virtual_key: 0x70,
             scan_code: 0,
             extended: false,
@@ -12532,6 +12535,7 @@ mod tests {
     fn native_video_window_mode_shortcut_follows_keymap() {
         let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12570,6 +12574,7 @@ mod tests {
     fn native_video_side_panel_shortcut_follows_effective_chords() {
         let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12593,6 +12598,7 @@ mod tests {
     fn native_video_fs_common_shortcuts_follow_keymap() {
         let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12602,6 +12608,7 @@ mod tests {
             repeat: false,
         };
         let alt_event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12649,6 +12656,7 @@ mod tests {
     fn native_video_close_fullscreen_shortcut_follows_keymap() {
         let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12681,6 +12689,7 @@ mod tests {
             "#,
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x51,
             scan_code: 0,
             extended: false,
@@ -12702,6 +12711,7 @@ mod tests {
             "#,
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x7F,
             scan_code: 0,
             extended: false,
@@ -12724,6 +12734,7 @@ mod tests {
             "#,
         );
         let numpad1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x61,
             scan_code: 0x4f,
             extended: false,
@@ -12733,6 +12744,7 @@ mod tests {
             repeat: false,
         };
         let digit1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key: 0x31,
             scan_code: 0x02,
             extended: false,
@@ -12742,6 +12754,7 @@ mod tests {
             repeat: false,
         };
         let jis_at = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(3),
             virtual_key: 0xC0,
             scan_code: KeyName::JIS_AT_SCAN,
             extended: false,

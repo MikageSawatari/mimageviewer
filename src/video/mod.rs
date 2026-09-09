@@ -88,7 +88,7 @@ pub mod zoom_view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
@@ -536,6 +536,9 @@ pub struct NativeVideoOutputConfig {
     ///   tick に十分な間隔にして無駄なスピンを避ける。
     /// `false` のとき従来の動画経路と**バイト等価**。
     pub audio_only: bool,
+    /// Opaque sRGB-byte color for the video canvas outside decoded pixels.
+    /// Audio-only presenters always receive black from the App boundary.
+    pub video_canvas_color: [u8; 3],
     /// presenter が最初のフレームを出す前から使う上下バー固定状態。
     /// これを渡さないと presenter は「固定なし」で生まれ、App の次フレームの
     /// `sync_native_video_metadata` が届くまで全域に描いてから縮む。
@@ -1125,6 +1128,9 @@ enum NativeVideoOutputCommand {
     SetVideoZoomState {
         state: Option<crate::video::zoom_view::VideoZoomState>,
     },
+    SetVideoCanvasColor {
+        color: [u8; 3],
+    },
     StartAnime4kMeasurement,
     SetAnime4kState {
         budget: anime4k_policy::VideoAnime4kBudgetPreset,
@@ -1600,7 +1606,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 33;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 34;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1638,6 +1644,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
         NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::SetVideoZoomState { .. } => Some(32),
+        NativeVideoOutputCommand::SetVideoCanvasColor { .. } => Some(33),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2059,6 +2066,16 @@ impl PresenterSourceState {
 }
 
 #[cfg(windows)]
+fn pack_native_video_canvas_color(color: [u8; 3]) -> u32 {
+    u32::from(color[0]) | (u32::from(color[1]) << 8) | (u32::from(color[2]) << 16)
+}
+
+#[cfg(all(windows, test))]
+fn unpack_native_video_canvas_color(packed: u32) -> [u8; 3] {
+    [packed as u8, (packed >> 8) as u8, (packed >> 16) as u8]
+}
+
+#[cfg(windows)]
 pub(crate) struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
@@ -2094,6 +2111,7 @@ pub(crate) struct NativeVideoOutput {
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
+    last_video_canvas_color: AtomicU32,
     visibility_gate: Arc<NativeVideoOutputVisibilityGate>,
     command_tx: NativeCommandSender,
     event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
@@ -2187,6 +2205,7 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
+            last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color([0, 0, 0])),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -2233,6 +2252,7 @@ impl NativeVideoOutput {
         let initial_checked = config.checked;
         let initial_text_contrast_strong =
             matches!(config.text_contrast, crate::settings::TextContrast::Strong);
+        let initial_video_canvas_color = config.video_canvas_color;
         let channel_fault = Arc::new(AtomicBool::new(false));
         let health = native_window_health::NativeWindowHealth::new_registered();
         let (event_tx, event_rx) =
@@ -2346,6 +2366,9 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
+            last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color(
+                initial_video_canvas_color,
+            )),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -2473,6 +2496,27 @@ impl NativeVideoOutput {
             .command_tx
             .send(NativeVideoOutputCommand::SetVideoZoomState { state });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    fn set_video_canvas_color(&self, color: [u8; 3]) {
+        let packed = pack_native_video_canvas_color(color);
+        if self.last_video_canvas_color.load(Ordering::Acquire) == packed {
+            return;
+        }
+        if self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoCanvasColor { color })
+            .is_ok()
+        {
+            self.last_video_canvas_color
+                .store(packed, Ordering::Release);
+            crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(test)]
+    fn video_canvas_color_for_test(&self) -> [u8; 3] {
+        unpack_native_video_canvas_color(self.last_video_canvas_color.load(Ordering::Acquire))
     }
 
     fn start_anime4k_measurement(&self) {
@@ -4003,6 +4047,14 @@ fn publish_native_overlay_input_routing(
 }
 
 #[cfg(windows)]
+fn native_window_event_should_forward_to_app(
+    event: &native_window::NativeVideoWindowEvent,
+    overlay_forwards: bool,
+) -> bool {
+    overlay_forwards || native_window::native_video_mouse_seek_hold_terminal(event)
+}
+
+#[cfg(windows)]
 fn send_native_overlay_command(
     tx: &NativeOutputEventSender,
     source_epoch: u64,
@@ -4453,6 +4505,7 @@ fn run_native_video_output(
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
                 bar_lock: config.bar_lock,
+                video_canvas_color: config.video_canvas_color,
                 scale_filter: config.scale_filter,
                 downscale_smoothing_percent: config.downscale_smoothing_percent,
                 anime4k_variant: config.anime4k_variant,
@@ -4511,6 +4564,7 @@ fn run_native_video_output(
         crate::panorama::PanoUvTransform,
     )> = None;
     let mut cur_video_zoom_state: Option<zoom_view::VideoZoomState> = None;
+    let mut cur_video_canvas_color = config.video_canvas_color;
     let mut cur_scale_filter = config.scale_filter;
     // presenter を作り直す経路 (F12 の placement 切替) でも固定状態を持ち越す。
     // open 時の config 値のまま作ると、切替のたびに固定なしの 1 枚が出る。
@@ -4651,8 +4705,8 @@ fn run_native_video_output(
     let mut startup_probe_count = 0_u32;
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
-    #[cfg(feature = "test-script")]
     let mut native_event_envelopes = Vec::new();
+    let mouse_seek_trace_enabled = crate::mouse_seek_debug::is_enabled();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     let mut pending_navigation_preview_clear_at: Option<Instant> = None;
     const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
@@ -5055,6 +5109,38 @@ fn run_native_video_output(
                         }
                         Err(error) => crate::logger::log(format!(
                             "[native-video] zoom state update failed: {error}"
+                        )),
+                    }
+                }
+                NativeVideoOutputCommand::SetVideoCanvasColor { color } => {
+                    match presenter.set_video_canvas_color(color) {
+                        Ok(changed) => {
+                            if changed {
+                                cur_video_canvas_color = color;
+                            }
+                            if frame_output.should_represent_for_visual_change(changed) {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] canvas color refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "[native-video] canvas color update failed: {error}"
                         )),
                     }
                 }
@@ -5704,6 +5790,7 @@ fn run_native_video_output(
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
                                 bar_lock: cur_bar_lock,
+                                video_canvas_color: cur_video_canvas_color,
                                 scale_filter: cur_scale_filter,
                                 downscale_smoothing_percent: cur_downscale_smoothing_percent,
                                 anime4k_variant: cur_anime4k_variant,
@@ -6000,33 +6087,33 @@ fn run_native_video_output(
             presenter.ui_smoke_canvas_geometry(),
         )?;
         native_events.clear();
-        #[cfg(feature = "test-script")]
-        {
-            native_event_envelopes.clear();
-            for envelope in window_pump.drain_window_events() {
-                if window_event_belongs_to_generation(&envelope, cur_generation) {
+        native_event_envelopes.clear();
+        for envelope in window_pump.drain_window_events() {
+            let accepted = window_event_belongs_to_generation(&envelope, cur_generation);
+            crate::mouse_seek_debug::log_render_gate(&envelope, cur_generation, accepted);
+            if accepted {
+                #[cfg(feature = "test-script")]
+                {
+                    native_events.push(envelope.event.clone());
                     native_event_envelopes.push(envelope);
-                } else if let Some(metadata) = envelope.smoke_metadata {
+                }
+                #[cfg(not(feature = "test-script"))]
+                if mouse_seek_trace_enabled {
+                    native_events.push(envelope.event.clone());
+                    native_event_envelopes.push(envelope);
+                } else {
+                    native_events.push(envelope.event);
+                }
+            } else {
+                #[cfg(feature = "test-script")]
+                if let Some(metadata) = envelope.smoke_metadata {
                     native_ui_smoke::record_render_failure(
                         metadata,
                         "native mouse event was stale at the render generation gate",
                     );
                 }
             }
-            native_events.extend(
-                native_event_envelopes
-                    .iter()
-                    .map(|envelope| envelope.event.clone()),
-            );
         }
-        #[cfg(not(feature = "test-script"))]
-        native_events.extend(
-            window_pump
-                .drain_window_events()
-                .into_iter()
-                .filter(|envelope| window_event_belongs_to_generation(envelope, cur_generation))
-                .map(|envelope| envelope.event),
-        );
 
         let now = Instant::now();
         for event in &native_events {
@@ -6873,10 +6960,20 @@ fn run_native_video_output(
                 overlay_routing,
             );
             for (event_index, event) in native_events.iter().enumerate() {
-                let should_forward = overlay_outcome.as_ref().map_or_else(
+                let overlay_forwards = overlay_outcome.as_ref().map_or_else(
                     || overlay_routing.should_forward_to_ui(event),
                     |outcome| outcome.should_forward_to_ui(event_index, event),
                 );
+                // A raw XButton release terminates an App-owned hold. Once its window
+                // generation/epoch passed the render gate it must survive a later overlay
+                // ownership change; an unmatched release is inert in App.
+                let should_forward =
+                    native_window_event_should_forward_to_app(event, overlay_forwards);
+                if mouse_seek_trace_enabled
+                    && let Some(envelope) = native_event_envelopes.get(event_index)
+                {
+                    crate::mouse_seek_debug::log_render_disposition(envelope, should_forward);
+                }
                 if should_forward {
                     send_native_output_event(
                         &ui_event_tx,
@@ -6918,11 +7015,15 @@ fn run_native_video_output(
                                 presenter_hwnd: cur_presenter_hwnd,
                                 geometry,
                                 geometry_version,
-                                raw_forwarded: overlay_outcome.as_ref().map_or_else(
-                                    || overlay_routing.should_forward_to_ui(&envelope.event),
-                                    |outcome| {
-                                        outcome.should_forward_to_ui(event_index, &envelope.event)
-                                    },
+                                raw_forwarded: native_window_event_should_forward_to_app(
+                                    &envelope.event,
+                                    overlay_outcome.as_ref().map_or_else(
+                                        || overlay_routing.should_forward_to_ui(&envelope.event),
+                                        |outcome| {
+                                            outcome
+                                                .should_forward_to_ui(event_index, &envelope.event)
+                                        },
+                                    ),
                                 ),
                                 command_count: ui_smoke_command_count,
                                 source: envelope.source,
@@ -7982,6 +8083,11 @@ impl VideoPlayer {
         self.clock.set_playing(false);
         self.clock.set_paused_position(position_secs);
         self.clock.set_playing(was_playing);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn user_seek_base_secs_for_test(&self) -> f64 {
+        self.user_seek_base_secs()
     }
 
     #[cfg(test)]
@@ -9856,6 +9962,20 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_video_canvas_color(&self, color: [u8; 3]) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_canvas_color(color);
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn native_video_canvas_color_for_test(&self) -> Option<[u8; 3]> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::video_canvas_color_for_test)
+    }
+
+    #[cfg(windows)]
     pub fn start_native_anime4k_measurement(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.start_anime4k_measurement();
@@ -11219,6 +11339,7 @@ mod tests {
             generation,
             source: NativeVideoWindowSource::Presenter,
             event: NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
                 virtual_key: 0x7B,
                 scan_code: 0x58,
                 extended: false,
@@ -11243,6 +11364,53 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_xbutton_release_reaches_app_after_overlay_ownership_changes() {
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseInputOwner,
+            NativeVideoWindowEvent, NativeVideoWindowSource,
+        };
+
+        let event = |button, down| {
+            NativeVideoWindowEvent::MouseButton(NativeVideoMouseButtonEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(81),
+                owner: NativeVideoMouseInputOwner {
+                    window_source: NativeVideoWindowSource::Presenter,
+                    receiver_hwnd: 0x1234,
+                    window_generation: 7,
+                },
+                button,
+                down,
+                double_click: false,
+                x: 0,
+                y: 0,
+                shift: false,
+                ctrl: false,
+            })
+        };
+        let extra_down = event(NativeVideoMouseButton::Extra1, true);
+        let extra_up = event(NativeVideoMouseButton::Extra1, false);
+        let left_up = event(NativeVideoMouseButton::Left, false);
+
+        assert!(!super::native_window_event_should_forward_to_app(
+            &extra_down,
+            false
+        ));
+        assert!(super::native_window_event_should_forward_to_app(
+            &extra_up, false
+        ));
+        assert!(!super::native_window_event_should_forward_to_app(
+            &left_up, false
+        ));
+        assert!(
+            super::native_output_event_latest_slot(&super::NativeVideoOutputEvent::Window(
+                extra_up
+            ))
+            .is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -11966,6 +12134,39 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn native_video_canvas_color_transport_preserves_asymmetric_rgb_and_deduplicates() {
+        let color = [17, 34, 201];
+        let packed = super::pack_native_video_canvas_color(color);
+        assert_eq!(super::unpack_native_video_canvas_color(packed), color);
+
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
+        tx.send(super::NativeVideoOutputCommand::SetVideoCanvasColor { color: [1, 2, 3] })
+            .unwrap();
+        tx.send(super::NativeVideoOutputCommand::SetVideoCanvasColor { color })
+            .unwrap();
+        let commands = rx.drain();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            super::NativeVideoOutputCommand::SetVideoCanvasColor { color: actual } if actual == color
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disconnected_native_output_tracks_the_latest_canvas_color_without_gpu_work() {
+        let output = super::NativeVideoOutput::disconnected_for_test();
+        assert_eq!(output.video_canvas_color_for_test(), [0, 0, 0]);
+        output.set_video_canvas_color([17, 34, 201]);
+        assert_eq!(output.video_canvas_color_for_test(), [17, 34, 201]);
+        output.set_video_canvas_color([17, 34, 201]);
+        assert_eq!(output.video_canvas_color_for_test(), [17, 34, 201]);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn native_command_bus_coalesces_hud_state_and_keeps_actions_lossless() {
         let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
@@ -12043,6 +12244,7 @@ mod tests {
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::KeyDown(
                     crate::video::native_window::NativeVideoKeyEvent {
+                        receipt: crate::mouse_seek_debug::test_receipt(1),
                         virtual_key: 0x41,
                         scan_code: 0,
                         extended: false,

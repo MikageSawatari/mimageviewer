@@ -1564,6 +1564,7 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
         free_rotation: 0.0,
         image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         image_content_bbox: None,
+        image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
         frozen_continuous_pages: Vec::new(),
         reopen_descriptor: None,
         reopen_sync_stamp: None,
@@ -1572,6 +1573,32 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
         focused_last_frame: false,
         initial_placement_applied: true,
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn deferred_static_view_projects_current_margin_without_changing_captured_underlay() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let mut snapshot = contextless_test_window(&ctx, 88);
+    snapshot.image_underlay = DetachedImageWindowUnderlay::Solid(egui::Color32::WHITE);
+    let placement = app.detached_viewer_window_placement();
+
+    app.settings.fullscreen_image_margin_color = [17, 34, 51];
+    let first = app.deferred_detached_image_window_view(&snapshot, placement, false);
+    assert_eq!(first.margin_color, egui::Color32::from_rgb(17, 34, 51));
+    assert!(matches!(
+        first.image_underlay,
+        DetachedImageWindowUnderlay::Solid(egui::Color32::WHITE)
+    ));
+
+    app.settings.fullscreen_image_margin_color = [90, 80, 70];
+    let second = app.deferred_detached_image_window_view(&snapshot, placement, false);
+    assert_eq!(second.margin_color, egui::Color32::from_rgb(90, 80, 70));
+    assert!(matches!(
+        second.image_underlay,
+        DetachedImageWindowUnderlay::Solid(egui::Color32::WHITE)
+    ));
 }
 
 #[cfg(windows)]
@@ -30496,6 +30523,19 @@ mod favorite_adjustment_defaults_tests {
             pair: (0, 1),
         });
         app.erase_mode = true;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
+            }),
+        }));
         // erase_base_cache に dummy ピクセルを入れる必要は無い: マスクが空なので
         // apply_inpaint_only は composite_mask の段階で false を返し、
         // base_cache 参照は走らない。
@@ -30518,6 +30558,50 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(ctx.pair, (0, 1));
         assert!(app.erase_mode, "erase_mode は維持される (= 編集継続)");
         assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
+        assert!(
+            app.fs_holdover_tex.is_none() && app.fs_nav_locked_gen.is_none(),
+            "消しゴムの直接ページ切替は旧 navigation intent を破棄する"
+        );
+    }
+
+    #[test]
+    fn switch_conceal_target_in_spread_disposes_superseded_navigation_intent() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single;
+        app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
+            }),
+        }));
+
+        app.switch_conceal_target_in_spread(1);
+
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert!(app.conceal_spread_ctx.is_some());
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
     }
 
     /// 消しゴム入場時は、過去に auto-apply / F7/F8 経由で入った
@@ -36265,9 +36349,10 @@ mod pipeline_cache_refactor_tests {
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
-                pages: vec![target_idx],
+                anchor_idx: target_idx,
+                accept_rendition: true,
                 phase: FsNavigationTargetPhase::Awaiting {
-                    accept_rendition: true,
+                    pages: vec![target_idx],
                 },
             }),
         }));
@@ -36310,6 +36395,293 @@ mod pipeline_cache_refactor_tests {
                 .any(|key| key.edit_key.idx == prefetch_idx),
             "non-target result must remain deferred"
         );
+    }
+
+    #[test]
+    fn navigation_topology_rebind_is_scoped_to_the_mounted_viewer_context() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for idx in 0..3 {
+            push_image(&mut app, &format!(r"C:\pics\main-nav-{idx}.png"));
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.items_generation = 30;
+        app.fullscreen_idx = Some(1);
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 30,
+                anchor_idx: 1,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Presenting {
+                    pages: vec![1, 2],
+                    presentation: FsNavigationPresentation::Materialized,
+                },
+            }),
+        }));
+
+        let sibling = app.build_window_context_for_test(9_204, |mounted| {
+            for idx in 0..3 {
+                push_image(mounted, &format!(r"C:\pics\sibling-nav-{idx}.png"));
+            }
+            mounted.visible_indices = (0..mounted.items.len()).collect();
+            mounted.items_generation = 40;
+            mounted.fullscreen_idx = Some(1);
+            mounted.spread_mode = crate::settings::SpreadMode::LtrCover;
+            assert_eq!(
+                mounted.resolve_spread_pair(1),
+                crate::ui_fullscreen::SpreadPair::Double { left: 1, right: 2 }
+            );
+            mounted.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+                previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
+                opened_at: std::time::Instant::now(),
+                target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    items_generation: 40,
+                    anchor_idx: 1,
+                    accept_rendition: false,
+                    phase: FsNavigationTargetPhase::Ready {
+                        pages: vec![1, 2],
+                        presentation: FsNavigationPresentation::Materialized,
+                    },
+                }),
+            }));
+        });
+
+        let sibling_pages = app
+            .with_viewer_context(sibling, |mounted| {
+                mounted.record_page_dims_for_spread(2, (1600, 900));
+                let _ = mounted.fs_page_turn_decision_for_frame(&ctx, 1);
+                mounted
+                    .fs_holdover_tex
+                    .as_ref()
+                    .and_then(FsHoldover::navigation_sequence)
+                    .and_then(|sequence| match &sequence.target {
+                        FsNavigationSequenceTarget::Display(target) => {
+                            Some(target.pages().to_vec())
+                        }
+                        FsNavigationSequenceTarget::FolderItems { .. }
+                        | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
+                    })
+            })
+            .expect("sibling viewer context remains registered");
+        assert_eq!(sibling_pages, Some(vec![1]));
+
+        let main_pages = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target) => Some(target.pages().to_vec()),
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
+            });
+        assert_eq!(
+            main_pages,
+            Some(vec![1, 2]),
+            "rebinding the sibling must not mutate the main viewer target"
+        );
+    }
+
+    #[test]
+    fn navigation_target_open_boundary_cancels_only_superseded_display_intent() {
+        let display_target = |items_generation, anchor_idx| {
+            FsHoldover::NavigationSequence(FsNavigationSequence {
+                previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
+                opened_at: std::time::Instant::now(),
+                target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    items_generation,
+                    anchor_idx,
+                    accept_rendition: false,
+                    phase: FsNavigationTargetPhase::Ready {
+                        pages: vec![anchor_idx],
+                        presentation: FsNavigationPresentation::Materialized,
+                    },
+                }),
+            })
+        };
+        let mut app = setup_app();
+        app.items_generation = 50;
+        app.fs_nav_locked_gen = Some(50);
+        app.fs_holdover_tex = Some(display_target(50, 1));
+
+        app.cancel_superseded_fs_navigation_display_target(1);
+        assert!(
+            app.fs_holdover_tex.is_some(),
+            "the accepted anchor stays mounted"
+        );
+        assert_eq!(app.fs_nav_locked_gen, Some(50));
+
+        app.cancel_superseded_fs_navigation_display_target(2);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+
+        app.fs_nav_locked_gen = Some(49);
+        app.fs_holdover_tex = Some(display_target(49, 1));
+        app.cancel_superseded_fs_navigation_display_target(1);
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "a stale generation is disposed"
+        );
+        assert!(app.fs_nav_locked_gen.is_none());
+
+        app.fs_nav_locked_gen = Some(50);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: 50,
+            },
+        }));
+        app.cancel_superseded_fs_navigation_display_target(2);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+                target: FsNavigationSequenceTarget::FolderItems { .. },
+                ..
+            }))
+        ));
+        assert_eq!(app.fs_nav_locked_gen, Some(50));
+    }
+
+    #[test]
+    fn navigation_target_remove_items_batch_releases_old_generation_display_intent() {
+        let mut app = setup_app();
+        let removed = push_image(&mut app, r"C:\pics\removed.png");
+        let _middle = push_image(&mut app, r"C:\pics\middle.png");
+        let target = push_image(&mut app, r"C:\pics\target.png");
+        app.visible_indices = (0..app.items.len()).collect();
+        app.fullscreen_idx = Some(target);
+        let generation = app.items_generation;
+        let diagnostic_target =
+            crate::snapshot::SnapshotTarget::Fs(std::path::PathBuf::from(r"C:\pics\target.png"));
+        let diagnostic_trace =
+            SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&diagnostic_target));
+        let diagnostic_trace_id = diagnostic_trace.id;
+        let diagnostic_location = SimilarBookLocation::from_destination(diagnostic_target).unwrap();
+        app.fs_nav_locked_gen = Some(generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+                origin: diagnostic_location.clone(),
+                destination: diagnostic_location,
+                diagnostic_trace: Some(diagnostic_trace),
+            }),
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: generation,
+                anchor_idx: target,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Awaiting {
+                    pages: vec![target],
+                },
+            }),
+        }));
+
+        app.set_items_generation(generation);
+        assert!(
+            app.fs_holdover_tex.is_some(),
+            "assigning the same identity generation must preserve a valid target"
+        );
+
+        app.remove_items_batch(&[removed]);
+
+        assert_eq!(app.fullscreen_idx, Some(target - 1));
+        assert_ne!(app.items_generation, generation);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(diagnostic_trace_id),
+            vec!["navigation_superseded"]
+        );
+        assert!(
+            !app.fs_navigation_sequence_blocks_new_target(),
+            "an old-generation Display target must not wedge the next page turn"
+        );
+    }
+
+    #[test]
+    fn navigation_target_generation_change_preserves_folder_bind_and_sibling_owner() {
+        let mut app = setup_app();
+        let accepted_generation = app.items_generation;
+        app.fs_nav_locked_gen = Some(accepted_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation,
+            },
+        }));
+
+        let sibling_generation = 9_205;
+        let sibling = app.build_window_context_for_test(9_205, |mounted| {
+            let sibling_idx = push_image(mounted, r"C:\pics\sibling.png");
+            mounted.items_generation = sibling_generation;
+            mounted.fullscreen_idx = Some(sibling_idx);
+            mounted.fs_nav_locked_gen = Some(sibling_generation);
+            mounted.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+                previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
+                opened_at: std::time::Instant::now(),
+                target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    items_generation: sibling_generation,
+                    anchor_idx: sibling_idx,
+                    accept_rendition: false,
+                    phase: FsNavigationTargetPhase::Awaiting {
+                        pages: vec![sibling_idx],
+                    },
+                }),
+            }));
+        });
+
+        app.bump_items_generation();
+
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+                target: FsNavigationSequenceTarget::FolderItems {
+                    accepted_generation: actual,
+                },
+                ..
+            })) if actual == accepted_generation
+        ));
+        assert_eq!(app.fs_nav_locked_gen, Some(accepted_generation));
+
+        let sibling_state = app
+            .with_viewer_context(sibling, |mounted| {
+                (
+                    mounted.items_generation,
+                    mounted.fs_nav_locked_gen,
+                    mounted
+                        .fs_holdover_tex
+                        .as_ref()
+                        .and_then(FsHoldover::navigation_sequence)
+                        .map(|sequence| sequence.target.clone()),
+                )
+            })
+            .expect("sibling viewer context remains registered");
+        assert_eq!(sibling_state.0, sibling_generation);
+        assert_eq!(sibling_state.1, Some(sibling_generation));
+        assert!(matches!(
+            sibling_state.2,
+            Some(FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation,
+                ..
+            })) if items_generation == sibling_generation
+        ));
     }
 
     #[test]
@@ -39712,6 +40084,133 @@ mod native_video_zoom_wheel_tests {
 }
 
 #[cfg(all(test, windows))]
+mod native_video_display_mode_input_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn insert_video(app: &mut App, path: &str, width: u32, height: u32) -> usize {
+        let path = PathBuf::from(path);
+        let idx = app.items.len();
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(
+            width,
+            height,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        idx
+    }
+
+    fn native_v(repeat: bool, receipt: u64) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(receipt),
+            virtual_key: 0x56,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat,
+        }
+    }
+
+    fn begin_generic_v_pass(app: &mut App, ctx: &egui::Context) {
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let _ = app.keyboard_owner_for_pass(ctx);
+    }
+
+    #[test]
+    fn ordinary_video_v_reaches_zoom_from_generic_and_native_inputs_once() {
+        let _input_guard = fullscreen_fixed_key_test_guard();
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = insert_video(&mut app, "C:/clips/v-generic-native.mp4", 1920, 1080);
+        app.fullscreen_idx = Some(idx);
+
+        begin_generic_v_pass(&mut app, &ctx);
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = ctx.end_pass();
+        assert!(
+            app.video_zoom_state.is_some(),
+            "the generic fallback must consume one V press exactly once"
+        );
+
+        app.video_zoom_state = None;
+        app.handle_native_video_key_event(&ctx, idx, native_v(false, 401));
+        app.handle_native_video_key_event(&ctx, idx, native_v(true, 402));
+        assert!(
+            app.video_zoom_state.is_some(),
+            "the native first press toggles zoom and its repeat must not toggle back"
+        );
+    }
+
+    #[test]
+    fn video_display_mode_input_requires_the_current_visible_video_owner() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let current = insert_video(&mut app, "C:/clips/v-current.mp4", 1920, 1080);
+        let sibling = insert_video(&mut app, "C:/clips/v-sibling.mp4", 1920, 1080);
+        app.fullscreen_idx = Some(current);
+
+        app.toggle_native_video_display_mode_for_input(&ctx, sibling);
+        assert!(
+            app.video_zoom_state.is_none(),
+            "a sibling context item must not mutate the mounted display mode"
+        );
+
+        app.video_audio_mode = Some(current);
+        app.toggle_native_video_display_mode_for_input(&ctx, current);
+        assert!(
+            app.video_zoom_state.is_none(),
+            "video audio mode owns the view and must leave V as a no-op"
+        );
+
+        app.video_audio_mode = None;
+        app.toggle_native_video_display_mode_for_input(&ctx, current);
+        assert!(app.video_zoom_state.is_some());
+    }
+
+    #[test]
+    fn generic_video_v_prefers_panorama_when_the_current_video_is_360() {
+        let _input_guard = fullscreen_fixed_key_test_guard();
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = insert_video(&mut app, "C:/clips/v-panorama.mp4", 3840, 1920);
+        app.fullscreen_idx = Some(idx);
+
+        begin_generic_v_pass(&mut app, &ctx);
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = ctx.end_pass();
+
+        assert!(app.is_panorama_mode_active(idx));
+        assert!(app.video_zoom_state.is_none());
+    }
+}
+
+#[cfg(all(test, windows))]
 mod native_video_rating_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
@@ -39755,6 +40254,7 @@ mod native_video_rating_key_tests {
         alt: bool,
     ) -> crate::video::native_window::NativeVideoKeyEvent {
         crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -42400,12 +42900,12 @@ mod still_window_mode_key_tests {
         );
     }
 
-    fn assert_frozen_background_white(background: &DetachedImageWindowFrozenBackground) {
-        match background {
-            DetachedImageWindowFrozenBackground::Solid(color) => {
+    fn assert_frozen_underlay_white(underlay: &DetachedImageWindowUnderlay) {
+        match underlay {
+            DetachedImageWindowUnderlay::Solid(color) => {
                 assert_eq!(*color, egui::Color32::WHITE)
             }
-            _ => panic!("expected frozen page to preserve white transparent background"),
+            _ => panic!("expected snapshot to preserve white transparent underlay"),
         }
     }
 
@@ -49052,6 +49552,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -49138,6 +49639,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -49364,6 +49866,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -49436,6 +49939,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Image {
                     path: std::path::PathBuf::from(path),
@@ -49922,6 +50426,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -50209,6 +50714,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -50620,6 +51126,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -50670,6 +51177,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -51854,6 +52362,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -51994,6 +52503,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -52203,6 +52713,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -52426,7 +52937,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn paused_continuous_detached_window_preserves_transparent_background() {
+    fn paused_continuous_detached_window_preserves_one_view_background() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -52458,8 +52969,8 @@ mod still_window_mode_key_tests {
             !snapshot.frozen_continuous_pages.is_empty(),
             "continuous passive windows use per-page frozen DTOs"
         );
+        assert_frozen_underlay_white(&snapshot.image_underlay);
         for page in &snapshot.frozen_continuous_pages {
-            assert_frozen_background_white(&page.background);
             assert_rect_close(
                 page.uv_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -52741,8 +53252,7 @@ mod still_window_mode_key_tests {
         assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
         let left_page = &snapshot.frozen_continuous_pages[0];
         let right_page = &snapshot.frozen_continuous_pages[1];
-        assert_frozen_background_white(&left_page.background);
-        assert_frozen_background_white(&right_page.background);
+        assert_frozen_underlay_white(&snapshot.image_underlay);
         assert_rect_close(
             left_page.uv_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -53008,7 +53518,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn paused_single_page_detached_window_does_not_use_multi_page_frozen_snapshot() {
+    fn paused_single_page_detached_window_preserves_view_background_without_multi_page_snapshot() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -53016,6 +53526,7 @@ mod still_window_mode_key_tests {
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(12));
         app.spread_mode = crate::settings::SpreadMode::Single;
+        app.fs_transparent_bg_mode = 1;
         let first = push_image(&mut app, r"C:\pics\single-a.jpg");
         let second = push_image(&mut app, r"C:\pics\single-b.jpg");
         insert_static_fs_entry(&mut app, &ctx, first, "single_a");
@@ -53023,13 +53534,14 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
 
         let snapshot = app
-            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .build_active_detached_image_window_snapshot(None)
             .expect("single detached viewer should build a snapshot");
 
         assert!(
             snapshot.frozen_continuous_pages.is_empty(),
             "single-page passive windows keep the existing one-texture snapshot path"
         );
+        assert_frozen_underlay_white(&snapshot.image_underlay);
     }
 
     #[test]
@@ -54579,6 +55091,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: Some(stamp),
@@ -54701,6 +55214,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -54809,6 +55323,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -54837,6 +55352,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -55084,6 +55600,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -55369,6 +55886,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -55422,6 +55940,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         app.native_video_parked_live_input_window_id = Some(91);
         let key = NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x28,
             scan_code: 0,
             extended: false,
@@ -55439,6 +55958,8 @@ mod still_window_mode_key_tests {
             alt: false,
         };
         let left_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Left,
             down: true,
             double_click: false,
@@ -55505,6 +56026,8 @@ mod still_window_mode_key_tests {
         );
 
         let right_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Right,
             down: true,
             double_click: false,
@@ -55592,6 +56115,7 @@ mod still_window_mode_key_tests {
         );
 
         let key = NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x28,
             scan_code: 0,
             extended: false,
@@ -55658,6 +56182,8 @@ mod still_window_mode_key_tests {
         );
 
         let right_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Right,
             down: true,
             double_click: false,
@@ -55895,6 +56421,7 @@ mod still_window_mode_key_tests {
         assert!(
             !App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::Window(
                 WinEv::KeyDown(NativeVideoKeyEvent {
+                    receipt: crate::mouse_seek_debug::test_receipt(1),
                     virtual_key: 0x28,
                     scan_code: 0,
                     extended: false,
@@ -55934,6 +56461,8 @@ mod still_window_mode_key_tests {
         );
 
         let left_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Left,
             down: true,
             double_click: false,
@@ -56012,6 +56541,8 @@ mod still_window_mode_key_tests {
         app.native_video_parked_live_input_window_id = Some(91);
 
         let left_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Left,
             down: true,
             double_click: false,
@@ -56062,6 +56593,8 @@ mod still_window_mode_key_tests {
 
         fn button(button: NativeVideoMouseButton, down: bool) -> NativeVideoMouseButtonEvent {
             NativeVideoMouseButtonEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
+                owner: crate::video::native_window::test_mouse_input_owner(),
                 button,
                 down,
                 double_click: false,
@@ -56134,6 +56667,8 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\menu.mp4");
         app.fullscreen_idx = Some(video);
         let left_down = NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button: NativeVideoMouseButton::Left,
             down: true,
             double_click: false,
@@ -56574,6 +57109,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -56633,6 +57169,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -58367,6 +58904,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -58450,6 +58988,30 @@ mod still_window_mode_key_tests {
                 pixels: std::sync::Arc::new(image),
                 texture,
                 generation: app.conceal_generation,
+            },
+        );
+        texture_id
+    }
+
+    fn insert_backstop_static_texture(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        size: [usize; 2],
+        color: egui::Color32,
+    ) -> egui::TextureId {
+        let image = egui::ColorImage::filled(size, color);
+        let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
+        let texture_id = texture.id();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels: std::sync::Arc::new(image),
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         texture_id
@@ -58601,6 +59163,106 @@ mod still_window_mode_key_tests {
                     .starts_with("direct.jpg")
             );
             assert!(output_uses_texture(&rendered.1, texture));
+            assert!(app.active_detached_viewport_rendered_this_frame());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_draws_loaded_side_of_partial_current_spread() {
+        std::thread::spawn(|| {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let left = push_image(&mut app, r"C:\owner\left.jpg");
+            let right = push_image(&mut app, r"C:\owner\right.jpg");
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.reading_flow = crate::settings::ReadingFlow::Paged;
+            app.fullscreen_idx = Some(left);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            let _source_texture = insert_backstop_static_texture(
+                &mut app,
+                &ctx,
+                left,
+                "backstop_partial_spread_left",
+                [4, 6],
+                egui::Color32::LIGHT_BLUE,
+            );
+            let left_texture = app
+                .resolve_fs_processed_texture(&ctx, left, false)
+                .expect("loaded spread side has a current paint texture")
+                .id();
+            assert_eq!(
+                app.resolve_spread_pair(left),
+                crate::ui_fullscreen::SpreadPair::Double { left, right }
+            );
+            assert!(app.fs_holdover_tex.is_none());
+            app.begin_mounted_detached_session_for_test(208, DetachedSource::Book);
+            set_detached_host_for_test(&mut app, 208, 0x2080, true);
+            app.frame_counter = 203;
+            let owner = app
+                .active_viewer_context_id()
+                .expect("partial spread backstop keeps a mounted owner");
+            let state_before = app.detached_window_state(208);
+
+            let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
+
+            assert!(output_uses_texture(&rendered.1, left_texture));
+            assert_eq!(app.fullscreen_idx, Some(left));
+            assert_eq!(app.active_viewer_context_id(), Some(owner));
+            assert_eq!(
+                app.viewer_context_residence(owner),
+                ContextResidence::Mounted
+            );
+            assert_eq!(app.detached_window_state(208), state_before);
+            assert!(app.active_detached_viewport_rendered_this_frame());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_continuous_draw_keeps_mounted_owner_and_current_index() {
+        std::thread::spawn(|| {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let idx = push_image(&mut app, r"C:\owner\continuous.jpg");
+            app.reading_flow = crate::settings::ReadingFlow::Vertical;
+            app.fullscreen_idx = Some(idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            let _source_texture = insert_backstop_static_texture(
+                &mut app,
+                &ctx,
+                idx,
+                "backstop_continuous",
+                [4, 6],
+                egui::Color32::LIGHT_GREEN,
+            );
+            let texture = app
+                .resolve_fs_processed_texture(&ctx, idx, false)
+                .expect("continuous current page has a paint texture")
+                .id();
+            assert!(app.continuous_reading_active_for_idx(idx));
+            app.begin_mounted_detached_session_for_test(209, DetachedSource::Book);
+            set_detached_host_for_test(&mut app, 209, 0x2090, true);
+            app.frame_counter = 204;
+            let owner = app
+                .active_viewer_context_id()
+                .expect("continuous backstop keeps a mounted owner");
+            let state_before = app.detached_window_state(209);
+
+            let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
+
+            assert!(output_uses_texture(&rendered.1, texture));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+            assert_eq!(app.active_viewer_context_id(), Some(owner));
+            assert_eq!(
+                app.viewer_context_residence(owner),
+                ContextResidence::Mounted
+            );
+            assert_eq!(app.detached_window_state(209), state_before);
             assert!(app.active_detached_viewport_rendered_this_frame());
         })
         .join()
@@ -60183,6 +60845,7 @@ mod still_window_mode_key_tests {
                     egui::pos2(1.0, 1.0),
                 ),
                 image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -60247,6 +60910,7 @@ mod still_window_mode_key_tests {
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
+            image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: Some(stamp),
@@ -60264,6 +60928,7 @@ mod still_window_mode_key_tests {
             placement,
             false,
             None,
+            egui::Color32::BLACK,
         );
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
@@ -60343,6 +61008,7 @@ mod still_window_mode_key_tests {
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
+            image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
@@ -60359,6 +61025,7 @@ mod still_window_mode_key_tests {
             previous,
             false,
             None,
+            egui::Color32::BLACK,
         );
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
@@ -66877,6 +67544,7 @@ fn video_adjust_slot_egui_modal_guard_leaves_key_unconsumed() {
 #[cfg(windows)]
 fn video_audio_native_z(repeat: bool) -> crate::video::native_window::NativeVideoKeyEvent {
     crate::video::native_window::NativeVideoKeyEvent {
+        receipt: crate::mouse_seek_debug::test_receipt(1),
         virtual_key: 0x5a,
         scan_code: 0x2c,
         extended: false,
@@ -71011,9 +71679,14 @@ mod sns_split_p2_transition_tests {
 #[cfg(windows)]
 mod native_bar_lock_reaches_the_presenter_at_birth {
     use crate::app::tests::phase_c_support::setup_app;
+    use crate::app::{DetachedSource, DetachedWindowState};
+    use crate::fs_animation::FsCacheEntry;
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use std::path::PathBuf;
 
     fn config_for(
         bar_lock: crate::video::NativeBarLockState,
+        audio_only: bool,
     ) -> crate::video::NativeVideoOutputConfig {
         super::super::native_video_presenter_config(
             0,
@@ -71041,10 +71714,30 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             crate::settings::VideoScaleFilter::OsDefault,
             0,
             crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            [17, 34, 201],
             bar_lock,
-            false,
+            audio_only,
         )
         .expect("presenter config")
+    }
+
+    fn install_canvas_test_player(app: &mut crate::app::App, path: PathBuf, audio_file: bool) {
+        app.items.push(if audio_file {
+            GridItem::Audio(path.clone())
+        } else {
+            GridItem::Video(path.clone())
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_native_video_canvas_color([201, 34, 17]);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
     }
 
     /// presenter は生成時点で固定状態を知っている必要がある。App の毎フレーム
@@ -71064,7 +71757,84 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
-        assert_eq!(config_for(requested).bar_lock, requested);
+        assert_eq!(config_for(requested, false).bar_lock, requested);
+    }
+
+    #[test]
+    fn video_canvas_color_is_carried_for_video_and_forced_black_for_audio() {
+        let bar_lock = crate::video::NativeBarLockState::default();
+        assert_eq!(
+            config_for(bar_lock, false).video_canvas_color,
+            [17, 34, 201]
+        );
+        assert_eq!(config_for(bar_lock, true).video_canvas_color, [0, 0, 0]);
+    }
+
+    #[test]
+    fn every_mounted_video_context_receives_the_current_canvas_color_classification() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let configured = [17, 34, 201];
+        app.settings.fullscreen_image_margin_color = configured;
+        install_canvas_test_player(&mut app, PathBuf::from(r"C:\clips\main.mp4"), false);
+
+        app.build_active_context_for_test(Some(200), DetachedSource::Video, |active| {
+            install_canvas_test_player(active, PathBuf::from(r"C:\clips\audio-mode.mp4"), false);
+        });
+        app.push_window_context_for_test(&ctx, 201, |parked| {
+            install_canvas_test_player(parked, PathBuf::from(r"C:\clips\parked.flac"), true);
+        });
+        app.transition_detached_window_state(
+            201,
+            DetachedWindowState::ParkedLive,
+            "test_video_canvas_color",
+        );
+
+        app.poll_video(&ctx);
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            unreachable!();
+        };
+        assert_eq!(
+            player.native_video_canvas_color_for_test(),
+            Some(configured)
+        );
+
+        app.with_active_viewer_context(|active| {
+            active.poll_video(&ctx);
+            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert_eq!(
+                player.native_video_canvas_color_for_test(),
+                Some(configured)
+            );
+
+            active.video_audio_mode = Some(0);
+            active.poll_video(&ctx);
+            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert_eq!(player.native_video_canvas_color_for_test(), Some([0, 0, 0]));
+
+            active.video_audio_mode = None;
+            active.poll_video(&ctx);
+            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert_eq!(
+                player.native_video_canvas_color_for_test(),
+                Some(configured)
+            );
+        })
+        .unwrap();
+        app.with_window_viewer_context(201, |parked| {
+            parked.poll_video(&ctx);
+            let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert_eq!(player.native_video_canvas_color_for_test(), Some([0, 0, 0]));
+        })
+        .unwrap();
     }
 
     /// 隙間 px の上限は初期値にも後からの変更にも同じ規則で効く。
@@ -71081,10 +71851,10 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
-            config_for(requested).bar_lock.fixed_bar_gap_px,
+            config_for(requested, false).bar_lock.fixed_bar_gap_px,
             crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX
         );
-        assert_eq!(requested.clamped(), config_for(requested).bar_lock);
+        assert_eq!(requested.clamped(), config_for(requested, false).bar_lock);
     }
 
     /// 設定を読む場所は 1 つ。config へ渡す値と、生成後の同期が送る値がずれない。

@@ -159,6 +159,8 @@ pub mod metadata_cleanup;
 pub mod modifier_ownership;
 mod modifier_probe;
 pub mod monitor;
+#[cfg(windows)]
+pub(crate) mod mouse_seek_debug;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
@@ -646,6 +648,17 @@ unsafe extern "system" fn mouse_nav_hook_proc(
             let msg_ptr = lparam.0 as *const MSG;
             if !msg_ptr.is_null() {
                 let msg = &*msg_ptr;
+                if let Some(candidate) = crate::mouse_seek_debug::classify_hook_candidate(
+                    msg.message,
+                    msg.wParam.0,
+                    msg.lParam.0,
+                ) {
+                    crate::mouse_seek_debug::log_hook_observation(
+                        wparam.0,
+                        msg.hwnd.0 as usize as u64,
+                        candidate,
+                    );
+                }
                 match msg.message {
                     WM_APPCOMMAND => {
                         // HIWORD(lparam) の下 12 bit が AppCommand。

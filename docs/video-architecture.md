@@ -63,6 +63,14 @@ wheel / drag ごとに swap chain を作り直さない。項目変更、fullscr
 入力可否の共通境界は `native_video_view_input_available` が所有する。fullscreen の対象項目であり、
 動画→音声モードでも同項目の音楽 VST shell でもないことを 360 / 通常動画拡大で共有し、各モードの
 active 条件だけを後段で重ねる。detached 専用 predicate は追加せず、既存 placement の意味を変えない。
+
+V (`FsPanorama`) は native presenter HWND、native overlay、egui fullscreen / root / in-window / focus handoff の
+正規 fallback の複数入口を持つ。動画では全入口を App の
+`toggle_native_video_display_mode_for_input` へ合流し、current fullscreen index、Video item、上記 view-input
+可用性を確認してから 360 検出済みなら panorama、通常動画なら zoom/pan を選ぶ。generic handler は
+no-repeat で action を consume した同じ pass から直ちに戻るため、後段の静止画 360 handler へ二重配送しない。
+音声モード / VST / sibling index は no-op であり、still の V / Shift+V の既存処理は変えない。
+
 通常動画拡大の wheel は presenter が確定した video target rect 内のポインタ座標を App へ渡し、
 `pointer_region_owns_wheel` が示すシークストリップ、端パネル、モーダルの領域では取得しない。
 左押下は `ZoomPan` がドラッグ終了まで所有する。
@@ -72,7 +80,17 @@ chain を DComp transform で拡大・縮小する。shader を使う 4 方式�
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
 video visual transform は等倍 + 中央寄せだけになる。通常動画拡大中は `OS に任せる` も標準
 resample を強制し、表示領域全体の surface へ source 部分矩形を resolve する。範囲外は最終 target の
-clear や背面 visual に任せず、Lanczos / nearest / NIS / Anime4K の各 resolve が不透明黒を返す。
+clear や背面 visual に任せず、Lanczos / nearest / NIS / Anime4K の各 resolve が
+`Settings::fullscreen_image_margin_color` から受け取った不透明 RGB を返す。これは fit 自体が source 外
+座標で letterbox を表す場合にも同じ色を保つためで、実動画画素と素材内の黒帯は変更しない。
+共有する静止画 NIS / Anime4K の uniform packer は従来どおり固定の不透明黒を渡す。panorama 投影の
+無効画素も映像内部として黒を維持する。
+
+余白 RGB は設定値の sRGB byte code を gamma 変換せず `R / 255, G / 255, B / 255, 1` として扱う。
+`NativeVideoOutputConfig` の生成時 snapshot と独立した coalesced command で render thread へ渡し、
+App は mounted main / active detached / ParkedLive の各 current player を既存 `poll_video` mount 内で
+同期する。同色は output-local atomic で除外し、render thread の clear / Present を毎 frame 発生させない。
+純音声と動画の音声モードは birth / live sync の両方で黒を渡す。
 
 ```
 decoder の BGRA frame
@@ -952,6 +970,15 @@ session owner が両 worker を
 
 App は毎 frame、所有権を持つ `NativeOverlaySeekStrip` payload を native presenter へ渡す。
 presenter は worker が作った RGBA だけを texture 化し、presenter thread では波形を再計算しない。
+seek strip 本体は場面サムネイル / 波形の両表示とも video canvas RGB から独立し、全域で従来の暗色下地と
+配色を保つ。場面サムネイルは pending / upload 前 / failed を含む動画範囲内の各セルを暗色 backing と border で
+描き、動画範囲外には偽のセルを置かない。波形用 raster は不透明な黒 / analyzed 暗色 / colored foreground を
+所有する。presenter は毎 frame 波形領域を黒で clear してから opaque texture を白 tint で描き、曲外 shade・境界も
+従来配色を使う。両表示の range 文字は同じ fitted galley を使うが、1 pt の影を black-alpha 220、前景を gray 232 で
+明示 override し、同色の二重描画にしない。marker は赤 2.5 pt のみである。RGB は overlay state / worker request /
+raster cache key に入れず、余白色変更で overlay redraw や再解析を起こさない。音楽画面の
+`render_timeline_row_image(..., None, ...)` は従来の不透明背景と画素演算を維持する。選択表示、HUD / panel も
+従来色を保つ。
 可視 first-paint raster は同じ中心の保持用 upgrade が届くまで描き続ける。
 中心が保持 span の中央 trigger band にある間は同じ texture の可視 span sub-rectangle を UV で
 ずらして描く。中心が trigger band を外れたときだけ replacement を要求し、pending span を latch に
@@ -1005,7 +1032,7 @@ HUD の vector film-strip button はメニューを開き、非表示・4 表示
 strip が `Some` の間は preview rect の下端を `native_seek_strip_rect().min.y - 14pt` に置き、
 短い viewport では 16:9 画像を縮めて strip と重ならない不変条件を優先する。strip が無ければ従来の
 下部 HUD 上端 - 14pt を基準にする。描画は既存の 64pt HUD `Area` から行い、全画面の受動 `Area` は
-作らない。`last_drawn_preview_rect` が実描画 rect を保持し、`compute_hud_regions` はその値をそのまま
+作らない。preview frame / image / loading / action row / time は `Area` の canvas clip を保持する painter、シーク線と HUD 本体・controls は `hud_rect` へ絞った painter を使う。preview は HUD より上にあるため、HUD 本体の clip を継承させない。`last_drawn_preview_rect` が実描画 rect を保持し、`compute_hud_regions` はその値をそのまま
 HUD HWND region へ入れるため、位置と入力 region は同じ snapshot に追従する。strip の鍵上では
 preview target を抑止し、drag 中は strip が pointer を所有する限り更新を続ける。tile / 音声 mode /
 長さ不明では出さず、source swap、strip close、mode switch では target と worker request を typed
@@ -1829,13 +1856,17 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   に正規化して内部 channel に push (UI スレッドが受信)
 - presenter が `VK_BROWSER_BACK` / `VK_BROWSER_FORWARD` の `WM_KEYDOWN` / `WM_SYSKEYDOWN`
   を native route へ enqueue した場合は、その exact message を処理済みとして返し
-  `DefWindowProcW` へ渡さない。既定処理へ渡すと同じ WndProc へ `WM_APPCOMMAND` が生成され、
-  実 key と合成 key が1物理クリックから2回配送されるためである。driver / AHK が直接送る
-  `WM_APPCOMMAND` branch は独立した fallback として維持する。KeyUp と他の key は従来どおり。
+  `DefWindowProcW` へ渡さない。driver / AHK が直接送る `WM_APPCOMMAND` branch は独立した fallback
+  として維持する。2026-09-09 の fresh trace では AHK が scan 付き key DOWN / UP と direct
+  AppCommand を別 OS message として送り、両順序も観測されたため、KeyUp の既定処理だけを生成元とは
+  扱わない。raw receipt は各 route / App で一意だった。KeyUp と他の key は従来どおり。
 - raw XButton の DOWN / UP / DBLCLK は presenter / HUD が同じ typed mouse route で所有し、
   decode 済み message は Win32 の処理済み契約に従って全て TRUE を返す。`CS_DBLCLKS` の
-  DBLCLK は2回目の物理押下として扱う。これは message ownership の統一であり、browser-key の
-  二重配送を止める上記の根因修正とは分ける
+  DBLCLK は2回目の物理押下として扱う。Extra1 / Extra2 の DOWN は既存 overlay ownership を維持し、
+  通常 UP と capture / cancel / destroy 由来の synthetic UP は generation gate 後に App へ lossless 配送する。
+  reported button と capture-owned button は分離し、複数 XButton の最後の capture-owned release だけが
+  `ReleaseCapture` する。SetCapture に失敗した非 X button の reported bit は lifecycle cleanup へ残すが、
+  後続 XButton capture の解放を妨げない
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
   egui の Event との 1:1 翻訳を意図しており、`native_presenter/render_core.rs` 側で
   `egui::Event` に変換される
@@ -1907,13 +1938,22 @@ chrome latch の toggle だけ、物理的な左 / 右の `PageSide` は 1 タ�
 `native_video_seek_relative_with_hint` へ流す。秒数を overlay metadata に複製しないため、
 source 切り替え時の metadata reset で設定が既定値へ戻らない。小 / 中 / 大の秒数は独立した
 整数 1～600 秒（既定 1 / 5 / 30 秒）で、キー・リング・マウスジェスチャ・ゲームパッド・
-音楽表示の実行経路も同じ設定を使う。物理 Back / Forward / Middle ボタンの 6 シークは、
-同じ 1 クリックが実 browser VK と合成 browser event の 2 producer として届く機器があるため、
-v3.7.0 では新規候補から外し、`App::apply_mouse_button` の単一 ownership 境界で実行しない。
-`RingActionId::is_valid_for_mouse_button_context` は永続データ互換の判定として 6 値を有効に保ち、
-`is_available_for_mouse_button_assignment` だけを候補 / 実行 policy とする。これにより保存済み値を
-sanitize・保存・キャンセル・再表示で消さず、将来の再有効化まで保持する。ring action 自体と
-キーボード・右ドラッグ gesture・gamepad・左右タップ・通常 wheel の経路はこの policy を通らない。
+音楽表示の実行経路も同じ設定を使う。物理 Back / Forward / Middle ボタンの 6 シークは v3.7.0 で候補と共有実行を一旦抑止したが、
+次版では利用者の明示指示により action-first / slot-first UI と `App::apply_mouse_button` を同じ
+context-validity 正本から再公開した。保存済み値を sanitize・保存・キャンセル・再表示で消さず、現在
+Settings の小 / 中 / 大秒数を使う。fresh trace では AHK 変換中だけ key + AppCommand の別 OS message、
+AHK 無効時の標準機器では一意な raw XButton DOWN / UP が確認された。
+
+標準 raw Extra1 / Extra2 の seek hold は初回 action を即時に実行し、press 時に実行済みと返った 6 種だけを
+`ViewerContextBundle` 内の2 slotへ armする。Windows の keyboard delay / speed を arm 時に sample し、
+`poll_video` の native event batch 後に1 frame / button 最大1回だけ共有 executorで反復する。UP、source /
+placement / context owner交代、audio / VST / remote / ParkedLiveで停止する。通常 AtRest deposit は同じ
+contextの保存形なので継続する。hold の window generation は現在の presenter / HUD HWND と厳密に照合し、
+`NativeVideoOutput.committed_generation` は現 generation の exact identity ではなく既存 close event と同じ
+stale floor として扱う。初期 presenter の generation 1 / committed floor 0 を受理し、floor 未満だけを
+失効させる。browser key / direct AppCommandにはrelease契約がないため反復を追加せず、AHK経路の重複は
+未解決の別課題である。ring action、キーボード、右ドラッグ gesture、gamepad、
+左右タップ、通常 wheelの経路は変更しない。
 `SwitchSource` は overlay を再利用するため、専用
 `reset_overlay_source_session()` から latch / 接点 / 初回案内状態の reset を必ず通し、新ファイルへ
 持ち越さない。`touch_correlation.rs` は
@@ -1982,9 +2022,16 @@ overlay bounds に clamp するため、解像度・DPI・モニター構成が�
 - eframe の `show_viewport_immediate` で借りる winit ビューポートは DWM 合成下で
   動作するため、4K 60fps + perf overlay + 動画フレーム描画の合成が DWM の
   `vblank` バジェットを超えて hitch する事例があった
-- ネイティブ HWND + DComp で「動画レイヤ」「黒背景レイヤ」「egui overlay レイヤ」を
+- ネイティブ HWND + DComp で「動画レイヤ」「余白色を描く canvas レイヤ」「egui overlay レイヤ」を
   別々の swap chain に分離し、動画レイヤだけを高頻度 present、overlay は必要時のみ
   redraw する構造に変えることで pacing が安定した
+- DComp root 最下層の canvas は native video letterbox の所有者で、生成 / resize / placement recreate に
+  current RGB を使う。live 変更は同色なら no-op、clear と `Present` が成功してから presented color を
+  更新する。`NativeEguiOverlay` は canvas RGB を複製せず、場面サムネイル / 波形の seek strip は両方とも
+  固定暗色のまま保つ。birth / recreate は config の current 値を使う。動画 swap chain 自身の clear は映像面内部の backfill なので
+  黒のままにする。pause 中の visible `DisplayResolved` frame は既存の visual-change 再 present を通し、
+  hidden frame は show 時の既存再 present で新しい source 外色になる。HUD / 左右パネルの暗色面は canvas と
+  分離したまま保つ。
 - メタデータパネルは FFmpeg format metadata から title / artist / description /
   HTTP(S) の元動画 URL (`comment` / `PURL` / `webpage_url` 等) を受け取り、description 内 URL も
   `ui_text_links` でリンク化する。リンククリックは native overlay command として
@@ -2693,9 +2740,10 @@ serial 変化や巻き戻り時は baseline 更新のみで誤爆 seek を防ぐ
 `poll_video` (`app.rs`) は 4 段階構成: Phase 0 で `ensure_fullscreen_video_marker_cache`
 (= 毎 tick の DB クエリを避ける)、Phase 1 で `iter_mut` 中に `set_loop_enabled` / `set_native_loop_mode`
 を effective + display_mode 分離で push + `active_video_indices` 収集 + `native_events` drain、
-Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Phase 3 で
-`tick_native_video_loop_boundary` (= 境界 tick)。順序は P2/P3 を入れ替えると serial guard が
-直近 seek を検出できないため固定。
+Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、その event batch 後に標準 raw
+XButton の context-owned hold を tickし、Phase 3 で `tick_native_video_loop_boundary` (= 境界 tick)。
+UP terminal がrepeatより先に確定し、repeatは既存 `next_repaint` deadlineへ合流する。順序は P2/P3を
+入れ替えると serial guardが直近 seekを検出できないため固定。
 
 ## 配布要件
 

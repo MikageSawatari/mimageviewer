@@ -387,6 +387,31 @@ ui_fullscreen.rs::render_fullscreen_viewport
     └─ update_prefetch_window(idx)     # フィルタ後の前後数枚を先読み / 範囲外を解放
 ```
 
+フルスクリーン余白色の正本は global な `Settings::fullscreen_image_margin_color` である。
+静止画キャンバスでは画像外の余白と seek strip のセル外空欄へ使い、通常画像、ZIP / PDF、
+単ページ、見開き、連結読み、比較、360 度パノラマ、画像分析で共有する。native 動画では DComp root
+最下層の canvas と、拡大・パン / display-resolved scaling の source 外画素へ同じ値を投影する。
+native 動画の seek strip は場面サムネイル / 波形の両表示とも全域で従来の暗色下地と配色を保ち、
+`NativeEguiOverlay` は canvas RGB の snapshot を持たない。動画画素、素材に含まれる黒帯、字幕、
+音声 / 動画の音声モード、HUD / 左右パネル、ナビゲータやルーペなど部品内部の黒も余白設定へ接続しない。
+
+透明下地は `fs_transparent_bg_mode` から不透明な黒 / 白 / 市松へ解決し、余白色には fallback
+しない。下地は `DisplayedImageTransform::paint_quad` が返す画像 texture と同じ 4 頂点へ描く。
+表示トリム後の `paint_rect` と任意角度回転中心を共有するため、回転 quad の AABB へ余分な色を
+塗らない。市松 texture の UV は page-local の幅 / 高さで反復し、quad と一緒に回転する。
+可視領域だけを再サンプルした texture でも、同じ clip 内で先に画像全体の paint quad 下地を描き、
+その上へ source-region texture を置く。この paint layer は画面表示専用で、画像画素、AI、copy、
+capture、export の合成には入らない。
+
+passive frozen single の direct texture も source-region mesh を使う。保存済み回転と表示 trim が
+同時に snapshot に残る場合、元の `image_rect` を geometry の基準にして trim bbox を位置と UV の
+両方へ渡すため、画像と透明下地は同じ trim 後 quad / clip になる。detached keepalive backstop は、
+両側を capture できた単ページ / 見開きを typed display unit で描き、片側だけ準備できた見開きで
+navigation holdover が無ければ canonical spread painter を呼んで両 slot を保つ。連結読みも canonical
+visible-pages painter を使う。general keepalive / embedded deferred の canvas は typed static unit が
+ある場合だけ現在の余白色にし、unit の無い media transition は egui 側の黒を保つ。native 動画の
+letterbox canvas は別の DComp owner が現在の余白色を描き、音声系だけ黒を保つ。
+
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
@@ -1399,6 +1424,10 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
+`strip_content` は左右対称 inset の全幅を layout / request / paint の共通座標にする。通常バーを隠したときの
+表示切替と列固定ボタン、および通常バー表示時の列固定ボタンはセルの上へ後登録する overlay で、専用の
+空欄幅を取らない。body の press / hover / click / preview / source mapping は両 control の矩形を除外するが、
+body から始まった drag は control 上を横切っても同じ gesture owner が release まで継続する。
 静止画の高さは専用の `StillSeekStripHeight` と5段階の独立値で保存する。既定は
 最小36 / 小48 / 中72 / 大104 / 最大144、各値は36～320のlogical point（100%表示時のpx相当）。
 閲覧中は下部バー右端のフィルムボタンから、列の表示 / 非表示と5段階を同じ menu popup で
@@ -2197,8 +2226,12 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
 受理時に current unit の texture / rotation / Part A の captured layout geometry を
-`FsNavigationSequence::previous` へ 1 unit として取り、target page set も 1 typed owner に保持する。
-`FsNavigationSequenceTarget::Display` の target page set は、page renderer が描く
+`FsNavigationSequence::previous` へ 1 unit として取る。`FsNavigationSequenceTarget::Display` は
+受理した `anchor_idx` と通過 rendition の許可方針を target の生存期間を通じて固定し、現在の
+canonical page set は `Awaiting / Ready / Presenting / RenditionFailed` phase が所有する。
+寸法または 90 度回転が後着して anchor の canonical unit が単ページ↔見開きへ変わった場合は、
+どの phase からでも新しい page set の `Awaiting` へ戻り、同じ許可方針で全ページを再検証する。
+`previous` と待機開始時刻はそのまま保持する。target page set は、page renderer が描く
 `GridItem::has_page_data` の項目だけで構成する。動画 / 音声など native presenter が描く項目を
 1 ページでも含む unit では `Display` sequence を作らず、そのまま移動先へ着地する。
 sequence を解放する presentation trace は page renderer だけが emit するため、native presenter 所有の
@@ -2217,6 +2250,21 @@ previous に属するなら提示とは数えない。
 推測しない。previous overlay を実際に描いたページは `Holdover` なので解放しない。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
+
+fullscreen frame は async 完了を `poll_prefetch` で取り込んだ後に canonical `SpreadPair` を 1 回
+解決し、その同じ pair で target の再 binding / readiness、holdover disposition、source 選択、描画、
+presentation trace を行う。poll 前に作った page-turn decision が同じ egui frame に cache 済みでも、
+page set が変わったときは rebound phase から decision を再計算して同じ cache slot を更新する。
+通常の sequence 非存在 frame は事前の target identity check で余分な spread 解決を行わない。
+target の generation / anchor が現在の mounted viewer context と一致しない場合は再 binding せず、
+兄弟 context の page set や holdover を変更しない。
+同一 context 内で common open、ページ編集の単ページ pivot、または連結読みの seek / scroll reanchor が
+別 anchor へ移る場合は、旧 `Display` intent とその lock / holdover を代入前に明示的に破棄する。
+同じ mounted bundle の items generation が実際に変わる場合も、旧 index identity を指す `Display` intent を
+generation owner で解放する。`FolderItems` は folder install 前の世代から新 items の bind までを所有するため
+この解放対象に含めず、同じ generation の再設定でも有効な `Display` intent を維持する。
+viewer-context の activation は `fullscreen_idx`、generation、navigation sequence、lock / holdover を
+bundle 単位で一緒に swap する ownership 移動なので、この in-context retarget cancellation は行わない。
 
 target の `materialized_ready` は、その frame の描画 resolver が実際に選ぶ source に対して評価する。
 `fs_display_bypasses_final_pipeline` が true の分析モード、またはナビゲーションシーケンスが

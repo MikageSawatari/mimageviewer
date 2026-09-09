@@ -3590,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_video_mouse_seek_survives_open_cancel_and_unrelated_commit() {
+    fn video_mouse_seek_survives_open_cancel_and_unrelated_commit() {
         use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
 
         let context = RingShortcutContext::VideoFullscreen;
@@ -3618,7 +3618,7 @@ mod tests {
                 .mouse_button_profile(context)
                 .action(MouseButtonSlot::Back),
             RingActionId::VideoSeekBackLarge,
-            "Cancel must leave the saved deferred value untouched"
+            "Cancel must leave the saved value untouched"
         );
 
         let reopened = preferences_state_for_test(&app.settings);
@@ -3629,7 +3629,7 @@ mod tests {
                 .mouse_button_profile(context)
                 .action(MouseButtonSlot::Back),
             RingActionId::VideoSeekBackLarge,
-            "reopening must show the saved deferred value"
+            "reopening must show the saved value"
         );
 
         let mut unrelated_commit = preferences_state_for_test(&app.settings);
@@ -3660,7 +3660,7 @@ mod tests {
                 .mouse_button_profile(context)
                 .action(MouseButtonSlot::Back),
             RingActionId::VideoMute,
-            "the user can replace a deferred value with an available action"
+            "the user can replace the saved value with another available action"
         );
     }
 

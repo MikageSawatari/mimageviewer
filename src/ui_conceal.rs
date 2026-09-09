@@ -307,10 +307,7 @@ impl App {
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
         self.conceal_shapes.clear();
-        self.spread_mode = crate::settings::SpreadMode::Single;
-        self.fullscreen_idx = Some(new_idx);
-        self.fs_zoom = 1.0;
-        self.fs_pan = egui::Vec2::ZERO;
+        self.enter_page_edit_single_view(new_idx);
         self.enter_conceal_mode(new_idx);
     }
 
