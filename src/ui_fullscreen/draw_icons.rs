@@ -273,6 +273,34 @@ pub(super) fn draw_more_icon(painter: &egui::Painter, center: egui::Pos2, _r: f3
     }
 }
 
+/// 指定された実矩形でバーボタンを描画する。
+///
+/// 静止画の極小ウィンドウでは下端バー自体が 32pt 未満へ fit する。同じ矩形を paint、
+/// pointer hit-test、touch correlation の全経路へ渡し、見えない画面外領域を操作対象にしない。
+pub(super) fn draw_bar_button_in_rect(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &str,
+    bg_fn: impl FnOnce(bool) -> egui::Color32,
+    _active: bool,
+    icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
+) -> BarButtonResponse {
+    debug_assert!(rect.is_positive());
+    let id = egui::Id::new(id);
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    let bg = bg_fn(resp.hovered());
+    let painter = ui.painter().with_clip_rect(rect);
+    let radius = 4.0_f32.min(rect.width().min(rect.height()) * 0.5);
+    painter.rect_filled(rect, radius, bg);
+    let r = rect.width().min(rect.height()) * 0.28;
+    icon_fn(&painter, rect.center(), r);
+    let touch_clicked = record_bar_button_and_resolve_touch(ui.ctx(), id, rect);
+    BarButtonResponse {
+        response: resp,
+        touch_clicked,
+    }
+}
+
 /// バーボタンの共通描画。位置とアイコン描画関数を受け取る。
 pub(super) fn draw_bar_button(
     ui: &mut egui::Ui,
@@ -280,24 +308,20 @@ pub(super) fn draw_bar_button(
     y: f32,
     id: &str,
     bg_fn: impl FnOnce(bool) -> egui::Color32,
-    _active: bool,
+    active: bool,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> BarButtonResponse {
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(x, y),
-        egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
-    );
-    let id = egui::Id::new(id);
-    let resp = ui.interact(rect, id, egui::Sense::click());
-    let bg = bg_fn(resp.hovered());
-    ui.painter().rect_filled(rect, 4.0, bg);
-    let r = BAR_BUTTON_SIZE * 0.28;
-    icon_fn(ui.painter(), rect.center(), r);
-    let touch_clicked = record_bar_button_and_resolve_touch(ui.ctx(), id, rect);
-    BarButtonResponse {
-        response: resp,
-        touch_clicked,
-    }
+    draw_bar_button_in_rect(
+        ui,
+        egui::Rect::from_min_size(
+            egui::pos2(x, y),
+            egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+        ),
+        id,
+        bg_fn,
+        active,
+        icon_fn,
+    )
 }
 
 #[cfg(test)]
@@ -312,6 +336,65 @@ mod bar_button_touch_tests {
                 egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
             ),
         }
+    }
+
+    #[test]
+    fn rect_button_preserves_legacy_size_and_accepts_a_fitted_hit_rect() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 40.0));
+        let fitted = egui::Rect::from_min_size(egui::pos2(54.0, 20.0), egui::vec2(18.0, 12.0));
+        let mut legacy_rect = None;
+        let mut fitted_rect = None;
+        let mut fitted_icon = None;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    legacy_rect = Some(
+                        draw_bar_button(
+                            ui,
+                            4.0,
+                            4.0,
+                            "legacy_rect_button",
+                            |_| egui::Color32::BLACK,
+                            false,
+                            |_, _, _| {},
+                        )
+                        .response
+                        .rect,
+                    );
+                    fitted_rect = Some(
+                        draw_bar_button_in_rect(
+                            ui,
+                            fitted,
+                            "fitted_rect_button",
+                            |_| egui::Color32::BLACK,
+                            false,
+                            |painter, _, r| {
+                                fitted_icon = Some((painter.clip_rect(), r));
+                            },
+                        )
+                        .response
+                        .rect,
+                    );
+                });
+            },
+        );
+
+        assert_eq!(
+            legacy_rect,
+            Some(egui::Rect::from_min_size(
+                egui::pos2(4.0, 4.0),
+                egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+            ))
+        );
+        assert_eq!(fitted_rect, Some(fitted));
+        assert!(screen.contains_rect(fitted));
+        assert_eq!(fitted_icon, Some((fitted, fitted.height() * 0.28)));
     }
 
     #[test]
@@ -455,6 +538,23 @@ pub(super) fn test_current_bar_button_targets(ctx: &egui::Context) -> Vec<(egui:
         .unwrap_or_default();
     targets.sort_by(|left, right| left.1.min.x.total_cmp(&right.1.min.x));
     targets
+}
+
+#[cfg(test)]
+pub(super) fn test_arm_bar_button_touch_click(ctx: &egui::Context, id: &str, bar_rect: egui::Rect) {
+    let state_id = bar_button_touch_state_id(ctx);
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            state_id,
+            BarButtonTouchState {
+                prepared_pass: Some(pass),
+                bar_rect: Some(bar_rect),
+                resolved_ids: vec![egui::Id::new(id)],
+                ..Default::default()
+            },
+        );
+    });
 }
 
 /// "VST" ラベルを線分で自前描画する (= ホバーバーの VST3 管理ボタン用アイコン)。

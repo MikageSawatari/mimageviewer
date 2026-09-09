@@ -28,6 +28,82 @@ fn select_native_video_display_mode_toggle(
     }
 }
 
+/// Native XButton の物理 press を 1 action へ正規化する。
+///
+/// `CS_DBLCLKS` の 2 回目は `WM_XBUTTONDOWN` ではなく `WM_XBUTTONDBLCLK` として届くが、
+/// decode 後はいずれも `down=true` なので同じ 1 press として扱う。release は action を
+/// 持たず、native HWND が処理済みにした raw message だけがここへ届く。
+#[cfg(windows)]
+fn native_video_extra_button_press(
+    event: crate::video::native_window::NativeVideoMouseButtonEvent,
+) -> Option<bool> {
+    use crate::video::native_window::NativeVideoMouseButton;
+
+    if !event.down {
+        return None;
+    }
+    match event.button {
+        NativeVideoMouseButton::Extra1 => Some(false),
+        NativeVideoMouseButton::Extra2 => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod native_extra_button_press_tests {
+    use super::*;
+    use crate::video::native_window::{NativeVideoMouseButton, NativeVideoMouseButtonEvent};
+
+    fn event(
+        button: NativeVideoMouseButton,
+        down: bool,
+        double_click: bool,
+    ) -> NativeVideoMouseButtonEvent {
+        NativeVideoMouseButtonEvent {
+            button,
+            down,
+            double_click,
+            x: 120,
+            y: 80,
+            shift: false,
+            ctrl: false,
+        }
+    }
+
+    #[test]
+    fn one_physical_xbutton_click_plans_one_action_and_double_click_plans_two() {
+        let single = [
+            event(NativeVideoMouseButton::Extra1, true, false),
+            event(NativeVideoMouseButton::Extra1, false, false),
+        ];
+        let double = [
+            event(NativeVideoMouseButton::Extra2, true, false),
+            event(NativeVideoMouseButton::Extra2, false, false),
+            event(NativeVideoMouseButton::Extra2, true, true),
+            event(NativeVideoMouseButton::Extra2, false, false),
+        ];
+
+        assert_eq!(
+            single
+                .into_iter()
+                .filter_map(native_video_extra_button_press)
+                .collect::<Vec<_>>(),
+            [false]
+        );
+        assert_eq!(
+            double
+                .into_iter()
+                .filter_map(native_video_extra_button_press)
+                .collect::<Vec<_>>(),
+            [true, true]
+        );
+        assert_eq!(
+            native_video_extra_button_press(event(NativeVideoMouseButton::Middle, true, false)),
+            None
+        );
+    }
+}
+
 #[cfg(windows)]
 pub(super) enum VideoSeekStripAxisState {
     Resolving { initial_time_secs: f64 },
@@ -574,8 +650,8 @@ enum NativeVideoFixedKeyAction {
     CloseFullscreen,
     TileCursorPrevious,
     TileCursorNext,
-    SeekBackFiveSeconds,
-    SeekForwardFiveSeconds,
+    SeekBackMedium,
+    SeekForwardMedium,
     MouseBack,
     MouseForward,
     RatingItem(u8),
@@ -596,8 +672,8 @@ impl NativeVideoFixedKeyAction {
             Self::CloseFullscreen => "close_fullscreen".to_string(),
             Self::TileCursorPrevious => "tile_cursor_previous".to_string(),
             Self::TileCursorNext => "tile_cursor_next".to_string(),
-            Self::SeekBackFiveSeconds => "seek_back_5s".to_string(),
-            Self::SeekForwardFiveSeconds => "seek_forward_5s".to_string(),
+            Self::SeekBackMedium => "seek_back_medium".to_string(),
+            Self::SeekForwardMedium => "seek_forward_medium".to_string(),
             Self::MouseBack => "mouse_back".to_string(),
             Self::MouseForward => "mouse_forward".to_string(),
             Self::RatingItem(stars) => format!("rating_item_{stars}"),
@@ -4062,7 +4138,7 @@ impl App {
             // Both producers are user input (Ctrl+wheel and the HUD column buttons), but neither
             // has requested activation while parked since R2. Telling them apart needs provenance
             // in the payload, which is a change this fix does not need; see backlog §1.131.
-            Ev::TileColumnsDelta { .. } => false,
+            Ev::TileColumnsDelta { .. } | Ev::NormalWheel { .. } => false,
             // Events that carry their own cause: ask the cause, not the variant. The presenter
             // converts a plain wheel into `NavigateItem`, and closes the strip with `HudHidden`
             // from the draw path whenever the HUD is not visible.
@@ -4072,6 +4148,7 @@ impl App {
             // inert; the click itself requests activation.
             Ev::Seek { .. }
             | Ev::SeekRelative { .. }
+            | Ev::SeekMedium { .. }
             | Ev::TouchChromeLearned
             | Ev::PanoramaDrag { .. }
             | Ev::TogglePanorama
@@ -4325,6 +4402,14 @@ impl App {
                 _ => {}
             }
         }
+        let resolved_normal_wheel = match &event {
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta } => self
+                .settings
+                .ring_shortcuts
+                .video_normal_wheel_action
+                .resolve(*delta as f32),
+            _ => None,
+        };
         let current_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
             _ => None,
@@ -4356,6 +4441,9 @@ impl App {
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
+            ) || matches!(
+                resolved_normal_wheel,
+                Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(_))
             ) {
                 // fall through: NavigateItem は dispatch 続行
             } else {
@@ -4484,6 +4572,15 @@ impl App {
             crate::video::NativeVideoOutputEvent::SeekRelative { delta_secs } => {
                 self.native_video_seek_relative_with_hint(fs_idx, delta_secs);
             }
+            crate::video::NativeVideoOutputEvent::SeekMedium { forward } => {
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                self.native_video_seek_relative_with_hint(
+                    fs_idx,
+                    if forward { seconds } else { -seconds },
+                );
+            }
             crate::video::NativeVideoOutputEvent::TouchChromeLearned => {
                 if !self.settings.touch_video_chrome_learned {
                     self.settings.touch_video_chrome_learned = true;
@@ -4547,6 +4644,30 @@ impl App {
             crate::video::NativeVideoOutputEvent::NavigateItem { delta, .. } => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
             }
+            crate::video::NativeVideoOutputEvent::NormalWheel { .. } => match resolved_normal_wheel
+            {
+                Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
+                    delta,
+                )) => self.navigate_native_video_fullscreen(ctx, fs_idx, delta),
+                Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(step)) => {
+                    let new_volume = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                        FsCacheEntry::Video { player, .. } => {
+                            let volume = crate::settings::step_video_volume_by_fader_key_step(
+                                player.volume(),
+                                step,
+                            );
+                            player.set_volume(volume);
+                            Some(volume)
+                        }
+                        _ => None,
+                    });
+                    if let Some(volume) = new_volume {
+                        self.settings.video_volume = volume;
+                        self.settings.save();
+                    }
+                }
+                None => {}
+            },
             crate::video::NativeVideoOutputEvent::TileColumnsDelta { delta } => {
                 self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
             }
@@ -6872,7 +6993,7 @@ impl App {
             ),
             (
                 "← / →",
-                "5秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
+                "中シークで戻る / 進む。タイルモード中はタイルカーソルを移動する",
             ),
             ("マウスホイール", "前または次の項目へ移動する"),
             ("Ctrl+ホイール", "タイルモード中はタイル列数を変更する"),
@@ -6933,8 +7054,8 @@ impl App {
 
         let touch_rows = [
             ("中央をタップ", "HUD を表示 / 非表示"),
-            ("左をタップ", "5 秒戻る"),
-            ("右をタップ", "5 秒進む"),
+            ("左をタップ", "中シークで戻る"),
+            ("右をタップ", "中シークで進む"),
         ]
         .into_iter()
         .map(|(keys, description)| NativeOverlayShortcutHelpRow {
@@ -7240,6 +7361,7 @@ impl App {
             bottom_lock: self.settings.video_bottom_lock(),
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
             seek_strip_height: self.settings.video_seek_strip_height,
+            seek_strip_height_values: self.settings.video_seek_strip_height_values,
             seek_hover_preview_mode: self.settings.video_seek_hover_preview_mode,
             seek_bar_with_strip: self.settings.video_seek_bar_with_strip,
         }
@@ -10291,40 +10413,76 @@ impl App {
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekBackSmall, &key) =>
             {
-                self.native_video_seek_relative_with_hint(fs_idx, -1.0);
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Small);
+                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekForwardSmall, &key) =>
             {
-                self.native_video_seek_relative_with_hint(fs_idx, 1.0);
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Small);
+                self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall)
+            }
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekBackMedium, &key) =>
+            {
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
+            }
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekForwardMedium, &key) =>
+            {
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                self.native_video_seek_relative_with_hint(fs_idx, seconds);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardMedium)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekBackLarge, &key) =>
             {
-                self.native_video_seek_relative_with_hint(fs_idx, -30.0);
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Large);
+                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekForwardLarge, &key) =>
             {
-                self.native_video_seek_relative_with_hint(fs_idx, 30.0);
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Large);
+                self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardLarge)
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
             0x25 if !key.ctrl && !key.shift && !key.alt => {
-                self.native_video_seek_relative_with_hint(fs_idx, -5.0);
-                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekBackFiveSeconds)
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekBackMedium)
             }
             0x27 if !key.ctrl && !key.shift && !key.alt => {
-                self.native_video_seek_relative_with_hint(fs_idx, 5.0);
-                NativeVideoKeyOutcome::FixedAction(
-                    NativeVideoFixedKeyAction::SeekForwardFiveSeconds,
-                )
+                let seconds = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                self.native_video_seek_relative_with_hint(fs_idx, seconds);
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekForwardMedium)
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             _ if !key.repeat
@@ -12039,7 +12197,7 @@ impl App {
     /// 末尾でシークを発行すると decoder が target 付近のフレームを返せず
     /// 「シーク中...」表示が固着するため、ここでシーク自体を抑止している。
     #[cfg(windows)]
-    fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
+    pub(crate) fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
         let outcome = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(delta_secs),
             _ => return,
@@ -12922,30 +13080,15 @@ impl App {
             self.native_video_pointer_down = None;
             return;
         }
-        if !event.double_click && event.down {
-            match event.button {
-                NativeVideoMouseButton::Extra1 => {
-                    self.native_video_pointer_down = None;
-                    self.mouse_ring_nav = self.apply_mouse_back_forward_button(
-                        ctx,
-                        false,
-                        crate::app::ActionSurface::Viewer,
-                        "native-video-mouse",
-                    );
-                    return;
-                }
-                NativeVideoMouseButton::Extra2 => {
-                    self.native_video_pointer_down = None;
-                    self.mouse_ring_nav = self.apply_mouse_back_forward_button(
-                        ctx,
-                        true,
-                        crate::app::ActionSurface::Viewer,
-                        "native-video-mouse",
-                    );
-                    return;
-                }
-                _ => {}
-            }
+        if let Some(forward) = native_video_extra_button_press(event) {
+            self.native_video_pointer_down = None;
+            self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                ctx,
+                forward,
+                crate::app::ActionSurface::Viewer,
+                "native-video-mouse",
+            );
+            return;
         }
         if event.button == NativeVideoMouseButton::Middle {
             self.native_video_pointer_down = None;
@@ -13246,6 +13389,364 @@ mod native_video_display_mode_toggle_tests {
             select_native_video_display_mode_toggle(false, false),
             NativeVideoDisplayModeToggle::NoOp
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod configurable_video_seek_dispatch_tests {
+    use super::*;
+
+    fn native_key(
+        virtual_key: u32,
+        shift: bool,
+        ctrl: bool,
+    ) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: matches!(virtual_key, 0x25 | 0x27),
+            shift,
+            ctrl,
+            alt: false,
+            repeat: false,
+        }
+    }
+
+    fn setup_seek_app() -> (crate::app::AppTestEnvForTest, usize) {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.video_seek_small_secs = 3;
+        app.settings.video_seek_medium_secs = 17;
+        app.settings.video_seek_large_secs = 43;
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsVideo]\nVideoSeekBackMedium = F13\nVideoSeekForwardMedium = F14\n",
+        );
+        let path = std::path::PathBuf::from(r"C:\clips\configurable-seek.mp4");
+        let idx = app.items.len();
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        reset_seek_player(&mut app, idx);
+        app.fullscreen_idx = Some(idx);
+        (app, idx)
+    }
+
+    fn reset_seek_player(app: &mut App, idx: usize) {
+        let path = std::path::PathBuf::from(r"C:\clips\configurable-seek.mp4");
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_duration_for_test(300.0);
+        player.set_position_for_test(100.0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+    }
+
+    fn player_position(app: &App, idx: usize) -> f64 {
+        match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.position(),
+            _ => panic!("test video player missing"),
+        }
+    }
+
+    fn player_volume(app: &App, idx: usize) -> f64 {
+        match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.volume(),
+            _ => panic!("test video player missing"),
+        }
+    }
+
+    #[test]
+    fn native_video_keys_apply_all_configured_steps_and_plain_medium() {
+        let ctx = egui::Context::default();
+        let cases = [
+            (
+                native_key(0x25, true, false),
+                97.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall),
+            ),
+            (
+                native_key(0x27, true, false),
+                103.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall),
+            ),
+            (
+                native_key(0x7C, false, false),
+                83.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium),
+            ),
+            (
+                native_key(0x7D, false, false),
+                117.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardMedium),
+            ),
+            (
+                native_key(0x25, false, true),
+                57.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge),
+            ),
+            (
+                native_key(0x27, false, true),
+                143.0,
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardLarge),
+            ),
+            (
+                native_key(0x25, false, false),
+                83.0,
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekBackMedium),
+            ),
+            (
+                native_key(0x27, false, false),
+                117.0,
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekForwardMedium),
+            ),
+        ];
+
+        for (key, expected_position, expected_outcome) in cases {
+            let (mut app, idx) = setup_seek_app();
+            let outcome = app.dispatch_native_video_key_event(&ctx, idx, key);
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(player_position(&app, idx), expected_position);
+        }
+    }
+
+    #[test]
+    fn tile_mode_keeps_arrow_keys_out_of_seek() {
+        let ctx = egui::Context::default();
+        let (mut app, idx) = setup_seek_app();
+        app.video_tile_mode_active = true;
+
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x27, false, false));
+
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::TileCursorNext)
+        );
+        assert_eq!(player_position(&app, idx), 100.0);
+    }
+
+    #[test]
+    fn ring_and_touch_stage_resolve_in_the_current_app_context() {
+        let ctx = egui::Context::default();
+
+        let (mut app, idx) = setup_seek_app();
+        let _ = app.apply_ring_action(
+            &ctx,
+            crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            crate::ring_shortcut::RingActionId::VideoSeekForwardSmall,
+            "test",
+        );
+        assert_eq!(player_position(&app, idx), 103.0);
+
+        reset_seek_player(&mut app, idx);
+        app.video_audio_mode = Some(idx);
+        let _ = app.apply_ring_action(
+            &ctx,
+            crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            crate::ring_shortcut::RingActionId::VideoSeekBackLarge,
+            "test",
+        );
+        assert_eq!(player_position(&app, idx), 57.0);
+
+        reset_seek_player(&mut app, idx);
+        app.video_audio_mode = None;
+        let source_epoch = match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_source_epoch().unwrap(),
+            _ => unreachable!(),
+        };
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch.wrapping_add(1),
+            crate::video::NativeVideoOutputEvent::SeekMedium { forward: true },
+        );
+        assert_eq!(player_position(&app, idx), 100.0);
+
+        app.settings.video_seek_medium_secs = 19;
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::SeekMedium { forward: true },
+        );
+        assert_eq!(player_position(&app, idx), 119.0);
+    }
+
+    #[test]
+    fn physical_mouse_buttons_ignore_deferred_video_seek_but_keep_other_routes() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
+
+        let ctx = egui::Context::default();
+        let (mut app, idx) = setup_seek_app();
+        for (slot, action, ring_position) in [
+            (
+                MouseButtonSlot::Back,
+                RingActionId::VideoSeekBackSmall,
+                97.0,
+            ),
+            (
+                MouseButtonSlot::Forward,
+                RingActionId::VideoSeekForwardSmall,
+                103.0,
+            ),
+            (
+                MouseButtonSlot::Middle,
+                RingActionId::VideoSeekBackMedium,
+                83.0,
+            ),
+            (
+                MouseButtonSlot::Back,
+                RingActionId::VideoSeekForwardMedium,
+                117.0,
+            ),
+            (
+                MouseButtonSlot::Forward,
+                RingActionId::VideoSeekBackLarge,
+                57.0,
+            ),
+            (
+                MouseButtonSlot::Middle,
+                RingActionId::VideoSeekForwardLarge,
+                143.0,
+            ),
+        ] {
+            let profile = app
+                .settings
+                .ring_shortcuts
+                .mouse_button_profile_mut(RingShortcutContext::VideoFullscreen);
+            match slot {
+                MouseButtonSlot::Back => profile.back = action.clone(),
+                MouseButtonSlot::Forward => profile.forward = action.clone(),
+                MouseButtonSlot::Middle => profile.middle = action.clone(),
+            }
+            reset_seek_player(&mut app, idx);
+
+            let result = app.apply_mouse_button(
+                &ctx,
+                slot,
+                crate::app::ActionSurface::Viewer,
+                "deferred-video-mouse-seek-test",
+            );
+
+            assert!(result.is_none());
+            assert_eq!(
+                player_position(&app, idx),
+                100.0,
+                "physical {slot:?} must not execute {}",
+                action.as_str()
+            );
+
+            let _ = app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::VideoFullscreen,
+                action,
+                "video-ring-seek-test",
+            );
+            assert_eq!(
+                player_position(&app, idx),
+                ring_position,
+                "the same action remains available outside physical mouse buttons"
+            );
+        }
+
+        app.video_session_muted = false;
+        app.settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(RingShortcutContext::VideoFullscreen)
+            .middle = RingActionId::VideoMute;
+        let _ = app.apply_mouse_button(
+            &ctx,
+            MouseButtonSlot::Middle,
+            crate::app::ActionSurface::Viewer,
+            "active-video-mouse-action-test",
+        );
+        assert!(
+            app.video_session_muted,
+            "non-seek video mouse-button actions must remain active"
+        );
+    }
+
+    #[test]
+    fn native_normal_wheel_resolves_current_settings_and_preserves_epoch_ownership() {
+        let ctx = egui::Context::default();
+        let (mut app, idx) = setup_seek_app();
+        let source_epoch = match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_source_epoch().unwrap(),
+            _ => unreachable!(),
+        };
+        let stale_epoch = source_epoch.wrapping_add(1);
+
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        app.settings.video_volume = 1.0;
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.set_volume(1.0);
+        }
+        let expected_down = crate::settings::step_video_volume_by_fader_key_step(1.0, -1);
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta: -120 },
+        );
+        assert_eq!(player_volume(&app, idx), expected_down);
+        assert_eq!(app.settings.video_volume, expected_down);
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            stale_epoch,
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta: -120 },
+        );
+        assert_eq!(player_volume(&app, idx), expected_down);
+        assert_eq!(app.settings.video_volume, expected_down);
+
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::NavigateItems;
+        let now = std::time::Instant::now();
+        app.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+            target_idx: idx,
+            target_path: std::path::PathBuf::from(r"C:\clips\configurable-seek.mp4"),
+            source_epoch,
+            started_at: now,
+            deadline: now + std::time::Duration::from_secs(2),
+            parked_live_window_id: None,
+        });
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            stale_epoch,
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta: 120 },
+        );
+        assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
+        assert_eq!(player_volume(&app, idx), expected_down);
+
+        app.native_video_deferred_nav_delta = None;
+        app.handle_native_video_output_event(
+            &ctx,
+            idx + 1,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta: 120 },
+        );
+        assert!(app.native_video_deferred_nav_delta.is_none());
+        assert_eq!(player_volume(&app, idx), expected_down);
+        assert_eq!(app.settings.video_volume, expected_down);
+
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        let expected_up = crate::settings::step_video_volume_by_fader_key_step(expected_down, 1);
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::NormalWheel { delta: 120 },
+        );
+        assert_eq!(player_volume(&app, idx), expected_up);
+        assert_eq!(app.settings.video_volume, expected_up);
+        assert!(app.native_video_deferred_nav_delta.is_none());
     }
 }
 

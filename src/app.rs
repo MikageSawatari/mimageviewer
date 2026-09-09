@@ -178,6 +178,8 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+#[cfg(all(windows, feature = "test-script"))]
+mod test_script_support;
 pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
@@ -549,6 +551,8 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
     pub(crate) right_drag_guide: Option<RightDragGuide>,
+    #[cfg(feature = "test-script")]
+    pub(crate) test_script_window_identity: Option<crate::test_script::TestScriptWindowIdentity>,
 }
 
 #[cfg(windows)]
@@ -572,6 +576,8 @@ impl DeferredDetachedImageWindowView {
             placement,
             apply_initial_placement,
             right_drag_guide,
+            #[cfg(feature = "test-script")]
+            test_script_window_identity: None,
         }
     }
 }
@@ -4661,6 +4667,98 @@ fn converted_archive_candidate_scope(
         (0..item_count).collect()
     } else {
         keep_set.clone()
+    }
+}
+
+/// The read-only union of every owner that currently needs a grid thumbnail.
+/// `bounded_range` excludes still seek's sparse exact pages so distant previews do not widen the
+/// worker's ordinary grid/navigation/hover range.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ThumbnailKeepProjection {
+    pages: HashSet<usize>,
+    bounded_range: (usize, usize),
+    interactive_pages: HashSet<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BookBookmarkPageIdentityKey {
+    RelativePath(String),
+    ArchiveEntry(String),
+    PdfPage(u32),
+}
+
+fn normalized_bookmark_page_path(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
+}
+
+fn book_bookmark_page_identity_key(
+    identity: &crate::book_bookmarks::PageIdentity,
+) -> BookBookmarkPageIdentityKey {
+    match identity {
+        crate::book_bookmarks::PageIdentity::RelativePath(value) => {
+            BookBookmarkPageIdentityKey::RelativePath(normalized_bookmark_page_path(value))
+        }
+        crate::book_bookmarks::PageIdentity::ArchiveEntry(value) => {
+            BookBookmarkPageIdentityKey::ArchiveEntry(normalized_bookmark_page_path(value))
+        }
+        crate::book_bookmarks::PageIdentity::PdfPage(page) => {
+            BookBookmarkPageIdentityKey::PdfPage(*page)
+        }
+    }
+}
+
+fn thumbnail_keep_projection(
+    item_count: usize,
+    grid_pages: impl IntoIterator<Item = usize>,
+    navigation_pages: impl IntoIterator<Item = usize>,
+    details_hover_page: Option<usize>,
+    bookmark_pages: impl IntoIterator<Item = usize>,
+    exact_pages: impl IntoIterator<Item = usize>,
+) -> ThumbnailKeepProjection {
+    let grid_pages = grid_pages
+        .into_iter()
+        .filter(|idx| *idx < item_count)
+        .collect::<HashSet<_>>();
+    let navigation_pages = navigation_pages
+        .into_iter()
+        .filter(|idx| *idx < item_count)
+        .collect::<HashSet<_>>();
+    let details_hover_page = details_hover_page.filter(|idx| *idx < item_count);
+    let bookmark_pages = bookmark_pages
+        .into_iter()
+        .filter(|idx| *idx < item_count)
+        .collect::<HashSet<_>>();
+    let exact_pages = exact_pages
+        .into_iter()
+        .filter(|idx| *idx < item_count)
+        .collect::<HashSet<_>>();
+
+    let mut pages = grid_pages.clone();
+    pages.extend(navigation_pages.iter().copied());
+    pages.extend(details_hover_page);
+    pages.extend(bookmark_pages.iter().copied());
+    pages.extend(exact_pages.iter().copied());
+
+    let bounded_range = grid_pages
+        .iter()
+        .chain(navigation_pages.iter())
+        .copied()
+        .chain(details_hover_page)
+        .chain(bookmark_pages.iter().copied())
+        .fold(None::<(usize, usize)>, |bounds, idx| match bounds {
+            Some((start, end)) => Some((start.min(idx), end.max(idx.saturating_add(1)))),
+            None => Some((idx, idx.saturating_add(1))),
+        })
+        .unwrap_or((0, 0));
+
+    let mut interactive_pages = navigation_pages;
+    interactive_pages.extend(details_hover_page);
+    interactive_pages.extend(bookmark_pages);
+    interactive_pages.extend(exact_pages);
+    ThumbnailKeepProjection {
+        pages,
+        bounded_range,
+        interactive_pages,
     }
 }
 
@@ -17068,12 +17166,22 @@ impl App {
     ) -> crate::keyboard_input::KeyboardOwner {
         if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
             crate::ime_focus::record_keyboard_owner(ctx, owner);
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::publish_action_pass_owner(
+                ctx,
+                self.test_script_action_owner_for_pass(ctx),
+            );
             return owner;
         }
         let owner =
             crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
         crate::keyboard_input::cache_keyboard_owner(ctx, owner);
         crate::ime_focus::record_keyboard_owner(ctx, owner);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::publish_action_pass_owner(
+            ctx,
+            self.test_script_action_owner_for_pass(ctx),
+        );
         owner
     }
 
@@ -31072,9 +31180,18 @@ impl App {
     }
 
     /// 現在ページを、ページ番号ではなく安定したページ identity を持つ本ブックマークへ変換する。
-    pub(crate) fn current_book_bookmark_draft(
+    fn current_book_bookmark_needs_image_folder_classification(&self, idx: usize) -> bool {
+        !self.book_bookmark_view_is_synthetic()
+            && matches!(self.items.get(idx), Some(GridItem::Image(_)))
+            && self.current_folder.is_some()
+            && !self.current_folder_is_book_folder()
+            && self.settings.auto_fullscreen_image_folders_enabled()
+    }
+
+    fn current_book_bookmark_draft_with_image_classification(
         &self,
         idx: usize,
+        all_items_are_images: bool,
     ) -> Option<crate::book_bookmarks::NewBookBookmark> {
         use crate::book_bookmarks::{BookContainerKind, NewBookBookmark, PageIdentity};
 
@@ -31088,11 +31205,7 @@ impl App {
                 let kind = if self.current_folder_is_book_folder() {
                     BookContainerKind::CompiledBook
                 } else if self.settings.auto_fullscreen_image_folders_enabled()
-                    && !self.items.is_empty()
-                    && self
-                        .items
-                        .iter()
-                        .all(|item| matches!(item, GridItem::Image(_)))
+                    && all_items_are_images
                 {
                     BookContainerKind::ImageFolder
                 } else {
@@ -31144,6 +31257,20 @@ impl App {
             page_identity,
             page_index_hint: idx,
         })
+    }
+
+    /// 現在ページを、ページ番号ではなく安定したページ identity を持つ本ブックマークへ変換する。
+    pub(crate) fn current_book_bookmark_draft(
+        &self,
+        idx: usize,
+    ) -> Option<crate::book_bookmarks::NewBookBookmark> {
+        let all_items_are_images = self
+            .current_book_bookmark_needs_image_folder_classification(idx)
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item, GridItem::Image(_)));
+        self.current_book_bookmark_draft_with_image_classification(idx, all_items_are_images)
     }
 
     pub(crate) fn next_book_bookmark_request_id(&mut self) -> u64 {
@@ -31387,35 +31514,41 @@ impl App {
         }
     }
 
+    fn book_bookmark_matches_item(
+        &self,
+        bookmark: &crate::book_bookmarks::BookBookmark,
+        idx: usize,
+    ) -> bool {
+        self.book_bookmark_item_identity_key(idx)
+            .is_some_and(|item| item == book_bookmark_page_identity_key(&bookmark.page_identity))
+    }
+
+    fn book_bookmark_item_identity_key(&self, idx: usize) -> Option<BookBookmarkPageIdentityKey> {
+        match self.items.get(idx)? {
+            GridItem::Image(path) => {
+                let container = self.current_folder.as_ref()?;
+                let relative = path.strip_prefix(container).ok()?;
+                Some(BookBookmarkPageIdentityKey::RelativePath(
+                    normalized_bookmark_page_path(&relative.to_string_lossy()),
+                ))
+            }
+            GridItem::ZipImage { entry_name, .. } => {
+                Some(BookBookmarkPageIdentityKey::ArchiveEntry(
+                    normalized_bookmark_page_path(entry_name),
+                ))
+            }
+            GridItem::PdfPage { page_num, .. } => {
+                Some(BookBookmarkPageIdentityKey::PdfPage(*page_num))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn book_bookmark_item_idx(
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> Option<usize> {
-        let normalize = |value: &str| value.replace('\\', "/").to_lowercase();
-        self.items.iter().enumerate().find_map(|(idx, item)| {
-            let matches = match (&bookmark.page_identity, item) {
-                (
-                    crate::book_bookmarks::PageIdentity::RelativePath(relative),
-                    GridItem::Image(path),
-                ) => {
-                    let container = self.current_folder.as_ref()?;
-                    path.strip_prefix(container)
-                        .ok()
-                        .map(|value| normalize(&value.to_string_lossy()) == normalize(relative))
-                        .unwrap_or(false)
-                }
-                (
-                    crate::book_bookmarks::PageIdentity::ArchiveEntry(wanted),
-                    GridItem::ZipImage { entry_name, .. },
-                ) => normalize(entry_name) == normalize(wanted),
-                (
-                    crate::book_bookmarks::PageIdentity::PdfPage(wanted),
-                    GridItem::PdfPage { page_num, .. },
-                ) => page_num == wanted,
-                _ => false,
-            };
-            matches.then_some(idx)
-        })
+        (0..self.items.len()).find(|idx| self.book_bookmark_matches_item(bookmark, *idx))
     }
 
     fn resolve_current_archive_bookmark_target(
@@ -31506,27 +31639,109 @@ impl App {
         true
     }
 
-    pub(crate) fn ensure_bookmark_panel_thumbnails(&mut self, indices: &[usize]) {
-        if indices.is_empty() {
-            return;
-        }
-        for &idx in indices {
-            if idx < self.items.len() {
-                self.keep_set.insert(idx);
-            }
-        }
-        if let (Some(first), Some(last)) =
-            (indices.iter().copied().min(), indices.iter().copied().max())
-        {
-            self.keep_start_shared.store(first, Ordering::Relaxed);
-            self.keep_end_shared
-                .store(last.saturating_add(1), Ordering::Relaxed);
-            for &idx in indices {
-                self.enqueue_details_hover_thumbnail(idx);
-            }
-        }
+    pub(crate) fn fullscreen_adjustment_panel_draw_reachable(
+        &self,
+        fs_idx: usize,
+        is_video: bool,
+        is_spread_double: bool,
+    ) -> bool {
+        let base_active = self.adjustment_mode.is_open()
+            && !matches!(self.compare_view_mode, CompareViewMode::Wipe { .. })
+            && !self.is_panorama_mode_active(fs_idx)
+            && !self.fs_zoom_mode_engaged();
+        let analysis_active =
+            self.analysis_mode && !is_spread_double && !self.is_panorama_mode_active(fs_idx);
+        base_active
+            && !self.fs_music_view_active(fs_idx)
+            && !analysis_active
+            && !is_video
+            && !self.local_adjust_mode
+            && self.sns_split.is_none()
+            && !self.export_crop_mode
+            && !(self.view_trim_mode && self.reading_flow.is_paged())
     }
 
+    fn current_bookmark_panel_thumbnail_pages(&mut self) -> Vec<usize> {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return Vec::new();
+        };
+        let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let is_spread_double = matches!(
+            self.resolve_spread_pair(fs_idx),
+            crate::ui_fullscreen::SpreadPair::Double { .. }
+        );
+        if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double)
+            || self.settings.fullscreen_left_panel_tab
+                != crate::settings::FullscreenLeftPanelTab::Bookmarks
+        {
+            return Vec::new();
+        }
+        // Image-folder eligibility scans every materialized item. Repeating that scan in the
+        // per-frame projection made a visible bookmark panel O(items). Cache the exact result
+        // under the existing context/generation-owned navigation cache; ZIP/PDF never need it.
+        let all_items_are_images = self
+            .current_book_bookmark_needs_image_folder_classification(fs_idx)
+            && self.viewer_navigation_caches.all_items_are_images(
+                self.items_generation,
+                self.reading_flow,
+                &self.items,
+            );
+        let Some(draft) = self
+            .current_book_bookmark_draft_with_image_classification(fs_idx, all_items_are_images)
+        else {
+            return Vec::new();
+        };
+        let container_key = crate::book_bookmarks::container_key(&draft.container_path);
+        if self.current_book_bookmarks_key.as_deref() != Some(container_key.as_str()) {
+            return Vec::new();
+        }
+
+        let bookmarked_pages = self
+            .current_book_bookmarks
+            .iter()
+            .filter(|bookmark| bookmark.container_key == container_key)
+            .map(|bookmark| book_bookmark_page_identity_key(&bookmark.page_identity))
+            .collect::<HashSet<_>>();
+        self.keep_set
+            .iter()
+            .copied()
+            .filter(|idx| {
+                self.book_bookmark_item_identity_key(*idx)
+                    .is_some_and(|identity| bookmarked_pages.contains(&identity))
+            })
+            .collect()
+    }
+
+    pub(crate) fn ensure_bookmark_panel_thumbnails(&mut self, indices: &[usize]) {
+        let mut valid_indices = indices
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.items.len())
+            .collect::<Vec<_>>();
+        valid_indices.sort_unstable();
+        valid_indices.dedup();
+        let Some((&first, &last)) = valid_indices.first().zip(valid_indices.last()) else {
+            return;
+        };
+
+        self.keep_set.extend(valid_indices.iter().copied());
+        let bookmark_range = (first, last.saturating_add(1));
+        self.keep_range = if self.keep_range.0 < self.keep_range.1 {
+            (
+                self.keep_range.0.min(bookmark_range.0),
+                self.keep_range.1.max(bookmark_range.1),
+            )
+        } else {
+            bookmark_range
+        };
+        self.keep_start_shared
+            .store(self.keep_range.0, Ordering::Relaxed);
+        self.keep_end_shared
+            .store(self.keep_range.1, Ordering::Relaxed);
+        for idx in valid_indices {
+            self.enqueue_details_hover_thumbnail(idx);
+        }
+    }
     fn ensure_bookmark_presence_loaded(&mut self) {
         if self.settings.facet_filter.uses_bookmark_state()
             && self.bookmark_presence.is_none()
@@ -33356,7 +33571,7 @@ impl App {
                         let _ = tx_w.send(crate::thumb_loader::ThumbMsg {
                             idx: req.idx,
                             image: None,
-                            origin: crate::thumb_loader::ThumbLoadOrigin::Source,
+                            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                             from_edit_preview: false,
                             edit_preview_adjustment: None,
                             source_dims: None,
@@ -33693,7 +33908,7 @@ impl App {
                 let _ = tx.send(crate::thumb_loader::ThumbMsg {
                     idx,
                     image: ci,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::Source,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -33897,7 +34112,7 @@ impl App {
                         }
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
-                            from_cache,
+                            origin,
                             from_edit_preview,
                             rendered_at_px,
                             source_dims,
@@ -34048,30 +34263,18 @@ impl App {
             return;
         }
 
+        let idx = idx.filter(|idx| *idx < self.items.len());
         if self.details_hover_thumb_idx != idx {
-            if let Some(prev_idx) = self.details_hover_thumb_idx {
-                self.remove_details_hover_thumbnail_request(prev_idx);
-                self.evict_grid_thumbnail(prev_idx);
-            }
             self.details_hover_thumb_idx = idx;
+            self.reconcile_details_thumbnail_keep_owners();
         }
-
         let Some(idx) = idx else {
-            self.clear_details_hover_keep();
             return;
         };
-        if idx >= self.items.len() {
-            self.clear_details_hover_keep();
-            return;
-        }
 
-        self.keep_set.clear();
-        self.keep_set.insert(idx);
-        self.keep_range = (idx, idx + 1);
-        self.keep_start_shared.store(idx, Ordering::Relaxed);
-        self.keep_end_shared.store(idx + 1, Ordering::Relaxed);
         self.scroll_hint.store(idx, Ordering::Relaxed);
-        self.visible_end_shared.store(idx + 1, Ordering::Relaxed);
+        self.visible_end_shared
+            .store(idx.saturating_add(1), Ordering::Relaxed);
         let display_px = (320.0 * self.last_pixels_per_point.max(1.0)).round() as u32;
         self.display_px_shared
             .store(display_px.clamp(128, 1024), Ordering::Relaxed);
@@ -34079,29 +34282,120 @@ impl App {
     }
 
     fn clear_details_hover_keep(&mut self) {
-        if let Some(idx) = self.details_hover_thumb_idx.take() {
-            self.remove_details_hover_thumbnail_request(idx);
-            self.evict_grid_thumbnail(idx);
+        if self.details_hover_thumb_idx.take().is_none() {
+            return;
         }
-        self.keep_range = (0, 0);
-        self.keep_set.clear();
-        self.keep_start_shared.store(0, Ordering::Relaxed);
-        self.keep_end_shared.store(0, Ordering::Relaxed);
+        // Thumbnail mode has already installed its grid projection. Leave it intact; the next
+        // update evicts the old hover only when grid/navigation/still owners also released it.
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            self.reconcile_details_thumbnail_keep_owners();
+        }
     }
 
-    fn remove_details_hover_thumbnail_request(&mut self, idx: usize) {
-        if let Some(queue_arc) = self.reload_queue.clone() {
-            let (ref mtx, _) = *queue_arc;
-            let mut q = mtx.lock().unwrap();
-            q.retain(|req| req.idx != idx);
+    fn current_navigation_thumbnail_pages(&self) -> Vec<usize> {
+        self.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| {
+                sequence
+                    .target_pages_for_generation(self.items_generation)
+                    .to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    fn reconcile_details_thumbnail_keep_owners(&mut self) {
+        let navigation_pages = self.current_navigation_thumbnail_pages();
+        let bookmark_pages = self.current_bookmark_panel_thumbnail_pages();
+        let projection = thumbnail_keep_projection(
+            self.items.len(),
+            std::iter::empty(),
+            navigation_pages,
+            self.details_hover_thumb_idx,
+            bookmark_pages,
+            self.still_seek_thumbnail_pages.iter().copied(),
+        );
+        self.install_thumbnail_keep_projection(projection, true);
+        self.details_thumb_suppression_applied = self.keep_set.is_empty();
+    }
+
+    fn install_thumbnail_keep_projection(
+        &mut self,
+        projection: ThumbnailKeepProjection,
+        prune_queues: bool,
+    ) -> HashSet<usize> {
+        let ThumbnailKeepProjection {
+            pages,
+            bounded_range,
+            interactive_pages,
+        } = projection;
+        let previous_keep_set = std::mem::replace(&mut self.keep_set, pages);
+        self.keep_range = bounded_range;
+        self.keep_start_shared
+            .store(bounded_range.0, Ordering::Relaxed);
+        self.keep_end_shared
+            .store(bounded_range.1, Ordering::Relaxed);
+
+        self.thumb_pixels
+            .retain(|idx, _| self.keep_set.contains(idx));
+        self.thumb_edit_preview_layers
+            .retain(|idx, _| self.keep_set.contains(idx));
+        self.thumb_adjust_tex
+            .retain(|idx, _| self.keep_set.contains(idx));
+        let force_full_reconcile =
+            self.thumbnail_eviction_generation != Some(self.items_generation);
+        self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
+        self.thumbnail_eviction_generation = Some(self.items_generation);
+
+        if prune_queues {
+            let mut locally_canceled = HashSet::new();
+            if let Some(queue_arc) = self.reload_queue.clone() {
+                let (ref mtx, _) = *queue_arc;
+                let mut q = mtx.lock().unwrap();
+                q.retain_mut(|req| {
+                    let keep = self.keep_set.contains(&req.idx);
+                    if keep {
+                        if interactive_pages.contains(&req.idx) {
+                            req.priority = true;
+                        }
+                    } else {
+                        locally_canceled.insert(req.idx);
+                    }
+                    keep
+                });
+            }
+            if let Some(queue_arc) = self.heavy_io_queue.clone() {
+                let (ref mtx, _) = *queue_arc;
+                let mut q = mtx.lock().unwrap();
+                q.retain_mut(|req| {
+                    let keep = self.keep_set.contains(&req.idx);
+                    if keep {
+                        if interactive_pages.contains(&req.idx) {
+                            req.priority = true;
+                        }
+                    } else {
+                        locally_canceled.insert(req.idx);
+                    }
+                    keep
+                });
+            }
+
+            for idx in previous_keep_set.difference(&self.keep_set).copied() {
+                if self.pending_finalize.remove(&idx) {
+                    locally_canceled.insert(idx);
+                }
+                let before = self.texture_backlog.len();
+                self.texture_backlog.retain(|msg| msg.idx != idx);
+                if self.texture_backlog.len() != before {
+                    locally_canceled.insert(idx);
+                }
+            }
+            for idx in locally_canceled {
+                self.requested.remove(&idx);
+            }
         }
-        if let Some(queue_arc) = self.heavy_io_queue.clone() {
-            let (ref mtx, _) = *queue_arc;
-            let mut q = mtx.lock().unwrap();
-            q.retain(|req| req.idx != idx);
-        }
-        self.requested.remove(&idx);
-        self.pending_finalize.remove(&idx);
+
+        interactive_pages
     }
 
     fn evict_grid_thumbnail(&mut self, idx: usize) {
@@ -34169,10 +34463,19 @@ impl App {
         self.keep_set.extend(pages.iter().copied());
         if let (Some(start), Some(end)) = (pages.iter().min().copied(), pages.iter().max().copied())
         {
-            self.keep_range = (start, end.saturating_add(1));
-            self.keep_start_shared.store(start, Ordering::Relaxed);
+            let navigation_range = (start, end.saturating_add(1));
+            self.keep_range = if self.keep_range.0 < self.keep_range.1 {
+                (
+                    self.keep_range.0.min(navigation_range.0),
+                    self.keep_range.1.max(navigation_range.1),
+                )
+            } else {
+                navigation_range
+            };
+            self.keep_start_shared
+                .store(self.keep_range.0, Ordering::Relaxed);
             self.keep_end_shared
-                .store(end.saturating_add(1), Ordering::Relaxed);
+                .store(self.keep_range.1, Ordering::Relaxed);
         }
         for idx in pages.iter().copied() {
             self.enqueue_priority_thumbnail(idx);
@@ -34258,6 +34561,9 @@ impl App {
             .any(|idx| self.requested.contains_key(idx))
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            self.reconcile_details_thumbnail_keep_owners();
         }
     }
 
@@ -34361,16 +34667,8 @@ impl App {
         if self.delete_pending.is_some() {
             return;
         }
-        let navigation_pages = self
-            .fs_holdover_tex
-            .as_ref()
-            .and_then(FsHoldover::navigation_sequence)
-            .map(|sequence| {
-                sequence
-                    .target_pages_for_generation(self.items_generation)
-                    .to_vec()
-            })
-            .unwrap_or_default();
+        let navigation_pages = self.current_navigation_thumbnail_pages();
+        let bookmark_pages = self.current_bookmark_panel_thumbnail_pages();
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && self.settings.facet_filter.has_rollup_edit_filter()
         {
@@ -34395,87 +34693,30 @@ impl App {
                 }
             }
         }
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && !navigation_pages.is_empty()
-        {
-            let previous_keep_set = std::mem::take(&mut self.keep_set);
-            self.keep_set.extend(navigation_pages.iter().copied());
-            self.keep_set
-                .extend(self.still_seek_thumbnail_pages.iter().copied());
-            let start = navigation_pages.iter().min().copied().unwrap_or(0);
-            let end = navigation_pages
-                .iter()
-                .max()
-                .copied()
-                .map_or(start, |idx| idx.saturating_add(1));
-            self.keep_range = (start, end);
-            self.keep_start_shared.store(start, Ordering::Relaxed);
-            self.keep_end_shared.store(end, Ordering::Relaxed);
-            self.thumb_pixels
-                .retain(|idx, _| self.keep_set.contains(idx));
-            self.thumb_edit_preview_layers
-                .retain(|idx, _| self.keep_set.contains(idx));
-            self.thumb_adjust_tex
-                .retain(|idx, _| self.keep_set.contains(idx));
-            let force_full_reconcile =
-                self.thumbnail_eviction_generation != Some(self.items_generation);
-            self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
-            self.thumbnail_eviction_generation = Some(self.items_generation);
-            self.details_thumb_suppression_applied = false;
-            self.ensure_navigation_target_thumbnail_requests(ctx, &navigation_pages);
-            return;
-        }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
-            if self.details_thumb_suppression_applied
-                && self.thumbnail_eviction_generation == Some(self.items_generation)
-                && self.still_seek_thumbnail_pages.is_empty()
-            {
-                return;
+            if !navigation_pages.is_empty() {
+                self.ensure_navigation_target_thumbnail_requests(ctx, &navigation_pages);
             }
-            let previous_keep_set = std::mem::take(&mut self.keep_set);
-            self.keep_set
-                .extend(self.still_seek_thumbnail_pages.iter().copied());
-            self.keep_range = (0, 0);
-            self.keep_start_shared.store(0, Ordering::Relaxed);
-            self.keep_end_shared.store(0, Ordering::Relaxed);
-            self.thumb_pixels
-                .retain(|idx, _| self.keep_set.contains(idx));
-            self.passthrough_rendition_cache.clear();
-            self.thumb_edit_preview_layers
-                .retain(|idx, _| self.keep_set.contains(idx));
-            self.thumb_adjust_tex
-                .retain(|idx, _| self.keep_set.contains(idx));
-            let force_full_reconcile =
-                self.thumbnail_eviction_generation != Some(self.items_generation);
-            self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
-            self.thumbnail_eviction_generation = Some(self.items_generation);
-            if let Some(queue_arc) = self.reload_queue.clone() {
-                let (ref mtx, _) = *queue_arc;
-                let mut q = mtx.lock().unwrap();
-                q.retain_mut(|r| {
-                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
-                    if keep {
-                        r.priority = true;
-                    } else {
-                        self.requested.remove(&r.idx);
-                    }
-                    keep
-                });
+            let navigation_active = !navigation_pages.is_empty();
+            let projection = thumbnail_keep_projection(
+                self.items.len(),
+                std::iter::empty(),
+                navigation_pages,
+                self.details_hover_thumb_idx,
+                bookmark_pages,
+                self.still_seek_thumbnail_pages.iter().copied(),
+            );
+            let projection_unchanged = self.thumbnail_eviction_generation
+                == Some(self.items_generation)
+                && self.keep_set == projection.pages
+                && self.keep_range == projection.bounded_range;
+            if !projection_unchanged {
+                self.install_thumbnail_keep_projection(projection, true);
+                if !navigation_active {
+                    self.passthrough_rendition_cache.clear();
+                }
             }
-            if let Some(queue_arc) = self.heavy_io_queue.clone() {
-                let (ref mtx, _) = *queue_arc;
-                let mut q = mtx.lock().unwrap();
-                q.retain_mut(|r| {
-                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
-                    if keep {
-                        r.priority = true;
-                    } else {
-                        self.requested.remove(&r.idx);
-                    }
-                    keep
-                });
-            }
-            self.details_thumb_suppression_applied = self.still_seek_thumbnail_pages.is_empty();
+            self.details_thumb_suppression_applied = self.keep_set.is_empty();
             return;
         }
         self.details_thumb_suppression_applied = false;
@@ -34619,46 +34860,24 @@ impl App {
             vis_keep_end = vis_keep_end.max(strict_visible_end);
         }
 
-        // keep_set: prefetch / eviction / retain / idle upgrade がこれを使う。
+        // Build the shared owner projection from the already capped grid slice. Do not derive the
+        // grid owner from the previous aggregate keep_set: that would keep released hover/seek
+        // pages alive forever and would lose the touch-row and VRAM-cap decisions above.
         let keep_slice = self
             .visible_indices
             .get(vis_keep_start_capped..vis_keep_end)
             .unwrap_or(&[]);
-        let previous_keep_set = std::mem::take(&mut self.keep_set);
-        self.keep_set.extend(keep_slice.iter().copied());
-        self.keep_set
-            .extend(self.still_seek_thumbnail_pages.iter().copied());
-
-        // keep_range: grid keep_slice の bounding box。worker atomic キャンセル判定で使う。
-        // still seek の bounded exact set は shared set で別判定し、ここを広げない。
-        // `visible_indices` は `rebuild_visible_indices` が `for i in 0..n { push(i) }` で
-        // 構築するため昇順。その部分列である `keep_slice` も昇順なので、min/max は
-        // 端の要素を直接参照すれば O(1)。将来 display list をソート以外の順で構築する
-        // 改修が入るときはこの前提ごと再考すること。
-        let (keep_start, keep_end) = match (keep_slice.first(), keep_slice.last()) {
-            (Some(&mn), Some(&mx)) => (mn, (mx + 1).min(total)),
-            _ => (0, 0),
-        };
-        self.keep_range = (keep_start, keep_end);
-        self.keep_start_shared.store(keep_start, Ordering::Relaxed);
-        self.keep_end_shared.store(keep_end, Ordering::Relaxed);
-
-        // (1) 範囲外の Loaded を Evicted にする (TextureHandle を drop)
-        //     動画サムネイルは一度ロードしたら維持する (別パスのため再要求できない)
-        //
-        //     重要: ここでは `requested` を触らない。ワーカーが処理中の idx を
-        //     requested から抜くと、scroll 戻り時に同じ idx が再エンキューされ、
-        //     二重レンダ (特に PDF) を引き起こすため。
-        //     requested の cleanup は以下で行う:
-        //       - エンキュー済・pop 前の取消: 下の q.retain が dropped idx を remove
-        //       - ワーカー pop 後の STALE: worker が canceled=true を送信し
-        //         poll_thumbnails が remove
-        //       - 正常完了: poll_thumbnails が remove
         let t1 = frame_t0.elapsed();
-        let force_full_reconcile =
-            self.thumbnail_eviction_generation != Some(self.items_generation);
-        self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
-        self.thumbnail_eviction_generation = Some(self.items_generation);
+        let projection = thumbnail_keep_projection(
+            total,
+            keep_slice.iter().copied(),
+            navigation_pages.iter().copied(),
+            None,
+            bookmark_pages,
+            self.still_seek_thumbnail_pages.iter().copied(),
+        );
+        let interactive_thumbnail_pages = self.install_thumbnail_keep_projection(projection, false);
+        let (keep_start, keep_end) = self.keep_range;
         let t2 = frame_t0.elapsed();
 
         // (2) reload_queue 内の keep_range 外リクエストを除去し、
@@ -34866,7 +35085,7 @@ impl App {
                 req.force_cache = true;
             }
             req.priority = (i >= visible_raw_start && i < visible_raw_end)
-                || self.still_seek_thumbnail_pages.contains(&i);
+                || interactive_thumbnail_pages.contains(&i);
             // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
             // enqueue しない。visible (= priority=true) は常に enqueue する。
             // SourceOnly は idle upgrade 経路 (本 PR scope 外) なので素通し。
@@ -34939,7 +35158,7 @@ impl App {
             // 非可視 + !SourceOnly (= grid prefetch) は prefetch_ok=false なら prune。
             // SourceOnly は idle upgrade 経路で本 PR scope 外。
             let keep_set = &self.keep_set;
-            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
+            let interactive_thumbnail_pages = &interactive_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34948,7 +35167,7 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
@@ -34959,7 +35178,7 @@ impl App {
             });
             for r in q.iter_mut() {
                 r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
-                    || still_seek_thumbnail_pages.contains(&r.idx);
+                    || interactive_thumbnail_pages.contains(&r.idx);
             }
             let _q_before = q.len();
             for r in new_regular {
@@ -34977,7 +35196,7 @@ impl App {
             let (ref mtx, ref cvar) = *hq;
             let mut q = mtx.lock().unwrap();
             let keep_set = &self.keep_set;
-            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
+            let interactive_thumbnail_pages = &interactive_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34986,7 +35205,7 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
@@ -34997,7 +35216,7 @@ impl App {
             });
             for r in q.iter_mut() {
                 r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
-                    || still_seek_thumbnail_pages.contains(&r.idx);
+                    || interactive_thumbnail_pages.contains(&r.idx);
             }
             for r in new_heavy {
                 requested.insert(r.idx, false);
@@ -35295,7 +35514,7 @@ impl App {
     /// - `reload_queue` が空で `requested` も空 (他の作業が全て終わっている)
     ///
     /// アップグレード対象:
-    /// 1. `Loaded { from_cache: true }` — キャッシュ (WebP q=75) 由来で画質劣化。
+    /// 1. `Loaded { origin: UpgradeableCache }` — キャッシュ (WebP q=75) 由来で画質劣化。
     ///    ただし `FinalCache` origin は対象外集合に記録される
     /// 2. `Loaded { rendered_at_px < current_display_px * 0.8 }` —
     ///    列数変更などで現在のセルサイズより 20% 以上小さい解像度で生成されている
@@ -35361,7 +35580,7 @@ impl App {
         // 現在の display_px (アイドル判定とサイズ比較に使用)
         let current_display_px = self.display_px_shared.load(Ordering::Relaxed);
 
-        // 候補集め: keep_range 内で from_cache=true or 解像度不足のものを全件
+        // 候補集め: keep_range 内で upgradeable cache または未評価の解像度不足を全件
         //
         // ※ 以前は BATCH=4 で小分け push していたが、進捗バーが「0/4 → 4/4 → 消える」
         //    を繰り返すちらつき現象が発生していた。現在は keep_range 内の全候補を
@@ -35378,7 +35597,7 @@ impl App {
             }
             let needs_upgrade = match self.thumbnails.get(i) {
                 Some(ThumbnailState::Loaded {
-                    from_cache,
+                    origin,
                     from_edit_preview,
                     rendered_at_px,
                     source_dims,
@@ -35398,8 +35617,16 @@ impl App {
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    !*from_edit_preview
-                        && (*from_cache || (*rendered_at_px as u64) * 5 < (target_px as u64) * 4)
+                    let undersized = (*rendered_at_px as u64) * 5 < (target_px as u64) * 4;
+                    let origin_needs_upgrade = match *origin {
+                        crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache => true,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px,
+                        } => undersized && evaluated_display_px < current_display_px,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
+                        | crate::thumb_loader::ThumbLoadOrigin::FinalCache => false,
+                    };
+                    !*from_edit_preview && origin_needs_upgrade
                 }
                 _ => false,
             };
@@ -35675,6 +35902,9 @@ impl App {
         {
             return None;
         }
+
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::mark_action_pass_eligible(ctx);
 
         if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
             return Some(nav);
@@ -41255,12 +41485,21 @@ impl App {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
         let right_drag_guide = self
             .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
-        DeferredDetachedImageWindowView::from_snapshot(
+        let view = DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,
             apply_initial_placement,
             right_drag_guide,
-        )
+        );
+        #[cfg(feature = "test-script")]
+        let view = {
+            let mut view = view;
+            let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            view.test_script_window_identity =
+                self.test_script_window_identity(window.id, viewport_id);
+            view
+        };
+        view
     }
 
     #[cfg(windows)]
@@ -42990,6 +43229,12 @@ impl App {
             ));
             return None;
         };
+        #[cfg(feature = "test-script")]
+        let test_script_content_proof = self.test_script_content_proof(
+            idx,
+            &texture,
+            self.test_script_paint_source_kind(idx, &texture),
+        );
         let texture_size = texture.size_vec2();
         let rotation = self.get_rotation(idx);
         let zoom_pan = self.fs_zoom_pan();
@@ -43059,6 +43304,11 @@ impl App {
             pixels_per_point,
             visible_region,
         );
+        #[cfg(feature = "test-script")]
+        let texture = match test_script_content_proof {
+            Some(proof) => texture.with_test_script_content_proof(proof),
+            None => texture,
+        };
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
@@ -70498,8 +70748,14 @@ impl App {
         self.sync_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
         self.drain_deferred_detached_activation_watcher(ctx);
+        #[cfg(all(windows, feature = "test-script"))]
+        let test_script_committed_activation = self.test_script_drive_targeted_activation(ctx);
+        #[cfg(not(all(windows, feature = "test-script")))]
+        let test_script_committed_activation = false;
         #[cfg(windows)]
-        self.commit_pending_deferred_detached_window_activation(ctx);
+        if !test_script_committed_activation {
+            self.commit_pending_deferred_detached_window_activation(ctx);
+        }
         mark_update_perf(
             &mut update_perf,
             UpdatePerfStage::DetachedViewportManagement,
@@ -72152,6 +72408,8 @@ impl eframe::App for App {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::finish_action_pass(ctx);
         // UI の代入箇所を列挙せず、frame 終端で有効値との差分を一括検出する。
         self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
         self.poll_favorite_view_writes(ctx);
@@ -74045,6 +74303,10 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "app/tests/still_seek_thumbnail_ownership.rs"]
+mod still_seek_thumbnail_ownership;
 
 /// Crate-wide `App` test fixture.
 ///

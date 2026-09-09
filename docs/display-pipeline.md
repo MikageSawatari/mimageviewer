@@ -12,7 +12,7 @@
 `GridItem` 1 個につき 1 つの `ThumbnailState` (grid_item.rs) を持つ:
 
 ```
-Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, from_cache, rendered_at_px,
+Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, origin, rendered_at_px,
                                                            source_dims, layout_dims }
                                                        │
                                            (keep_range 外に出ると)
@@ -21,6 +21,13 @@ Pending ──────────(ワーカーがデコード)────�
 ```
 
 Failed は単発の終端ステート。デコードエラー時のみ。
+
+`origin` はworkerの`ThumbMsg`とLoadedが共用する`ThumbLoadOrigin`で、
+`SourceGenerated { evaluated_display_px }` / `SourceIntrinsic` /
+`UpgradeableCache` / `FinalCache`を区別する。`rendered_at_px`は実際の画像長辺、
+`evaluated_display_px`はその画像の生成に使った要求サイズであり、単位は同じでも意味が違う。
+cache由来かどうかはoriginから導出し、独立した`from_cache`状態は保持しない。
+画像なしのfinalized/cancel/errorはLoaded画像のoriginを更新しない。
 
 `Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）と PDF の `layout_dims` を
 per-context の `PageDimsCache` の別 map に記録する。`source_dims` は常にピクセル座標、
@@ -45,7 +52,9 @@ fail-closed する。
    - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
      通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン中の
      early return で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
-4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `LoadSourcePolicy::SourceOnly` で再要求 → 高品質デコード。ただし、`make_load_request` が親コンテナや手動ピンを最終 target へ解決した後も `SourceOnly` を保つ要求だけを upgrade queue へ入れる。編集プレビューと、動画ピンから seed された完成済み WebP キャッシュは元画像から改善できない派生画像なので対象外。特に動画ピン要求は `apply_folder_thumb_pin` が意図的に `CacheOrSource` へ変換し、アイドル高画質化へ投入しないことでフォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定した idx は現在の Loaded サムネイル / viewer context に紐づけて記憶し、repaint ごとの pin 解決も行わない。この記憶は新しい items 世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する。`--perf-log` 時は最終判定を `thumb.idle_upgrade_enqueue` / `thumb.idle_upgrade_ineligible` として記録し、同一 key / idx / items 世代の反復をリリース前 `idle-health` 検査で拒否する
+4. **アイドル時品質アップグレード**: 入力・スクロールが500ms静止し、既存要求が完了したら、`UpgradeableCache`のLoadedを`LoadSourcePolicy::SourceOnly`で再要求する。`SourceGenerated`は実寸が`min(source_long_edge, current_display_px)`の80%未満、かつ現在の要求サイズがその画像の`evaluated_display_px`より大きい場合だけ再要求する。編集プレビュー、`FinalCache`、動画Shell等の`SourceIntrinsic`は対象外。ただし、`make_load_request`が親コンテナや手動ピンを最終targetへ解決した後も`SourceOnly`を保つ要求だけをupgrade queueへ入れる。動画ピン要求は`apply_folder_thumb_pin`が意図的に`CacheOrSource`へ変換し、フォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定したidxは現在のLoadedサムネイル/viewer contextに紐づけて記憶し、repaintごとのpin解決も行わない。この記憶は新しいitems世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する。`--perf-log`時は最終判定を`thumb.idle_upgrade_enqueue` / `thumb.idle_upgrade_ineligible`として記録し、同一key/idx/items世代の反復をリリース前`idle-health`検査で拒否する。
+   - **同一要求の収束 (§1.198)**: 整数寸法選択は比率精度を優先するため、884×444への374px要求が247×124になる場合がある。実寸だけで不足判定すると同じ生成を永久に繰り返す。生成に使った要求サイズを画像と共に保持し、同一/縮小要求では再投入しない。374→400pxのような拡大要求では不足を再評価する。生成画素・0.05%の比率精度契約は変更せず、「十分な実解像度」ではなく「同一生成要求の完了」を保証する。
+   - 要求サイズはworkerが実際に生成へ使った値を載せ、送信時やUI受信時の最新値に置き換えない。texture backlogもoriginをそのまま保持し、過去要求の最大値と合成しない。世代不一致・keep外で捨てた画像から完了coverageを公開しない。
    - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
      親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
    - **フレーム内境界レース対策 (2026-06-19)**: アップグレードの起動条件 (input/scroll が
@@ -309,6 +318,54 @@ idle frame で本全体を再走査しない。本体側の見開き解決規則
 RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
+
+### 1.7 サムネイル画質ダイアログのプレビュー寸法
+
+`src/ui_dialogs/thumb_quality.rs` は viewport と実際の利用可能幅から A/B プレビューを配置する。
+詳細表示の `last_cell_size` / `last_cell_h` は行幅と行高であり、サムネイルの寸法として使わない。
+詳細表示ではサムネイル比率を反映した基準寸法を用い、サムネイル表示でも巨大なセル寸法を
+そのまま Window の要求寸法へ流さず、プレビューを利用可能幅と高さの上限へ収める。
+
+狭幅では A/B を縦に配置し、内容を ScrollArea に入れる。下部の説明・操作はその外へ置く。
+Window の初期サイズ・最小サイズ・最大サイズと constrain rect を viewport から定め、
+詳細表示から開いた場合やウィンドウを縮めた場合も、実外枠と閉じる操作を viewport 内に保つ。
+egui の content サイズには title / frame が後から加わるため、内側の余白と実外枠を同一視しない。
+プレビューの拡大クリック、スライダー、A/B 適用、全画面プレビュー、Esc とタイトルの閉じる処理を維持する。
+
+§1.200 の回帰は同 module の headless egui tests 8 件。日本語フォントを用いた詳細/サムネイル表示、
+fresh 480×420 と大画面からの縮小、実 ScrollArea 後の B 適用ボタン到達、プレビュークリック、
+タイトル閉じるクリックと後始末を確認する。適用ボタンの到達性は実 Response で観測し、
+ユーザーの設定保存は実行しない。2026-09-08 の焦点 gate は 8 件 PASS、独立 Astra レビューに blocking なし。
+実 OS のリサイズドラッグ、IME、実アプリ操作の完了を示すものではない。
+
+### 1.8 詳細表示と複数のサムネイル利用元の保持
+
+詳細表示は通常グリッドのサムネイル読み込みを抑制するが、静止画シーク列・ホバー・しおりや
+ページ移動先の要求まで消去しない。`thumbnail_keep_projection` が現在の利用元を合成し、
+`install_thumbnail_keep_projection` が同じ viewer context の保持・退去・キューを調整する。
+
+| 利用元 | 投影の正本 | worker 側の範囲 |
+| --- | --- | --- |
+| 通常グリッド | 既存の可視範囲・タッチ追加行・VRAM上限を反映した keep slice | bbox |
+| ページ移動先 | items 世代が一致する navigation sequence の target pages | bbox・優先 |
+| 詳細ホバー | 現在の hover idx | bbox・優先 |
+| 表示中のしおりパネル | 現 container と loaded bookmark の typed page identity に一致する既存 keep 候補 | bbox・優先 |
+| 静止画シーク | 既存の `still_seek_thumbnail_pages` | sparse exact set・優先 |
+
+合成済みの keep / bbox からグリッドの元範囲を逆算しない。しおりの新しいページは既存 ensure が
+keep へ入れてから要求し、次の投影は現在の membership と実パネルの表示条件で保持・失効を決める。
+navigation / bookmark の ensure は既存 bbox と union してから worker へ公開する。
+離れた still seek ページは bbox を広げず、従来の exact set で読み込みを許可する。
+
+最後の利用元が離れたページだけを退去し、未処理キューやUI側のbacklog / finalize待ちから
+実際に取り除いた要求の `requested` を解除する。worker が既に pop して処理中の要求は、結果・cancel・error・finalized の
+既存通知で終える。`SourceGenerated` は画像到着後に Loaded となっても cache 確定通知まで
+requested を保持し、同じページの重複 decode を防ぐ。
+
+しおり候補照合は loaded bookmark の typed HashSet と keep 候補を使い O(B+K) に留める。
+フォルダ本の適格性に必要な全画像分類は既存 `ViewerNavigationCaches` の context / source 世代で
+memo 化する。製本・synthetic 等の既存短絡条件を維持し、毎フレームの全件走査を増やさない。
+独立レビューと回帰の結果は [v3.7.0 作業台帳](v3.7.0-priority-work.md) に記録する。
 
 ## 2. フルスクリーン表示パイプライン
 
@@ -1286,10 +1343,12 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 で区別する。拡大時はさらに、
 生成元となった source pixel 領域の x / y / width / height を記録する。
 
-静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
-実表示と固定状態から解決した `StillSeekGeometry::reserved_height`、上部情報バー固定時は
-`TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
-両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
+静止画の最終フィット矩形は `fullscreen_media_rect_with_geometry` が所有する。
+active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeometry` の
+下部予約量・有効gap・上部予約量を使い、上下を同時に除外した同一矩形を、
+単ページ・見開き・連結読み・入力座標へ渡す。単独入口の `fullscreen_media_rect` は同じ解決を行うwrapperである。
+極小の外枠では `min(1, viewport_height)` の画像領域を保ち、controlsを先にfitしてから任意gapへ
+残りを配分する。上部固定バー自身の描画を高さ44pt未満へ再設計する変更は含めない。
 固定領域の予約は各バーの描画可否と同じ述語を使う。特に編集／注釈・範囲キャプチャ・音楽ビューで
 上部バーを抑止するときは `TOP_BAR_HEIGHT` も予約せず、非表示バー由来の黒帯を残さない。
 上端の原画プレビュー・スライドショー進捗インジケータと、下端の比較ピンインジケータも
@@ -1340,9 +1399,29 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
-列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer の X/Y を
-保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ押下時点からの総 x 移動量と
-同じ高さ preset の `window_cell_width_points()` を渡し、整数 source position へ丸めて先頭 / 末尾で
+静止画の高さは専用の `StillSeekStripHeight` と5段階の独立値で保存する。既定は
+最小36 / 小48 / 中72 / 大104 / 最大144、各値は36～320のlogical point（100%表示時のpx相当）。
+閲覧中は下部バー右端のフィルムボタンから、列の表示 / 非表示と5段階を同じ menu popup で
+選べる。各行は環境設定に保存済みの現在値を表示し、選択は既存の Settings setter / save と
+`StillSeekGeometry` へ合流するため、main / F12 と本・通常画像で同じ設定を使う。popup の開閉は
+viewport ごとの egui memory が所有し、新しい App state は持たない。popup 表示中は下部バーを維持し、
+Escape・矢印・Enter、pointer・touch は popup を優先して背面のページ移動や fullscreen close に流さない。
+動画・音声のシークストリップも専用の `SeekStripHeight` と独立した5段階値を持ち、同じ既定値と
+36～320の解決時clampを使う。旧4段階の保存名と既定の大は保ち、静止画の値とは共有しない。
+動画側は `NativeBarLockState` が段階と値をsource切替・main/F12間へ運ぶ。実効下部バー、strip、
+top lock、固定gapは `VideoSeekGeometry` がviewport内で一度解決し、paint / hit / 映像予約 / hover /
+波形要求が同じ矩形を読む。操作面を優先して残余だけをgapへ使い、上部HUDとstripを重ねない。
+正の極小stripではcell・鍵・notice・範囲文字を同じbody clipへ収め、文字は実galleyに合わせて
+連続縮小・省略する。0領域だけ描画と新規material要求を止め、Primary dragの所有はreleaseまで保つ。
+周辺表示のdragは押下時のセル幅または波形の帯幅・時間幅を保持するため、途中の高さ変更で着地が
+飛ばない。0寸法中は新規material要求だけを止め、進行中gestureのreleaseは押下時尺度で完了する。
+現在のCentralPanel外枠から一度解決する `StillSeekGeometry` が、画像予約量・表示・入力・
+左右パネル・zoom・holdoverの実効寸法を共有する。小さい外枠ではbar、strip、gap、ボタンを
+同じ予算内へ収め、正の操作領域を寸法の下限だけで隠さない。holdoverも現在のchrome設定を使う。
+
+列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position、pointer の X/Y と
+`drag_step_width` を保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ
+押下時点からの総 x 移動量と保持した換算幅を渡し、整数 source position へ丸めて先頭 / 末尾で
 clamp する。右へ引くと中央 source position は小さくなる。判定順序も動画と同じく、まず
 `strip_drag_closes_downward` で下ドラッグ close を決め、close でない場合だけ中央を動かす。
 静止画側の呼び出し境界は `min(strip_rect.bottom(), full_rect.bottom() - 1 / pixels_per_point)`
@@ -2452,6 +2531,12 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   対象 idx を `ai_upscale_prefetch_forward / back` 件まで取得する。同じ更新入口から
   カラー化の final composite 先読みも行い、AI 使用ページは `final_ai_cache` 完成後、
   AI 不使用ページは edit pixels 準備後に 1 件ずつ final-effect worker へ送る。
+  対象列はアップスケール / ノイズ除去の final AI と、カラー化 / Creative LUT の
+  final effect で共通である。ページ単位の見開きでは表示単位の読み順先頭が現在 idx になり、
+  同じ見開きの相方が前方 1 枚目を使う。既定の後方 2 / 前方 3 は、表紙なしの 2 ページ見開きで
+  直前・直後の表示単位を両ページとも範囲へ含める。v3.7.0 では旧既定の前方 2 だけを版境界で
+  一度 3 へ移行し、保存済みの後方値は変更しない。表紙ありモードの末尾から先頭への循環は
+  この範囲計算へ含めない。
   ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を

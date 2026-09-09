@@ -11,6 +11,38 @@ HDD 上の長尺動画では、未測定動画を再生する前に全尺スキ�
 `normalize_scan_bench` は既存の `scan_audio_loudness` をそのまま使い、ランダム抽出した
 動画を逐次 / 並列で測る。アプリの再生 UI は起動せず、スキャン単体の実効速度を見る。
 
+## 解析用入力のストリーム除外（v3.7.0）
+
+ノーマライズと動画波形のrange decoderは、`audio_decode::discard_unselected_streams` を
+共有する。FFmpeg inputを開いて音声を選択し、codec情報を取得した後、選択stream以外を
+`AVDISCARD_ALL` に設定してからpacketを読む。別の音声trackも除外対象となり、選択した
+音声stream自身のdiscard設定は変更しない。packet側のstream index検査も維持する。
+
+対象は各解析workerが所有する専用Inputだけで、再生用の映像・音声demuxや別workerのInputへ
+設定を伝播しない。音楽ビューの全尺 / progressive decoderは今回の適用範囲に含めない。
+初期open / stream probeの前には設定しないため、その段階の高速化は本変更の主張に含まない。
+
+LUFS / true peakは従来どおり全尺の48kHz stereo音声を `ebur128` で測定し、
+10分ぶんの仮結果、確定値のDB保存、取消と進捗の仕組みを維持する。
+波形の粗いpeak列はノーマライズ測定の代用にしない。
+
+波形側の `50e25ffb8` には特定のwarm-cache素材で約1.8倍となった過去の記録があるが、
+ノーマライズへ同じ倍率を保証するものではない。効果はコンテナ・音声codec・I/O条件と
+`ebur128` の処理比率に依存するため、本ベンチでの比較結果と実装済みを分けて記録する。
+
+非対話の回帰は `audio_decode::tests::discard_unselected_streams_preserves_selected_and_other_context`
+で対象streamと別Inputの不変を検査する。実demux / 測定の回帰はFFmpeg CLIが必要なため
+通常gateではignoreし、次を明示実行する。`ffmpeg.exe` をPATHに置くか、
+`MIV_TEST_FFMPEG` 環境変数でCLIの場所を指定する。
+
+```powershell
+cargo test -p mimageviewer --lib normalize_discard_preserves_selected_audio_results_and_cancellation -- --ignored --nocapture
+```
+
+このテストは一時フォルダに動画と音量の異なる2本の音声を生成し、既定の選択音声だけを
+取り出した素材との全尺・仮結果の一致、専用Inputのdiscard設定、別Input非干渉、進捗・取消を
+確認する。再生アプリやユーザーの設定DBは使わない。実UIの検証とは別に実行できる。
+
 ## 使い方
 
 別 worktree で clean build する場合、`vendor/` は junction / symlink で共有しない。必要な

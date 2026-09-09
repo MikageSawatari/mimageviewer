@@ -507,6 +507,13 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 
+Source生成結果には、実寸と別に`ThumbLoadOrigin::SourceGenerated { evaluated_display_px }`
+で実際の生成要求サイズを付ける。Loadedまで同じoriginを保持し、同一要求の完了をidle側が
+認識できるようにする（§1.198）。画像なしのcancel/error/finalizedからは完了を公開しない。
+texture backlogは画像とoriginを一緒に保持し、旧items世代やkeep外の破棄結果を新しい画像へ
+合成しない。contextの移動・forkでもLoaded画像のprovenanceとして扱い、App-globalな
+完了フラグや別contextへの失効通知を追加しない。
+
 サムネイルは「keep_range 内かどうか」が毎フレーム変化するため、単純なキャンセルでは
 **同じ idx が in-flight なのに scroll 戻りで再エンキューされ、PDF 再レンダが二重に走る**
 事故を起こす。2026-04 のセッションで以下のルールを確立した:

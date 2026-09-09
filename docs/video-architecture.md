@@ -332,12 +332,18 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 
 固定したバーは映像へ重ねず、`compute_video_visual_transform` の target 矩形から上部 54pt / 下部
 64pt と `fullscreen_fixed_bar_gap_px` の共通余白を除外し、残った領域へ映像を letterbox fit する。
-`BarAndStrip` では presenter が所有する `Option<NativeOverlaySeekStrip>` が `Some` のときだけ
-ストリップの高さも下部予約領域へ足す。**その高さは選んだプリセット (大 104 / 中 72 / 小 48pt) で
-変わるので、`VideoVisualLayout` は「表示中か」ではなく占めている points を運ぶ。** 高さの正本は
-overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・セル寸法・波形ラスタの要求・左右パネルの
-hover band も同じ `SeekStripLayout` から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md)
-の「全体表示と高さ」)。`Some` / `None` の変化は transform と表示解像度 surface の
+`BarAndStrip` では presenter が所有する strip の material availability が利用可能または解決中なら、
+ストリップの実効高さも下部予約領域へ足す。高さは最大 / 大 / 中 / 小 / 最小の 5 段階を独立に保存し、
+既定は 144 / 104 / 72 / 48 / 36 logical point、各値は解決時だけ 36..=320 に制限する。
+旧 4 段階の保存名と既定の「大」は維持する。`VideoVisualLayout` は「表示中か」ではなく占めている
+points を運ぶ。高さと5段階値の正本は overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・
+セル寸法・波形ラスタの要求・左右パネルの hover band も同じ `VideoSeekGeometry` / `SeekStripLayout`
+から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md) の「全体表示と高さ」)。
+要求高さが viewport に収まらない場合は下部 controls、固定上部、strip、残余の固定 gap の順に
+実効量を解き、hover で同時表示される上部 54pt と下部バーの間に strip を収める。正の領域では
+notice と範囲文字も実寸に合わせて連続的に縮小・省略し、strip 本体の clip 内へ収める。0 領域では
+画像・波形要求と描画を発行せず、進行中の Primary drag は保持して release を 1 回だけ処理し、
+正領域へ戻れば再要求する。`Some` / `None` の変化は transform と表示解像度 surface の
 準備状態を更新し、ストリップを「なし」にしたときは固定設定を保持したまま領域だけを解放する。
 論理 pt と余白は native overlay の pixels-per-point で物理 px に変換する。presenter HWND は monitor
 全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
@@ -367,9 +373,15 @@ egui が後勝ちでポインタを渡す規則に合わせて本体の `interac
 上下の実描画状態と、上部 hover から下部への連動は tile / navigation preview の間は抑止する。
 hover / 固定状態を region 側で再計算しないため、描画されたバーだけが入力を受け、
 鍵ボタンも同じ上下 bar region 内で入力を受ける。透明な上下端帯が VST editor の操作を奪う状態も
-作らない。固定表示は external drag 中も維持するが、
-`native_touch.chrome_latched()` 自体は変更しない。したがって固定解除後は、その時点の
+作らない。固定表示は external drag 中も維持するが、`native_touch.chrome_latched()` 自体は
+変更しない。したがって固定解除後は、その時点の
 touch latch または hover 入力へ直ちに戻り、固定表示だけで左右の touch handle が開くことはない。
+
+上部バーのタイトル / 補助情報は、右から配置した各 control の実 `Response::rect` と倍率表示 rect の
+union を描画時に一度集め、その左側に残る幅だけへ 1 行で layout する。収まらない文字列は実フォント幅で
+末尾を省略し、残り幅がない場合は文字列だけを描かない。通常再生、音声 shell、タイル一覧、
+動画切替プレビューで同じ規約を使い、control の表示条件、28pt の response / hit area、tooltip、
+metadata パネルから全文を確認できる経路は変えない。
 
 通常の動画→音声モードは native presenter を隠し、音楽ビュー側の常時表示バーを使うため、
 この設定による見た目の変更はない。VST GUI の owner として audio-only native presenter を
@@ -844,9 +856,9 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 サムネイル軸、2 種類の worker を 1 session として所有する。
 
 通常バーの表示方針とストリップ配置は presenter の `VideoSeekGeometry::resolve` が一度だけ解決する。
-場面サムネイル表示中に通常バーを隠す場合は `normal_bar_height = 0` とし、ストリップ矩形、HUD の
-入力領域、固定映像領域、下端ホバー、左右 / VST パネルが同じ解決値を見る。表示する場合と音声波形
-表示中は `HUD_BOTTOM_HEIGHT` を保つため、従来座標と予約高を変えない。
+場面サムネイル表示中に通常シーク行を隠す場合は下部 controls 40pt を保ったまま seek row 24pt だけを
+外し、ストリップ矩形、HUD の入力領域、固定映像領域、下端ホバー、左右 / VST パネルが同じ解決値を
+見る。表示する場合と音声波形表示中は `HUD_BOTTOM_HEIGHT` を保つため、従来座標と予約高を変えない。
 
 **全体表示では中心位置は状態ではなく導出値**で、`pin_whole_center` だけが書く。軸の真ん中
 (場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した
@@ -925,7 +937,10 @@ failed bitset にだけ記録して永続化せず、残りの構築を継続す
 failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と音声 track なし
 だけはファイル単位の `Unavailable` として全体を止める。
 
-`AudioRangeDecoder::open` は FFI で音声以外の `AVStream.discard` を `AVDISCARD_ALL` にし、
+`AudioRangeDecoder::open` は共有 `audio_decode::discard_unselected_streams` で選択音声以外の
+`AVStream.discard` を `AVDISCARD_ALL` にする。同helperを動画ノーマライズの専用Inputでも使い、
+再生Inputや別workerへ影響させない。既存perf項目 `discarded_non_audio_streams` は互換のため
+名前を維持するが、実際には非選択の別音声trackも含む除外数である。
 永続 chunk の一括読み込みは `wave_coarse_cache`、chunk perf は `wave_coarse_chunk`、粗い列からの描画は
 `wave_coarse_serve` へ出す。従来窓の
 pre-roll bins は raster 前に捨て、全尺前提の beat grid は作らない。窓波形 raster の LRU は
@@ -971,12 +986,13 @@ strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする 
 占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。
 描画、pointer hit test、可視窓計算はすべてこの左端基準を使う。モード切替では中央時刻を
 保ったまま軸だけを交換する。ドラッグは press 時の
-中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
-同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
+中心と pointer、セル幅または波形の帯幅・時間幅を immutable origin とし、現在 pointer との差から
+毎 frame の中心と release 中心を同じ純関数で求める。ドラッグ中に高さ設定や viewport が変わっても
+押下時の換算尺度を使う。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
 100ms cadence で
 playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。**この追従と
 ドラッグ移動は周辺表示だけのもの**で、全体表示は帯を動かさず、離した位置の時刻へ 1 回 seek する。
-HUD の vector film-strip button はメニューを開き、非表示・4 表示・3 高さを直接選べる
+HUD の vector film-strip button はメニューを開き、非表示・4 表示・5 高さを直接選べる
 (巡回は `Shift+S`)。OFF は非アクティブ、waveform はフィルム上の vector 音符で区別する。
 ストリップ本体にはモード切替 UI を置かず、全域を
 ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ選んだ高さのぶん上へ退避し、
@@ -1811,6 +1827,15 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `CreateWindowExW` で borderless top-level window を作成、message pump を別スレッドで回す
 - `WM_KEYDOWN` / `WM_LBUTTONDOWN` / `WM_MOUSEWHEEL` 等を `NativeVideoWindowEvent` enum
   に正規化して内部 channel に push (UI スレッドが受信)
+- presenter が `VK_BROWSER_BACK` / `VK_BROWSER_FORWARD` の `WM_KEYDOWN` / `WM_SYSKEYDOWN`
+  を native route へ enqueue した場合は、その exact message を処理済みとして返し
+  `DefWindowProcW` へ渡さない。既定処理へ渡すと同じ WndProc へ `WM_APPCOMMAND` が生成され、
+  実 key と合成 key が1物理クリックから2回配送されるためである。driver / AHK が直接送る
+  `WM_APPCOMMAND` branch は独立した fallback として維持する。KeyUp と他の key は従来どおり。
+- raw XButton の DOWN / UP / DBLCLK は presenter / HUD が同じ typed mouse route で所有し、
+  decode 済み message は Win32 の処理済み契約に従って全て TRUE を返す。`CS_DBLCLKS` の
+  DBLCLK は2回目の物理押下として扱う。これは message ownership の統一であり、browser-key の
+  二重配送を止める上記の根因修正とは分ける
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
   egui の Event との 1:1 翻訳を意図しており、`native_presenter/render_core.rs` 側で
   `egui::Event` に変換される
@@ -1844,6 +1869,30 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 
+#### 通常wheelの設定とイベント単位の消費（v3.7.0）
+
+修飾なしの動画・音声wheelは、上位のpanel / modal / seek strip / panorama / zoom / tile処理が
+所有しなかった場合に、`ring_shortcuts.video_normal_wheel_action` の前後ファイル移動（既定）か
+音量調整へ流す。native presenter / HUDで取得したAlt状態も運び、Shift / Altの従来経路は維持する。
+音量は既存dBフェーダーのstep helperとplayer / Settingsへ合流する。
+
+native側は設定値をmetadataへ複製せず、量付き `NormalWheel` をAppへ渡す。Appが現在Settingsを
+一度だけ解決し、同じ実効操作をsource gateと実行に使う。連続ファイル送りに必要な既存
+Navigateのepoch不一致許可は保ち、Volumeにはsource epoch拒否を適用する。fs_idxの所有確認は維持する。
+
+`run_native_event_batch` はraw event indexごとの `Command / OverlayRegion / AppRemainder` を
+outcomeへ持たせる。commandへ変換したwheelはrawで再転送せず、領域wheelは元座標のegui handlerへ
+一度渡す。残余eventのApp転送は同じ論理segmentのrouting snapshotで判定する。
+wheelまでのsegmentをeguiで確定してから次のmoveへ進み、key / buttonによるmodal状態変更がある
+prefixも後続wheelを分類する前に確定する。text / modal / 消費済みEscapeの保護はsegment内に限定する。
+
+論理passの `FullOutput` はappendしてtexture / platform outputの順を保ち、最後のshapesを
+一度だけGPUへsubmit / presentする。productionの時計は実elapsedを使う。契約はraw入力の配送であり、
+egui内部の平滑化残量を別実装したり、全ての残量を元panelへ固定したりはしない。
+headless回帰はproductionと同じdriver / wheel planner、実eguiのstrip handler / ScrollAreaで検査する。
+fixtureの制御時計は単調に進めるが、実GPU出力・USER32配送や実処理時間を検証したことにはしない。
+検証の完了範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) を参照。
+
 #### `native_touch.rs` (`NativeTouchAdapter`)
 
 Win32 依存を持たない純粋部分を両 wndproc から分離する。bounded ownership state、
@@ -1851,10 +1900,21 @@ screen/client/points の座標契約、promoted mouse の fail-open 判定、既
 `crate::touch_input::TouchRecognizer` への sample 変換、先頭接点の egui pointer emulation、
 `ToggleChrome` / `PageSide` の動画 command 写像と source-session reset を持つ。
 動画 presenter は静止画と同じ `center_tap_rect` / `classify_tap` を使い、`ToggleChrome` は
-chrome latch の toggle だけ、物理的な左 / 右の `PageSide` は 1 タップごとに -5 / +5 秒の
-`SeekRelative` だけへ直接写像する。読み方向の解決は通さず、シーク dispatch は latch を
-読み書きしない。タップ間の時刻・距離・回数 state は持たない。App は相対 command を既存
-`native_video_seek_relative_with_hint` へ流す。`SwitchSource` は overlay を再利用するため、専用
+chrome latch の toggle だけ、物理的な左 / 右の `PageSide` は 1 タップごとに方向付きの
+`SeekMedium` へ写像する。読み方向の解決は通さず、シーク dispatch は latch を
+読み書きしない。タップ間の時刻・距離・回数 state は持たない。App は fs_idx / source epoch を
+確認してから現在の Settings の中シーク秒数（既定 5 秒）を解決し、既存
+`native_video_seek_relative_with_hint` へ流す。秒数を overlay metadata に複製しないため、
+source 切り替え時の metadata reset で設定が既定値へ戻らない。小 / 中 / 大の秒数は独立した
+整数 1～600 秒（既定 1 / 5 / 30 秒）で、キー・リング・マウスジェスチャ・ゲームパッド・
+音楽表示の実行経路も同じ設定を使う。物理 Back / Forward / Middle ボタンの 6 シークは、
+同じ 1 クリックが実 browser VK と合成 browser event の 2 producer として届く機器があるため、
+v3.7.0 では新規候補から外し、`App::apply_mouse_button` の単一 ownership 境界で実行しない。
+`RingActionId::is_valid_for_mouse_button_context` は永続データ互換の判定として 6 値を有効に保ち、
+`is_available_for_mouse_button_assignment` だけを候補 / 実行 policy とする。これにより保存済み値を
+sanitize・保存・キャンセル・再表示で消さず、将来の再有効化まで保持する。ring action 自体と
+キーボード・右ドラッグ gesture・gamepad・左右タップ・通常 wheel の経路はこの policy を通らない。
+`SwitchSource` は overlay を再利用するため、専用
 `reset_overlay_source_session()` から latch / 接点 / 初回案内状態の reset を必ず通し、新ファイルへ
 持ち越さない。`touch_correlation.rs` は
 native では使わない。`TapZoneGeometry.excluded` は exact な描画 response rect ではなく

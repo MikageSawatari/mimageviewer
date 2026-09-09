@@ -58,6 +58,7 @@ accesskit = [
     "egui/accesskit",
     "egui-winit/accesskit",
 ]
+miv-test-script-window-witness = []
 android-game-activity = ["egui-winit/android-game-activity"]
 android-native-activity = ["egui-winit/android-native-activity"]
 default = [

@@ -79,7 +79,7 @@ Escape / 修飾なし矢印キーへ割り当てた場合は起動時に警告�
 表示し、Esc / 修飾なし矢印など固定扱いの操作は固定キーとして補助表示する。
 通常の画像フルスクリーンではさらに「タッチ操作」欄を表示し、中央タップのクローム切替、
 左右タップのページ送り、2 本指のズーム / パンを再確認できる。動画では中央タップの HUD 切替と
-左 / 右タップの 5 秒戻る / 進むを表示する。音楽にはこの欄を出さない。
+左 / 右タップの中シークで戻る / 進むを表示する（既定 5 秒、設定で変更可能）。音楽にはこの欄を出さない。
 キー未設定または明示無効化中の割り当て可能操作は、操作カスタマイズ画面で確認する。
 `HelpShowContextShortcuts` もコマンド設定で変更でき、ヘルプ内の固定キー欄や native 動画 overlay の表示は変更後のキーを表示する。動画フルスクリーンは egui 経路と Windows native
 動画 overlay の両方で対応する。既定の `?` は設定ファイル上も `?` と書けるが、内部的には `Shift+/` と同等に扱う。
@@ -282,8 +282,8 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | 編集ツール内のドラッグ状態 | 消しゴム / 隠蔽加工 / 補正レイヤーの選択後の矢印 / <kbd>Ctrl</kbd>+矢印、<kbd>[</kbd> / <kbd>]</kbd>、<kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd>、ハンドル操作中の <kbd>Shift</kbd> / <kbd>Alt</kbd>、テキスト注釈の四隅ハンドルドラッグ中の <kbd>Ctrl</kbd> / <kbd>Shift</kbd>、切り取り / テキスト注釈のドラッグやホイールなど | 選択中オブジェクト、ドラッグ中の形状、パネルフォーカスに依存するモード内操作。テキスト注釈の <kbd>Ctrl</kbd>（中心対称）と <kbd>Shift</kbd>（縦横比固定）は離散ショートカットではなく、マウスドラッグ中だけ幾何制約を切り替える修飾なので keymap 対象外。フルスクリーンキャンバスでは egui の修飾状態が stale になり得るため、両方ともドラッグ中の各フレームで OS から直接読む。操作カスタマイズ画面では消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤーの通常コマンドは「編集モード」としてまとめるが、これらの微調整キーは固定入力のまま |
 | マスク筆の半径 | 消しゴム / 隠蔽加工 / 補正レイヤーで、筆系ツール選択中のキャンバス上 <kbd>Shift</kbd>+ホイール | 1 ノッチごとに半径を約 1.1 倍 / 1.1 分の 1 とし、小さい側でも最低 1px 動かす。筆系ツールかつキャンバス上のときだけ消費し、筆以外やパネル上では従来のホイール経路へ残す。バックログ §4.1 の一般的な Shift / Alt+ホイールのペアバインド再設計はグリッド / 画像 / 動画を横断する別課題であり、今回は動画へ到達しない編集モード限定の固定入力なので `KeyAction` や `Settings.ring_shortcuts` の対象にしない |
 | 360 度パノラマ / 通常動画の拡大表示中 | 360 は左ドラッグの yaw/pitch、ホイールの FOV、上バーの解除・投影方式・視点リセット。通常動画は左ドラッグの表示位置移動、ホイールの拡大縮小、上バーの解除・位置と倍率のリセット | 表示中だけの連続操作 / ボタンなので keymap 対象外。通常動画のホイールはシークストリップ、端パネル、モーダルの領域から奪わず、タッチのピンチは使わない。<kbd>V</kbd> の表示モード切替 (`FsPanorama`) は `FsCommon` の 1 Action で、360 候補ならパノラマ、それ以外の通常動画なら拡大表示を切り替える。<kbd>Shift</kbd>+<kbd>V</kbd> の投影方式順送り (`FsPanoramaProjection`) は 360 専用。どちらも画像 / 動画のコマンド設定から変更できる |
-| 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の 5 秒シーク、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Alt</kbd> 付き左右は固定シーク扱いにせず、割り当てた `KeyAction` を優先する。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み |
-| 動画のタッチシーク | 物理的な左 / 右の単発タップ = 5 秒戻る / 進む | 静止画と同じ位置分類と presenter / HUD の source ownership に依存する固定タッチ操作なので `TouchAction` を `KeyAction` に合流させず、実行時だけキーボードと同じ相対シーク helper を共有する。読み方向では反転せず、シーク時に HUD 表示状態を変えない |
+| 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の中シーク（既定 5 秒）、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Alt</kbd> 付き左右は固定シーク扱いにせず、割り当てた `KeyAction` を優先する。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み。段階別の秒数は Settings と共通 |
+| 動画のタッチシーク | 物理的な左 / 右の単発タップ = 中シークで戻る / 進む（既定 5 秒） | 静止画と同じ位置分類と presenter / HUD の source ownership に依存する固定タッチ操作なので `TouchAction` を `KeyAction` に合流させず、実行時だけキーボードと同じ相対シーク helper を共有する。読み方向では反転せず、シーク時に HUD 表示状態を変えない |
 
 補足: 画像分析モード起動の既定 <kbd>Shift</kbd>+<kbd>Z</kbd> は `FsImageAnalysis`、ルーペの
 <kbd>Shift</kbd> 押しっぱなしは `FsLoupeHold`、元画像表示の右 <kbd>Ctrl</kbd> 押しっぱなしは
@@ -390,7 +390,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>Home</kbd> / <kbd>End</kbd> | フルスクリーン中の先頭 / 末尾の項目へ移動する。Action: `FsJumpFirst` / `FsJumpLast`。動画 native presenter 経路でも App 側へ転送する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る。切り離した detached 窓 / always-new 窓では、メイン bundle との境界をまたがないため無効化し案内だけ出す |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |
-| マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動、全画面ズームモードも候補に含む。ウィンドウ最小化は通常フルスクリーン / detached viewer / native video で利用でき、動画は最小化後も再生を継続する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系は表示しない。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。従来どおりを選んだ既存環境は戻る / 進むのみ Ctrl+↑ / Ctrl+↓ 相当。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、中ボタンドラッグズームとは分離する。全画面ズームモードへ割り当てた場合、Z キー長押し時の照準表示はスキップして現在のカーソル位置でズーム状態へ入る |
+| マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動、全画面ズームモードも候補に含む。ウィンドウ最小化は通常フルスクリーン / detached viewer / native video で利用でき、動画は最小化後も再生を継続する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系は表示しない。動画の小 / 中 / 大シーク 6 操作は、機器によって 1 クリックが複数 producer から届く問題を避けるため v3.7.0 では候補に出さず、保存済みの割り当ても実行しない。保存値は消さず保持する。キーボード、リング、マウスジェスチャ、ゲームパッド、左右タップのシークと通常ホイールの音量調整は従来どおり。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。従来どおりを選んだ既存環境は戻る / 進むのみ Ctrl+↑ / Ctrl+↓ 相当。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、中ボタンドラッグズームとは分離する。全画面ズームモードへ割り当てた場合、Z キー長押し時の照準表示はスキップして現在のカーソル位置でズーム状態へ入る |
 | マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | マウス右クリック短押し | `Settings.ring_shortcuts.short_right_click_image` / `short_right_click_video` に従い、画像 / 動画別にフルスクリーンを閉じる（既定）/ 何もしない / 右クリックメニュー表示を実行する。右ドラッグのリング方向・登録ジェスチャが発火した場合は実行しない。グリッドは従来どおりメニュー、編集モードは編集操作を優先する固定入力で、この設定の対象外 |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
@@ -661,9 +661,10 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Backspace</kbd> | 一覧へ戻る | Action: `FsBackToList`。画像フルスクリーンと同じ。native presenter 経路でも App 側へ転送する |
 | <kbd>Home</kbd> / <kbd>End</kbd> | 先頭 / 末尾の項目へ移動 | Action: `FsJumpFirst` / `FsJumpLast`。native presenter 経路でも App 側へ転送する |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 外部プレイヤー起動 | Action: `VideoExternalPlayer` |
-| <kbd>←</kbd> / <kbd>→</kbd> | 5 秒シーク (デフォルト) | |
-| <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
-| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
+| <kbd>←</kbd> / <kbd>→</kbd> | 中シーク (既定 5 秒) | 修飾なし矢印は固定ナビゲーション。タイル中はカーソル移動を維持 |
+| <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 小シーク (既定 1 秒) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
+| 既定キーなし | 中シーク (既定 5 秒) | Action: `VideoSeekBackMedium` / `VideoSeekForwardMedium`。固定矢印以外にも割り当て可能 |
+| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 大シーク (既定 30 秒) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
 | <kbd>V</kbd> | 表示モードを切り替える | Action: `FsPanorama`。360 候補の動画では 360 度表示、それ以外の通常動画では拡大表示を ON / OFF にする。拡大表示中はホイールで拡大縮小、左ドラッグで移動し、上バーに倍率とリセットボタンを表示する。項目を切り替えると拡大表示を終了する |
 | <kbd>T</kbd> | 動画の拡大方法を OS に任せる → 標準（補間あり）→ ニアレスト（補間なし）→ シャープ拡大 → アニメ塗り拡大の順に切り替える | Action: `VideoScaleFilterNext`。一時停止中も現在フレームへ即時反映し、設定へ保存する。反映完了後に右上へ選択を表示し、表示サイズの上限で適用できない場合は「OS に任せる」で表示することも併記する |
@@ -673,7 +674,8 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを 1 行分移動 | 列数分だけ前 / 次へ移動 |
 | <kbd>Space</kbd> / <kbd>Enter</kbd> (タイル中) | タイルカーソル位置から再生 | S / Esc で閉じた場合は再生位置を変更しない |
 | <kbd>P</kbd> (タイル中) | タイルカーソル位置のサムネイルを代表フレームとしてピン留め | マウス hover ではカーソルを動かさない。マウス操作はタイルクリックだけが seek として反応する |
-| <kbd>↑</kbd> / <kbd>↓</kbd> | **前 / 次のファイル** (画像と同じ、マウスホイールと同じ) | Phase 7.H |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | **前 / 次のファイル** (画像と同じ) | Phase 7.H |
+| 修飾なしマウスホイール | 前 / 次のファイル（既定）、または音量調整 | `Settings.ring_shortcuts.video_normal_wheel_action`。動画・音声共通で、操作カスタマイズ「マウスボタン」から選択。パネル・モーダル・ストリップ、360度・拡大表示など既存の入力所有を優先し、KeyAction にはしない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。切り離した detached 窓 / always-new 窓では無効 |
@@ -699,7 +701,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | マウスホイール | 前 / 次ファイル | 前 / 次ファイル | ✅ 揃った |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次フォルダまたは検索結果 | 前 / 次フォルダまたは検索結果 | ✅ 揃った。切り離した detached / always-new では両方 no-op |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次ファイル (= ↑↓ と同義)。スタックのフラット読書中は前 / 次スタックへジャンプ (v2.0.0) | 音量を dB フェーダー目盛りの 1/4 幅で上下 | ⚠ 残った差異 (許容、動画プレイヤー慣例) |
-| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次ファイル | 5 秒シーク | ⚠ 動画プレイヤー慣例 (mpv/VLC/YouTube) で許容 |
+| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次ファイル | 中シーク（既定 5 秒） | ⚠ 動画プレイヤー慣例 (mpv/VLC/YouTube) で許容 |
 | マウス左クリック | ページめくり | 再生 / 一時停止 | ⚠ 動画プレイヤー慣例で許容 |
 
 ## ★固定 (Snapshot Lock) 中の挙動
@@ -757,7 +759,8 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
   カスタマイズ可能。
 - 5/1/30 秒シークの粒度は動画プレイヤー一般の慣例 (mpv: ←→=5s, Shift+←→=1s,
   ←/→ alone in YouTube=5s, J/L=10s) を踏襲しつつ、modifier で粒度切替できる
-  ようにした。
+  ようにした。v3.7.0 ではこの値を小 / 中 / 大の初期値として維持し、各段階の秒数を
+  環境設定で変更できるようにする。
 - 既に先頭 / 末尾に居て ←→ シークが動かない場合は、シークを発行せず
   「動画先頭です」「動画末尾です」のトーストを出す (詳細は
   [video-architecture.md](video-architecture.md) の seek HUD 節)。

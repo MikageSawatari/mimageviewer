@@ -1553,6 +1553,199 @@ park中の完了の帰属、別contextのdrop非干渉、既存contextテスト�
 全体gateとportable実機確認は後続で実施する。
 この役割移行を他ブランチの作業へ一括適用するものではない。
 
+**2026-09-08 静止画シーク popup と native browser-key の1クリック1操作:**
+
+静止画の共有 fullscreen 下部バーに、既存 Settings の列表示 / 非表示と5段階高さを選ぶ
+viewport-local egui popup を追加した。main / F12 は同じ `ViewerContextBundle` 描画と設定保存を通り、
+popup open は egui memory が所有するため App / detached 専用 state は追加しない。入力 handler は
+native pending を先に drain した後、現在 viewport の popup が開いている間だけ fullscreen shortcut を
+配送せず、Escape・矢印・Enterをpopupへ残す。既存のtouch correlation済み論理clickをmenuの
+open commandへ渡すため、mouse / touchのどちらも1回だけtoggleする。
+
+native videoはpresenter WndProcが実 `VK_BROWSER_BACK/FORWARD` keydownをrouteへenqueueした時点で
+同じmessageの既定処理を止め、同一WndProcへの合成 `WM_APPCOMMAND` 再配送を防ぐ。direct
+`WM_APPCOMMAND`、KeyUp、他keyは維持する。XButton DOWN / UP / DBLCLKを処理済みとして統一し、
+DBLCLKを2回目の物理押下としてrouteする変更は別のWin32契約hardeningである。いずれもdetached
+predicate、viewport ID / recreate、runtime / host ownership、placement / focus、window lifecycleを
+変更せず、新しいbool / Option、時間窓、debounce、retryを追加しない。親と独立レビューは、既存の
+viewport input ownerとWndProc producer境界を揃える構造修正として合意した。
+
+**2026-09-08 §4.2: 動画入力の段階別シークと raw wheel の所有（設計合意、実装進行中）:**
+
+既存 native / egui / music / ring 入力は同じ小中大の設定値を使い、固定左右とタップは中を選ぶ。
+タップの秒数を source 固有 metadata へ複製すると切替時に既定へ戻り得るため、段階の意図を
+既存 source gate 経由で App へ運び、実行時の Settings から解決する。
+通常 wheel は同一 batch 内の最終 pointer で所有が変わる問題を避け、各 event の処理先を
+既存 input outcome 内で所有する。Command 化したものを egui / App へ二重投入せず、領域入力は
+元位置の実 handler へ配送する。論理 UI pass を wheel 境界で分けても、GPU 描画は最終出力を
+一回だけ送る。非 wheel の text / modal 保護と source epoch の判定、既存 egui 平滑処理は保つ。
+通常 wheel の Navigate / Volume も App の現在設定で一度解決し、Navigate の既存 epoch 不一致許容を
+保つ一方、Volume は古い source を拒否する。設定の任意 metadata への複製は不要とする。
+
+親 Astra と独立 Astra は、入力の配送・消費境界を揃える構造的修正と合意した。
+detached 専用 state、猶予時間、追加の描画ループ、入力の一時禁止は導入しない。
+host / binding / placement の所有は変更せず、実装担当が実 handler の mixed-batch 回帰で確認する。
+詳細は [実装計画](v3.7.0-input-and-still-seek-plan.md)。実アプリ操作は別途明示了承後。
+
+**2026-09-08 §1.200: 詳細表示と静止画シークの保持所有・段階別高さ（設計合意、実装進行中）:**
+
+利用者指定の今回の体制は親 Astra 設計・独立 Astra レビュー・Sol 実装であり、旧担当指定との
+移行範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) のとおり。構造制約は維持する。
+親と独立レビューは、ROOT の詳細 hover 終了が still seek の keep/request を消す根因を照合した。
+既存 grid / navigation target / details hover / still seek / 表示中の本ブックマークの owner から保持を合成し、最後の owner
+離脱時だけ取消・退去させる。新しい detached pending や focus・時間猶予・一括 reset は追加しない。
+still seek の worker 公開は限定 exact set のままとし、他 context の所有集合を変更しない。
+本ブックマークは現在の loaded membership と container / PageIdentity を既存 keep 候補に照合し、
+新しい全件走査や cache owner を増やさずに保持する。worker の bounded range も同じ union へ合流する。
+
+高さ設定は still 専用の5段階として動画から分け、実 viewport に収まる共通 geometry を
+描画・hit・画像予約・パネル・touch が共有する。detached に ROOT の最小窓サイズを仮定せず、
+窓の新しい最小サイズ制限を加えない。ドラッグ幅は既存 gesture の押下座標と共に保持する。
+極小領域のbar / stripを最低高の条件で消さず、ボタン・鍵・余白も同じ矩形へfitする。
+共有 `draw_icons.rs` はrect版のbuttonを加え、既存32pt APIをwrapperとして残す。
+stillだけがfitted rectを渡し、描画clip・hit・touch correlationを一致させる（親/独立Astraで追加境界を確認済み）。
+これらは所有と寸法の正本を揃える構造的修正と合意した。host / binding / placement / window
+lifecycle は変更しない。詳細と回帰要件は [実装計画](v3.7.0-input-and-still-seek-plan.md)。
+実アプリ検証は明示了承後のリリース前の枠に残す。
+
+**2026-09-08 §1.197 S3b: native上部ボタンの実描画観測（設計合意・未実装）:**
+
+利用者指定の親Astraと独立Astraで、既存render ownerに属する診断観測として合意した。
+Solは実装前に入口と前提を再確認する。対象は上部hover入口と実際の
+`native_top_panorama` Responseだけで、通常の入力・表示・初期化順は維持する。
+影響先は`video/mod.rs`のsource/host取引、`render_core.rs`の全render入口、
+`overlay_draw.rs`の実Response生成、`native_ui_smoke.rs`の既存catalogである。
+
+ctor前の不変な実owner stampとoverlay所有のArc markerを描画結果へ結び付ける。
+catalog・準備済みtargetはWeakだけを持ち、commit後に同じowner・marker・対象状態を照合する。
+旧sourceのframeを新epochへ付け替えない。初期化後のbindだけではpaused/clean状態で
+観測待ちが残るため、実bootstrapを捕捉する。診断だけのrepaintは追加しない。
+ボタンは位置に加えて明示enabled引数・実click sense・通常のmodal/dim等を確認する。
+この観測はmetadataの新規生成やApp処理完了を保証せず、それらのreceiptとは分ける。
+詳細は[自動化設計](ui-smoke-automation-plan.md)の「上部ボタンの観測契約」を参照。
+実装・回帰・portableでの実hover確認は未完了で、症状修正の代用にはしない。
+
+**2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
+
+利用者指定の親Astra設計・Sol前提検証・独立Astraレビューで、同じwheelをsemanticな
+`VideoZoomWheel`と元のraw `MouseWheel`の両方としてAppへ渡す分類漏れを確認した。
+既存のcommand消費判定を純関数へ集約し、当該variantを加える案に合意する。
+overlayを無効にする、入力を遅らせる、App側で回数を補正する症状パッチではない。
+
+影響先はnative overlayのcommand/raw振り分け。1回のpush→render batch内では
+video zoom/audio modeが一定で、canvas wheelにはsemantic command、strip/panel/modalには
+既存egui/local処理先がある。正当な処理先がApp rawだけになる兄弟wheelは見つからず、
+pending egui入力は維持する。Panorama/項目移動/tile/strip-rangeの既存消費分類も保持する。
+§1.199の混在batchで最終pointer位置が先行egui wheelに影響する問題は、この修正では未解決。
+
+production helper→raw非転送と、実Appのcurrent source epochにおける1.0→1.2/stale不変を
+分けて回帰検証する。epoch 0を無効とは扱わない。実compile・portable実入力・通常確認用buildは
+これからで、Windows nativeのproduction変更は利用者の実機確認前にcommitしない。
+
+**2026-09-08 §1.197 S2: 診断pointerのexact owner配送（実装前の構造合意）:**
+
+今回の利用者指定による担当移行の下で、親Astraの設計・Solの実装前提検証・独立Astraの
+source-copy再レビューを実施し、現設計は症状パッチではないと確認した。
+実compile・回帰・portable liveはこの合意後の工程であり、完了を意味しない。
+
+対象は明示選択したactive detachedの静止画strip/track。既存synthetic timelineを唯一の
+transaction ownerとし、exact window/context/backend incarnation/items generationへ配送する。
+共通input hookのpointerは一度だけ渡し、Legacy key replayは維持する。ROOT preparationと
+child RawInputのframe/timeを同一視せず、実child配送・show-local handler・最終passのtailを結ぶ。
+通常のmount/activation、viewport生成・配置・描画入口を変更して検査を通す方法は採らない。
+
+通常Close/F12や未使用pointerのsibling showを診断失敗にしない。取消後の古いtransportに
+後続窓を失敗させる権限はなく、残るcleanup義務は元のtyped transactionだけが所有する。
+terminal failureはUiRuntimeで環境失敗を確定してからexact ackでidleへ移し、同frameの
+Successが勝たないよう実接続の回帰を行う。Downは実page/item/mode/lock/Response/pppを照合し、
+Move/Upは正当なpage・strip row変化を許してpress座標基準と実coordinate frameを保持する。
+
+共有機構の影響先は`key_input`の診断入力、`test_script`の終了処理、fullscreenの共通strip/track
+handlerとactive detached show境界。新しい観測・操作は診断feature内に限定し、普通の入力・
+兄弟contextのcache/queue/worker・既存keymapを保持する。実装と検証の正本は
+[ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) S2と
+[v3.7.0-priority-work.md](v3.7.0-priority-work.md)。
+
+**2026-09-07 §1.197 S3a: 実MouseMoveのnative経路観測（実装前の構造合意）:**
+
+親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の
+S3a条件を確認した。利用者が選択した実OS入力を、通常のDetachedViewerChild/PresenterOnlyで
+試す。`test-script`限定で実WndProcのtoken・HWNDを既存event envelopeに保持し、pumpの
+active epoch/cursor reducer後、renderの正常handler/routing/raw-forward判定後を観測する。
+通常coalesce・polling・capture・topology・source切替順を変更せず、診断だけlosslessにしない。
+
+native側はoutput/host leaseのpublisher寿命、実render source/placement/geometryを正本として
+既存source Atomicを切替途中の検出にだけ用いる。遅い旧publishや曖昧候補を拒否する。
+UI threadへ重い処理/待機を追加せず、SendInput・path検証・receipt待ちはscript workerで行う。
+Appとの共通接続は既存選択context/hostの再検証へ限定し、App stateやactivation busを増やさない。
+最初は異なる2点へのmoveだけを実portableで確認し、zoom/他surface/GPU確認を完了とはしない。
+共通native envelopeの影響先はpump/render全consumerだが、通常eventは同じ処理を保つ。
+metadata保持・世代/geometry不一致・publisher退去・render error・欠落を回帰/独立レビューする。
+
+S3a接続の追加合意: callback-local witnessをworkerから読む案はTLS制約で不成立。
+process-unique token/viewport/HWNDのread-only照合を追加し、registry掃除・Windowのstrong保持を
+workerへ移さない。同じallocationで論理ownerが変わる際のsnapshot遅延は既存UiCommand上の
+fresh validationで検査する。App由来一覧のpublish直後・command drain時にexact ownerを
+照合してreplyを返し、UI側の待機や新しいactivation/pending fieldは追加しない。
+準備前・receipt後とnative target再照合を一つの期限に揃える設計を親/独立AstraとSolが確認した。
+
+**2026-09-07 §1.197 S1b: 明示した窓への診断action配送（実装前の構造合意）:**
+
+親Astra・調査Sol・独立Astraが [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の
+S1b境界を確認した。未選択のLegacyImplicitは既存動作を保ち、新しいTargeted requestだけ
+S1aのexact ownerへ固定する。5つのKeymap consumerへ既存ctxを渡し、実handler scopeの
+owner・完了を観測する。通常のKeyboardOwner判定やfocus/permit guardは変更しない。
+ROOT frame基準のLegacy expiryとTargetedの対象pass完了を型で分離する。
+
+passive activationは既存managerへ長寿命のtest intentを足さず、typed request内で待つ。
+Closingを含む全既存intentがなくなった同じUI処理内で、exact claim再検証→既存queue→
+既存commit→actual owner照合を行う。通常intentの順序・選択規則を変えず、失敗で再queueしない。
+managerの追加は全intent有無のread-only観測に限り、独自mount/session・viewport生成・
+host lifetime・placement変更は加えない。cancel/staleは要求のackを一度だけ終了させる。
+共通Keymapの影響先は全action consumerだが、新分岐はtest-scriptのTargetedに限定し、
+兄弟非消費・既存Legacy互換・close/transfer・activation競合・pass expiryを回帰で固定する。
+実装前提が違えばSolが根拠付きで親へ戻し、実装後も独立Astraレビューを行う。
+
+S1b追加レビューで、旧host claim生存中にも実backendのhostが再生成されるためclaimだけでは
+callbackを認証できないと判明した。親Astra・独立Astraはvendor eframeのwgpu 2入口に
+診断feature限定の実Window witnessを置く設計に合意。RawInputと同じArcのWeak identityと
+非再利用tokenで通常resizeとWindow再生成を区別し、nested callback scopeを復元する。
+Appのhost registryや生成規則を直す症状パッチではなく、診断証拠を実ownerへ結び付ける変更。
+影響先・token寿命・snapshot/consumer/paintへの統合はui-smoke計画書のS1b追加節に記録した。
+下のS1a合意にある「host claimのみ」の観測はこの追加検証で補強する。通常host lifetimeの
+ownerは引き続きmanagerであり、診断tokenからrecreate・placement同期を起こさない。
+
+**2026-09-07 §1.197 S1a: 診断feature内のwindow観測とpaint証跡（実装前の構造合意）:**
+
+利用者の明示指示による担当移行は [v3.7.0-priority-work.md](v3.7.0-priority-work.md) を参照。
+親Astraの設計判断・Solの前提検証・独立Astraの再レビューが、以下を症状パッチではなく
+既存ownerを観測する構造として合意した。通常のdetached predicate・mount/session・
+描画選択・host lifecycleを変更せず、`test-script` feature内の証跡を追加する。
+
+- registryのread-only ContextRefで窓/context/items generation/pageを列挙する。観測で
+  mountやworker drainを起こさない。Mounted↔AtRestは保存場所の移動でありidentityに含めない。
+- host lifetimeは既存`DetachedWindowManager`の`DetachedHostClaim`/incarnationを使い、
+  独自のepochやViewportIdだけの生存判定を追加しない。
+  ROOTは別のtyped ownerとし、`viewer_context_main()`・ROOT viewport・既存`main_hwnd`を使う。
+  detached用のwindow ID/host incarnationをROOTへ捏造せず、別fullscreen viewportとも区別する。
+- activeの`CurrentItem`実texture描画だけを現在ページの証拠とし、Captured holdoverを除外。
+  passiveはtexture選択時にcontent/source TextureId/thumbnail由来を同時記録し、
+  Snapshot→DeferredView→実行時`shared.view()`の同じpayloadへ保持する。
+- 登録時ownerと実行時最新viewを別々に結合しない。後からcache readyを見て凍結thumbnailを
+  fullと推定しない。source TextureIdはLanczos化後も保持される既存resource APIと照合する。
+- 実装時の統合先は共通`FullscreenPaintResource`の診断feature限定メタデータとする。
+  `gpu_lanczos.rs`のDirect/Resampleable/Lanczos変換で画像と証拠を一体で保持し、
+  Snapshot/Viewへ重複ownerを作らない。通常featureの型・描画選択・cache keyを変更せず、
+  証拠の有無を表示制御には使わない。この共通境界の追加は親が確認し、最終レビューに含める。
+- close/recreate・context退去・page/gen変更をexact identityで拒否し、旧callbackが後着しても
+  現ownerの有効証拠を上書きしない。full/processedのpaint-command発行と、実解像度・
+  USER32配送・GPU scanoutの保証は区別する。
+
+窓snapshotの無副作用、sourceとproofの一体性、全identityのstale拒否、旧callback後着、
+thumbnail/full区別を検証する。操作対象の固定・activation・Keymap接続は次のS1bで別に
+レビューする。実装・実行結果は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) と
+作業台帳へ追記する。この合意だけで実機確認済みとは扱わない。
+
 **2026-09-07 PDF 初回 open の binding 衝突: 窓 ID の正本を registry へ一本化
 （ClaudeCode の依頼が指定する構造修正として実施。Codex は §2 を読み、production 経路の
 修正前再現で BA-7 と確認。実装後の ClaudeCode 検収・実機確認は未実施）:**

@@ -1712,6 +1712,8 @@ pub enum KeyAction {
     VideoSeekStart,
     VideoSeekBackSmall,
     VideoSeekForwardSmall,
+    VideoSeekBackMedium,
+    VideoSeekForwardMedium,
     VideoSeekBackLarge,
     VideoSeekForwardLarge,
     VideoFrameStepBack,
@@ -2202,6 +2204,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoSeekStart,
     KeyAction::VideoSeekBackSmall,
     KeyAction::VideoSeekForwardSmall,
+    KeyAction::VideoSeekBackMedium,
+    KeyAction::VideoSeekForwardMedium,
     KeyAction::VideoSeekBackLarge,
     KeyAction::VideoSeekForwardLarge,
     KeyAction::VideoFrameStepBack,
@@ -3797,6 +3801,8 @@ impl KeyAction {
             VideoSeekStart => "VideoSeekStart",
             VideoSeekBackSmall => "VideoSeekBackSmall",
             VideoSeekForwardSmall => "VideoSeekForwardSmall",
+            VideoSeekBackMedium => "VideoSeekBackMedium",
+            VideoSeekForwardMedium => "VideoSeekForwardMedium",
             VideoSeekBackLarge => "VideoSeekBackLarge",
             VideoSeekForwardLarge => "VideoSeekForwardLarge",
             VideoFrameStepBack => "VideoFrameStepBack",
@@ -4396,10 +4402,12 @@ impl KeyAction {
             VideoCloseFullscreen => "動画フルスクリーンを閉じて一覧へ戻る",
             VideoPlayPause => "動画の再生または一時停止を切り替える",
             VideoSeekStart => "動画の先頭へ移動して再生する",
-            VideoSeekBackSmall => "動画を1秒戻す",
-            VideoSeekForwardSmall => "動画を1秒進める",
-            VideoSeekBackLarge => "動画を30秒戻す",
-            VideoSeekForwardLarge => "動画を30秒進める",
+            VideoSeekBackSmall => "動画・音声を小シークで戻す",
+            VideoSeekForwardSmall => "動画・音声を小シークで進める",
+            VideoSeekBackMedium => "動画・音声を中シークで戻す",
+            VideoSeekForwardMedium => "動画・音声を中シークで進める",
+            VideoSeekBackLarge => "動画・音声を大シークで戻す",
+            VideoSeekForwardLarge => "動画・音声を大シークで進める",
             VideoFrameStepBack => "動画を1フレーム戻す",
             VideoFrameStepForward => "動画を1フレーム進める",
             VideoVolumeUp => "動画音量を上げる",
@@ -4852,6 +4860,8 @@ impl KeyAction {
             | VideoSeekStart
             | VideoSeekBackSmall
             | VideoSeekForwardSmall
+            | VideoSeekBackMedium
+            | VideoSeekForwardMedium
             | VideoSeekBackLarge
             | VideoSeekForwardLarge
             | VideoFrameStepBack
@@ -5284,6 +5294,8 @@ impl KeyAction {
             | VideoSeekStart
             | VideoSeekBackSmall
             | VideoSeekForwardSmall
+            | VideoSeekBackMedium
+            | VideoSeekForwardMedium
             | VideoSeekBackLarge
             | VideoSeekForwardLarge
             | VideoFrameStepBack
@@ -5764,6 +5776,7 @@ impl KeyAction {
             VideoSeekStart => ChordList::one(Chord::key(W)),
             VideoSeekBackSmall => ChordList::one(Chord::shift(Left)),
             VideoSeekForwardSmall => ChordList::one(Chord::shift(Right)),
+            VideoSeekBackMedium | VideoSeekForwardMedium => ChordList::EMPTY,
             VideoSeekBackLarge => ChordList::one(Chord::ctrl(Left)),
             VideoSeekForwardLarge => ChordList::one(Chord::ctrl(Right)),
             VideoFrameStepBack => ChordList::one(Chord::ctrl_shift(Left)),
@@ -6788,7 +6801,7 @@ impl Keymap {
     pub fn consume_action_press_count(&self, ctx: &egui::Context, action: KeyAction) -> usize {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
-        if crate::test_script::consume_pending_action(action) {
+        if crate::test_script::consume_pending_action(ctx, action) {
             return 1;
         }
         if action.press_multiplicity() == PressMultiplicity::SinglePerFrame {
@@ -6827,7 +6840,7 @@ impl Keymap {
     ) -> PageTurnConsumeResult {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
-        if crate::test_script::consume_pending_action(action) {
+        if crate::test_script::consume_pending_action(ctx, action) {
             return PageTurnConsumeResult::ScriptAction {
                 action,
                 viewport: ctx.viewport_id(),
@@ -6933,7 +6946,7 @@ impl Keymap {
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
-        if crate::test_script::consume_pending_action(action) {
+        if crate::test_script::consume_pending_action(ctx, action) {
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -6969,7 +6982,7 @@ impl Keymap {
     pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
-        if crate::test_script::consume_pending_action(action) {
+        if crate::test_script::consume_pending_action(ctx, action) {
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -7005,7 +7018,7 @@ impl Keymap {
     pub fn pressed_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
-        if crate::test_script::peek_pending_action(action) {
+        if crate::test_script::peek_pending_action(ctx, action) {
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -9328,6 +9341,12 @@ mod tests {
             "VideoMarkerNext".to_string(),
             "VideoTileMode".to_string(),
             "VideoExternalPlayer".to_string(),
+            "VideoSeekBackSmall".to_string(),
+            "VideoSeekForwardSmall".to_string(),
+            "VideoSeekBackMedium".to_string(),
+            "VideoSeekForwardMedium".to_string(),
+            "VideoSeekBackLarge".to_string(),
+            "VideoSeekForwardLarge".to_string(),
             "OpenLocationDriveList".to_string(),
             "OpenLocationReadingHistory".to_string(),
             "OpenLocationRating1".to_string(),
@@ -9462,6 +9481,34 @@ mod tests {
                 action.ini_name()
             );
         }
+    }
+
+    #[test]
+    fn configurable_video_seek_steps_keep_existing_defaults_and_leave_medium_unbound() {
+        for action in [
+            KeyAction::VideoSeekBackMedium,
+            KeyAction::VideoSeekForwardMedium,
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.context(), KeyContext::FsVideo);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        }
+        assert_eq!(
+            KeyAction::VideoSeekBackSmall
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::Left)]
+        );
+        assert_eq!(
+            KeyAction::VideoSeekForwardLarge
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::ctrl(KeyName::Right)]
+        );
     }
 
     #[test]

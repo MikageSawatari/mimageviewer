@@ -1,13 +1,13 @@
 //! Opt-in Rhai runner for isolated in-process application tests.
 //!
-//! The worker evaluates scripts and sends typed commands only. Synthetic input
-//! is materialized by `key_input`'s ROOT plugin, while App/UI state publication,
-//! direct `KeyAction` delivery, failure classification, and shutdown stay on
-//! the UI thread.
+//! The worker evaluates scripts. App/UI access stays behind typed commands;
+//! synthetic key input is materialized by `key_input`'s ROOT plugin, while the
+//! opt-in native mouse diagnostic calls its OS driver on the worker. App state
+//! publication, direct `KeyAction` delivery, and shutdown stay on the UI thread.
 
 #![cfg_attr(all(test, not(feature = "test-script")), allow(dead_code))]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
@@ -21,6 +21,8 @@ use crate::key_input::{
     SyntheticInputIssue, SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey,
 };
 use crate::keymap::{KeyAction, KeyTrigger};
+
+pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -38,6 +40,294 @@ pub(crate) struct KeymapLevelObservation {
     pub(crate) key: String,
     pub(crate) hold_ids: Vec<u64>,
     pub(crate) held: bool,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TestScriptPaintSourceKind {
+    CatalogThumbnail,
+    FullOrProcessed,
+}
+
+impl TestScriptPaintSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogThumbnail => "catalog_thumbnail",
+            Self::FullOrProcessed => "full_or_processed",
+        }
+    }
+
+    fn preference(self) -> u8 {
+        match self {
+            Self::CatalogThumbnail => 0,
+            Self::FullOrProcessed => 1,
+        }
+    }
+}
+
+/// Identity captured by the producer that selected the texture later painted.
+///
+/// This is diagnostic evidence only. It must travel with the selected resource;
+/// reconstructing it from the current cache would incorrectly relabel a frozen
+/// thumbnail after a full-resolution entry arrives.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct TestScriptContentProof {
+    pub(crate) context_serial: u64,
+    pub(crate) items_generation: u64,
+    pub(crate) page_index: usize,
+    pub(crate) item_identity: String,
+    pub(crate) source_texture_id: egui::TextureId,
+    pub(crate) source_kind: TestScriptPaintSourceKind,
+}
+
+/// Existing window lifetime owners represented without inventing a shared ID space.
+///
+/// The root content owner is the registry's main context. Detached host incarnations
+/// come from `DetachedWindowManager`; they are not a second test-owned epoch. Both
+/// variants also carry the eframe backend token for the exact live `winit::Window`
+/// allocation, because an HWND alone can be reused while an older host is still alive.
+/// Residence is deliberately absent because Mounted/AtRest is only the storage
+/// location of the same logical viewer and host.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TestScriptWindowIdentity {
+    Root {
+        context_serial: u64,
+        hwnd: u64,
+        backend_token: u64,
+    },
+    Detached {
+        window_id: u64,
+        context_serial: u64,
+        viewport_id: egui::ViewportId,
+        host_incarnation: u64,
+        hwnd: u64,
+        backend_token: u64,
+    },
+}
+
+impl TestScriptWindowIdentity {
+    pub(crate) fn role(&self) -> &'static str {
+        match self {
+            Self::Root { .. } => "root",
+            Self::Detached { .. } => "detached",
+        }
+    }
+
+    pub(crate) fn window_id(&self) -> Option<u64> {
+        match self {
+            Self::Root { .. } => None,
+            Self::Detached { window_id, .. } => Some(*window_id),
+        }
+    }
+
+    pub(crate) fn context_serial(&self) -> u64 {
+        match self {
+            Self::Root { context_serial, .. } | Self::Detached { context_serial, .. } => {
+                *context_serial
+            }
+        }
+    }
+
+    pub(crate) fn viewport_id(&self) -> egui::ViewportId {
+        match self {
+            Self::Root { .. } => egui::ViewportId::ROOT,
+            Self::Detached { viewport_id, .. } => *viewport_id,
+        }
+    }
+
+    pub(crate) fn host_incarnation(&self) -> Option<u64> {
+        match self {
+            Self::Root { .. } => None,
+            Self::Detached {
+                host_incarnation, ..
+            } => Some(*host_incarnation),
+        }
+    }
+
+    pub(crate) fn hwnd(&self) -> u64 {
+        match self {
+            Self::Root { hwnd, .. } | Self::Detached { hwnd, .. } => *hwnd,
+        }
+    }
+
+    pub(crate) fn backend_token(&self) -> u64 {
+        match self {
+            Self::Root { backend_token, .. } | Self::Detached { backend_token, .. } => {
+                *backend_token
+            }
+        }
+    }
+
+    pub(crate) fn matches_backend_witness(
+        &self,
+        witness: eframe::miv_test_script_window_witness::WindowWitness,
+    ) -> bool {
+        self.viewport_id() == witness.viewport_id()
+            && self.hwnd() == witness.hwnd()
+            && self.backend_token() == witness.token()
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Root {
+                context_serial,
+                hwnd,
+                backend_token,
+            } => format!("root/context={context_serial}/hwnd=0x{hwnd:x}/backend={backend_token}"),
+            Self::Detached {
+                window_id,
+                context_serial,
+                viewport_id,
+                host_incarnation,
+                hwnd,
+                backend_token,
+            } => format!(
+                "detached/window={window_id}/context={context_serial}/viewport={viewport_id:?}/host={host_incarnation}/hwnd=0x{hwnd:x}/backend={backend_token}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum TestScriptActionSelection {
+    #[default]
+    LegacyImplicit,
+    Targeted(TestScriptWindowIdentity),
+}
+
+impl TestScriptActionSelection {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::LegacyImplicit => "legacy_implicit",
+            Self::Targeted(_) => "targeted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TestScriptPaintEvidenceKey {
+    owner: TestScriptWindowIdentity,
+    content: TestScriptContentProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptWindowSnapshot {
+    pub(crate) identity: Option<TestScriptWindowIdentity>,
+    pub(crate) role: String,
+    pub(crate) window_id: Option<u64>,
+    pub(crate) context_serial: u64,
+    pub(crate) viewport_id: egui::ViewportId,
+    pub(crate) host_incarnation: Option<u64>,
+    pub(crate) hwnd: Option<u64>,
+    pub(crate) backend_token: Option<u64>,
+    pub(crate) residence: String,
+    pub(crate) media_kind: String,
+    pub(crate) page_index: Option<usize>,
+    pub(crate) items_generation: u64,
+    pub(crate) item_identity: String,
+    pub(crate) page_ready: bool,
+    pub(crate) viewport_rendered: bool,
+    pub(crate) viewport_revision: u64,
+    pub(crate) paint_matches_current_page: bool,
+    pub(crate) full_texture_painted: bool,
+    pub(crate) paint_source: String,
+    pub(crate) paint_source_texture: String,
+    pub(crate) painted_page_index: Option<usize>,
+    pub(crate) paint_revision: u64,
+}
+
+impl TestScriptWindowSnapshot {
+    fn current_content_matches(&self, proof: &TestScriptContentProof) -> bool {
+        self.context_serial == proof.context_serial
+            && self.items_generation == proof.items_generation
+            && self.page_index == Some(proof.page_index)
+            && self.item_identity == proof.item_identity
+    }
+
+    fn accepts_owner(&self, owner: &TestScriptWindowIdentity) -> bool {
+        self.identity.as_ref() == Some(owner)
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("role".into(), self.role.clone().into());
+        map.insert(
+            "window_id".into(),
+            self.window_id
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "context_serial".into(),
+            saturating_rhai_int(self.context_serial).into(),
+        );
+        map.insert("viewport".into(), format!("{:?}", self.viewport_id).into());
+        map.insert(
+            "host_incarnation".into(),
+            self.host_incarnation
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "hwnd".into(),
+            self.hwnd
+                .map(|value| Dynamic::from(format!("0x{value:x}")))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert(
+            "backend_token".into(),
+            self.backend_token
+                .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("host_ready".into(), self.identity.is_some().into());
+        map.insert("residence".into(), self.residence.clone().into());
+        map.insert("media_kind".into(), self.media_kind.clone().into());
+        map.insert(
+            "page_index".into(),
+            self.page_index
+                .map_or(-1, |value| i64::try_from(value).unwrap_or(i64::MAX))
+                .into(),
+        );
+        map.insert(
+            "items_generation".into(),
+            saturating_rhai_int(self.items_generation).into(),
+        );
+        map.insert("item_identity".into(), self.item_identity.clone().into());
+        map.insert("page_ready".into(), self.page_ready.into());
+        map.insert("viewport_rendered".into(), self.viewport_rendered.into());
+        map.insert(
+            "viewport_revision".into(),
+            saturating_rhai_int(self.viewport_revision).into(),
+        );
+        map.insert(
+            "paint_matches_current_page".into(),
+            self.paint_matches_current_page.into(),
+        );
+        map.insert(
+            "full_texture_painted".into(),
+            self.full_texture_painted.into(),
+        );
+        map.insert("paint_source".into(), self.paint_source.clone().into());
+        map.insert(
+            "paint_source_texture".into(),
+            self.paint_source_texture.clone().into(),
+        );
+        map.insert(
+            "painted_page_index".into(),
+            self.painted_page_index
+                .map_or(-1, |value| i64::try_from(value).unwrap_or(i64::MAX))
+                .into(),
+        );
+        map.insert(
+            "paint_revision".into(),
+            saturating_rhai_int(self.paint_revision).into(),
+        );
+        map
+    }
+}
+
+fn saturating_rhai_int(value: u64) -> rhai::INT {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +369,7 @@ pub(crate) struct TestScriptSnapshot {
     /// Why the page has no stand-in to show, or empty. See `PassthroughUnavailable`.
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
+    pub(crate) windows: Vec<TestScriptWindowSnapshot>,
 }
 
 impl Default for TestScriptSnapshot {
@@ -111,6 +402,7 @@ impl Default for TestScriptSnapshot {
             upload_deferral_streak: 0,
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
+            windows: Vec::new(),
         }
     }
 }
@@ -152,6 +444,14 @@ impl TestScriptSnapshot {
         insert!(reading_flow);
         insert!(upload_deferral_streak);
         insert!(passthrough_unavailable);
+        map.insert(
+            "windows".into(),
+            self.windows
+                .iter()
+                .map(|window| Dynamic::from_map(window.to_rhai_map()))
+                .collect::<rhai::Array>()
+                .into(),
+        );
         map
     }
 }
@@ -235,7 +535,12 @@ enum UiCommand {
     },
     RunAction {
         action: KeyAction,
+        selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
+    },
+    ValidateSelectedOwner {
+        expected_identity: TestScriptWindowIdentity,
+        reply: mpsc::SyncSender<Result<(), String>>,
     },
     Log(String),
     Precondition(PreconditionTrace),
@@ -308,6 +613,8 @@ struct RunnerBridge {
     interrupt: Arc<InterruptState>,
     wake: Arc<dyn Fn() + Send + Sync>,
     next_hold_id: Arc<AtomicU64>,
+    action_selection: Arc<Mutex<TestScriptActionSelection>>,
+    pointer_regions: pointer_input::SharedRegionCatalog,
 }
 
 impl RunnerBridge {
@@ -360,6 +667,273 @@ impl RunnerBridge {
     fn allocate_hold_id(&self) -> u64 {
         self.next_hold_id.fetch_add(1, Ordering::Relaxed) + 1
     }
+
+    fn action_selection(&self) -> Result<TestScriptActionSelection, String> {
+        self.action_selection
+            .lock()
+            .map(|selection| selection.clone())
+            .map_err(|_| "test-script action selection is poisoned".to_string())
+    }
+
+    fn select_root(&self) -> Result<Map, String> {
+        let snapshot = self.latest_snapshot()?;
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|window| window.role == "root")
+            .ok_or_else(|| "select_root could not find the root window".to_string())?;
+        self.select_window_snapshot(window)
+    }
+
+    fn select_window(&self, window_id: u64, context_serial: u64) -> Result<Map, String> {
+        let snapshot = self.latest_snapshot()?;
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|window| {
+                window.role == "detached"
+                    && window.window_id == Some(window_id)
+                    && window.context_serial == context_serial
+            })
+            .ok_or_else(|| {
+                format!(
+                    "select_window target is not current: window={window_id} context={context_serial}"
+                )
+            })?;
+        self.select_window_snapshot(window)
+    }
+
+    fn select_window_snapshot(&self, window: &TestScriptWindowSnapshot) -> Result<Map, String> {
+        let identity = window
+            .identity
+            .clone()
+            .ok_or_else(|| format!("select_{} target has no current host identity", window.role))?;
+        let mut selection = self
+            .action_selection
+            .lock()
+            .map_err(|_| "test-script action selection is poisoned".to_string())?;
+        *selection = TestScriptActionSelection::Targeted(identity.clone());
+        drop(selection);
+
+        let mut selected = window.to_rhai_map();
+        selected.insert("target_mode".into(), Dynamic::from("targeted"));
+        selected.insert("current".into(), Dynamic::from(true));
+        let _ = self.send_unchecked(UiCommand::Log(format!(
+            "action target selected mode=targeted owner={}",
+            identity.describe()
+        )));
+        Ok(selected)
+    }
+
+    fn selected_target(&self) -> Result<Map, String> {
+        let selection = self.action_selection()?;
+        let snapshot = self.latest_snapshot()?;
+        let mut selected = Map::new();
+        selected.insert("target_mode".into(), Dynamic::from(selection.mode()));
+        match selection {
+            TestScriptActionSelection::LegacyImplicit => {
+                selected.insert("current".into(), Dynamic::from(true));
+                selected.insert("role".into(), Dynamic::from("implicit"));
+            }
+            TestScriptActionSelection::Targeted(identity) => {
+                let current = snapshot
+                    .windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(&identity));
+                selected.insert("current".into(), Dynamic::from(current));
+                selected.insert("role".into(), Dynamic::from(identity.role()));
+                selected.insert(
+                    "context_serial".into(),
+                    Dynamic::from(saturating_rhai_int(identity.context_serial())),
+                );
+                selected.insert(
+                    "window_id".into(),
+                    identity
+                        .window_id()
+                        .map(|value| Dynamic::from(saturating_rhai_int(value)))
+                        .unwrap_or(Dynamic::UNIT),
+                );
+            }
+        }
+        Ok(selected)
+    }
+
+    fn selected_detached_identity(&self) -> Result<TestScriptWindowIdentity, String> {
+        match self.action_selection()? {
+            TestScriptActionSelection::Targeted(
+                identity @ TestScriptWindowIdentity::Detached { .. },
+            ) => Ok(identity),
+            TestScriptActionSelection::Targeted(identity) => Err(format!(
+                "native mouse input requires a detached target; selected {}",
+                identity.describe()
+            )),
+            TestScriptActionSelection::LegacyImplicit => {
+                Err("native mouse input requires select_window first".to_string())
+            }
+        }
+    }
+
+    fn validate_selected_owner_cached(
+        &self,
+        expected: &TestScriptWindowIdentity,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("native mouse deadline expired while validating the selected owner".into());
+        }
+        self.interrupt.check()?;
+        match self.action_selection()? {
+            TestScriptActionSelection::Targeted(identity) if identity == *expected => {}
+            _ => {
+                return Err(format!(
+                    "native mouse selected owner changed: expected {}",
+                    expected.describe()
+                ));
+            }
+        }
+        if !self
+            .latest_snapshot()?
+            .windows
+            .iter()
+            .any(|window| window.identity.as_ref() == Some(expected))
+        {
+            return Err(format!(
+                "native mouse selected owner is absent from the published snapshot: {}",
+                expected.describe()
+            ));
+        }
+        let backend_is_current = eframe::miv_test_script_window_witness::is_current(
+            expected.viewport_id(),
+            expected.hwnd(),
+            expected.backend_token(),
+        )
+        .map_err(|error| {
+            let message = format!("native window witness validation failed: {error}");
+            self.interrupt.fail(message.clone());
+            message
+        })?;
+        if !backend_is_current {
+            return Err(format!(
+                "native mouse backend allocation is no longer current: {}",
+                expected.describe()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_selected_owner_fresh(
+        &self,
+        expected: &TestScriptWindowIdentity,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.validate_selected_owner_cached(expected, deadline)?;
+        let (reply, acknowledgement) = mpsc::sync_channel(1);
+        let command = UiCommand::ValidateSelectedOwner {
+            expected_identity: expected.clone(),
+            reply,
+        };
+        if self.tx.send(command).is_err() {
+            let message = "selected-owner validation channel disconnected before dispatch";
+            self.interrupt.fail(message);
+            return Err(message.to_string());
+        }
+        (self.wake)();
+
+        loop {
+            self.interrupt.check()?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out waiting for fresh selected-owner validation: {}",
+                    expected.describe()
+                ));
+            }
+            let wait = WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+            match acknowledgement.recv_timeout(wait) {
+                Ok(result) => {
+                    result?;
+                    return self.validate_selected_owner_cached(expected, deadline);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let message = "selected-owner validation acknowledgement channel disconnected";
+                    self.interrupt.fail(message);
+                    return Err(message.to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    fn move_native_canvas(&self, normalized: [f32; 2], timeout: Duration) -> Result<Map, String> {
+        if timeout.is_zero() {
+            return Err("move_native_canvas timeout_ms must be greater than zero".to_string());
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "move_native_canvas timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        let owner_hwnd = identity.hwnd();
+        let prepared = crate::video::native_ui_smoke::prepare_real_mouse_in_canvas(
+            owner_hwnd,
+            normalized,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let receipt = crate::video::native_ui_smoke::send_prepared_real_mouse_move(
+            prepared,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        Ok(native_mouse_receipt_to_rhai_map(receipt))
+    }
+}
+
+#[cfg(feature = "test-script")]
+fn native_mouse_environment_error(bridge: &RunnerBridge, message: String) -> Box<EvalAltResult> {
+    bridge.interrupt.fail(message.clone());
+    rhai_error(message)
+}
+
+#[cfg(feature = "test-script")]
+fn native_mouse_receipt_to_rhai_map(
+    receipt: crate::video::native_ui_smoke::NativeUiSmokeMoveReceipt,
+) -> Map {
+    let mut map = Map::new();
+    map.insert("token".into(), saturating_rhai_int(receipt.token).into());
+    map.insert(
+        "owner_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.owner_hwnd)),
+    );
+    map.insert(
+        "presenter_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.presenter_hwnd)),
+    );
+    map.insert(
+        "source_epoch".into(),
+        saturating_rhai_int(receipt.source_epoch).into(),
+    );
+    map.insert(
+        "generation".into(),
+        saturating_rhai_int(receipt.generation).into(),
+    );
+    map.insert(
+        "requested_client_x".into(),
+        rhai::INT::from(receipt.requested_client_x).into(),
+    );
+    map.insert(
+        "requested_client_y".into(),
+        rhai::INT::from(receipt.requested_client_y).into(),
+    );
+    map.insert(
+        "actual_client_x".into(),
+        rhai::INT::from(receipt.actual_client_x).into(),
+    );
+    map.insert(
+        "actual_client_y".into(),
+        rhai::INT::from(receipt.actual_client_y).into(),
+    );
+    map
 }
 
 fn emit_perf_step(message: &str) {
@@ -452,6 +1026,10 @@ fn checked_duration(ms: rhai::INT, argument: &str) -> Result<Duration, Box<EvalA
     let ms =
         u64::try_from(ms).map_err(|_| rhai_error(format!("{argument} must be zero or greater")))?;
     Ok(Duration::from_millis(ms))
+}
+
+fn checked_u64(value: rhai::INT, argument: &str) -> Result<u64, Box<EvalAltResult>> {
+    u64::try_from(value).map_err(|_| rhai_error(format!("{argument} must be zero or greater")))
 }
 
 fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAltResult>> {
@@ -569,6 +1147,67 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    let select_root_bridge = bridge.clone();
+    engine.register_fn("select_root", move || -> Result<Map, Box<EvalAltResult>> {
+        select_root_bridge.select_root().map_err(rhai_error)
+    });
+
+    let select_window_bridge = bridge.clone();
+    engine.register_fn(
+        "select_window",
+        move |window_id: rhai::INT, context_serial: rhai::INT| -> Result<Map, Box<EvalAltResult>> {
+            select_window_bridge
+                .select_window(
+                    checked_u64(window_id, "select_window window_id")?,
+                    checked_u64(context_serial, "select_window context_serial")?,
+                )
+                .map_err(rhai_error)
+        },
+    );
+
+    let selected_target_bridge = bridge.clone();
+    engine.register_fn(
+        "selected_target",
+        move || -> Result<Map, Box<EvalAltResult>> {
+            selected_target_bridge.selected_target().map_err(rhai_error)
+        },
+    );
+
+    #[cfg(feature = "test-script")]
+    {
+        let native_mouse_bridge = bridge.clone();
+        engine.register_fn(
+            "move_native_canvas",
+            move |normalized_x: rhai::FLOAT,
+                  normalized_y: rhai::FLOAT,
+                  timeout_ms: rhai::INT|
+                  -> Result<Map, Box<EvalAltResult>> {
+                if !normalized_x.is_finite()
+                    || !normalized_y.is_finite()
+                    || normalized_x <= 0.0
+                    || normalized_x >= 1.0
+                    || normalized_y <= 0.0
+                    || normalized_y >= 1.0
+                {
+                    return Err(rhai_error(
+                        "move_native_canvas coordinates must be finite and between zero and one",
+                    ));
+                }
+                let timeout = checked_duration(timeout_ms, "move_native_canvas timeout_ms")?;
+                if timeout.is_zero() {
+                    return Err(rhai_error(
+                        "move_native_canvas timeout_ms must be greater than zero",
+                    ));
+                }
+                native_mouse_bridge
+                    .move_native_canvas([normalized_x as f32, normalized_y as f32], timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_mouse_bridge, message)
+                    })
+            },
+        );
+    }
+
     let hold_bridge = bridge.clone();
     engine.register_fn(
         "hold_key",
@@ -627,10 +1266,12 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         "run_action",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             let action = parse_action(&name)?;
+            let selection = action_bridge.action_selection().map_err(rhai_error)?;
             let (applied_tx, applied_rx) = mpsc::sync_channel(1);
             action_bridge
                 .send(UiCommand::RunAction {
                     action,
+                    selection,
                     applied: applied_tx,
                 })
                 .map_err(rhai_error)?;
@@ -786,6 +1427,11 @@ fn build_engine(bridge: RunnerBridge) -> Engine {
             None
         }
     });
+    pointer_input::register(
+        &mut engine,
+        bridge.clone(),
+        Arc::clone(&bridge.pointer_regions),
+    );
     register_runner_api(&mut engine, bridge);
     engine
 }
@@ -856,10 +1502,70 @@ fn spawn_script_source(source: String, bridge: RunnerBridge) -> Result<(), Strin
 
 struct PendingAction {
     action: KeyAction,
+    dispatch: PendingActionDispatch,
     // `None` means a non-consuming pressed_action peek already acknowledged
     // the command. Keep the entry until the frame ends so later peeks observe
     // the same press, just like an egui input event.
     applied: Option<mpsc::SyncSender<Result<(), String>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingActionDispatch {
+    LegacyImplicit,
+    Targeted {
+        owner: TestScriptWindowIdentity,
+        phase: TargetedActionPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetedActionPhase {
+    AwaitingDetachedOwner,
+    AwaitingPass,
+}
+
+#[derive(Clone, Debug)]
+struct TestScriptActionPassObservation {
+    pass: u64,
+    owner: Option<TestScriptWindowIdentity>,
+    eligible: bool,
+}
+
+fn joined_window_snapshots(
+    authoritative: &[TestScriptWindowSnapshot],
+    viewport_observations: &HashMap<TestScriptWindowIdentity, u64>,
+    paint_observations: &HashMap<TestScriptPaintEvidenceKey, u64>,
+) -> Vec<TestScriptWindowSnapshot> {
+    authoritative
+        .iter()
+        .cloned()
+        .map(|mut window| {
+            if let Some(revision) = window
+                .identity
+                .as_ref()
+                .and_then(|identity| viewport_observations.get(identity))
+            {
+                window.viewport_rendered = true;
+                window.viewport_revision = *revision;
+            }
+            let best = paint_observations
+                .iter()
+                .filter(|(key, _)| {
+                    window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
+                })
+                .max_by_key(|(key, revision)| (key.content.source_kind.preference(), **revision));
+            if let Some((key, revision)) = best {
+                window.paint_matches_current_page = true;
+                window.full_texture_painted =
+                    key.content.source_kind == TestScriptPaintSourceKind::FullOrProcessed;
+                window.paint_source = key.content.source_kind.as_str().to_string();
+                window.paint_source_texture = format!("{:?}", key.content.source_texture_id);
+                window.painted_page_index = Some(key.content.page_index);
+                window.paint_revision = *revision;
+            }
+            window
+        })
+        .collect()
 }
 
 struct FinishState {
@@ -876,6 +1582,11 @@ struct UiRuntime {
     last_frame: Option<u64>,
     finish: Option<FinishState>,
     cancel_requested: bool,
+    authoritative_windows: Vec<TestScriptWindowSnapshot>,
+    viewport_observations: HashMap<TestScriptWindowIdentity, u64>,
+    paint_observations: HashMap<TestScriptPaintEvidenceKey, u64>,
+    next_observation_revision: u64,
+    pointer_regions: pointer_input::SharedRegionCatalog,
 }
 
 impl UiRuntime {
@@ -883,6 +1594,7 @@ impl UiRuntime {
         rx: mpsc::Receiver<UiCommand>,
         snapshot: Arc<RwLock<TestScriptSnapshot>>,
         interrupt: Arc<InterruptState>,
+        pointer_regions: pointer_input::SharedRegionCatalog,
     ) -> Self {
         Self {
             rx,
@@ -892,7 +1604,162 @@ impl UiRuntime {
             last_frame: None,
             finish: None,
             cancel_requested: false,
+            authoritative_windows: Vec::new(),
+            viewport_observations: HashMap::new(),
+            paint_observations: HashMap::new(),
+            next_observation_revision: 0,
+            pointer_regions,
         }
+    }
+
+    fn replace_authoritative_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) {
+        self.authoritative_windows = windows;
+        if let Ok(mut regions) = self.pointer_regions.write() {
+            regions.retain_authoritative(&self.authoritative_windows);
+        } else {
+            self.interrupt
+                .fail("test-script pointer region catalog is poisoned");
+        }
+        let mut retained_actions = VecDeque::with_capacity(self.pending_actions.len());
+        while let Some(mut pending) = self.pending_actions.pop_front() {
+            let stale_owner = match &pending.dispatch {
+                PendingActionDispatch::LegacyImplicit => None,
+                PendingActionDispatch::Targeted { owner, .. } => (!self
+                    .authoritative_windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(owner)))
+                .then(|| owner.clone()),
+            };
+            if let Some(owner) = stale_owner {
+                let message = format!(
+                    "run_action target is no longer current: {}",
+                    owner.describe()
+                );
+                if let Some(applied) = pending.applied.take() {
+                    let _ = applied.send(Err(message.clone()));
+                }
+                crate::logger::log(format!(
+                    "[test-script] action rejected target_mode=targeted owner={} reason=stale",
+                    owner.describe()
+                ));
+            } else {
+                retained_actions.push_back(pending);
+            }
+        }
+        self.pending_actions = retained_actions;
+        self.viewport_observations.retain(|identity, _| {
+            self.authoritative_windows
+                .iter()
+                .any(|window| window.accepts_owner(identity))
+        });
+        self.paint_observations.retain(|key, _| {
+            self.authoritative_windows.iter().any(|window| {
+                window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
+            })
+        });
+    }
+
+    fn joined_windows(&self) -> Vec<TestScriptWindowSnapshot> {
+        joined_window_snapshots(
+            &self.authoritative_windows,
+            &self.viewport_observations,
+            &self.paint_observations,
+        )
+    }
+
+    fn publish_snapshot(&mut self, mut snapshot: TestScriptSnapshot) -> Result<(), String> {
+        self.replace_authoritative_windows(std::mem::take(&mut snapshot.windows));
+        snapshot.windows = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| *published = snapshot)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn publish_windows(&mut self, windows: Vec<TestScriptWindowSnapshot>) -> Result<(), String> {
+        self.replace_authoritative_windows(windows);
+        let joined = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| published.windows = joined)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn validate_selected_owner(&self, expected: &TestScriptWindowIdentity) -> Result<(), String> {
+        if self.finish.is_some() {
+            return Err("script is already finishing".to_string());
+        }
+        if self.cancel_requested {
+            return Err("script input cancellation is already active".to_string());
+        }
+        if !self
+            .authoritative_windows
+            .iter()
+            .any(|window| window.identity.as_ref() == Some(expected))
+        {
+            return Err(format!(
+                "selected owner is no longer authoritative: {}",
+                expected.describe()
+            ));
+        }
+        match eframe::miv_test_script_window_witness::is_current(
+            expected.viewport_id(),
+            expected.hwnd(),
+            expected.backend_token(),
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "selected owner backend allocation is no longer current: {}",
+                expected.describe()
+            )),
+            Err(error) => Err(format!("native window witness validation failed: {error}")),
+        }
+    }
+
+    fn publish_window_frame(
+        &mut self,
+        owner: TestScriptWindowIdentity,
+        content: Option<TestScriptContentProof>,
+    ) -> Result<bool, String> {
+        let owner_is_current = self
+            .authoritative_windows
+            .iter()
+            .any(|window| window.accepts_owner(&owner));
+        if !owner_is_current {
+            return Ok(false);
+        }
+        self.next_observation_revision = self.next_observation_revision.wrapping_add(1).max(1);
+        let revision = self.next_observation_revision;
+        self.viewport_observations.insert(owner.clone(), revision);
+        if let Some(content) = content
+            && self.authoritative_windows.iter().any(|window| {
+                window.accepts_owner(&owner) && window.current_content_matches(&content)
+            })
+        {
+            let existing_preference = self
+                .paint_observations
+                .iter()
+                .filter(|(key, _)| key.owner == owner)
+                .map(|(key, _)| key.content.source_kind.preference())
+                .max();
+            if existing_preference
+                .is_none_or(|preference| content.source_kind.preference() >= preference)
+            {
+                // One current-content observation per exact owner is enough. A new
+                // processed texture must not grow this table forever, while a late
+                // thumbnail callback must not replace evidence that a full source was
+                // already painted for the same current page.
+                self.paint_observations.retain(|key, _| key.owner != owner);
+                self.paint_observations
+                    .insert(TestScriptPaintEvidenceKey { owner, content }, revision);
+            }
+        }
+        let joined = self.joined_windows();
+        self.snapshot
+            .write()
+            .map(|mut published| published.windows = joined)
+            .map_err(|_| "test-script snapshot is poisoned".to_string())?;
+        Ok(true)
     }
 
     fn begin_finish(&mut self, mut outcome: ScriptOutcome, frame: u64) {
@@ -907,6 +1774,7 @@ impl UiRuntime {
         if let Some(environment_failure) = self.interrupt.failure_message() {
             outcome = ScriptOutcome::environment_failure(environment_failure);
         }
+        self.release_pending_actions("script finished before run_action was consumed");
         self.finish = Some(FinishState {
             outcome,
             started_frame: frame,
@@ -916,6 +1784,7 @@ impl UiRuntime {
 
     fn fail_environment(&mut self, message: String, frame: u64) {
         self.interrupt.fail(message.clone());
+        self.release_pending_actions(&message);
         self.begin_finish(ScriptOutcome::environment_failure(message), frame);
     }
 
@@ -927,15 +1796,154 @@ impl UiRuntime {
         self.cancel_requested
     }
 
-    fn expire_unconsumed_actions(&mut self, frame: u64) {
+    fn release_pending_actions(&mut self, message: &str) {
+        for mut pending in self.pending_actions.drain(..) {
+            if let Some(applied) = pending.applied.take() {
+                let _ = applied.send(Err(message.to_string()));
+            }
+        }
+    }
+
+    fn queue_action(
+        &mut self,
+        action: KeyAction,
+        selection: TestScriptActionSelection,
+        applied: mpsc::SyncSender<Result<(), String>>,
+    ) -> Option<egui::ViewportId> {
+        match selection {
+            TestScriptActionSelection::LegacyImplicit => {
+                self.pending_actions.push_back(PendingAction {
+                    action,
+                    dispatch: PendingActionDispatch::LegacyImplicit,
+                    applied: Some(applied),
+                });
+                crate::logger::log(format!(
+                    "[test-script] run_action action={} target_mode=legacy_implicit",
+                    action.ini_name()
+                ));
+                None
+            }
+            TestScriptActionSelection::Targeted(owner) => {
+                let Some(window) = self
+                    .authoritative_windows
+                    .iter()
+                    .find(|window| window.identity.as_ref() == Some(&owner))
+                else {
+                    let message = format!(
+                        "run_action target is no longer current: {}",
+                        owner.describe()
+                    );
+                    let _ = applied.send(Err(message));
+                    return None;
+                };
+                let phase = match (&owner, window.residence.as_str()) {
+                    (TestScriptWindowIdentity::Root { .. }, "mounted" | "at_rest") => {
+                        TargetedActionPhase::AwaitingPass
+                    }
+                    (TestScriptWindowIdentity::Detached { .. }, "mounted" | "at_rest") => {
+                        TargetedActionPhase::AwaitingDetachedOwner
+                    }
+                    _ => {
+                        let message = format!(
+                            "run_action target cannot accept input: {} residence={}",
+                            owner.describe(),
+                            window.residence
+                        );
+                        let _ = applied.send(Err(message));
+                        return None;
+                    }
+                };
+                let focus =
+                    (phase == TargetedActionPhase::AwaitingPass).then(|| owner.viewport_id());
+                crate::logger::log(format!(
+                    "[test-script] run_action action={} target_mode=targeted owner={} phase={phase:?}",
+                    action.ini_name(),
+                    owner.describe()
+                ));
+                self.pending_actions.push_back(PendingAction {
+                    action,
+                    dispatch: PendingActionDispatch::Targeted { owner, phase },
+                    applied: Some(applied),
+                });
+                focus
+            }
+        }
+    }
+
+    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+        self.pending_actions
+            .iter()
+            .find_map(|pending| match &pending.dispatch {
+                PendingActionDispatch::Targeted {
+                    owner,
+                    phase: TargetedActionPhase::AwaitingDetachedOwner,
+                } => Some(owner.clone()),
+                PendingActionDispatch::LegacyImplicit
+                | PendingActionDispatch::Targeted {
+                    phase: TargetedActionPhase::AwaitingPass,
+                    ..
+                } => None,
+            })
+    }
+
+    fn finish_targeted_detached_owner(
+        &mut self,
+        owner: &TestScriptWindowIdentity,
+        result: Result<(), String>,
+    ) {
+        let Some(index) = self.pending_actions.iter().position(|pending| {
+            matches!(
+                &pending.dispatch,
+                PendingActionDispatch::Targeted {
+                    owner: pending_owner,
+                    phase: TargetedActionPhase::AwaitingDetachedOwner,
+                } if pending_owner == owner
+            )
+        }) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                if let PendingActionDispatch::Targeted { phase, .. } =
+                    &mut self.pending_actions[index].dispatch
+                {
+                    *phase = TargetedActionPhase::AwaitingPass;
+                }
+                crate::logger::log(format!(
+                    "[test-script] action target ready owner={}",
+                    owner.describe()
+                ));
+            }
+            Err(message) => {
+                let mut pending = self.pending_actions.remove(index).expect("index exists");
+                if let Some(applied) = pending.applied.take() {
+                    let _ = applied.send(Err(message.clone()));
+                }
+                crate::logger::log(format!(
+                    "[test-script] action target resolution failed owner={} error={message}",
+                    owner.describe()
+                ));
+            }
+        }
+    }
+
+    fn expire_unconsumed_legacy_actions(&mut self, frame: u64) {
         if self.pending_actions.is_empty() {
             return;
         }
-        let unconsumed = self
-            .pending_actions
-            .drain(..)
-            .filter(|pending| pending.applied.is_some())
-            .collect::<Vec<_>>();
+        let mut retained = VecDeque::with_capacity(self.pending_actions.len());
+        let mut unconsumed = Vec::new();
+        while let Some(pending) = self.pending_actions.pop_front() {
+            match pending.dispatch {
+                PendingActionDispatch::LegacyImplicit => {
+                    if pending.applied.is_some() {
+                        unconsumed.push(pending);
+                    }
+                }
+                PendingActionDispatch::Targeted { .. } => retained.push_back(pending),
+            }
+        }
+        self.pending_actions = retained;
         if unconsumed.is_empty() {
             return;
         }
@@ -945,6 +1953,46 @@ impl UiRuntime {
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!("run_action was not consumed in its UI frame: {names}");
+        for mut pending in unconsumed {
+            if let Some(applied) = pending.applied.take() {
+                let _ = applied.send(Err(message.clone()));
+            }
+        }
+        self.fail_environment(message, frame);
+    }
+
+    fn finish_target_pass(&mut self, owner: &TestScriptWindowIdentity, eligible: bool, frame: u64) {
+        let mut retained = VecDeque::with_capacity(self.pending_actions.len());
+        let mut unconsumed = Vec::new();
+        while let Some(pending) = self.pending_actions.pop_front() {
+            let belongs_to_pass = matches!(
+                &pending.dispatch,
+                PendingActionDispatch::Targeted {
+                    owner: pending_owner,
+                    phase: TargetedActionPhase::AwaitingPass,
+                } if pending_owner == owner
+            );
+            if belongs_to_pass && (eligible || pending.applied.is_none()) {
+                if eligible && pending.applied.is_some() {
+                    unconsumed.push(pending);
+                }
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        self.pending_actions = retained;
+        if unconsumed.is_empty() {
+            return;
+        }
+        let names = unconsumed
+            .iter()
+            .map(|pending| pending.action.ini_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "run_action was not consumed in its target UI pass: owner={} actions={names}",
+            owner.describe()
+        );
         for mut pending in unconsumed {
             if let Some(applied) = pending.applied.take() {
                 let _ = applied.send(Err(message.clone()));
@@ -985,6 +2033,26 @@ fn describe_issue(issue: &SyntheticInputIssue) -> String {
         } => format!(
             "synthetic target viewport was not rendered in its outer frame: viewport={viewport:?} raw_input_time={raw_input_time:?} event_count={event_count}"
         ),
+        SyntheticInputIssue::PointerOwnerMismatch { handle, detail } => {
+            format!(
+                "synthetic pointer owner mismatch: step={} detail={detail}",
+                handle.step_id
+            )
+        }
+        SyntheticInputIssue::PointerPhysicalInputMixed { handle } => {
+            format!(
+                "physical pointer input mixed with synthetic transaction: step={}",
+                handle.step_id
+            )
+        }
+        SyntheticInputIssue::PointerViewportNotRendered { handle, viewport } => format!(
+            "synthetic pointer viewport was not rendered: step={} viewport={viewport:?}",
+            handle.step_id
+        ),
+        SyntheticInputIssue::MissingPointerShowTail { handle, viewport } => format!(
+            "synthetic pointer show ended without callback tail: step={} viewport={viewport:?}",
+            handle.step_id
+        ),
     }
 }
 
@@ -1020,6 +2088,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
     let interrupt = Arc::new(InterruptState::default());
+    let pointer_regions = Arc::new(RwLock::new(pointer_input::RegionCatalog::default()));
     let wake_ctx = ctx.clone();
     let bridge = RunnerBridge {
         tx,
@@ -1029,6 +2098,8 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
             wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
         }),
         next_hold_id: Arc::new(AtomicU64::new(0)),
+        action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+        pointer_regions: Arc::clone(&pointer_regions),
     };
 
     let mut guard = runtime()
@@ -1038,7 +2109,7 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         crate::key_input::disarm_synthetic_input();
         return Err("a test-script runtime is already active".to_string());
     }
-    *guard = Some(UiRuntime::new(rx, snapshot, interrupt));
+    *guard = Some(UiRuntime::new(rx, snapshot, interrupt, pointer_regions));
     drop(guard);
 
     if let Err(error) = spawn_script_path(path, bridge) {
@@ -1052,14 +2123,31 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     Ok(())
 }
 
+fn action_matches_owner(
+    dispatch: &PendingActionDispatch,
+    owner: Option<&TestScriptWindowIdentity>,
+) -> bool {
+    match dispatch {
+        PendingActionDispatch::LegacyImplicit => true,
+        PendingActionDispatch::Targeted {
+            owner: target,
+            phase: TargetedActionPhase::AwaitingPass,
+        } => owner == Some(target),
+        PendingActionDispatch::Targeted {
+            phase: TargetedActionPhase::AwaitingDetachedOwner,
+            ..
+        } => false,
+    }
+}
+
 fn consume_pending_action_from(
     pending_actions: &mut VecDeque<PendingAction>,
+    owner: Option<&TestScriptWindowIdentity>,
     action: KeyAction,
 ) -> bool {
-    let Some(index) = pending_actions
-        .iter()
-        .position(|pending| pending.action == action)
-    else {
+    let Some(index) = pending_actions.iter().position(|pending| {
+        pending.action == action && action_matches_owner(&pending.dispatch, owner)
+    }) else {
         return false;
     };
     let mut pending = pending_actions.remove(index).expect("index exists");
@@ -1071,11 +2159,12 @@ fn consume_pending_action_from(
 
 fn peek_pending_action_from(
     pending_actions: &mut VecDeque<PendingAction>,
+    owner: Option<&TestScriptWindowIdentity>,
     action: KeyAction,
 ) -> bool {
     let Some(pending) = pending_actions
         .iter_mut()
-        .find(|pending| pending.action == action)
+        .find(|pending| pending.action == action && action_matches_owner(&pending.dispatch, owner))
     else {
         return false;
     };
@@ -1085,24 +2174,127 @@ fn peek_pending_action_from(
     true
 }
 
-pub(crate) fn consume_pending_action(action: KeyAction) -> bool {
-    let Ok(mut guard) = runtime().lock() else {
-        return false;
-    };
-    let Some(runtime) = guard.as_mut() else {
-        return false;
-    };
-    consume_pending_action_from(&mut runtime.pending_actions, action)
+fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
+    egui::Id::new("miv.test_script.action_pass_observation").with(viewport_id)
 }
 
-pub(crate) fn peek_pending_action(action: KeyAction) -> bool {
+fn action_pass_observation(ctx: &egui::Context) -> Option<TestScriptActionPassObservation> {
+    let pass = ctx.cumulative_pass_nr();
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<TestScriptActionPassObservation>(observation_id)
+            .filter(|observation| observation.pass == pass)
+    })
+}
+
+fn action_pass_observation_for_active_backend(
+    ctx: &egui::Context,
+) -> Option<TestScriptActionPassObservation> {
+    let observation = action_pass_observation(ctx)?;
+    if observation.owner.as_ref().is_none_or(|owner| {
+        eframe::miv_test_script_window_witness::active()
+            .is_some_and(|witness| owner.matches_backend_witness(witness))
+    }) {
+        Some(observation)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn publish_action_pass_owner(
+    ctx: &egui::Context,
+    owner: Option<TestScriptWindowIdentity>,
+) {
+    let owner = owner.filter(|owner| {
+        eframe::miv_test_script_window_witness::active()
+            .is_some_and(|witness| owner.matches_backend_witness(witness))
+    });
+    let pass = ctx.cumulative_pass_nr();
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data_mut(|data| {
+        let eligible = data
+            .get_temp::<TestScriptActionPassObservation>(observation_id)
+            .is_some_and(|observation| {
+                observation.pass == pass && observation.owner == owner && observation.eligible
+            });
+        data.insert_temp(
+            observation_id,
+            TestScriptActionPassObservation {
+                pass,
+                owner,
+                eligible,
+            },
+        );
+    });
+}
+
+pub(crate) fn mark_action_pass_eligible(ctx: &egui::Context) {
+    let Some(mut observation) = action_pass_observation_for_active_backend(ctx) else {
+        return;
+    };
+    observation.eligible = true;
+    let observation_id = action_pass_observation_id(ctx.viewport_id());
+    ctx.data_mut(|data| data.insert_temp(observation_id, observation));
+}
+
+pub(crate) fn finish_action_pass(ctx: &egui::Context) {
+    let Some(observation) = action_pass_observation_for_active_backend(ctx) else {
+        return;
+    };
+    let Some(owner) = observation.owner else {
+        return;
+    };
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    runtime.finish_target_pass(&owner, observation.eligible, frame_key(ctx));
+}
+
+pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
+    let owner =
+        action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
     let Ok(mut guard) = runtime().lock() else {
         return false;
     };
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    peek_pending_action_from(&mut runtime.pending_actions, action)
+    consume_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+}
+
+pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
+    let owner =
+        action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
+    let Ok(mut guard) = runtime().lock() else {
+        return false;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return false;
+    };
+    peek_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+}
+
+pub(crate) fn pending_targeted_detached_owner() -> Option<TestScriptWindowIdentity> {
+    runtime()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_owner())
+}
+
+pub(crate) fn finish_targeted_detached_owner(
+    owner: &TestScriptWindowIdentity,
+    result: Result<(), String>,
+) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    runtime.finish_targeted_detached_owner(owner, result);
 }
 
 fn flush_exit_logs() {
@@ -1171,19 +2363,29 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let new_frame = runtime.last_frame != Some(frame);
     if new_frame {
         if runtime.last_frame.is_some() {
-            runtime.expire_unconsumed_actions(frame);
+            runtime.expire_unconsumed_legacy_actions(frame);
         }
         runtime.last_frame = Some(frame);
     }
     emit_perf_level_reads(&snapshot.keymap_level_observations);
-    if let Ok(mut published) = runtime.snapshot.write() {
-        *published = snapshot;
-    } else {
-        runtime.fail_environment("test-script snapshot is poisoned".to_string(), frame);
+    if let Err(error) = runtime.publish_snapshot(snapshot) {
+        runtime.fail_environment(error, frame);
     }
 
     for issue in issues {
+        let terminal_pointer_step = match &issue {
+            SyntheticInputIssue::PointerOwnerMismatch { handle, .. }
+            | SyntheticInputIssue::PointerPhysicalInputMixed { handle }
+            | SyntheticInputIssue::PointerViewportNotRendered { handle, .. }
+            | SyntheticInputIssue::MissingPointerShowTail { handle, .. } => Some(handle.clone()),
+            _ => None,
+        };
         runtime.fail_environment(describe_issue(&issue), frame);
+        if let Some(handle) = terminal_pointer_step {
+            // EnvironmentFailure is committed before the typed terminal pointer phase releases
+            // to Idle, so a nominal Finished in this same frame cannot mask missing cleanup proof.
+            let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+        }
     }
 
     while let Ok(command) = runtime.rx.try_recv() {
@@ -1198,6 +2400,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 }
             }
             UiCommand::Cancel(at) => {
+                runtime.release_pending_actions("run_action was cancelled before consumption");
                 if crate::key_input::cancel_synthetic_input(at) {
                     runtime.cancel_requested = true;
                 } else {
@@ -1215,15 +2418,29 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     );
                 }
             }
-            UiCommand::RunAction { action, applied } => {
+            UiCommand::RunAction {
+                action,
+                selection,
+                applied,
+            } => {
                 if runtime.finish.is_some() {
                     let _ = applied.send(Err("script is already finishing".to_string()));
                 } else {
-                    runtime.pending_actions.push_back(PendingAction {
-                        action,
-                        applied: Some(applied),
-                    });
+                    if let Some(viewport_id) = runtime.queue_action(action, selection, applied) {
+                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                        ctx.request_repaint_of(viewport_id);
+                    }
                 }
+            }
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => {
+                let result = runtime.validate_selected_owner(&expected_identity);
+                if let Err(message) = result.as_ref() {
+                    runtime.fail_environment(message.clone(), frame);
+                }
+                let _ = reply.send(result);
             }
             UiCommand::Log(message) => {
                 crate::logger::log(format!("[test-script] {message}"));
@@ -1274,6 +2491,192 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     close
 }
 
+/// Replace the read-only detached-window table after a lifecycle phase that can
+/// establish or retire an HWND claim. This never drives the lifecycle itself.
+pub(crate) fn publish_window_snapshots(windows: Vec<TestScriptWindowSnapshot>) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let _ = runtime.publish_windows(windows);
+}
+
+/// Record one viewport callback and, when supplied, the exact texture command
+/// queued by that callback. The current table is checked before either record is
+/// exposed, so a callback from a retired host cannot displace current evidence.
+pub(crate) fn publish_window_frame(
+    owner: TestScriptWindowIdentity,
+    content: Option<TestScriptContentProof>,
+) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let _ = runtime.publish_window_frame(owner, content);
+}
+
+pub(crate) fn publish_pointer_show(
+    ctx: &egui::Context,
+    output: pointer_input::ShowOutput,
+    current_identity: TestScriptWindowIdentity,
+    current_items_generation: u64,
+    page_after_navigation: usize,
+) {
+    let frame_key = frame_key(ctx);
+    let delivered_handle = output.delivered_cancel_handle();
+    let pointer_owner = output.pointer_owner();
+    let catalog_owner = output.catalog_owner();
+    let has_pointer_obligation = output.has_pointer_obligation();
+    let result = pointer_input::join_show_output(
+        output,
+        &current_identity,
+        current_items_generation,
+        page_after_navigation,
+    );
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    match result {
+        Ok(joined) => {
+            let published_revision = runtime
+                .pointer_regions
+                .write()
+                .map(|mut catalog| catalog.publish(joined.frame.clone()))
+                // A PoisonError owns the failed guard. Erase it before mutably borrowing runtime
+                // for the environment failure path below.
+                .map_err(|_| ());
+            let published_revision = match published_revision {
+                Ok(revision) => revision,
+                Err(_) => {
+                    let error = "test-script pointer region catalog is poisoned".to_string();
+                    runtime.fail_environment(error.clone(), frame_key);
+                    let terminal_handle = if let Some(handle) = delivered_handle {
+                        crate::key_input::fail_synthetic_pointer_delivered(&handle, error)
+                            .then_some(handle)
+                    } else {
+                        pointer_owner.as_ref().and_then(|owner| {
+                            crate::key_input::fail_synthetic_pointer_owner_lost(owner)
+                        })
+                    };
+                    if let Some(handle) = terminal_handle {
+                        let _ =
+                            crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+                    }
+                    return;
+                }
+            };
+            // Drop the catalog write guard before the timeline can wake the Rhai worker. Its
+            // completion now carries this exact published revision as the next-paint barrier.
+            if let Err(error) = joined.finish(published_revision) {
+                let catalog_invalidated = runtime
+                    .pointer_regions
+                    .write()
+                    .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+                    .is_ok();
+                if !catalog_invalidated {
+                    runtime.fail_environment(
+                        "test-script pointer region catalog is poisoned".to_string(),
+                        frame_key,
+                    );
+                }
+                if !has_pointer_obligation {
+                    return;
+                }
+                runtime.fail_environment(error.clone(), frame_key);
+                let terminal_handle = if let Some(handle) = delivered_handle {
+                    crate::key_input::fail_synthetic_pointer_delivered(&handle, error)
+                        .then_some(handle)
+                } else {
+                    pointer_owner.as_ref().and_then(|owner| {
+                        crate::key_input::fail_synthetic_pointer_owner_lost(owner)
+                    })
+                };
+                if let Some(handle) = terminal_handle {
+                    let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+                }
+            }
+        }
+        Err(error) => {
+            let catalog_invalidated = runtime
+                .pointer_regions
+                .write()
+                .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+                .is_ok();
+            if !catalog_invalidated {
+                runtime.fail_environment(
+                    "test-script pointer region catalog is poisoned".to_string(),
+                    frame_key,
+                );
+            }
+            if !has_pointer_obligation {
+                return;
+            }
+            runtime.fail_environment(error.clone(), frame_key);
+            let terminal_handle = if let Some(handle) = delivered_handle {
+                crate::key_input::fail_synthetic_pointer_delivered(&handle, error).then_some(handle)
+            } else {
+                pointer_owner
+                    .as_ref()
+                    .and_then(|owner| crate::key_input::fail_synthetic_pointer_owner_lost(owner))
+            };
+            if let Some(handle) = terminal_handle {
+                // This direct post-show error has already reached fail_environment. It can now
+                // release the typed terminal phase without waiting for issue polling.
+                let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+            }
+        }
+    }
+}
+
+pub(crate) fn reject_pointer_show(
+    ctx: &egui::Context,
+    output: pointer_input::ShowOutput,
+    error: String,
+) {
+    let delivered_handle = output.delivered_cancel_handle();
+    let pointer_owner = output.pointer_owner();
+    let catalog_owner = output.catalog_owner();
+    let has_pointer_obligation = output.has_pointer_obligation();
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    let catalog_invalidated = runtime
+        .pointer_regions
+        .write()
+        .map(|mut catalog| catalog.invalidate(catalog_owner.as_ref()))
+        .is_ok();
+    if !catalog_invalidated {
+        runtime.fail_environment(
+            "test-script pointer region catalog is poisoned".to_string(),
+            frame_key(ctx),
+        );
+    }
+    if !has_pointer_obligation {
+        return;
+    }
+    runtime.fail_environment(error.clone(), frame_key(ctx));
+    let terminal_handle = if let Some(handle) = delivered_handle {
+        crate::key_input::fail_synthetic_pointer_delivered(&handle, error).then_some(handle)
+    } else {
+        pointer_owner
+            .as_ref()
+            .and_then(crate::key_input::fail_synthetic_pointer_owner_lost)
+    };
+    if let Some(handle) = terminal_handle {
+        let _ = crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle);
+    }
+}
+
 pub(crate) fn publish_fullscreen_input_state(
     ctx: &egui::Context,
     fs_idx: usize,
@@ -1314,7 +2717,7 @@ pub(crate) fn publish_fullscreen_input_state(
 
 pub(crate) fn on_app_exit() {
     let active = runtime().lock().ok().and_then(|mut guard| guard.take());
-    let Some(runtime) = active else {
+    let Some(mut runtime) = active else {
         return;
     };
     PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
@@ -1324,6 +2727,7 @@ pub(crate) fn on_app_exit() {
     runtime
         .interrupt
         .fail("application exited before the test script completed");
+    runtime.release_pending_actions("application exited before run_action was consumed");
     let _ = crate::key_input::cancel_synthetic_input(Instant::now());
     crate::key_input::disarm_synthetic_input();
     crate::logger::log(format!(
@@ -1464,6 +2868,8 @@ mod tests {
                     wake_count.fetch_add(1, AtomicOrdering::Relaxed);
                 }),
                 next_hold_id: Arc::new(AtomicU64::new(0)),
+                action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+                pointer_regions: pointer_input::new_shared_catalog(),
             },
             rx,
             wakes,
@@ -1637,9 +3043,11 @@ mod tests {
         match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
             UiCommand::RunAction {
                 action: actual,
+                selection,
                 applied,
             } => {
                 assert_eq!(actual, action);
+                assert_eq!(selection, TestScriptActionSelection::LegacyImplicit);
                 applied.send(Ok(())).unwrap();
             }
             command => panic!("unexpected command before action acknowledgement: {command:?}"),
@@ -1666,27 +3074,96 @@ mod tests {
     }
 
     #[test]
+    fn selected_root_is_attached_to_run_action_as_an_exact_target() {
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 31,
+            hwnd: 0x3131,
+            backend_token: 41,
+        };
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 1, 0, "root-item")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        spawn_script_source(
+            r#"
+                let selected = select_root();
+                if selected.target_mode != "targeted" || !selected.current {
+                    fail("root target missing");
+                }
+                run_action("GridMoveFirst");
+            "#
+            .to_string(),
+            bridge,
+        )
+        .unwrap();
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                UiCommand::RunAction {
+                    action,
+                    selection,
+                    applied,
+                } => {
+                    assert_eq!(action, KeyAction::GridMoveFirst);
+                    assert_eq!(selection, TestScriptActionSelection::Targeted(owner));
+                    applied.send(Ok(())).unwrap();
+                    break;
+                }
+                UiCommand::Log(message) => assert!(message.contains("mode=targeted")),
+                command => panic!("unexpected command before targeted action: {command:?}"),
+            }
+        }
+        assert!(matches!(
+            receive_through_finished(&rx).last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::Success,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn explicit_selection_fails_instead_of_reserving_a_missing_identity() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("select_root();".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::RunAction { .. }))
+        );
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("could not find the root window")
+        ));
+    }
+
+    #[test]
     fn pending_action_peek_is_repeatable_within_the_ui_frame() {
         let action = KeyAction::FsClose;
         let (applied, acknowledgement) = mpsc::sync_channel(1);
         let mut pending = VecDeque::from([PendingAction {
             action,
+            dispatch: PendingActionDispatch::LegacyImplicit,
             applied: Some(applied),
         }]);
 
-        assert!(peek_pending_action_from(&mut pending, action));
+        assert!(peek_pending_action_from(&mut pending, None, action));
         assert_eq!(
             acknowledgement
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
             Ok(())
         );
-        assert!(peek_pending_action_from(&mut pending, action));
+        assert!(peek_pending_action_from(&mut pending, None, action));
         assert!(matches!(
             acknowledgement.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-        assert!(consume_pending_action_from(&mut pending, action));
+        assert!(consume_pending_action_from(&mut pending, None, action));
         assert!(pending.is_empty());
     }
 
@@ -1701,6 +3178,36 @@ mod tests {
                 kind: ScriptOutcomeKind::ScriptFailure,
                 message,
             })) if message.contains("expected")
+        ));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn invalid_native_mouse_arguments_are_script_failures() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_native_canvas(0.0, 0.5, 1000);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("coordinates")
+        ));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_mouse_runtime_failures_are_environment_failures() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_native_canvas(0.5, 0.5, 1000);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::EnvironmentFailure,
+                message,
+            })) if message.contains("requires select_window")
         ));
     }
 
@@ -1742,10 +3249,1107 @@ mod tests {
         assert!(message.contains("event_count=3"));
     }
 
+    fn window_identity(
+        window_id: u64,
+        context_serial: u64,
+        host_incarnation: u64,
+    ) -> TestScriptWindowIdentity {
+        window_identity_with_backend_token(
+            window_id,
+            context_serial,
+            host_incarnation,
+            0x2000 + host_incarnation,
+        )
+    }
+
+    fn window_identity_with_backend_token(
+        window_id: u64,
+        context_serial: u64,
+        host_incarnation: u64,
+        backend_token: u64,
+    ) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Detached {
+            window_id,
+            context_serial,
+            viewport_id: egui::ViewportId::from_hash_of(("test-window", window_id)),
+            host_incarnation,
+            hwnd: 0x1000 + host_incarnation,
+            backend_token,
+        }
+    }
+
+    fn root_identity(context_serial: u64, hwnd: u64) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Root {
+            context_serial,
+            hwnd,
+            backend_token: 0x3000 + context_serial,
+        }
+    }
+
+    fn detached_identity_from_witness(
+        witness: eframe::miv_test_script_window_witness::WindowWitness,
+        context_serial: u64,
+        host_incarnation: u64,
+    ) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::Detached {
+            window_id: 7,
+            context_serial,
+            viewport_id: witness.viewport_id(),
+            host_incarnation,
+            hwnd: witness.hwnd(),
+            backend_token: witness.token(),
+        }
+    }
+
+    fn local_runtime() -> UiRuntime {
+        let (_tx, rx) = mpsc::channel();
+        UiRuntime::new(
+            rx,
+            Arc::new(RwLock::new(TestScriptSnapshot::default())),
+            Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
+        )
+    }
+
+    #[test]
+    fn fresh_owner_barrier_accepts_the_exact_live_ui_and_backend_identity() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-current");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x500);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = detached_identity_from_witness(witness, 11, 13);
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 17, 0, "video::current")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(owner.clone());
+        let worker = {
+            let bridge = bridge.clone();
+            let owner = owner.clone();
+            std::thread::spawn(move || {
+                bridge
+                    .validate_selected_owner_fresh(&owner, Instant::now() + Duration::from_secs(1))
+            })
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                0,
+                "video::current",
+            )])
+            .unwrap();
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => {
+                assert_eq!(expected_identity, owner);
+                reply
+                    .send(runtime.validate_selected_owner(&expected_identity))
+                    .unwrap();
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn fresh_owner_barrier_rejects_a_logical_replacement_despite_a_cached_snapshot() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-replaced");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x501);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let old_owner = detached_identity_from_witness(witness, 11, 13);
+        let replacement = detached_identity_from_witness(witness, 12, 14);
+        let mut cached = ready_snapshot();
+        cached.windows = vec![window_snapshot(old_owner.clone(), 17, 0, "video::old")];
+        let (bridge, rx, _) = runner_bridge(cached);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(old_owner.clone());
+        let worker = {
+            let bridge = bridge.clone();
+            let old_owner = old_owner.clone();
+            std::thread::spawn(move || {
+                bridge.validate_selected_owner_fresh(
+                    &old_owner,
+                    Instant::now() + Duration::from_secs(1),
+                )
+            })
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                replacement,
+                18,
+                0,
+                "video::replacement",
+            )])
+            .unwrap();
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            UiCommand::ValidateSelectedOwner {
+                expected_identity,
+                reply,
+            } => reply
+                .send(runtime.validate_selected_owner(&expected_identity))
+                .unwrap(),
+            command => panic!("unexpected command: {command:?}"),
+        }
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("no longer authoritative"));
+    }
+
+    #[test]
+    fn owner_barrier_disconnect_is_an_environment_failure() {
+        let context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fresh-owner-disconnect");
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, viewport, 0x502);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = detached_identity_from_witness(witness, 11, 13);
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![window_snapshot(owner.clone(), 17, 0, "video::current")];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        *bridge.action_selection.lock().unwrap() =
+            TestScriptActionSelection::Targeted(owner.clone());
+        drop(rx);
+
+        let error = bridge
+            .validate_selected_owner_fresh(&owner, Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.contains("disconnected before dispatch"));
+        assert_eq!(
+            bridge.interrupt.failure_message().as_deref(),
+            Some(error.as_str())
+        );
+    }
+
+    #[test]
+    fn owner_barrier_rejects_finishing_or_cancelled_ui_runtime() {
+        let context = egui::Context::default();
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let witness = {
+            let _scope = fixture.enter(&context, egui::ViewportId::ROOT, 0x503);
+            eframe::miv_test_script_window_witness::active().unwrap()
+        };
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 11,
+            hwnd: witness.hwnd(),
+            backend_token: witness.token(),
+        };
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 0, "root::current")])
+            .unwrap();
+        runtime.cancel_requested = true;
+        assert!(
+            runtime
+                .validate_selected_owner(&owner)
+                .unwrap_err()
+                .contains("cancellation")
+        );
+        runtime.cancel_requested = false;
+        runtime.begin_finish(ScriptOutcome::success(), 1);
+        assert!(
+            runtime
+                .validate_selected_owner(&owner)
+                .unwrap_err()
+                .contains("already finishing")
+        );
+    }
+
+    #[test]
+    fn targeted_action_waits_for_exact_owner_and_does_not_repeat_after_peek() {
+        let owner = window_identity(7, 11, 14);
+        let sibling = window_identity(8, 12, 15);
+        let action = KeyAction::FsPageNext;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![
+                window_snapshot(owner.clone(), 17, 2, "pdf::owner#2"),
+                window_snapshot(sibling.clone(), 18, 4, "pdf::sibling#4"),
+            ])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                applied,
+            ),
+            None,
+            "detached owner is resolved by App before a pass is eligible"
+        );
+        assert_eq!(
+            runtime.pending_targeted_detached_owner(),
+            Some(owner.clone())
+        );
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&sibling),
+            action
+        ));
+        runtime.finish_target_pass(&sibling, true, 1);
+        runtime.finish_target_pass(&owner, false, 1);
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(
+            acknowledgement
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(())
+        );
+        assert!(peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.finish_target_pass(&owner, false, 1);
+        assert!(runtime.pending_actions.is_empty());
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+    }
+
+    #[test]
+    fn root_frame_expiry_does_not_expire_a_detached_target_before_its_pass() {
+        let owner = window_identity(7, 11, 14);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "pdf::owner#2")])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+        );
+
+        runtime.expire_unconsumed_legacy_actions(2);
+        assert_eq!(runtime.pending_actions.len(), 1);
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        runtime.finish_target_pass(&owner, true, 2);
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("target UI pass"));
+    }
+
+    #[test]
+    fn stale_target_is_rejected_without_legacy_fallback() {
+        let owner = window_identity(7, 11, 14);
+        let sibling = window_identity(8, 12, 15);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "pdf::owner#2")])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                sibling.clone(),
+                18,
+                4,
+                "pdf::sibling#4",
+            )])
+            .unwrap();
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no longer current"));
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&sibling),
+            action
+        ));
+    }
+
+    #[test]
+    fn backend_replacement_stales_target_without_a_manager_claim_change() {
+        let old_owner = window_identity_with_backend_token(7, 11, 14, 101);
+        let replacement_owner = window_identity_with_backend_token(7, 11, 14, 102);
+        let action = KeyAction::FsClose;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                old_owner.clone(),
+                17,
+                2,
+                "pdf::owner#2",
+            )])
+            .unwrap();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::Targeted(old_owner),
+            applied,
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                replacement_owner,
+                17,
+                2,
+                "pdf::owner#2",
+            )])
+            .unwrap();
+
+        let error = acknowledgement
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no longer current"));
+        assert!(runtime.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn legacy_action_retains_first_matching_consumer_behavior() {
+        let action = KeyAction::GridMoveFirst;
+        let owner = window_identity(7, 11, 14);
+        let mut runtime = local_runtime();
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        runtime.queue_action(action, TestScriptActionSelection::LegacyImplicit, applied);
+
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(
+            acknowledgement
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn action_pass_observations_are_partitioned_by_viewport_at_the_same_pass() {
+        let ctx = egui::Context::default();
+        let root = root_identity(1, 0x100);
+        let child = window_identity(7, 11, 14);
+        let pass = 9;
+        let root_observation = TestScriptActionPassObservation {
+            pass,
+            owner: Some(root.clone()),
+            eligible: true,
+        };
+        let child_observation = TestScriptActionPassObservation {
+            pass,
+            owner: Some(child.clone()),
+            eligible: false,
+        };
+        let child_viewport = child.viewport_id();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                action_pass_observation_id(egui::ViewportId::ROOT),
+                root_observation,
+            );
+            data.insert_temp(
+                action_pass_observation_id(child_viewport),
+                child_observation,
+            );
+        });
+
+        ctx.data(|data| {
+            assert_eq!(
+                data.get_temp::<TestScriptActionPassObservation>(action_pass_observation_id(
+                    egui::ViewportId::ROOT
+                ))
+                .and_then(|observation| observation.owner),
+                Some(root)
+            );
+            assert_eq!(
+                data.get_temp::<TestScriptActionPassObservation>(action_pass_observation_id(
+                    child_viewport
+                ))
+                .and_then(|observation| observation.owner),
+                Some(child)
+            );
+        });
+    }
+
+    #[test]
+    fn action_pass_publication_and_eligibility_use_egui_data_without_reentry() {
+        let ctx = egui::Context::default();
+        let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = fixture.enter(&ctx, egui::ViewportId::ROOT, 0x100);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 1,
+            hwnd: 0x100,
+            backend_token: witness.token(),
+        };
+        ctx.begin_pass(Default::default());
+
+        publish_action_pass_owner(&ctx, Some(owner.clone()));
+        mark_action_pass_eligible(&ctx);
+        let observation = action_pass_observation(&ctx).expect("current pass observation");
+
+        assert_eq!(observation.owner, Some(owner));
+        assert!(observation.eligible);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn replacement_backend_with_the_same_hwnd_cannot_consume_an_old_target() {
+        let ctx = egui::Context::default();
+        let first = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let old_owner = {
+            let _scope = first.enter(&ctx, egui::ViewportId::ROOT, 0x101);
+            TestScriptWindowIdentity::Root {
+                context_serial: 1,
+                hwnd: 0x101,
+                backend_token: eframe::miv_test_script_window_witness::active()
+                    .unwrap()
+                    .token(),
+            }
+        };
+        let replacement = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = replacement.enter(&ctx, egui::ViewportId::ROOT, 0x101);
+        ctx.begin_pass(Default::default());
+
+        publish_action_pass_owner(&ctx, Some(old_owner.clone()));
+        let observed_owner = action_pass_observation_for_active_backend(&ctx)
+            .and_then(|observation| observation.owner);
+        let (applied, _acknowledgement) = mpsc::sync_channel(1);
+        let mut pending = VecDeque::from([PendingAction {
+            action: KeyAction::GridToggleDetailsView,
+            dispatch: PendingActionDispatch::Targeted {
+                owner: old_owner,
+                phase: TargetedActionPhase::AwaitingPass,
+            },
+            applied: Some(applied),
+        }]);
+
+        assert_eq!(observed_owner, None);
+        assert!(!consume_pending_action_from(
+            &mut pending,
+            observed_owner.as_ref(),
+            KeyAction::GridToggleDetailsView
+        ));
+        assert_eq!(pending.len(), 1);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn backend_witness_scope_is_context_scoped_nested_and_thread_local() {
+        let first_context = egui::Context::default();
+        let second_context = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("same-viewport-separate-contexts");
+        let first = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let second = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let first_scope = first.enter(&first_context, viewport, 0x201);
+        let first_witness = eframe::miv_test_script_window_witness::active().unwrap();
+
+        assert_eq!(
+            eframe::miv_test_script_window_witness::latest(viewport),
+            Some(first_witness)
+        );
+        std::thread::spawn(move || {
+            assert_eq!(eframe::miv_test_script_window_witness::active(), None);
+            assert_eq!(
+                eframe::miv_test_script_window_witness::latest(viewport),
+                None
+            );
+        })
+        .join()
+        .unwrap();
+        {
+            let _second_scope = second.enter(&second_context, viewport, 0x202);
+            let second_witness = eframe::miv_test_script_window_witness::active().unwrap();
+            assert_ne!(first_witness.token(), second_witness.token());
+            assert_eq!(
+                eframe::miv_test_script_window_witness::latest(viewport),
+                Some(second_witness)
+            );
+        }
+
+        assert_eq!(
+            eframe::miv_test_script_window_witness::active(),
+            Some(first_witness)
+        );
+        assert_eq!(
+            eframe::miv_test_script_window_witness::latest(viewport),
+            Some(first_witness)
+        );
+        drop(first_scope);
+        assert_eq!(eframe::miv_test_script_window_witness::active(), None);
+    }
+
+    fn content_proof(
+        context_serial: u64,
+        generation: u64,
+        page_index: usize,
+        item: &str,
+        texture: u64,
+        source_kind: TestScriptPaintSourceKind,
+    ) -> TestScriptContentProof {
+        TestScriptContentProof {
+            context_serial,
+            items_generation: generation,
+            page_index,
+            item_identity: item.to_string(),
+            source_texture_id: egui::TextureId::Managed(texture),
+            source_kind,
+        }
+    }
+
+    fn window_snapshot(
+        identity: TestScriptWindowIdentity,
+        generation: u64,
+        page_index: usize,
+        item: &str,
+    ) -> TestScriptWindowSnapshot {
+        TestScriptWindowSnapshot {
+            identity: Some(identity.clone()),
+            role: identity.role().to_string(),
+            window_id: identity.window_id(),
+            context_serial: identity.context_serial(),
+            viewport_id: identity.viewport_id(),
+            host_incarnation: identity.host_incarnation(),
+            hwnd: Some(identity.hwnd()),
+            backend_token: Some(identity.backend_token()),
+            residence: "at_rest".to_string(),
+            media_kind: "pdf".to_string(),
+            page_index: Some(page_index),
+            items_generation: generation,
+            item_identity: item.to_string(),
+            page_ready: true,
+            viewport_rendered: false,
+            viewport_revision: 0,
+            paint_matches_current_page: false,
+            full_texture_painted: false,
+            paint_source: String::new(),
+            paint_source_texture: String::new(),
+            painted_page_index: None,
+            paint_revision: 0,
+        }
+    }
+
+    #[test]
+    fn paint_evidence_requires_the_exact_owner_and_current_page_identity() {
+        let owner = window_identity(7, 11, 13);
+        let current = window_snapshot(owner.clone(), 17, 2, "pdf::current#2");
+        let exact = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            19,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        let mut observations = HashMap::new();
+        observations.insert(
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: exact.clone(),
+            },
+            1,
+        );
+        assert!(
+            joined_window_snapshots(&[current.clone()], &HashMap::new(), &observations)[0]
+                .paint_matches_current_page
+        );
+
+        let stale_cases = [
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(8, 11, 13),
+                content: exact.clone(),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(7, 12, 13),
+                content: content_proof(
+                    12,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: window_identity(7, 11, 14),
+                content: exact.clone(),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: content_proof(
+                    11,
+                    18,
+                    2,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner: owner.clone(),
+                content: content_proof(
+                    11,
+                    17,
+                    3,
+                    "pdf::current#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+            TestScriptPaintEvidenceKey {
+                owner,
+                content: content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::other#2",
+                    19,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                ),
+            },
+        ];
+        for stale in stale_cases {
+            let joined = joined_window_snapshots(
+                &[current.clone()],
+                &HashMap::new(),
+                &HashMap::from([(stale, 2)]),
+            );
+            assert!(!joined[0].paint_matches_current_page);
+        }
+    }
+
+    #[test]
+    fn late_old_callback_cannot_replace_current_full_paint_evidence() {
+        let current_owner = window_identity(7, 11, 14);
+        let old_owner = window_identity(7, 11, 13);
+        let window = window_snapshot(current_owner.clone(), 17, 2, "pdf::current#2");
+        let full = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            20,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        let thumbnail = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            19,
+            TestScriptPaintSourceKind::CatalogThumbnail,
+        );
+        let observations = HashMap::from([
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: current_owner.clone(),
+                    content: full,
+                },
+                2,
+            ),
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: old_owner,
+                    content: thumbnail.clone(),
+                },
+                3,
+            ),
+            (
+                TestScriptPaintEvidenceKey {
+                    owner: current_owner,
+                    content: thumbnail,
+                },
+                4,
+            ),
+        ]);
+
+        let joined = joined_window_snapshots(&[window], &HashMap::new(), &observations);
+        assert!(joined[0].full_texture_painted);
+        assert_eq!(joined[0].paint_revision, 2);
+        assert_eq!(joined[0].paint_source, "full_or_processed");
+    }
+
+    #[test]
+    fn repeated_textures_keep_one_best_paint_observation_per_owner() {
+        let (_tx, rx) = mpsc::channel();
+        let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
+        let mut runtime = UiRuntime::new(
+            rx,
+            Arc::clone(&snapshot),
+            Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
+        );
+        let owner = window_identity(7, 11, 14);
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+
+        for texture in 100..164 {
+            runtime
+                .publish_window_frame(
+                    owner.clone(),
+                    Some(content_proof(
+                        11,
+                        17,
+                        2,
+                        "pdf::current#2",
+                        texture,
+                        TestScriptPaintSourceKind::CatalogThumbnail,
+                    )),
+                )
+                .unwrap();
+        }
+        assert_eq!(runtime.paint_observations.len(), 1);
+
+        runtime
+            .publish_window_frame(
+                owner.clone(),
+                Some(content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    1000,
+                    TestScriptPaintSourceKind::FullOrProcessed,
+                )),
+            )
+            .unwrap();
+        let full_revision = snapshot.read().unwrap().windows[0].paint_revision;
+        runtime
+            .publish_window_frame(
+                owner,
+                Some(content_proof(
+                    11,
+                    17,
+                    2,
+                    "pdf::current#2",
+                    1001,
+                    TestScriptPaintSourceKind::CatalogThumbnail,
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(runtime.paint_observations.len(), 1);
+        let published = snapshot.read().unwrap();
+        assert!(published.windows[0].full_texture_painted);
+        assert_eq!(published.windows[0].paint_revision, full_revision);
+        assert!(published.windows[0].viewport_revision > full_revision);
+    }
+
+    #[test]
+    fn table_change_prunes_stale_callbacks_without_clearing_current_evidence() {
+        let (_tx, rx) = mpsc::channel();
+        let snapshot = Arc::new(RwLock::new(TestScriptSnapshot::default()));
+        let mut runtime = UiRuntime::new(
+            rx,
+            Arc::clone(&snapshot),
+            Arc::new(InterruptState::default()),
+            pointer_input::new_shared_catalog(),
+        );
+        let old_owner = window_identity(7, 11, 13);
+        let current_owner = window_identity(7, 11, 14);
+        let content = content_proof(
+            11,
+            17,
+            2,
+            "pdf::current#2",
+            20,
+            TestScriptPaintSourceKind::FullOrProcessed,
+        );
+        runtime
+            .publish_windows(vec![window_snapshot(
+                old_owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+        assert!(
+            runtime
+                .publish_window_frame(old_owner.clone(), Some(content.clone()))
+                .unwrap()
+        );
+
+        runtime
+            .publish_windows(vec![window_snapshot(
+                current_owner.clone(),
+                17,
+                2,
+                "pdf::current#2",
+            )])
+            .unwrap();
+        assert!(
+            runtime
+                .publish_window_frame(current_owner, Some(content.clone()))
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .publish_window_frame(old_owner, Some(content))
+                .unwrap()
+        );
+        let published = snapshot.read().unwrap();
+        assert!(published.windows[0].paint_matches_current_page);
+        assert!(published.windows[0].full_texture_painted);
+    }
+
     #[test]
     fn outcome_kinds_map_to_process_exit_codes() {
         assert_eq!(ScriptOutcomeKind::Success.exit_code(), 0);
         assert_ne!(ScriptOutcomeKind::ScriptFailure.exit_code(), 0);
         assert_ne!(ScriptOutcomeKind::EnvironmentFailure.exit_code(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn poisoned_pointer_catalog_fails_the_actual_show_and_releases_its_exact_step() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_synthetic_input();
+
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("poisoned-pointer-catalog");
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, 0x7272);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = detached_identity_from_witness(witness, 17, 19);
+        let pointer_owner = crate::key_input::SyntheticPointerOwner {
+            identity: owner.clone(),
+            items_generation: 29,
+        };
+        let mode = pointer_input::FullscreenModeProof {
+            spread_mode: "Single".to_string(),
+            reading_flow: "Paged".to_string(),
+            strip_rtl: false,
+            seek_bar_rtl: false,
+            strip_visible: true,
+            strip_locked: true,
+            bar_locked: true,
+        };
+        let mode_signature = crate::key_input::SyntheticPointerModeSignature {
+            spread_mode: mode.spread_mode.clone(),
+            reading_flow: mode.reading_flow.clone(),
+            strip_rtl: mode.strip_rtl,
+            seek_bar_rtl: mode.seek_bar_rtl,
+            strip_visible: mode.strip_visible,
+            strip_locked: mode.strip_locked,
+            bar_locked: mode.bar_locked,
+        };
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+        let point = egui::pos2(20.0, 30.0);
+        let prepared = crate::key_input::prepared_synthetic_pointer_step_for_test(
+            73,
+            crate::key_input::SyntheticPointerLatch {
+                transaction_id: 73,
+                owner: pointer_owner,
+                region: crate::key_input::SyntheticPointerRegion::StillSeekTrack,
+                mode: mode_signature,
+                region_geometry_token: 1,
+                press_page_index: 2,
+                press_item_identity: "page-2".to_string(),
+                widget_id: egui::Id::new("poisoned-pointer-track"),
+                press_rect: rect,
+                coordinate_frame: rect,
+                press_pixels_per_point: 1.0,
+                press_point: point,
+            },
+            crate::key_input::SyntheticPointerStepKind::Down { point },
+            1,
+            1.0_f64.to_bits(),
+        );
+        let completion =
+            crate::key_input::install_synthetic_pointer_delivered_for_test(prepared.clone());
+
+        let mut warmup_input = egui::RawInput {
+            viewport_id: viewport,
+            time: Some(1.0),
+            ..Default::default()
+        };
+        warmup_input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                native_pixels_per_point: Some(1.0),
+                ..Default::default()
+            },
+        );
+        ctx.begin_pass(warmup_input);
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let _ = ui.interact(
+                rect,
+                egui::Id::new("poisoned-pointer-track"),
+                egui::Sense::click_and_drag(),
+            );
+        });
+        let _ = ctx.end_pass();
+
+        let mut child_input = egui::RawInput {
+            viewport_id: viewport,
+            time: Some(1.005),
+            events: vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        child_input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                native_pixels_per_point: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let show = pointer_input::enter_show(Some(pointer_input::ShowOwner {
+            identity: owner.clone(),
+            items_generation: 29,
+        }));
+        ctx.begin_pass(child_input.clone());
+        pointer_input::record_delivery_proof(&prepared, &child_input);
+        pointer_input::begin_pass(&ctx, 29, 2, "page-2".to_string(), mode);
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let response = ui.interact(
+                rect,
+                egui::Id::new("poisoned-pointer-track"),
+                egui::Sense::click_and_drag(),
+            );
+            assert!(
+                response.is_pointer_button_down_on(),
+                "test precondition: egui must hit the actual track response"
+            );
+            pointer_input::record_region(
+                pointer_input::RegionId::StillSeekTrack,
+                &response,
+                rect,
+                None,
+            );
+            pointer_input::observe_region_handler(
+                &response,
+                pointer_input::RegionId::StillSeekTrack,
+                None,
+            );
+        });
+        pointer_input::finish_pass(&ctx);
+        let output = show.finish();
+        let _ = ctx.end_pass();
+
+        let poisoned_catalog = pointer_input::new_shared_catalog();
+        let poison_target = Arc::clone(&poisoned_catalog);
+        let poison = std::thread::spawn(move || {
+            let _guard = poison_target.write().unwrap();
+            panic!("poison pointer catalog for publication regression");
+        });
+        assert!(poison.join().is_err());
+        let mut ui_runtime = local_runtime();
+        ui_runtime.pointer_regions = poisoned_catalog;
+        {
+            let mut active = runtime().lock().expect("test-script runtime lock poisoned");
+            assert!(active.is_none(), "no other runtime may own this regression");
+            *active = Some(ui_runtime);
+        }
+
+        publish_pointer_show(&ctx, output, owner, 29, 2);
+
+        let completion_error = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the exact delivered step must be completed")
+            .expect_err("catalog publication failure must not report pointer success");
+        assert!(completion_error.contains("catalog is poisoned"));
+        assert!(crate::key_input::synthetic_input_is_idle());
+        let mut active = runtime().lock().expect("test-script runtime lock poisoned");
+        let mut ui_runtime = active
+            .take()
+            .expect("the regression runtime must remain present");
+        ui_runtime.begin_finish(ScriptOutcome::success(), 1.005_f64.to_bits());
+        let finish = ui_runtime
+            .finish
+            .expect("environment failure must finish the run");
+        assert_eq!(finish.outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
+        assert_ne!(finish.outcome.kind.exit_code(), 0);
+        assert!(finish.outcome.message.contains("catalog is poisoned"));
+        drop(active);
+        crate::key_input::clear_test_synthetic_input();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pointer_terminal_ack_cannot_be_masked_by_same_frame_success() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_synthetic_input();
+        let handle = crate::key_input::SyntheticPointerCancelHandle {
+            transaction_id: 73,
+            step_id: 73_u64 << 32 | 1,
+            owner: crate::key_input::SyntheticPointerOwner {
+                identity: root_identity(17, 0x7171),
+                items_generation: 29,
+            },
+        };
+        crate::key_input::install_synthetic_pointer_terminal_for_test(handle.clone());
+        let mut runtime = local_runtime();
+
+        runtime.fail_environment(
+            "synthetic pointer cleanup did not release primary".to_string(),
+            41,
+        );
+        assert!(crate::key_input::acknowledge_synthetic_pointer_terminal_issue(&handle));
+        runtime.begin_finish(ScriptOutcome::success(), 41);
+
+        let finish = runtime.finish.as_ref().expect("finish must be committed");
+        assert_eq!(finish.outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
+        assert_ne!(finish.outcome.kind.exit_code(), 0);
+        assert!(crate::key_input::synthetic_input_is_idle());
+        crate::key_input::clear_test_synthetic_input();
     }
 }

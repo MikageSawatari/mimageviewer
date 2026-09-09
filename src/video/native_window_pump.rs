@@ -382,6 +382,8 @@ pub(crate) struct NativeWindowPumpSpawn {
     pub(crate) init_error: Arc<Mutex<Option<String>>>,
     pub(crate) channel_fault: Arc<AtomicBool>,
     pub(crate) health: Arc<super::native_window_health::NativeWindowHealth>,
+    #[cfg(feature = "test-script")]
+    pub(crate) ui_smoke_output_id: super::native_ui_smoke::NativeUiSmokeOutputId,
 }
 
 pub(crate) fn spawn_native_window_pump(
@@ -458,6 +460,11 @@ struct PumpRuntime {
     cursor: CursorAutoHideReducer,
     shutdown_request: u64,
     quitting: bool,
+    #[cfg(feature = "test-script")]
+    ui_smoke_output_id: super::native_ui_smoke::NativeUiSmokeOutputId,
+    #[cfg(feature = "test-script")]
+    ui_smoke_host_publishers:
+        HashMap<WindowEpoch, super::native_ui_smoke::NativeUiSmokeHostPublisher>,
 }
 
 impl PumpRuntime {
@@ -505,6 +512,10 @@ impl PumpRuntime {
             cursor,
             shutdown_request: 0,
             quitting: false,
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: spawn.ui_smoke_output_id,
+            #[cfg(feature = "test-script")]
+            ui_smoke_host_publishers: HashMap::new(),
         }
     }
 
@@ -973,7 +984,19 @@ impl PumpRuntime {
             window.hud_hwnd(),
             false,
         );
+        #[cfg(feature = "test-script")]
+        let ui_smoke_host_publisher = super::native_ui_smoke::NativeUiSmokeHostPublisher::new(
+            self.ui_smoke_output_id,
+            request.0,
+            epoch,
+            placement.placement,
+            placement.owner_hwnd,
+            windows,
+        )?;
         self.hosts.insert(epoch, window);
+        #[cfg(feature = "test-script")]
+        self.ui_smoke_host_publishers
+            .insert(epoch, ui_smoke_host_publisher);
         self.parent_sizes.insert(epoch, (width, height));
         let dispatch_t0 = Instant::now();
         let result = self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowCreated {
@@ -1170,6 +1193,8 @@ impl PumpRuntime {
         if let Some(mut window) = self.hosts.remove(&host.epoch) {
             window.destroy();
         }
+        #[cfg(feature = "test-script")]
+        self.ui_smoke_host_publishers.remove(&host.epoch);
         self.requests.remove(&host.epoch);
         self.parent_sizes.remove(&host.epoch);
         self.health.clear_window_handles_if_epoch(host.epoch.0);
@@ -1184,6 +1209,8 @@ impl PumpRuntime {
         self.reset_cursor_for_transition(host.epoch);
         self.clear_published_if_matches(host.epoch);
         self.hosts.remove(&host.epoch);
+        #[cfg(feature = "test-script")]
+        self.ui_smoke_host_publishers.remove(&host.epoch);
         self.requests.remove(&host.epoch);
         self.parent_sizes.remove(&host.epoch);
         self.health.clear_window_handles_if_epoch(host.epoch.0);
@@ -1303,6 +1330,8 @@ impl PumpRuntime {
                     window.destroy();
                 }
             }
+            #[cfg(feature = "test-script")]
+            self.ui_smoke_host_publishers.clear();
             self.finish_typed_shutdown();
         }
     }
@@ -1315,6 +1344,8 @@ impl PumpRuntime {
         self.hud_hwnd_out.store(0, Ordering::Release);
         self.health.clear_window_handles();
         self.presenter_visibility.publish_hidden(false);
+        #[cfg(feature = "test-script")]
+        self.ui_smoke_host_publishers.clear();
         self.closed.store(true, Ordering::Release);
         let _ = self.send_lifecycle(PumpLifecycleEvent::Shutdown);
         self.quitting = true;
@@ -1385,6 +1416,8 @@ impl PumpRuntime {
     fn drain_window_events(&mut self) -> Result<(), String> {
         let active_before_drain = cursor_input_epoch(self.state);
         let mut cursor_events = Vec::new();
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_cursor_receipts = Vec::new();
         for envelope in self.pump_events.drain() {
             let epoch = WindowEpoch(envelope.epoch);
             if !self.hosts.contains_key(&epoch) {
@@ -1392,6 +1425,18 @@ impl PumpRuntime {
             }
             if let Some(event) = cursor_routing_event_for_epoch(active_before_drain, &envelope) {
                 cursor_events.push(event);
+                #[cfg(feature = "test-script")]
+                if let (Some(metadata), NativeVideoWindowEvent::MouseMove(mouse)) =
+                    (envelope.smoke_metadata, &envelope.event)
+                {
+                    ui_smoke_cursor_receipts.push((
+                        epoch,
+                        metadata,
+                        envelope.source,
+                        mouse.x,
+                        mouse.y,
+                    ));
+                }
             }
             match envelope.event {
                 NativeVideoWindowEvent::CloseRequested { .. } => {
@@ -1466,6 +1511,31 @@ impl PumpRuntime {
             );
             self.apply_cursor_icon(epoch, icon);
             self.record_cursor_health(epoch);
+            #[cfg(feature = "test-script")]
+            for (receipt_epoch, metadata, source, event_x, event_y) in ui_smoke_cursor_receipts {
+                if receipt_epoch != epoch {
+                    continue;
+                }
+                let Some(request) = self.requests.get(&epoch) else {
+                    continue;
+                };
+                let Some(window) = self.hosts.get(&epoch) else {
+                    continue;
+                };
+                super::native_ui_smoke::record_pump_receipt(
+                    metadata,
+                    super::native_ui_smoke::NativeUiSmokePumpReceipt {
+                        output: self.ui_smoke_output_id,
+                        epoch: epoch.0,
+                        placement: request.placement,
+                        owner_hwnd: request.owner_hwnd,
+                        windows: window.contract_windows(),
+                        source,
+                        event_x,
+                        event_y,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -1811,6 +1881,8 @@ mod tests {
                     ctrl: false,
                 },
             ),
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         // Hidden/preparing/closing states expose no cursor input epoch, so
         // queued pre-transition mouse messages cannot reseed ownership.
@@ -1950,6 +2022,8 @@ mod tests {
             init_error: Arc::clone(&init_error),
             channel_fault,
             health: Arc::clone(&health),
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: super::super::native_ui_smoke::allocate_output_id(),
         })
         .expect("spawn production window pump");
         let NativeWindowPumpThread {

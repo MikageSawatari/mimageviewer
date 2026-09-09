@@ -4,7 +4,6 @@ use crate::touch_input::{
 
 pub(crate) const MAX_OWNED_TOUCH_POINTERS: usize = 16;
 const PRIMARY_CANCEL_DISTANCE_POINTS: f32 = 1024.0;
-pub(crate) const VIDEO_TAP_SEEK_SECS: f64 = 5.0;
 
 /// Native HWND that originated a video-overlay input stream.
 ///
@@ -275,8 +274,8 @@ pub(crate) fn native_touch_command_toggles_chrome_without_video_gestures(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum NativeVideoTouchCommand {
     ToggleChrome,
-    SeekRelative {
-        delta_secs: f64,
+    SeekMedium {
+        forward: bool,
     },
     PanoramaDrag {
         delta_points: egui::Vec2,
@@ -311,10 +310,10 @@ impl PhysicalTapSide {
         if left { Self::Left } else { Self::Right }
     }
 
-    fn seek_delta_secs(self) -> f64 {
+    fn seeks_forward(self) -> bool {
         match self {
-            Self::Left => -VIDEO_TAP_SEEK_SECS,
-            Self::Right => VIDEO_TAP_SEEK_SECS,
+            Self::Left => false,
+            Self::Right => true,
         }
     }
 }
@@ -681,8 +680,8 @@ impl NativeTouchAdapter {
                 TouchCommand::PageSide { left } if self.video_gestures_enabled => {
                     let side = PhysicalTapSide::from_left(left);
                     self.pending_commands
-                        .push(NativeVideoTouchCommand::SeekRelative {
-                            delta_secs: side.seek_delta_secs(),
+                        .push(NativeVideoTouchCommand::SeekMedium {
+                            forward: side.seeks_forward(),
                         });
                 }
                 TouchCommand::ToggleChrome => {
@@ -1425,7 +1424,7 @@ mod tests {
     #[test]
     fn side_taps_seek_once_without_changing_chrome_latch() {
         for chrome_visible in [false, true] {
-            for (x, delta_secs) in [(100, -VIDEO_TAP_SEEK_SECS), (900, VIDEO_TAP_SEEK_SECS)] {
+            for (x, forward) in [(100, false), (900, true)] {
                 let mut adapter = NativeTouchAdapter::default();
                 if chrome_visible {
                     adapter.show_chrome();
@@ -1433,7 +1432,7 @@ mod tests {
 
                 assert_eq!(
                     tap(&mut adapter, event, 1, x, 400, 0),
-                    vec![NativeVideoTouchCommand::SeekRelative { delta_secs }]
+                    vec![NativeVideoTouchCommand::SeekMedium { forward }]
                 );
                 assert_eq!(adapter.chrome_latched(), chrome_visible);
             }
@@ -1446,9 +1445,7 @@ mod tests {
         for (index, start_ms) in [0, 150, 300, 450].into_iter().enumerate() {
             assert_eq!(
                 tap(&mut adapter, event, index as u32 + 1, 900, 400, start_ms),
-                vec![NativeVideoTouchCommand::SeekRelative {
-                    delta_secs: VIDEO_TAP_SEEK_SECS,
-                }]
+                vec![NativeVideoTouchCommand::SeekMedium { forward: true }]
             );
         }
     }
@@ -1594,9 +1591,7 @@ mod tests {
         assert!(!adapter.first_run_help_visible());
         assert_eq!(
             tap(&mut adapter, event, 3, 100, 400, 300),
-            vec![NativeVideoTouchCommand::SeekRelative {
-                delta_secs: -VIDEO_TAP_SEEK_SECS,
-            }]
+            vec![NativeVideoTouchCommand::SeekMedium { forward: false }]
         );
     }
 
@@ -1636,13 +1631,13 @@ mod tests {
         let mut left = NativeTouchAdapter::default();
         assert_eq!(
             tap(&mut left, event, 1, 100, 400, 0),
-            vec![NativeVideoTouchCommand::SeekRelative { delta_secs: -5.0 }]
+            vec![NativeVideoTouchCommand::SeekMedium { forward: false }]
         );
 
         let mut right = NativeTouchAdapter::default();
         assert_eq!(
             tap(&mut right, event, 1, 900, 400, 0),
-            vec![NativeVideoTouchCommand::SeekRelative { delta_secs: 5.0 }]
+            vec![NativeVideoTouchCommand::SeekMedium { forward: true }]
         );
     }
 
@@ -1668,5 +1663,9 @@ mod tests {
         assert!(has_primary_button(&reset.egui_events, false));
         assert!(!adapter.chrome_latched());
         assert!(adapter.take_commands().is_empty());
+        assert_eq!(
+            tap(&mut adapter, event, 2, 100, 400, 200),
+            vec![NativeVideoTouchCommand::SeekMedium { forward: false }]
+        );
     }
 }

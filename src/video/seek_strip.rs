@@ -1068,11 +1068,62 @@ pub enum SeekStripCenter {
 pub(crate) struct SeekStripDragOrigin {
     pub(crate) center: SeekStripCenter,
     pub(crate) pointer: eframe::egui::Pos2,
+    metric: SeekStripDragMetric,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SeekStripDragMetric {
+    Thumbnail {
+        cell_width: f32,
+        axis_origin_x: f32,
+    },
+    Waveform {
+        strip_width: f32,
+        span_secs: f64,
+        axis_origin_x: f32,
+    },
 }
 
 impl SeekStripDragOrigin {
-    pub(crate) fn new(center: SeekStripCenter, pointer: eframe::egui::Pos2) -> Self {
-        Self { center, pointer }
+    pub(crate) fn new(
+        center: SeekStripCenter,
+        pointer: eframe::egui::Pos2,
+        thumbnail_cell_width: f32,
+        strip_width: f32,
+        waveform_span_secs: f64,
+        axis_origin_x: f32,
+    ) -> Option<Self> {
+        if !axis_origin_x.is_finite() {
+            return None;
+        }
+        let metric = match center {
+            SeekStripCenter::Thumbnails { .. }
+                if thumbnail_cell_width.is_finite() && thumbnail_cell_width > 0.0 =>
+            {
+                SeekStripDragMetric::Thumbnail {
+                    cell_width: thumbnail_cell_width,
+                    axis_origin_x,
+                }
+            }
+            SeekStripCenter::Waveform { .. }
+                if strip_width.is_finite()
+                    && strip_width > 0.0
+                    && waveform_span_secs.is_finite()
+                    && waveform_span_secs > 0.0 =>
+            {
+                SeekStripDragMetric::Waveform {
+                    strip_width,
+                    span_secs: waveform_span_secs,
+                    axis_origin_x,
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            center,
+            pointer,
+            metric,
+        })
     }
 }
 
@@ -1155,23 +1206,59 @@ pub(crate) fn waveform_time_at_pointer(
 pub(crate) fn seek_strip_center_at_drag_pointer(
     origin: SeekStripDragOrigin,
     pointer: eframe::egui::Pos2,
-    thumbnail_cell_width: f32,
-    strip_width: f32,
-    waveform_span_secs: f64,
 ) -> Option<SeekStripCenter> {
     let total_delta_x = pointer.x - origin.pointer.x;
-    match origin.center {
-        SeekStripCenter::Thumbnails { center_index } => {
-            center_index_after_drag(center_index, total_delta_x, thumbnail_cell_width)
-                .map(|center_index| SeekStripCenter::Thumbnails { center_index })
-        }
-        SeekStripCenter::Waveform { center_time_secs } => waveform_center_after_drag(
+    match (origin.center, origin.metric) {
+        (
+            SeekStripCenter::Thumbnails { center_index },
+            SeekStripDragMetric::Thumbnail { cell_width, .. },
+        ) => center_index_after_drag(center_index, total_delta_x, cell_width)
+            .map(|center_index| SeekStripCenter::Thumbnails { center_index }),
+        (
+            SeekStripCenter::Waveform { center_time_secs },
+            SeekStripDragMetric::Waveform {
+                strip_width,
+                span_secs,
+                ..
+            },
+        ) => waveform_center_after_drag(center_time_secs, total_delta_x, strip_width, span_secs)
+            .map(|center_time_secs| SeekStripCenter::Waveform { center_time_secs }),
+        _ => None,
+    }
+}
+
+/// Whole-span drag/click keeps mapping the current pointer to the fixed axis. The normal path uses
+/// the current layout; this press snapshot is the fallback if the viewport becomes zero-sized
+/// before release.
+pub(crate) fn seek_strip_center_at_press_axis_pointer(
+    origin: SeekStripDragOrigin,
+    pointer: eframe::egui::Pos2,
+) -> Option<SeekStripCenter> {
+    match (origin.center, origin.metric) {
+        (
+            SeekStripCenter::Thumbnails { center_index },
+            SeekStripDragMetric::Thumbnail {
+                cell_width,
+                axis_origin_x,
+            },
+        ) => center_index_at_pointer(center_index, pointer.x, axis_origin_x, cell_width)
+            .map(|center_index| SeekStripCenter::Thumbnails { center_index }),
+        (
+            SeekStripCenter::Waveform { center_time_secs },
+            SeekStripDragMetric::Waveform {
+                strip_width,
+                span_secs,
+                axis_origin_x,
+            },
+        ) => waveform_time_at_pointer(
             center_time_secs,
-            total_delta_x,
+            pointer.x,
+            axis_origin_x,
             strip_width,
-            waveform_span_secs,
+            span_secs,
         )
         .map(|center_time_secs| SeekStripCenter::Waveform { center_time_secs }),
+        _ => None,
     }
 }
 
@@ -2196,16 +2283,17 @@ mod tests {
         let origin = SeekStripDragOrigin::new(
             SeekStripCenter::Thumbnails { center_index: 10.0 },
             eframe::egui::pos2(600.0, 100.0),
-        );
+            100.0,
+            1_000.0,
+            60.0,
+            500.0,
+        )
+        .expect("valid thumbnail metric");
         let centers = [590.0, 570.0, 535.0, 500.0].map(|pointer_x| {
-            let SeekStripCenter::Thumbnails { center_index } = seek_strip_center_at_drag_pointer(
-                origin,
-                eframe::egui::pos2(pointer_x, 100.0),
-                100.0,
-                1_000.0,
-                60.0,
-            )
-            .expect("finite drag") else {
+            let SeekStripCenter::Thumbnails { center_index } =
+                seek_strip_center_at_drag_pointer(origin, eframe::egui::pos2(pointer_x, 100.0))
+                    .expect("finite drag")
+            else {
                 panic!("thumbnail origin must stay on the thumbnail axis");
             };
             center_index
@@ -2215,13 +2303,7 @@ mod tests {
         }
         assert!(centers.windows(2).all(|pair| pair[0] < pair[1]));
 
-        let release = seek_strip_center_at_drag_pointer(
-            origin,
-            eframe::egui::pos2(500.0, 100.0),
-            100.0,
-            1_000.0,
-            60.0,
-        );
+        let release = seek_strip_center_at_drag_pointer(origin, eframe::egui::pos2(500.0, 100.0));
         assert_eq!(
             release,
             Some(SeekStripCenter::Thumbnails { center_index: 11.0 })
@@ -2232,14 +2314,16 @@ mod tests {
                 center_time_secs: 90.0,
             },
             eframe::egui::pos2(600.0, 100.0),
-        );
+            100.0,
+            1_000.0,
+            60.0,
+            500.0,
+        )
+        .expect("valid waveform metric");
         let waveform_centers = [590.0, 570.0, 535.0, 500.0].map(|pointer_x| {
             let SeekStripCenter::Waveform { center_time_secs } = seek_strip_center_at_drag_pointer(
                 waveform_origin,
                 eframe::egui::pos2(pointer_x, 100.0),
-                100.0,
-                1_000.0,
-                60.0,
             )
             .expect("finite drag") else {
                 panic!("waveform origin must stay on the waveform axis");
@@ -2248,6 +2332,41 @@ mod tests {
         });
         assert!(waveform_centers.windows(2).all(|pair| pair[0] < pair[1]));
         assert!((waveform_centers[3] - 96.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn drag_uses_press_metric_when_height_or_viewport_changes_mid_gesture() {
+        let thumbnail = SeekStripDragOrigin::new(
+            SeekStripCenter::Thumbnails { center_index: 10.0 },
+            eframe::egui::pos2(600.0, 100.0),
+            100.0,
+            1_000.0,
+            60.0,
+            500.0,
+        )
+        .unwrap();
+        assert_eq!(
+            seek_strip_center_at_drag_pointer(thumbnail, eframe::egui::pos2(500.0, 100.0)),
+            Some(SeekStripCenter::Thumbnails { center_index: 11.0 })
+        );
+
+        let waveform = SeekStripDragOrigin::new(
+            SeekStripCenter::Waveform {
+                center_time_secs: 90.0,
+            },
+            eframe::egui::pos2(600.0, 100.0),
+            100.0,
+            1_000.0,
+            60.0,
+            500.0,
+        )
+        .unwrap();
+        let Some(SeekStripCenter::Waveform { center_time_secs }) =
+            seek_strip_center_at_drag_pointer(waveform, eframe::egui::pos2(500.0, 100.0))
+        else {
+            panic!("waveform drag must remain on its press-time axis");
+        };
+        assert!((center_time_secs - 96.0).abs() < 1.0e-6);
     }
 
     #[test]

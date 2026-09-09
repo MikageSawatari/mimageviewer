@@ -15,9 +15,9 @@
 #
 # Copy the suggested line from the script's output rather than typing it: the
 # payload column must match its normalization exactly.
-src\app.rs:39069:21	detached session binding failed for ViewerContextId(#): ContextOwnedBy(#)	filed	backlog 1.195; multi-window PDF open, fixed for v3.6.0
-src\ui_fullscreen.rs:13611:21	active detached backstop window # has no context binding	filed	backlog 1.195; same ownership family, seen 2026-08-28
-src\app\viewer_context_registry.rs:2935:32	window # has no viewer-context binding	filed	backlog 1.195; same ownership family, seen 2026-08-28
+src\app.rs:39069:21	detached session binding failed for ViewerContextId(#): ContextOwnedBy(#)	fixed	c40716b37 (v3.6.0); derive window identity from registry; detached_binding_identity 10 tests passed again on 2026-09-07
+src\ui_fullscreen.rs:13611:21	active detached backstop window # has no context binding	fixed	786992a34 (2026-08-28 13:24); native session published without binding; v3.7.0-priority-work.md, 22 current regression tests passed
+src\app\viewer_context_registry.rs:2935:32	window # has no viewer-context binding	fixed	same root cause as ui_fullscreen.rs:13611; detection moved by 29ecf9429, fixed by 786992a34; 22 current regression tests passed
 src\ui_main.rs:1013:48	index out of bounds: the len is # but the index is #	filed	backlog 1.196; grid index, 2026-04
 src\ui_main.rs:1026:48	index out of bounds: the len is # but the index is #	filed	backlog 1.196; grid index, 2026-04
 src\video\dsp\gui.rs:221:33	RefCell already mutably borrowed	filed	backlog 1.196; VST editor, 2026-05

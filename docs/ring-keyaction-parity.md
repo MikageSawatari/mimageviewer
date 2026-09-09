@@ -76,6 +76,16 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 `ImageZoomMode`→`FsZoomMode` (KeyHold の照準表示は一発アクションではスキップ)。
 動画 FS: `VideoCapture/Mute/Loop/Bookmark/MarkerPrev/MarkerNext/TileMode/ExternalPlayer` は同名 `KeyAction` あり。
 
+v3.7.0 の段階別シーク: `VideoSeekBackSmall/ForwardSmall/BackMedium/ForwardMedium/BackLarge/ForwardLarge`
+は RingActionId / KeyAction の両方へ対応する。小・大の既存 KeyAction ID と既定キーは維持し、
+中の KeyAction は既定割り当てなし。修飾なし左右キーと左右タップは従来の固定入力を保ち、
+中シークの設定秒数を使う。リング・マウスジェスチャ・ゲームパッド・キーの各経路が同じ小 / 中 / 大設定を参照する。
+物理 Back / Forward / Middle ボタンへの 6 シーク割り当ては、機器によって 1 クリックが
+複数の browser-navigation event として届く問題が未解消のため、v3.7.0 では候補から外し実行もしない。
+既に保存された `RingActionId` は serialized validity として保持し、sanitize / 保存で `None` に変えない。
+通常ホイールの「前後ファイル / 音量」選択は動画・音声の専用マウス設定であり、
+RingActionId や新しい固定キー操作を増やすものではない。
+
 ## ⚪ ring/パッド専用
 
 `CycleFavorite` / `GridToggleSnapshotLock` / `ImageOpenFolder`。

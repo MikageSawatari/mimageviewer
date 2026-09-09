@@ -473,10 +473,12 @@
 # VideoPlayPause.1 = Space ; 動画の再生または一時停止を切り替える
 # VideoPlayPause.2 = Enter ; 動画の再生または一時停止を切り替える
 # VideoSeekStart = W ; 動画の先頭へ移動して再生する
-# VideoSeekBackSmall = Shift+Left ; 動画を1秒戻す
-# VideoSeekForwardSmall = Shift+Right ; 動画を1秒進める
-# VideoSeekBackLarge = Ctrl+Left ; 動画を30秒戻す
-# VideoSeekForwardLarge = Ctrl+Right ; 動画を30秒進める
+# VideoSeekBackSmall = Shift+Left ; 動画・音声を小シークで戻す
+# VideoSeekForwardSmall = Shift+Right ; 動画・音声を小シークで進める
+# VideoSeekBackMedium = none ; 動画・音声を中シークで戻す
+# VideoSeekForwardMedium = none ; 動画・音声を中シークで進める
+# VideoSeekBackLarge = Ctrl+Left ; 動画・音声を大シークで戻す
+# VideoSeekForwardLarge = Ctrl+Right ; 動画・音声を大シークで進める
 # VideoFrameStepBack = Ctrl+Shift+Left ; 動画を1フレーム戻す
 # VideoFrameStepForward = Ctrl+Shift+Right ; 動画を1フレーム進める
 # VideoVolumeUp = Shift+Up ; 動画音量を上げる

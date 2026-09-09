@@ -48,6 +48,8 @@ pub(crate) mod native_cursor;
 #[cfg(windows)]
 pub mod native_presenter;
 pub(crate) mod native_touch;
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) mod native_ui_smoke;
 #[cfg(windows)]
 pub mod native_window;
 #[cfg(windows)]
@@ -454,6 +456,7 @@ pub struct NativeBarLockState {
     pub bottom_lock: crate::settings::BottomBarLock,
     pub fixed_bar_gap_px: u32,
     pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    pub seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
     pub seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
     pub seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
 }
@@ -688,6 +691,9 @@ pub enum NativeVideoOutputEvent {
     SeekRelative {
         delta_secs: f64,
     },
+    SeekMedium {
+        forward: bool,
+    },
     TouchChromeLearned,
     PanoramaDrag {
         delta_points: egui::Vec2,
@@ -711,6 +717,9 @@ pub enum NativeVideoOutputEvent {
     NavigateItem {
         delta: i32,
         via_wheel: bool,
+    },
+    NormalWheel {
+        delta: i32,
     },
     TileColumnsDelta {
         delta: i32,
@@ -2216,6 +2225,10 @@ impl NativeVideoOutput {
         let presenter_visibility = NativePresenterVisibility::new(config.initial_visibility);
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "test-script")]
+        let native_ui_smoke_output_id = native_ui_smoke::allocate_output_id();
+        #[cfg(feature = "test-script")]
+        let render_requested_source_epoch = Arc::clone(&source_epoch);
         let initial_vst3_available = config.vst3_available;
         let initial_checked = config.checked;
         let initial_text_contrast_strong =
@@ -2250,6 +2263,8 @@ impl NativeVideoOutput {
                 init_error: Arc::clone(&init_error),
                 channel_fault: Arc::clone(&channel_fault),
                 health: Arc::clone(&health),
+                #[cfg(feature = "test-script")]
+                ui_smoke_output_id: native_ui_smoke_output_id,
             },
         ) {
             Ok(pump) => pump,
@@ -2285,6 +2300,10 @@ impl NativeVideoOutput {
                         audio_diagnostics,
                         &pump_render,
                         thread_health,
+                        #[cfg(feature = "test-script")]
+                        native_ui_smoke_output_id,
+                        #[cfg(feature = "test-script")]
+                        render_requested_source_epoch,
                     )
                 }));
                 let error = match result {
@@ -3994,6 +4013,7 @@ fn send_native_overlay_command(
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
+        Command::SeekMedium { forward } => NativeVideoOutputEvent::SeekMedium { forward },
         Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
         Command::PanoramaDrag {
             delta_points,
@@ -4021,6 +4041,7 @@ fn send_native_overlay_command(
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
         }
+        Command::NormalWheel { delta } => NativeVideoOutputEvent::NormalWheel { delta },
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
         Command::RequestSeekThumbnail {
             target_secs,
@@ -4395,6 +4416,8 @@ fn run_native_video_output(
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     window_pump: &native_window_pump::NativeWindowPumpRenderClient,
     health: Arc<native_window_health::NativeWindowHealth>,
+    #[cfg(feature = "test-script")] ui_smoke_output_id: native_ui_smoke::NativeUiSmokeOutputId,
+    #[cfg(feature = "test-script")] requested_source_epoch: Arc<AtomicU64>,
 ) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
@@ -4599,6 +4622,11 @@ fn run_native_video_output(
         fallback_file_name: cur_fallback_file_name.clone(),
         show_preparing_overlay: config.initial_tile_overlay,
     });
+    #[cfg(feature = "test-script")]
+    let ui_smoke_render_publisher = native_ui_smoke::NativeUiSmokeRenderPublisher::new(
+        ui_smoke_output_id,
+        &requested_source_epoch,
+    );
     health.record_source_generation(source.source_epoch);
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
@@ -4623,6 +4651,8 @@ fn run_native_video_output(
     let mut startup_probe_count = 0_u32;
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
+    #[cfg(feature = "test-script")]
+    let mut native_event_envelopes = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     let mut pending_navigation_preview_clear_at: Option<Instant> = None;
     const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
@@ -5960,7 +5990,36 @@ fn run_native_video_output(
                 }
             }
         }
+        #[cfg(feature = "test-script")]
+        let _ = ui_smoke_render_publisher.publish(
+            source.source_epoch,
+            cur_generation,
+            cur_placement,
+            cur_owner_hwnd,
+            cur_presenter_hwnd,
+            presenter.ui_smoke_canvas_geometry(),
+        )?;
         native_events.clear();
+        #[cfg(feature = "test-script")]
+        {
+            native_event_envelopes.clear();
+            for envelope in window_pump.drain_window_events() {
+                if window_event_belongs_to_generation(&envelope, cur_generation) {
+                    native_event_envelopes.push(envelope);
+                } else if let Some(metadata) = envelope.smoke_metadata {
+                    native_ui_smoke::record_render_failure(
+                        metadata,
+                        "native mouse event was stale at the render generation gate",
+                    );
+                }
+            }
+            native_events.extend(
+                native_event_envelopes
+                    .iter()
+                    .map(|envelope| envelope.event.clone()),
+            );
+        }
+        #[cfg(not(feature = "test-script"))]
         native_events.extend(
             window_pump
                 .drain_window_events()
@@ -6075,6 +6134,10 @@ fn run_native_video_output(
             }
         }
         if !native_events.is_empty() {
+            #[cfg(feature = "test-script")]
+            let mut ui_smoke_render_succeeded = false;
+            #[cfg(feature = "test-script")]
+            let mut ui_smoke_command_count = 0_usize;
             presenter.update_overlay_video_state(
                 source.clock.now_secs(),
                 f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
@@ -6087,10 +6150,15 @@ fn run_native_video_output(
                 source.clock.is_seeking(),
                 source.clock.current_seek_serial(),
             );
-            let overlay_routing = match presenter.handle_window_events(&native_events) {
-                Ok(outcome) => {
+            let overlay_outcome = match presenter.handle_window_events(&native_events) {
+                Ok(mut outcome) => {
+                    #[cfg(feature = "test-script")]
+                    {
+                        ui_smoke_render_succeeded = true;
+                        ui_smoke_command_count = outcome.commands.len();
+                    }
                     sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
-                    for command in outcome.commands {
+                    for command in std::mem::take(&mut outcome.commands) {
                         let event_epoch = source.source_epoch;
                         match command {
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
@@ -6109,6 +6177,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SeekRelative { delta_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SeekMedium {
+                                forward,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SeekMedium { forward },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TouchChromeLearned => {
@@ -6205,6 +6282,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::NavigateItem { delta, via_wheel },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::NormalWheel {
+                                delta,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::NormalWheel { delta },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {
@@ -6759,28 +6845,92 @@ fn run_native_video_output(
                             }
                         }
                     }
-                    outcome.routing
+                    Some(outcome)
                 }
                 Err(err) => {
                     crate::logger::log(format!(
                         "[native-video] overlay input render failed: {err}"
                     ));
-                    crate::video::native_presenter::NativeOverlayInputRouting::default()
+                    #[cfg(feature = "test-script")]
+                    for envelope in &native_event_envelopes {
+                        if let Some(metadata) = envelope.smoke_metadata {
+                            native_ui_smoke::record_render_failure(
+                                metadata,
+                                format!("native mouse overlay input failed: {err}"),
+                            );
+                        }
+                    }
+                    None
                 }
             };
+            let overlay_routing = overlay_outcome
+                .as_ref()
+                .map_or_else(Default::default, |outcome| outcome.routing);
             publish_native_overlay_input_routing(
                 &ui_event_tx,
                 source.source_epoch,
                 &mut published_overlay_input_routing,
                 overlay_routing,
             );
-            for event in &native_events {
-                if overlay_routing.should_forward_to_ui(event) {
+            for (event_index, event) in native_events.iter().enumerate() {
+                let should_forward = overlay_outcome.as_ref().map_or_else(
+                    || overlay_routing.should_forward_to_ui(event),
+                    |outcome| outcome.should_forward_to_ui(event_index, event),
+                );
+                if should_forward {
                     send_native_output_event(
                         &ui_event_tx,
                         source.source_epoch,
                         NativeVideoOutputEvent::Window(event.clone()),
                     );
+                }
+            }
+            #[cfg(feature = "test-script")]
+            if ui_smoke_render_succeeded {
+                let geometry = presenter.ui_smoke_canvas_geometry();
+                let geometry_version = ui_smoke_render_publisher.publish(
+                    source.source_epoch,
+                    cur_generation,
+                    cur_placement,
+                    cur_owner_hwnd,
+                    cur_presenter_hwnd,
+                    geometry,
+                )?;
+                for (event_index, envelope) in native_event_envelopes.iter().enumerate() {
+                    if let Some(metadata) = envelope.smoke_metadata {
+                        let native_window::NativeVideoWindowEvent::MouseMove(mouse) =
+                            &envelope.event
+                        else {
+                            native_ui_smoke::record_render_failure(
+                                metadata,
+                                "tagged native mouse event was not a mouse move at the render tail",
+                            );
+                            continue;
+                        };
+                        native_ui_smoke::record_render_receipt(
+                            metadata,
+                            native_ui_smoke::NativeUiSmokeRenderReceipt {
+                                output: ui_smoke_render_publisher.output_id(),
+                                actual_source_epoch: source.source_epoch,
+                                generation: cur_generation,
+                                placement: cur_placement,
+                                owner_hwnd: cur_owner_hwnd,
+                                presenter_hwnd: cur_presenter_hwnd,
+                                geometry,
+                                geometry_version,
+                                raw_forwarded: overlay_outcome.as_ref().map_or_else(
+                                    || overlay_routing.should_forward_to_ui(&envelope.event),
+                                    |outcome| {
+                                        outcome.should_forward_to_ui(event_index, &envelope.event)
+                                    },
+                                ),
+                                command_count: ui_smoke_command_count,
+                                source: envelope.source,
+                                event_x: mouse.x,
+                                event_y: mouse.y,
+                            },
+                        );
+                    }
                 }
             }
             last_overlay_tick = Instant::now();
@@ -7832,6 +7982,14 @@ impl VideoPlayer {
         self.clock.set_playing(false);
         self.clock.set_paused_position(position_secs);
         self.clock.set_playing(was_playing);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_duration_for_test(&mut self, duration_secs: f64) {
+        self.info
+            .as_mut()
+            .expect("test player must have VideoInfo")
+            .duration_secs = duration_secs;
     }
 
     #[cfg(test)]
@@ -9973,6 +10131,21 @@ impl VideoPlayer {
             .unwrap_or_default()
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_native_overlay_input_routing_for_test(
+        &self,
+        routing: native_presenter::NativeOverlayInputRouting,
+    ) {
+        let output = self
+            .native_output
+            .as_ref()
+            .expect("test player must have native output");
+        *output
+            .overlay_input_routing
+            .lock()
+            .expect("test routing must not be poisoned") = routing;
+    }
+
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
     /// 戻り値は次回再描画推奨時刻 (秒) — `ctx.request_repaint_after` に渡す目安。
     pub fn tick(&mut self, ctx: &egui::Context) -> Option<std::time::Duration> {
@@ -11048,6 +11221,8 @@ mod tests {
                 alt: false,
                 repeat: false,
             }),
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
 
         const CURRENT: u64 = 7;
