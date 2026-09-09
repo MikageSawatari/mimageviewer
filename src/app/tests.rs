@@ -1466,7 +1466,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
-    FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+    FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
             idx: page_idx,
             layout_size: texture.size_vec2(),
@@ -1478,7 +1478,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
             source_size: None,
             content_bbox: None,
         }],
-    })
+    }))
 }
 
 #[test]
@@ -27075,10 +27075,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.capture_fs_nav_holdover(idx);
 
-        let FsHoldover::FolderNavigation(unit) =
+        let FsHoldover::FolderNavigation(Some(unit)) =
             app.fs_holdover_tex.as_ref().expect("holdover captured")
         else {
-            panic!("folder navigation must own its own release state");
+            panic!("folder navigation must own a captured display unit");
         };
         assert_eq!(unit.pages.len(), 1);
         assert_eq!(unit.pages[0].idx, idx);
@@ -27195,7 +27195,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             app.spread_mode = mode;
             app.capture_fs_nav_holdover(first);
-            let FsHoldover::FolderNavigation(unit) = app
+            let FsHoldover::FolderNavigation(Some(unit)) = app
                 .fs_holdover_tex
                 .as_ref()
                 .expect("spread holdover captured")
@@ -28411,15 +28411,37 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // **フォルダ移動 (Ctrl+↑↓) の内部 close→open では解除しない。**
-        // この判定を viewport 保持の可否と混ぜていたため、埋め込みフルスクリーンでは
-        // 移動のたびに落ちていた (実機報告 2026-09-02)。移動の意図だけで決める。
+        // Capture may have no drawable resource yet, but FolderNavigation(None) remains the
+        // typed legacy owner until the target is reopened or the navigation terminates.
+        app.items = vec![GridItem::Image(PathBuf::from(r"C:\move\pending.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
         app.fs_info_panel.locked = true;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.capture_fs_nav_holdover(0);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+
         app.close_fullscreen();
         assert!(
             app.fs_info_panel.locked,
-            "フォルダ移動の内部 close でロックが落ちた"
+            "resource-less folder navigation must survive its internal close"
         );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_info_panel.locked);
+
+        app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(!app.fs_info_panel.locked);
     }
 
     #[test]
@@ -29089,7 +29111,7 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex,
+            tex: new_tex.clone(),
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
@@ -29102,13 +29124,13 @@ mod favorite_adjustment_defaults_tests {
             app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "表示可否の一時判定ではなく texture handle の破棄をラッチにする"
-        );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
         assert!(
             app.fs_nav_is_locked(),
-            "描画ラッチと入力抑止 lock の解除タイミングは独立してよい"
+            "consuming the drawable asset must not erase the typed owner before poll observes readiness"
         );
 
         // Reproduce the transient empty display resolution during an AI-final swap.
@@ -29123,6 +29145,24 @@ mod favorite_adjustment_defaults_tests {
                 .and_then(|unit| unit.pages.first())
                 .map(|page| page.texture.id())
         );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+
+        app.thumbnails = vec![ThumbnailState::Loaded {
+            tex: new_tex,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: None,
+            layout_dims: None,
+        }];
+        app.poll_fs_nav_lock(&ctx);
+        assert!(!app.fs_nav_is_locked());
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     /// PDF/ZIP の async enumerate defer で `fullscreen_idx == None` の間は、従来どおり
@@ -58502,7 +58542,11 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 42;
         app.fs_viewport_recreate_after_hide = false;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.capture_fs_nav_holdover(idx);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(_))
+        ));
 
         app.close_fullscreen_for_folder_nav_reopen();
 
@@ -58552,7 +58596,11 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 9;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.capture_fs_nav_holdover(idx);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(_))
+        ));
 
         app.close_fullscreen_for_folder_nav_reopen();
         app.start_loading_items(

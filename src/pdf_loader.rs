@@ -4598,6 +4598,21 @@ impl Drop for PdfEnumerateHandle {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn completed_enumerate_handle_for_test(
+    pdf_path: &Path,
+    result: std::io::Result<Vec<PdfPageEntry>>,
+) -> PdfEnumerateHandle {
+    let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+    let key = PdfEnumerateKey::new(pdf_path, None);
+    let (handle, admission) = coordinator.subscribe(key.clone());
+    let PdfEnumerateAdmission::Start(start) = admission else {
+        unreachable!("a fresh test coordinator must start one request");
+    };
+    coordinator.complete(&key, start.request_id, result);
+    handle
+}
+
 /// UI ナビゲーション経路の PDF ページ列挙。
 ///
 /// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下を組み合わせる:

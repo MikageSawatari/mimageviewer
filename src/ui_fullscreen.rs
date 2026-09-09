@@ -2744,6 +2744,7 @@ fn fs_page_wait_indicator_visible(
                 true
             }
             FsNavigationSequenceTarget::FolderItems { .. }
+            | FsNavigationSequenceTarget::AwaitingPassword { .. }
             | FsNavigationSequenceTarget::Display(_) => false,
         })
     else {
@@ -9146,7 +9147,7 @@ impl App {
                 .as_ref()
                 .and_then(FsHoldover::navigation_sequence)
                 .and_then(|sequence| sequence.previous.clone());
-            self.fs_holdover_tex = previous.map(FsHoldover::FolderNavigation);
+            self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous));
             return false;
         }
         if let Some(sequence) = self
@@ -9194,7 +9195,8 @@ impl App {
             .and_then(FsHoldover::navigation_sequence)
             .and_then(|sequence| match &sequence.target {
                 FsNavigationSequenceTarget::Display(target) => Some(target.clone()),
-                FsNavigationSequenceTarget::FolderItems { .. } => None,
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
             })
         else {
             return;
@@ -9373,6 +9375,7 @@ impl App {
                     Some(target)
                 }
                 FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. }
                 | FsNavigationSequenceTarget::Display(_) => None,
             })
         else {
@@ -9416,6 +9419,7 @@ impl App {
                     Some(target.pages.clone())
                 }
                 FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. }
                 | FsNavigationSequenceTarget::Display(_) => None,
             })
     }
@@ -9423,6 +9427,19 @@ impl App {
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
     /// 入力ハンドラ・描画パスから「現在 nav ロック中か」を簡潔に問い合わせるため。
     pub(crate) fn fs_nav_is_locked(&self) -> bool {
+        if self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.target,
+                    FsNavigationSequenceTarget::AwaitingPassword { .. }
+                )
+            })
+        {
+            return false;
+        }
         self.fs_nav_locked_gen.is_some()
     }
 
@@ -9442,6 +9459,9 @@ impl App {
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
         {
+            if !sequence.displays_previous_unit() {
+                return FsNavHoldoverDecision::Unavailable;
+            }
             if let FsNavigationSequenceTarget::Display(target) = &sequence.target {
                 match target.phase {
                     FsNavigationTargetPhase::Ready(presentation) => {
@@ -9510,6 +9530,14 @@ impl App {
                     }
                     return None;
                 }
+                if let Some(FsHoldover::FolderNavigation(previous)) = self.fs_holdover_tex.as_mut()
+                {
+                    // The legacy navigation owner outlives its drawable resource.  Keep the
+                    // owner until poll/release reaches the terminal transition so an internal
+                    // close in this interval is still distinguished from a true viewer exit.
+                    previous.take();
+                    return None;
+                }
                 // 一方向ラッチ: 新 generation の表示物を選べた描画フレームで旧フォルダの
                 // texture handle 自体を破棄する。AI final の差し替えで次フレームの
                 // resolve が一時的に None へ戻っても、旧画像を再選択できなくする。
@@ -9547,16 +9575,135 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn presentation_switch_holdover(&self) -> Option<FsDisplayUnitHoldover> {
+        match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::PresentationSwitch(unit)) => Some(unit.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn presentation_switch_holdover_for_test(&self) -> Option<FsDisplayUnitHoldover> {
+        self.presentation_switch_holdover()
+    }
+
+    pub(crate) fn fs_navigation_continues_viewer_during_content_teardown(&self) -> bool {
+        self.fs_holdover_tex
+            .as_ref()
+            .is_some_and(FsHoldover::continues_viewer_during_content_teardown)
+    }
+
+    pub(crate) fn finish_fs_navigation_sequence(
+        &mut self,
+        finish: crate::app::FsNavigationSequenceFinish,
+    ) {
+        let had_navigation_owner = matches!(
+            self.fs_holdover_tex.as_ref(),
+            Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+        );
+        self.release_fs_nav_lock();
+        if had_navigation_owner
+            && matches!(finish, crate::app::FsNavigationSequenceFinish::ViewerExited)
+        {
+            self.fs_info_panel.on_fullscreen_exit();
+        }
+    }
+
+    pub(crate) fn suspend_fs_navigation_sequence_for_password(&mut self) -> bool {
+        let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+        else {
+            return false;
+        };
+        let accepted_generation = match sequence.target {
+            FsNavigationSequenceTarget::FolderItems {
+                accepted_generation,
+            } => accepted_generation,
+            FsNavigationSequenceTarget::AwaitingPassword { .. } => return true,
+            FsNavigationSequenceTarget::Display(_) => return false,
+        };
+        sequence.target = FsNavigationSequenceTarget::AwaitingPassword {
+            accepted_generation,
+        };
+        self.fs_nav_locked_gen = None;
+        true
+    }
+
+    pub(crate) fn resume_fs_navigation_sequence_after_password(&mut self) -> bool {
+        let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+        else {
+            return false;
+        };
+        if !matches!(
+            sequence.target,
+            FsNavigationSequenceTarget::AwaitingPassword { .. }
+        ) {
+            return false;
+        }
+        sequence.target = FsNavigationSequenceTarget::FolderItems {
+            accepted_generation: self.items_generation,
+        };
+        self.fs_nav_locked_gen = Some(self.items_generation);
+        true
+    }
+
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込み、`items_generation` を
     /// ロック取得時点で記録する。ナビによる items 入れ替えで fs_cache が drop されても、
     /// ロック解除まで holdover Arc を Render パスから参照することで画面が真っ白に
     /// なるのを防ぐ。`items_generation` のスナップショットは `poll_fs_nav_lock` の
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
-        self.fs_holdover_tex = self
-            .capture_fs_display_unit(fs_idx)
-            .map(FsHoldover::FolderNavigation);
+        self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+            self.capture_fs_display_unit(fs_idx),
+        ));
         self.fs_nav_locked_gen = Some(self.items_generation);
+    }
+
+    /// Replace any unfinished explicit folder target while keeping the same viewer session.
+    /// This is used by similar-result navigation, where a second chosen result supersedes a
+    /// password wait or an older enumerate request rather than exiting the side-panel session.
+    pub(crate) fn supersede_and_begin_fs_folder_navigation_sequence(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let previous = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(|holdover| match holdover {
+                FsHoldover::FolderNavigation(previous) => previous.clone(),
+                FsHoldover::PresentationSwitch(unit) => Some(unit.clone()),
+                FsHoldover::NavigationSequence(sequence) => sequence.previous.clone(),
+                FsHoldover::FinalEffectSourceReload(_) => None,
+            })
+            .or_else(|| {
+                self.fullscreen_idx
+                    .and_then(|idx| self.capture_fs_navigation_display_unit(ctx, idx))
+            });
+        if previous.is_none()
+            && self.fullscreen_idx.is_none()
+            && !matches!(
+                self.fs_holdover_tex.as_ref(),
+                Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+            )
+        {
+            return false;
+        }
+        self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::Superseded);
+        self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: self.items_generation,
+            },
+        }));
+        self.fs_nav_locked_gen = Some(self.items_generation);
+        true
     }
 
     /// 毎フレーム呼び出され、ナビロックの解除条件を満たしたら lock を解除する。
@@ -9577,6 +9724,7 @@ impl App {
                 FsNavigationSequenceTarget::FolderItems {
                     accepted_generation,
                 } => Some(accepted_generation),
+                FsNavigationSequenceTarget::AwaitingPassword { .. } => return,
                 FsNavigationSequenceTarget::Display(_) => None,
             };
             if let Some(accepted_generation) = accepted_generation {
@@ -17118,6 +17266,7 @@ impl App {
     ) {
         let current_page_changed = self.fullscreen_idx != Some(target_idx);
         if current_page_changed {
+            self.supersede_required_fullscreen_folder_open();
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
@@ -18115,12 +18264,11 @@ impl App {
                 // poll_pdf_enumerate 完了時のフルスクリーン再オープンが抑止され、
                 // 次フレーム以降はこの関数の非アクティブ経路でビューポートが
                 // 隠される (グリッドへ戻る)。
-                self.fs_nav_after_pdf_enumerate = None;
                 // ZIP defer の場合 `items_generation` がまだ進んでいないため、
                 // `poll_fs_nav_lock` の解放経路に乗らず lock/holdover が居座る。
                 // 明示 release で確実に状態をクリーンにする (embedded 用ヘルパと対称、
                 // Codex 第 3 ラウンド P2)。
-                self.release_fs_nav_lock();
+                self.finish_fullscreen_navigation_for_true_close();
                 // deferred holdover 中の Esc / × は detached viewer を閉じる明示操作。
                 // 同フレームの backstop より前に session を畳んで空窓の再描画を防ぐ
                 // (Codex レビュー #3 site 3)。(detached session は cfg(windows))
@@ -18493,8 +18641,7 @@ impl App {
 
         if cancel {
             // 保留中の「列挙後にフルスクリーン復帰」意図を破棄してグリッドへ戻す。
-            self.fs_nav_after_pdf_enumerate = None;
-            self.release_fs_nav_lock();
+            self.finish_fullscreen_navigation_for_true_close();
             ctx.request_repaint();
         } else {
             // enumerate worker は別スレッドで完了し repaint を要求しないため、
@@ -18513,7 +18660,10 @@ impl App {
 
         if self.fullscreen_idx.is_none() || self.native_video_in_window_active {
             self.still_fullscreen_viewport_enter_suppress_until = None;
-            if !self.fs_nav_is_locked() {
+            if matches!(
+                self.fs_holdover_tex,
+                Some(FsHoldover::PresentationSwitch(_))
+            ) {
                 self.fs_holdover_tex = None;
             }
             return false;
@@ -18524,7 +18674,10 @@ impl App {
         }
 
         self.still_fullscreen_viewport_enter_suppress_until = None;
-        if !self.fs_nav_is_locked() {
+        if matches!(
+            self.fs_holdover_tex,
+            Some(FsHoldover::PresentationSwitch(_))
+        ) {
             self.fs_holdover_tex = None;
         }
         false
@@ -18535,7 +18688,9 @@ impl App {
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
     pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_nav_holdover_without_latching();
+        let holdover = self
+            .presentation_switch_holdover()
+            .or_else(|| self.fs_nav_holdover_without_latching());
         if let Some(unit) = holdover.as_ref() {
             for page in &unit.pages {
                 self.trace_fs_texture_choice(
@@ -22130,6 +22285,7 @@ impl App {
                     Some(target.clone())
                 }
                 FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. }
                 | FsNavigationSequenceTarget::Display(_) => None,
             })
         else {
@@ -30437,6 +30593,16 @@ impl App {
         let mut fs_navigation_perf = fs_render_perf
             .as_ref()
             .map(|_| FsNavigationPerfRecorder::default());
+        if close_fs || close_to_page_list {
+            self.cancel_required_fullscreen_folder_open();
+        } else if ctrl_nav.is_some()
+            || sibling_nav.is_some()
+            || mouse_nav.is_some()
+            || jump_to.is_some()
+            || !page_nav.is_none()
+        {
+            self.supersede_required_fullscreen_folder_open();
+        }
         if close_fs {
             let close_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             #[cfg(windows)]
@@ -30486,6 +30652,7 @@ impl App {
                 self.video_presentation_transition.is_transitioning();
             #[cfg(not(windows))]
             let presentation_was_transitioning = false;
+            self.finish_fullscreen_navigation_for_true_close();
             self.close_fullscreen();
             if !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -32721,6 +32888,10 @@ impl App {
             return;
         }
         let current_page_changed = self.fullscreen_idx != Some(new_idx);
+        let display_unit_changed = current_page_changed || self.fullscreen_page_slice != new_slice;
+        if display_unit_changed {
+            self.supersede_required_fullscreen_folder_open();
+        }
         if current_page_changed {
             // 連結ストリーム内の再アンカーはファイルを開き直す遷移ではないため、
             // pointer-open の左右パネルは維持する。touch handle の右パネルは current-file
@@ -45388,7 +45559,8 @@ mod tests {
             .and_then(FsHoldover::navigation_sequence)
             .and_then(|sequence| match &sequence.target {
                 FsNavigationSequenceTarget::Display(target) => Some(target),
-                FsNavigationSequenceTarget::FolderItems { .. } => None,
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
             })
             .expect("display navigation target");
         target.phase
@@ -45719,12 +45891,12 @@ mod tests {
     }
 
     fn captured_folder_navigation_unit(app: &App) -> FsDisplayUnitHoldover {
-        let FsHoldover::FolderNavigation(unit) = app
+        let FsHoldover::FolderNavigation(Some(unit)) = app
             .fs_holdover_tex
             .as_ref()
             .expect("folder navigation holdover captured")
         else {
-            panic!("expected folder navigation holdover");
+            panic!("expected captured folder navigation display unit");
         };
         unit.clone()
     }
@@ -49713,7 +49885,7 @@ mod tests {
             started_at + COLORIZE_WAIT_INDICATOR_DELAY,
         ));
 
-        let folder_navigation = FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+        let folder_navigation = FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
             pages: vec![FsDisplayUnitHoldoverPage {
                 idx: 0,
                 layout_size: texture.size_vec2(),
@@ -49725,7 +49897,7 @@ mod tests {
                 source_size: None,
                 content_bbox: None,
             }],
-        });
+        }));
         assert!(!colorize_wait_indicator_visible(
             Some(&folder_navigation),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY * 10,

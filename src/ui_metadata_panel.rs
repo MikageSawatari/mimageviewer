@@ -1168,10 +1168,11 @@ impl TagPanelRow {
 }
 
 impl App {
-    fn open_similar_hit(&mut self, hit: &crate::similar_index::QueryHit) {
+    fn open_similar_hit(&mut self, ctx: &egui::Context, hit: &crate::similar_index::QueryHit) {
         if let Some(index) = self.items.iter().position(|item| {
             crate::app::similar_index_item_key(item).as_deref() == Some(hit.item_key.as_str())
         }) {
+            self.supersede_required_fullscreen_folder_open();
             self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
             return;
         }
@@ -1179,15 +1180,21 @@ impl App {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;
         };
-        if self.is_snapshot_active() {
-            let _ = self.dismiss_snapshot_without_restore();
-        }
-        self.snapshot_load_and_open(
+        self.open_required_fullscreen_location(
+            ctx,
             location,
-            false,
-            Some(target),
+            target,
             crate::app::HistoryTrigger::UserChosen,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_similar_hit_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &crate::similar_index::QueryHit,
+    ) {
+        self.open_similar_hit(ctx, hit);
     }
 
     /// ページ帯から相手の本のページを開く。
@@ -1196,6 +1203,7 @@ impl App {
     /// 解決済みの移動先を使う。
     fn open_similar_book_page(
         &mut self,
+        ctx: &egui::Context,
         item_key: &str,
         target: crate::similar_index::SimilarItemTarget,
     ) {
@@ -1204,6 +1212,7 @@ impl App {
             .iter()
             .position(|item| crate::app::similar_index_item_key(item).as_deref() == Some(item_key))
         {
+            self.supersede_required_fullscreen_folder_open();
             self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
             return;
         }
@@ -1211,15 +1220,22 @@ impl App {
             self.show_feedback_toast("ページの場所を開けません".to_string());
             return;
         };
-        if self.is_snapshot_active() {
-            let _ = self.dismiss_snapshot_without_restore();
-        }
-        self.snapshot_load_and_open(
+        self.open_required_fullscreen_location(
+            ctx,
             location,
-            false,
-            Some(target),
+            target,
             crate::app::HistoryTrigger::UserChosen,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_similar_book_page_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        item_key: &str,
+        target: crate::similar_index::SimilarItemTarget,
+    ) {
+        self.open_similar_book_page(ctx, item_key, target);
     }
 
     fn pin_similar_hit(
@@ -1927,10 +1943,10 @@ impl App {
             self.show_favorites_editor = true;
         }
         if let Some(hit) = similar_actions.open_hit {
-            self.open_similar_hit(&hit);
+            self.open_similar_hit(ctx, &hit);
         }
         if let Some((item_key, target)) = similar_actions.open_page {
-            self.open_similar_book_page(&item_key, target);
+            self.open_similar_book_page(ctx, &item_key, target);
         }
 
         // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。

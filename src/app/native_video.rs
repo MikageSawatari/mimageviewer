@@ -3853,10 +3853,13 @@ impl App {
         if in_window {
             self.still_fullscreen_viewport_enter_suppress_until = None;
         } else {
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.fs_holdover_tex = self
-                    .capture_fs_display_unit(fs_idx)
-                    .map(crate::app::FsHoldover::FolderNavigation);
+            if self.fs_holdover_tex.as_ref().is_none_or(|holdover| {
+                !holdover.continues_viewer_during_content_teardown()
+                    && holdover.navigation_sequence().is_none()
+            }) && let Some(fs_idx) = self.fullscreen_idx
+                && let Some(unit) = self.capture_fs_display_unit(fs_idx)
+            {
+                self.fs_holdover_tex = Some(crate::app::FsHoldover::PresentationSwitch(unit));
             }
             self.still_fullscreen_viewport_enter_suppress_until =
                 Some(now + std::time::Duration::from_millis(260));
