@@ -99,7 +99,9 @@ const SHOULDER_REPEAT_INTERVAL: Duration = Duration::from_millis(260);
 const STICK_STEP_INTERVAL: Duration = Duration::from_millis(110);
 const TRIGGER_STEP_INTERVAL: Duration = Duration::from_millis(150);
 
-fn video_seek_ring_action(action: &RingActionId) -> Option<(crate::settings::VideoSeekStep, bool)> {
+pub(super) fn video_seek_ring_action(
+    action: &RingActionId,
+) -> Option<(crate::settings::VideoSeekStep, bool)> {
     use crate::settings::VideoSeekStep;
     match action {
         RingActionId::VideoSeekBackSmall => Some((VideoSeekStep::Small, false)),
@@ -566,6 +568,12 @@ fn draw_mouse_gesture_guide_row(
         egui::FontId::proportional(14.5),
         egui::Color32::WHITE,
     );
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MouseButtonDispatchResult {
+    pub(crate) navigation: Option<AddressBarNav>,
+    pub(crate) dispatched_action: Option<RingActionId>,
 }
 
 impl App {
@@ -5149,6 +5157,20 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        self.dispatch_mouse_button(ctx, slot, surface, source)
+            .navigation
+    }
+
+    /// Resolves and executes one mouse-slot press, returning the exact action that
+    /// passed all shared validity/edit-mode gates. Native XButton hold state may
+    /// arm only from this result, never from the configured slot alone.
+    pub(crate) fn dispatch_mouse_button(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+    ) -> MouseButtonDispatchResult {
         self.note_input_surface(surface);
         let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
@@ -5161,31 +5183,28 @@ impl App {
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
                 action.as_str()
             ));
-            return None;
-        }
-        if !action.is_available_for_mouse_button_assignment(context) {
-            crate::logger::log(format!(
-                "[input-nav] source={source} ignored deferred mouse button action={} context={context:?}",
-                action.as_str()
-            ));
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored mouse button action={} during edit mode",
                 action.as_str()
             ));
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         if matches!(action, RingActionId::None | RingActionId::Unknown(_)) {
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         crate::logger::log(format!(
             "[input-nav] source={source} mouse_button={} action={} context={context:?}",
             slot.log_name(),
             action.as_str()
         ));
-        self.apply_ring_action(ctx, context, action, source)
+        let dispatched_action = action.clone();
+        MouseButtonDispatchResult {
+            navigation: self.apply_ring_action(ctx, context, action, source),
+            dispatched_action: Some(dispatched_action),
+        }
     }
 
     fn apply_folder_history_nav(
@@ -7121,6 +7140,7 @@ impl App {
         repeat: bool,
     ) {
         let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::gamepad_receipt(),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -7129,6 +7149,7 @@ impl App {
             alt: false,
             repeat,
         };
+        crate::mouse_seek_debug::log_gamepad_observation(key.receipt, key.virtual_key, key.repeat);
         self.handle_native_video_key_event(ctx, fs_idx, key);
     }
 

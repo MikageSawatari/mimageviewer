@@ -468,6 +468,9 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) free_rotation: f32,
     pub(crate) image_rect_norm: egui::Rect,
     pub(crate) image_content_bbox: Option<egui::Rect>,
+    /// The image-local transparency underlay captured for this displayed view.
+    /// All single/spread/continuous pages share one mode.
+    pub(crate) image_underlay: DetachedImageWindowUnderlay,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
@@ -484,12 +487,10 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) uv_rect: egui::Rect,
     pub(crate) clip_rect_norm: egui::Rect,
     pub(crate) rotation: crate::rotation_db::Rotation,
-    pub(crate) background: DetachedImageWindowFrozenBackground,
 }
 
 #[derive(Clone)]
-pub(crate) enum DetachedImageWindowFrozenBackground {
-    Default,
+pub(crate) enum DetachedImageWindowUnderlay {
     Solid(egui::Color32),
     Checker(egui::TextureHandle),
 }
@@ -505,7 +506,11 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) free_rotation: f32,
     pub(crate) image_rect_norm: egui::Rect,
     pub(crate) image_content_bbox: Option<egui::Rect>,
+    pub(crate) image_underlay: DetachedImageWindowUnderlay,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
+    /// Current global preference projected into a passive still-image frame.
+    /// Media callers do not construct this static display payload.
+    pub(crate) margin_color: egui::Color32,
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
     pub(crate) right_drag_guide: Option<RightDragGuide>,
@@ -520,6 +525,7 @@ impl DeferredDetachedImageWindowView {
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
         right_drag_guide: Option<RightDragGuide>,
+        margin_color: egui::Color32,
     ) -> Self {
         Self {
             id: window.id,
@@ -530,7 +536,9 @@ impl DeferredDetachedImageWindowView {
             free_rotation: window.free_rotation,
             image_rect_norm: window.image_rect_norm,
             image_content_bbox: window.image_content_bbox,
+            image_underlay: window.image_underlay.clone(),
             frozen_continuous_pages: window.frozen_continuous_pages.clone(),
+            margin_color,
             placement,
             apply_initial_placement,
             right_drag_guide,
@@ -729,6 +737,7 @@ impl Clone for DetachedImageWindowSnapshot {
             free_rotation: self.free_rotation,
             image_rect_norm: self.image_rect_norm,
             image_content_bbox: self.image_content_bbox,
+            image_underlay: self.image_underlay.clone(),
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
             reopen_sync_stamp: self.reopen_sync_stamp.clone(),
@@ -8283,9 +8292,10 @@ impl FsNavigationSequence {
     pub(crate) fn blocks_new_target(&self) -> bool {
         match &self.target {
             FsNavigationSequenceTarget::FolderItems { .. } => true,
-            FsNavigationSequenceTarget::Display(target) => {
-                !matches!(target.phase, FsNavigationTargetPhase::RenditionFailed)
-            }
+            FsNavigationSequenceTarget::Display(target) => !matches!(
+                target.phase,
+                FsNavigationTargetPhase::RenditionFailed { .. }
+            ),
         }
     }
 
@@ -8300,21 +8310,22 @@ impl FsNavigationSequence {
                 accepted_generation,
             } => format!("FolderItems accepted_generation={accepted_generation}"),
             FsNavigationSequenceTarget::Display(target) => {
-                let phase = match target.phase {
-                    FsNavigationTargetPhase::Awaiting { accept_rendition } => {
-                        format!("Awaiting accept_rendition={accept_rendition}")
-                    }
-                    FsNavigationTargetPhase::Ready(presentation) => {
+                let phase = match &target.phase {
+                    FsNavigationTargetPhase::Awaiting { .. } => "Awaiting".to_owned(),
+                    FsNavigationTargetPhase::Ready { presentation, .. } => {
                         format!("Ready({presentation:?})")
                     }
-                    FsNavigationTargetPhase::Presenting(presentation) => {
+                    FsNavigationTargetPhase::Presenting { presentation, .. } => {
                         format!("Presenting({presentation:?})")
                     }
-                    FsNavigationTargetPhase::RenditionFailed => "RenditionFailed".to_owned(),
+                    FsNavigationTargetPhase::RenditionFailed { .. } => "RenditionFailed".to_owned(),
                 };
                 format!(
-                    "Display items_generation={} pages={:?} phase={phase}",
-                    target.items_generation, target.pages
+                    "Display items_generation={} anchor_idx={} pages={:?} accept_rendition={} phase={phase}",
+                    target.items_generation,
+                    target.anchor_idx,
+                    target.pages(),
+                    target.accept_rendition,
                 )
             }
         }
@@ -8325,7 +8336,7 @@ impl FsNavigationSequence {
             FsNavigationSequenceTarget::Display(target)
                 if target.items_generation == items_generation =>
             {
-                &target.pages
+                target.pages()
             }
             FsNavigationSequenceTarget::FolderItems { .. }
             | FsNavigationSequenceTarget::Display(_) => &[],
@@ -8342,24 +8353,48 @@ pub(crate) enum FsNavigationSequenceTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FsNavigationDisplayTarget {
     pub(crate) items_generation: u64,
-    /// Sorted indices of the complete single-page/spread display unit.
-    pub(crate) pages: Vec<usize>,
+    /// Stable accepted page identity. The canonical single/spread unit around this page may
+    /// change as dimensions and rotation arrive, but the navigation intent does not.
+    pub(crate) anchor_idx: usize,
+    /// Stable target policy. Readiness topology may be rebound from any lifecycle phase without
+    /// losing whether the accepted move permits a rendition.
+    pub(crate) accept_rendition: bool,
     pub(crate) phase: FsNavigationTargetPhase,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl FsNavigationDisplayTarget {
+    pub(crate) fn pages(&self) -> &[usize] {
+        self.phase.pages()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationTargetPhase {
-    /// Passing page/folder targets accept a thumbnail-quality rendition. The first
-    /// discrete page turn may remain full-quality while still blocking repeats.
-    Awaiting {
-        accept_rendition: bool,
+    /// Canonical pages are bound to the stable anchor, but none has been accepted for painting.
+    Awaiting { pages: Vec<usize> },
+    Ready {
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
     },
-    Ready(FsNavigationPresentation),
-    Presenting(FsNavigationPresentation),
+    Presenting {
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
+    },
     /// PDFium/catalog production reached a terminal failure. This does not block
     /// another repeat; on release, full materialization is admitted while the
     /// previous complete unit remains visible.
-    RenditionFailed,
+    RenditionFailed { pages: Vec<usize> },
+}
+
+impl FsNavigationTargetPhase {
+    pub(crate) fn pages(&self) -> &[usize] {
+        match self {
+            Self::Awaiting { pages }
+            | Self::Ready { pages, .. }
+            | Self::Presenting { pages, .. }
+            | Self::RenditionFailed { pages } => pages,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8477,6 +8512,7 @@ impl App {
 
     /// 単ページ表示へ倒す。見開きを解除し、対象ページへ寄せ、ズーム / パンを戻す。
     pub(crate) fn enter_page_edit_single_view(&mut self, target_idx: usize) {
+        self.cancel_superseded_fs_navigation_display_target(target_idx);
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.fullscreen_idx = Some(target_idx);
         self.fs_zoom = 1.0;
@@ -8528,6 +8564,7 @@ impl App {
         let Some(pivot) = pivot else {
             return;
         };
+        self.cancel_superseded_fs_navigation_display_target(pivot.pair.0);
         self.spread_mode = pivot.saved_mode;
         self.fullscreen_idx = Some(pivot.pair.0);
         self.fs_zoom = 1.0;
@@ -11822,6 +11859,9 @@ pub struct App {
     /// mount 中の viewer context が所有する通常動画の拡大・パン state の投影。
     /// 360 と違いセッション意図は持たず、項目が変わるたびに `None` へ戻す。
     pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
+    /// Raw XButton seek holds owned by the currently projected viewer context.
+    /// Normal AtRest deposits preserve this state via `ViewerContextBundle`.
+    pub(crate) native_video_mouse_seek_holds: native_video::NativeVideoMouseSeekHolds,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
     /// 「360 で見ていた」という事実はこちらが覚える。次に開いたものが 360 素材なら
@@ -15202,6 +15242,7 @@ impl App {
             sidecar_display_cache: std::collections::HashMap::new(),
             panorama_state: None,
             video_zoom_state: None,
+            native_video_mouse_seek_holds: native_video::NativeVideoMouseSeekHolds::default(),
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
@@ -26020,6 +26061,19 @@ impl App {
         if self.items_generation != items_generation {
             // Exact seek indices belong to the items identity, not the current page.
             self.clear_still_seek_thumbnail_requests();
+            // A Display target names pages in the old items identity and cannot be remapped
+            // after this owner changes generation. FolderItems is different: it deliberately
+            // spans the folder install and binds to the new generation after the items arrive.
+            let superseded_display_target = self
+                .fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .is_some_and(|sequence| {
+                    matches!(&sequence.target, FsNavigationSequenceTarget::Display(_))
+                });
+            if superseded_display_target {
+                self.release_fs_nav_lock();
+            }
         }
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
@@ -41359,6 +41413,10 @@ impl App {
             placement,
             apply_initial_placement,
             right_drag_guide,
+            {
+                let [red, green, blue] = self.settings.fullscreen_image_margin_color;
+                egui::Color32::from_rgb(red, green, blue)
+            },
         );
         #[cfg(feature = "test-script")]
         let view = {
@@ -43178,6 +43236,7 @@ impl App {
             Some(proof) => texture.with_test_script_content_proof(proof),
             None => texture,
         };
+        let image_underlay = self.detached_image_underlay_for_snapshot(ctx);
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
@@ -43207,6 +43266,7 @@ impl App {
             free_rotation,
             image_rect_norm,
             image_content_bbox,
+            image_underlay,
             frozen_continuous_pages,
             reopen_descriptor,
             reopen_sync_stamp,
@@ -43251,6 +43311,7 @@ impl App {
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
+            image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
@@ -45657,6 +45718,27 @@ impl App {
         );
     }
 
+    pub(crate) fn cancel_superseded_fs_navigation_display_target(&mut self, idx: usize) {
+        let superseded = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    &sequence.target,
+                    FsNavigationSequenceTarget::Display(target)
+                        if target.items_generation != self.items_generation
+                            || target.anchor_idx != idx
+                )
+            });
+        if superseded {
+            // Any open that does not land on the accepted anchor replaces that navigation intent.
+            // Dispose its lock and retained unit at this common owner boundary so a stale Ready or
+            // Presenting phase cannot survive for a later page with a coincidentally equal unit.
+            self.release_fs_nav_lock();
+        }
+    }
+
     pub(crate) fn open_fullscreen_with_materialization_and_contract(
         &mut self,
         idx: usize,
@@ -45683,8 +45765,11 @@ impl App {
             return;
         }
 
+        self.cancel_superseded_fs_navigation_display_target(idx);
+
         #[cfg(windows)]
         if self.fullscreen_idx != Some(idx) {
+            self.clear_native_video_mouse_seek_holds("fullscreen_item_change");
             self.video_zoom_state = None;
         }
 
@@ -52691,6 +52776,7 @@ impl App {
                             self.settings.video_scale_filter,
                             self.settings.video_downscale_smoothing_percent,
                             self.settings.video_anime4k_budget,
+                            self.settings.fullscreen_image_margin_color,
                             self.native_bar_lock_state(),
                             // 動画経路: 常に映像フレームを持つ。
                             false,
@@ -53870,6 +53956,7 @@ impl App {
 
     #[cfg(windows)]
     fn prepare_viewer_presentation_close(&mut self) {
+        self.clear_native_video_mouse_seek_holds("presentation_close");
         // A content close does not release the context's window binding. The registry
         // retains identity through initial book construction, reload and folder navigation.
         // This method only resets presentation/content state; terminal close and context
@@ -69263,6 +69350,8 @@ impl App {
         #[cfg(windows)]
         let native_text_contrast = self.settings.text_contrast;
         #[cfg(windows)]
+        let native_video_canvas_color = self.settings.fullscreen_image_margin_color;
+        #[cfg(windows)]
         let native_vst3_controls_available = self.native_video_vst3_controls_available();
         // 音声 VST シェル (Inc 6 ②-3): フレーム開始時点のシェル対象 fs_idx。close race
         // (soft close イベントで exit 済み ↔ hard close の native_closed_idx) を安全に判定する
@@ -69350,6 +69439,12 @@ impl App {
                 player.set_native_hud_dimmed(native_hud_dimmed);
                 #[cfg(windows)]
                 player.set_native_text_contrast(native_text_contrast);
+                #[cfg(windows)]
+                player.set_native_video_canvas_color(native_video_canvas_color_for_item(
+                    native_video_canvas_color,
+                    is_audio_file,
+                    video_audio_mode == Some(*idx),
+                ));
                 if let Some(d) = player.tick(ctx) {
                     merge_repaint_deadline(&mut next_repaint, Some(d));
                 }
@@ -69523,6 +69618,13 @@ impl App {
             if audio_mode_before_event && self.video_audio_mode.is_some() {
                 break;
             }
+        }
+        #[cfg(windows)]
+        {
+            // Native events (including lossless UP terminals) settle before hold ticks.
+            // The tick returns the nearest OS-cadence deadline for the existing repaint owner.
+            let deadline = self.tick_native_video_mouse_seek_holds(ctx, std::time::Instant::now());
+            merge_repaint_deadline(&mut next_repaint, deadline);
         }
         for (idx, serial, kind) in continuous_eof_events {
             match kind {
@@ -74076,6 +74178,19 @@ fn video_resume_for_open(
     if from_start { None } else { saved_resume }
 }
 
+#[cfg(any(windows, test))]
+fn native_video_canvas_color_for_item(
+    configured: [u8; 3],
+    is_audio_file: bool,
+    video_audio_mode: bool,
+) -> [u8; 3] {
+    if is_audio_file || video_audio_mode {
+        [0, 0, 0]
+    } else {
+        configured
+    }
+}
+
 #[cfg(windows)]
 fn native_video_presenter_config(
     owner_hwnd: u64,
@@ -74100,6 +74215,7 @@ fn native_video_presenter_config(
     scale_filter: crate::settings::VideoScaleFilter,
     downscale_smoothing_percent: u32,
     anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    fullscreen_image_margin_color: [u8; 3],
     // presenter が生まれた瞬間から使う上下バー固定状態。App の毎フレーム sync
     // (`sync_native_video_metadata`) より前に 1 枚目が出るため、ここで渡さないと
     // 固定なしの全域表示が一瞬見えてから縮む。
@@ -74152,6 +74268,11 @@ fn native_video_presenter_config(
         },
         in_main_window,
         audio_only,
+        video_canvas_color: native_video_canvas_color_for_item(
+            fullscreen_image_margin_color,
+            audio_only,
+            false,
+        ),
     })
 }
 

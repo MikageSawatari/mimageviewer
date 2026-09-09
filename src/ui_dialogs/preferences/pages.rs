@@ -37,12 +37,12 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.radio_value(
             &mut state.settings.ui_theme,
             UiTheme::Light,
-            "ライト (サムネイル白基調 / フルスクリーン黒)",
+            "ライト (サムネイル白基調)",
         );
         ui.radio_value(
             &mut state.settings.ui_theme,
             UiTheme::Dark,
-            "ダーク (全体暗色 / フルスクリーン黒)",
+            "ダーク (全体暗色)",
         );
     });
     ui.add_space(10.0);
@@ -70,8 +70,8 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new(
-            "フルスクリーン表示は画像鑑賞のためテーマに関係なく黒背景になります。\n\
-             Shift+B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
+            "画像・動画の余白色は「表示 › 閲覧表示」で変更できます。\n\
+             Shift+B キーは透過画像内の背景だけを循環します (黒 → 白 → 市松)。",
         )
         .weak(),
     );
@@ -8674,6 +8674,26 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.small("通常ホバーは左端 / 右端で各パネルを表示します。クリック表示は最端の細いバーをクリックして開きます。");
     });
     ui.add_space(8.0);
+    anchored(ui, state, "spread/image-margin-color", |ui, state| {
+        let color = &mut state.settings.fullscreen_image_margin_color;
+        ui.label(egui::RichText::new("画像・動画の余白色").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (label, preset) in [
+                ("黒", [0, 0, 0]),
+                ("灰", [128, 128, 128]),
+                ("白", [255, 255, 255]),
+            ] {
+                if ui.selectable_label(*color == preset, label).clicked() {
+                    *color = preset;
+                }
+            }
+            ui.separator();
+            ui.label("任意の色");
+            ui.color_edit_button_srgb(color);
+        });
+        ui.small("静止画・本の画像外、静止画サムネイル列の空欄、動画の映像外に共通で使います。透過画像内の黒 / 白 / 市松、音声画面、操作パネルは変わりません。");
+    });
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("案内と状況表示").strong());
     anchored(ui, state, "spread/boundary-notice", |ui, state| {
         ui.checkbox(
@@ -9643,11 +9663,10 @@ mod tests {
             );
             assert!(ring.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen));
             assert!(
-                !ring
-                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
-                "the ring/key mapping must not make video seek a v3.7 mouse-button candidate"
+                ring.is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "the next-version build must offer video seek as a mouse-button candidate"
             );
-            assert!(!operation_assignment_tab_enabled(
+            assert!(operation_assignment_tab_enabled(
                 &OperationAssignmentTarget::Key(key),
                 OperationAssignmentTab::MouseButtons,
             ));
@@ -9659,7 +9678,7 @@ mod tests {
                 &OperationAssignmentTarget::Key(key),
                 OperationAssignmentTab::MouseGesture,
             ));
-            assert!(!operation_assignment_tab_enabled(
+            assert!(operation_assignment_tab_enabled(
                 &OperationAssignmentTarget::Ring {
                     context: RingShortcutContext::VideoFullscreen,
                     action: ring.clone(),
@@ -9670,7 +9689,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_video_seek_projects_to_none_only_for_physical_mouse_ui() {
+    fn video_seek_assignment_is_visible_in_physical_mouse_ui() {
         let action = RingActionId::VideoSeekBackSmall;
         let context = RingShortcutContext::VideoFullscreen;
         let mut settings = RingShortcutSettings::default();
@@ -9678,12 +9697,13 @@ mod tests {
 
         assert_eq!(
             effective_mouse_button_action(&action, context),
-            RingActionId::None,
-            "the saved value is shown as the existing unassigned choice"
+            action,
+            "the saved value is shown as the active physical assignment"
         );
-        assert!(
-            mouse_assignment_labels(&settings, context, &action).is_empty(),
-            "an unavailable physical assignment must not look active in the overview"
+        assert_eq!(
+            mouse_assignment_labels(&settings, context, &action),
+            vec!["戻るボタン".to_string()],
+            "the active physical assignment must be visible in the overview"
         );
         assert_eq!(
             settings.mouse_button_profile(context).back,
@@ -9699,9 +9719,9 @@ mod tests {
                 action.clone(),
             ));
         let labels = mouse_assignment_labels(&settings, context, &action);
-        assert_eq!(labels.len(), 1);
-        assert!(labels[0].contains('↑'));
-        assert!(!labels[0].contains("戻るボタン"));
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], "戻るボタン");
+        assert!(labels[1].contains('↑'));
     }
 
     #[test]

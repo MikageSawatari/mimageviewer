@@ -60,6 +60,7 @@ struct ResampleConstants {
     source_region: [f32; 4],
     inverse_axes: [f32; 4],
     inverse_offset: [f32; 4],
+    outside_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -73,6 +74,7 @@ struct NisConstants {
     inverse_y: [f32; 2],
     inverse_offset: [f32; 2],
     _padding: [f32; 2],
+    outside_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -89,6 +91,7 @@ struct Anime4kConstants {
     inverse_y: [f32; 2],
     inverse_offset: [f32; 2],
     _padding: [f32; 2],
+    outside_color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,6 +498,7 @@ impl VideoResamplePipeline {
         target_height: u32,
         orientation: VideoOrientation,
         source_rect: VideoZoomSourceRect,
+        outside_color: [f32; 4],
         mode: VideoResampleMode,
     ) -> Result<(), String> {
         match mode {
@@ -510,6 +514,7 @@ impl VideoResamplePipeline {
                 orientation,
                 source_rect,
                 smoothing_percent,
+                outside_color,
             ),
             VideoResampleMode::Nis | VideoResampleMode::Nearest => self.draw_single_pass(
                 device,
@@ -522,6 +527,7 @@ impl VideoResamplePipeline {
                 target_height,
                 orientation,
                 source_rect,
+                outside_color,
                 mode,
             ),
             VideoResampleMode::Anime4k { variant } => self.draw_anime4k(
@@ -536,6 +542,7 @@ impl VideoResamplePipeline {
                 orientation,
                 source_rect,
                 variant,
+                outside_color,
             ),
         }
     }
@@ -554,6 +561,7 @@ impl VideoResamplePipeline {
         orientation: VideoOrientation,
         source_rect: VideoZoomSourceRect,
         smoothing_percent: u32,
+        outside_color: [f32; 4],
     ) -> Result<(), String> {
         let (intermediate_width, intermediate_height) =
             Self::intermediate_dimensions(source_width, source_height, target_width, orientation);
@@ -604,6 +612,7 @@ impl VideoResamplePipeline {
                 mapping.inverse_y[1],
             ],
             inverse_offset: [mapping.offset[0], mapping.offset[1], 0.0, 0.0],
+            outside_color,
         };
 
         unsafe {
@@ -656,6 +665,7 @@ impl VideoResamplePipeline {
         target_height: u32,
         orientation: VideoOrientation,
         source_rect: VideoZoomSourceRect,
+        outside_color: [f32; 4],
         mode: VideoResampleMode,
     ) -> Result<(), String> {
         let source_view = create_shader_view(device, source)?;
@@ -687,6 +697,7 @@ impl VideoResamplePipeline {
                 mapping.inverse_y[1],
             ],
             inverse_offset: [mapping.offset[0], mapping.offset[1], 0.0, 0.0],
+            outside_color,
         };
         let nis_constants = NisConstants {
             target_size: [target_width.max(1), target_height.max(1)],
@@ -697,6 +708,7 @@ impl VideoResamplePipeline {
             inverse_y: mapping.inverse_y,
             inverse_offset: mapping.offset,
             _padding: [0.0, 0.0],
+            outside_color,
         };
 
         unsafe {
@@ -768,6 +780,7 @@ impl VideoResamplePipeline {
         orientation: VideoOrientation,
         source_rect: VideoZoomSourceRect,
         variant: VideoAnime4kVariant,
+        outside_color: [f32; 4],
     ) -> Result<(), String> {
         let gpu_variant = gpu_anime4k_variant(variant);
         let pipeline = self
@@ -819,6 +832,7 @@ impl VideoResamplePipeline {
                 origin: [0.0, 0.0],
                 extent: [mapping.source_axis_x as f32, mapping.source_axis_y as f32],
             },
+            outside_color,
         );
         let resolve = anime4k_video_constants(
             source_width,
@@ -827,6 +841,7 @@ impl VideoResamplePipeline {
             target_height,
             orientation,
             source_rect,
+            outside_color,
         );
         let pass_inputs = gpu_variant.pass_inputs();
         let input_binding_count = gpu_variant.input_binding_count();
@@ -973,6 +988,7 @@ fn anime4k_video_constants(
     output_height: u32,
     orientation: VideoOrientation,
     source_rect: VideoZoomSourceRect,
+    outside_color: [f32; 4],
 ) -> Anime4kConstants {
     let source_width = source_width.max(1);
     let source_height = source_height.max(1);
@@ -994,6 +1010,7 @@ fn anime4k_video_constants(
         inverse_y: mapping.inverse_y,
         inverse_offset: mapping.offset,
         _padding: [0.0, 0.0],
+        outside_color,
     }
 }
 
@@ -1351,6 +1368,7 @@ fn measure_video_anime4k_case(
                 origin: [0.0, 0.0],
                 extent: [source_width as f32, source_height as f32],
             },
+            [0.0, 0.0, 0.0, 1.0],
             mode,
         )?;
     }
@@ -1382,6 +1400,7 @@ fn measure_video_anime4k_case(
                 origin: [0.0, 0.0],
                 extent: [source_width as f32, source_height as f32],
             },
+            [0.0, 0.0, 0.0, 1.0],
             mode,
         )?;
         unsafe {
@@ -1645,6 +1664,7 @@ mod tests {
                     origin: [0.0, 0.0],
                     extent: [SOURCE_WIDTH as f32, SOURCE_HEIGHT as f32],
                 },
+                [0.0, 0.0, 0.0, 1.0],
                 mode,
             )
             .unwrap_or_else(|error| panic!("draw {label}: {error}"));
@@ -1929,7 +1949,9 @@ mod tests {
 
     #[test]
     fn anime4k_constant_layout_matches_generated_shader() {
-        assert_eq!(std::mem::size_of::<Anime4kConstants>(), 96);
+        assert_eq!(std::mem::size_of::<ResampleConstants>(), 96);
+        assert_eq!(std::mem::size_of::<NisConstants>(), 80);
+        assert_eq!(std::mem::size_of::<Anime4kConstants>(), 112);
     }
 
     #[test]
@@ -1944,6 +1966,7 @@ mod tests {
                 origin: [0.0, 0.0],
                 extent: [1080.0, 1920.0],
             },
+            [0.125, 0.25, 0.75, 1.0],
         );
         assert_eq!(constants.output_size, [2160, 3840]);
         assert_eq!(constants.source_size, [1920, 1080]);
@@ -1953,6 +1976,7 @@ mod tests {
         assert_eq!(constants.inverse_x, [0.0, -1.0]);
         assert_eq!(constants.inverse_y, [1.0, 0.0]);
         assert_eq!(constants.inverse_offset, [0.0, 1079.0]);
+        assert_eq!(constants.outside_color, [0.125, 0.25, 0.75, 1.0]);
     }
 
     #[test]

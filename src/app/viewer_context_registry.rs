@@ -856,6 +856,9 @@ pub(in crate::app) struct ViewerContextBundle {
     /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
     /// context を mount した間だけ App field へ投影する。
     video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
+    /// Raw XButton seek holds persist with their viewer context through ordinary
+    /// frame-to-frame AtRest deposits; semantic owner terminals clear them.
+    native_video_mouse_seek_holds: crate::app::native_video::NativeVideoMouseSeekHolds,
     /// 360 で見ているという意図 (+ 選んだ投影方式)。フルスクリーンを閉じても残る
     /// ので、App グローバルに置くと別ウィンドウの 360 が混ざる (backlog §1.145)。
     panorama_intent: crate::panorama::PanoramaSessionIntent,
@@ -1421,6 +1424,8 @@ impl ViewerContextBundle {
             video_audio_exit_pending: None,
             panorama_state: None,
             video_zoom_state: None,
+            native_video_mouse_seek_holds:
+                crate::app::native_video::NativeVideoMouseSeekHolds::default(),
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
@@ -1759,6 +1764,7 @@ impl App {
             video_audio_exit_pending,
             panorama_state,
             video_zoom_state,
+            native_video_mouse_seek_holds,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2008,6 +2014,7 @@ impl App {
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
         swap_field!(video_zoom_state);
+        swap_field!(native_video_mouse_seek_holds);
         swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
@@ -2295,6 +2302,7 @@ impl App {
             video_audio_exit_pending,
             panorama_state,
             video_zoom_state,
+            native_video_mouse_seek_holds,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2511,6 +2519,7 @@ impl App {
             video_audio_exit_pending,
             panorama_state,
             video_zoom_state,
+            native_video_mouse_seek_holds,
             // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、
             // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
             panorama_intent,
@@ -2578,6 +2587,10 @@ impl App {
             last_loop_pos,
             bookmark_open_pending,
         );
+
+        // ParkedLive/ownership transfer is a semantic terminal for a physical hold.
+        // Ordinary registry deposit does not pass this split and preserves the state.
+        let _ = native_video_mouse_seek_holds.clear();
 
         viewer_session.swap_with_mounted(
             &mut self.viewer_presentation,
@@ -3316,6 +3329,7 @@ impl App {
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
+            image_underlay: super::DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
@@ -3536,6 +3550,83 @@ mod tests {
         assert_eq!(app.video_zoom_state, Some(state_main));
         app.swap_viewer_context_bundle(&mut fork);
         assert_eq!(app.video_zoom_state, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_mouse_seek_hold_survives_ordinary_at_rest_roundtrip() {
+        use crate::ring_shortcut::MouseButtonSlot;
+
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(713, |app| {
+            let context_id = app.projected_viewer_context_id();
+            app.native_video_mouse_seek_holds
+                .seed_for_test(context_id, MouseButtonSlot::Back);
+        });
+        let b = app.build_window_context_for_test(714, |app| {
+            assert!(
+                !app.native_video_mouse_seek_holds
+                    .is_armed_for_test(MouseButtonSlot::Back)
+            );
+        });
+
+        for _ in 0..2 {
+            app.with_viewer_context(a, |app| {
+                assert!(
+                    app.native_video_mouse_seek_holds
+                        .is_armed_for_test(MouseButtonSlot::Back)
+                );
+            })
+            .unwrap();
+            app.with_viewer_context(b, |app| {
+                assert!(
+                    !app.native_video_mouse_seek_holds
+                        .is_armed_for_test(MouseButtonSlot::Back)
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parked_live_split_is_a_terminal_for_mouse_seek_hold() {
+        use crate::ring_shortcut::MouseButtonSlot;
+
+        let mut app = crate::app::setup_app_for_test();
+        let context_id = app.projected_viewer_context_id();
+        app.native_video_mouse_seek_holds
+            .seed_for_test(context_id, MouseButtonSlot::Forward);
+
+        let parked = app.split_current_context_preserving_main_grid();
+
+        assert!(
+            !app.native_video_mouse_seek_holds
+                .is_armed_for_test(MouseButtonSlot::Forward)
+        );
+        assert!(
+            !parked
+                .native_video_mouse_seek_holds
+                .is_armed_for_test(MouseButtonSlot::Forward)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_presentation_close_is_a_terminal_for_mouse_seek_hold() {
+        use crate::ring_shortcut::MouseButtonSlot;
+
+        let mut app = crate::app::setup_app_for_test();
+        let context_id = app.projected_viewer_context_id();
+        app.native_video_mouse_seek_holds
+            .seed_for_test(context_id, MouseButtonSlot::Back);
+
+        app.prepare_viewer_presentation_close();
+
+        assert!(
+            !app.native_video_mouse_seek_holds
+                .is_armed_for_test(MouseButtonSlot::Back)
+        );
     }
 
     #[cfg(windows)]

@@ -2009,6 +2009,7 @@ mod tests {
             initial_visibility: NativeVideoInitialVisibility::Visible,
             in_main_window: true,
             audio_only: false,
+            video_canvas_color: [0, 0, 0],
         };
         let pump = spawn_native_window_pump(NativeWindowPumpSpawn {
             config,
@@ -2095,6 +2096,7 @@ mod tests {
                             text_contrast: crate::settings::TextContrast::Standard,
                             ui_font: crate::settings::UiFontSettings::default(),
                             bar_lock: crate::video::NativeBarLockState::default(),
+                            video_canvas_color: [0, 0, 0],
                             scale_filter: crate::settings::VideoScaleFilter::OsDefault,
                             downscale_smoothing_percent: 0,
                             anime4k_variant: None,

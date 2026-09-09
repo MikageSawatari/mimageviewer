@@ -1834,8 +1834,10 @@ fn resample_region_params_uniform(
     })
 }
 
-fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buffer {
-    let mut bytes = [0_u8; 56];
+const NIS_PARAMS_UNIFORM_SIZE: usize = 80;
+
+fn pack_nis_params_uniform(plan: NisUpscalePlan) -> [u8; NIS_PARAMS_UNIFORM_SIZE] {
+    let mut bytes = [0_u8; NIS_PARAMS_UNIFORM_SIZE];
     bytes[..4].copy_from_slice(&plan.target_size[0].to_ne_bytes());
     bytes[4..8].copy_from_slice(&plan.target_size[1].to_ne_bytes());
     bytes[8..12].copy_from_slice(&plan.source_size[0].to_ne_bytes());
@@ -1847,6 +1849,16 @@ fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buff
     for (offset, value) in [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0].into_iter().enumerate() {
         bytes[32 + offset * 4..36 + offset * 4].copy_from_slice(&value.to_ne_bytes());
     }
+    // The WGSL resolver is shared with native video. Still-image NIS keeps its historical
+    // opaque-black source-exterior contract in the aligned vec4 at byte 64.
+    for (offset, value) in [0.0_f32, 0.0, 0.0, 1.0].into_iter().enumerate() {
+        bytes[64 + offset * 4..68 + offset * 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buffer {
+    let bytes = pack_nis_params_uniform(plan);
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: &bytes,
@@ -2901,6 +2913,25 @@ mod tests {
         let standard_range = sample_range(2480, 1562, 700, standard.blur_factor);
         let smooth_range = sample_range(2480, 1562, 700, smooth.blur_factor);
         assert!(smooth_range.1 - smooth_range.0 > standard_range.1 - standard_range.0);
+    }
+
+    #[test]
+    fn still_nis_uniform_keeps_source_exterior_opaque_black() {
+        let bytes = pack_nis_params_uniform(NisUpscalePlan {
+            source_size: [101, 202],
+            target_size: [303, 404],
+            source_region_px: [11.5, 12.5, 13.5, 14.5],
+            texture_fetches: 0,
+        });
+        assert_eq!(bytes.len(), NIS_PARAMS_UNIFORM_SIZE);
+        for (offset, expected) in [
+            (64, 0.0_f32.to_ne_bytes()),
+            (68, 0.0_f32.to_ne_bytes()),
+            (72, 0.0_f32.to_ne_bytes()),
+            (76, 1.0_f32.to_ne_bytes()),
+        ] {
+            assert_eq!(&bytes[offset..offset + 4], &expected);
+        }
     }
 
     #[test]

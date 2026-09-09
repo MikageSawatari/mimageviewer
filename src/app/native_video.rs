@@ -28,6 +28,177 @@ fn select_native_video_display_mode_toggle(
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeMouseRepeatTiming {
+    initial_delay: std::time::Duration,
+    interval: std::time::Duration,
+}
+
+#[cfg(windows)]
+fn native_mouse_repeat_timing_from_system_values(
+    keyboard_delay: Option<u32>,
+    keyboard_speed: Option<u32>,
+) -> NativeMouseRepeatTiming {
+    let delay = keyboard_delay.unwrap_or(1).min(3);
+    let speed = keyboard_speed.unwrap_or(20).min(31);
+    let repeats_per_second = 2.5 + 27.5 * f64::from(speed) / 31.0;
+    NativeMouseRepeatTiming {
+        initial_delay: std::time::Duration::from_millis(u64::from(delay + 1) * 250),
+        interval: std::time::Duration::from_secs_f64(1.0 / repeats_per_second),
+    }
+}
+
+#[cfg(windows)]
+fn sample_native_mouse_repeat_timing() -> NativeMouseRepeatTiming {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
+    };
+
+    fn sample(
+        action: windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_ACTION,
+    ) -> Option<u32> {
+        let mut value = 0_u32;
+        unsafe {
+            SystemParametersInfoW(
+                action,
+                0,
+                Some((&mut value as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()
+            .map(|_| value)
+        }
+    }
+
+    native_mouse_repeat_timing_from_system_values(
+        sample(SPI_GETKEYBOARDDELAY),
+        sample(SPI_GETKEYBOARDSPEED),
+    )
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct NativeVideoMouseSeekHold {
+    context_id: ViewerContextId,
+    fs_idx: usize,
+    slot: crate::ring_shortcut::MouseButtonSlot,
+    action: crate::ring_shortcut::RingActionId,
+    input_owner: crate::video::native_window::NativeVideoMouseInputOwner,
+    source_epoch: u64,
+    initial_receipt: crate::mouse_seek_debug::NativeVideoInputReceipt,
+    next_repeat_at: std::time::Instant,
+    repeat_interval: std::time::Duration,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub(crate) struct NativeVideoMouseSeekHolds {
+    back: Option<NativeVideoMouseSeekHold>,
+    forward: Option<NativeVideoMouseSeekHold>,
+}
+
+#[cfg(windows)]
+impl NativeVideoMouseSeekHolds {
+    fn slot_mut(
+        &mut self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> Option<&mut Option<NativeVideoMouseSeekHold>> {
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => Some(&mut self.back),
+            crate::ring_shortcut::MouseButtonSlot::Forward => Some(&mut self.forward),
+            crate::ring_shortcut::MouseButtonSlot::Middle => None,
+        }
+    }
+
+    fn take(
+        &mut self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> Option<NativeVideoMouseSeekHold> {
+        self.slot_mut(slot)?.take()
+    }
+
+    fn put(&mut self, hold: NativeVideoMouseSeekHold) {
+        if let Some(slot) = self.slot_mut(hold.slot) {
+            *slot = Some(hold);
+        }
+    }
+
+    pub(in crate::app) fn clear(&mut self) -> bool {
+        let had_any = self.back.take().is_some() | self.forward.take().is_some();
+        had_any
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn seed_for_test(
+        &mut self,
+        context_id: ViewerContextId,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) {
+        let action = match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => {
+                crate::ring_shortcut::RingActionId::VideoSeekBackSmall
+            }
+            crate::ring_shortcut::MouseButtonSlot::Forward => {
+                crate::ring_shortcut::RingActionId::VideoSeekForwardSmall
+            }
+            crate::ring_shortcut::MouseButtonSlot::Middle => return,
+        };
+        self.put(NativeVideoMouseSeekHold {
+            context_id,
+            fs_idx: 7,
+            slot,
+            action,
+            input_owner: crate::video::native_window::test_mouse_input_owner(),
+            source_epoch: 1,
+            initial_receipt: crate::mouse_seek_debug::test_receipt(1),
+            next_repeat_at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            repeat_interval: std::time::Duration::from_millis(100),
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn is_armed_for_test(
+        &self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> bool {
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => self.back.is_some(),
+            crate::ring_shortcut::MouseButtonSlot::Forward => self.forward.is_some(),
+            crate::ring_shortcut::MouseButtonSlot::Middle => false,
+        }
+    }
+
+    fn release(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: &crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) -> bool {
+        let slot = match event.button {
+            crate::video::native_window::NativeVideoMouseButton::Extra1 => {
+                crate::ring_shortcut::MouseButtonSlot::Back
+            }
+            crate::video::native_window::NativeVideoMouseButton::Extra2 => {
+                crate::ring_shortcut::MouseButtonSlot::Forward
+            }
+            _ => return false,
+        };
+        let matches = self.slot_mut(slot).is_some_and(|candidate| {
+            candidate.as_ref().is_some_and(|hold| {
+                hold.fs_idx == fs_idx
+                    && hold.source_epoch == source_epoch
+                    && hold.input_owner == event.owner
+            })
+        });
+        if matches {
+            let _ = self.take(slot);
+        }
+        matches
+    }
+}
+
 /// Native XButton の物理 press を 1 action へ正規化する。
 ///
 /// `CS_DBLCLKS` の 2 回目は `WM_XBUTTONDOWN` ではなく `WM_XBUTTONDBLCLK` として届くが、
@@ -60,6 +231,8 @@ mod native_extra_button_press_tests {
         double_click: bool,
     ) -> NativeVideoMouseButtonEvent {
         NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button,
             down,
             double_click,
@@ -1114,6 +1287,153 @@ pub(super) fn apply_normalize_gain_with_perf(
 
 impl App {
     #[cfg(windows)]
+    pub(in crate::app) fn clear_native_video_mouse_seek_holds(&mut self, reason: &'static str) {
+        if self.native_video_mouse_seek_holds.clear() {
+            crate::logger::log(format!(
+                "[native-video] mouse seek hold cleared: reason={reason}"
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_video_mouse_seek_hold_valid(&self, hold: &NativeVideoMouseSeekHold) -> bool {
+        if self.projected_viewer_context_id() != hold.context_id
+            || self.fullscreen_idx != Some(hold.fs_idx)
+            || !self.native_video_view_input_available(hold.fs_idx)
+            || self.remote_session_blocks_local_control()
+            || self.native_video_parked_live_input_window_id.is_some()
+        {
+            return false;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&hold.fs_idx) else {
+            return false;
+        };
+        let committed_generation = player.native_committed_generation().unwrap_or(0);
+        if player.native_source_epoch() != Some(hold.source_epoch)
+            || !Self::native_video_close_generation_is_current(
+                hold.input_owner.window_generation,
+                committed_generation,
+            )
+            || player.native_presenter_hidden()
+        {
+            return false;
+        }
+        let current_hwnd = match hold.input_owner.window_source {
+            crate::video::native_window::NativeVideoWindowSource::Presenter => {
+                player.native_presenter_hwnd()
+            }
+            crate::video::native_window::NativeVideoWindowSource::Hud => player.native_hud_hwnd(),
+        };
+        if current_hwnd == 0 || current_hwnd != hold.input_owner.receiver_hwnd {
+            return false;
+        }
+        let routing = player.native_overlay_input_routing_snapshot();
+        if routing.modal_dialog_active || routing.text_input_active {
+            return false;
+        }
+        self.settings
+            .ring_shortcuts
+            .mouse_button_profile(crate::ring_shortcut::RingShortcutContext::VideoFullscreen)
+            .action(hold.slot)
+            == hold.action
+    }
+
+    #[cfg(windows)]
+    fn arm_native_video_mouse_seek_hold(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::native_window::NativeVideoMouseButtonEvent,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+        action: crate::ring_shortcut::RingActionId,
+        timing: NativeMouseRepeatTiming,
+        now: std::time::Instant,
+    ) {
+        if crate::app::gamepad_input::video_seek_ring_action(&action).is_none() {
+            return;
+        }
+        let hold = NativeVideoMouseSeekHold {
+            context_id: self.projected_viewer_context_id(),
+            fs_idx,
+            slot,
+            action,
+            input_owner: event.owner,
+            source_epoch,
+            initial_receipt: event.receipt,
+            next_repeat_at: now + timing.initial_delay,
+            repeat_interval: timing.interval,
+        };
+        if self.native_video_mouse_seek_hold_valid(&hold) {
+            self.native_video_mouse_seek_holds.put(hold);
+        }
+    }
+
+    #[cfg(windows)]
+    fn release_native_video_mouse_seek_hold(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: &crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) -> bool {
+        self.native_video_mouse_seek_holds
+            .release(fs_idx, source_epoch, event)
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn tick_native_video_mouse_seek_holds(
+        &mut self,
+        ctx: &egui::Context,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let mut next_delay: Option<std::time::Duration> = None;
+        for slot in [
+            crate::ring_shortcut::MouseButtonSlot::Back,
+            crate::ring_shortcut::MouseButtonSlot::Forward,
+        ] {
+            let Some(mut hold) = self.native_video_mouse_seek_holds.take(slot) else {
+                continue;
+            };
+            if !self.native_video_mouse_seek_hold_valid(&hold) {
+                continue;
+            }
+            if now < hold.next_repeat_at {
+                let delay = hold.next_repeat_at.duration_since(now);
+                next_delay = Some(next_delay.map_or(delay, |current| current.min(delay)));
+                self.native_video_mouse_seek_holds.put(hold);
+                continue;
+            }
+            let result = self.dispatch_mouse_button(
+                ctx,
+                hold.slot,
+                crate::app::ActionSurface::Viewer,
+                "native-video-mouse-hold",
+            );
+            if result.dispatched_action.as_ref() != Some(&hold.action) {
+                continue;
+            }
+            if result.navigation.is_some() {
+                self.mouse_ring_nav = result.navigation;
+            }
+            // Never replay missed ticks as a burst. One frame performs at most one
+            // action per button and schedules the next deadline from this observation.
+            crate::mouse_seek_debug::log_app_mouse_hold_repeat(
+                hold.initial_receipt,
+                match hold.slot {
+                    crate::ring_shortcut::MouseButtonSlot::Back => "back",
+                    crate::ring_shortcut::MouseButtonSlot::Forward => "forward",
+                    crate::ring_shortcut::MouseButtonSlot::Middle => "middle",
+                },
+                hold.action.as_str(),
+            );
+            hold.next_repeat_at = now + hold.repeat_interval;
+            let delay = hold.repeat_interval;
+            next_delay = Some(next_delay.map_or(delay, |current| current.min(delay)));
+            self.native_video_mouse_seek_holds.put(hold);
+        }
+        next_delay
+    }
+
+    #[cfg(windows)]
     pub(crate) fn sync_native_video_grade(&mut self) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
@@ -1625,6 +1945,7 @@ impl App {
             .flatten();
         let target_detached = target_detached_window_id
             .map(|window_id| self.detached_host_lease_for_window_id(window_id));
+        self.clear_native_video_mouse_seek_holds("placement_replace");
         let request_id = self.video_presentation_transition.request_transition(
             target_presentation,
             activate_on_show,
@@ -2147,6 +2468,7 @@ impl App {
                 return false;
             }
         };
+        self.clear_native_video_mouse_seek_holds("source_swap_deferred");
         let now = std::time::Instant::now();
         let parked_live_window_id = self.native_video_parked_live_input_window_id;
         // Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られた swap かどうか
@@ -4283,6 +4605,33 @@ impl App {
             ));
             return;
         }
+        if let crate::video::NativeVideoOutputEvent::Window(
+            crate::video::native_window::NativeVideoWindowEvent::MouseButton(mouse),
+        ) = &event
+            && !mouse.down
+            && matches!(
+                mouse.button,
+                crate::video::native_window::NativeVideoMouseButton::Extra1
+                    | crate::video::native_window::NativeVideoMouseButton::Extra2
+            )
+        {
+            // Render already accepted this HWND generation. Releases terminate an
+            // App-owned hold regardless of the overlay state that changed after DOWN.
+            crate::mouse_seek_debug::log_app_received(match &event {
+                crate::video::NativeVideoOutputEvent::Window(window) => window,
+                _ => unreachable!(),
+            });
+            let released = self.release_native_video_mouse_seek_hold(fs_idx, source_epoch, mouse);
+            crate::mouse_seek_debug::log_app_mouse(
+                mouse.receipt,
+                if released {
+                    "release_hold"
+                } else {
+                    "release_unmatched"
+                },
+            );
+            return;
+        }
         if self.remote_session_blocks_local_control()
             && Self::native_video_output_event_blocked_while_parked_live(&event)
         {
@@ -4610,11 +4959,7 @@ impl App {
                 self.apply_native_video_zoom_wheel(ctx, fs_idx, delta, pointer_points);
             }
             crate::video::NativeVideoOutputEvent::TogglePanorama => {
-                let target = select_native_video_display_mode_toggle(
-                    self.detect_panorama(fs_idx).is_some(),
-                    self.native_video_zoom_available(fs_idx),
-                );
-                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
+                self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
             }
             crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
                 if self.native_video_panorama_input_active(fs_idx)
@@ -5194,6 +5539,7 @@ impl App {
         fs_idx: usize,
         event: crate::video::native_window::NativeVideoWindowEvent,
     ) {
+        crate::mouse_seek_debug::log_app_received(&event);
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
@@ -5227,7 +5573,11 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
-            crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
+            crate::video::native_window::NativeVideoWindowEvent::KeyUp(key) => {
+                if crate::mouse_seek_debug::is_comparison_key(key.virtual_key) {
+                    crate::mouse_seek_debug::log_app_key(key.receipt, "release_no_action");
+                }
+            }
             crate::video::native_window::NativeVideoWindowEvent::Text(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::Ime(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
@@ -7317,6 +7667,27 @@ impl App {
         }
         self.sync_native_video_zoom_state(fs_idx);
         self.request_native_video_hud_repaint(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn toggle_native_video_display_mode_for_input(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        // Native HWND, native overlay, and egui fullscreen fallback inputs all arrive here.
+        // Resolve the action only for the mounted visible video owner: `detect_panorama`
+        // intentionally wins over zoom in the selector, so the owner/audio gate must run first.
+        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            || !self.native_video_view_input_available(fs_idx)
+        {
+            return;
+        }
+        let target = select_native_video_display_mode_toggle(
+            self.detect_panorama(fs_idx).is_some(),
+            self.native_video_zoom_available(fs_idx),
+        );
+        self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
     }
 
     #[cfg(windows)]
@@ -10100,6 +10471,22 @@ impl App {
             })
             .unwrap_or(0);
         let outcome = self.dispatch_native_video_key_event(ctx, fs_idx, key);
+        if crate::mouse_seek_debug::is_enabled()
+            && crate::mouse_seek_debug::is_comparison_key(key.virtual_key)
+        {
+            let route_outcome = match (key.virtual_key, outcome) {
+                (
+                    0xA6,
+                    NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseBack),
+                ) => "press_mouse_back_routed".to_string(),
+                (
+                    0xA7,
+                    NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward),
+                ) => "press_mouse_forward_routed".to_string(),
+                _ => outcome.format(),
+            };
+            crate::mouse_seek_debug::log_app_key(key.receipt, &route_outcome);
+        }
         log_native_video_key_diagnostic(NativeVideoKeyDiagnosticRecord {
             seq,
             fs_idx,
@@ -10376,11 +10763,7 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
             }
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
-                let target = select_native_video_display_mode_toggle(
-                    self.detect_panorama(fs_idx).is_some(),
-                    self.native_video_zoom_available(fs_idx),
-                );
-                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
+                self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanorama)
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
@@ -11231,6 +11614,7 @@ impl App {
             self.settings.video_scale_filter,
             self.settings.video_downscale_smoothing_percent,
             self.settings.video_anime4k_budget,
+            self.settings.fullscreen_image_margin_color,
             self.native_bar_lock_state(),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
@@ -11578,6 +11962,7 @@ impl App {
         self.video_audio_mode_entry_target = entry_target;
         self.video_audio_exit_pending = None;
         self.reset_video_audio_side_panel_sessions(fs_idx);
+        self.clear_native_video_mouse_seek_holds("video_audio_mode_enter");
         self.video_audio_mode = Some(fs_idx);
         // 診断ログの session 境界だけを再 arm する。入力判定・presenter 遷移には使わない。
         crate::ui_fullscreen::reset_video_audio_exit_key_diagnostic_rate();
@@ -11845,6 +12230,7 @@ impl App {
                 self.settings.video_scale_filter,
                 self.settings.video_downscale_smoothing_percent,
                 self.settings.video_anime4k_budget,
+                self.settings.fullscreen_image_margin_color,
                 self.native_bar_lock_state(),
                 false,
             )
@@ -12463,6 +12849,7 @@ impl App {
             return None;
         }
 
+        self.clear_native_video_mouse_seek_holds("source_swap_fast");
         crate::logger::log(format!(
             "[native-video] fast source swap begin: reason={reason} from_idx={from_idx} -> target_idx={target_idx} target={}",
             target_path.display()
@@ -12948,6 +13335,13 @@ impl App {
         use crate::video::native_window::NativeVideoMouseButton;
 
         self.mark_native_video_hud_activity(ctx);
+        if matches!(
+            event.button,
+            NativeVideoMouseButton::Extra1 | NativeVideoMouseButton::Extra2
+        ) && !event.down
+        {
+            crate::mouse_seek_debug::log_app_mouse(event.receipt, "release_no_action");
+        }
         let right_drag_owner = self
             .native_video_parked_live_input_window_id
             .map(crate::ring_shortcut::RightDragOwner::DetachedWindow)
@@ -13082,11 +13476,44 @@ impl App {
         }
         if let Some(forward) = native_video_extra_button_press(event) {
             self.native_video_pointer_down = None;
-            self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+            let slot = if forward {
+                crate::ring_shortcut::MouseButtonSlot::Forward
+            } else {
+                crate::ring_shortcut::MouseButtonSlot::Back
+            };
+            let result = self.dispatch_mouse_button(
                 ctx,
-                forward,
+                slot,
                 crate::app::ActionSurface::Viewer,
                 "native-video-mouse",
+            );
+            self.mouse_ring_nav = result.navigation;
+            if let Some(action) = result.dispatched_action
+                && crate::app::gamepad_input::video_seek_ring_action(&action).is_some()
+            {
+                self.arm_native_video_mouse_seek_hold(
+                    fs_idx,
+                    self.fs_cache
+                        .get(&fs_idx)
+                        .and_then(|entry| match entry {
+                            FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+                            _ => None,
+                        })
+                        .unwrap_or(0),
+                    event,
+                    slot,
+                    action,
+                    sample_native_mouse_repeat_timing(),
+                    std::time::Instant::now(),
+                );
+            }
+            crate::mouse_seek_debug::log_app_mouse(
+                event.receipt,
+                if forward {
+                    "press_mouse_forward_routed"
+                } else {
+                    "press_mouse_back_routed"
+                },
             );
             return;
         }
@@ -13402,6 +13829,7 @@ mod configurable_video_seek_dispatch_tests {
         ctrl: bool,
     ) -> crate::video::native_window::NativeVideoKeyEvent {
         crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: matches!(virtual_key, 0x25 | 0x27),
@@ -13456,6 +13884,541 @@ mod configurable_video_seek_dispatch_tests {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => panic!("test video player missing"),
         }
+    }
+
+    fn player_seek_base(app: &App, idx: usize) -> f64 {
+        match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.user_seek_base_secs_for_test(),
+            _ => panic!("test video player missing"),
+        }
+    }
+
+    fn setup_mouse_hold_app() -> (
+        crate::app::AppTestEnvForTest,
+        usize,
+        u64,
+        crate::video::native_window::NativeVideoMouseInputOwner,
+    ) {
+        let (mut app, idx) = setup_seek_app();
+        let player = match app.fs_cache.get_mut(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player,
+            _ => panic!("test video player missing"),
+        };
+        player.configure_native_timing_for_test(100.0, 300.0, false, false);
+        let source_epoch = player.native_source_epoch().expect("native source epoch");
+        assert_eq!(
+            player.native_committed_generation(),
+            Some(0),
+            "the disconnected fixture models an initial presenter before any placement commit"
+        );
+        let owner = crate::video::native_window::NativeVideoMouseInputOwner {
+            window_source: crate::video::native_window::NativeVideoWindowSource::Presenter,
+            receiver_hwnd: player.native_presenter_hwnd(),
+            // The first real presenter window starts at generation 1 while the App-side
+            // committed generation is still the stale-close floor 0.
+            window_generation: 1,
+        };
+        assert_ne!(owner.receiver_hwnd, 0);
+        (app, idx, source_epoch, owner)
+    }
+
+    fn native_extra_mouse_event(
+        receipt_id: u64,
+        owner: crate::video::native_window::NativeVideoMouseInputOwner,
+        button: crate::video::native_window::NativeVideoMouseButton,
+        down: bool,
+        double_click: bool,
+    ) -> crate::video::native_window::NativeVideoMouseButtonEvent {
+        crate::video::native_window::NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(receipt_id),
+            owner,
+            button,
+            down,
+            double_click,
+            x: 120,
+            y: 80,
+            shift: false,
+            ctrl: false,
+        }
+    }
+
+    fn route_native_mouse_button(
+        app: &mut App,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) {
+        app.handle_native_video_output_event(
+            ctx,
+            fs_idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::MouseButton(event),
+            ),
+        );
+    }
+
+    fn set_video_mouse_action(
+        app: &mut App,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+        action: crate::ring_shortcut::RingActionId,
+    ) {
+        let profile = app
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(crate::ring_shortcut::RingShortcutContext::VideoFullscreen);
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => profile.back = action,
+            crate::ring_shortcut::MouseButtonSlot::Forward => profile.forward = action,
+            crate::ring_shortcut::MouseButtonSlot::Middle => profile.middle = action,
+        }
+    }
+
+    #[test]
+    fn native_mouse_repeat_timing_clamps_and_uses_documented_fallbacks() {
+        let slowest = native_mouse_repeat_timing_from_system_values(Some(0), Some(0));
+        assert_eq!(slowest.initial_delay, std::time::Duration::from_millis(250));
+        assert_eq!(slowest.interval, std::time::Duration::from_millis(400));
+
+        let fastest = native_mouse_repeat_timing_from_system_values(Some(3), Some(31));
+        assert_eq!(
+            fastest.initial_delay,
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            fastest.interval,
+            std::time::Duration::from_secs_f64(1.0 / 30.0)
+        );
+        assert_eq!(
+            native_mouse_repeat_timing_from_system_values(Some(99), Some(99)),
+            fastest
+        );
+        assert_eq!(
+            native_mouse_repeat_timing_from_system_values(None, None),
+            native_mouse_repeat_timing_from_system_values(Some(1), Some(20))
+        );
+    }
+
+    #[test]
+    fn raw_xbutton_hold_generation_uses_the_committed_stale_floor() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        assert_eq!(owner.window_generation, 1);
+        assert_eq!(app.native_video_committed_generation_for(idx), 0);
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(90, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "the initial generation 1 presenter is current above the committed floor 0"
+        );
+        app.native_video_mouse_seek_holds.clear();
+
+        app.bump_native_video_committed_generation(idx, 1);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(91, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "the committed current generation remains valid"
+        );
+        app.native_video_mouse_seek_holds.clear();
+
+        app.bump_native_video_committed_generation(idx, 2);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(92, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_none(),
+            "an older generation is rejected even if Windows reuses the same HWND"
+        );
+    }
+
+    #[test]
+    fn all_six_video_seek_actions_arm_a_standard_raw_xbutton_hold() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        let actions = [
+            RingActionId::VideoSeekBackSmall,
+            RingActionId::VideoSeekBackMedium,
+            RingActionId::VideoSeekBackLarge,
+            RingActionId::VideoSeekForwardSmall,
+            RingActionId::VideoSeekForwardMedium,
+            RingActionId::VideoSeekForwardLarge,
+        ];
+        for (offset, action) in actions.into_iter().enumerate() {
+            set_video_mouse_action(&mut app, MouseButtonSlot::Back, action.clone());
+            route_native_mouse_button(
+                &mut app,
+                &ctx,
+                idx,
+                source_epoch,
+                native_extra_mouse_event(
+                    100 + offset as u64,
+                    owner,
+                    NativeVideoMouseButton::Extra1,
+                    true,
+                    false,
+                ),
+            );
+            assert_eq!(
+                app.native_video_mouse_seek_holds
+                    .back
+                    .as_ref()
+                    .expect("seek action must arm the raw hold")
+                    .action,
+                action
+            );
+            assert!(app.native_video_mouse_seek_holds.clear());
+        }
+    }
+
+    #[test]
+    fn raw_xbutton_hold_validates_context_source_assignment_modal_and_parked_owners() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(120, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        let hold = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("valid raw hold")
+            .clone();
+        assert!(app.native_video_mouse_seek_hold_valid(&hold));
+
+        let mut wrong_context = hold.clone();
+        wrong_context.context_id = ViewerContextId::for_test(hold.context_id.serial() + 1000);
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_context));
+
+        let mut wrong_fs = hold.clone();
+        wrong_fs.fs_idx += 1;
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_fs));
+
+        let mut wrong_epoch = hold.clone();
+        wrong_epoch.source_epoch += 1;
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_epoch));
+
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::VideoMute);
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.set_native_overlay_input_routing_for_test(
+                crate::video::native_presenter::NativeOverlayInputRouting {
+                    modal_dialog_active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.set_native_overlay_input_routing_for_test(Default::default());
+        }
+
+        app.native_video_parked_live_input_window_id = Some(77);
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+    }
+
+    #[test]
+    fn raw_xbutton_hold_is_immediate_bounded_and_stops_on_lossless_up() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(10, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert_eq!(
+            player_seek_base(&app, idx),
+            97.0,
+            "DOWN executes immediately once"
+        );
+        let first_due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("back hold armed")
+            .next_repeat_at;
+        let before_due = first_due - std::time::Duration::from_millis(1);
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, before_due)
+                .is_some()
+        );
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, first_due)
+                .is_some()
+        );
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+        let hold = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("hold remains armed after repeat");
+        let late = hold.next_repeat_at + hold.repeat_interval * 8;
+        assert!(app.tick_native_video_mouse_seek_holds(&ctx, late).is_some());
+        assert_eq!(
+            player_seek_base(&app, idx),
+            91.0,
+            "an overdue frame performs one repeat without catch-up burst"
+        );
+        assert!(
+            app.native_video_mouse_seek_holds
+                .back
+                .as_ref()
+                .expect("hold rescheduled")
+                .next_repeat_at
+                > late
+        );
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(11, owner, NativeVideoMouseButton::Extra1, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, late + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(player_seek_base(&app, idx), 91.0);
+    }
+
+    #[test]
+    fn raw_xbutton_double_click_and_two_buttons_keep_independent_press_counts() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        for event in [
+            native_extra_mouse_event(20, owner, NativeVideoMouseButton::Extra1, true, false),
+            native_extra_mouse_event(21, owner, NativeVideoMouseButton::Extra1, false, false),
+            native_extra_mouse_event(22, owner, NativeVideoMouseButton::Extra1, true, true),
+            native_extra_mouse_event(23, owner, NativeVideoMouseButton::Extra1, false, false),
+        ] {
+            route_native_mouse_button(&mut app, &ctx, idx, source_epoch, event);
+        }
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        drop(app);
+
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Forward,
+            RingActionId::VideoSeekForwardLarge,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(24, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(25, owner, NativeVideoMouseButton::Extra2, true, false),
+        );
+        assert_eq!(player_seek_base(&app, idx), 140.0);
+        let due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .unwrap()
+            .next_repeat_at
+            .max(
+                app.native_video_mouse_seek_holds
+                    .forward
+                    .as_ref()
+                    .unwrap()
+                    .next_repeat_at,
+            );
+        let _ = app.tick_native_video_mouse_seek_holds(&ctx, due);
+        assert_eq!(player_seek_base(&app, idx), 180.0);
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(26, owner, NativeVideoMouseButton::Extra1, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        let forward_due = app
+            .native_video_mouse_seek_holds
+            .forward
+            .as_ref()
+            .expect("forward hold survives back release")
+            .next_repeat_at;
+        let _ = app.tick_native_video_mouse_seek_holds(&ctx, forward_due);
+        assert_eq!(player_seek_base(&app, idx), 223.0);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(27, owner, NativeVideoMouseButton::Extra2, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.forward.is_none());
+    }
+
+    #[test]
+    fn raw_xbutton_hold_arms_only_seek_and_revalidates_owner_boundaries() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::VideoMute);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(30, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.video_session_muted,
+            "non-seek action still executes once"
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(31, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_some());
+        let wrong_owner = crate::video::native_window::NativeVideoMouseInputOwner {
+            receiver_hwnd: owner.receiver_hwnd + 1,
+            ..owner
+        };
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(
+                32,
+                wrong_owner,
+                NativeVideoMouseButton::Extra1,
+                false,
+                false,
+            ),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "a sibling HWND release cannot terminate this owner"
+        );
+
+        let due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .unwrap()
+            .next_repeat_at;
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.bump_native_committed_generation(owner.window_generation + 1);
+        }
+        let position = player_position(&app, idx);
+        assert!(app.tick_native_video_mouse_seek_holds(&ctx, due).is_none());
+        assert_eq!(player_position(&app, idx), position);
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        drop(app);
+
+        let (mut audio_app, audio_idx, audio_epoch, audio_owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut audio_app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        audio_app.video_audio_mode = Some(audio_idx);
+        route_native_mouse_button(
+            &mut audio_app,
+            &ctx,
+            audio_idx,
+            audio_epoch,
+            native_extra_mouse_event(33, audio_owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(audio_app.native_video_mouse_seek_holds.back.is_none());
     }
 
     #[test]
@@ -13576,7 +14539,7 @@ mod configurable_video_seek_dispatch_tests {
     }
 
     #[test]
-    fn physical_mouse_buttons_ignore_deferred_video_seek_but_keep_other_routes() {
+    fn physical_mouse_buttons_execute_configured_video_seek_and_keep_other_routes() {
         use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
 
         let ctx = egui::Context::default();
@@ -13624,21 +14587,23 @@ mod configurable_video_seek_dispatch_tests {
             }
             reset_seek_player(&mut app, idx);
 
-            let result = app.apply_mouse_button(
+            let result = app.dispatch_mouse_button(
                 &ctx,
                 slot,
                 crate::app::ActionSurface::Viewer,
-                "deferred-video-mouse-seek-test",
+                "video-mouse-seek-test",
             );
 
-            assert!(result.is_none());
+            assert!(result.navigation.is_none());
+            assert_eq!(result.dispatched_action.as_ref(), Some(&action));
             assert_eq!(
                 player_position(&app, idx),
-                100.0,
-                "physical {slot:?} must not execute {}",
+                ring_position,
+                "physical {slot:?} must execute configured {} exactly once",
                 action.as_str()
             );
 
+            reset_seek_player(&mut app, idx);
             let _ = app.apply_ring_action(
                 &ctx,
                 RingShortcutContext::VideoFullscreen,
@@ -13768,6 +14733,7 @@ mod native_video_key_observation_tests {
             foreground_hwnd: 0xA1,
             presenter_hwnd: 0xB2,
             key: crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
                 virtual_key: 0x5A,
                 scan_code: 0x2C,
                 extended: true,

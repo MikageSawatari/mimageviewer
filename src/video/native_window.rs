@@ -55,6 +55,7 @@ use crate::touch_debug::{TouchDebugWindow, log_win32_message};
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoKeyEvent {
+    pub(crate) receipt: crate::mouse_seek_debug::NativeVideoInputReceipt,
     pub virtual_key: u32,
     pub scan_code: u16,
     pub extended: bool,
@@ -316,6 +317,14 @@ impl NativeVideoWindowEventSink {
         }
     }
 
+    pub(super) fn mouse_input_owner(&self, receiver_hwnd: u64) -> NativeVideoMouseInputOwner {
+        NativeVideoMouseInputOwner {
+            window_source: self.source,
+            receiver_hwnd,
+            window_generation: self.generation,
+        }
+    }
+
     pub(crate) fn send(&self, event: NativeVideoWindowEvent) {
         let envelope = NativeVideoWindowEventEnvelope {
             sequence: 0,
@@ -349,6 +358,12 @@ impl NativeVideoWindowEventSink {
     }
 
     fn dispatch(&self, envelope: NativeVideoWindowEventEnvelope) {
+        crate::mouse_seek_debug::log_producer_enqueued(
+            envelope.epoch,
+            envelope.generation,
+            envelope.source,
+            &envelope.event,
+        );
         if matches!(
             envelope.event,
             NativeVideoWindowEvent::CloseRequested { .. }
@@ -393,6 +408,183 @@ pub enum NativeVideoMouseButton {
     Extra2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeVideoMouseInputOwner {
+    pub(crate) window_source: NativeVideoWindowSource,
+    pub(crate) receiver_hwnd: u64,
+    pub(crate) window_generation: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn test_mouse_input_owner() -> NativeVideoMouseInputOwner {
+    NativeVideoMouseInputOwner {
+        window_source: NativeVideoWindowSource::Presenter,
+        receiver_hwnd: 1,
+        window_generation: 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct NativeHeldMouseButtons {
+    /// Buttons whose DOWN was reported and still needs a matching physical or
+    /// synthetic UP.
+    reported_bits: u8,
+    /// Buttons pressed while this HWND actually owned Win32 mouse capture.
+    /// Keeping this separate prevents an earlier non-X capture failure from
+    /// blocking capture release after a later XButton hold ends.
+    captured_bits: u8,
+}
+
+impl NativeHeldMouseButtons {
+    const LEFT: u8 = 1 << 0;
+    const RIGHT: u8 = 1 << 1;
+    const MIDDLE: u8 = 1 << 2;
+    const EXTRA1: u8 = 1 << 3;
+    const EXTRA2: u8 = 1 << 4;
+
+    fn bit(button: NativeVideoMouseButton) -> u8 {
+        match button {
+            NativeVideoMouseButton::Left => Self::LEFT,
+            NativeVideoMouseButton::Right => Self::RIGHT,
+            NativeVideoMouseButton::Middle => Self::MIDDLE,
+            NativeVideoMouseButton::Extra1 => Self::EXTRA1,
+            NativeVideoMouseButton::Extra2 => Self::EXTRA2,
+        }
+    }
+
+    pub(super) fn press(&mut self, button: NativeVideoMouseButton) {
+        self.reported_bits |= Self::bit(button);
+    }
+
+    pub(super) fn capture_succeeded(&mut self, button: NativeVideoMouseButton) {
+        self.captured_bits |= Self::bit(button);
+    }
+
+    pub(super) fn capture_failed(&mut self) {
+        self.captured_bits = 0;
+    }
+
+    /// Returns true only when this release removed the final button associated
+    /// with capture currently owned by this HWND. Reported buttons from an
+    /// earlier failed capture remain available for lifecycle cleanup, but do
+    /// not keep a later successful capture stuck.
+    pub(super) fn release(&mut self, button: NativeVideoMouseButton) -> bool {
+        let bit = Self::bit(button);
+        self.reported_bits &= !bit;
+        let owned_capture = self.captured_bits & bit != 0;
+        self.captured_bits &= !bit;
+        owned_capture && self.captured_bits == 0
+    }
+
+    pub(super) fn debug_bits(self) -> u8 {
+        self.reported_bits
+    }
+
+    fn take(&mut self) -> u8 {
+        self.captured_bits = 0;
+        std::mem::take(&mut self.reported_bits)
+    }
+}
+
+pub(super) fn emit_synthetic_mouse_button_cleanup(
+    held: &mut NativeHeldMouseButtons,
+    sink: Option<&NativeVideoWindowEventSink>,
+    owner: NativeVideoMouseInputOwner,
+    cause_message: u32,
+) {
+    let bits = held.take();
+    let Some(sink) = sink else {
+        return;
+    };
+    for (bit, button) in [
+        (NativeHeldMouseButtons::LEFT, NativeVideoMouseButton::Left),
+        (NativeHeldMouseButtons::RIGHT, NativeVideoMouseButton::Right),
+        (
+            NativeHeldMouseButtons::MIDDLE,
+            NativeVideoMouseButton::Middle,
+        ),
+        (
+            NativeHeldMouseButtons::EXTRA1,
+            NativeVideoMouseButton::Extra1,
+        ),
+        (
+            NativeHeldMouseButtons::EXTRA2,
+            NativeVideoMouseButton::Extra2,
+        ),
+    ] {
+        if bits & bit == 0 {
+            continue;
+        }
+        sink.send(NativeVideoWindowEvent::MouseButton(
+            NativeVideoMouseButtonEvent {
+                receipt: crate::mouse_seek_debug::win32_mouse_cleanup_receipt(
+                    owner.window_source,
+                    owner.receiver_hwnd,
+                    cause_message,
+                ),
+                owner,
+                button,
+                down: false,
+                double_click: false,
+                x: 0,
+                y: 0,
+                shift: false,
+                ctrl: false,
+            },
+        ));
+    }
+}
+
+pub(super) fn emit_synthetic_extra_button_release_if_held(
+    held: &mut NativeHeldMouseButtons,
+    sink: Option<&NativeVideoWindowEventSink>,
+    owner: NativeVideoMouseInputOwner,
+    button: NativeVideoMouseButton,
+    cause_message: u32,
+) {
+    if !matches!(
+        button,
+        NativeVideoMouseButton::Extra1 | NativeVideoMouseButton::Extra2
+    ) {
+        return;
+    }
+    let bit = NativeHeldMouseButtons::bit(button);
+    if held.reported_bits & bit == 0 {
+        return;
+    }
+    held.reported_bits &= !bit;
+    held.captured_bits &= !bit;
+    let Some(sink) = sink else {
+        return;
+    };
+    sink.send(NativeVideoWindowEvent::MouseButton(
+        NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::win32_mouse_cleanup_receipt(
+                owner.window_source,
+                owner.receiver_hwnd,
+                cause_message,
+            ),
+            owner,
+            button,
+            down: false,
+            double_click: false,
+            x: 0,
+            y: 0,
+            shift: false,
+            ctrl: false,
+        },
+    ));
+}
+
+pub(crate) fn native_video_mouse_seek_hold_terminal(event: &NativeVideoWindowEvent) -> bool {
+    matches!(
+        event,
+        NativeVideoWindowEvent::MouseButton(button)
+            if !button.down
+                && matches!(button.button, NativeVideoMouseButton::Extra1 | NativeVideoMouseButton::Extra2)
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoMouseEvent {
     pub x: i32,
@@ -403,6 +595,8 @@ pub struct NativeVideoMouseEvent {
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoMouseButtonEvent {
+    pub(crate) receipt: crate::mouse_seek_debug::NativeVideoInputReceipt,
+    pub(crate) owner: NativeVideoMouseInputOwner,
     pub button: NativeVideoMouseButton,
     pub down: bool,
     pub double_click: bool,
@@ -485,6 +679,8 @@ struct WindowState {
     close_on_escape: bool,
     event_sink: Option<NativeVideoWindowEventSink>,
     ime_preediting: bool,
+    /// Win32 capture owner for every mouse button held by this presenter HWND.
+    held_mouse_buttons: NativeHeldMouseButtons,
     /// Whole-stream `PT_TOUCH` ownership for this presenter HWND. The HUD has
     /// an independent owner set in its own per-HWND `WindowState`.
     touch_ownership: NativeTouchOwnership,
@@ -732,6 +928,7 @@ impl NativeVideoWindow {
                 close_on_escape: config.close_on_escape,
                 event_sink: config.event_sink,
                 ime_preediting: false,
+                held_mouse_buttons: NativeHeldMouseButtons::default(),
                 touch_ownership: NativeTouchOwnership::default(),
                 generation: config.generation,
             });
@@ -1824,7 +2021,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(wparam, lparam);
+                let key = native_key_event(hwnd, msg, wparam, lparam);
                 crate::key_debug::record_native_video_key(key, true);
                 sink.send(NativeVideoWindowEvent::KeyDown(key));
             }
@@ -1838,11 +2035,10 @@ unsafe extern "system" fn wnd_proc(
                 }
                 return LRESULT(0);
             }
-            // Browser Back/Forward は上で既に 1 回 enqueue 済み。ここから
-            // DefWindowProcW へ渡すと WM_APPCOMMAND が生成され、本 wndproc の
-            // WM_APPCOMMAND branch が scan_code=0 の合成 KeyDown をもう 1 回流す。
-            // 実機ログでは実 KeyDown (scan 0x69/0x6A, extended) と合成 KeyDown が
-            // 同時刻に並び、1 クリックで同じ seek action が 2 回実行されていた。
+            // Browser Back/Forward は上で既に 1 回 enqueue 済み。この WndProc 内で
+            // DefWindowProcW 由来の WM_APPCOMMAND を追加生成しないため処理済みにする。
+            // ただし後続の実機ログでも scan 0 の別 receipt は残っており、その producer は
+            // 未確定である。この局所 ownership を reported duplicate の解決とは扱わない。
             if native_browser_keydown_message_handled(msg, wparam.0 as u32) {
                 return LRESULT(0);
             }
@@ -1850,7 +2046,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_KEYUP | WM_SYSKEYUP => {
             if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(wparam, lparam);
+                let key = native_key_event(hwnd, msg, wparam, lparam);
                 crate::key_debug::record_native_video_key(key, false);
                 sink.send(NativeVideoWindowEvent::KeyUp(key));
             }
@@ -1873,6 +2069,12 @@ unsafe extern "system" fn wnd_proc(
                 && let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
             {
                 let key = NativeVideoKeyEvent {
+                    receipt: crate::mouse_seek_debug::win32_app_command_receipt(
+                        NativeVideoWindowSource::Presenter,
+                        hwnd.0 as usize as u64,
+                        wparam.0 as u64,
+                        lparam.0,
+                    ),
                     virtual_key: vk,
                     scan_code: 0,
                     extended: false,
@@ -2019,19 +2221,43 @@ unsafe extern "system" fn wnd_proc(
             if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Presenter) {
                 return LRESULT(0);
             }
-            if mouse_message_is_down(msg) {
-                unsafe {
-                    let _ = SetCapture(hwnd);
+            if let Some(state) = window_state_mut(hwnd) {
+                let owner = state
+                    .event_sink
+                    .as_ref()
+                    .map(|sink| sink.mouse_input_owner(hwnd.0 as usize as u64))
+                    .unwrap_or(NativeVideoMouseInputOwner {
+                        window_source: NativeVideoWindowSource::Presenter,
+                        receiver_hwnd: hwnd.0 as usize as u64,
+                        window_generation: state.generation,
+                    });
+                let event = native_mouse_button_event(owner, msg, wparam, lparam);
+                if let Some(sink) = state.event_sink.as_ref() {
+                    sink.send(NativeVideoWindowEvent::MouseButton(event));
                 }
-            } else {
-                unsafe {
-                    let _ = ReleaseCapture();
+                if event.down {
+                    state.held_mouse_buttons.press(event.button);
+                    unsafe {
+                        let _ = SetCapture(hwnd);
+                    }
+                    if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == hwnd
+                    {
+                        state.held_mouse_buttons.capture_succeeded(event.button);
+                    } else {
+                        state.held_mouse_buttons.capture_failed();
+                        emit_synthetic_extra_button_release_if_held(
+                            &mut state.held_mouse_buttons,
+                            state.event_sink.as_ref(),
+                            owner,
+                            event.button,
+                            msg,
+                        );
+                    }
+                } else if state.held_mouse_buttons.release(event.button) {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
                 }
-            }
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                sink.send(NativeVideoWindowEvent::MouseButton(
-                    native_mouse_button_event(msg, wparam, lparam),
-                ));
             }
             // MouseButton(Extra1/Extra2) として decode 済みの XButton message は、この
             // HWND が DOWN / UP / DBLCLK を一括所有する。2 回目の物理押下を表す DBLCLK も
@@ -2068,10 +2294,21 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                sink.send(NativeVideoWindowEvent::CursorOwnership(
-                    NativeCursorOwnershipEdge::CaptureLost,
-                ));
+            if let Some(state) = window_state_mut(hwnd) {
+                if let Some(sink) = state.event_sink.as_ref() {
+                    sink.send(NativeVideoWindowEvent::CursorOwnership(
+                        NativeCursorOwnershipEdge::CaptureLost,
+                    ));
+                    let owner = sink.mouse_input_owner(hwnd.0 as usize as u64);
+                    emit_synthetic_mouse_button_cleanup(
+                        &mut state.held_mouse_buttons,
+                        Some(sink),
+                        owner,
+                        msg,
+                    );
+                } else {
+                    state.held_mouse_buttons = NativeHeldMouseButtons::default();
+                }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -2156,8 +2393,19 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                sink.send(NativeVideoWindowEvent::Destroyed);
+            if let Some(state) = window_state_mut(hwnd) {
+                if let Some(sink) = state.event_sink.as_ref() {
+                    let owner = sink.mouse_input_owner(hwnd.0 as usize as u64);
+                    emit_synthetic_mouse_button_cleanup(
+                        &mut state.held_mouse_buttons,
+                        Some(sink),
+                        owner,
+                        msg,
+                    );
+                    sink.send(NativeVideoWindowEvent::Destroyed);
+                } else {
+                    state.held_mouse_buttons = NativeHeldMouseButtons::default();
+                }
             }
             LRESULT(0)
         }
@@ -2165,6 +2413,17 @@ unsafe extern "system" fn wnd_proc(
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 unsafe {
+                    if let Some(sink) = (*ptr).event_sink.as_ref() {
+                        let owner = sink.mouse_input_owner(hwnd.0 as usize as u64);
+                        emit_synthetic_mouse_button_cleanup(
+                            &mut (*ptr).held_mouse_buttons,
+                            Some(sink),
+                            owner,
+                            msg,
+                        );
+                    } else {
+                        (*ptr).held_mouse_buttons = NativeHeldMouseButtons::default();
+                    }
                     (*ptr).touch_ownership.clear();
                     let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let _ = Box::from_raw(ptr);
@@ -2231,7 +2490,7 @@ fn ime_composition_string(hwnd: HWND, mode: IME_COMPOSITION_STRING) -> Option<St
     }
 }
 
-fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
+fn native_key_event(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
     // The native presenter WndProc is a separate input route and is explicitly
     // outside the app-side synthetic timeline.
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
@@ -2239,6 +2498,11 @@ fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
     let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
     let raw = lparam.0 as u64;
     NativeVideoKeyEvent {
+        receipt: crate::mouse_seek_debug::win32_key_receipt(
+            NativeVideoWindowSource::Presenter,
+            hwnd.0 as usize as u64,
+            msg,
+        ),
         virtual_key: wparam.0 as u32,
         scan_code: ((raw >> 16) & 0xff) as u16,
         extended: (raw & (1 << 24)) != 0,
@@ -2259,6 +2523,7 @@ fn native_mouse_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseEvent {
 }
 
 fn native_mouse_button_event(
+    owner: NativeVideoMouseInputOwner,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
@@ -2276,6 +2541,13 @@ fn native_mouse_button_event(
         _ => NativeVideoMouseButton::Left,
     };
     NativeVideoMouseButtonEvent {
+        receipt: crate::mouse_seek_debug::win32_mouse_button_receipt(
+            owner.window_source,
+            owner.receiver_hwnd,
+            msg,
+            ((wparam.0 >> 16) & 0xFFFF) as u16,
+        ),
+        owner,
         button,
         down: mouse_message_is_down(msg),
         double_click: matches!(
@@ -2419,6 +2691,7 @@ mod tests {
 
     fn key(virtual_key: u32) -> NativeVideoWindowEvent {
         NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -2427,6 +2700,14 @@ mod tests {
             alt: false,
             repeat: false,
         })
+    }
+
+    fn test_mouse_owner() -> NativeVideoMouseInputOwner {
+        NativeVideoMouseInputOwner {
+            window_source: NativeVideoWindowSource::Presenter,
+            receiver_hwnd: 0,
+            window_generation: 7,
+        }
     }
 
     #[test]
@@ -2465,17 +2746,152 @@ mod tests {
         let press_count = |messages: &[u32]| {
             messages
                 .iter()
-                .map(|msg| native_mouse_button_event(*msg, wparam, lparam))
+                .map(|msg| native_mouse_button_event(test_mouse_owner(), *msg, wparam, lparam))
                 .filter(|event| event.down)
                 .count()
         };
 
         assert_eq!(press_count(&single), 1);
         assert_eq!(press_count(&double), 2);
-        let second_press = native_mouse_button_event(WM_XBUTTONDBLCLK, wparam, lparam);
+        let second_press =
+            native_mouse_button_event(test_mouse_owner(), WM_XBUTTONDBLCLK, wparam, lparam);
         assert_eq!(second_press.button, NativeVideoMouseButton::Extra1);
         assert!(second_press.down);
         assert!(second_press.double_click);
+    }
+
+    #[test]
+    fn mouse_capture_releases_only_after_the_last_successfully_captured_button() {
+        let mut held = NativeHeldMouseButtons::default();
+        held.press(NativeVideoMouseButton::Extra1);
+        held.capture_succeeded(NativeVideoMouseButton::Extra1);
+        held.press(NativeVideoMouseButton::Extra2);
+        held.capture_succeeded(NativeVideoMouseButton::Extra2);
+
+        assert!(!held.release(NativeVideoMouseButton::Extra1));
+        assert_eq!(held.debug_bits(), NativeHeldMouseButtons::EXTRA2);
+        assert!(held.release(NativeVideoMouseButton::Extra2));
+        assert_eq!(held.debug_bits(), 0);
+    }
+
+    #[test]
+    fn failed_non_x_capture_cannot_keep_a_later_xbutton_capture_stuck() {
+        let mut held = NativeHeldMouseButtons::default();
+        held.press(NativeVideoMouseButton::Left);
+        held.capture_failed();
+        held.press(NativeVideoMouseButton::Extra1);
+        held.capture_succeeded(NativeVideoMouseButton::Extra1);
+
+        assert!(
+            held.release(NativeVideoMouseButton::Extra1),
+            "only successfully captured buttons own ReleaseCapture"
+        );
+        assert_eq!(
+            held.debug_bits(),
+            NativeHeldMouseButtons::LEFT,
+            "the failed non-X press remains for lifecycle synthetic-up cleanup"
+        );
+    }
+
+    #[test]
+    fn lifecycle_cleanup_emits_one_lossless_release_for_each_reported_button() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(
+            9,
+            7,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
+        let owner = sink.mouse_input_owner(0x1234);
+        let mut held = NativeHeldMouseButtons::default();
+        held.press(NativeVideoMouseButton::Left);
+        held.capture_failed();
+        held.press(NativeVideoMouseButton::Extra2);
+        held.capture_succeeded(NativeVideoMouseButton::Extra2);
+
+        emit_synthetic_mouse_button_cleanup(&mut held, Some(&sink), owner, WM_CANCELMODE);
+
+        assert_eq!(held.debug_bits(), 0);
+        let assert_releases = |events: Vec<NativeVideoWindowEventEnvelope>| {
+            assert_eq!(events.len(), 2);
+            let buttons = events
+                .into_iter()
+                .map(|envelope| match envelope.event {
+                    NativeVideoWindowEvent::MouseButton(event) => {
+                        assert!(!event.down);
+                        assert_eq!(event.owner, owner);
+                        assert!(matches!(
+                            event.receipt.origin,
+                            crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseCleanup {
+                                window_source: NativeVideoWindowSource::Presenter,
+                                receiver_hwnd: 0x1234,
+                                cause_message: WM_CANCELMODE,
+                            }
+                        ));
+                        event.button
+                    }
+                    other => panic!("unexpected cleanup event: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                buttons,
+                [NativeVideoMouseButton::Left, NativeVideoMouseButton::Extra2]
+            );
+        };
+        assert_releases(pump_rx.drain());
+        assert_releases(render_rx.drain());
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn one_xbutton_receipt_survives_distinct_pump_and_render_sequences() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(
+            9,
+            9,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::MouseButton(
+            NativeVideoMouseButtonEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(77),
+                owner: test_mouse_input_owner(),
+                button: NativeVideoMouseButton::Extra1,
+                down: true,
+                double_click: false,
+                x: 0,
+                y: 0,
+                shift: false,
+                ctrl: false,
+            },
+        ));
+
+        let pump_mouse = pump_rx
+            .drain()
+            .into_iter()
+            .find(|envelope| matches!(&envelope.event, NativeVideoWindowEvent::MouseButton(_)))
+            .expect("pump receives XButton");
+        let render_mouse = render_rx
+            .drain()
+            .into_iter()
+            .find(|envelope| matches!(&envelope.event, NativeVideoWindowEvent::MouseButton(_)))
+            .expect("render receives XButton");
+        let receipt_id = |envelope: &NativeVideoWindowEventEnvelope| match &envelope.event {
+            NativeVideoWindowEvent::MouseButton(mouse) => mouse.receipt.input_receipt_id,
+            _ => unreachable!(),
+        };
+        assert_eq!(receipt_id(&pump_mouse), 77);
+        assert_eq!(receipt_id(&render_mouse), 77);
+        assert_eq!(pump_mouse.sequence, 2);
+        assert_eq!(render_mouse.sequence, 1);
+        assert!(!overflow.load(Ordering::Acquire));
     }
 
     #[test]

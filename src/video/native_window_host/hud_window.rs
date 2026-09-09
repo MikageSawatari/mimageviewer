@@ -38,9 +38,11 @@
 //!   3. `RequestFocusClaim` を pump へ enqueue し、dispatch 後に presenter HWND へ
 //!      foreground/focus を戻す
 //!   4. `SetCapture(hud_hwnd)` で region 外の up も拾えるようにする
-//!   5. `GetCapture() != hud_hwnd` (= capture 失敗) なら synthetic up + held_buttons clear
-//!      で egui の `pointer.any_down()` が stuck しないようにする
-//! - `WM_*BUTTONUP`: ReleaseCapture + held_buttons clear。
+//!   5. `GetCapture() != hud_hwnd` なら raw XButton だけ immediate synthetic up で
+//!      seek repeat を終了する。通常 pointer は既存 click/drag contract を維持する
+//! - `WM_*BUTTONUP`: 該当 tracking bit を落とし、最後の capture-owned button のときだけ
+//!   ReleaseCapture。capture 失敗後も lifecycle cleanup 用の reported bit は残すが、後で成功した
+//!   XButton capture の解放を妨げないよう captured bit と分離する。
 //! - `WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY`: held_buttons に残っている
 //!   ボタンの synthetic up と、HUD が所有する touch stream の Cancel を補完してから
 //!   DefWindowProc (= `pointer.any_down()` の stuck を防ぐ)。
@@ -83,11 +85,12 @@ use windows::core::w;
 use crate::touch_debug::{TouchDebugWindow, log_win32_message};
 use crate::video::native_touch::NativeTouchOwnership;
 use crate::video::native_window::{
-    NativeCursorOwnershipEdge, NativeVideoKeyEvent, NativeVideoMouseButton,
+    NativeCursorOwnershipEdge, NativeHeldMouseButtons, NativeVideoKeyEvent, NativeVideoMouseButton,
     NativeVideoMouseButtonEvent, NativeVideoMouseEvent, NativeVideoMouseWheelEvent,
     NativeVideoWindowEvent, NativeVideoWindowEventSink, NativeVideoWindowSource,
-    cancel_hud_touch_streams, handle_hud_pointer_message, native_xbutton_message_handled,
-    should_discard_promoted_touch_mouse,
+    cancel_hud_touch_streams, emit_synthetic_extra_button_release_if_held,
+    emit_synthetic_mouse_button_cleanup, handle_hud_pointer_message,
+    native_xbutton_message_handled, should_discard_promoted_touch_mouse,
 };
 
 /// HUD overlay HWND の生成設定。
@@ -173,7 +176,7 @@ impl HudOverlayWindow {
             let state = Box::new(WindowState {
                 event_sink: cfg.event_sink,
                 regions: cfg.regions,
-                held_buttons: 0,
+                held_buttons: NativeHeldMouseButtons::default(),
                 touch_ownership: NativeTouchOwnership::default(),
                 mouse_tracking: false,
                 last_mouse_move_log_at: None,
@@ -410,19 +413,12 @@ impl Drop for HudOverlayWindow {
 /// `CreateWindowExW` 双方に同じ値を渡す (Codex CP2 P1 反映)。
 const HUD_CLASS_NAME: PCWSTR = w!("mIVHudOverlay");
 
-/// Mouse button tracking bitset.
-const BTN_LEFT: u8 = 1 << 0;
-const BTN_RIGHT: u8 = 1 << 1;
-const BTN_MIDDLE: u8 = 1 << 2;
-const BTN_X1: u8 = 1 << 3;
-const BTN_X2: u8 = 1 << 4;
-
 struct WindowState {
     event_sink: NativeVideoWindowEventSink,
     regions: Arc<std::sync::Mutex<HudInteractiveRegions>>,
     /// 現在押下中のマウスボタン (`BTN_*` の OR)。`WM_CAPTURECHANGED` 等で残っていたら
     /// synthetic up を補完する。
-    held_buttons: u8,
+    held_buttons: NativeHeldMouseButtons,
     /// Whole-stream `PT_TOUCH` ownership scoped to this HUD HWND.
     touch_ownership: NativeTouchOwnership,
     /// `TrackMouseEvent(TME_LEAVE)` 登録済みフラグ。
@@ -558,24 +554,18 @@ fn mouse_ctrl(wparam: WPARAM) -> bool {
     (wparam.0 & 0x0008) != 0
 }
 
-fn button_bit_for_msg(msg: u32, wparam: WPARAM) -> (NativeVideoMouseButton, u8) {
+fn button_for_msg(msg: u32, wparam: WPARAM) -> NativeVideoMouseButton {
     match msg {
-        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-            (NativeVideoMouseButton::Left, BTN_LEFT)
-        }
-        WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => {
-            (NativeVideoMouseButton::Right, BTN_RIGHT)
-        }
-        WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK => {
-            (NativeVideoMouseButton::Middle, BTN_MIDDLE)
-        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => NativeVideoMouseButton::Left,
+        WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => NativeVideoMouseButton::Right,
+        WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK => NativeVideoMouseButton::Middle,
         WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             match ((wparam.0 >> 16) & 0xFFFF) as u16 {
-                2 => (NativeVideoMouseButton::Extra2, BTN_X2),
-                _ => (NativeVideoMouseButton::Extra1, BTN_X1),
+                2 => NativeVideoMouseButton::Extra2,
+                _ => NativeVideoMouseButton::Extra1,
             }
         }
-        _ => (NativeVideoMouseButton::Left, BTN_LEFT),
+        _ => NativeVideoMouseButton::Left,
     }
 }
 
@@ -608,81 +598,18 @@ fn track_mouse_leave(hwnd: HWND, state: &mut WindowState) -> bool {
     registered
 }
 
-/// 現在 held_buttons に残っているボタンの synthetic up を補完し、`MouseLeave` も流す。
+/// 現在 held_buttons に残っているボタンの synthetic up を補完する。
 /// `WM_CAPTURECHANGED` / `WM_CANCELMODE` / `WM_DESTROY` 共通 cleanup。
-fn emit_synthetic_button_cleanup(state: &mut WindowState) {
-    let held = state.held_buttons;
-    state.held_buttons = 0;
-
-    if (held & BTN_LEFT) != 0 {
-        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
-            NativeVideoMouseButtonEvent {
-                button: NativeVideoMouseButton::Left,
-                down: false,
-                double_click: false,
-                x: 0,
-                y: 0,
-                shift: false,
-                ctrl: false,
-            },
-        ));
-    }
-    if (held & BTN_RIGHT) != 0 {
-        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
-            NativeVideoMouseButtonEvent {
-                button: NativeVideoMouseButton::Right,
-                down: false,
-                double_click: false,
-                x: 0,
-                y: 0,
-                shift: false,
-                ctrl: false,
-            },
-        ));
-    }
-    if (held & BTN_MIDDLE) != 0 {
-        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
-            NativeVideoMouseButtonEvent {
-                button: NativeVideoMouseButton::Middle,
-                down: false,
-                double_click: false,
-                x: 0,
-                y: 0,
-                shift: false,
-                ctrl: false,
-            },
-        ));
-    }
-    if (held & BTN_X1) != 0 {
-        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
-            NativeVideoMouseButtonEvent {
-                button: NativeVideoMouseButton::Extra1,
-                down: false,
-                double_click: false,
-                x: 0,
-                y: 0,
-                shift: false,
-                ctrl: false,
-            },
-        ));
-    }
-    if (held & BTN_X2) != 0 {
-        state.event_sink.send(NativeVideoWindowEvent::MouseButton(
-            NativeVideoMouseButtonEvent {
-                button: NativeVideoMouseButton::Extra2,
-                down: false,
-                double_click: false,
-                x: 0,
-                y: 0,
-                shift: false,
-                ctrl: false,
-            },
-        ));
-    }
-
-    // CP9 実機修正: capture 喪失 cleanup でも `MouseLeave` は流さない。
-    // 同じ振動ループ理由 (上の `WM_MOUSELEAVE` ハンドラ コメント参照)。
-    // synthetic up を流せば egui の `pointer.any_down()` は false に戻るので drag stuck は解消。
+fn emit_synthetic_button_cleanup(state: &mut WindowState, hwnd: HWND, cause_message: u32) {
+    let owner = state.event_sink.mouse_input_owner(hwnd.0 as usize as u64);
+    emit_synthetic_mouse_button_cleanup(
+        &mut state.held_buttons,
+        Some(&state.event_sink),
+        owner,
+        cause_message,
+    );
+    // Capture loss must not manufacture MouseLeave; the synthetic releases are
+    // the complete pointer terminal and avoid hover activation oscillation.
     state.mouse_tracking = false;
 }
 
@@ -690,14 +617,14 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
 ///
 /// Mouse capture cleanup synthesizes missing button-up events; touch cleanup
 /// emits Cancel for every owned stream before releasing the per-HWND set.
-fn emit_input_cleanup(state: &mut WindowState) {
+fn emit_input_cleanup(state: &mut WindowState, hwnd: HWND, cause_message: u32) {
     let WindowState {
         event_sink,
         touch_ownership,
         ..
     } = state;
     cancel_hud_touch_streams(touch_ownership, event_sink);
-    emit_synthetic_button_cleanup(state);
+    emit_synthetic_button_cleanup(state, hwnd, cause_message);
 }
 
 fn window_state(hwnd: HWND) -> Option<&'static mut WindowState> {
@@ -914,7 +841,7 @@ unsafe extern "system" fn hud_wnd_proc(
                 return LRESULT(0);
             }
             if let Some(state) = window_state(hwnd) {
-                let (button, bit) = button_bit_for_msg(msg, wparam);
+                let button = button_for_msg(msg, wparam);
                 let down = mouse_message_is_down(msg);
                 let dbl = matches!(
                     msg,
@@ -939,6 +866,13 @@ unsafe extern "system" fn hud_wnd_proc(
                 // 1. down/up event を bounded route に流す。
                 state.event_sink.send(NativeVideoWindowEvent::MouseButton(
                     NativeVideoMouseButtonEvent {
+                        receipt: crate::mouse_seek_debug::win32_mouse_button_receipt(
+                            NativeVideoWindowSource::Hud,
+                            hwnd.0 as usize as u64,
+                            msg,
+                            ((wparam.0 >> 16) & 0xFFFF) as u16,
+                        ),
+                        owner: state.event_sink.mouse_input_owner(hwnd.0 as usize as u64),
                         button,
                         down,
                         double_click: dbl,
@@ -950,32 +884,38 @@ unsafe extern "system" fn hud_wnd_proc(
                 ));
 
                 if down {
-                    // 2. capture 成否に関係なく必ず tracking (Codex 11 P1 #1)。
-                    state.held_buttons |= bit;
+                    // 2. capture 成否に関係なく必ず tracking。
+                    state.held_buttons.press(button);
                     // 3. focus handoff は wndproc 内で実行せず pump task に enqueue する。
                     state
                         .event_sink
                         .send(NativeVideoWindowEvent::RequestFocusClaim);
                     // 4. SetCapture(hud_hwnd) で region 外の up も拾えるようにする。
-                    let prev_capture = unsafe { SetCapture(hwnd) };
-                    let _ = prev_capture;
-                    // 5. capture 失敗チェック。**即時 synthetic up は流さない** (Codex CP9 実機 P1 #2 反映):
-                    //    旧実装は capture 失敗時に即 synthetic up を流していたが、down と up が
-                    //    同フレームに egui に届いて seek drag が完成しない問題があった (= 実機で seek
-                    //    操作が反応しない原因)。capture を取れていなくても down event は流しているので
-                    //    egui は click 判定する。cursor が region 外で up したケースは
-                    //    `WM_CAPTURECHANGED` / `WM_CANCELMODE` 経路の cleanup で synthetic up が流れる
-                    //    (= held_buttons は立てたままなので確実に補完される)。
+                    let _ = unsafe { SetCapture(hwnd) };
                     let cur = unsafe { GetCapture() };
-                    if cur.0 != hwnd.0 {
+                    if cur.0 == hwnd.0 {
+                        state.held_buttons.capture_succeeded(button);
+                    } else {
+                        state.held_buttons.capture_failed();
                         crate::logger::log(format!(
                             "[HUD] SetCapture failed: got={:p} expected={:p} button={:?}",
                             cur.0, hwnd.0, button
                         ));
+                        // Raw XButton seek repeat cannot tolerate a missing release. Preserve
+                        // the immediate press, then end only that repeat slot synchronously.
+                        // Non-X presses remain reported for the existing lifecycle cleanup,
+                        // but are not allowed to keep a later successful capture stuck.
+                        let owner = state.event_sink.mouse_input_owner(hwnd.0 as usize as u64);
+                        emit_synthetic_extra_button_release_if_held(
+                            &mut state.held_buttons,
+                            Some(&state.event_sink),
+                            owner,
+                            button,
+                            msg,
+                        );
                     }
-                } else {
-                    // up: held_buttons から該当 bit をクリアして ReleaseCapture。
-                    state.held_buttons &= !bit;
+                } else if state.held_buttons.release(button) {
+                    // One HWND owns all held buttons; release capture only after the last one.
                     unsafe {
                         let _ = ReleaseCapture();
                     }
@@ -1009,6 +949,12 @@ unsafe extern "system" fn hud_wnd_proc(
                 state
                     .event_sink
                     .send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                        receipt: crate::mouse_seek_debug::win32_app_command_receipt(
+                            NativeVideoWindowSource::Hud,
+                            hwnd.0 as usize as u64,
+                            wparam.0 as u64,
+                            lparam.0,
+                        ),
                         virtual_key: vk,
                         scan_code: 0,
                         extended: false,
@@ -1025,7 +971,9 @@ unsafe extern "system" fn hud_wnd_proc(
 
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             if super::hud_debug_enabled() {
-                let held = window_state(hwnd).map(|s| s.held_buttons).unwrap_or(0);
+                let held = window_state(hwnd)
+                    .map(|s| s.held_buttons.debug_bits())
+                    .unwrap_or(0);
                 crate::logger::log(format!(
                     "[HUD-DEBUG] {} held_buttons=0x{:02x}",
                     if msg == WM_CAPTURECHANGED {
@@ -1042,7 +990,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     .send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::CaptureLost,
                     ));
-                emit_input_cleanup(state);
+                emit_input_cleanup(state, hwnd, msg);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1105,7 +1053,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     .send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::Leave,
                     ));
-                emit_input_cleanup(state);
+                emit_input_cleanup(state, hwnd, msg);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1114,7 +1062,7 @@ unsafe extern "system" fn hud_wnd_proc(
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 unsafe {
-                    emit_input_cleanup(&mut *ptr);
+                    emit_input_cleanup(&mut *ptr, hwnd, msg);
                     let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let _ = Box::from_raw(ptr);
                 }
