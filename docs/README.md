@@ -137,6 +137,7 @@
 
 ## 進行中のレビュー
 
+- [duplicate-detection-feedback-20260909.md](duplicate-detection-feedback-20260909.md) — v3.7.0 dupe 実機追補。固定パネルの遅延表示、帯セル比較、類似専用履歴、音声途切れの診断。
 - [duplicate-detection-merge-v370-20260909.md](duplicate-detection-merge-v370-20260909.md) — v3.7.0 master の統合、未コミット変更保持、独立レビュー、全体 gate、portable 更新と手動確認待ち。
 - [duplicate-detection-handoff-review-20260907.md](duplicate-detection-handoff-review-20260907.md) — `duplicate-detection` の引き継ぎ監査。実装状況、独立レビュー指摘、検証証跡、Astra/Sol体制への移行と統合条件。
 - [duplicate-detection-review-fixes-20260907.md](duplicate-detection-review-fixes-20260907.md) — R1〜R9の修正計画。所有境界、実装前検証、独立レビュー、既存データを保持するportable検証。

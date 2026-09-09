@@ -1,4 +1,4 @@
-﻿# 動画再生サブシステム アーキテクチャ
+# 動画再生サブシステム アーキテクチャ
 
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
@@ -2884,6 +2884,22 @@ A/V offset を比較。修正前は累積 −20s 級、修正後は ±数十 ms 
 | `underrun_end` | pump (callback edge) | silence 出力終了 (active true → false) | `edge_wall_ns`, `edge_age_ms` |
 | `audio_pts_jump` | pump (callback edge) | `set_audio_pts` 大ジャンプ (\|requested\|>5ms or cap 乖離) | `requested_pts`, `prev_now`, `after_now`, `requested_delta_ms`, `applied_delta_ms`, `edge_wall_ns`, `edge_age_ms` |
 | `buffer_clear` | UI スレッド (`clear_audio_output_buffer`) | seek / fast-swap / shutdown 共通の汎用名。旧版では Norm でも発火していたが 2026-05-11 に削除 (= 5+ 秒 A/V offset バグの直接原因だったため) | `processed_secs_before`, `raw_pending_secs_before`, `audio_tx_queued_before`, `now_secs_at_clear` |
+
+### 音声途切れの診断追補 (dupe / 2026-09-09)
+
+実装・検証の記録は [dupe 実機フィードバック](duplicate-detection-feedback-20260909.md)。`--perf-log` 有効時に、既存の zero-fill 計装へ次を追加する。再生処理・Normalize・VST・検索アルゴリズムの動作は変えない。
+
+- `audio_out.stream_open` / `stream_end`: CPAL stream 寿命ごとの `stream_id`。新しい成功 stream は新 ID。source の変更や viewer 移動は stream の作り直しと同一視しない。
+- `audio_out.bind`: `stream_id` を `viewer_context_id`、source key/epoch、window/native placement、seek serial、engine state、再生意図・速度、Normalize 初期状態/scan、VST 状態へ非 RT 側で関連付ける。`fs_idx` 単独で所有者を決めない。
+- `audio_out.snapshot`: 従来の processed/audio_tx に `raw_pending_secs` を追加。underrun begin/end の累積 seq と前回差分、silence 量を併記し、poll 間の複数回の不足を回数として残す。全ての区間の開始/終了時刻を完全復元するものではない。
+- callback の count/delta、expected period、latest/max interval、late count/max、buffer lock wait 最大、fill 所要最大を snapshot へ出す。最大値は集計区間の観測値で、同じ callback で同時に起きたとは限らない。`engine_state` / `seek_serial` と併読し、pause/seek/EOF を音飛びと自動判定しない。
+- `audio_out.device_error`: CPAL が通知した error の category/count/wall と stream を記録する。device/error callback の format/logger や stale/PDC 診断出力は atomic 記録と外側の集約へ分ける。
+- `video.normalize_scan_start` / `normalize_scan_provisional` / `normalize_scan_terminal` と既存 norm apply は stream/source/context と相関させる。初期 DB hit 等では apply event がないため、その不在から Normalize OFF と判断しない。
+- `similar_item.start/end` と `similar_book.start/end`: query trace ID、key、wall/thread CPU、実 thread priority と終了分類を記録する。単体照会の `active` は cache 採用対象かの bool、`stale` はその逆であり、同時実行数ではない。同時実行の重なりは start/end 区間から再構成する。
+
+新しい callback 時刻計測は perf 無効時に行わない。RT callback 内で JSON、文字列整形、logger/perf 出力を行わず、atomic で集計し pump 側で出力する。通常の既存 underrun/PTS 状態更新を診断 OFF のために削除しない。
+
+この計装で観測できるのはアプリ内のデータ不足・処理間隔・待ち・CPAL error。遅れが観測されても可聴 glitch の証明ではなく、無検出でも OS/driver/出力機器以降の音切れを否定しない。検索との時刻一致も因果証明ではない。比較時は同じ再生条件で `--perf-log` を使い、実際に聞こえた途切れの概算時刻と操作を対応付ける。
 
 #### `cat = "gpu_memory"`
 
