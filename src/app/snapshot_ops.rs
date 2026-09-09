@@ -1454,7 +1454,7 @@ impl App {
     ///
     /// `load_folder_with_scan` の snapshot guard を bypass するため、`snapshot_internal_nav`
     /// を true にしてから呼ぶ。flag は呼び出し後に false に戻す (= scope guard pattern)。
-    fn snapshot_load_and_open(
+    pub(crate) fn snapshot_load_and_open(
         &mut self,
         folder_path: std::path::PathBuf,
         resume_slideshow: bool,
@@ -1529,6 +1529,263 @@ impl App {
         }
     }
 
+    /// Open one explicitly chosen similar-result leaf without falling back to another item.
+    /// Physical directories are scanned by the existing worker first, so a failed read leaves
+    /// the current viewer untouched. Archive/PDF containers keep a typed navigation owner from
+    /// teardown through asynchronous enumerate and password retry.
+    pub(crate) fn open_required_fullscreen_location(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        self.open_required_fullscreen_location_with_purpose(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            crate::app::FsNavigationPurpose::Ordinary,
+        );
+    }
+
+    pub(crate) fn open_required_fullscreen_location_with_purpose(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        if matches!(target, crate::snapshot::SnapshotTarget::Fs(_)) {
+            // Accepting the new scan supersedes any old ZIP/PDF enumerate or password retry.
+            // The current viewer remains intact until this physical scan succeeds.
+            self.finish_similar_move_diagnostic("async_replaced");
+            self.retire_superseded_required_fullscreen_async_request();
+            self.start_required_fullscreen_folder_open(
+                folder_path,
+                target,
+                history_trigger,
+                navigation_purpose,
+            );
+            return;
+        }
+        self.open_required_fullscreen_from_location_load(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            navigation_purpose,
+        );
+    }
+
+    fn retire_superseded_required_fullscreen_async_request(&mut self) {
+        self.cancel_inflight_folder_nav_for_required_fullscreen_open();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        self.pdf_password_request = None;
+        self.pdf_password_pending_save = None;
+        self.show_pdf_password_dialog = false;
+        self.pdf_password_input.clear();
+        self.pdf_password_error = None;
+        self.pdf_password_save = false;
+        self.fs_nav_after_pdf_enumerate = None;
+    }
+
+    /// A failed exact-folder scan returns to an existing page when one still exists. When a PDF
+    /// password gap has no page to return to, the same failure is the real end of the viewer.
+    pub(crate) fn finish_required_fullscreen_folder_scan_failure(&mut self) {
+        let finish = if self.fullscreen_idx.is_some() {
+            crate::app::FsNavigationSequenceFinish::Superseded
+        } else {
+            crate::app::FsNavigationSequenceFinish::RequestFailed
+        };
+        self.finish_fs_navigation_sequence(finish);
+    }
+
+    pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        self.cancel_required_fullscreen_folder_open();
+        self.cancel_inflight_folder_nav_for_required_fullscreen_open();
+        if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
+            self.pdf_enumerate_pending = None;
+            self.zip_enumerate_pending = None;
+            self.pdf_password_request = None;
+            self.pdf_password_pending_save = None;
+            self.show_pdf_password_dialog = false;
+            self.pdf_password_input.clear();
+            self.pdf_password_error = None;
+            self.pdf_password_save = false;
+            self.fs_nav_after_pdf_enumerate = None;
+        }
+        self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+    }
+
+    fn prepare_required_fullscreen_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) -> bool {
+        if !self.supersede_and_begin_fs_folder_navigation_sequence(ctx, navigation_purpose) {
+            return false;
+        }
+        // The new typed owner has replaced the old request. Retire the old async payload without
+        // publishing a fullscreen exit; the new owner now carries the same viewer forward.
+        self.retire_superseded_required_fullscreen_async_request();
+        if self.is_snapshot_active() {
+            let _ = self.dismiss_snapshot_without_restore();
+        }
+        // ZIP/PDF loaders clear and enumerate before the shared item-install teardown. Close the
+        // old content explicitly while the typed owner is already active; a physical directory
+        // reaches this same boundary only after its worker scan succeeds.
+        self.close_fullscreen_for_folder_nav_reopen();
+        true
+    }
+
+    fn finish_required_fullscreen_load(
+        &mut self,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
+            self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                history_trigger,
+                resume_slideshow: false,
+                target: crate::app::DeferredFsTarget::Required(target),
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: true,
+            });
+            return;
+        }
+        let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
+            self.finish_fs_navigation_sequence(
+                crate::app::FsNavigationSequenceFinish::RequestFailed,
+            );
+            self.show_feedback_toast("移動先の画像が見つかりません".to_string());
+            return;
+        };
+        self.open_fullscreen(idx, history_trigger);
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+    }
+
+    fn open_required_fullscreen_from_location_load(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
+            self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        }
+        self.snapshot_internal_nav = true;
+        self.load_folder(folder_path);
+        self.snapshot_internal_nav = false;
+        self.finish_required_fullscreen_load(target, history_trigger);
+    }
+
+    pub(crate) fn open_required_fullscreen_from_completed_scan(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        scan: crate::app::ScannedDir,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
+            self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        }
+        self.snapshot_internal_nav = true;
+        self.load_folder_with_scan(folder_path, Some(scan));
+        self.snapshot_internal_nav = false;
+        self.finish_required_fullscreen_load(target, history_trigger);
+    }
+
+    pub(crate) fn resolve_required_snapshot_target_idx(
+        &mut self,
+        target: &crate::snapshot::SnapshotTarget,
+    ) -> Option<usize> {
+        use crate::grid_item::GridItem;
+        use crate::snapshot::SnapshotTarget;
+        match target {
+            SnapshotTarget::Fs(path) => self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    GridItem::Image(candidate) | GridItem::Video(candidate)
+                        if crate::folder_tree::path_eq(candidate, path)
+                )
+            }),
+            SnapshotTarget::PdfPage { pdf_path, page_num } => self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    GridItem::PdfPage {
+                        pdf_path: candidate,
+                        page_num: candidate_page,
+                        ..
+                    } if crate::folder_tree::path_eq(candidate, pdf_path)
+                        && candidate_page == page_num
+                )
+            }),
+            SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                let materialized =
+                    self.materialize_required_archive_target(zip_path, entry_name)?;
+                self.resolve_snapshot_target_idx(&materialized)
+            }
+            SnapshotTarget::ConvertibleArchive { .. } => None,
+        }
+    }
+
+    fn materialize_required_archive_target(
+        &mut self,
+        requested_outer: &Path,
+        requested_entry: &str,
+    ) -> Option<crate::snapshot::SnapshotTarget> {
+        let (tree_path, target) = {
+            let nav = self.zip_nav.as_ref()?;
+            let tree_path = nav.tree.zip_path.clone();
+            let direct = crate::folder_tree::path_eq(&tree_path, requested_outer);
+            let converted_alias =
+                self.archive_source_override
+                    .as_deref()
+                    .is_some_and(|source| {
+                        crate::folder_tree::path_eq(source, requested_outer)
+                            && self.current_folder.as_deref().is_some_and(|current| {
+                                crate::folder_tree::path_eq(current, &tree_path)
+                            })
+                    });
+            if !direct && !converted_alias {
+                return None;
+            }
+            let target = crate::book_bookmarks::resolve_archive_bookmark_target(
+                &nav.tree,
+                requested_entry,
+                &self.settings.grid_display_order,
+            )?;
+            (tree_path, target)
+        };
+        let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
+            let current = nav.current().join("/");
+            current == target.effective_prefix.trim_end_matches('/')
+        });
+        if !already_materialized {
+            self.zip_nav.as_mut()?.enter(&target.effective_prefix);
+            self.zip_nav_show_current_level();
+        }
+        Some(crate::snapshot::SnapshotTarget::ZipImage {
+            zip_path: tree_path,
+            entry_name: target.entry_name,
+        })
+    }
+
     /// `SnapshotTarget` を現在の `items` から解決して idx を返す (Codex P2 fix の共有 helper)。
     ///
     /// `snapshot_load_and_open` の同期 open 経路と、`poll_zip_enumerate` /
@@ -1548,13 +1805,31 @@ impl App {
             SnapshotTarget::ZipImage {
                 zip_path,
                 entry_name,
-            } => self.items.iter().position(|it| match it {
-                GridItem::ZipImage {
-                    zip_path: zp,
-                    entry_name: en,
-                } => zp == zip_path && en == entry_name,
-                _ => false,
-            }),
+            } => self
+                .items
+                .iter()
+                .position(|it| match it {
+                    GridItem::ZipImage {
+                        zip_path: zp,
+                        entry_name: en,
+                    } => zp == zip_path && en == entry_name,
+                    _ => false,
+                })
+                .or_else(|| {
+                    // The similar index stores its Windows/ZIP identity case-folded. Preserve
+                    // exact matching for normal snapshot callers, then accept that canonical
+                    // identity as a fallback for a result-row navigation target.
+                    self.items.iter().position(|it| match it {
+                        GridItem::ZipImage {
+                            zip_path: zp,
+                            entry_name: en,
+                        } => {
+                            crate::similar_index::item_key_for_zip_page(zp, en)
+                                == crate::similar_index::item_key_for_zip_page(zip_path, entry_name)
+                        }
+                        _ => false,
+                    })
+                }),
             SnapshotTarget::PdfPage { pdf_path, page_num } => {
                 self.items.iter().position(|it| match it {
                     GridItem::PdfPage {
@@ -2455,6 +2730,15 @@ mod tests {
             app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
                 zip_path: PathBuf::from(r"E:\test\arc.zip"),
                 entry_name: "sub/img.png".into(),
+            }),
+            Some(2)
+        );
+        // Similar-result identity is case-folded; exact lookup misses but canonical fallback lands
+        // on the enumerated entry without doing filesystem work on the UI thread.
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from(r"e:\TEST\ARC.ZIP"),
+                entry_name: "SUB/IMG.PNG".into(),
             }),
             Some(2)
         );

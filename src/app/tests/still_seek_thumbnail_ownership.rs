@@ -55,6 +55,8 @@ fn navigation_sequence(items_generation: u64, pages: Vec<usize>) -> FsHoldover {
     let anchor_idx = *pages.first().expect("test target has an anchor");
     FsHoldover::NavigationSequence(FsNavigationSequence {
         previous: None,
+        chrome: FsNavigationChromeContinuation::None,
+        purpose: FsNavigationPurpose::Ordinary,
         opened_at: std::time::Instant::now(),
         target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
             items_generation,

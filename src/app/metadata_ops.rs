@@ -55,7 +55,7 @@ pub(super) fn format_details_duration(secs: f64) -> String {
 }
 
 #[cfg(windows)]
-pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -96,7 +96,7 @@ pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String 
 }
 
 #[cfg(not(windows))]
-pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
     if secs <= 0 {
         String::new()
     } else {
@@ -2136,9 +2136,7 @@ mod tests {
     /// 取り消した検索の worker が残り、次の検索の pool と並んで走ってしまう。
     /// 「どの読みの直前にも、その読みより後に評価される取消の観測がある」ことを
     /// 本文から固定する。
-    #[test]
-    fn every_pass2_read_is_preceded_by_a_cancel_check() {
-        const SOURCE: &str = include_str!("metadata_ops.rs");
+    fn assert_every_pass2_read_is_preceded_by_a_cancel_check(source: &str) {
         const READS: [&str; 5] = [
             "build_searchable_from_path_counted",
             "read_tweet_info_counted",
@@ -2148,18 +2146,19 @@ mod tests {
         ];
         const CANCEL: &str = "self.cancel.load(";
 
-        let start = SOURCE
+        let source = source.replace("\r\n", "\n");
+        let start = source
             .find("    fn process(&self, idx: usize, item: &GridItem)")
             .expect("pass 2 item entry point");
         let end = start
-            + SOURCE[start..]
+            + source[start..]
                 .find(
                     "
     }
 ",
                 )
                 .expect("end of the item entry point");
-        let body = &SOURCE[start..end];
+        let body = &source[start..end];
 
         let mut events: Vec<(usize, &str)> = Vec::new();
         for (offset, _) in body.match_indices(CANCEL) {
@@ -2187,6 +2186,16 @@ mod tests {
             );
             cancel_since_last_read = 0;
         }
+    }
+
+    #[test]
+    fn every_pass2_read_is_preceded_by_a_cancel_check() {
+        const SOURCE: &str = include_str!("metadata_ops.rs");
+
+        let lf_source = SOURCE.replace("\r\n", "\n");
+        let crlf_source = lf_source.replace('\n', "\r\n");
+        assert_every_pass2_read_is_preceded_by_a_cancel_check(&lf_source);
+        assert_every_pass2_read_is_preceded_by_a_cancel_check(&crlf_source);
     }
 
     fn write_zip_with_nested_images(path: &Path) {

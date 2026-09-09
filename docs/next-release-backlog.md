@@ -24,6 +24,20 @@
 ---
 
 ## 1. 優先候補
+### 1.200 一時表示ナビゲーターの未開始クリックが、同passのfocus lossで消える (2026-09-08)
+
+- P2、コード確認済み・実機再現未確認。固定表示OFFでholdキーにより表示している間、
+  既存gestureの無い状態からpress/release→focus loss（またはhold release）が同passに届くと、
+  `handle_fs_navigator_input` 冒頭の最終focus/現在ModifierHold gateが先行操作まで捨てる。
+- duplicate-detection のR4入力修正で発見した既存欠陥。変更前HEADでも同じgateを確認した。
+  今回の類似長押し修正に伴う回帰ではなく、別変更として扱う。
+- WindowsではRightCtrl/RightShift/RightAltも設定できるため、左右を失うegui event Modifiersだけへ
+  置換しない。現在OS levelを偽の過去focus permitで読んだり、gate全撤去で非表示領域を操作可能にしない。
+- 設計候補は、viewer-owned navigatorに実描画済みhit領域・表示根拠Fixed/Holdを所有させ、
+  次入力のfocused区間で開始し、既存gesture終端と最終表示許可を分ける。未実装・要設計レビュー。
+  現在の表示/修飾カスタム、Hold由来のkeyboard owner制約、modal、page/source/close失効を保つ。
+- 経緯と範囲判断は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) の
+  「R4 ordered Flat接続の先行レビュー」とその後の範囲訂正を参照。
 
 ### 1.206 動画の V キーが入力先によってズーム切り替えへ届かない疑い (2026-09-09)
 

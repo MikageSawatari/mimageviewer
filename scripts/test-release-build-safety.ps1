@@ -64,6 +64,7 @@ $testFull = Get-Content -LiteralPath $testFullPath -Raw -Encoding UTF8
 Assert-True ($buildDist.Contains('[switch] $PreserveRuntime')) 'build-dist lacks -PreserveRuntime'
 Assert-True ($buildRelease.Contains('[switch] $PreserveRuntime')) 'build-release lacks -PreserveRuntime'
 Assert-True ($buildPortable.Contains('[switch] $PreserveRuntime')) 'build-portable lacks -PreserveRuntime'
+Assert-True ($buildPortable.Contains('[switch] $KeepRunning')) 'build-portable lacks -KeepRunning'
 Assert-True ($testFull.Contains('[switch] $SuppressCrashDialogs')) 'test-full lacks -SuppressCrashDialogs'
 
 $distResidentGuards = @($buildDistAst.FindAll({
@@ -89,15 +90,21 @@ Assert-True ($releaseGuardElse.Contains('Stop-Process')) 'build-release default 
 $portableResidentGuards = @($buildPortableAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.IfStatementAst] -and
-        $node.Clauses[0].Item1.Extent.Text -eq '$PreserveRuntime' -and
+        $node.Clauses[0].Item1.Extent.Text -eq '$KeepRunning' -and
         $node.Extent.Text.Contains('Stop-Process -Id $_.Id')
 }, $true))
 Assert-True ($portableResidentGuards.Count -eq 1) 'build-portable preserve-runtime resident guard is missing or ambiguous'
-$portableGuardThen = $portableResidentGuards[0].Clauses[0].Item2.Extent.Text
-Assert-True ($portableResidentGuards[0].Clauses.Count -eq 2) 'build-portable default process-stop clause is missing'
-$portableGuardElse = $portableResidentGuards[0].Clauses[1].Item2.Extent.Text
-Assert-True ($portableGuardThen.Contains('throw') -and -not $portableGuardThen.Contains('Stop-Process')) 'build-portable preserve-runtime branch can stop a process'
-Assert-True ($portableGuardElse.Contains('Stop-Process')) 'build-portable default process-stop branch was removed'
+$portableGuard = $portableResidentGuards[0]
+Assert-True ($portableGuard.Clauses.Count -eq 3) 'build-portable process policy clauses are missing'
+Assert-True ($portableGuard.Clauses[1].Item1.Extent.Text -eq '$PreserveRuntime') 'build-portable preserve-runtime clause condition changed'
+Assert-True ($portableGuard.Clauses[2].Item1.Extent.Text -eq '-not $SmokeTestScript') 'build-portable default process-stop clause condition changed'
+$portableKeepRunningBody = $portableGuard.Clauses[0].Item2.Extent.Text
+$portablePreserveBody = $portableGuard.Clauses[1].Item2.Extent.Text
+$portableDefaultBody = $portableGuard.Clauses[2].Item2.Extent.Text
+Assert-True (-not $portableKeepRunningBody.Contains('Stop-Process')) 'build-portable keep-running branch can stop a process'
+Assert-True ($portablePreserveBody.Contains('throw') -and -not $portablePreserveBody.Contains('Stop-Process')) 'build-portable preserve-runtime branch can stop a process'
+Assert-True ($portableDefaultBody.Contains('Stop-Process')) 'build-portable default process-stop branch was removed'
+Assert-True ($buildPortable.Contains('if ($KeepRunning -and $PreserveRuntime)')) 'build-portable does not reject conflicting process policies'
 
 $cacheGuards = @($buildReleaseAst.FindAll({
     param($node)
@@ -136,7 +143,8 @@ Assert-OrderedText $buildRelease @(
 ) 'build-release process/build/sign/cache flow'
 
 Assert-OrderedText $buildPortable @(
-    'if ($PreserveRuntime)',
+    'if ($KeepRunning -and $PreserveRuntime)',
+    'if ($KeepRunning)',
     'Stop-Process -Id $_.Id -Force -ErrorAction Stop',
     '& cargo build --release --bin mimageviewer-core',
     'Remove-Item -LiteralPath $pkgDir -Recurse -Force',
@@ -149,6 +157,7 @@ Assert-OrderedText $testFull @(
     'public static extern uint GetErrorMode();',
     '$effectiveMode = [MivTestErrorMode]::GetErrorMode()',
     '& cargo test --workspace --features pack-build-tools --no-fail-fast',
+    '& cargo test --manifest-path vendor/egui/Cargo.toml --lib',
     '& cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib',
     '& cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib',
     '[void][MivTestErrorMode]::SetErrorMode($modeBefore)',
@@ -241,7 +250,7 @@ exit $LASTEXITCODE
     $baselineExit = $LASTEXITCODE
     Assert-True ($baselineExit -eq 0) "test-full default success stub returned $baselineExit; output: $($baselineOutput -join ' | ')"
     $baselineCalls = @(Get-Content -LiteralPath $baselineLog -Encoding UTF8)
-    Assert-True ($baselineCalls.Count -eq 3) "test-full default path invoked cargo $($baselineCalls.Count) times"
+    Assert-True ($baselineCalls.Count -eq 4) "test-full default path invoked cargo $($baselineCalls.Count) times"
     Assert-True (-not (($baselineOutput -join "`n").Contains('crash-dialog suppression active'))) 'test-full default path enabled crash-dialog suppression'
 
     $successLog = Join-Path $testRootFull 'success.log'
@@ -249,7 +258,7 @@ exit $LASTEXITCODE
     $successExit = $LASTEXITCODE
     Assert-True ($successExit -eq 0) "test-full success stub returned $successExit; output: $($successOutput -join ' | ')"
     $successCalls = @(Get-Content -LiteralPath $successLog -Encoding UTF8)
-    Assert-True ($successCalls.Count -eq 3) "test-full success path invoked cargo $($successCalls.Count) times"
+    Assert-True ($successCalls.Count -eq 4) "test-full success path invoked cargo $($successCalls.Count) times"
     Assert-True ((@($successCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a success-path cargo child did not inherit both error-mode bits'
     Assert-True (($successOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full success path did not report error-mode restoration'
 

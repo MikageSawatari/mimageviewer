@@ -1,4 +1,4 @@
-﻿# docs/ — ドキュメント索引
+# docs/ — ドキュメント索引
 
 修正作業の前に、関連するドキュメントを読んで全体設計を把握すること。
 
@@ -103,7 +103,7 @@
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |
 | [scroll-visibility-priority-plan.md](scroll-visibility-priority-plan.md) | スクロール停止後に可視サムネのジョブを優先レーンへ昇格させる仕組みと perf 計装 |
 | [prefetch-suppression-during-scroll-plan.md](prefetch-suppression-during-scroll-plan.md) | スクロール中 / 可視待ち中に prefetch を enqueue しない判定と、永久 stall を防ぐ backstop |
-| [duplicate-detection-plan.md](duplicate-detection-plan.md) | **設計 v0 (未実装)**。重複画像の検出と整理。狙いは「ほぼ同じ画像だが解像度違い / 軽微な修正」= 近重複のみ (埋め込みは使わない)。`similar.db` に 64bit + 256bit pHash を持ち、**索引を作らず線形走査**。白ページの退化ハッシュ対策 (`confidence`)、漫画は本単位で判定、削除は既存のゴミ箱経路、検証は既存の比較表示 (Diff) を再利用 |
+| [duplicate-detection-plan.md](duplicate-detection-plan.md) | 表示中の画像と同じ絵の別バージョンを見つけ、その保存場所へ移動する機能の設計・実測・実装記録。`similar.db` には PDQ-256 を保存する。単体画像検索は線形走査、本照会の厳密 MIH と同一 TX 化は後続のレビュー修正記録を参照する。白ページ等は品質値で判定不能として区別し、画像の削除や残す版の判断は行わない |
 | [similar-image-search-research.md](similar-image-search-research.md) | 上の前段の調査メモ。類似画像検索 / 重複検出。他ツール (hydrus / digiKam / XnView MP / Eagle / Komga / Immich) の機能と用途、perceptual hash と埋め込みのアルゴリズム比較、100 万件規模の実測 (索引不要という結論)、mIV へ載せる場合の保存先・スコープ・UI 案 |
 | [dpi-multimonitor-issue.md](dpi-multimonitor-issue.md) | マルチモニター DPI 問題の調査記録 |
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
@@ -140,6 +140,11 @@
 
 ## 進行中のレビュー
 
+- [duplicate-detection-feedback-20260909.md](duplicate-detection-feedback-20260909.md) — v3.7.0 dupe 実機追補。固定パネルの遅延表示、帯セル比較、類似専用履歴、音声途切れの診断。
+- [duplicate-detection-merge-v370-20260909.md](duplicate-detection-merge-v370-20260909.md) — v3.7.0 master の統合、未コミット変更保持、独立レビュー、全体 gate、portable 更新と手動確認待ち。
+- [duplicate-detection-handoff-review-20260907.md](duplicate-detection-handoff-review-20260907.md) — `duplicate-detection` の引き継ぎ監査。実装状況、独立レビュー指摘、検証証跡、Astra/Sol体制への移行と統合条件。
+- [duplicate-detection-review-fixes-20260907.md](duplicate-detection-review-fixes-20260907.md) — R1〜R9の修正計画。所有境界、実装前検証、独立レビュー、既存データを保持するportable検証。
+- [duplicate-detection-book-query-review-fixes.md](duplicate-detection-book-query-review-fixes.md) — 本照会R1/R5/R6の実装・採用検証。viewer別の要求、同一read transaction、厳密MIH、再列挙による対応付けと疎な表示結果は接続済み。実本oracle・途中取消・通常/大規模負荷・UI補助測定を検証済み。最終全体gateとportable更新も完了し、利用者実機確認待ち。
 - [review-v2.8.1/README.md](review-v2.8.1/README.md) — v2.8.1 前の全体点検。領域別の
   docs↔コード整合監査の結果 (不一致 / リファクタ候補 / バグ) と、文書ごとの信頼度。
   **文書を現行仕様として読む前に、ここで該当文書の信頼度を確認すること。**

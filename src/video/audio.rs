@@ -29,6 +29,32 @@ use super::engine::actor::state_code;
 
 const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
 
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn device_error_category_label(category: u64) -> &'static str {
+    match category {
+        1 => "device_not_available",
+        2 => "backend_specific",
+        _ => "unknown",
+    }
+}
+
+struct FillTiming<'a> {
+    diagnostics: &'a AudioDiagnostics,
+    started_at: Option<std::time::Instant>,
+}
+
+impl Drop for FillTiming<'_> {
+    fn drop(&mut self) {
+        if let Some(started_at) = self.started_at {
+            self.diagnostics
+                .record_fill_duration(duration_ns_u64(started_at.elapsed()));
+        }
+    }
+}
+
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
 pub struct AudioOutput {
@@ -44,6 +70,7 @@ pub struct AudioOutput {
     /// pump スレッドハンドル。drop で join する。
     pump: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
+    stream_id: u64,
     /// A/V sync drift 計装用 atomic bundle。`clear_buffer` で `audio_out.buffer_clear` を
     /// emit するために保持する (callback / pump へは spawn 時に Arc clone を渡す)。
     diagnostics: Arc<AudioDiagnostics>,
@@ -79,6 +106,7 @@ impl AudioOutput {
             shutdown_tx,
             pump: None,
             sample_rate,
+            stream_id: 0,
             diagnostics: Arc::new(AudioDiagnostics::new(std::time::Instant::now())),
             audio_tap: AudioTapController {
                 command_tx,
@@ -91,6 +119,10 @@ impl AudioOutput {
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.pause();
         }
+    }
+
+    pub(crate) fn stream_id(&self) -> Option<u64> {
+        (self.stream_id != 0).then_some(self.stream_id)
     }
 
     pub fn clear_buffer(&self, clock: &AvClock) {
@@ -179,10 +211,21 @@ pub fn warm_up_default_output_device() {
                 return;
             };
             let config = supported.config();
+            let error_count = Arc::new(AtomicU64::new(0));
+            let error_category = Arc::new(AtomicU64::new(0));
+            let error_count_callback = Arc::clone(&error_count);
+            let error_category_callback = Arc::clone(&error_category);
             let Ok(stream) = device.build_output_stream(
                 &config,
                 |out: &mut [f32], _: &cpal::OutputCallbackInfo| out.fill(0.0),
-                |err| crate::logger::log(format!("cpal warm-up stream error: {err}")),
+                move |err| {
+                    let category = match err {
+                        cpal::StreamError::DeviceNotAvailable => 1,
+                        cpal::StreamError::BackendSpecific { .. } => 2,
+                    };
+                    error_category_callback.store(category, Ordering::Relaxed);
+                    error_count_callback.fetch_add(1, Ordering::Relaxed);
+                },
                 None,
             ) else {
                 crate::logger::log(
@@ -198,6 +241,13 @@ pub fn warm_up_default_output_device() {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
             let _ = stream.pause();
+            let errors = error_count.load(Ordering::Relaxed);
+            if errors > 0 {
+                crate::logger::log(format!(
+                    "cpal warm-up stream error: category={} count={errors}",
+                    device_error_category_label(error_category.load(Ordering::Relaxed))
+                ));
+            }
             crate::logger::log(format!(
                 "[startup] cpal warm-up done ms={:.1}",
                 started.elapsed().as_secs_f64() * 1000.0
@@ -215,6 +265,37 @@ impl Drop for AudioOutput {
             use cpal::traits::StreamTrait;
             let _ = stream.pause();
             drop(stream);
+        }
+        if self.stream_id != 0 && crate::perf::is_enabled() {
+            crate::perf::event(
+                "audio_out",
+                "stream_end",
+                None,
+                0,
+                &[
+                    ("stream_id", serde_json::Value::from(self.stream_id)),
+                    (
+                        "callback_count",
+                        serde_json::Value::from(
+                            self.diagnostics.callback_count.load(Ordering::Acquire),
+                        ),
+                    ),
+                    (
+                        "device_error_count",
+                        serde_json::Value::from(
+                            self.diagnostics.device_error_count.load(Ordering::Acquire),
+                        ),
+                    ),
+                    (
+                        "device_error_category",
+                        serde_json::Value::from(device_error_category_label(
+                            self.diagnostics
+                                .device_error_category
+                                .load(Ordering::Acquire),
+                        )),
+                    ),
+                ],
+            );
         }
         // 3. pump を join。通常は cancel + shutdown signal で 100ms 以内に終了するが、
         //    decoder/engine 側の back-pressure デッドロック等で pump が動けないと join が
@@ -804,6 +885,15 @@ pub(crate) fn start(
         .map_err(|e| format!("default_output_config: {e}"))?;
     let sample_rate = supported.sample_rate().0;
     let device_default_channels = supported.channels();
+    let device_name = device.name().unwrap_or_else(|_| "unknown".to_owned());
+    let diagnostics_enabled = crate::perf::is_enabled();
+    #[cfg(windows)]
+    let (vst_enabled, vst_active_slots) = dsp_bridge
+        .as_ref()
+        .map(|bridge| (bridge.is_enabled(), bridge.active_slot_count()))
+        .unwrap_or((false, 0));
+    #[cfg(not(windows))]
+    let (vst_enabled, vst_active_slots) = (false, 0usize);
 
     // Stereo packed f32 で固定 (decoder 側 swresample に合わせる)。
     // WASAPI Shared モードの auto-mix で 5.1 / 7.1 デバイスでも 2 ch 出力できる
@@ -873,19 +963,48 @@ pub(crate) fn start(
     let cb_clock = clock.clone();
     let cb_engine_state = engine_state.clone();
     let cb_diagnostics = Arc::clone(&diagnostics);
+    let error_diagnostics = Arc::clone(&diagnostics);
+    let mut previous_callback_entry: Option<std::time::Instant> = None;
+    let mut previous_expected_period_ns: u64 = 0;
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let callback_entry = diagnostics_enabled.then(std::time::Instant::now);
+                if let Some(entry) = callback_entry {
+                    let interval_ns = previous_callback_entry
+                        .map(|previous| duration_ns_u64(entry.duration_since(previous)));
+                    let expected_period_ns = previous_expected_period_ns;
+                    cb_diagnostics.record_callback_entry(
+                        cb_diagnostics.wall_ns_now(),
+                        interval_ns,
+                        expected_period_ns,
+                        cb_clock.current_seek_serial(),
+                        cb_engine_state.load(Ordering::Relaxed),
+                    );
+                    previous_callback_entry = Some(entry);
+                    previous_expected_period_ns = (((out.len() / channels as usize) as u128)
+                        * 1_000_000_000u128
+                        / sample_rate.max(1) as u128)
+                        .min(u64::MAX as u128) as u64;
+                }
+                let fill_started_at = diagnostics_enabled.then(std::time::Instant::now);
                 fill_output(
                     out,
                     &cb_buffer,
                     &cb_clock,
                     &cb_engine_state,
                     &cb_diagnostics,
+                    fill_started_at,
                 );
             },
-            |err| crate::logger::log(format!("cpal output stream error: {err}")),
+            move |err| {
+                let category = match err {
+                    cpal::StreamError::DeviceNotAvailable => 1,
+                    cpal::StreamError::BackendSpecific { .. } => 2,
+                };
+                error_diagnostics.record_device_error(category);
+            },
             None,
         )
         .map_err(|e| {
@@ -897,7 +1016,34 @@ pub(crate) fn start(
             )
         })?;
 
+    let stream_id = AudioDiagnostics::allocate_stream_id();
     stream.play().map_err(|e| format!("stream.play: {e}"))?;
+    diagnostics.publish_stream_id(stream_id);
+
+    if diagnostics_enabled {
+        crate::perf::event(
+            "audio_out",
+            "stream_open",
+            None,
+            0,
+            &[
+                ("stream_id", serde_json::Value::from(stream_id)),
+                ("device", serde_json::Value::from(device_name)),
+                ("sample_rate", serde_json::Value::from(sample_rate)),
+                ("channels", serde_json::Value::from(channels)),
+                ("buffer_size", serde_json::Value::from("default")),
+                (
+                    "normalize_gain_linear",
+                    serde_json::Value::from(clock.normalize_gain()),
+                ),
+                ("vst_enabled", serde_json::Value::from(vst_enabled)),
+                (
+                    "vst_active_slots",
+                    serde_json::Value::from(vst_active_slots as u64),
+                ),
+            ],
+        );
+    }
 
     Ok(AudioOutput {
         stream: Some(stream),
@@ -906,6 +1052,7 @@ pub(crate) fn start(
         shutdown_tx,
         pump: Some(pump_handle),
         sample_rate,
+        stream_id,
         diagnostics,
         audio_tap,
     })
@@ -1109,9 +1256,16 @@ fn run_pump(
     // ここから 1Hz / edge で emit する (Codex 3 巡目 P1 ① 反映、xrun 防止)。
     let mut last_diag_log_at = std::time::Instant::now();
     let mut last_silence_total_logged: u64 = 0;
+    let mut last_callback_count_logged: u64 = 0;
+    let mut last_callback_late_count_logged: u64 = 0;
+    let mut last_underrun_begin_seq_logged: u64 = 0;
+    let mut last_underrun_end_seq_logged: u64 = 0;
     let mut last_seen_underrun_begin_seq: u64 = 0;
     let mut last_seen_underrun_end_seq: u64 = 0;
     let mut last_seen_pts_jump_seq: u64 = 0;
+    let mut last_seen_device_error_count: u64 = 0;
+    let mut last_seen_stale_clear_seq: u64 = 0;
+    let mut last_seen_pdc_change_seq: u64 = 0;
 
     while !cancel.load(Ordering::Acquire) {
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
@@ -1736,6 +1890,7 @@ fn run_pump(
         // mutex) は pump スレッドのここでまとめる。callback への影響ゼロ。
         if crate::perf::is_enabled() {
             let log_now = std::time::Instant::now();
+            let stream_id = diagnostics.audio_stream_id.load(Ordering::Acquire);
 
             // (1) 1Hz snapshot: underrun 状態 / 直近 1 秒の silence ms / バッファ残量
             if log_now.duration_since(last_diag_log_at) >= std::time::Duration::from_secs(1) {
@@ -1746,6 +1901,25 @@ fn run_pump(
                 let silence_delta_samples = silence_total.saturating_sub(last_silence_total_logged);
                 last_silence_total_logged = silence_total;
                 let silence_delta_ms = (silence_delta_samples as f64 / samples_per_sec) * 1000.0;
+                let callback_count = diagnostics.callback_count.load(Ordering::Acquire);
+                let callback_count_delta =
+                    callback_count.saturating_sub(last_callback_count_logged);
+                last_callback_count_logged = callback_count;
+                let callback_late_count = diagnostics.callback_late_count.load(Ordering::Acquire);
+                let callback_late_count_delta =
+                    callback_late_count.saturating_sub(last_callback_late_count_logged);
+                last_callback_late_count_logged = callback_late_count;
+                let underrun_begin_seq =
+                    diagnostics.audio_underrun_begin_seq.load(Ordering::Acquire);
+                let underrun_begin_delta =
+                    underrun_begin_seq.saturating_sub(last_underrun_begin_seq_logged);
+                last_underrun_begin_seq_logged = underrun_begin_seq;
+                let underrun_end_seq = diagnostics.audio_underrun_end_seq.load(Ordering::Acquire);
+                let underrun_end_delta =
+                    underrun_end_seq.saturating_sub(last_underrun_end_seq_logged);
+                last_underrun_end_seq_logged = underrun_end_seq;
+                let (interval_max_ns, late_max_ns, lock_wait_max_ns, fill_max_ns) =
+                    diagnostics.take_interval_maxima_ns();
                 crate::perf::event(
                     "audio_out",
                     "snapshot",
@@ -1759,8 +1933,99 @@ fn run_pump(
                         ),
                         ("processed_secs", serde_json::Value::from(processed_secs)),
                         (
+                            "raw_pending_secs",
+                            serde_json::Value::from(clock.audio_raw_pending_secs()),
+                        ),
+                        (
                             "audio_tx_queued_secs",
                             serde_json::Value::from(clock.audio_tx_queued_secs()),
+                        ),
+                        ("callback_count", serde_json::Value::from(callback_count)),
+                        (
+                            "callback_count_delta",
+                            serde_json::Value::from(callback_count_delta),
+                        ),
+                        (
+                            "callback_late_count",
+                            serde_json::Value::from(callback_late_count),
+                        ),
+                        (
+                            "callback_late_count_delta",
+                            serde_json::Value::from(callback_late_count_delta),
+                        ),
+                        (
+                            "callback_expected_period_ms",
+                            serde_json::Value::from(
+                                diagnostics
+                                    .callback_expected_period_ns
+                                    .load(Ordering::Acquire) as f64
+                                    / 1.0e6,
+                            ),
+                        ),
+                        (
+                            "callback_interval_ms_latest",
+                            serde_json::Value::from(
+                                diagnostics
+                                    .callback_interval_latest_ns
+                                    .load(Ordering::Acquire) as f64
+                                    / 1.0e6,
+                            ),
+                        ),
+                        (
+                            "callback_latest_wall_ns",
+                            serde_json::Value::from(
+                                diagnostics.callback_latest_wall_ns.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "callback_interval_ms_max",
+                            serde_json::Value::from(interval_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "callback_late_ms_max",
+                            serde_json::Value::from(late_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "buffer_lock_wait_ms_max",
+                            serde_json::Value::from(lock_wait_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "fill_ms_max",
+                            serde_json::Value::from(fill_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "underrun_begin_seq",
+                            serde_json::Value::from(underrun_begin_seq),
+                        ),
+                        (
+                            "underrun_begin_delta",
+                            serde_json::Value::from(underrun_begin_delta),
+                        ),
+                        (
+                            "underrun_end_seq",
+                            serde_json::Value::from(underrun_end_seq),
+                        ),
+                        (
+                            "underrun_end_delta",
+                            serde_json::Value::from(underrun_end_delta),
                         ),
                     ],
                 );
@@ -1771,6 +2036,7 @@ fn run_pump(
             //     その変化を poll して即時 emit (50-200ms 解像度で取りたい)。
             let cur_begin_seq = diagnostics.audio_underrun_begin_seq.load(Ordering::Acquire);
             if cur_begin_seq != last_seen_underrun_begin_seq {
+                let edge_delta = cur_begin_seq.saturating_sub(last_seen_underrun_begin_seq);
                 last_seen_underrun_begin_seq = cur_begin_seq;
                 let wall_ns = diagnostics
                     .audio_underrun_begin_wall_ns
@@ -1783,6 +2049,21 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_begin_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
                         ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
                         ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
                     ],
@@ -1790,6 +2071,7 @@ fn run_pump(
             }
             let cur_end_seq = diagnostics.audio_underrun_end_seq.load(Ordering::Acquire);
             if cur_end_seq != last_seen_underrun_end_seq {
+                let edge_delta = cur_end_seq.saturating_sub(last_seen_underrun_end_seq);
                 last_seen_underrun_end_seq = cur_end_seq;
                 let wall_ns = diagnostics
                     .audio_underrun_end_wall_ns
@@ -1802,6 +2084,21 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_end_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
                         ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
                         ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
                     ],
@@ -1811,6 +2108,7 @@ fn run_pump(
             // (3) audio_pts_jump: callback 側で閾値判定済みのものだけ seq が上がる。
             let cur_jump_seq = diagnostics.audio_pts_jump_seq.load(Ordering::Acquire);
             if cur_jump_seq != last_seen_pts_jump_seq {
+                let edge_delta = cur_jump_seq.saturating_sub(last_seen_pts_jump_seq);
                 last_seen_pts_jump_seq = cur_jump_seq;
                 let req = f64::from_bits(
                     diagnostics
@@ -1838,6 +2136,9 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_jump_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
                         ("requested_pts", serde_json::Value::from(req)),
                         ("prev_now", serde_json::Value::from(prev)),
                         ("after_now", serde_json::Value::from(after)),
@@ -1848,6 +2149,129 @@ fn run_pump(
                         ),
                         ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
                         ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
+                    ],
+                );
+            }
+        }
+
+        let device_errors = diagnostics.device_error_count.load(Ordering::Acquire);
+        if device_errors != last_seen_device_error_count {
+            let delta = device_errors.saturating_sub(last_seen_device_error_count);
+            last_seen_device_error_count = device_errors;
+            let category = diagnostics.device_error_category.load(Ordering::Acquire);
+            crate::logger::log(format!(
+                "cpal output stream error: category={} count={} delta={}",
+                device_error_category_label(category),
+                device_errors,
+                delta
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "device_error",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "category",
+                            serde_json::Value::from(device_error_category_label(category)),
+                        ),
+                        ("count", serde_json::Value::from(device_errors)),
+                        ("delta", serde_json::Value::from(delta)),
+                        (
+                            "edge_wall_ns",
+                            serde_json::Value::from(
+                                diagnostics.device_error_wall_ns.load(Ordering::Acquire),
+                            ),
+                        ),
+                    ],
+                );
+            }
+        }
+        let stale_seq = diagnostics.stale_clear_seq.load(Ordering::Acquire);
+        if stale_seq != last_seen_stale_clear_seq {
+            let stale_delta = stale_seq.saturating_sub(last_seen_stale_clear_seq);
+            last_seen_stale_clear_seq = stale_seq;
+            let pump_serial = diagnostics.stale_clear_pump_serial.load(Ordering::Acquire);
+            let live_serial = diagnostics.stale_clear_live_serial.load(Ordering::Acquire);
+            let processed_secs = f64::from_bits(
+                diagnostics
+                    .stale_clear_processed_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            let raw_pending_secs = f64::from_bits(
+                diagnostics
+                    .stale_clear_raw_pending_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            crate::logger::log(format!(
+                "[audio-out] fill_output stale clear: count={stale_seq} delta={stale_delta} pump_serial={pump_serial} live_serial={live_serial} processed_secs={processed_secs:.3} raw_pending_secs={raw_pending_secs:.3}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "fill_output_stale_clear",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        ("count", serde_json::Value::from(stale_seq)),
+                        ("delta", serde_json::Value::from(stale_delta)),
+                        ("pump_serial", serde_json::Value::from(pump_serial)),
+                        ("live_serial", serde_json::Value::from(live_serial)),
+                        ("processed_secs", serde_json::Value::from(processed_secs)),
+                        (
+                            "raw_pending_secs",
+                            serde_json::Value::from(raw_pending_secs),
+                        ),
+                    ],
+                );
+            }
+        }
+        let pdc_seq = diagnostics.pdc_change_seq.load(Ordering::Acquire);
+        if pdc_seq != last_seen_pdc_change_seq {
+            let pdc_delta = pdc_seq.saturating_sub(last_seen_pdc_change_seq);
+            last_seen_pdc_change_seq = pdc_seq;
+            let delta_secs = f64::from_bits(
+                diagnostics
+                    .pdc_change_delta_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            let pts_secs =
+                f64::from_bits(diagnostics.pdc_change_pts_secs_bits.load(Ordering::Acquire));
+            crate::logger::log(format!(
+                "[VST3 PDC] fill_output: count={pdc_seq} delta={pdc_delta} chunk latency change ({:+.1}ms) -> jump video clock to {:.3}s",
+                delta_secs * 1000.0,
+                pts_secs
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "pdc_change",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        ("count", serde_json::Value::from(pdc_seq)),
+                        ("delta", serde_json::Value::from(pdc_delta)),
+                        ("delta_ms", serde_json::Value::from(delta_secs * 1000.0)),
+                        ("pts", serde_json::Value::from(pts_secs)),
                     ],
                 );
             }
@@ -1988,10 +2412,19 @@ fn fill_output(
     clock: &Arc<AvClock>,
     engine_state: &Arc<AtomicU8>,
     diagnostics: &Arc<AudioDiagnostics>,
+    callback_started_at: Option<std::time::Instant>,
 ) {
+    let _timing = FillTiming {
+        diagnostics,
+        started_at: callback_started_at,
+    };
     // ── pre-seek discard (= state gate より先、Codex P1-4) ──
     let clock_serial = clock.current_seek_serial();
+    let lock_started_at = callback_started_at.map(|_| std::time::Instant::now());
     let mut buf = buffer.lock().unwrap();
+    if let Some(started_at) = lock_started_at {
+        diagnostics.record_buffer_lock_wait(duration_ns_u64(started_at.elapsed()));
+    }
 
     if buf.pump_seek_serial < clock_serial {
         let pump_serial = buf.pump_seek_serial;
@@ -2008,27 +2441,12 @@ fn fill_output(
         publish_buffer_secs(&buf, clock);
         drop(buf);
         if should_log {
-            crate::logger::log(format!(
-                "[audio-out] fill_output stale clear: pump_serial={} live_serial={} processed_secs={:.3} raw_pending_secs={:.3}",
-                pump_serial, clock_serial, processed_secs, raw_pending_secs
-            ));
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "audio_out",
-                    "fill_output_stale_clear",
-                    None,
-                    0,
-                    &[
-                        ("pump_serial", serde_json::Value::from(pump_serial as i64)),
-                        ("live_serial", serde_json::Value::from(clock_serial as i64)),
-                        ("processed_secs", serde_json::Value::from(processed_secs)),
-                        (
-                            "raw_pending_secs",
-                            serde_json::Value::from(raw_pending_secs),
-                        ),
-                    ],
-                );
-            }
+            diagnostics.record_stale_clear(
+                pump_serial,
+                clock_serial,
+                processed_secs,
+                raw_pending_secs,
+            );
         }
         out.fill(0.0);
         return;
@@ -2147,11 +2565,7 @@ fn fill_output(
         let delta_secs = latency - buf.pdc_latency_secs_applied;
         if delta_secs.abs() > PDC_JUMP_THRESHOLD_SECS {
             latency_jumped = true;
-            crate::logger::log(format!(
-                "[VST3 PDC] fill_output: chunk latency change ({:+.1}ms) -> jump video clock to {:.3}s",
-                delta_secs * 1000.0,
-                pts_for_video
-            ));
+            diagnostics.record_pdc_change(delta_secs, pts_for_video);
         }
         if delta_secs.abs() > 1e-6 {
             buf.pdc_latency_secs_applied = latency;
@@ -2369,7 +2783,7 @@ mod tests {
             .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         assert!(buf.lock().unwrap().processed.is_empty());
         assert!(out.iter().all(|sample| *sample == 0.0));
@@ -2458,7 +2872,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let produced_all = loop {
             let mut out = vec![0.0; 1_920];
-            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics, None);
             match producer_done_rx.try_recv() {
                 Ok(result) => break result,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break false,
@@ -2477,7 +2891,7 @@ mod tests {
         );
         while queue_observer.len() > 0 && std::time::Instant::now() < deadline {
             let mut out = vec![0.0; 1_920];
-            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics, None);
             std::thread::yield_now();
         }
         assert_eq!(
@@ -2815,7 +3229,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -2843,7 +3257,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
@@ -2874,7 +3288,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
@@ -2906,7 +3320,7 @@ mod tests {
 
         let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &buffering_state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &buffering_state, &make_diag(), None);
 
         let len_after: usize = buf
             .lock()
@@ -2938,7 +3352,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &state, &make_diag(), None);
         assert!(
             out.iter().all(|&s| s == 0.0),
             "Paused: output must be silence"
@@ -2955,7 +3369,7 @@ mod tests {
         );
 
         state.store(state_code::PLAYING, Ordering::Release);
-        fill_output(&mut out, &buf, &clock, &state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &state, &make_diag(), None);
         assert!(
             out.iter().all(|&s| (s - 0.3).abs() < 1e-6),
             "Playing: buffered samples should be drained with volume applied"
@@ -3090,7 +3504,7 @@ mod tests {
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         // drain 後、buf.next_pts_secs が audible_pts ベースで更新されている
         let expected_audible_after = target_audible + 480.0 / samples_per_sec;
@@ -3125,7 +3539,7 @@ mod tests {
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         // 最初 240 samples: 0.5 * 0.6 = 0.3
         for &v in out.iter().take(240) {

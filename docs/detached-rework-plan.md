@@ -1,4 +1,4 @@
-﻿# Detached viewer 構造リワーク マスタープラン (正本)
+# Detached viewer 構造リワーク マスタープラン (正本)
 
 作成: 2026-07-05 / ClaudeCode
 体制: **実装 = Codex / 検収 = ClaudeCode / 実機検証 = ユーザー**
@@ -1454,10 +1454,34 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-08 別バージョン検索C: viewer別本照会の需要と終了（実装・関連回帰・独立Solレビュー済み、全体gate/実機は後続）**
+
+本タスクの最新利用者指定により、親Astra/mediumと独立Sol/xhighが設計を確認し、実装Sol/xhighを別担当とする。
+旧ClaudeCode/Codex担当指定からの移行は本タスク内に限定し、§2の症状パッチ禁止と実機・既存回帰条件は維持する。
+既存のViewerContextBundle内SimilarPanelStateがmove-onlyな本照会clientを所有し、確定したParked/ParkedLiveへの遷移で
+bindingからContextRefを取得してRetainedへ投影する。AtRestをmountせず、同じcontextの既受付仕事・結果を保持する。
+true close/ViewerExited/current無し/本でない入力はそのclientだけWithdrawnとし、復帰後の実queryでActiveになる。
+これは検索要求の所有を既存viewerの確定lifecycleへ接続する構造修正であり、detached述語、viewport配置/再生成、focusやgeometryの条件を追加しない。
+ROOT repaint通知を一度注入し、既存scheduler/render経路を利用する。新しいdetached bool/Option、時間窓、再試行による症状吸収は加えない。
+編集対象はapp/ui_metadata_panel/ui_fullscreenと検索manager/executor・lib生成境界。既存ContextRef accessorを使いregistry自体は変更しない。
+具体的な差分・検証・残項目は[本照会引き継ぎ](duplicate-detection-book-query-review-fixes.md)と[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡する。
 
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-09-10 次版統合: display topology・native seek・別バージョン検索の所有境界統合:**
+
+親Codex、実装Sol、独立Solは、master側で既にレビュー済みのdisplay topology / native mouse seek /
+画像geometry・余白修正と、別バージョン検索側で既にレビュー済みのviewer-owned navigator /
+capture / similar panel修正を、双方のtyped ownerと取消・終端規則を保持したまま統合する方針に合意した。
+これは既存の構造修正同士を同じtarget rebind、navigation sequence、context mount / park / retire、
+image geometry境界へ接続するものであり、detached predicate、viewport生成、placement、focus、時間guardを
+追加する症状パッチではない。display targetはgenerationとstable anchorを持ち、phase-owned canonical pagesを
+rebindする。候補ナビゲータと入力captureはviewport contextに属し、native mouse hold、similar query / worker、
+paint resourceも同じbundleのlifecycleで保持・解放する。画像余白とunderlayは共通の最終paint geometryを使う。
+双方の既存回帰を残し、統合後のshared pathを独立Solレビューと全体gateで確認する。
+native seek stripの次版実機確認はこの統合で完了扱いにせず、既存計画どおり保留する。
 
 **2026-09-09 §1.204: 後着した見開き topology とページ送り target の再 binding:**
 
@@ -1584,6 +1608,88 @@ still の V / Shift+V と既存 keymap は維持する。新しい App state / p
 runtime / host ownership、placement / focus / HWND routing、window lifecycle は変更しない。親 Codex と独立
 レビューは、正規入口間で分裂していた意味処理を既存 owner gate の内側へ集約する根本修正であり、
 §2 が禁じる focus guard や症状 fallback ではないと実装前に合意した。
+**2026-09-08 別バージョン検索レビューR4/R8: 一時候補表示のviewer所有と描画identity
+（実装前の構造合意。実装・検証は[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡）:**
+
+親Astra/highと独立Astra/highは、長押し表示をApp-globalな通常比較modeから分離し、
+既存viewer-owned SimilarPanelStateにgestureと有界asset準備を所有させる方針で合意した。
+パネル可視性でreleaseが抜ける根因を、所有viewportの入力段で終端を処理する形で正す。
+raw mount/swapに取消副作用を加えず、明示park/close/pagechange/modechangeを終端境界とする。
+本文とnavigatorが候補専用identity/geometryを使い、元pageのidx・編集座標・提示完了へ偽装しない。
+幾何計算/paintのidentity非依存部分を共有し、通常page APIはwrapperとして維持する。
+元viewerのzoom/pan等へ書き戻さず、通常比較pin/mode/pair、viewport生成、host/registryの所有は維持する。
+新規detached bool/Optionや時間guardではなく、入力と描画資源の所有境界を揃える構造修正と判断した。
+通常/見開き/continuous、release/focus/遅延完了、park/mount/retire、2viewer非干渉を回帰対象とする。
+captureとmetadataの逆順操作では、集約pointer flagsと最終位置が先行releaseのcropを上書きする根因も確認した。
+親・独立Astraは既存selectionをevent順に更新し、release座標で一度だけCopy/Cancelを出す共有入力修正に合意。
+後続panel pressのために先行の正当なコピーを消さず、canvasからpanel上へのreleaseも維持する。
+新App状態やclipboard開始後のresetを足さず、当該frameのpanel表示/矩形の入力所有をdrawと共有する。
+候補navigatorの操作復帰はframe-local入力所有を確定し、元rendererを一度描いた最終layoutへ同frameで適用する。
+normal/候補復帰が共通のordered pointer reducerを使い、入力を次frameへ持越すpendingや背景上塗りは追加しない。
+同frame退役でnative TextureIdが実render前に解放される欠陥には、実paint outputが共有資源を所有する方式で合意。
+親・独立Astraがmain/immediate双方のrenderer guardとprimitive寿命を照合した。通常/holdover/frozen/候補の
+typed resource描画境界で、同painter/clipに不変Arcを持つ有効なno-op egui_wgpu callbackを添える。
+callback処理中のArc破棄やcallback_resourcesへの保存は再lock/循環所有になるため禁止する。
+viewport別の任意1frame遅延やApp pending field、vendor変更は追加しない。実装・回帰は修正記録で追跡する。
+追加監査で既存navigatorのglobal temp操作状態を別viewerが消費・削除する欠陥を確認した。
+親・独立AstraはIdle/Flat/Panoramaの唯一typed ownerをApp mounted field/ViewerContextBundleへ移す方針で合意。
+viewport入力観測は操作意図と分け、全viewport begin-passに必要なpointer eventだけを記録する。
+同passで共有し、multipassで旧eventsを再生しない。fresh pass index 0のlive viewport集合でclosed入力cacheを回収する。
+raw mount/swapはowner payloadの交換だけ。page/source/真のcloseで対象ownerを失効し、他viewerへ作用させない。
+Flat payload内ではgeometry intent（None/Center）とpointer gesture（Idle/Pan/Select/Header/AwaitingPan）を別責務として所有する。
+park/focus loss/primary releaseはgestureだけを終了し、確定済みCenterを保つ。旧PendingPanTransitionはCenter+AwaitingPanに対応する。
+描画はCenterだけを消費し、Header/Selectを保持する。AwaitingPanは復元後panからdrag baselineを作る。
+これはZ→短press/release→Headerが復元意図を上書きする欠陥を親・独立UI・Solがコード確認した構造訂正であり、
+新App field、ディスク保存、detached専用分岐は追加しない。page/source/真のcloseだけが両軸を失効する。
+またfullscreen_page_layoutはAppに残りB描画後のA復元でB geometryをA入力へ渡すため、既存layoutを同じbundleへ移す。
+親・独立core/UIは実with_viewer_contextのswapと描画前handler順で根因を確認し、操作ownerとgeometryの同時所有を承認した。
+影響先はnavigator/ルーペ/範囲コピー/holdover。raw mountはpayload交換だけ、disk Snapshot/viewport predicate/blanketclearは追加しない。
+focus終端後のraw Press再生成はFlat/Panorama共通のordered focus区間で閉じる。既存Centerと先行release確定を保つ。
+Response.double_clickedのpass集約だけでは正しいreleaseへ対応できないため、同egui0.33.3の判定済み全release列を
+read-only公開する小API追加を親・独立core/UI・Solが前提確認した。クリック判定/native/viewport生成は変更しない。
+rootとstandalone vendor両方を同local eguiへ統合し、依存の新lib testsと既存full gateを必須にする。
+予約nav操作は本文/holdover/通常navigator描画後に同frame適用し、確定した復元を次の実geometryで消費する。
+新pending fieldでの回避ではなく、既存操作状態の所有移管と終端責務の分離であり、viewport生成/host選択は変えない。
+A→B→A・同viewport context交替・flat/panorama別窓・短いpress/release・古drag不復活を回帰対象に追加する。
+役割移行は利用者が明示した今回の開発体制に限り、実装・実機確認の完了を意味しない。
+
+**2026-09-08 別バージョン検索レビューR2: 明示候補移動が所有するviewer継続
+（製品コード・テスト設計は独立Astra承認、handler回帰16件・legacy lock1件成功。全体gate・portable・実機は[修正記録](duplicate-detection-review-fixes-20260907.md)で追跡）:**
+
+右パネルのロックが別場所への類似移動で解除される根因は、一覧差替えのcloseを
+`fs_nav_locked_gen` の有無だけで真の退出と判定する点にある。password待ちでは入力lockが
+外れても同じ移動要求が続くため、lockを延長するだけの修正では契約を満たさない。
+親Astra/highと独立Astra/highは、既存context-owned `FsNavigationSequence` のphaseから
+viewer継続、入力block、holdover描画を導く変更を、症状パッチではない所有境界の修正と判断した。
+明示候補はRequired targetを持ち、真の退出/取消/失敗はownerを終端する。
+既存snapshotのPreferred target、通常動画transition、viewport生成とgeometryは維持する。
+入れ子ZIPの解決は既存bookmarkのtree解決を共有し、別contextへ副作用を出さない。
+通常/ZIP/PDF、password retry/cancel、対象欠落、真の終了、2viewer非干渉を回帰対象とする。
+事前レビューで、raw `release_fs_nav_lock` に退出副作用を足す案はsupersede時のロック消失を
+再導入するため撤回した。明示typed終端でViewerExitedとSupersededを区別する。
+既存legacy FolderNavigationも、任意のprevious画像と常に存在する移動ownerを分ける。
+capture失敗と非page bind fallbackでもownerを生成し、TargetReadyの描画消費はpreviousだけを
+解放する。動画を含むlegacy pollの経路を維持する所有修正として両Astraが合意した。
+全srcのproducer棚卸しで、`app/native_video.rs::toggle_still_window_mode` が同じvariantを
+表示切替用に使う第3経路だと確認した。`PresentationSwitch` へ分離し、viewer継続とは別に
+描画資源/timeoutを所有することを両Astraが追加承認した。viewport-enter描画は専用accessorへ接続し、
+既存navigation ownerをtoggle/timeoutで上書き・破棄しない。native presentation API全体とregistryは維持する。
+表示切替直後の退出、資源の描画/解放、移動待ち中のtoggle非干渉を自動回帰とportable実機で確認する。
+役割移行は利用者が明示した今回の開発体制に限る。
+
+**2026-09-07 別バージョン検索R3: パネル派生状態のviewer所有への移行
+（2026-09-08実装・独立レビュー完了。検証結果は[修正記録](duplicate-detection-review-fixes-20260907.md)を参照）:**
+
+利用者の明示した役割移行により、このタスクの双方レビューは親Astra/highと独立Astra/highが担当する。
+Sol/xhighの実装前調査で、`fs_info_panel` はbundle-ownedだが `similar_panel` はApp-globalであると確認した。
+類似パネルのorigin、last_ready、texture、要求、完了channelを同じ `ViewerContextBundle` へ移し、
+capture/swap/restore/dropを揃えることを、両AstraがBA-7に対応する構造修正と判断した。
+窓のgeometry、placement、viewport生成、時刻によるguardは変更しない。
+タブも永続・全窓共通設定ではないruntime状態として同じownerへ含める。
+park中の完了の帰属、別contextのdrop非干渉、既存contextテストを回帰対象とする。
+この所有移行とサムネイル要求の21件の回帰、binのcheck、fmtが成功し、独立Astra/highが承認した。
+全体gateとportable実機確認は後続で実施する。
+この役割移行を他ブランチの作業へ一括適用するものではない。
 
 **2026-09-08 静止画シーク popup と native browser-key の1クリック1操作:**
 
@@ -3305,3 +3411,9 @@ foreground ownership を扱う際の観測として残す。
 | 2026-07-29 | nav lock 中の Ctrl+↑↓ / sibling 入力を detached physical bundle 自身の folder-nav request へ累積 | `handle_fullscreen_ctrl_nav_context` / `handle_fullscreen_sibling_nav_context` の lock 分岐から既存 `detached_physical_folder_nav_available` を読み取り専用 resolver で再利用 | nav lock を入力拒否ではなく context-owned holdover の表示確定世代へ限定する修正。App / detached runtime に新規状態を足さず、mounted bundle の `folder_nav_pending` / `FolderNavResult` だけが request と累積を所有する。ユーザー提示の ClaudeCode 分析と Codex のコード裏取り・追加 ownership 分析が一致し、症状 guard ではなく入力 router と request owner の構造修正として双方合意 |
 | 2026-07-29 | 同一フレームの Ctrl+↑↓ / sibling 物理押下数を既存 folder-nav request へ渡す | `key_input` / `keymap` の edge cardinality と、`handle_fs_key_input` → `handle_fs_navigation` の既存 generic dispatch。detached predicate、viewport/runtime、request owner は変更なし | ユーザー提示の ClaudeCode 根本原因分析と Codex のコード裏取りが一致。未消費 edge の寿命は 1 フレームのまま、新規 bool / Option / pending、delay/retry を追加せず、mounted bundle が既に所有する `folder_nav_pending` と上限 5 の accumulator へ物理押下回数を渡す構造修正として双方合意 |
 | 2026-07-29 | キーボード入力所有権 S3: root / fullscreen の各 viewport pass で型付き `KeyboardOwner` を一度だけ決定・共有 | `App::update`、`handle_fullscreen_root_key_input`、`handle_fs_key_input` の既存入力入口で共通 snapshot / pass cache を収集。detached predicate、入力送信元 routing、viewport / window lifecycle は変更なし | ClaudeCode レビューを前提に設計確定した `keyboard-input-ownership-plan.md` の S3 をそのまま実装し、Codex も純粋決定関数と既存判定への互換投影を確認した。新規 detached bool / Option、geometry / focus heuristic、delay / retry は追加せず、pending claim も bookmark TextEdit の 1 pass focus 要求だけを型付きで所有するため、症状パッチではなく全 viewport 共通の入力 ownership 境界である |
+
+| 2026-09-09 | dupe 実機追補: 本移動待ちの固定右パネルと holdover の共通 layout（実装・独立 Sol 承認・7941 件全体 gate 済み） | 対象予定は app.rs の既存 FsNavigationSequence、ui_fullscreen.rs の embedded / separate / detached gap surface、ui_metadata_panel.rs の panel frame。画像未確定でも同 viewer の panel presentation を維持し、現 full_rect・lock 設定から共通 media/panel rect を解決する。viewport の生成・host identity・placement は変更しない | 親が source 調査と照合し、gap surface が共通 panel geometry owner を迂回する欠落の修正と判断。timer/repaint/lock 保存復元ではない。可変設定の二重 owner を作らず、capture 成否に panel 寿命を従属させない。利用者指定により旧 ClaudeCode 検収は独立 Sol / xhigh へ移行し、独立 Sol は意味入力から現 rect/DPI で再解決・live lock 状態・4 入口の共通 answer・gap shell の Retained 維持を条件に構造方向承認。親と実装担当も合意し、この契約で着手する。詳細は duplicate-detection-feedback-20260909.md |
+
+| 2026-09-09 | dupe 類似移動の opt-in 診断: park / retire / failure 時の trace 終端補完（実装・独立 Sol レビュー・本体7958件全体 gate 完了、診断portable更新済み） | app.rs / ui_fullscreen.rs の既存 pending・sequence 診断 helper と app/viewer_context_registry.rs の既存 park / Drop。既存の要求受付・cancel・viewport・選択・host ownership は変更しない | 親と独立 Sol / xhigh が §2 を照合し、既存 owner の退役時に診断 provenance を終端する責務の補完であり、移動不能の症状パッチではないと合意。新規 detached 状態・delay・retry・repaint は追加しない。利用者指定により旧 ClaudeCode 検収を独立 Sol に移管した扱いを継続。対象は pause checkpoint の最終レビュー P2 対応で、検証結果は duplicate-detection-feedback-20260909.md に記録する |
+
+| 2026-09-09 | dupe main embedded の RequiredFullscreenTarget 完了回収漏れ修正（実装・独立レビュー済み） | app.rs の main embedded post-render / early-return。main 所有の物理 scan のみ対象とし、active detached や通常 Pane/Grid の所有・優先順位は変更しない | 実機18入力は受付後main pumpに到達しないことを親・実装Sol・独立Solが照合。既存のtyped requestを所有するcontextで完了を回収する接続修正で、timer/retry/追加boolによる症状回避ではない。close/page-navを先に処理するpost-renderを選び、Requiredだけを回収することで入力優先を維持する。ユーザー指定の旧ClaudeCode検収から独立Solへの移管を継続。actual App::update経路のEmpty→完了、同frame Esc/page優先、通常purpose非消費、他context非消費の5回帰PASS。独立Sol P1/P2なし。全体gate本体7963件PASS、portable更新済み。実機未確認 |

@@ -9,6 +9,7 @@
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
+| 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |
@@ -154,6 +155,8 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 | Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
 | `DebouncedChange` (notify-rs) | FsWatcher → supervisor | 500ms ウィンドウで集約した変更イベント (`favorite_id`, `path`, `ChangeKind`) |
 | `SupervisorCommand` | UI (`IndexerManager`) → supervisor | 一時停止 / 再開 / フル再スキャン要求 |
+| `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の追加・変更・削除通知を軽量な再照合要求へ変換する。進行中なら revision だけ進め、終了後の 1 回へ coalesce するため watcher を追加しない。coalesce された中間 pass では Complete 済みの検索 snapshot を保持し、最終 pass の全 in-flight 回収後だけ再読込する。検索用メモリ表は起動時 configure と索引 worker の DB open 時に専用 `similar-index-load` worker で先行ロードし、パネルは実行中に未ロードでも新たなロードを開始しない。`similar.compact` が DB store ID・内容世代・行数・hash/proxy version・SHA-256 と一致すれば順次読込し、不一致なら SQLite snapshot へ戻して sidecar を作り直す。更新中の右パネルは変更が完了後に反映されることを明示する |
+| `similar_index` bounded work queue | 別バージョン索引 coordinator → 16 scan worker | ルーズ画像 1 枚または本 1 冊を単位に、全体 16・ドライブ文字または UNC server/share ごと 8 まで実行する。操作中は既存 `ActivityGate` で 1 / 1 へ縮退し、cancel 時は未開始を捨てても in-flight 全件の終了を待ってから Cancelled を返す。本のページ処理と generation publish は 1 worker 内に閉じる |
 | `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
 | `IndexerManager.writer` | 全書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。 ingest worker (Background) と tag_write_worker (Interactive) は `WriterJob::Upsert` / `Delete` / `Commit` / `Batch` を `submit` するだけで、writer に直接触らない (§5.5)。 |
 
@@ -588,7 +591,8 @@ cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未�
 | ワーカー | 発火元 | シグナル |
 | --- | --- | --- |
 | Ctrl+G クエリワーカー (`global_search::run`) | クエリ変更 / フィルタ変更 / バー閉じ / folder 遷移 / `GlobalSearchHandle` drop | `Arc<AtomicBool>` を Tantivy ページングループ頭と post-filter ループ頭で check。pending/debounce 中は App が `ActivityGate::bump()` を継続し、背景インデクサの walker/ingest を次 checkpoint で待たせる |
-| IndexerSupervisor (メタ / 名前) | `IndexerManager::sync_with_favorites` で OFF 化、App drop | `SupervisorHandle::stop()` → cancel + FsWatcher drop + thread join (最大 ~250ms) |
+| IndexerSupervisor (メタ / 別バージョン共有 watcher) | `IndexerManager::sync_with_favorites` で両方 OFF 化、App drop | 全停止対象へ先に cancel を通知し、join は専用 thread へ移す。FsWatcher はお気に入りごとに 1 本だけ持つ |
+| 別バージョン索引 scheduler | 対象 favorite の変更、App drop | 対象 snapshot の変更時は現在の旧 snapshot 走査を cancel。watcher 通知は走査を中断せず revision に coalesce し、終了後に最新 snapshot を再照合する。App drop は cancel を立て、UI thread で join しない |
 | walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
 | tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
 

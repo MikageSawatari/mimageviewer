@@ -1466,7 +1466,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
-    FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
+    FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
             idx: page_idx,
             layout_size: texture.size_vec2(),
@@ -1478,7 +1478,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
             source_size: None,
             content_bbox: None,
         }],
-    })
+    }))
 }
 
 #[test]
@@ -15355,6 +15355,7 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
 fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
     let folder = app.tmp.path().join("image-book");
     std::fs::create_dir_all(&folder).expect("create image book");
     std::fs::write(folder.join("page-001.jpg"), []).expect("create page");
@@ -27102,10 +27103,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.capture_fs_nav_holdover(idx);
 
-        let FsHoldover::FolderNavigation(unit) =
+        let FsHoldover::FolderNavigation(Some(unit)) =
             app.fs_holdover_tex.as_ref().expect("holdover captured")
         else {
-            panic!("folder navigation must own its own release state");
+            panic!("folder navigation must own a captured display unit");
         };
         assert_eq!(unit.pages.len(), 1);
         assert_eq!(unit.pages[0].idx, idx);
@@ -27222,7 +27223,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             app.spread_mode = mode;
             app.capture_fs_nav_holdover(first);
-            let FsHoldover::FolderNavigation(unit) = app
+            let FsHoldover::FolderNavigation(Some(unit)) = app
                 .fs_holdover_tex
                 .as_ref()
                 .expect("spread holdover captured")
@@ -28323,6 +28324,198 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.fs_info_panel.locked);
     }
 
+    /// Similar-panel runtime state owns its worker channel together with the viewer. A completion
+    /// received while A is parked must wait for A, and retiring B must not cancel or drain A.
+    #[test]
+    fn similar_panel_runtime_and_completions_belong_to_one_viewer_context_each() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.similar_panel.set_context_marker_for_test("viewer-a");
+        app.similar_panel
+            .queue_failed_completion_for_test("viewer-a-completion");
+
+        let viewer_a = app.stash_mounted_and_start_fresh("test_similar_panel_viewer_a");
+        assert_eq!(
+            app.similar_panel.context_marker_for_test(),
+            (false, None, None),
+            "a fresh viewer must not inherit A's tab, origin, or last-ready query"
+        );
+
+        app.similar_panel.set_context_marker_for_test("viewer-b");
+        app.similar_panel
+            .queue_failed_completion_for_test("viewer-b-completion");
+        app.similar_panel.consume_completions_for_test(&ctx);
+        assert!(
+            app.similar_panel
+                .thumbnail_failed_for_test("viewer-b-completion")
+        );
+
+        app.with_viewer_context(viewer_a, |mounted| {
+            assert_eq!(
+                mounted.similar_panel.context_marker_for_test(),
+                (
+                    true,
+                    Some("viewer-a".to_owned()),
+                    Some("ready:viewer-a".to_owned())
+                )
+            );
+            mounted.similar_panel.consume_completions_for_test(&ctx);
+            assert!(
+                mounted
+                    .similar_panel
+                    .thumbnail_failed_for_test("viewer-a-completion"),
+                "A's parked completion is consumed only after A is mounted"
+            );
+            mounted
+                .similar_panel
+                .queue_failed_completion_for_test("viewer-a-after-b-drop");
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.similar_panel.context_marker_for_test(),
+            (
+                true,
+                Some("viewer-b".to_owned()),
+                Some("ready:viewer-b".to_owned())
+            ),
+            "mounting A must round-trip B's independent runtime state"
+        );
+        let viewer_b = app.stash_mounted_and_start_fresh("test_similar_panel_viewer_b");
+        app.retire_context(viewer_b, "test_drop_similar_panel_viewer_b", |_| ())
+            .expect("B is parked and can be retired");
+
+        app.with_viewer_context(viewer_a, |mounted| {
+            mounted.similar_panel.consume_completions_for_test(&ctx);
+            assert!(
+                mounted
+                    .similar_panel
+                    .thumbnail_failed_for_test("viewer-a-after-b-drop"),
+                "dropping B must not close or invalidate A's receiver"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn book_query_demand_park_transitions_retain_only_the_bound_window_clients() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let main_item = GridItem::Image(PathBuf::from(r"C:\books\main\page.jpg"));
+        let _ = app.query_similar_book(&main_item);
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        for (window_id, page) in [
+            (701, r"C:\books\parked\page.jpg"),
+            (702, r"C:\books\parked-live\page.jpg"),
+        ] {
+            app.push_window_context_for_test(&ctx, window_id, |window| {
+                let item = GridItem::Image(PathBuf::from(page));
+                let _ = window.query_similar_book(&item);
+                assert!(matches!(
+                    window.similar_panel.book_query_demand_for_test(),
+                    BookQueryDemandSnapshot::Active(_)
+                ));
+            });
+        }
+
+        app.transition_detached_window_state(701, DetachedWindowState::Parked, "test_query_retain");
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+        app.with_window_viewer_context(701, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Retained(_)
+            ));
+        })
+        .expect("Parked query owner must remain mounted");
+        app.with_window_viewer_context(702, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Active(_)
+            ));
+        })
+        .expect("unrelated window query remains active");
+
+        app.transition_detached_window_state(
+            702,
+            DetachedWindowState::ParkedLive,
+            "test_query_retain_live",
+        );
+        app.with_window_viewer_context(702, |window| {
+            assert!(matches!(
+                window.similar_panel.book_query_demand_for_test(),
+                BookQueryDemandSnapshot::Retained(_)
+            ));
+        })
+        .expect("ParkedLive query owner must remain mounted");
+    }
+
+    #[test]
+    fn book_query_demand_viewer_exit_withdraws_but_internal_reopen_preserves_it() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let mut app = setup_app();
+        let item = GridItem::Image(PathBuf::from(r"C:\books\exit\page.jpg"));
+        app.items = vec![item.clone()];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        let _ = app.query_similar_book(&item);
+
+        app.capture_fs_nav_holdover(0);
+        app.close_fullscreen();
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+
+        let _ = app.query_similar_book(&item);
+        app.close_fullscreen();
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+    }
+
+    #[test]
+    fn book_query_demand_nonbook_input_withdraws_the_previous_book() {
+        use crate::similar_book_query::BookQueryDemandSnapshot;
+
+        let app = setup_app();
+        let _ =
+            app.query_similar_book(&GridItem::Image(PathBuf::from(r"C:\books\active\page.jpg")));
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
+
+        assert!(matches!(
+            app.query_similar_book(&GridItem::Folder(PathBuf::from(r"C:\books\folder")))
+                .as_ref(),
+            crate::similar_index::BookQuery::NotBook
+        ));
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Withdrawn
+        );
+    }
+
     /// ロック中は前後移動でパネルを閉じないが、**フルスクリーンを出たら解除する**。
     ///
     /// `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるので、「ロック中は reset を
@@ -28365,15 +28558,37 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // **フォルダ移動 (Ctrl+↑↓) の内部 close→open では解除しない。**
-        // この判定を viewport 保持の可否と混ぜていたため、埋め込みフルスクリーンでは
-        // 移動のたびに落ちていた (実機報告 2026-09-02)。移動の意図だけで決める。
+        // Capture may have no drawable resource yet, but FolderNavigation(None) remains the
+        // typed legacy owner until the target is reopened or the navigation terminates.
+        app.items = vec![GridItem::Image(PathBuf::from(r"C:\move\pending.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
         app.fs_info_panel.locked = true;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.capture_fs_nav_holdover(0);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+
         app.close_fullscreen();
         assert!(
             app.fs_info_panel.locked,
-            "フォルダ移動の内部 close でロックが落ちた"
+            "resource-less folder navigation must survive its internal close"
         );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_info_panel.locked);
+
+        app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(!app.fs_info_panel.locked);
     }
 
     #[test]
@@ -29043,7 +29258,7 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex,
+            tex: new_tex.clone(),
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
@@ -29056,13 +29271,13 @@ mod favorite_adjustment_defaults_tests {
             app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "表示可否の一時判定ではなく texture handle の破棄をラッチにする"
-        );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
         assert!(
             app.fs_nav_is_locked(),
-            "描画ラッチと入力抑止 lock の解除タイミングは独立してよい"
+            "consuming the drawable asset must not erase the typed owner before poll observes readiness"
         );
 
         // Reproduce the transient empty display resolution during an AI-final swap.
@@ -29077,6 +29292,24 @@ mod favorite_adjustment_defaults_tests {
                 .and_then(|unit| unit.pages.first())
                 .map(|page| page.texture.id())
         );
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+
+        app.thumbnails = vec![ThumbnailState::Loaded {
+            tex: new_tex,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: None,
+            layout_dims: None,
+        }];
+        app.poll_fs_nav_lock(&ctx);
+        assert!(!app.fs_nav_is_locked());
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     /// PDF/ZIP の async enumerate defer で `fullscreen_idx == None` の間は、従来どおり
@@ -30293,6 +30526,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
@@ -30349,6 +30584,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
@@ -36107,6 +36344,8 @@ mod pipeline_cache_refactor_tests {
         app.fullscreen_idx = Some(target_idx);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
@@ -36171,6 +36410,8 @@ mod pipeline_cache_refactor_tests {
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 30,
@@ -36197,6 +36438,8 @@ mod pipeline_cache_refactor_tests {
             );
             mounted.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
                 previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
                 opened_at: std::time::Instant::now(),
                 target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                     items_generation: 40,
@@ -36222,7 +36465,8 @@ mod pipeline_cache_refactor_tests {
                         FsNavigationSequenceTarget::Display(target) => {
                             Some(target.pages().to_vec())
                         }
-                        FsNavigationSequenceTarget::FolderItems { .. } => None,
+                        FsNavigationSequenceTarget::FolderItems { .. }
+                        | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
                     })
             })
             .expect("sibling viewer context remains registered");
@@ -36234,7 +36478,8 @@ mod pipeline_cache_refactor_tests {
             .and_then(FsHoldover::navigation_sequence)
             .and_then(|sequence| match &sequence.target {
                 FsNavigationSequenceTarget::Display(target) => Some(target.pages().to_vec()),
-                FsNavigationSequenceTarget::FolderItems { .. } => None,
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
             });
         assert_eq!(
             main_pages,
@@ -36248,6 +36493,8 @@ mod pipeline_cache_refactor_tests {
         let display_target = |items_generation, anchor_idx| {
             FsHoldover::NavigationSequence(FsNavigationSequence {
                 previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
                 opened_at: std::time::Instant::now(),
                 target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                     items_generation,
@@ -36288,6 +36535,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_nav_locked_gen = Some(50);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation: 50,
@@ -36313,9 +36562,21 @@ mod pipeline_cache_refactor_tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.fullscreen_idx = Some(target);
         let generation = app.items_generation;
+        let diagnostic_target =
+            crate::snapshot::SnapshotTarget::Fs(std::path::PathBuf::from(r"C:\pics\target.png"));
+        let diagnostic_trace =
+            SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&diagnostic_target));
+        let diagnostic_trace_id = diagnostic_trace.id;
+        let diagnostic_location = SimilarBookLocation::from_destination(diagnostic_target).unwrap();
         app.fs_nav_locked_gen = Some(generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::SimilarBookVisit(SimilarBookNavigationIntent {
+                origin: diagnostic_location.clone(),
+                destination: diagnostic_location,
+                diagnostic_trace: Some(diagnostic_trace),
+            }),
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: generation,
@@ -36339,6 +36600,10 @@ mod pipeline_cache_refactor_tests {
         assert_ne!(app.items_generation, generation);
         assert!(app.fs_holdover_tex.is_none());
         assert!(app.fs_nav_locked_gen.is_none());
+        assert_eq!(
+            SimilarMoveTrace::terminal_reasons_for_test(diagnostic_trace_id),
+            vec!["navigation_superseded"]
+        );
         assert!(
             !app.fs_navigation_sequence_blocks_new_target(),
             "an old-generation Display target must not wedge the next page turn"
@@ -36352,6 +36617,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_nav_locked_gen = Some(accepted_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation,
@@ -36366,6 +36633,8 @@ mod pipeline_cache_refactor_tests {
             mounted.fs_nav_locked_gen = Some(sibling_generation);
             mounted.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
                 previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
                 opened_at: std::time::Instant::now(),
                 target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                     items_generation: sibling_generation,
@@ -40906,6 +41175,7 @@ mod still_window_mode_key_tests {
     fn detached_context_polls_its_own_fs_nav_lock() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let window_id = 31u64;
 
         app.settings.detached_viewer_open_images_in_window = true;
@@ -41013,6 +41283,7 @@ mod still_window_mode_key_tests {
     fn detached_ctrl_nav_can_repeat_after_previous_nav_completed() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let first = temp.path().join("01");
         let second = temp.path().join("02");
@@ -44727,6 +44998,7 @@ mod still_window_mode_key_tests {
     fn virtual_c_a_image_open_builds_detached_physical_a_b_c_before_ctrl_nav() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let first = temp.path().join("01");
         std::fs::create_dir_all(&first).unwrap();
@@ -46191,6 +46463,7 @@ mod still_window_mode_key_tests {
     fn detached_image_open_resolves_windows_path_case_without_fallback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let folder = temp.path().join("physical");
         std::fs::create_dir_all(&folder).unwrap();
@@ -46686,6 +46959,7 @@ mod still_window_mode_key_tests {
     fn active_detached_update_polls_only_its_bundle_folder_nav_result() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let image = PathBuf::from(r"C:\main\keep.jpg");
         app.items = vec![GridItem::Image(image)];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -47442,6 +47716,7 @@ mod still_window_mode_key_tests {
     fn detached_folder_nav_boundary_keeps_current_pdf_and_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let window_id = 28u64;
 
         app.settings.detached_viewer_open_images_in_window = true;
@@ -57782,6 +58057,8 @@ mod still_window_mode_key_tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
             opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation: app.items_generation,
@@ -59057,7 +59334,11 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 42;
         app.fs_viewport_recreate_after_hide = false;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.capture_fs_nav_holdover(idx);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(_))
+        ));
 
         app.close_fullscreen_for_folder_nav_reopen();
 
@@ -59107,7 +59388,11 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 9;
-        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.capture_fs_nav_holdover(idx);
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(_))
+        ));
 
         app.close_fullscreen_for_folder_nav_reopen();
         app.start_loading_items(

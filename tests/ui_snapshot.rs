@@ -304,6 +304,41 @@ fn preferences_video_thumbnail_indicator_dark() {
 }
 
 #[test]
+fn metadata_panel_information_tab_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_information_tab_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 260.0),
+        None,
+        |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn metadata_panel_similar_results_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_similar_results_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        // スクロール領域を保ちつつ、本名・識別用パス・明示的な [移動]・帯と次の候補まで
+        // 一枚で確認できる高さにする。情報タブ側は収まるため、2 枚で溝の有無も比較できる。
+        egui::vec2(400.0, 800.0),
+        None,
+        |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn metadata_panel_similar_states_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_similar_states_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 640.0),
+        None,
+        mimageviewer::draw_similar_states_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_favorite_view_state_dark() {
     snapshot_with_theme_at_size(
         "preferences_favorite_view_state_dark",

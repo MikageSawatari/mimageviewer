@@ -87,6 +87,9 @@ default-features = false
 [dependencies.bytemuck]
 version = "1.24.0"
 
+[patch.crates-io]
+egui = { path = "../egui" }
+
 [dependencies.document-features]
 version = "0.2.11"
 

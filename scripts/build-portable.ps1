@@ -11,6 +11,7 @@
 # Usage:
 #   PS> scripts\build-portable.ps1
 #   PS> scripts\build-portable.ps1 -SkipBuild      (re-assemble only, reuse last core build)
+#   PS> scripts\build-portable.ps1 -KeepRunning    (do not stop repo-built app processes)
 #   PS> scripts\build-portable.ps1 -SmokeTestScript (diagnostic package; no dist/zip/sign)
 #   PS> scripts\build-portable.ps1 -PreserveRuntime
 
@@ -18,6 +19,7 @@
 param(
     [switch] $SkipBuild,
     [switch] $Sign,
+    [switch] $KeepRunning,
     [switch] $SmokeTestScript,
     # Never stop mImageViewer processes; fail before build or package replacement.
     [switch] $PreserveRuntime
@@ -28,6 +30,9 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 if ($SmokeTestScript -and $Sign) {
     throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
+}
+if ($KeepRunning -and $PreserveRuntime) {
+    throw '[portable] -KeepRunning and -PreserveRuntime have different process contracts and cannot be combined'
 }
 
 function Get-NormalizedPath {
@@ -129,6 +134,7 @@ function Get-MivSourceFingerprintRecords {
         'crates',
         'assets',
         'vendor/eframe',
+        'vendor/egui',
         'vendor/egui-wgpu',
         'vendor/twemoji'
     )
@@ -280,6 +286,8 @@ Write-Host "[portable] version = $version"
 # ---------------------------------------------------------------------------
 # Stop any running core/portable instances that may lock the exe.
 # Only repo-built ones (path under repo root) are touched.
+# -KeepRunning skips only this block so build/package preparation can proceed
+# while a portable copy is open. The default behavior remains unchanged.
 # ---------------------------------------------------------------------------
 $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
 # Exact names only. "mimageviewer*" also matches Cargo's test harnesses
@@ -292,7 +300,9 @@ $stoppableProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
-if ($PreserveRuntime) {
+if ($KeepRunning) {
+    Write-Host "[portable] leaving repo-built app processes running"
+} elseif ($PreserveRuntime) {
     $running = @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $stoppableProcessNames -contains $_.Name })
     if ($running.Count -gt 0) {

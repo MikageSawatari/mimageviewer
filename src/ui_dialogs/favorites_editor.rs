@@ -3,6 +3,7 @@
 //! 1 つのダイアログで:
 //! - 表示名 / 並べ替え / 削除
 //! - 名前索引 / メタ索引の ON/OFF
+//! - 別バージョン索引の ON/OFF
 //! - メタ索引の初期スキャン状態 (✅ 完了 / ⏳ スキャン中)
 //! - サムネイル一括作成ダイアログの起動
 //!
@@ -135,6 +136,7 @@ impl App {
         // (ループ中に self を再帰的に &mut 借りる回避)。
         let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
+        let mut similar_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
         let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
         let mut favorite_view_resets: Vec<uuid::Uuid> = Vec::new();
         let mut any_setting_dirty = false;
@@ -248,6 +250,14 @@ impl App {
             .iter()
             .map(|(id, h)| (*id, h.snapshot_stats()))
             .collect();
+        let similar_progress = self.similar_index_progress();
+        let similar_summary = self.similar_index.summary();
+        if matches!(
+            similar_summary,
+            crate::similar_index::IndexSummaryStatus::Preparing
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
 
         egui::Window::new("お気に入り")
             .open(&mut open)
@@ -273,7 +283,7 @@ impl App {
                     .auto_shrink([false, false])
                     .max_height(body_height)
                     .show(ui, |ui| {
-                        ui.set_min_width((safe_size.x - 40.0).clamp(1.0, 744.0));
+                        ui.set_min_width((safe_size.x - 40.0).clamp(1.0, 944.0));
 
                 // ── 起動時整合性チェック (インデクサが有効なら表示) ──
                 if reconciling {
@@ -418,7 +428,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(
                             "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
-                             アイテム検索 (Ctrl+G) できます。\
+                             アイテム検索 (Ctrl+G) と別バージョン検索ができます。\
                              チェックを入れた項目はこの場で 1 回全走査し、以降は\
                              ファイルの変更監視と起動時スキャンで自動更新します。",
                         )
@@ -459,6 +469,12 @@ impl App {
                                          AI プロンプト等で横断検索\n\
                                          ✅ 監視中 = 初期スキャン完了 + ファイルの変更を追従\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
+                                        );
+                                    ui.label(egui::RichText::new("別バージョン索引").strong())
+                                        .on_hover_text(
+                                            "表示中の画像と同じ絵の別バージョンを検索\n\
+                                             ✅ 監視中 = 初回作成完了 + ファイルの変更を追従\n\
+                                             ⏳ 作成中 = バックグラウンドで画像を確認中",
                                         );
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
@@ -578,6 +594,27 @@ impl App {
                                             );
                                         });
 
+                                        // 別バージョン索引: チェック + 全体 worker の状態。
+                                        ui.horizontal(|ui| {
+                                            let similar_resp = ui.checkbox(
+                                                &mut self.settings.favorites[i].auto_index_similar,
+                                                "",
+                                            );
+                                            if similar_resp.changed() {
+                                                similar_index_toggles.push((
+                                                    fav_path.clone(),
+                                                    self.settings.favorites[i]
+                                                        .auto_index_similar,
+                                                ));
+                                                any_setting_dirty = true;
+                                            }
+                                            draw_similar_state_inline(
+                                                ui,
+                                                self.settings.favorites[i].auto_index_similar,
+                                                &similar_progress,
+                                            );
+                                        });
+
                                         // 操作 (↑ ↓ 削除)
                                         ui.horizontal(|ui| {
                                             let up_en = i > 0;
@@ -644,6 +681,24 @@ impl App {
                                 }
                             }
                         }
+                        if ui.button("別バージョン 全ON").clicked() {
+                            for f in &mut self.settings.favorites {
+                                if !f.auto_index_similar {
+                                    f.auto_index_similar = true;
+                                    similar_index_toggles.push((f.path.clone(), true));
+                                    any_setting_dirty = true;
+                                }
+                            }
+                        }
+                        if ui.button("別バージョン 全OFF").clicked() {
+                            for f in &mut self.settings.favorites {
+                                if f.auto_index_similar {
+                                    f.auto_index_similar = false;
+                                    similar_index_toggles.push((f.path.clone(), false));
+                                    any_setting_dirty = true;
+                                }
+                            }
+                        }
                     });
 
                     // ── サムネイル一括作成 (I/O が重いため手動バルクのみの位置付け) ──
@@ -693,6 +748,28 @@ impl App {
                                 all_etas.push(eta);
                             }
                         }
+                    }
+                    match &similar_progress {
+                        crate::similar_index::IndexProgress::Running(progress) => {
+                            let stage = match progress.stage {
+                                crate::similar_index::IndexStage::Opening => "準備中",
+                                crate::similar_index::IndexStage::Scanning => "画像を確認中",
+                                crate::similar_index::IndexStage::Pruning => "更新内容を整理中",
+                            };
+                            let mut message = format!(
+                                "{stage} {}/{}",
+                                format_count(progress.report.processed),
+                                format_count(progress.report.discovered)
+                            );
+                            if let Some(path) = &progress.current_path {
+                                message.push_str(&format!("  {}", path.display()));
+                            }
+                            active.push(("別バージョン".to_owned(), message));
+                        }
+                        crate::similar_index::IndexProgress::Failed(error) => {
+                            active.push(("別バージョン".to_owned(), format!("失敗: {error}")));
+                        }
+                        _ => {}
                     }
                     // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
                     // 「処理速度 = Σ(各 rate_per_sec)」。各 supervisor のサンプルがまだ
@@ -758,6 +835,7 @@ impl App {
                             .on_hover_text(format!("{name}: {msg}"));
                         }
                     }
+                    draw_similar_index_summary(ui, &similar_summary, &similar_progress);
                     // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
                     // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -819,7 +897,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(
-                                "コンテナ索引・アイテム索引・お気に入り標準設定・記憶した表示状態も解除されます。",
+                                "コンテナ索引・アイテム索引・別バージョン索引・お気に入り標準設定・記憶した表示状態も解除されます。",
                             )
                             .weak(),
                         );
@@ -868,6 +946,9 @@ impl App {
             if removed.auto_index_metadata {
                 meta_index_toggles.push((removed.id, false));
             }
+            // 旧版で OFF 後に残った行も含め、favorite 自体の削除では常に掃除を要求する。
+            // 他の ON favorite と範囲が重なる行は SimilarDb 側が保持する。
+            similar_index_toggles.push((removed.path.clone(), false));
             // 補正のお気に入り標準も即時に掃除する (次回起動時の prune_favorite_params
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
             // 効いたまま、という不整合を避ける。
@@ -887,6 +968,9 @@ impl App {
         // ループしてもコストは少ない (sync はほぼ idempotent)。
         for (fav_id, new_on) in &meta_index_toggles {
             self.apply_favorite_meta_index_change(*fav_id, *new_on);
+        }
+        for (path, new_on) in &similar_index_toggles {
+            self.apply_favorite_similar_index_change(path, *new_on);
         }
 
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
@@ -930,6 +1014,107 @@ impl App {
     }
 }
 
+fn draw_similar_index_summary(
+    ui: &mut egui::Ui,
+    status: &crate::similar_index::IndexSummaryStatus,
+    progress: &crate::similar_index::IndexProgress,
+) {
+    use crate::similar_index::IndexSummaryStatus;
+
+    match status {
+        IndexSummaryStatus::NoIndex => {
+            if !matches!(progress, crate::similar_index::IndexProgress::Running(_)) {
+                ui.label(
+                    egui::RichText::new("  別バージョン: 索引なし")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        }
+        IndexSummaryStatus::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("別バージョン索引の情報を読込中")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
+        }
+        IndexSummaryStatus::Ready(summary) => {
+            let updated =
+                crate::app::format_details_timestamp(summary.completed_at_unix_secs, true);
+            let updated = if updated.is_empty() {
+                "不明"
+            } else {
+                &updated
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン（前回完了）: {} 件 / 最終更新 {updated}",
+                    format_count(summary.registered_items),
+                ))
+                .size(11.0)
+                .monospace()
+                .color(ui.visuals().weak_text_color()),
+            );
+            draw_similar_failure_breakdown(
+                ui,
+                "前回完了時に",
+                summary.password_required_pdfs,
+                summary.corrupt_containers,
+                summary.zero_page_containers,
+                summary.decode_failures,
+                summary.io_failures,
+            );
+        }
+        IndexSummaryStatus::Failed(error) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン索引の情報を読み込めませんでした: {error}"
+                ))
+                .size(11.0)
+                .color(ui.visuals().error_fg_color),
+            );
+        }
+    }
+
+    if let crate::similar_index::IndexProgress::Running(running) = progress {
+        draw_similar_failure_breakdown(
+            ui,
+            "今回",
+            running.report.password_required_pdfs,
+            running.report.corrupt_containers,
+            running.report.zero_page_containers,
+            running.report.decode_failures,
+            running.report.io_failures,
+        );
+    }
+}
+
+fn draw_similar_failure_breakdown(
+    ui: &mut egui::Ui,
+    run_label: &str,
+    password_required_pdfs: u64,
+    corrupt_containers: u64,
+    zero_page_containers: u64,
+    decode_failures: u64,
+    io_failures: u64,
+) {
+    ui.label(
+        egui::RichText::new(format!(
+            "    {run_label}確認できなかった項目: パスワード付き PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
+            format_count(password_required_pdfs),
+            format_count(corrupt_containers),
+            format_count(zero_page_containers),
+            format_count(decode_failures),
+            format_count(io_failures),
+        ))
+        .size(11.0)
+        .color(ui.visuals().weak_text_color()),
+    );
+}
+
 fn favorites_editor_dialog_geometry(
     content_rect: egui::Rect,
     has_favorites: bool,
@@ -937,8 +1122,8 @@ fn favorites_editor_dialog_geometry(
     let safe_rect = content_rect.shrink2(egui::vec2(16.0, 16.0));
     let safe_size = safe_rect.size();
     let preferred_height = if has_favorites { 800.0 } else { 420.0 };
-    let dialog_size = egui::vec2(980.0, preferred_height).min(safe_size);
-    let min_dialog_size = egui::vec2(760.0, 420.0).min(safe_size);
+    let dialog_size = egui::vec2(1180.0, preferred_height).min(safe_size);
+    let min_dialog_size = egui::vec2(820.0, 420.0).min(safe_size);
     (safe_rect, dialog_size, min_dialog_size)
 }
 
@@ -996,6 +1181,33 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
     ui.label(egui::RichText::new(text).size(11.0).color(color));
 }
 
+fn draw_similar_state_inline(
+    ui: &mut egui::Ui,
+    on: bool,
+    progress: &crate::similar_index::IndexProgress,
+) {
+    if !on {
+        ui.label(
+            egui::RichText::new("—")
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        return;
+    }
+    const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
+    let (label, color) = match progress {
+        crate::similar_index::IndexProgress::Running(_) => ("⏳ 作成中", YELLOW),
+        crate::similar_index::IndexProgress::Failed(_) => {
+            ("⚠ 作成失敗", ui.visuals().error_fg_color)
+        }
+        crate::similar_index::IndexProgress::Idle => ("⏳ 起動中", YELLOW),
+        crate::similar_index::IndexProgress::Complete(_)
+        | crate::similar_index::IndexProgress::Cancelled(_) => ("✅ 監視中", GREEN),
+    };
+    ui.label(egui::RichText::new(label).size(11.0).color(color));
+}
+
 #[cfg(test)]
 mod tests {
     use super::favorites_editor_dialog_geometry;
@@ -1018,7 +1230,7 @@ mod tests {
             favorites_editor_dialog_geometry(content_rect, true);
 
         assert_eq!(safe_rect.size(), egui::vec2(1248.0, 968.0));
-        assert_eq!(dialog_size, egui::vec2(980.0, 800.0));
-        assert_eq!(min_dialog_size, egui::vec2(760.0, 420.0));
+        assert_eq!(dialog_size, egui::vec2(1180.0, 800.0));
+        assert_eq!(min_dialog_size, egui::vec2(820.0, 420.0));
     }
 }

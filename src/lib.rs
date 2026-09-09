@@ -68,6 +68,7 @@ pub mod delete_worker;
 pub mod diagnostics;
 mod displayed_image_transform;
 mod double_click_time;
+pub mod dupe;
 #[cfg(windows)]
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
@@ -212,6 +213,20 @@ pub mod settings_restore;
 pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
+mod similar_book_engine;
+mod similar_book_mih;
+mod similar_book_query;
+#[cfg(feature = "dev-tools")]
+pub mod similar_book_query_bench;
+#[cfg(test)]
+mod similar_book_query_test_probe;
+#[cfg(feature = "dev-tools")]
+pub mod similar_book_query_verify;
+pub mod similar_db;
+pub mod similar_image;
+pub mod similar_index;
+mod similar_preview;
+mod similar_search_array;
 pub mod single_instance;
 pub mod snapshot;
 mod sns_split;
@@ -258,6 +273,10 @@ pub use ui_fullscreen::{
 pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
+#[doc(hidden)]
+pub use ui_metadata_panel::{
+    draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
+};
 pub mod ui_music_panels;
 pub mod ui_music_spectrum;
 pub mod ui_music_timeline;
@@ -1321,6 +1340,7 @@ pub fn run() -> eframe::Result {
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
+            ui_fullscreen::install_fs_navigator_input_tracking(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();
             ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);
@@ -1341,9 +1361,11 @@ pub fn run() -> eframe::Result {
             let t = Instant::now();
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
-            let mut app = app::App::new_from_settings_with_load_meta(
+            let repaint_ctx = cc.egui_ctx.clone();
+            let mut app = app::App::new_from_settings_with_load_meta_and_book_query_repaint(
                 saved.clone(),
                 settings_load_meta.clone(),
+                move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
             );
             if let Some(handle) = remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);

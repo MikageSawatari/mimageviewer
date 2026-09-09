@@ -9491,6 +9491,12 @@ impl VideoPlayer {
         self.audio_diagnostics.load_av_drift_ms()
     }
 
+    /// Identity of the successfully started CPAL stream owned by this player. `None` keeps
+    /// video-only/headless/open-failure players out of audio correlation logs.
+    pub(crate) fn audio_stream_id(&self) -> Option<u64> {
+        self.audio.as_ref().and_then(audio::AudioOutput::stream_id)
+    }
+
     fn frame_step_base(&self) -> Option<f64> {
         let pts = f64::from_bits(self.frame_step_base_bits.load(Ordering::Acquire));
         if pts.is_finite() {

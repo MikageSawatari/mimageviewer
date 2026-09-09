@@ -115,6 +115,44 @@ pub(crate) struct FullscreenPaintSourceGeneration {
     pub(crate) input: u64,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum FullscreenPaintSourceId {
+    Page(usize),
+    SimilarPreview(u64),
+}
+
+/// Keeps a native fullscreen output alive through egui tessellation and the renderer paint pass.
+///
+/// `NativeTextureIdLease::drop` unregisters the texture immediately, while egui renders shapes
+/// only after the UI closure returns. A no-op callback in the same paint list therefore owns the
+/// output for exactly as long as the batch that refers to its native texture id.
+struct FullscreenPaintBatchLifetime {
+    _owner: Arc<dyn Send + Sync>,
+}
+
+impl egui_wgpu::CallbackTrait for FullscreenPaintBatchLifetime {
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        _render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+    }
+}
+
+fn retain_owner_for_fullscreen_paint_batch<T>(painter: &egui::Painter, owner: Arc<T>)
+where
+    T: Send + Sync + 'static,
+{
+    let owner: Arc<dyn Send + Sync> = owner;
+    painter.add(egui::Shape::Callback(
+        egui_wgpu::Callback::new_paint_callback(
+            egui::Rect::ZERO,
+            FullscreenPaintBatchLifetime { _owner: owner },
+        ),
+    ));
+}
+
 /// One typed resource shared by live, continuous, holdover, and detached routes.
 #[derive(Clone)]
 pub(crate) enum FullscreenPaintResource {
@@ -124,14 +162,14 @@ pub(crate) enum FullscreenPaintResource {
         test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
     Resampleable {
-        page_idx: usize,
+        source_id: FullscreenPaintSourceId,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
         #[cfg(all(windows, feature = "test-script"))]
         test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
     Lanczos {
-        page_idx: usize,
+        source_id: FullscreenPaintSourceId,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
         smoothing_percent: u32,
@@ -155,8 +193,28 @@ impl FullscreenPaintResource {
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
     ) -> Self {
+        Self::resampleable_for_source(FullscreenPaintSourceId::Page(page_idx), source, generation)
+    }
+
+    pub(crate) fn resampleable_similar_preview(
+        resource_id: u64,
+        source: egui::TextureHandle,
+        generation: FullscreenPaintSourceGeneration,
+    ) -> Self {
+        Self::resampleable_for_source(
+            FullscreenPaintSourceId::SimilarPreview(resource_id),
+            source,
+            generation,
+        )
+    }
+
+    fn resampleable_for_source(
+        source_id: FullscreenPaintSourceId,
+        source: egui::TextureHandle,
+        generation: FullscreenPaintSourceGeneration,
+    ) -> Self {
         Self::Resampleable {
-            page_idx,
+            source_id,
             source,
             generation,
             #[cfg(all(windows, feature = "test-script"))]
@@ -202,14 +260,30 @@ impl FullscreenPaintResource {
         }
     }
 
+    /// Attach the native output lease to the egui paint batch that uses its texture id.
+    pub(crate) fn retain_native_output_for_paint(&self, painter: &egui::Painter) {
+        if let Some(output) = self.lanczos_output() {
+            retain_owner_for_fullscreen_paint_batch(painter, Arc::clone(output));
+        }
+    }
+
     pub(crate) fn visible_source_uv_rect(&self) -> Option<egui::Rect> {
         self.lanczos_output()
             .and_then(|output| output.visible_source_uv_rect())
     }
 
     pub(crate) fn page_idx(&self) -> Option<usize> {
+        match self.source_id()? {
+            FullscreenPaintSourceId::Page(page_idx) => Some(page_idx),
+            FullscreenPaintSourceId::SimilarPreview(_) => None,
+        }
+    }
+
+    pub(crate) fn source_id(&self) -> Option<FullscreenPaintSourceId> {
         match self {
-            Self::Resampleable { page_idx, .. } | Self::Lanczos { page_idx, .. } => Some(*page_idx),
+            Self::Resampleable { source_id, .. } | Self::Lanczos { source_id, .. } => {
+                Some(*source_id)
+            }
             Self::Direct { .. } => None,
         }
     }
@@ -258,20 +332,24 @@ impl FullscreenPaintResource {
 
     fn resampleable_parts(
         &self,
-    ) -> Option<(usize, &egui::TextureHandle, FullscreenPaintSourceGeneration)> {
+    ) -> Option<(
+        FullscreenPaintSourceId,
+        &egui::TextureHandle,
+        FullscreenPaintSourceGeneration,
+    )> {
         match self {
             Self::Resampleable {
-                page_idx,
+                source_id,
                 source,
                 generation,
                 ..
             }
             | Self::Lanczos {
-                page_idx,
+                source_id,
                 source,
                 generation,
                 ..
-            } => Some((*page_idx, source, *generation)),
+            } => Some((*source_id, source, *generation)),
             Self::Direct { .. } => None,
         }
     }
@@ -279,12 +357,13 @@ impl FullscreenPaintResource {
     fn original_resampleable(&self) -> Self {
         match self {
             Self::Lanczos {
-                page_idx,
+                source_id,
                 source,
                 generation,
                 ..
             } => {
-                let original = Self::resampleable(*page_idx, source.clone(), *generation);
+                let original =
+                    Self::resampleable_for_source(*source_id, source.clone(), *generation);
                 #[cfg(all(windows, feature = "test-script"))]
                 if let Some(proof) = self.test_script_content_proof().cloned() {
                     return original.with_test_script_content_proof(proof);
@@ -296,9 +375,9 @@ impl FullscreenPaintResource {
     }
 
     fn with_lanczos(&self, output: Arc<LanczosOutput>, smoothing_percent: u32) -> Self {
-        let (page_idx, source, generation) = self.resampleable_parts().unwrap();
+        let (source_id, source, generation) = self.resampleable_parts().unwrap();
         Self::Lanczos {
-            page_idx,
+            source_id,
             source: source.clone(),
             generation,
             smoothing_percent,
@@ -311,7 +390,7 @@ impl FullscreenPaintResource {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct LanczosCacheKey {
-    page_idx: usize,
+    source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
     generation: FullscreenPaintSourceGeneration,
     target_size: [u32; 2],
@@ -359,7 +438,7 @@ impl LanczosSourceRegionKey {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct LanczosFallbackSourceKey {
-    page_idx: usize,
+    source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
     generation: FullscreenPaintSourceGeneration,
     scale_branch: FullscreenPaintScaleBranch,
@@ -453,7 +532,7 @@ impl GpuLanczosCache {
         let Some(render_state) = render_state else {
             return (resource.original_resampleable(), None);
         };
-        let (page_idx, source, generation) = resource.resampleable_parts().unwrap();
+        let (source_id, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
         let physical_scale = physical_scale(logical_scale, pixels_per_point);
         let Some((target_size, source_region)) = target_and_source_region_for_branch(
@@ -474,7 +553,7 @@ impl GpuLanczosCache {
             return (resource.original_resampleable(), None);
         }
         let fallback_source = LanczosFallbackSourceKey {
-            page_idx,
+            source_id,
             source_texture_id: source.id(),
             generation,
             scale_branch,
@@ -512,7 +591,7 @@ impl GpuLanczosCache {
             return (resource.clone(), None);
         }
         let key = LanczosCacheKey {
-            page_idx,
+            source_id,
             source_texture_id: source.id(),
             generation,
             target_size,
@@ -538,7 +617,7 @@ impl GpuLanczosCache {
             );
         }
         self.entries.retain(|candidate, _| {
-            candidate.page_idx != key.page_idx
+            candidate.source_id != key.source_id
                 || (candidate.source_texture_id == key.source_texture_id
                     && candidate.generation == key.generation)
         });
@@ -713,15 +792,36 @@ impl GpuLanczosCache {
     }
 
     pub(crate) fn retain_page_indices(&mut self, keep: &std::collections::HashSet<usize>) {
-        self.entries.retain(|key, _| keep.contains(&key.page_idx));
+        self.entries.retain(|key, _| match key.source_id {
+            FullscreenPaintSourceId::Page(page_idx) => keep.contains(&page_idx),
+            FullscreenPaintSourceId::SimilarPreview(_) => true,
+        });
         self.limit_fallback_sources
-            .retain(|key| keep.contains(&key.page_idx));
+            .retain(|key| match key.source_id {
+                FullscreenPaintSourceId::Page(page_idx) => keep.contains(&page_idx),
+                FullscreenPaintSourceId::SimilarPreview(_) => true,
+            });
     }
 
     pub(crate) fn remove_page(&mut self, page_idx: usize) {
-        self.entries.retain(|key, _| key.page_idx != page_idx);
+        self.entries.retain(
+            |key, _| !matches!(key.source_id, FullscreenPaintSourceId::Page(idx) if idx == page_idx),
+        );
+        self.limit_fallback_sources.retain(
+            |key| !matches!(key.source_id, FullscreenPaintSourceId::Page(idx) if idx == page_idx),
+        );
+    }
+
+    pub(crate) fn retain_similar_preview_resource(&mut self, keep: Option<u64>) {
+        self.entries.retain(|key, _| match key.source_id {
+            FullscreenPaintSourceId::Page(_) => true,
+            FullscreenPaintSourceId::SimilarPreview(resource_id) => Some(resource_id) == keep,
+        });
         self.limit_fallback_sources
-            .retain(|key| key.page_idx != page_idx);
+            .retain(|key| match key.source_id {
+                FullscreenPaintSourceId::Page(_) => true,
+                FullscreenPaintSourceId::SimilarPreview(resource_id) => Some(resource_id) == keep,
+            });
     }
 
     pub(crate) fn clear(&mut self) {
@@ -740,10 +840,12 @@ impl GpuLanczosCache {
         true
     }
 
-    pub(crate) fn outputs(&self) -> impl Iterator<Item = (usize, &Arc<LanczosOutput>)> {
+    pub(crate) fn outputs(
+        &self,
+    ) -> impl Iterator<Item = (FullscreenPaintSourceId, &Arc<LanczosOutput>)> {
         self.entries
             .iter()
-            .map(|(key, entry)| (key.page_idx, &entry.output))
+            .map(|(key, entry)| (key.source_id, &entry.output))
     }
 
     fn prune_source_targets(&mut self, inserted: LanczosCacheKey) {
@@ -816,7 +918,7 @@ impl GpuLanczosCache {
 }
 
 fn same_source_target_family(left: LanczosCacheKey, right: LanczosCacheKey) -> bool {
-    left.page_idx == right.page_idx
+    left.source_id == right.source_id
         && left.source_texture_id == right.source_texture_id
         && left.generation == right.generation
         && left.smoothing_percent == right.smoothing_percent
@@ -2598,7 +2700,7 @@ mod tests {
     #[test]
     fn fully_visible_nis_uses_the_nis_work_plan() {
         let key = LanczosCacheKey {
-            page_idx: 0,
+            source_id: FullscreenPaintSourceId::Page(0),
             source_texture_id: egui::TextureId::Managed(1),
             generation: FullscreenPaintSourceGeneration { items: 1, input: 1 },
             target_size: [3840, 2160],
@@ -2617,7 +2719,7 @@ mod tests {
     #[test]
     fn fully_visible_pixel_art_uses_four_tap_work_plan() {
         let key = LanczosCacheKey {
-            page_idx: 0,
+            source_id: FullscreenPaintSourceId::Page(0),
             source_texture_id: egui::TextureId::Managed(3),
             generation: FullscreenPaintSourceGeneration { items: 1, input: 1 },
             target_size: [3840, 2160],
@@ -2637,7 +2739,7 @@ mod tests {
     fn anime_work_plan_keeps_all_intermediates_at_expanded_source_resolution() {
         let visible = egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75));
         let key = LanczosCacheKey {
-            page_idx: 0,
+            source_id: FullscreenPaintSourceId::Page(0),
             source_texture_id: egui::TextureId::Managed(2),
             generation: FullscreenPaintSourceGeneration { items: 1, input: 1 },
             target_size: [2048, 2048],
@@ -2656,9 +2758,42 @@ mod tests {
     }
 
     #[test]
+    fn page_retention_and_preview_retirement_do_not_cross_source_owners() {
+        let generation = FullscreenPaintSourceGeneration { items: 4, input: 8 };
+        let fallback = |source_id| LanczosFallbackSourceKey {
+            source_id,
+            source_texture_id: egui::TextureId::Managed(7),
+            generation,
+            scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
+        };
+        let page = fallback(FullscreenPaintSourceId::Page(7));
+        let preview_7 = fallback(FullscreenPaintSourceId::SimilarPreview(7));
+        let preview_9 = fallback(FullscreenPaintSourceId::SimilarPreview(9));
+        let mut cache = GpuLanczosCache::default();
+        cache
+            .limit_fallback_sources
+            .extend([page, preview_7, preview_9]);
+
+        cache.retain_page_indices(&std::collections::HashSet::from([7]));
+        assert_eq!(cache.limit_fallback_sources.len(), 3);
+        cache.remove_page(7);
+        assert_eq!(
+            cache.limit_fallback_sources,
+            std::collections::HashSet::from([preview_7, preview_9])
+        );
+        cache.retain_similar_preview_resource(Some(9));
+        assert_eq!(
+            cache.limit_fallback_sources,
+            std::collections::HashSet::from([preview_9])
+        );
+        cache.retain_similar_preview_resource(None);
+        assert!(cache.limit_fallback_sources.is_empty());
+    }
+
+    #[test]
     fn source_generation_is_cache_identity() {
         let base = LanczosCacheKey {
-            page_idx: 3,
+            source_id: FullscreenPaintSourceId::Page(3),
             source_texture_id: egui::TextureId::Managed(7),
             generation: FullscreenPaintSourceGeneration { items: 4, input: 8 },
             target_size: [640, 480],
@@ -2671,6 +2806,14 @@ mod tests {
             ..base
         };
         assert_ne!(base, changed);
+        let preview = LanczosCacheKey {
+            source_id: FullscreenPaintSourceId::SimilarPreview(3),
+            ..base
+        };
+        assert_ne!(
+            base, preview,
+            "page and transient preview IDs must stay distinct even for the same numeric value"
+        );
         let smoothing_changed = LanczosCacheKey {
             smoothing_percent: 50,
             ..base
@@ -2700,7 +2843,7 @@ mod tests {
         assert_ne!(nis_branch, pixel_art_branch);
         assert_ne!(anime_branch, pixel_art_branch);
         let lanczos_fallback = LanczosFallbackSourceKey {
-            page_idx: base.page_idx,
+            source_id: base.source_id,
             source_texture_id: base.source_texture_id,
             generation: base.generation,
             scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
@@ -2796,7 +2939,7 @@ mod tests {
         assert!(matches!(
             restored,
             FullscreenPaintResource::Resampleable {
-                page_idx: 5,
+                source_id: FullscreenPaintSourceId::Page(5),
                 generation: restored_generation,
                 ..
             } if restored_generation == generation
@@ -2815,6 +2958,148 @@ mod tests {
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
         drop(snapshot_owner);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    fn native_texture_batch_output(
+        texture_id: egui::TextureId,
+        owner: Arc<NativeTextureIdLease>,
+        clip_rect: egui::Rect,
+    ) -> (egui::Context, egui::FullOutput) {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(64.0, 64.0),
+        ));
+        let output = ctx.run(raw, |ctx| {
+            let painter = ctx.debug_painter().with_clip_rect(clip_rect);
+            painter.image(
+                texture_id,
+                egui::Rect::from_min_size(egui::pos2(8.0, 9.0), egui::vec2(16.0, 18.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            retain_owner_for_fullscreen_paint_batch(&painter, Arc::clone(&owner));
+        });
+        drop(owner);
+        (ctx, output)
+    }
+
+    fn tessellated_native_texture_batch(
+        texture_id: egui::TextureId,
+        owner: Arc<NativeTextureIdLease>,
+    ) -> Vec<egui::ClippedPrimitive> {
+        let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
+        let (ctx, output) = native_texture_batch_output(texture_id, owner, clip_rect);
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(primitives.iter().any(|primitive| {
+            matches!(
+                &primitive.primitive,
+                egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture_id
+            )
+        }));
+        let callback = primitives
+            .iter()
+            .find_map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Callback(callback) => Some((primitive, callback)),
+                egui::epaint::Primitive::Mesh(_) => None,
+            })
+            .expect("paint-batch lifetime callback");
+        assert_eq!(callback.1.rect, egui::Rect::ZERO);
+        assert_eq!(callback.0.clip_rect, clip_rect);
+        primitives
+    }
+
+    #[test]
+    fn native_texture_lease_survives_shapes_and_tessellated_batch() {
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let lease = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(43),
+            releaser: releaser.clone(),
+        });
+        let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
+        let (ctx, output) =
+            native_texture_batch_output(lease.texture_id, Arc::clone(&lease), clip_rect);
+        drop(lease);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        drop(primitives);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dropping_unrendered_full_output_releases_native_texture_lease() {
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let lease = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(47),
+            releaser: releaser.clone(),
+        });
+        let (_, output) = native_texture_batch_output(
+            lease.texture_id,
+            Arc::clone(&lease),
+            egui::Rect::EVERYTHING,
+        );
+        drop(lease);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        drop(output);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn empty_clip_discards_mesh_and_callback_and_releases_lease() {
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let lease = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(48),
+            releaser: releaser.clone(),
+        });
+        let empty_clip = egui::Rect::from_min_max(egui::pos2(7.0, 7.0), egui::pos2(7.0, 7.0));
+        let (ctx, output) =
+            native_texture_batch_output(lease.texture_id, Arc::clone(&lease), empty_clip);
+        drop(lease);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(primitives.is_empty());
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shared_native_texture_lease_waits_for_both_paint_batches() {
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let lease = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(44),
+            releaser: releaser.clone(),
+        });
+        let batch_a = tessellated_native_texture_batch(lease.texture_id, Arc::clone(&lease));
+        let batch_b = tessellated_native_texture_batch(lease.texture_id, Arc::clone(&lease));
+        drop(lease);
+        drop(batch_a);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        drop(batch_b);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn independent_native_texture_leases_retire_with_their_own_paint_batches() {
+        let releaser_a = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let releaser_b = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let lease_a = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(45),
+            releaser: releaser_a.clone(),
+        });
+        let lease_b = Arc::new(NativeTextureIdLease {
+            texture_id: egui::TextureId::User(46),
+            releaser: releaser_b.clone(),
+        });
+        let batch_a = tessellated_native_texture_batch(lease_a.texture_id, Arc::clone(&lease_a));
+        let batch_b = tessellated_native_texture_batch(lease_b.texture_id, Arc::clone(&lease_b));
+        drop(lease_a);
+        drop(lease_b);
+        drop(batch_a);
+        assert_eq!(releaser_a.0.load(Ordering::Relaxed), 1);
+        assert_eq!(releaser_b.0.load(Ordering::Relaxed), 0);
+        drop(batch_b);
+        assert_eq!(releaser_b.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -17,10 +17,16 @@ members = [
     "tools/seek_strip_probe",
     "tools/viewer_context_audit",
 ]
-exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
+exclude = [
+    "crates/unrar-patched",
+    "vendor/eframe",
+    "vendor/egui",
+    "vendor/egui-wgpu",
+]
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
+egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
@@ -75,6 +81,13 @@ bench = false
 [[bin]]
 name = "bench_ai"
 path = "src/bin/bench_ai.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_dupe"
+path = "src/bin/bench_dupe.rs"
 test = false
 bench = false
 required-features = ["dev-tools"]
@@ -144,6 +157,20 @@ required-features = ["dev-tools"]
 name = "clockless_transcode_bench"
 path = "src/bin/clockless_transcode_bench.rs"
 test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_bench"
+path = "src/bin/similar_book_query_bench.rs"
+test = true
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_verify"
+path = "src/bin/similar_book_query_verify.rs"
+test = true
 bench = false
 required-features = ["dev-tools"]
 
@@ -337,7 +364,7 @@ resvg = "0.45"
 kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 sha2 = "0.10"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }

@@ -1,0 +1,3441 @@
+//! Duplicate-signature measurement helper.
+//!
+//! This binary deliberately reports distributions and caller-selected bins. It
+//! does not contain an accept/reject threshold for duplicate detection.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
+use mimageviewer::dupe::{self, Algo, LumaMetrics, Proxy, Sig, Signature};
+use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
+use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
+use mimageviewer::similar_image::{
+    PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
+};
+use mimageviewer::thumb_loader::{
+    DctDecodeError, apply_exif_orientation, apply_exif_orientation_from_bytes,
+    decode_jpeg_turbo_scaled_from_bytes,
+};
+use rayon::prelude::*;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+const SCHEMA_VERSION: u32 = 1;
+// Chosen by measurement, not preference. decode-selfcheck over 400 real JPEGs
+// compared each DCT target against a full 1/1 decode; a synth re-run then
+// compared whole tables. 1024 reached a median of zero but left a tail of 10
+// bits and lost one core duplicate of 1840, while 2048 reproduced the full
+// decode exactly (core p99 4, max 8, 1840/1840 within distance 8). A target is
+// kept rather than always decoding whole so that peak memory stays bounded on
+// very large sources.
+const DEFAULT_LARGE_DIFF_THRESHOLD_BIN: u8 = 0;
+
+type Result<T> = std::result::Result<T, String>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScanRecord {
+    schema_version: u32,
+    proxy_version: u32,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    file_size: u64,
+    extension: String,
+    decode: DecodeInfo,
+    decode_ms: f64,
+    signature_ms: f64,
+    total_ms: f64,
+    signatures: Vec<StoredSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PdfPageRecord {
+    schema_version: u32,
+    proxy_version: u32,
+    book_path: PathBuf,
+    page_index: u32,
+    page_count: u32,
+    quality: u8,
+    render_long_edge: u32,
+    render_width: u32,
+    render_height: u32,
+    render_ms: f64,
+    signature_ms: f64,
+    total_ms: f64,
+    signatures: Vec<StoredSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "record_type", rename_all = "snake_case")]
+enum BooksRecord {
+    Config(BooksConfigRecord),
+    Book(BooksBookRecord),
+    Pair(BooksPairRecord),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksConfigRecord {
+    schema_version: u32,
+    input: PathBuf,
+    #[serde(default = "legacy_book_grouping")]
+    book_grouping: String,
+    algorithm: String,
+    radius: u32,
+    max_books_per_page: u32,
+    min_quality: u8,
+    coverage_threshold: f32,
+    #[serde(default = "legacy_min_matched_pages")]
+    min_matched_pages: u32,
+    render_long_edge: Option<u32>,
+    book_count: usize,
+    page_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksBookRecord {
+    schema_version: u32,
+    book: u32,
+    path: PathBuf,
+    declared_page_count: u32,
+    scanned_page_count: u32,
+    distinctive_pages: u32,
+    featureless_pages: u32,
+    common_pages: u32,
+    undecidable_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksPairRecord {
+    schema_version: u32,
+    a: u32,
+    b: u32,
+    relation: String,
+    whole: Option<u32>,
+    matched: u32,
+    distinctive_a: u32,
+    distinctive_b: u32,
+    coverage_a: f32,
+    coverage_b: f32,
+    alignment: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DecodeInfo {
+    method: String,
+    scale_num: u32,
+    scale_den: u32,
+    decoded_width: u32,
+    decoded_height: u32,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredSignature {
+    algo: String,
+    kind: String,
+    hex: String,
+    bit_width: Option<u32>,
+    value_count: Option<u32>,
+    quality: u8,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct LumaDistance {
+    l1: f32,
+    l1_gain_offset: f32,
+    grad_l1: f32,
+    large_diff_area: f32,
+    aspect_ratio_delta: f32,
+}
+
+impl From<LumaMetrics> for LumaDistance {
+    fn from(value: LumaMetrics) -> Self {
+        Self {
+            l1: value.l1,
+            l1_gain_offset: value.l1_gain_offset,
+            grad_l1: value.grad_l1,
+            large_diff_area: value.large_diff_area,
+            aspect_ratio_delta: value.aspect_ratio_delta,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PairDistances {
+    pdq256: u32,
+    pdq64: u32,
+    phash63: u32,
+    blockhash256: u32,
+    luma32: LumaDistance,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CandidateBins {
+    exhaustive: bool,
+    pdq256: Option<u32>,
+    pdq64: Option<u32>,
+    phash63: Option<u32>,
+    blockhash256: Option<u32>,
+    luma_l1: Option<f32>,
+    luma_gain_offset: Option<f32>,
+    luma_grad: Option<f32>,
+    luma_large_diff_area: Option<f32>,
+    aspect_ratio_delta: Option<f32>,
+    large_diff_threshold_bin: u8,
+}
+
+impl CandidateBins {
+    fn exhaustive(large_diff_threshold_bin: u8) -> Self {
+        Self {
+            exhaustive: true,
+            pdq256: None,
+            pdq64: None,
+            phash63: None,
+            blockhash256: None,
+            luma_l1: None,
+            luma_gain_offset: None,
+            luma_grad: None,
+            luma_large_diff_area: None,
+            aspect_ratio_delta: None,
+            large_diff_threshold_bin,
+        }
+    }
+
+    fn has_selected_bin(&self) -> bool {
+        self.pdq256.is_some()
+            || self.pdq64.is_some()
+            || self.phash63.is_some()
+            || self.blockhash256.is_some()
+            || self.luma_l1.is_some()
+            || self.luma_gain_offset.is_some()
+            || self.luma_grad.is_some()
+            || self.luma_large_diff_area.is_some()
+            || self.aspect_ratio_delta.is_some()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PairRecord {
+    schema_version: u32,
+    path_a: PathBuf,
+    path_b: PathBuf,
+    dims_a: (u32, u32),
+    dims_b: (u32, u32),
+    distances: PairDistances,
+    candidate_by: Vec<String>,
+    bins: CandidateBins,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SynthDistance {
+    Hamming { value: u32 },
+    Luma { metrics: LumaDistance },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SynthRecord {
+    schema_version: u32,
+    relation: String,
+    transformation: String,
+    source_path: PathBuf,
+    other_path: Option<PathBuf>,
+    algo: String,
+    dims_a: (u32, u32),
+    dims_b: (u32, u32),
+    quality_a: u8,
+    quality_b: u8,
+    large_diff_threshold_bin: u8,
+    distance: SynthDistance,
+}
+
+struct DecodedImage {
+    rgba: RgbaImage,
+    source_dims: (u32, u32),
+}
+
+#[derive(Clone)]
+struct PreparedSignatures {
+    pdq256: Signature,
+    pdq64: Signature,
+    phash63: Signature,
+    blockhash256: Signature,
+    luma32: Signature,
+}
+
+impl PreparedSignatures {
+    fn compute(proxy: &Proxy) -> Self {
+        Self {
+            pdq256: dupe::compute(Algo::Pdq256, proxy),
+            pdq64: dupe::compute(Algo::Pdq64, proxy),
+            phash63: dupe::compute(Algo::Phash63, proxy),
+            blockhash256: dupe::compute(Algo::Blockhash256, proxy),
+            luma32: dupe::compute(Algo::Luma32, proxy),
+        }
+    }
+
+    fn get(&self, algo: Algo) -> &Signature {
+        match algo {
+            Algo::Pdq256 => &self.pdq256,
+            Algo::Pdq64 => &self.pdq64,
+            Algo::Phash63 => &self.phash63,
+            Algo::Blockhash256 => &self.blockhash256,
+            Algo::Luma32 => &self.luma32,
+        }
+    }
+}
+
+struct PreparedScan {
+    path: PathBuf,
+    dims: (u32, u32),
+    signatures: PreparedSignatures,
+}
+
+fn main() {
+    if std::env::args().any(|arg| arg == pdf_loader::PDF_WORKER_ARG) {
+        mimageviewer::data_dir::init();
+        pdf_loader::run_worker_process();
+        return;
+    }
+
+    if let Err(error) = run() {
+        eprintln!("bench_dupe: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let Some(command) = args.next() else {
+        return Err(usage());
+    };
+    let rest: Vec<String> = args.collect();
+    match command.as_str() {
+        "scan" => run_scan(&rest),
+        "decode-selfcheck" => run_decode_selfcheck(&rest),
+        "pdf-selfcheck" => run_pdf_selfcheck(&rest),
+        "pdf-scan" => run_pdf_scan(&rest),
+        "books" => run_books(&rest),
+        "books-report" => run_books_report(&rest),
+        "pairs" => run_pairs(&rest),
+        "synth" => run_synth(&rest),
+        "report" => run_report(&rest),
+        "-h" | "--help" | "help" => {
+            println!("{}", usage());
+            Ok(())
+        }
+        _ => Err(format!("unknown command {command:?}\n{}", usage())),
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE [--threads N] [--limit N] [--skip N]\n  \
+         bench_dupe decode-selfcheck --dir DIR [--recursive] --out FILE [--limit N]\n  \
+         bench_dupe pdf-selfcheck --dir DIR [--recursive] --out FILE \
+         [--limit-books N] [--max-pages-per-book N]\n  \
+         bench_dupe pdf-scan --dir DIR [--recursive] --out FILE \
+         [--render-long-edge N] [--limit-books N] [--max-pages-per-book N]\n  \
+         bench_dupe books --in FILE --out FILE [--group-by-directory] [--radius N] [--k N] \
+         [--min-quality N] [--coverage X] [--min-matched-pages N]\n  \
+         bench_dupe books-report --in FILE --out FILE\n  \
+         bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
+         bench_dupe synth --dir DIR --out FILE [--recursive] [--limit N] \
+         [--large-diff-threshold-bin N]\n  \
+         bench_dupe report --synth FILE [--pairs FILE] --out FILE\n\n\
+         Pair BIN OPTIONS (the union of every supplied bin is emitted):\n  \
+         --pdq256-bin N --pdq64-bin N --phash63-bin N --blockhash256-bin N\n  \
+         --luma-l1-bin X --luma-gain-offset-bin X --luma-grad-bin X\n  \
+         --luma-large-diff-area-bin X --aspect-ratio-delta-bin X\n  \
+         --large-diff-threshold-bin N\n\n\
+         With no pair bins, or with --loose, every pair is emitted. No option is\n  \
+         an accept/reject rule; all are measurement bins. The compiled default\n  \
+         large-difference pixel bin is {DEFAULT_LARGE_DIFF_THRESHOLD_BIN}. Filtered mode requires\n  \
+         one bin for every bit algorithm and at least one Luma32 metric."
+    )
+}
+
+fn take_value(args: &[String], index: &mut usize, flag: &str) -> Result<String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn parse_usize(value: &str, flag: &str) -> Result<usize> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid {flag} value {value:?}"))
+}
+
+fn parse_u32(value: &str, flag: &str) -> Result<u32> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid {flag} value {value:?}"))
+}
+
+fn parse_positive_u32(value: &str, flag: &str) -> Result<u32> {
+    let parsed = parse_u32(value, flag)?;
+    if parsed > 0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be greater than zero"))
+    }
+}
+
+fn parse_u8(value: &str, flag: &str) -> Result<u8> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid {flag} value {value:?}"))
+}
+
+fn parse_nonnegative_f32(value: &str, flag: &str) -> Result<f32> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid {flag} value {value:?}"))?;
+    if parsed.is_finite() && parsed >= 0.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be finite and non-negative"))
+    }
+}
+
+fn parse_unit_f32(value: &str, flag: &str) -> Result<f32> {
+    let parsed = parse_nonnegative_f32(value, flag)?;
+    if parsed <= 1.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be in 0..=1"))
+    }
+}
+
+fn run_scan(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut threads = None;
+    let mut limit = None;
+    let mut skip = 0usize;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, "--dir")?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, "--out")?)),
+            "--recursive" => recursive = true,
+            // Concurrency is a measurement axis, not a setting: the product's
+            // own indexer decides its own. Reading is what dominates a scan, so
+            // the useful question is how many reads to have outstanding.
+            "--threads" => threads = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            // --skip with --limit takes a disjoint slice, so a sweep can give
+            // each thread count files the file cache has not already seen.
+            "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            "--skip" => skip = parse_usize(&take_value(args, &mut index, flag)?, flag)?,
+            flag => return Err(format!("unknown scan option {flag:?}")),
+        }
+        index += 1;
+    }
+    let dir = dir.ok_or_else(|| "scan requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "scan requires --out".to_owned())?;
+    let mut paths = collect_image_paths(&dir, recursive)?;
+    if skip > 0 {
+        paths = if skip >= paths.len() {
+            Vec::new()
+        } else {
+            paths.split_off(skip)
+        };
+    }
+    if let Some(limit) = limit {
+        paths.truncate(limit);
+    }
+    let started = Instant::now();
+    let scan_all =
+        || -> Vec<Result<ScanRecord>> { paths.par_iter().map(|path| scan_one(path)).collect() };
+    let results: Vec<Result<ScanRecord>> = match threads {
+        Some(threads) => rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| format!("thread pool: {error}"))?
+            .install(scan_all),
+        None => scan_all(),
+    };
+    let wall = started.elapsed().as_secs_f64();
+    eprintln!(
+        "scan: files={} threads={} wall={:.2}s rate={:.1} files/s",
+        results.len(),
+        threads
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "default".to_owned()),
+        wall,
+        results.len() as f64 / wall.max(1e-9),
+    );
+    let mut records = Vec::with_capacity(results.len());
+    for result in results {
+        records.push(result?);
+    }
+    write_jsonl(&output, &records)?;
+    eprintln!(
+        "wrote {} image records to {}",
+        records.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Picks `limit` paths spread evenly across `paths` instead of the first `limit`.
+///
+/// Collection order is directory order, so a prefix of a recursive walk is every
+/// page of the first few works rather than a sample of the library, and a distance
+/// distribution measured from it would describe those works instead of the corpus.
+/// Selection is by integer stride, so one input always yields the same sample.
+fn stride_sample(paths: Vec<PathBuf>, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 || paths.len() <= limit {
+        return paths;
+    }
+    let total = paths.len();
+    (0..limit)
+        .map(|slot| paths[slot * total / limit].clone())
+        .collect()
+}
+
+fn stride_sample_page_numbers(page_numbers: Vec<u32>, limit: usize) -> Vec<u32> {
+    if limit == 0 || page_numbers.len() <= limit {
+        return page_numbers;
+    }
+    let total = page_numbers.len();
+    (0..limit)
+        .map(|slot| page_numbers[slot * total / limit])
+        .collect()
+}
+
+struct DecodeSelfcheckVariant {
+    label: &'static str,
+    source_dims: (u32, u32),
+    signatures: PreparedSignatures,
+}
+
+fn run_decode_selfcheck(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            _ => return Err(format!("unknown decode-selfcheck option {flag:?}")),
+        }
+        index += 1;
+    }
+
+    let dir = dir.ok_or_else(|| "decode-selfcheck requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "decode-selfcheck requires --out".to_owned())?;
+    let mut paths = collect_image_paths(&dir, recursive)?;
+    paths.retain(|path| matches!(extension_lower(path).as_str(), "jpg" | "jpeg"));
+    if let Some(limit) = limit {
+        paths = stride_sample(paths, limit);
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let selected = paths.len();
+    let mut measured = 0usize;
+    let mut failed = 0usize;
+    let mut record_count = 0usize;
+    for path in paths {
+        let result: Result<usize> = (|| {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("read JPEG {}: {error}", path.display()))?;
+            let variants = [
+                decode_selfcheck_variant(&path, &bytes, "target_64", 64)?,
+                decode_selfcheck_variant(&path, &bytes, "target_128", 128)?,
+                decode_selfcheck_variant(&path, &bytes, "target_256", 256)?,
+                decode_selfcheck_variant(&path, &bytes, "target_512", 512)?,
+                decode_selfcheck_variant(&path, &bytes, "target_1024", 1024)?,
+                decode_selfcheck_variant(&path, &bytes, "full", u32::MAX)?,
+            ];
+
+            let mut emitted = 0usize;
+            for left in 0..variants.len() {
+                for right in left + 1..variants.len() {
+                    let a = &variants[left];
+                    let b = &variants[right];
+                    let transformation = format!("jpeg_dct_{}_vs_{}", a.label, b.label);
+                    emitted += write_synth_comparison(
+                        &mut writer,
+                        "related",
+                        &transformation,
+                        &path,
+                        None,
+                        a.source_dims,
+                        b.source_dims,
+                        &a.signatures,
+                        &b.signatures,
+                        DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+                    )?;
+                }
+            }
+            Ok(emitted)
+        })();
+
+        match result {
+            Ok(emitted) => {
+                measured += 1;
+                record_count += emitted;
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("decode-selfcheck: skip {}: {error}", path.display());
+            }
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!(
+        "decode-selfcheck: selected={} measured={} failed={} records={} out={}",
+        selected,
+        measured,
+        failed,
+        record_count,
+        output.display()
+    );
+    Ok(())
+}
+
+fn decode_selfcheck_variant(
+    path: &Path,
+    bytes: &[u8],
+    label: &'static str,
+    target_edge: u32,
+) -> Result<DecodeSelfcheckVariant> {
+    let decoded = decode_jpeg_at_target(path, bytes, target_edge)?;
+    let signatures = signatures_from_rgba(&decoded.rgba, decoded.source_dims);
+    Ok(DecodeSelfcheckVariant {
+        label,
+        source_dims: decoded.source_dims,
+        signatures,
+    })
+}
+
+#[derive(Default)]
+struct PdfSelfcheckStats {
+    selected_books: usize,
+    measured_books: usize,
+    measured_pages: usize,
+    password_required_books: usize,
+    zero_page_books: usize,
+    failed_books: usize,
+    failed_pages: usize,
+    records: usize,
+}
+
+struct RenderedPageSignatures {
+    rgba: RgbaImage,
+    dims: (u32, u32),
+    signatures: PreparedSignatures,
+}
+
+fn run_pdf_selfcheck(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut limit_books = None;
+    let mut max_pages_per_book = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--limit-books" => {
+                limit_books = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            "--max-pages-per-book" => {
+                max_pages_per_book = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            _ => return Err(format!("unknown pdf-selfcheck option {flag:?}")),
+        }
+        index += 1;
+    }
+
+    let dir = dir.ok_or_else(|| "pdf-selfcheck requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "pdf-selfcheck requires --out".to_owned())?;
+    let mut paths = collect_pdf_paths(&dir, recursive)?;
+    if let Some(limit) = limit_books {
+        paths = stride_sample(paths, limit);
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut stats = PdfSelfcheckStats {
+        selected_books: paths.len(),
+        ..PdfSelfcheckStats::default()
+    };
+
+    for path in paths {
+        let entries = match pdf_loader::enumerate_pages(&path, None) {
+            Ok(entries) => entries,
+            Err(error) if pdf_password_required(&error) => {
+                stats.password_required_books += 1;
+                eprintln!(
+                    "pdf-selfcheck: skip password-required PDF {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                stats.failed_books += 1;
+                eprintln!(
+                    "pdf-selfcheck: skip unreadable PDF {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if entries.is_empty() {
+            stats.zero_page_books += 1;
+            eprintln!("pdf-selfcheck: skip zero-page PDF {}", path.display());
+            continue;
+        }
+
+        let page_numbers = entries
+            .into_iter()
+            .map(|entry| entry.page_num)
+            .collect::<Vec<_>>();
+        let page_numbers = max_pages_per_book
+            .map(|limit| stride_sample_page_numbers(page_numbers.clone(), limit))
+            .unwrap_or(page_numbers);
+        let mut measured_this_book = false;
+        for page_num in page_numbers {
+            match selfcheck_pdf_page(&mut writer, &path, page_num) {
+                Ok(record_count) => {
+                    measured_this_book = true;
+                    stats.measured_pages += 1;
+                    stats.records += record_count;
+                }
+                Err(error) => {
+                    stats.failed_pages += 1;
+                    eprintln!(
+                        "pdf-selfcheck: skip page {} of {}: {error}",
+                        page_num + 1,
+                        path.display()
+                    );
+                }
+            }
+        }
+        if measured_this_book {
+            stats.measured_books += 1;
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!(
+        "pdf-selfcheck: selected_books={} measured_books={} measured_pages={} \
+         password_required_books={} zero_page_books={} failed_books={} failed_pages={} records={} out={}",
+        stats.selected_books,
+        stats.measured_books,
+        stats.measured_pages,
+        stats.password_required_books,
+        stats.zero_page_books,
+        stats.failed_books,
+        stats.failed_pages,
+        stats.records,
+        output.display()
+    );
+    Ok(())
+}
+
+struct PdfBookTask {
+    path: PathBuf,
+    page_count: u32,
+    page_numbers: Vec<u32>,
+}
+
+struct PdfPageTask {
+    path: PathBuf,
+    page_count: u32,
+    page_index: u32,
+}
+
+enum PdfEnumerateOutcome {
+    Ready(PdfBookTask),
+    PasswordRequired { path: PathBuf, error: String },
+    ZeroPages { path: PathBuf },
+    Failed { path: PathBuf, error: String },
+}
+
+fn run_pdf_scan(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut render_long_edge = PDF_RENDER_LONG_EDGE;
+    let mut limit_books = None;
+    let mut max_pages_per_book = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--render-long-edge" => {
+                render_long_edge = parse_positive_u32(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--limit-books" => {
+                limit_books = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            "--max-pages-per-book" => {
+                max_pages_per_book = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            _ => return Err(format!("unknown pdf-scan option {flag:?}")),
+        }
+        index += 1;
+    }
+    let dir = dir.ok_or_else(|| "pdf-scan requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "pdf-scan requires --out".to_owned())?;
+    let mut paths = collect_pdf_paths(&dir, recursive)?;
+    if let Some(limit) = limit_books {
+        paths = stride_sample(paths, limit);
+    }
+    let selected_books = paths.len();
+
+    let outcomes = paths
+        .par_iter()
+        .map(|path| match pdf_loader::enumerate_pages(path, None) {
+            Ok(entries) if entries.is_empty() => {
+                PdfEnumerateOutcome::ZeroPages { path: path.clone() }
+            }
+            Ok(entries) => {
+                let page_count = entries.len() as u32;
+                let page_numbers = entries
+                    .into_iter()
+                    .map(|entry| entry.page_num)
+                    .collect::<Vec<_>>();
+                let page_numbers = max_pages_per_book
+                    .map(|limit| stride_sample_page_numbers(page_numbers.clone(), limit))
+                    .unwrap_or(page_numbers);
+                PdfEnumerateOutcome::Ready(PdfBookTask {
+                    path: path.clone(),
+                    page_count,
+                    page_numbers,
+                })
+            }
+            Err(error) if pdf_password_required(&error) => PdfEnumerateOutcome::PasswordRequired {
+                path: path.clone(),
+                error: error.to_string(),
+            },
+            Err(error) => PdfEnumerateOutcome::Failed {
+                path: path.clone(),
+                error: error.to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let mut password_required_books = 0usize;
+    let mut zero_page_books = 0usize;
+    let mut failed_enumerate_books = 0usize;
+    let mut book_tasks = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            PdfEnumerateOutcome::Ready(task) => book_tasks.push(task),
+            PdfEnumerateOutcome::PasswordRequired { path, error } => {
+                password_required_books += 1;
+                eprintln!(
+                    "pdf-scan: skip password-required PDF {}: {error}",
+                    path.display()
+                );
+            }
+            PdfEnumerateOutcome::ZeroPages { path } => {
+                zero_page_books += 1;
+                eprintln!("pdf-scan: skip zero-page PDF {}", path.display());
+            }
+            PdfEnumerateOutcome::Failed { path, error } => {
+                failed_enumerate_books += 1;
+                eprintln!("pdf-scan: skip unreadable PDF {}: {error}", path.display());
+            }
+        }
+    }
+    book_tasks.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let page_tasks = book_tasks
+        .iter()
+        .flat_map(|book| {
+            book.page_numbers
+                .iter()
+                .copied()
+                .map(|page_index| PdfPageTask {
+                    path: book.path.clone(),
+                    page_count: book.page_count,
+                    page_index,
+                })
+        })
+        .collect::<Vec<_>>();
+    let render_results = page_tasks
+        .par_iter()
+        .map(|task| render_pdf_scan_page(task, render_long_edge))
+        .collect::<Vec<_>>();
+
+    let mut failed_render_books = BTreeSet::new();
+    let mut records = Vec::with_capacity(render_results.len());
+    for (task, result) in page_tasks.iter().zip(render_results) {
+        match result {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                failed_render_books.insert(task.path.clone());
+                eprintln!(
+                    "pdf-scan: discard book after page {} failed in {}: {error}",
+                    task.page_index + 1,
+                    task.path.display()
+                );
+            }
+        }
+    }
+    records.retain(|record| !failed_render_books.contains(&record.book_path));
+    records.sort_by(|left, right| {
+        left.book_path
+            .cmp(&right.book_path)
+            .then(left.page_index.cmp(&right.page_index))
+    });
+    write_jsonl(&output, &records)?;
+    let completed_books = book_tasks.len().saturating_sub(failed_render_books.len());
+    eprintln!(
+        "pdf-scan: selected_books={} completed_books={} pages={} render_long_edge={} \
+         password_required_books={} zero_page_books={} failed_enumerate_books={} \
+         failed_render_books={} out={}",
+        selected_books,
+        completed_books,
+        records.len(),
+        render_long_edge,
+        password_required_books,
+        zero_page_books,
+        failed_enumerate_books,
+        failed_render_books.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<PdfPageRecord> {
+    let total_start = Instant::now();
+    let render_start = Instant::now();
+    let rendered = pdf_loader::render_page(
+        &task.path,
+        task.page_index,
+        render_long_edge,
+        None,
+        None,
+        JobPriority::Normal,
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )
+    .map_err(|error| {
+        format!(
+            "render {} page {}: {error}",
+            task.path.display(),
+            task.page_index + 1
+        )
+    })?;
+    let render_ms = elapsed_ms(render_start);
+    if rendered.page_count != task.page_count {
+        return Err(format!(
+            "page count changed during scan: enumerated {}, render reported {}",
+            task.page_count, rendered.page_count
+        ));
+    }
+    let render_dims = rendered.image.dimensions();
+    let signature_start = Instant::now();
+    let proxy = proxy_from_source(
+        ProxySource::Raster {
+            image: &rendered.image,
+            source_dims: render_dims,
+            format: SimilarImageFormat::Pdf,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    .proxy;
+    let computed = dupe::all_algos()
+        .iter()
+        .map(|&algo| dupe::compute(algo, &proxy))
+        .collect::<Vec<_>>();
+    let quality = computed
+        .iter()
+        .find(|signature| signature.algo == Algo::Pdq256)
+        .expect("all algorithms includes Pdq256")
+        .quality;
+    let signatures = computed.into_iter().map(store_signature).collect();
+    let signature_ms = elapsed_ms(signature_start);
+    Ok(PdfPageRecord {
+        schema_version: SCHEMA_VERSION,
+        proxy_version: dupe::PROXY_VERSION,
+        book_path: task.path.clone(),
+        page_index: task.page_index,
+        page_count: task.page_count,
+        quality,
+        render_long_edge,
+        render_width: render_dims.0,
+        render_height: render_dims.1,
+        render_ms,
+        signature_ms,
+        total_ms: elapsed_ms(total_start),
+        signatures,
+    })
+}
+
+struct InputBookMeta {
+    path: PathBuf,
+    declared_page_count: u32,
+    scanned_page_count: u32,
+}
+
+struct PreparedBooksInput {
+    book_meta: BTreeMap<u32, InputBookMeta>,
+    pages: Vec<dupe::book::BookPage>,
+    render_long_edge: Option<u32>,
+    book_grouping: String,
+}
+
+const PDF_BOOK_GROUPING: &str = "PDF document path (one PDF file per measured book).";
+const PARENT_DIRECTORY_BOOK_GROUPING: &str = "Parent-directory approximation: each image's immediate parent directory is treated as one measured book, with pages ordered by path. This approximates mIV's image-only-book rule (the deepest folder containing only images and no subfolders); it is not the product grouping rule.";
+
+fn legacy_book_grouping() -> String {
+    "Unspecified grouping from a legacy relations JSONL file.".to_owned()
+}
+
+fn legacy_min_matched_pages() -> u32 {
+    // Before this field existed, every emitted candidate with one aligned page
+    // could be classified by coverage, so legacy relation files imply a floor of 1.
+    1
+}
+
+fn run_books(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut group_by_directory = false;
+    let mut params = dupe::book::Params::default();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--group-by-directory" => group_by_directory = true,
+            "--radius" => params.radius = parse_u32(&take_value(args, &mut index, flag)?, flag)?,
+            "--k" => {
+                params.max_books_per_page = parse_u32(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--min-quality" => {
+                params.min_quality = parse_u8(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--coverage" => {
+                params.coverage_threshold =
+                    parse_unit_f32(&take_value(args, &mut index, flag)?, flag)?;
+            }
+            "--min-matched-pages" => {
+                params.min_matched_pages = parse_u32(&take_value(args, &mut index, flag)?, flag)?
+            }
+            _ => return Err(format!("unknown books option {flag:?}")),
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| "books requires --in".to_owned())?;
+    let output = output.ok_or_else(|| "books requires --out".to_owned())?;
+    let prepared = if group_by_directory {
+        prepare_directory_books_input(&input)?
+    } else {
+        prepare_pdf_books_input(&input)?
+    };
+    let PreparedBooksInput {
+        book_meta,
+        pages,
+        render_long_edge,
+        book_grouping,
+    } = prepared;
+
+    let analysis = dupe::book::analyze(&pages, params)
+        .map_err(|error| format!("analyze books in {}: {error}", input.display()))?;
+    let stats = analysis
+        .books
+        .iter()
+        .map(|stats| (stats.book, stats))
+        .collect::<BTreeMap<_, _>>();
+    let mut output_records = Vec::with_capacity(1 + book_meta.len() + analysis.pairs.len());
+    output_records.push(BooksRecord::Config(BooksConfigRecord {
+        schema_version: SCHEMA_VERSION,
+        input: input.clone(),
+        book_grouping,
+        algorithm: "Pdq256".to_owned(),
+        radius: params.radius,
+        max_books_per_page: params.max_books_per_page,
+        min_quality: params.min_quality,
+        coverage_threshold: params.coverage_threshold,
+        min_matched_pages: params.min_matched_pages,
+        render_long_edge,
+        book_count: book_meta.len(),
+        page_count: pages.len(),
+    }));
+    for (&book, meta) in &book_meta {
+        let stats = stats
+            .get(&book)
+            .copied()
+            .expect("every input book has analysis stats");
+        let undecidable_reason = (stats.distinctive_pages == 0).then(|| {
+            format!(
+                "no distinctive pages (featureless={}, common={})",
+                stats.featureless_pages, stats.common_pages
+            )
+        });
+        output_records.push(BooksRecord::Book(BooksBookRecord {
+            schema_version: SCHEMA_VERSION,
+            book,
+            path: meta.path.clone(),
+            declared_page_count: meta.declared_page_count,
+            scanned_page_count: meta.scanned_page_count,
+            distinctive_pages: stats.distinctive_pages,
+            featureless_pages: stats.featureless_pages,
+            common_pages: stats.common_pages,
+            undecidable_reason,
+        }));
+    }
+    for pair in analysis.pairs {
+        let (relation, whole) = match pair.relation {
+            dupe::book::Relation::Same => ("same", None),
+            dupe::book::Relation::Contains { whole } => ("contains", Some(whole)),
+            dupe::book::Relation::Unrelated => ("unrelated", None),
+            dupe::book::Relation::Undecidable => ("undecidable", None),
+        };
+        output_records.push(BooksRecord::Pair(BooksPairRecord {
+            schema_version: SCHEMA_VERSION,
+            a: pair.a,
+            b: pair.b,
+            relation: relation.to_owned(),
+            whole,
+            matched: pair.matched,
+            distinctive_a: pair.distinctive_a,
+            distinctive_b: pair.distinctive_b,
+            coverage_a: pair.coverage_a,
+            coverage_b: pair.coverage_b,
+            alignment: pair.alignment,
+        }));
+    }
+    write_jsonl(&output, &output_records)?;
+    eprintln!(
+        "books: books={} pages={} candidate_pairs={} group_by_directory={} radius={} k={} min_quality={} \
+         coverage={:.6} min_matched_pages={} out={}",
+        book_meta.len(),
+        pages.len(),
+        output_records
+            .iter()
+            .filter(|record| matches!(record, BooksRecord::Pair(_)))
+            .count(),
+        group_by_directory,
+        params.radius,
+        params.max_books_per_page,
+        params.min_quality,
+        params.coverage_threshold,
+        params.min_matched_pages,
+        output.display()
+    );
+    Ok(())
+}
+
+fn prepare_pdf_books_input(input: &Path) -> Result<PreparedBooksInput> {
+    let page_records: Vec<PdfPageRecord> = read_jsonl(input)?;
+    let paths = page_records
+        .iter()
+        .map(|record| record.book_path.clone())
+        .collect::<BTreeSet<_>>();
+    if paths.len() > u32::MAX as usize {
+        return Err("books input contains more than u32::MAX books".to_owned());
+    }
+    let book_ids = paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| (path, index as u32))
+        .collect::<BTreeMap<_, _>>();
+    let mut book_meta = book_ids
+        .iter()
+        .map(|(path, &book)| {
+            (
+                book,
+                InputBookMeta {
+                    path: path.clone(),
+                    declared_page_count: 0,
+                    scanned_page_count: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut render_edges = BTreeSet::new();
+    let mut seen_pages = HashSet::new();
+    let mut pages = Vec::with_capacity(page_records.len());
+    for record in &page_records {
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{} page {} has schema version {}, expected {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.schema_version,
+                SCHEMA_VERSION
+            ));
+        }
+        if record.proxy_version != dupe::PROXY_VERSION {
+            return Err(format!(
+                "{} page {} has proxy version {}, expected {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.proxy_version,
+                dupe::PROXY_VERSION
+            ));
+        }
+        let book = *book_ids
+            .get(&record.book_path)
+            .expect("every page path has an assigned book id");
+        if !seen_pages.insert((book, record.page_index)) {
+            return Err(format!(
+                "{} contains duplicate page index {}",
+                record.book_path.display(),
+                record.page_index
+            ));
+        }
+        let meta = book_meta
+            .get_mut(&book)
+            .expect("every assigned book id has metadata");
+        if meta.declared_page_count == 0 {
+            meta.declared_page_count = record.page_count;
+        } else if meta.declared_page_count != record.page_count {
+            return Err(format!(
+                "{} mixes declared page counts {} and {}",
+                record.book_path.display(),
+                meta.declared_page_count,
+                record.page_count
+            ));
+        }
+        meta.scanned_page_count += 1;
+        render_edges.insert(record.render_long_edge);
+        let signature = restore_pdf_pdq256(record)?;
+        if signature.quality != record.quality {
+            return Err(format!(
+                "{} page {} has top-level quality {}, Pdq256 stores {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.quality,
+                signature.quality
+            ));
+        }
+        pages.push(dupe::book::BookPage {
+            book,
+            index: record.page_index,
+            quality: record.quality,
+            sig: signature.sig,
+        });
+    }
+    if render_edges.len() > 1 {
+        return Err(format!(
+            "{} mixes PDF render long edges; scan each configuration separately",
+            input.display()
+        ));
+    }
+    Ok(PreparedBooksInput {
+        book_meta,
+        pages,
+        render_long_edge: render_edges.first().copied(),
+        book_grouping: PDF_BOOK_GROUPING.to_owned(),
+    })
+}
+
+fn prepare_directory_books_input(input: &Path) -> Result<PreparedBooksInput> {
+    let scan_records: Vec<ScanRecord> = read_jsonl(input)?;
+    prepare_directory_book_records(&scan_records, input)
+}
+
+fn prepare_directory_book_records(
+    scan_records: &[ScanRecord],
+    input: &Path,
+) -> Result<PreparedBooksInput> {
+    let mut grouped = BTreeMap::<PathBuf, Vec<&ScanRecord>>::new();
+    let mut seen_paths = HashSet::new();
+    for record in scan_records {
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{} has schema version {}, expected {}",
+                record.path.display(),
+                record.schema_version,
+                SCHEMA_VERSION
+            ));
+        }
+        if record.proxy_version != dupe::PROXY_VERSION {
+            return Err(format!(
+                "{} has proxy version {}, expected {}",
+                record.path.display(),
+                record.proxy_version,
+                dupe::PROXY_VERSION
+            ));
+        }
+        if !seen_paths.insert(record.path.clone()) {
+            return Err(format!(
+                "{} contains duplicate image path {}",
+                input.display(),
+                record.path.display()
+            ));
+        }
+        let parent = record.path.parent().ok_or_else(|| {
+            format!(
+                "{} has no parent directory for --group-by-directory",
+                record.path.display()
+            )
+        })?;
+        if parent.as_os_str().is_empty() {
+            return Err(format!(
+                "{} has an empty parent directory for --group-by-directory",
+                record.path.display()
+            ));
+        }
+        grouped
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(record);
+    }
+    if grouped.len() > u32::MAX as usize {
+        return Err("books input contains more than u32::MAX parent directories".to_owned());
+    }
+
+    let mut book_meta = BTreeMap::new();
+    let mut pages = Vec::with_capacity(scan_records.len());
+    for (book_index, (directory, mut records)) in grouped.into_iter().enumerate() {
+        records.sort_by(|left, right| left.path.cmp(&right.path));
+        let book = book_index as u32;
+        let page_count = u32::try_from(records.len()).map_err(|_| {
+            format!(
+                "directory {} contains more than u32::MAX scanned images",
+                directory.display()
+            )
+        })?;
+        book_meta.insert(
+            book,
+            InputBookMeta {
+                path: directory,
+                declared_page_count: page_count,
+                scanned_page_count: page_count,
+            },
+        );
+        for (page_index, record) in records.into_iter().enumerate() {
+            let signature = restore_scan_pdq256(record)?;
+            pages.push(dupe::book::BookPage {
+                book,
+                index: page_index as u32,
+                quality: signature.quality,
+                sig: signature.sig,
+            });
+        }
+    }
+
+    Ok(PreparedBooksInput {
+        book_meta,
+        pages,
+        render_long_edge: None,
+        book_grouping: PARENT_DIRECTORY_BOOK_GROUPING.to_owned(),
+    })
+}
+
+fn restore_pdf_pdq256(record: &PdfPageRecord) -> Result<Signature> {
+    restore_pdq256(
+        &record.signatures,
+        &format!(
+            "{} page {}",
+            record.book_path.display(),
+            record.page_index + 1
+        ),
+    )
+}
+
+fn restore_scan_pdq256(record: &ScanRecord) -> Result<Signature> {
+    restore_pdq256(&record.signatures, &record.path.display().to_string())
+}
+
+fn restore_pdq256(signatures: &[StoredSignature], context: &str) -> Result<Signature> {
+    let matches = signatures
+        .iter()
+        .filter(|signature| signature.algo == "Pdq256")
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "{context} contains {} Pdq256 signatures, expected exactly one",
+            matches.len()
+        ));
+    }
+    let stored = matches[0];
+    validate_stored_shape(stored, "bits", Some(256), None, 32)?;
+    Ok(Signature {
+        algo: Algo::Pdq256,
+        sig: Sig::Bits(decode_hex(&stored.hex)?.into_boxed_slice()),
+        quality: stored.quality,
+    })
+}
+
+fn run_books_report(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            _ => return Err(format!("unknown books-report option {flag:?}")),
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| "books-report requires --in".to_owned())?;
+    let output = output.ok_or_else(|| "books-report requires --out".to_owned())?;
+    let records: Vec<BooksRecord> = read_jsonl(&input)?;
+    let mut config = None;
+    let mut books = Vec::new();
+    let mut pairs = Vec::new();
+    for record in records {
+        match record {
+            BooksRecord::Config(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                if config.replace(record).is_some() {
+                    return Err(format!(
+                        "{} contains more than one config record",
+                        input.display()
+                    ));
+                }
+            }
+            BooksRecord::Book(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                books.push(record);
+            }
+            BooksRecord::Pair(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                pairs.push(record);
+            }
+        }
+    }
+    let config = config.ok_or_else(|| format!("{} contains no config record", input.display()))?;
+    books.sort_by_key(|book| book.book);
+    pairs.sort_by_key(|pair| (pair.a, pair.b));
+    if books.len() != config.book_count {
+        return Err(format!(
+            "{} config declares {} books but contains {} book records",
+            input.display(),
+            config.book_count,
+            books.len()
+        ));
+    }
+    let book_paths = books
+        .iter()
+        .map(|book| (book.book, &book.path))
+        .collect::<BTreeMap<_, _>>();
+    for pair in &pairs {
+        if !book_paths.contains_key(&pair.a) || !book_paths.contains_key(&pair.b) {
+            return Err(format!(
+                "{} pair ({}, {}) refers to an unknown book",
+                input.display(),
+                pair.a,
+                pair.b
+            ));
+        }
+        if pair.relation == "contains"
+            && !pair
+                .whole
+                .is_some_and(|whole| whole == pair.a || whole == pair.b)
+        {
+            return Err(format!(
+                "{} contains pair ({}, {}) without a valid whole book",
+                input.display(),
+                pair.a,
+                pair.b
+            ));
+        }
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "# Book-version relationship measurement report").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "> This report describes measured overlap. It does not recommend deletion, cleanup, or which version to keep."
+    )
+    .map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Measurement configuration").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "- Input: {}", markdown_path(&config.input)).map_err(io_error)?;
+    writeln!(writer, "- Book grouping: {}", config.book_grouping).map_err(io_error)?;
+    if config.book_grouping == PARENT_DIRECTORY_BOOK_GROUPING {
+        writeln!(writer).map_err(io_error)?;
+        writeln!(
+            writer,
+            "> **Grouping caveat:** Parent-directory grouping is a measurement approximation. It does not call or replace `folder_scan::is_image_only_book_contents`, and must not be read as the product's book-boundary rule."
+        )
+        .map_err(io_error)?;
+        writeln!(writer).map_err(io_error)?;
+    }
+    writeln!(writer, "- Algorithm: {}", config.algorithm).map_err(io_error)?;
+    writeln!(writer, "- Radius: {}", config.radius).map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Maximum books per distinctive page (K): {}",
+        config.max_books_per_page
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "- Minimum quality: {}", config.min_quality).map_err(io_error)?;
+    writeln!(writer, "- Coverage cut: {:.6}", config.coverage_threshold).map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Minimum matched pages: {}",
+        config.min_matched_pages
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Default calibration basis: coverage 0.5 was measured against 37 Contains results from 511 parent-directory groups / 19,306 real pages. Five matched only 1–2 pages; the other 32 were genuine relations and matched at least 10 pages, which set the default minimum matched-page floor to 3."
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- PDF render long edge: {}",
+        config
+            .render_long_edge
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string())
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Books: {}; scanned pages: {}",
+        config.book_count, config.page_count
+    )
+    .map_err(io_error)?;
+
+    let mut relation_counts = BTreeMap::<&str, usize>::new();
+    for name in ["same", "contains", "unrelated", "undecidable"] {
+        relation_counts.insert(name, 0);
+    }
+    for pair in &pairs {
+        *relation_counts.entry(&pair.relation).or_default() += 1;
+    }
+    let undecidable_books = books
+        .iter()
+        .filter(|book| book.undecidable_reason.is_some())
+        .count();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Relationship counts").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Relation | Count |").map_err(io_error)?;
+    writeln!(writer, "|---|---:|").map_err(io_error)?;
+    for name in ["same", "contains", "unrelated", "undecidable"] {
+        writeln!(writer, "| {name} | {} |", relation_counts[name]).map_err(io_error)?;
+    }
+    writeln!(writer, "| undecidable books | {undecidable_books} |").map_err(io_error)?;
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Contains relationships").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    let contains = pairs
+        .iter()
+        .filter(|pair| pair.relation == "contains")
+        .collect::<Vec<_>>();
+    if contains.is_empty() {
+        writeln!(writer, "No Contains relationship was measured.").map_err(io_error)?;
+    } else {
+        writeln!(
+            writer,
+            "| Contained book | Whole book | Matched | Contained coverage | Whole coverage | Aligned page bands |"
+        )
+        .map_err(io_error)?;
+        writeln!(writer, "|---|---|---:|---:|---:|---|").map_err(io_error)?;
+        for pair in contains {
+            let whole = pair.whole.expect("validated contains whole");
+            let subset = if whole == pair.a { pair.b } else { pair.a };
+            let subset_coverage = if subset == pair.a {
+                pair.coverage_a
+            } else {
+                pair.coverage_b
+            };
+            let whole_coverage = if whole == pair.a {
+                pair.coverage_a
+            } else {
+                pair.coverage_b
+            };
+            writeln!(
+                writer,
+                "| {} | {} | {} | {:.4} | {:.4} | {} |",
+                markdown_path(book_paths[&subset]),
+                markdown_path(book_paths[&whole]),
+                pair.matched,
+                subset_coverage,
+                whole_coverage,
+                format_alignment_bands(pair, subset == pair.a)
+            )
+            .map_err(io_error)?;
+        }
+    }
+
+    let coverage_values = pairs
+        .iter()
+        .flat_map(|pair| [pair.coverage_a as f64, pair.coverage_b as f64])
+        .collect::<Vec<_>>();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Coverage distribution").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Directions | min | p50 | p90 | p99 | max |").map_err(io_error)?;
+    writeln!(writer, "|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| {} | {} | {} | {} | {} | {} |",
+        coverage_values.len(),
+        format_decimal(minimum(&coverage_values)),
+        format_decimal(percentile(&coverage_values, 50.0)),
+        format_decimal(percentile(&coverage_values, 90.0)),
+        format_decimal(percentile(&coverage_values, 99.0)),
+        format_decimal(maximum(&coverage_values))
+    )
+    .map_err(io_error)?;
+
+    let distinctive_values = books
+        .iter()
+        .map(|book| book.distinctive_pages as f64)
+        .collect::<Vec<_>>();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Distinctive-page distribution").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Books | min | p50 | p90 | p99 | max |").map_err(io_error)?;
+    writeln!(writer, "|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| {} | {} | {} | {} | {} | {} |",
+        distinctive_values.len(),
+        format_integer(minimum(&distinctive_values)),
+        format_integer(percentile(&distinctive_values, 50.0)),
+        format_integer(percentile(&distinctive_values, 90.0)),
+        format_integer(percentile(&distinctive_values, 99.0)),
+        format_integer(maximum(&distinctive_values))
+    )
+    .map_err(io_error)?;
+
+    let featureless_pages: u64 = books.iter().map(|book| book.featureless_pages as u64).sum();
+    let common_pages: u64 = books.iter().map(|book| book.common_pages as u64).sum();
+    let books_with_featureless = books
+        .iter()
+        .filter(|book| book.featureless_pages > 0)
+        .count();
+    let books_with_common = books.iter().filter(|book| book.common_pages > 0).count();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Excluded pages").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Reason | Pages | Books affected |").map_err(io_error)?;
+    writeln!(writer, "|---|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| quality below min_quality | {featureless_pages} | {books_with_featureless} |"
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "| direct radius neighborhood spans more than K books | {common_pages} | {books_with_common} |"
+    )
+    .map_err(io_error)?;
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Undecidable books").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    if undecidable_books == 0 {
+        writeln!(writer, "No book was undecidable.").map_err(io_error)?;
+    } else {
+        writeln!(writer, "| Book | Reason | Scanned / declared pages |").map_err(io_error)?;
+        writeln!(writer, "|---|---|---:|").map_err(io_error)?;
+        for book in books
+            .iter()
+            .filter(|book| book.undecidable_reason.is_some())
+        {
+            writeln!(
+                writer,
+                "| {} | {} | {} / {} |",
+                markdown_path(&book.path),
+                book.undecidable_reason.as_deref().unwrap_or_default(),
+                book.scanned_page_count,
+                book.declared_page_count
+            )
+            .map_err(io_error)?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!("books-report: wrote {}", output.display());
+    Ok(())
+}
+
+fn validate_books_schema(schema_version: u32, input: &Path) -> Result<()> {
+    if schema_version == SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} contains schema version {}, expected {}",
+            input.display(),
+            schema_version,
+            SCHEMA_VERSION
+        ))
+    }
+}
+
+fn markdown_path(path: &Path) -> String {
+    path.display().to_string().replace('|', "\\|")
+}
+
+fn format_decimal(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"))
+}
+
+fn format_integer(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.0}"))
+}
+
+fn format_alignment_bands(pair: &BooksPairRecord, subset_is_a: bool) -> String {
+    let mut coordinates = pair
+        .alignment
+        .iter()
+        .map(|&(a, b)| if subset_is_a { (a, b) } else { (b, a) })
+        .collect::<Vec<_>>();
+    if coordinates.is_empty() {
+        return "none".to_owned();
+    }
+    coordinates.sort_unstable();
+    let mut bands = Vec::new();
+    let mut start = coordinates[0];
+    let mut end = start;
+    for coordinate in coordinates.into_iter().skip(1) {
+        if coordinate.0 == end.0 + 1 && coordinate.1 == end.1 + 1 {
+            end = coordinate;
+        } else {
+            bands.push(format_page_band(start, end));
+            start = coordinate;
+            end = coordinate;
+        }
+    }
+    bands.push(format_page_band(start, end));
+    bands.join("; ")
+}
+
+fn format_page_band(start: (u32, u32), end: (u32, u32)) -> String {
+    format!(
+        "contained {}-{} -> whole {}-{}",
+        start.0 + 1,
+        end.0 + 1,
+        start.1 + 1,
+        end.1 + 1
+    )
+}
+
+fn collect_image_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
+    }
+    let mut paths = Vec::new();
+    collect_image_paths_inner(dir, recursive, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_image_paths_inner(dir: &Path, recursive: bool, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
+    let mut entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("read directory entry in {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("read file type {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if recursive {
+                collect_image_paths_inner(&path, true, paths)?;
+            }
+        } else if file_type.is_file() && is_supported_image(&path) && !is_apple_double(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_pdf_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
+    }
+    let mut paths = Vec::new();
+    collect_pdf_paths_inner(dir, recursive, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_pdf_paths_inner(dir: &Path, recursive: bool, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
+    let mut entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("read directory entry in {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("read file type {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if recursive {
+                collect_pdf_paths_inner(&path, true, paths)?;
+            }
+        } else if file_type.is_file() && extension_lower(&path) == "pdf" {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| SUPPORTED_EXTENSIONS.contains(&extension.as_str()))
+}
+
+fn scan_one(path: &Path) -> Result<ScanRecord> {
+    let total_start = Instant::now();
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| format!("metadata {}: {error}", path.display()))?
+        .len();
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("read image {}: {error}", path.display()))?;
+
+    let canonical = proxy_from_source(
+        ProxySource::File {
+            path,
+            verified_bytes: Some(&bytes),
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let signature_start = Instant::now();
+    let signatures = dupe::all_algos()
+        .iter()
+        .map(|&algo| store_signature(dupe::compute(algo, &canonical.proxy)))
+        .collect();
+    let signature_ms = canonical.proxy_ms + elapsed_ms(signature_start);
+
+    Ok(ScanRecord {
+        schema_version: SCHEMA_VERSION,
+        proxy_version: dupe::PROXY_VERSION,
+        path: path.to_path_buf(),
+        width: canonical.source_dims.0,
+        height: canonical.source_dims.1,
+        file_size,
+        extension: extension_lower(path),
+        decode: DecodeInfo {
+            method: canonical.method.as_str().to_owned(),
+            scale_num: canonical.scale_num,
+            scale_den: canonical.scale_den,
+            decoded_width: canonical.decoded_dims.0,
+            decoded_height: canonical.decoded_dims.1,
+            note: canonical.note,
+        },
+        decode_ms: canonical.decode_ms,
+        signature_ms,
+        total_ms: elapsed_ms(total_start),
+        signatures,
+    })
+}
+
+fn decode_jpeg_at_target(path: &Path, bytes: &[u8], target_edge: u32) -> Result<DecodedImage> {
+    match decode_jpeg_turbo_scaled_from_bytes(bytes, target_edge) {
+        Ok((image, stats)) => {
+            let orientation = read_exif_orientation_for_source_dims(bytes);
+            let image = apply_exif_orientation_from_bytes(image, bytes);
+            let source_dims = stats.source_dims_after_exif(orientation);
+            Ok(DecodedImage {
+                rgba: image.to_rgba8(),
+                source_dims,
+            })
+        }
+        Err(DctDecodeError::TerminalRejection(error)) => Err(format!(
+            "terminal JPEG rejection for {}: {error}",
+            path.display()
+        )),
+        Err(DctDecodeError::Fallback(_)) => {
+            let (image, _, _) = decode_full(path, bytes)?;
+            let image = apply_exif_orientation(image, path);
+            let source_dims = image.dimensions();
+            Ok(DecodedImage {
+                rgba: image.to_rgba8(),
+                source_dims,
+            })
+        }
+    }
+}
+
+fn selfcheck_pdf_page<W: Write>(writer: &mut W, path: &Path, page_num: u32) -> Result<usize> {
+    let render_512 = render_pdf_page_signatures(path, page_num, 512)?;
+    let render_1024 = render_pdf_page_signatures(path, page_num, 1024)?;
+    let render_2048 = render_pdf_page_signatures(path, page_num, 2048)?;
+    let jpeg_bytes = encode_jpeg(&render_1024.rgba, 95)?;
+    let jpeg_canonical = proxy_from_source(
+        ProxySource::Encoded {
+            filename_hint: "pdf-selfcheck.jpg",
+            bytes: &jpeg_bytes,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let jpeg_dims = jpeg_canonical.source_dims;
+    let jpeg_signatures = PreparedSignatures::compute(&jpeg_canonical.proxy);
+    let source_path = PathBuf::from(format!("{}::page_{}", path.display(), page_num));
+    let mut records = 0;
+
+    for (transformation, left, right) in [
+        ("pdf_render_512_vs_1024", &render_512, &render_1024),
+        ("pdf_render_1024_vs_2048", &render_1024, &render_2048),
+        ("pdf_render_512_vs_2048", &render_512, &render_2048),
+    ] {
+        records += write_synth_comparison(
+            writer,
+            "related",
+            transformation,
+            &source_path,
+            None,
+            left.dims,
+            right.dims,
+            &left.signatures,
+            &right.signatures,
+            DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+        )?;
+    }
+
+    records += write_synth_comparison(
+        writer,
+        "related",
+        "pdf_render_1024_vs_jpeg_q95_scan_path",
+        &source_path,
+        None,
+        render_1024.dims,
+        jpeg_dims,
+        &render_1024.signatures,
+        &jpeg_signatures,
+        DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+    )?;
+    Ok(records)
+}
+
+fn render_pdf_page_signatures(
+    path: &Path,
+    page_num: u32,
+    long_edge: u32,
+) -> Result<RenderedPageSignatures> {
+    let rendered = pdf_loader::render_page(
+        path,
+        page_num,
+        long_edge,
+        None,
+        None,
+        JobPriority::Normal,
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )
+    .map_err(|error| {
+        format!(
+            "render {} page {} at long edge {long_edge}: {error}",
+            path.display(),
+            page_num + 1
+        )
+    })?;
+    let rgba = rendered.image.to_rgba8();
+    let dims = rgba.dimensions();
+    let signatures = signatures_from_rgba(&rgba, dims);
+    Ok(RenderedPageSignatures {
+        rgba,
+        dims,
+        signatures,
+    })
+}
+
+fn pdf_password_required(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.to_string().to_ascii_lowercase().contains("password")
+}
+
+fn decode_full(path: &Path, bytes: &[u8]) -> Result<(DynamicImage, String, String)> {
+    match image::load_from_memory(bytes) {
+        Ok(image) => Ok((image, "image_full".to_owned(), "direct decode".to_owned())),
+        Err(image_error) => match mimageviewer::wic_decoder::decode_to_dynamic_image(path) {
+            Some(image) => Ok((
+                image,
+                "wic_full".to_owned(),
+                format!("image crate failed: {image_error}"),
+            )),
+            None => Err(format!(
+                "decode {}: image crate failed ({image_error}); WIC failed",
+                path.display()
+            )),
+        },
+    }
+}
+
+fn read_exif_orientation_for_source_dims(bytes: &[u8]) -> u16 {
+    rexif::parse_buffer(bytes)
+        .ok()
+        .and_then(|exif| {
+            exif.entries
+                .iter()
+                .find(|entry| entry.ifd.tag == 274)
+                .and_then(|entry| {
+                    entry
+                        .value
+                        .to_i64(0)
+                        .and_then(|value| u16::try_from(value).ok())
+                        .filter(|value| (1..=8).contains(value))
+                        .or_else(|| {
+                            entry
+                                .value_more_readable
+                                .trim()
+                                .parse::<u16>()
+                                .ok()
+                                .filter(|value| (1..=8).contains(value))
+                        })
+                        .or_else(|| orientation_from_text(&entry.value_more_readable))
+                })
+        })
+        .unwrap_or(1)
+}
+
+fn orientation_from_text(text: &str) -> Option<u16> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("straight") || text.contains("normal") {
+        Some(1)
+    } else if text.contains("rotated to left") || text.contains("90 cw") {
+        Some(6)
+    } else if text.contains("upside down") || text.contains("180") {
+        Some(3)
+    } else if text.contains("rotated to right")
+        || text.contains("270 cw")
+        || text.contains("90 ccw")
+    {
+        Some(8)
+    } else if text.contains("mirrored horizontally") {
+        Some(2)
+    } else if text.contains("mirrored vertically") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn store_signature(signature: Signature) -> StoredSignature {
+    let (kind, bytes, bit_width, value_count) = match signature.sig {
+        Sig::Bits(bytes) => (
+            "bits".to_owned(),
+            bytes,
+            Some(match signature.algo {
+                Algo::Pdq256 | Algo::Blockhash256 => 256,
+                Algo::Pdq64 => 64,
+                Algo::Phash63 => 63,
+                Algo::Luma32 => unreachable!("Luma32 cannot contain Bits"),
+            }),
+            None,
+        ),
+        Sig::Luma(bytes) => ("luma".to_owned(), bytes, None, Some(32 * 32)),
+    };
+    StoredSignature {
+        algo: algo_name(signature.algo).to_owned(),
+        kind,
+        hex: encode_hex(&bytes),
+        bit_width,
+        value_count,
+        quality: signature.quality,
+    }
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1_000.0
+}
+
+fn extension_lower(path: &Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn run_pairs(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut max_pairs = None;
+    let mut loose = false;
+    let mut bins = CandidateBins::exhaustive(DEFAULT_LARGE_DIFF_THRESHOLD_BIN);
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--max-pairs" => {
+                max_pairs = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            "--loose" => loose = true,
+            "--pdq256-bin" => {
+                bins.pdq256 = Some(parse_bounded_u32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                    256,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--pdq64-bin" => {
+                bins.pdq64 = Some(parse_bounded_u32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                    64,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--phash63-bin" => {
+                bins.phash63 = Some(parse_bounded_u32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                    63,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--blockhash256-bin" => {
+                bins.blockhash256 = Some(parse_bounded_u32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                    256,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--luma-l1-bin" => {
+                bins.luma_l1 = Some(parse_nonnegative_f32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--luma-gain-offset-bin" => {
+                bins.luma_gain_offset = Some(parse_nonnegative_f32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--luma-grad-bin" => {
+                bins.luma_grad = Some(parse_nonnegative_f32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--luma-large-diff-area-bin" => {
+                let value = parse_nonnegative_f32(&take_value(args, &mut index, flag)?, flag)?;
+                if value > 1.0 {
+                    return Err(format!("{flag} must be in the metric domain 0..=1"));
+                }
+                bins.luma_large_diff_area = Some(value);
+                bins.exhaustive = false;
+            }
+            "--aspect-ratio-delta-bin" => {
+                bins.aspect_ratio_delta = Some(parse_nonnegative_f32(
+                    &take_value(args, &mut index, flag)?,
+                    flag,
+                )?);
+                bins.exhaustive = false;
+            }
+            "--large-diff-threshold-bin" => {
+                bins.large_diff_threshold_bin =
+                    parse_u8(&take_value(args, &mut index, flag)?, flag)?;
+            }
+            _ => return Err(format!("unknown pairs option {flag:?}")),
+        }
+        index += 1;
+    }
+    if loose && bins.has_selected_bin() {
+        return Err("--loose cannot be combined with a candidate bin".to_owned());
+    }
+    if loose {
+        bins = CandidateBins::exhaustive(bins.large_diff_threshold_bin);
+    }
+    if !bins.exhaustive {
+        validate_all_algorithms_have_candidate_bins(&bins)?;
+    }
+
+    let input = input.ok_or_else(|| "pairs requires --in".to_owned())?;
+    let output = output.ok_or_else(|| "pairs requires --out".to_owned())?;
+    let scan_records: Vec<ScanRecord> = read_jsonl(&input)?;
+    let prepared: Vec<PreparedScan> = scan_records
+        .iter()
+        .map(prepare_scan_record)
+        .collect::<Result<_>>()?;
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut emitted = 0usize;
+
+    'outer: for left in 0..prepared.len() {
+        for right in left + 1..prepared.len() {
+            if max_pairs.is_some_and(|maximum| emitted >= maximum) {
+                break 'outer;
+            }
+            let a = &prepared[left];
+            let b = &prepared[right];
+            let distances = pair_distances(
+                &a.signatures,
+                &b.signatures,
+                a.dims,
+                b.dims,
+                bins.large_diff_threshold_bin,
+            )?;
+            let candidate_by = candidate_reasons(&distances, &bins);
+            if candidate_by.is_empty() {
+                continue;
+            }
+            let record = PairRecord {
+                schema_version: SCHEMA_VERSION,
+                path_a: a.path.clone(),
+                path_b: b.path.clone(),
+                dims_a: a.dims,
+                dims_b: b.dims,
+                distances,
+                candidate_by,
+                bins: bins.clone(),
+            };
+            write_json_line(&mut writer, &record)?;
+            emitted += 1;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!("wrote {emitted} candidate pairs to {}", output.display());
+    Ok(())
+}
+
+fn validate_all_algorithms_have_candidate_bins(bins: &CandidateBins) -> Result<()> {
+    let mut missing = Vec::new();
+    if bins.pdq256.is_none() {
+        missing.push("Pdq256");
+    }
+    if bins.pdq64.is_none() {
+        missing.push("Pdq64");
+    }
+    if bins.phash63.is_none() {
+        missing.push("Phash63");
+    }
+    if bins.blockhash256.is_none() {
+        missing.push("Blockhash256");
+    }
+    if bins.luma_l1.is_none()
+        && bins.luma_gain_offset.is_none()
+        && bins.luma_grad.is_none()
+        && bins.luma_large_diff_area.is_none()
+        && bins.aspect_ratio_delta.is_none()
+    {
+        missing.push("Luma32");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "a filtered candidate pool must include every algorithm; missing bins for {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn parse_bounded_u32(value: &str, flag: &str, maximum: u32) -> Result<u32> {
+    let parsed = parse_u32(value, flag)?;
+    if parsed <= maximum {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be in the metric domain 0..={maximum}"))
+    }
+}
+
+fn prepare_scan_record(record: &ScanRecord) -> Result<PreparedScan> {
+    if record.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "{} has schema version {}, expected {}",
+            record.path.display(),
+            record.schema_version,
+            SCHEMA_VERSION
+        ));
+    }
+    if record.proxy_version != dupe::PROXY_VERSION {
+        return Err(format!(
+            "{} has proxy version {}, expected {}",
+            record.path.display(),
+            record.proxy_version,
+            dupe::PROXY_VERSION
+        ));
+    }
+    Ok(PreparedScan {
+        path: record.path.clone(),
+        dims: (record.width, record.height),
+        signatures: PreparedSignatures {
+            pdq256: restore_signature(record, Algo::Pdq256)?,
+            pdq64: restore_signature(record, Algo::Pdq64)?,
+            phash63: restore_signature(record, Algo::Phash63)?,
+            blockhash256: restore_signature(record, Algo::Blockhash256)?,
+            luma32: restore_signature(record, Algo::Luma32)?,
+        },
+    })
+}
+
+fn restore_signature(record: &ScanRecord, algo: Algo) -> Result<Signature> {
+    let name = algo_name(algo);
+    let matches: Vec<_> = record
+        .signatures
+        .iter()
+        .filter(|signature| signature.algo == name)
+        .collect();
+    if matches.len() != 1 {
+        return Err(format!(
+            "{} contains {} {name} signatures, expected exactly one",
+            record.path.display(),
+            matches.len()
+        ));
+    }
+    let stored = matches[0];
+    let bytes = decode_hex(&stored.hex)?;
+    let sig = match algo {
+        Algo::Pdq256 | Algo::Blockhash256 => {
+            validate_stored_shape(stored, "bits", Some(256), None, 32)?;
+            Sig::Bits(bytes.into_boxed_slice())
+        }
+        Algo::Pdq64 => {
+            validate_stored_shape(stored, "bits", Some(64), None, 8)?;
+            Sig::Bits(bytes.into_boxed_slice())
+        }
+        Algo::Phash63 => {
+            validate_stored_shape(stored, "bits", Some(63), None, 8)?;
+            if bytes[0] & 0x80 != 0 {
+                return Err(format!("{} has a 64th Phash63 bit", record.path.display()));
+            }
+            Sig::Bits(bytes.into_boxed_slice())
+        }
+        Algo::Luma32 => {
+            validate_stored_shape(stored, "luma", None, Some(32 * 32), 32 * 32)?;
+            Sig::Luma(bytes.into_boxed_slice())
+        }
+    };
+    Ok(Signature {
+        algo,
+        sig,
+        quality: stored.quality,
+    })
+}
+
+fn validate_stored_shape(
+    stored: &StoredSignature,
+    kind: &str,
+    bit_width: Option<u32>,
+    value_count: Option<u32>,
+    byte_len: usize,
+) -> Result<()> {
+    if stored.kind != kind
+        || stored.bit_width != bit_width
+        || stored.value_count != value_count
+        || stored.hex.len() != byte_len * 2
+    {
+        return Err(format!("invalid stored shape for {}", stored.algo));
+    }
+    Ok(())
+}
+
+fn pair_distances(
+    a: &PreparedSignatures,
+    b: &PreparedSignatures,
+    dims_a: (u32, u32),
+    dims_b: (u32, u32),
+    large_diff_threshold_bin: u8,
+) -> Result<PairDistances> {
+    Ok(PairDistances {
+        pdq256: required_hamming(&a.pdq256.sig, &b.pdq256.sig, "Pdq256")?,
+        pdq64: required_hamming(&a.pdq64.sig, &b.pdq64.sig, "Pdq64")?,
+        phash63: required_hamming(&a.phash63.sig, &b.phash63.sig, "Phash63")?,
+        blockhash256: required_hamming(&a.blockhash256.sig, &b.blockhash256.sig, "Blockhash256")?,
+        luma32: dupe::luma_metrics(
+            &a.luma32.sig,
+            &b.luma32.sig,
+            dims_a,
+            dims_b,
+            large_diff_threshold_bin,
+        )
+        .ok_or_else(|| "Luma32 signature types or dimensions do not match".to_owned())?
+        .into(),
+    })
+}
+
+fn required_hamming(a: &Sig, b: &Sig, name: &str) -> Result<u32> {
+    dupe::hamming(a, b).ok_or_else(|| format!("{name} signature types or widths do not match"))
+}
+
+fn candidate_reasons(distances: &PairDistances, bins: &CandidateBins) -> Vec<String> {
+    if bins.exhaustive {
+        return vec!["exhaustive".to_owned()];
+    }
+    let mut reasons = Vec::new();
+    push_if_within(&mut reasons, "Pdq256", distances.pdq256, bins.pdq256);
+    push_if_within(&mut reasons, "Pdq64", distances.pdq64, bins.pdq64);
+    push_if_within(&mut reasons, "Phash63", distances.phash63, bins.phash63);
+    push_if_within(
+        &mut reasons,
+        "Blockhash256",
+        distances.blockhash256,
+        bins.blockhash256,
+    );
+    push_if_within_f32(&mut reasons, "Luma32.l1", distances.luma32.l1, bins.luma_l1);
+    push_if_within_f32(
+        &mut reasons,
+        "Luma32.l1_gain_offset",
+        distances.luma32.l1_gain_offset,
+        bins.luma_gain_offset,
+    );
+    push_if_within_f32(
+        &mut reasons,
+        "Luma32.grad_l1",
+        distances.luma32.grad_l1,
+        bins.luma_grad,
+    );
+    push_if_within_f32(
+        &mut reasons,
+        "Luma32.large_diff_area",
+        distances.luma32.large_diff_area,
+        bins.luma_large_diff_area,
+    );
+    push_if_within_f32(
+        &mut reasons,
+        "Luma32.aspect_ratio_delta",
+        distances.luma32.aspect_ratio_delta,
+        bins.aspect_ratio_delta,
+    );
+    reasons
+}
+
+fn push_if_within(reasons: &mut Vec<String>, name: &str, value: u32, bin: Option<u32>) {
+    if bin.is_some_and(|maximum| value <= maximum) {
+        reasons.push(name.to_owned());
+    }
+}
+
+fn push_if_within_f32(reasons: &mut Vec<String>, name: &str, value: f32, bin: Option<f32>) {
+    if bin.is_some_and(|maximum| value <= maximum) {
+        reasons.push(name.to_owned());
+    }
+}
+
+fn run_synth(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut limit = None;
+    let mut recursive = false;
+    let mut large_diff_threshold_bin = DEFAULT_LARGE_DIFF_THRESHOLD_BIN;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            "--recursive" => recursive = true,
+            "--large-diff-threshold-bin" => {
+                large_diff_threshold_bin = parse_u8(&take_value(args, &mut index, flag)?, flag)?
+            }
+            _ => return Err(format!("unknown synth option {flag:?}")),
+        }
+        index += 1;
+    }
+    let dir = dir.ok_or_else(|| "synth requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "synth requires --out".to_owned())?;
+    let mut paths = collect_image_paths(&dir, recursive)?;
+    if let Some(limit) = limit {
+        paths = stride_sample(paths, limit);
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut originals = Vec::with_capacity(paths.len());
+    let mut record_count = 0usize;
+
+    for path in &paths {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("read image {}: {error}", path.display()))?;
+        let canonical = proxy_from_source(
+            ProxySource::File {
+                path,
+                verified_bytes: Some(&bytes),
+            },
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let dims = canonical.source_dims;
+        let original_signatures = PreparedSignatures::compute(&canonical.proxy);
+
+        // This full-resolution decode only supplies pixels from which synthetic
+        // files are generated. It is never used to compute a signature.
+        let rgba = decode_full_oriented_for_synthesis(path, &bytes)?;
+
+        for (label, numerator) in [
+            ("scale_50pct", 50),
+            ("scale_75pct", 75),
+            ("scale_25pct", 25),
+        ] {
+            let transformed = scale_percent(&rgba, numerator);
+            record_count += emit_related_transform(
+                &mut writer,
+                path,
+                dims,
+                &original_signatures,
+                label,
+                &transformed,
+                large_diff_threshold_bin,
+            )?;
+        }
+
+        for quality in [95u8, 85, 70] {
+            record_count += emit_jpeg_transform(
+                &mut writer,
+                path,
+                dims,
+                &original_signatures,
+                &format!("jpeg_q{quality}"),
+                &rgba,
+                quality,
+                large_diff_threshold_bin,
+            )?;
+        }
+
+        if extension_lower(path) == "png" {
+            // The conversion reuses q=95 from the explicitly specified JPEG
+            // recompression levels; it does not introduce another quality value.
+            record_count += emit_jpeg_transform(
+                &mut writer,
+                path,
+                dims,
+                &original_signatures,
+                "png_to_jpeg_q95",
+                &rgba,
+                95,
+                large_diff_threshold_bin,
+            )?;
+        }
+
+        for (label, area_fraction) in [("logo_area_1pct", 0.01), ("logo_area_4pct", 0.04)] {
+            let transformed = add_bottom_right_logo(&rgba, area_fraction);
+            record_count += emit_related_transform(
+                &mut writer,
+                path,
+                dims,
+                &original_signatures,
+                label,
+                &transformed,
+                large_diff_threshold_bin,
+            )?;
+        }
+
+        let transformed = gain_and_offset(&rgba, 1.05, 8.0);
+        record_count += emit_related_transform(
+            &mut writer,
+            path,
+            dims,
+            &original_signatures,
+            "gain_1.05_offset_plus_8",
+            &transformed,
+            large_diff_threshold_bin,
+        )?;
+
+        originals.push(PreparedScan {
+            path: path.clone(),
+            dims,
+            signatures: original_signatures,
+        });
+    }
+
+    for left in 0..originals.len() {
+        for right in left + 1..originals.len() {
+            let a = &originals[left];
+            let b = &originals[right];
+            record_count += write_synth_comparison(
+                &mut writer,
+                "unrelated",
+                "unrelated_pair",
+                &a.path,
+                Some(&b.path),
+                a.dims,
+                b.dims,
+                &a.signatures,
+                &b.signatures,
+                large_diff_threshold_bin,
+            )?;
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!(
+        "wrote {record_count} synthetic measurements to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn decode_full_oriented_for_synthesis(path: &Path, bytes: &[u8]) -> Result<RgbaImage> {
+    let image = if matches!(extension_lower(path).as_str(), "jpg" | "jpeg") {
+        match decode_jpeg_turbo_scaled_from_bytes(bytes, u32::MAX) {
+            Ok((image, _)) => apply_exif_orientation_from_bytes(image, bytes),
+            Err(DctDecodeError::TerminalRejection(error)) => {
+                return Err(format!(
+                    "terminal JPEG rejection for {}: {error}",
+                    path.display()
+                ));
+            }
+            Err(DctDecodeError::Fallback(_)) => {
+                let (image, _, _) = decode_full(path, bytes)?;
+                apply_exif_orientation(image, path)
+            }
+        }
+    } else {
+        let (image, _, _) = decode_full(path, bytes)?;
+        apply_exif_orientation(image, path)
+    };
+    Ok(image.to_rgba8())
+}
+
+fn signatures_from_rgba(rgba: &RgbaImage, source_dims: (u32, u32)) -> PreparedSignatures {
+    let image = DynamicImage::ImageRgba8(rgba.clone());
+    let proxy = proxy_from_source(
+        ProxySource::Raster {
+            image: &image,
+            source_dims,
+            format: SimilarImageFormat::Other,
+        },
+        None,
+    )
+    .expect("raster Proxy source is infallible")
+    .proxy;
+    PreparedSignatures::compute(&proxy)
+}
+
+fn emit_related_transform<W: Write>(
+    writer: &mut W,
+    source_path: &Path,
+    original_dims: (u32, u32),
+    original_signatures: &PreparedSignatures,
+    transformation: &str,
+    transformed: &RgbaImage,
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    // Pixel-only transforms are materialized losslessly so their named change
+    // is not conflated with an invented compression quality.
+    let encoded = encode_png(transformed)?;
+    emit_encoded_related_transform(
+        writer,
+        source_path,
+        original_dims,
+        original_signatures,
+        transformation,
+        "png",
+        &encoded,
+        large_diff_threshold_bin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_jpeg_transform<W: Write>(
+    writer: &mut W,
+    source_path: &Path,
+    original_dims: (u32, u32),
+    original_signatures: &PreparedSignatures,
+    transformation: &str,
+    transformed: &RgbaImage,
+    quality: u8,
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    let encoded = encode_jpeg(transformed, quality)?;
+    emit_encoded_related_transform(
+        writer,
+        source_path,
+        original_dims,
+        original_signatures,
+        transformation,
+        "jpg",
+        &encoded,
+        large_diff_threshold_bin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_encoded_related_transform<W: Write>(
+    writer: &mut W,
+    source_path: &Path,
+    original_dims: (u32, u32),
+    original_signatures: &PreparedSignatures,
+    transformation: &str,
+    extension: &str,
+    encoded: &[u8],
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    let synthetic_path = source_path.with_extension(extension);
+    let filename_hint = synthetic_path.to_string_lossy();
+    let canonical = proxy_from_source(
+        ProxySource::Encoded {
+            filename_hint: filename_hint.as_ref(),
+            bytes: encoded,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let transformed_dims = canonical.source_dims;
+    let transformed_signatures = PreparedSignatures::compute(&canonical.proxy);
+    write_synth_comparison(
+        writer,
+        "related",
+        transformation,
+        source_path,
+        None,
+        original_dims,
+        transformed_dims,
+        original_signatures,
+        &transformed_signatures,
+        large_diff_threshold_bin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_synth_comparison<W: Write>(
+    writer: &mut W,
+    relation: &str,
+    transformation: &str,
+    source_path: &Path,
+    other_path: Option<&Path>,
+    dims_a: (u32, u32),
+    dims_b: (u32, u32),
+    signatures_a: &PreparedSignatures,
+    signatures_b: &PreparedSignatures,
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    for &algo in dupe::all_algos() {
+        let a = signatures_a.get(algo);
+        let b = signatures_b.get(algo);
+        let distance = if algo == Algo::Luma32 {
+            let metrics =
+                dupe::luma_metrics(&a.sig, &b.sig, dims_a, dims_b, large_diff_threshold_bin)
+                    .ok_or_else(|| {
+                        "Luma32 signature types or dimensions do not match".to_owned()
+                    })?;
+            SynthDistance::Luma {
+                metrics: metrics.into(),
+            }
+        } else {
+            SynthDistance::Hamming {
+                value: required_hamming(&a.sig, &b.sig, algo_name(algo))?,
+            }
+        };
+        let record = SynthRecord {
+            schema_version: SCHEMA_VERSION,
+            relation: relation.to_owned(),
+            transformation: transformation.to_owned(),
+            source_path: source_path.to_path_buf(),
+            other_path: other_path.map(Path::to_path_buf),
+            algo: algo_name(algo).to_owned(),
+            dims_a,
+            dims_b,
+            quality_a: a.quality,
+            quality_b: b.quality,
+            large_diff_threshold_bin,
+            distance,
+        };
+        write_json_line(writer, &record)?;
+    }
+    Ok(dupe::all_algos().len())
+}
+
+fn scale_percent(source: &RgbaImage, percent: u32) -> RgbaImage {
+    let width = ((source.width() as u64 * percent as u64 + 50) / 100).max(1) as u32;
+    let height = ((source.height() as u64 * percent as u64 + 50) / 100).max(1) as u32;
+    image::imageops::resize(source, width, height, image::imageops::FilterType::Lanczos3)
+}
+
+fn encode_jpeg(source: &RgbaImage, quality: u8) -> Result<Vec<u8>> {
+    let mut rgb = RgbImage::new(source.width(), source.height());
+    for (target, pixel) in rgb.pixels_mut().zip(source.pixels()) {
+        let alpha = pixel[3] as u16;
+        let inverse = 255 - alpha;
+        *target = Rgb([
+            ((pixel[0] as u16 * alpha + 255 * inverse + 127) / 255) as u8,
+            ((pixel[1] as u16 * alpha + 255 * inverse + 127) / 255) as u8,
+            ((pixel[2] as u16 * alpha + 255 * inverse + 127) / 255) as u8,
+        ]);
+    }
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
+        .encode_image(&DynamicImage::ImageRgb8(rgb))
+        .map_err(|error| format!("encode synthetic JPEG q={quality}: {error}"))?;
+    Ok(encoded)
+}
+
+fn encode_png(source: &RgbaImage) -> Result<Vec<u8>> {
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(source.clone())
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| format!("encode lossless synthetic PNG: {error}"))?;
+    Ok(encoded.into_inner())
+}
+
+fn add_bottom_right_logo(source: &RgbaImage, area_fraction: f64) -> RgbaImage {
+    let mut output = source.clone();
+    let image_area = source.width() as f64 * source.height() as f64;
+    let target_area = (image_area * area_fraction).round().max(1.0);
+    let logo_width = (target_area.sqrt().round() as u32)
+        .max(1)
+        .min(source.width());
+    let logo_height = ((target_area / logo_width as f64).ceil() as u32)
+        .max(1)
+        .min(source.height());
+    let start_x = source.width() - logo_width;
+    let start_y = source.height() - logo_height;
+    for local_y in 0..logo_height {
+        for local_x in 0..logo_width {
+            let border = local_x == 0
+                || local_y == 0
+                || local_x + 1 == logo_width
+                || local_y + 1 == logo_height;
+            let diagonal =
+                local_x as u64 * logo_height as u64 / logo_width.max(1) as u64 == local_y as u64;
+            let value = if border || diagonal { 0 } else { 255 };
+            output.put_pixel(
+                start_x + local_x,
+                start_y + local_y,
+                Rgba([value, value, value, 255]),
+            );
+        }
+    }
+    output
+}
+
+fn gain_and_offset(source: &RgbaImage, gain: f32, offset: f32) -> RgbaImage {
+    let mut output = source.clone();
+    for pixel in output.pixels_mut() {
+        for channel in &mut pixel.0[..3] {
+            *channel = (*channel as f32 * gain + offset).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    output
+}
+
+fn run_report(args: &[String]) -> Result<()> {
+    let mut synth_path = None;
+    let mut pairs_path = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--synth" => synth_path = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--pairs" => pairs_path = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            _ => return Err(format!("unknown report option {flag:?}")),
+        }
+        index += 1;
+    }
+    let synth_path = synth_path.ok_or_else(|| "report requires --synth".to_owned())?;
+    let output = output.ok_or_else(|| "report requires --out".to_owned())?;
+    let synth_records: Vec<SynthRecord> = read_jsonl(&synth_path)?;
+
+    let mut related: BTreeMap<(String, String, String), Vec<f64>> = BTreeMap::new();
+    let mut unrelated: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut large_diff_bins = BTreeSet::new();
+    for record in &synth_records {
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{} contains synth schema version {}, expected {}",
+                synth_path.display(),
+                record.schema_version,
+                SCHEMA_VERSION
+            ));
+        }
+        large_diff_bins.insert(record.large_diff_threshold_bin);
+        for (metric, value) in synth_metric_values(record)? {
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite {}.{} measurement in {}",
+                    record.algo,
+                    metric,
+                    synth_path.display()
+                ));
+            }
+            match record.relation.as_str() {
+                "related" => related
+                    .entry((record.algo.clone(), metric, record.transformation.clone()))
+                    .or_default()
+                    .push(value),
+                "unrelated" => unrelated
+                    .entry((record.algo.clone(), metric))
+                    .or_default()
+                    .push(value),
+                other => return Err(format!("unknown synth relation {other:?}")),
+            }
+        }
+    }
+    if large_diff_bins.len() > 1 {
+        return Err(format!(
+            "{} mixes large-difference pixel bins ({}); report each bin separately",
+            synth_path.display(),
+            format_u8_set(&large_diff_bins)
+        ));
+    }
+
+    let pair_records = if let Some(path) = &pairs_path {
+        let records: Vec<PairRecord> = read_jsonl(path)?;
+        for record in &records {
+            if record.schema_version != SCHEMA_VERSION {
+                return Err(format!(
+                    "{} contains pair schema version {}, expected {}",
+                    path.display(),
+                    record.schema_version,
+                    SCHEMA_VERSION
+                ));
+            }
+        }
+        let distinct_bins: BTreeSet<_> = records
+            .iter()
+            .map(|record| {
+                serde_json::to_string(&record.bins)
+                    .map_err(|error| format!("serialize candidate bins: {error}"))
+            })
+            .collect::<Result<_>>()?;
+        if distinct_bins.len() > 1 {
+            return Err(format!(
+                "{} mixes candidate-bin configurations; report each configuration separately",
+                path.display()
+            ));
+        }
+        Some(records)
+    } else {
+        None
+    };
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "# Duplicate signature measurement report").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "> This report is measurement-only. It does not choose or recommend an accept/reject threshold."
+    )
+    .map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Measurement configuration").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Compiled default large-difference pixel bin: `{DEFAULT_LARGE_DIFF_THRESHOLD_BIN}` (not a recommendation)"
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Large-difference pixel bins present in synth input: `{}`",
+        format_u8_set(&large_diff_bins)
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Quantiles use nearest-rank order statistics; `p0.01` means the 0.01st percentile."
+    )
+    .map_err(io_error)?;
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Known-related transformations").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "| Algorithm | Metric | Transformation | N | p50 | p90 | p99 | max | unrelated min | gap (unrelated min - related max) |"
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    for ((algo, metric, transformation), values) in &related {
+        let related_max = maximum(values);
+        let unrelated_min = unrelated
+            .get(&(algo.clone(), metric.clone()))
+            .and_then(|values| minimum(values));
+        let gap = unrelated_min.zip(related_max).map(|(u, r)| u - r);
+        writeln!(
+            writer,
+            "| {algo} | {metric} | {transformation} | {} | {} | {} | {} | {} | {} | {} |",
+            values.len(),
+            format_value(metric, percentile(values, 50.0)),
+            format_value(metric, percentile(values, 90.0)),
+            format_value(metric, percentile(values, 99.0)),
+            format_value(metric, related_max),
+            format_value(metric, unrelated_min),
+            format_signed_value(metric, gap),
+        )
+        .map_err(io_error)?;
+    }
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Unrelated image pairs").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "| Algorithm | Metric | N | p0.01 | p0.1 | p1 | min |"
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "|---|---|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    for ((algo, metric), values) in &unrelated {
+        writeln!(
+            writer,
+            "| {algo} | {metric} | {} | {} | {} | {} | {} |",
+            values.len(),
+            format_value(metric, percentile(values, 0.01)),
+            format_value(metric, percentile(values, 0.1)),
+            format_value(metric, percentile(values, 1.0)),
+            format_value(metric, minimum(values)),
+        )
+        .map_err(io_error)?;
+    }
+
+    if let Some(records) = pair_records.as_deref() {
+        write_pair_report(&mut writer, records)?;
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!("wrote report to {}", output.display());
+    Ok(())
+}
+
+fn synth_metric_values(record: &SynthRecord) -> Result<Vec<(String, f64)>> {
+    match (&record.distance, record.algo.as_str()) {
+        (SynthDistance::Hamming { value }, "Pdq256" | "Pdq64" | "Phash63" | "Blockhash256") => {
+            Ok(vec![("hamming".to_owned(), *value as f64)])
+        }
+        (SynthDistance::Luma { metrics }, "Luma32") => Ok(vec![
+            ("l1".to_owned(), metrics.l1 as f64),
+            ("l1_gain_offset".to_owned(), metrics.l1_gain_offset as f64),
+            ("grad_l1".to_owned(), metrics.grad_l1 as f64),
+            ("large_diff_area".to_owned(), metrics.large_diff_area as f64),
+            (
+                "aspect_ratio_delta".to_owned(),
+                metrics.aspect_ratio_delta as f64,
+            ),
+        ]),
+        _ => Err(format!(
+            "distance kind does not match algorithm {}",
+            record.algo
+        )),
+    }
+}
+
+fn write_pair_report<W: Write>(writer: &mut W, records: &[PairRecord]) -> Result<()> {
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Candidate-pool measurements").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "- Emitted pair count: `{}`", records.len()).map_err(io_error)?;
+
+    let mut configurations = BTreeSet::new();
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut values: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    for record in records {
+        let configuration = serde_json::to_string(&record.bins)
+            .map_err(|error| format!("serialize candidate bins: {error}"))?;
+        configurations.insert(configuration);
+        for reason in &record.candidate_by {
+            *reasons.entry(reason.clone()).or_default() += 1;
+        }
+        append_pair_values(&mut values, &record.distances);
+    }
+    writeln!(
+        writer,
+        "- Distinct exact candidate-bin configurations present: `{}`",
+        configurations.len()
+    )
+    .map_err(io_error)?;
+    for configuration in configurations {
+        writeln!(writer, "  - `{configuration}`").map_err(io_error)?;
+    }
+    if records.is_empty() {
+        writeln!(
+            writer,
+            "- No pair record was available, so the JSONL contains no repeated bin configuration to report."
+        )
+        .map_err(io_error)?;
+    }
+    for (reason, count) in reasons {
+        writeln!(writer, "- Candidate reason `{reason}`: `{count}` pairs").map_err(io_error)?;
+    }
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "| Algorithm | Metric | N | min | p50 | p90 | p99 | max |"
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "|---|---|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    for ((algo, metric), metric_values) in values {
+        writeln!(
+            writer,
+            "| {algo} | {metric} | {} | {} | {} | {} | {} | {} |",
+            metric_values.len(),
+            format_value(&metric, minimum(&metric_values)),
+            format_value(&metric, percentile(&metric_values, 50.0)),
+            format_value(&metric, percentile(&metric_values, 90.0)),
+            format_value(&metric, percentile(&metric_values, 99.0)),
+            format_value(&metric, maximum(&metric_values)),
+        )
+        .map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn append_pair_values(
+    values: &mut BTreeMap<(String, String), Vec<f64>>,
+    distances: &PairDistances,
+) {
+    let mut push = |algo: &str, metric: &str, value: f64| {
+        values
+            .entry((algo.to_owned(), metric.to_owned()))
+            .or_default()
+            .push(value);
+    };
+    push("Pdq256", "hamming", distances.pdq256 as f64);
+    push("Pdq64", "hamming", distances.pdq64 as f64);
+    push("Phash63", "hamming", distances.phash63 as f64);
+    push("Blockhash256", "hamming", distances.blockhash256 as f64);
+    push("Luma32", "l1", distances.luma32.l1 as f64);
+    push(
+        "Luma32",
+        "l1_gain_offset",
+        distances.luma32.l1_gain_offset as f64,
+    );
+    push("Luma32", "grad_l1", distances.luma32.grad_l1 as f64);
+    push(
+        "Luma32",
+        "large_diff_area",
+        distances.luma32.large_diff_area as f64,
+    );
+    push(
+        "Luma32",
+        "aspect_ratio_delta",
+        distances.luma32.aspect_ratio_delta as f64,
+    );
+}
+
+fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = ((percentile / 100.0) * sorted.len() as f64).ceil();
+    let index = (rank.max(1.0) as usize - 1).min(sorted.len() - 1);
+    Some(sorted[index])
+}
+
+fn minimum(values: &[f64]) -> Option<f64> {
+    values.iter().copied().min_by(f64::total_cmp)
+}
+
+fn maximum(values: &[f64]) -> Option<f64> {
+    values.iter().copied().max_by(f64::total_cmp)
+}
+
+fn format_value(metric: &str, value: Option<f64>) -> String {
+    value.map_or_else(
+        || "n/a".to_owned(),
+        |value| {
+            if metric == "hamming" {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.6}")
+            }
+        },
+    )
+}
+
+fn format_signed_value(metric: &str, value: Option<f64>) -> String {
+    value.map_or_else(
+        || "n/a".to_owned(),
+        |value| {
+            if metric == "hamming" {
+                format!("{value:+.0}")
+            } else {
+                format!("{value:+.6}")
+            }
+        },
+    )
+}
+
+fn format_u8_set(values: &BTreeSet<u8>) -> String {
+    if values.is_empty() {
+        return "none".to_owned();
+    }
+    values
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn algo_name(algo: Algo) -> &'static str {
+    match algo {
+        Algo::Pdq256 => "Pdq256",
+        Algo::Pdq64 => "Pdq64",
+        Algo::Phash63 => "Phash63",
+        Algo::Blockhash256 => "Blockhash256",
+        Algo::Luma32 => "Luma32",
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("hex signature has odd length".to_owned());
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for index in (0..bytes.len()).step_by(2) {
+        let high = decode_hex_digit(bytes[index])?;
+        let low = decode_hex_digit(bytes[index + 1])?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_digit(digit: u8) -> Result<u8> {
+    match digit {
+        b'0'..=b'9' => Ok(digit - b'0'),
+        b'a'..=b'f' => Ok(digit - b'a' + 10),
+        b'A'..=b'F' => Ok(digit - b'A' + 10),
+        _ => Err(format!("invalid hex digit {:?}", digit as char)),
+    }
+}
+
+fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line
+            .map_err(|error| format!("read {} line {}: {error}", path.display(), line_index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str(&line).map_err(|error| {
+            format!("parse {} line {}: {error}", path.display(), line_index + 1)
+        })?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()> {
+    let file = File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        write_json_line(&mut writer, record)?;
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", path.display()))
+}
+
+fn write_json_line<W: Write, T: Serialize>(writer: &mut W, record: &T) -> Result<()> {
+    serde_json::to_writer(&mut *writer, record)
+        .map_err(|error| format!("serialize JSONL record: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("write JSONL record: {error}"))
+}
+
+fn io_error(error: std::io::Error) -> String {
+    error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_record(path: &str, marker: u8, quality: u8) -> ScanRecord {
+        let bits = vec![marker; 32];
+        ScanRecord {
+            schema_version: SCHEMA_VERSION,
+            proxy_version: dupe::PROXY_VERSION,
+            path: PathBuf::from(path),
+            width: 100,
+            height: 200,
+            file_size: 1,
+            extension: "jpg".to_owned(),
+            decode: DecodeInfo {
+                method: "test".to_owned(),
+                scale_num: 8,
+                scale_den: 8,
+                decoded_width: 100,
+                decoded_height: 200,
+                note: None,
+            },
+            decode_ms: 0.0,
+            signature_ms: 0.0,
+            total_ms: 0.0,
+            signatures: vec![StoredSignature {
+                algo: "Pdq256".to_owned(),
+                kind: "bits".to_owned(),
+                hex: encode_hex(&bits),
+                bit_width: Some(256),
+                value_count: None,
+                quality,
+            }],
+        }
+    }
+
+    fn jpeg_fixture() -> RgbaImage {
+        // Twice the target on the long edge, so the canonical path must scale
+        // whatever the target is set to. Sizing this to a literal tied the test
+        // to one value of the constant.
+        RgbaImage::from_fn(
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE * 2,
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE,
+            |x, y| {
+                let checker = (((x / 31) + (y / 29)) & 1) as u8 * 73;
+                Rgba([
+                    (x.wrapping_mul(17) as u8).wrapping_add(checker),
+                    (y.wrapping_mul(29) as u8).wrapping_sub(checker),
+                    ((x ^ y).wrapping_mul(11) as u8).wrapping_add(checker),
+                    255,
+                ])
+            },
+        )
+    }
+
+    #[test]
+    fn canonical_jpeg_file_proxy_uses_configured_dct_target() {
+        let image = jpeg_fixture();
+        let encoded = encode_jpeg(&image, 95).unwrap();
+        let canonical = proxy_from_source(
+            ProxySource::Encoded {
+                filename_hint: "fixture.jpg",
+                bytes: &encoded,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(canonical.scale_num < canonical.scale_den);
+        assert_eq!(
+            canonical.decoded_dims.0,
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE
+        );
+        assert_eq!(canonical.source_dims, image.dimensions());
+    }
+
+    #[test]
+    fn synth_jpeg_variant_is_measured_through_canonical_file_proxy() {
+        let image = jpeg_fixture();
+        let original = signatures_from_rgba(&image, image.dimensions());
+        let encoded = encode_jpeg(&image, 70).unwrap();
+        let canonical = proxy_from_source(
+            ProxySource::Encoded {
+                filename_hint: "fixture.jpg",
+                bytes: &encoded,
+            },
+            None,
+        )
+        .unwrap();
+        let expected = PreparedSignatures::compute(&canonical.proxy);
+        let expected_distance =
+            required_hamming(&original.pdq256.sig, &expected.pdq256.sig, "Pdq256").unwrap();
+
+        let mut output = Vec::new();
+        emit_jpeg_transform(
+            &mut output,
+            Path::new("fixture.png"),
+            image.dimensions(),
+            &original,
+            "jpeg_q70",
+            &image,
+            70,
+            DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+        )
+        .unwrap();
+        let pdq_record = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<SynthRecord>(line).unwrap())
+            .find(|record| record.algo == "Pdq256")
+            .unwrap();
+
+        let SynthDistance::Hamming { value } = pdq_record.distance else {
+            panic!("Pdq256 must have a Hamming distance");
+        };
+        assert_eq!(value, expected_distance);
+    }
+
+    #[test]
+    fn scan_records_group_by_parent_and_sort_pages_by_path() {
+        let records = vec![
+            scan_record(r"root\book-b\002.jpg", 3, 33),
+            scan_record(r"root\book-a\010.jpg", 2, 22),
+            scan_record(r"root\book-a\001.jpg", 1, 11),
+        ];
+        let prepared =
+            prepare_directory_book_records(&records, Path::new("fixture.scan.jsonl")).unwrap();
+
+        assert_eq!(prepared.book_meta.len(), 2);
+        assert_eq!(prepared.book_meta[&0].path, PathBuf::from(r"root\book-a"));
+        assert_eq!(prepared.book_meta[&0].declared_page_count, 2);
+        assert_eq!(prepared.book_meta[&1].path, PathBuf::from(r"root\book-b"));
+        assert_eq!(prepared.render_long_edge, None);
+        assert_eq!(prepared.book_grouping, PARENT_DIRECTORY_BOOK_GROUPING);
+
+        let page_keys = prepared
+            .pages
+            .iter()
+            .map(|page| {
+                let Sig::Bits(bits) = &page.sig else {
+                    panic!("Pdq256 must use bits");
+                };
+                (page.book, page.index, page.quality, bits[0])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(page_keys, vec![(0, 0, 11, 1), (0, 1, 22, 2), (1, 0, 33, 3)]);
+    }
+}

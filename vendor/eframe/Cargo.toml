@@ -124,6 +124,9 @@ features = [
 ]
 default-features = false
 
+[patch.crates-io]
+egui = { path = "../egui" }
+
 [dependencies.document-features]
 version = "0.2.11"
 

@@ -717,6 +717,16 @@ pub(crate) fn pick_dct_scale_num(src_max_edge: u32, target_px: u32) -> u32 {
     m_raw.clamp(1, 8) as u32
 }
 
+#[inline]
+fn thumbnail_jpeg_decode_target(display_px: u32, thumb_px: u32) -> u32 {
+    display_px.max(thumb_px)
+}
+
+#[inline]
+fn thumbnail_pdf_render_target(display_px: u32) -> u32 {
+    display_px
+}
+
 /// バイト列から JPEG を TurboJPEG で DCT scale 付きデコードする。
 ///
 /// `target_px` は最終 thumbnail 表示の max-edge 目安。これに対して
@@ -2705,7 +2715,7 @@ pub fn load_one_cached(
         let render_result = crate::pdf_loader::render_page(
             path,
             page_num,
-            display_px,
+            thumbnail_pdf_render_target(display_px),
             pdf_password,
             cancel.map(Arc::clone),
             pdf_priority,
@@ -2757,7 +2767,7 @@ pub fn load_one_cached(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if is_jpeg_ext(path) {
-            let target_px = display_px.max(thumb_px);
+            let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
             match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
                 Ok((img, stats)) => {
                     dct_stats = Some(stats);
@@ -2796,7 +2806,7 @@ pub fn load_one_cached(
                 byte_orientation = read_exif_orientation_from_bytes(&bytes);
                 // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
-                    let target_px = display_px.max(thumb_px);
+                    let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
                     match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
                         Ok((img, stats)) => {
                             dct_stats = Some(stats);
@@ -2846,7 +2856,7 @@ pub fn load_one_cached(
         // 通常ファイル: JPEG なら TurboJPEG DCT scale を最初に試す
         let turbo_img: Option<Result<image::DynamicImage, image::ImageError>> = if is_jpeg_ext(path)
         {
-            let target_px = display_px.max(thumb_px);
+            let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
             match decode_jpeg_turbo_scaled_from_path(path, target_px) {
                 Ok((img, stats)) => {
                     dct_stats = Some(stats);
@@ -3003,6 +3013,19 @@ pub fn load_one_cached(
         Some((img.width(), img.height()))
     };
     let layout_dims = pdf_page.is_some().then_some(pdf_layout_dims).flatten();
+
+    // 保存済み thumbnail ではなく、この元 source decode buffer を prefill 候補にする。
+    // 索引側が実寸を見て正準サイズ未満の raster を拒否するため、ここで decode target を
+    // 引き上げてはならない。背景索引が全件を保証し、prefill は既存 decode の再利用だけ行う。
+    crate::similar_index::offer_thumbnail_raster(
+        path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        &img,
+        source_dims.unwrap_or((img.width(), img.height())),
+    );
 
     // DCT スケール経由なら perf event を発火 (`thumb/dct_scale`)。
     // `decode_ms` を含めることで analyze_perf.py で scale_num 別の所要時間を集計可能。
@@ -3493,6 +3516,26 @@ mod tests {
     }
 
     // ── DCT スケール: 詳細は docs/dct-scale-plan.md ───────────────────────
+
+    #[test]
+    fn thumbnail_decode_targets_do_not_change_when_similar_store_is_open() {
+        let display_px = 300;
+        let thumb_px = 512;
+        let before = (
+            super::thumbnail_jpeg_decode_target(display_px, thumb_px),
+            super::thumbnail_pdf_render_target(display_px),
+        );
+
+        let store = Arc::new(crate::similar_db::SimilarDb::open_in_memory().unwrap());
+        crate::similar_index::register_prefill_db_for_test(&store);
+        let while_store_is_open = (
+            super::thumbnail_jpeg_decode_target(display_px, thumb_px),
+            super::thumbnail_pdf_render_target(display_px),
+        );
+
+        assert_eq!(before, (display_px.max(thumb_px), display_px));
+        assert_eq!(while_store_is_open, before);
+    }
 
     #[test]
     fn pick_dct_scale_num_clamps_low() {
