@@ -35,6 +35,12 @@ PC使用の了承を明確にする運用である。
 従来のpage-turn、perf smoke、idle-healthなども、実アプリの起動・操作を伴えば同じ確認が必要。
 既存logの解析だけでPCを操作しない処理は通常の開発中に実行してよい。
 
+`NativeTopPanoramaHover`は単独で約90秒を見込み、使い捨て640x360動画を別窓で開く間に
+前面ウィンドウとマウスを使用する。native側が送る入力は上端36ptへのMouseMove 1件だけで、
+実`native_top_panorama` Responseのenabled/位置/owner/source/hostを観測して終了する。
+click、wheel、key、panは送らない。この具体scenarioの実行了承が届くまでは
+`-InteractiveApproved`を付けず、portable artifactの準備と非対話検証までに留める。
+
 ## データ保護と記録
 
 実行了承は、通常profileの起動許可を兼ねない。エージェントは引き続き

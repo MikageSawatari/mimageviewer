@@ -611,7 +611,7 @@ zoom/raw-wheel/navigationの非発行、Appの同context/source/zoom不変を揃
 strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさず、Window spanの段変更を
 確認する場合はその前提を明示する。
 
-### 上部ボタンの観測契約（設計合意・未実装）
+### 上部ボタンの観測契約（hover-only実装済み・live未実施）
 
 親Astraと独立Astraのsource照合により、最初の対象を上部hover入口と
 `native_top_panorama`に限定する。既存catalogへ実renderの観測を加え、別のglobal widget表は作らない。
@@ -636,6 +636,25 @@ hover入口は通常の非表示時36ptの領域を共用し、表示後の76pt�
 named targetはfinal passの実inventoryを使い、非表示・再出現時には同じ矩形でも新tokenを発行する。
 frame revision、named geometry token、既存canvas geometry versionは別の意味を保つ。
 App/current-source receiptと実OS point/layer確認は後続層であり、Responseの存在だけでは入力成功にしない。
+
+2026-09-10にhover-onlyの最初の閉じた単位を実装した。`test-script` feature内で
+Canvas・TopHoverActivationを別のpoint/containment型としてprepareからpump/render receiptまで
+維持し、上端36ptのMouseMove完了後に、同じowner/source/hostでenabledになった実
+`native_top_panorama` Responseを待つ。Responseは`ui.interact`直後の明示enabled、sense、
+rect/interact rect/layer/clipを保持する。final logical passだけをsurface present成功後にcommitし、
+ctor bootstrap・通常/overlay-only resize・event batch・tickは同じcommitted inventoryを更新する。
+source切替は旧inventoryを新epochへ結合する前に失効させ、overlay ctorの各試行は別Arc markerを持つ。
+通常再生tickではnamed tokenを維持し、非表示からの再出現では更新する。診断用repaintは追加しない。
+hover準備は`native_top_panorama` Response観測自体がないhidden基線だけを受け入れ、visible-disabledを
+hiddenとはみなさない。MouseMove後はowner/source/host/activation areaを厳密に保ったまま、実presentで
+Responseが現れるinventory版進行だけをreceipt完了時に許す。送信前はhidden基線の版完全一致、receipt時は
+tagged final passでの版進行とResponse出現を必須とし、後続tickの出現で成功を代用しない。
+Canvasはchrome inventory版から独立し、
+従来どおりsource/hostとcanvas geometry/versionを厳密に照合する。touch初回helpとnormalize scanningも
+前面blockerとしてnamed targetを公開しない。
+`NativeTopPanoramaHover` scenarioが送る実OS入力はこのMouseMove 1件だけで、click/wheel/key/panは
+後続単位に残す。非対話検証と独立review後も、明示了承を得たportable liveが終わるまで実機PASSとは
+扱わない。
 
 ## 検証記録
 
@@ -673,4 +692,9 @@ S3aの初回対話liveは別窓video表示まで進み、診断側の初期epoch
 その後のtoken幅修正とPowerShell間fingerprint修正を経て、2点moveの最終liveはexit 0。
 静止画列dragは上記S2の最終liveで自動確認済み。動画zoomは未完了であり、
 S3aのmove配送確認だけでzoom・button・panの完了を主張しない。
+S3bの上部hover入口と実Response観測は2026-09-10に実装した。`NativeTopPanoramaHover`の
+Rhai/runner接続とfeature限定回帰を非対話で検証し、test-script付きportable artifactも準備した。
+同日の非対話検証ではmain 8029件（43件ignored）、UI snapshot 48件、vendor 25/9/15件、
+PowerShell 5.1/7 parserとapproval guardを通過した。
+対話liveは未実施であり、ボタンclick、zoom wheel、pan、thumbnail pixelの成功へ読み替えない。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。

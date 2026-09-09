@@ -4588,6 +4588,32 @@ fn run_native_video_output(
         });
     }
 
+    #[cfg(feature = "test-script")]
+    fn publish_ui_smoke_inventory(
+        publisher: &native_ui_smoke::NativeUiSmokeRenderPublisher,
+        presenter: &crate::video::native_presenter::NativeRenderCore,
+        source_epoch: u64,
+        generation: u64,
+        placement: NativeVideoPlacement,
+        owner_hwnd: u64,
+        presenter_hwnd: u64,
+    ) -> Result<Option<u64>, String> {
+        let Some(inventory) = presenter.ui_smoke_committed_inventory() else {
+            return Ok(None);
+        };
+        publisher
+            .publish(
+                source_epoch,
+                generation,
+                placement,
+                owner_hwnd,
+                presenter_hwnd,
+                presenter.ui_smoke_canvas_geometry(),
+                inventory,
+            )
+            .map(Some)
+    }
+
     let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_video_grade(cur_video_grade.clone())?;
@@ -4681,6 +4707,16 @@ fn run_native_video_output(
         ui_smoke_output_id,
         &requested_source_epoch,
     );
+    #[cfg(feature = "test-script")]
+    let _ = publish_ui_smoke_inventory(
+        &ui_smoke_render_publisher,
+        &presenter,
+        source.source_epoch,
+        cur_generation,
+        cur_placement,
+        cur_owner_hwnd,
+        cur_presenter_hwnd,
+    )?;
     health.record_source_generation(source.source_epoch);
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
@@ -5438,6 +5474,13 @@ fn run_native_video_output(
                     }
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
+                    #[cfg(feature = "test-script")]
+                    {
+                        ui_smoke_render_publisher.invalidate(
+                            "native mouse source changed while the diagnostic target was live",
+                        )?;
+                        presenter.invalidate_ui_smoke_committed_inventory();
+                    }
                     emit_native_vram_trace(
                         "switch_source_begin",
                         "before_drain_old_source",
@@ -6078,13 +6121,14 @@ fn run_native_video_output(
             }
         }
         #[cfg(feature = "test-script")]
-        let _ = ui_smoke_render_publisher.publish(
+        let _ = publish_ui_smoke_inventory(
+            &ui_smoke_render_publisher,
+            &presenter,
             source.source_epoch,
             cur_generation,
             cur_placement,
             cur_owner_hwnd,
             cur_presenter_hwnd,
-            presenter.ui_smoke_canvas_geometry(),
         )?;
         native_events.clear();
         native_event_envelopes.clear();
@@ -6985,14 +7029,18 @@ fn run_native_video_output(
             #[cfg(feature = "test-script")]
             if ui_smoke_render_succeeded {
                 let geometry = presenter.ui_smoke_canvas_geometry();
-                let geometry_version = ui_smoke_render_publisher.publish(
+                let geometry_version = publish_ui_smoke_inventory(
+                    &ui_smoke_render_publisher,
+                    &presenter,
                     source.source_epoch,
                     cur_generation,
                     cur_placement,
                     cur_owner_hwnd,
                     cur_presenter_hwnd,
-                    geometry,
-                )?;
+                )?
+                .ok_or_else(|| {
+                    "native mouse render completed without a committed UI observation".to_string()
+                })?;
                 for (event_index, envelope) in native_event_envelopes.iter().enumerate() {
                     if let Some(metadata) = envelope.smoke_metadata {
                         let native_window::NativeVideoWindowEvent::MouseMove(mouse) =
@@ -7057,6 +7105,16 @@ fn run_native_video_output(
                 source.clock.current_seek_serial(),
             ) {
                 Ok(outcome) => {
+                    #[cfg(feature = "test-script")]
+                    let _ = publish_ui_smoke_inventory(
+                        &ui_smoke_render_publisher,
+                        &presenter,
+                        source.source_epoch,
+                        cur_generation,
+                        cur_placement,
+                        cur_owner_hwnd,
+                        cur_presenter_hwnd,
+                    )?;
                     publish_native_overlay_input_routing(
                         &ui_event_tx,
                         source.source_epoch,

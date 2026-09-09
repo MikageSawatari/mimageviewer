@@ -2172,6 +2172,10 @@ struct NativeTestOverlay {
 }
 
 struct NativeEguiOverlay {
+    #[cfg(feature = "test-script")]
+    ui_smoke_owner: Arc<crate::video::native_ui_smoke::NativeUiSmokeOverlayOwner>,
+    #[cfg(feature = "test-script")]
+    ui_smoke_committed: Option<crate::video::native_ui_smoke::NativeUiSmokeCommittedInventory>,
     health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     window_epoch: u64,
     surface: wgpu::Surface<'static>,
@@ -2426,6 +2430,39 @@ struct NativeBarVisibilitySnapshot {
     top_bar_visible: bool,
     /// 上端 hover 連動と下部自身の固定状態まで通した、下部バーの実描画状態。
     bottom_hud_visible: bool,
+}
+
+#[cfg(feature = "test-script")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeUiSmokeChromeEligibility {
+    top_hover_activation: bool,
+    named_control: bool,
+}
+
+#[cfg(feature = "test-script")]
+#[allow(clippy::too_many_arguments)]
+fn native_ui_smoke_chrome_eligibility(
+    panel_chrome_visible: bool,
+    tile_overlay_visible: bool,
+    navigation_preview_visible: bool,
+    hud_dimmed: bool,
+    external_drag_in_progress: bool,
+    modal_or_overlap: bool,
+    touch_first_run_help_visible: bool,
+    normalize_scanning: bool,
+    audio_only: bool,
+) -> NativeUiSmokeChromeEligibility {
+    let chrome_allowed = !tile_overlay_visible
+        && !navigation_preview_visible
+        && !hud_dimmed
+        && !external_drag_in_progress
+        && !modal_or_overlap
+        && !touch_first_run_help_visible
+        && !normalize_scanning;
+    NativeUiSmokeChromeEligibility {
+        top_hover_activation: chrome_allowed,
+        named_control: chrome_allowed && panel_chrome_visible && !audio_only,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3112,6 +3149,8 @@ struct NativeOverlayLogicalOutput {
     overlay_visible: bool,
     hud_visible: bool,
     perf_visible: bool,
+    #[cfg(feature = "test-script")]
+    ui_smoke_inventory: crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory,
 }
 
 #[derive(Default)]
@@ -3124,6 +3163,8 @@ struct NativeOverlayLogicalBatch {
     overlay_visible: bool,
     hud_visible: bool,
     perf_visible: bool,
+    #[cfg(feature = "test-script")]
+    ui_smoke_inventory: Option<crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory>,
 }
 
 impl NativeOverlayLogicalBatch {
@@ -3142,6 +3183,12 @@ impl NativeOverlayLogicalBatch {
         self.overlay_visible = output.overlay_visible;
         self.hud_visible = output.hud_visible;
         self.perf_visible = output.perf_visible;
+        #[cfg(feature = "test-script")]
+        {
+            // A native input batch can run multiple logical passes before one present.
+            // Only the final pass describes the pixels that are committed below.
+            self.ui_smoke_inventory = Some(output.ui_smoke_inventory);
+        }
     }
 }
 
@@ -7684,6 +7731,22 @@ impl NativeRenderCore {
         }
     }
 
+    #[cfg(feature = "test-script")]
+    pub(crate) fn ui_smoke_committed_inventory(
+        &self,
+    ) -> Option<crate::video::native_ui_smoke::NativeUiSmokeCommittedInventory> {
+        self.egui_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.ui_smoke_committed.clone())
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn invalidate_ui_smoke_committed_inventory(&mut self) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.ui_smoke_committed = None;
+        }
+    }
+
     fn pixel_probe_due(&mut self) -> bool {
         if !self.pixel_probe_enabled {
             return false;
@@ -8124,6 +8187,8 @@ impl NativeEguiOverlay {
         health: Arc<crate::video::native_window_health::NativeWindowHealth>,
         window_epoch: u64,
     ) -> Result<Self, String> {
+        #[cfg(feature = "test-script")]
+        let ui_smoke_owner = crate::video::native_ui_smoke::allocate_overlay_owner();
         // 本関数は placement 切替 (F12 の main ⇄ 別ウィンドウ) のたびに丸ごと走る。
         // Surface / Renderer / Context は窓ごとに作るが、Instance と compatible な
         // DeviceEpoch は process-owned service から再利用する (backlog §1.122)。
@@ -8180,6 +8245,10 @@ impl NativeEguiOverlay {
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point = effective_overlay_pixels_per_point(os_pixels_per_point, ui_scale);
         let this = Self {
+            #[cfg(feature = "test-script")]
+            ui_smoke_owner,
+            #[cfg(feature = "test-script")]
+            ui_smoke_committed: None,
             health,
             window_epoch,
             surface,
@@ -11212,6 +11281,51 @@ impl NativeEguiOverlay {
             || left_callout_visible
             || right_callout_visible
             || touch_panel_handles_visible;
+        #[cfg(feature = "test-script")]
+        let ui_smoke_panorama_classification = video_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.panorama_detection)
+            .map_or(
+                crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::Unknown,
+                |classification| {
+                    if classification.is_ok() {
+                        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::Panorama
+                    } else {
+                        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::NonPanorama
+                    }
+                },
+            );
+        #[cfg(feature = "test-script")]
+        let ui_smoke_modal_or_overlap = bookmark_title_edit_visible
+            || bulk_bookmark_dialog_visible
+            || shortcut_help_open
+            || ring_picker_visible
+            || vst3_panel_visible;
+        #[cfg(feature = "test-script")]
+        let ui_smoke_eligibility = native_ui_smoke_chrome_eligibility(
+            panel_chrome_visible,
+            tile_overlay_visible,
+            navigation_preview_visible,
+            hud_dimmed,
+            self.external_drag_in_progress,
+            ui_smoke_modal_or_overlap,
+            touch_first_run_help_visible,
+            normalize_scanning,
+            audio_only,
+        );
+        #[cfg(feature = "test-script")]
+        let ui_smoke_top_hover_activation = ui_smoke_eligibility.top_hover_activation.then(|| {
+            crate::video::native_ui_smoke::NativeUiSmokeTargetArea::new(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 36.0)),
+                ppp,
+                self.width,
+                self.height,
+            )
+        });
+        #[cfg(feature = "test-script")]
+        let ui_smoke_named_control_allowed = ui_smoke_eligibility.named_control;
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_native_top_panorama = None;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -11470,6 +11584,8 @@ impl NativeEguiOverlay {
                     top_bar_locked,
                     hud_dimmed,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    &mut ui_smoke_native_top_panorama,
                 );
             }
             if checked {
@@ -13229,6 +13345,19 @@ impl NativeEguiOverlay {
             overlay_visible,
             hud_visible,
             perf_visible,
+            #[cfg(feature = "test-script")]
+            ui_smoke_inventory: crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory::new(
+                &self.ui_smoke_owner,
+                ui_smoke_top_hover_activation,
+                ui_smoke_native_top_panorama,
+                ui_smoke_panorama_classification,
+                panorama_pose.is_some(),
+                video_zoom_scale.is_some(),
+                ui_smoke_named_control_allowed,
+                ppp,
+                self.width,
+                self.height,
+            ),
         })
     }
 
@@ -13246,6 +13375,8 @@ impl NativeEguiOverlay {
             overlay_visible,
             hud_visible,
             perf_visible,
+            #[cfg(feature = "test-script")]
+            ui_smoke_inventory,
         } = batch;
         let full_output = full_output
             .ok_or_else(|| "native overlay logical batch produced no output".to_string())?;
@@ -13373,6 +13504,18 @@ impl NativeEguiOverlay {
                 .health
                 .begin_render_operation(NativeRenderOperation::Present, self.window_epoch);
             surface_texture.present();
+        }
+        #[cfg(feature = "test-script")]
+        {
+            let logical = ui_smoke_inventory.ok_or_else(|| {
+                "native overlay logical batch produced no UI smoke inventory".to_string()
+            })?;
+            self.ui_smoke_committed = Some(
+                crate::video::native_ui_smoke::NativeUiSmokeCommittedInventory::commit(
+                    self.ui_smoke_committed.as_ref(),
+                    logical,
+                ),
+            );
         }
         let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
         let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
@@ -14561,6 +14704,8 @@ mod tests {
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
         video_zoom_takes_the_wheel,
     };
+    #[cfg(feature = "test-script")]
+    use super::{NativeUiSmokeChromeEligibility, native_ui_smoke_chrome_eligibility};
     use crate::panorama::{PanoPose, PanoUvTransform};
     use crate::settings::{BottomBarLock, FsSidePanelMode};
     use crate::video::native_presenter::overlay_draw::{
@@ -16290,6 +16435,8 @@ mod tests {
     }
 
     struct HeadlessNativeBatchTarget {
+        #[cfg(feature = "test-script")]
+        ui_smoke_owner: std::sync::Arc<crate::video::native_ui_smoke::NativeUiSmokeOverlayOwner>,
         ctx: egui::Context,
         routing: NativeOverlayInputRouting,
         pending_events: Vec<egui::Event>,
@@ -16312,11 +16459,15 @@ mod tests {
         presented_texture_ids: Vec<egui::TextureId>,
         presented_shape_count: usize,
         last_logical_shape_count: usize,
+        #[cfg(feature = "test-script")]
+        presented_ui_smoke_top_y: Option<f32>,
     }
 
     impl Default for HeadlessNativeBatchTarget {
         fn default() -> Self {
             Self {
+                #[cfg(feature = "test-script")]
+                ui_smoke_owner: crate::video::native_ui_smoke::allocate_overlay_owner(),
                 ctx: egui::Context::default(),
                 routing: NativeOverlayInputRouting::default(),
                 pending_events: Vec::new(),
@@ -16339,6 +16490,8 @@ mod tests {
                 presented_texture_ids: Vec::new(),
                 presented_shape_count: 0,
                 last_logical_shape_count: 0,
+                #[cfg(feature = "test-script")]
+                presented_ui_smoke_top_y: None,
             }
         }
     }
@@ -16590,6 +16743,28 @@ mod tests {
                 overlay_visible: true,
                 hud_visible: true,
                 perf_visible: false,
+                #[cfg(feature = "test-script")]
+                ui_smoke_inventory:
+                    crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory::new(
+                        &self.ui_smoke_owner,
+                        Some(crate::video::native_ui_smoke::NativeUiSmokeTargetArea::new(
+                            egui::Rect::from_min_size(
+                                egui::pos2(0.0, pass as f32),
+                                egui::vec2(640.0, 36.0),
+                            ),
+                            1.0,
+                            640,
+                            360,
+                        )),
+                        None,
+                        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::Unknown,
+                        false,
+                        false,
+                        false,
+                        1.0,
+                        640,
+                        360,
+                    ),
             })
         }
 
@@ -16599,6 +16774,13 @@ mod tests {
             _render_t0: std::time::Instant,
         ) -> Result<(Vec<NativeOverlayCommand>, Vec<super::NativeWindowIntent>), String> {
             self.present_calls += 1;
+            #[cfg(feature = "test-script")]
+            {
+                self.presented_ui_smoke_top_y = batch
+                    .ui_smoke_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.top_hover_min_y());
+            }
             let full_output = batch.full_output.expect("logical pass output");
             self.presented_platform_markers = full_output
                 .platform_output
@@ -16795,6 +16977,12 @@ mod tests {
 
             assert_eq!(target.logical_passes, 2);
             assert_eq!(target.present_calls, 1);
+            #[cfg(feature = "test-script")]
+            assert_eq!(
+                target.presented_ui_smoke_top_y,
+                Some(1.0),
+                "the published inventory must come from the final logical pass"
+            );
             assert_eq!(target.strip_steps, [expected_strip_step]);
             assert_eq!(run.commands.len(), 2);
             let strip_index = 1 - canvas_index;
@@ -16912,6 +17100,62 @@ mod tests {
             hud_regions: Vec::new(),
         };
         assert!(!outcome.should_forward_to_ui(0, &event));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn ui_smoke_top_and_named_targets_follow_final_chrome_suppression() {
+        let ready = native_ui_smoke_chrome_eligibility(
+            true, false, false, false, false, false, false, false, false,
+        );
+        assert_eq!(
+            ready,
+            NativeUiSmokeChromeEligibility {
+                top_hover_activation: true,
+                named_control: true,
+            }
+        );
+        for blocked in [
+            native_ui_smoke_chrome_eligibility(
+                true, true, false, false, false, false, false, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, true, false, false, false, false, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, false, true, false, false, false, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, false, false, true, false, false, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, false, false, false, true, false, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, false, false, false, false, true, false, false,
+            ),
+            native_ui_smoke_chrome_eligibility(
+                true, false, false, false, false, false, false, true, false,
+            ),
+        ] {
+            assert_eq!(
+                blocked,
+                NativeUiSmokeChromeEligibility {
+                    top_hover_activation: false,
+                    named_control: false,
+                }
+            );
+        }
+        let audio = native_ui_smoke_chrome_eligibility(
+            true, false, false, false, false, false, false, false, true,
+        );
+        assert!(audio.top_hover_activation);
+        assert!(!audio.named_control);
+        let hidden_bar = native_ui_smoke_chrome_eligibility(
+            false, false, false, false, false, false, false, false, false,
+        );
+        assert!(hidden_bar.top_hover_activation);
+        assert!(!hidden_bar.named_control);
     }
 
     #[test]

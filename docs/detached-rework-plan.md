@@ -1746,7 +1746,7 @@ stillだけがfitted rectを渡し、描画clip・hit・touch correlationを一�
 lifecycle は変更しない。詳細と回帰要件は [実装計画](v3.7.0-input-and-still-seek-plan.md)。
 実アプリ検証は明示了承後のリリース前の枠に残す。
 
-**2026-09-08 §1.197 S3b: native上部ボタンの実描画観測（設計合意・未実装）:**
+**2026-09-10 §1.197 S3b: native上部ボタンの実描画観測（hover-only実装済み・live未実施）:**
 
 利用者指定の親Astraと独立Astraで、既存render ownerに属する診断観測として合意した。
 Solは実装前に入口と前提を再確認する。対象は上部hover入口と実際の
@@ -1761,7 +1761,19 @@ catalog・準備済みtargetはWeakだけを持ち、commit後に同じowner・m
 ボタンは位置に加えて明示enabled引数・実click sense・通常のmodal/dim等を確認する。
 この観測はmetadataの新規生成やApp処理完了を保証せず、それらのreceiptとは分ける。
 詳細は[自動化設計](ui-smoke-automation-plan.md)の「上部ボタンの観測契約」を参照。
-実装・回帰・portableでの実hover確認は未完了で、症状修正の代用にはしない。
+実装は`test-script` feature内に限定した。Canvas/TopHoverActivation/NamedControlのpoint契約、
+final logical passからpresent成功後のcommit、ctor bootstrapと両resize/event/tickの共通inventory、
+source advance前の失効、overlay試行ごとのArc/Weak markerを接続した。実Responseは`ui.interact`
+直後の明示enabled/sense/rect/interact rect/layer/clipとclassification/pose/zoom有無を保持する。
+hover準備はResponse観測のないhidden基線に限定し、visible-disabledを除外する。receipt完了では
+同じowner/source/hostと36pt activation areaを保った実present後のResponse出現だけを許し、
+送信前の版完全一致とtagged final passでの版進行を必須にして、後続tickの出現を成功に数えない。
+Canvasのgeometry/version照合を上部chrome inventory版から分離した。touch初回helpとnormalize scanningを
+含む前面blocker中はnamed targetを公開しない。
+`NativeTopPanoramaHover`は上端36ptへ実MouseMoveを1件送り、pump/renderのexact receipt後に
+同owner/source/hostのenabled Responseを待つ。診断repaint、click/wheel/key/pan送信は追加しない。
+非対話回帰とportable artifact準備を完了しても、明示了承後の実hover確認までは未実施として残し、
+症状修正やzoom/button/panの実機成功の代用にはしない。
 
 **2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
 

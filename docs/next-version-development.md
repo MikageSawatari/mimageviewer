@@ -431,3 +431,23 @@ dupe HEAD cfb849e361e321d0e52878d9ec0ed3ffece20743には未コミット完成差
 動画strip両mode暗色/文字二重の追加修正を完了。独立review承認、focused回帰・core check・fmt・glyph・diff-check成功、全体gate lib7696 pass/34 ignored・ui_snapshot45・vendor等全target成功（wrapper exit0）。8-file manifestはgate/build後も一致。通常features build-dev成功、core SHA256 `725077E1B938E3E9DD2DB428BDFBEAD9B6580EF4837D43A228504C113D003751`。証拠 `target/next-version-work/logs/video-seek-strip-dark-verification-ledger-20260910.md`。最新実機表示のみ未確認。利用者の夜間統合依頼に従い、依存の閉じる製品差分をcommitしてdupe統合担当へ引き渡す。開発writer終了後はdupeへmaster編集権を渡す。
 
 統合後は利用者依頼により実機テスト自動化実装を継続する。次候補は既存S3b上HUD hover入口/native_top_panoramaの実描画target観測をhover-only scenarioへ通す範囲。調査はread-onlyで完了し、merge後のsourceで前提を確認して実装・独立reviewを行う。クリック/zoom/pan成功をこの段階だけで主張しない。8時頃までは利用者就寝、実アプリの対話実行は引き続き具体suite了承待ち。
+
+## v3.8.0 dupe統合完了と自動検証の継続
+
+2026-09-10夜間、dupeタスクの統合を完了し、master `426df75b9ee9e258139a6179ec8bcca6665dbfcd`（parents b003e6494 + dupe 3110c040b）となった。master treeは全体gateを通過したdupe treeと同一。dupe側の独立Sol検収・全体gate成功（lib8029 pass/43 ignored、UI48、vendor25/9/15等）。初回gateの1失敗はcurrent page/anchorのfixture不一致を実routeへ適応して修正し、独立再reviewと全体再実行で成功。初回失敗記録も保持。
+
+masterで通常build-dev成功、core SHA256 `4087876E36EBA81821542B8EFFA9C513D28A5C2868F84B9A7B0C5B168C837703`。親もHEAD/hashを照合した。正本 `target/next-version-work/logs/duplicate-integration-final-manifest-20260910.json`。詳細 `docs/duplicate-detection-integration-v380-20260910.md`。アプリの起動/停止/input/push/publicationなし。最新strip実機表示・統合実機suiteは未検証のまま。
+
+別所有dirtyは保持された。AGENTS/README/release-operationsはmixed EOLからCRLFへのraw差のみで、semantic内容とdirtyを独立reviewで確認し記録した。development-build-and-testの元追記はincoming vendor節へunion、briefは元byte同一でtrackedへ昇格。他untrackedも保持。元raw復元が可能だった4pathは復元。これを製品機能の変更と混同しない。
+
+dupeからmaster編集/Cargo権を返却後、ユーザー依頼のS3b自動テスト実装を開始。実装/test owner smoke_next_plan（Sol xhigh）、独立review next_independent_review（別Sol xhigh）。上HUD hover入口とnative_top_panorama実Responseのtarget観測をhover-only scenarioへ通す。typed targetの座標契約、final pass/present成功公開、ctor/resize/source epoch/owner寿命の境界を設計合意に含める。クリック/wheel/pan等は本sliceに含めない。既存scripts/ui-smoke.ps1のidle198差分を保持する。実機実行は別途了承待ち、通常確認buildは診断onlyの範囲ならそのまま保持する。
+
+日中実機suiteの具体了承をasyncで依頼済み（回答待ち）。9/10 09:30〜18:30内、実装/review完了後の30〜60分程度、MultiWindowPdf / StillStripDrag / NativeMouseMove / NativeTopPanoramaHover / Idle198Convergence。前面windowとmouse、生成素材とtarget/portable-smoke/dataのみ、各項目初回+原因確認後の再試行1回まで、18:30までに後片付け終了。通常profile/dataは使わない。時間枠の事前了承のみをsuite実行許可へ読み替えず、返答までは実行しない。
+
+S3b hover-only実装を完了。独立Solの最終検収は重要指摘なし。正本 `target/next-version-work/logs/s3b-native-top-panorama-hover-final-manifest-20260910.json` のSHA256 `CF346A74B61F667FCDF715E1D484789C215758601702043FFB73DE529DB1CACD` を承認対象として固定した（JSON内の承認欄は承認前snapshotのためpending表記、最終承認結果は本記録とreviewer引渡しを参照）。非test feature check、native_ui_smoke39件、top_hover8件、関連回帰、PS5.1/7 parser・approval guard、fmt/diffを通過。default full gateは8029/43ignored・UI48・vendor25/9/15成功後の追加修正がtest-script cfg/tests/docsだけで通常active code/default tests不変のため、独立review承認付きで再利用した。
+
+最終のphase契約：BeforeInputはhidden観測/版の完全一致、ReceiptCompletionは入力後presentの版進行とResponse存在、enabledは後続観測。Canvasは独自geometry/ownerを維持して無関係なchrome版へ依存しない。準備前の曖昧候補をready filteringで隠さず、owner/source変化・pre-input show/hide往復・hiddenのままのreceiptを拒否する。touch help/normalize scanningも操作不能として観測する。
+
+診断portable SHA256 `2837643A6E8F3913BECCA0F3413664F5969531EAB19BAE45346D5B46853A86EE`、fingerprint `00a73a21d188762799add761b04f08bca452a69d0dcb271b14dd8021efb4f2fa` を準備済み。通常統合build `4087876E...` は保持。アプリ/UI/SendInputは実行していない。NativeTopPanoramaHoverはlive pendingであり、クリック・zoom・panやthumbnail pixel出力の検証済みとは扱わない。
+
+コミットはS3b candidate10pathと親台帳を対象にする。ui-smoke.ps1は既存idle198差分を残し、`target/next-version-work/logs/s3b-ui-smoke-isolation/ui-smoke-s3b-only-index-ready.patch`（SHA E5EDBDEEF71A726DA4508179A02667CD85C325C89E88E67E28DC114346B4849B）だけをindexへ適用する。既存dirtyを全addしない。実機suiteの具体了承は引き続き回答待ち。

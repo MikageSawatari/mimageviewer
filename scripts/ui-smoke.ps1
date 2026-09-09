@@ -19,7 +19,7 @@ Automation must not pass this switch until that approval has been obtained.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'StillStripDrag')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'StillStripDrag')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -473,7 +473,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'StillStripDrag')
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'StillStripDrag')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -585,13 +585,14 @@ if ($script:archiveErrors.Count -gt 0) {
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
-    'NativeMouseMove' {
-        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\native-mouse-move'
-        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\native-mouse-move.rhai'
+    { $_ -in @('NativeMouseMove', 'NativeTopPanoramaHover') } {
+        $scenarioSlug = if ($Scenario -eq 'NativeMouseMove') { 'native-mouse-move' } else { 'native-top-panorama-hover' }
+        $scenarioRoot = Join-Path $targetRoot (Join-Path 'ui-smoke' $scenarioSlug)
+        $candidateScriptPath = Join-Path $PSScriptRoot (Join-Path 'ui-smoke' ($scenarioSlug + '.rhai'))
         $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
         $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
 
-        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\native-mouse-move') 'ui-smoke-scenario'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot (Join-Path 'target\ui-smoke' $scenarioSlug)) 'ui-smoke-scenario'
         Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
         if (Test-Path -LiteralPath $scenarioRoot) {
             Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
@@ -602,7 +603,7 @@ if ($script:archiveErrors.Count -gt 0) {
         if ($null -eq $ffmpegCommand -or -not (Test-Path -LiteralPath $ffmpegCommand.Source -PathType Leaf)) {
             throw '[ui-smoke] ffmpeg.exe was not found on PATH'
         }
-        $videoPath = Join-Path $candidateFixtureDir 'native-mouse-move.mp4'
+        $videoPath = Join-Path $candidateFixtureDir ($scenarioSlug + '.mp4')
         $ffmpegArgs = @(
             '-hide_banner', '-loglevel', 'error', '-y',
             '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10',
