@@ -338,6 +338,35 @@ fresh 480×420 と大画面からの縮小、実 ScrollArea 後の B 適用ボ�
 ユーザーの設定保存は実行しない。2026-09-08 の焦点 gate は 8 件 PASS、独立 Astra レビューに blocking なし。
 実 OS のリサイズドラッグ、IME、実アプリ操作の完了を示すものではない。
 
+### 1.8 詳細表示と複数のサムネイル利用元の保持
+
+詳細表示は通常グリッドのサムネイル読み込みを抑制するが、静止画シーク列・ホバー・しおりや
+ページ移動先の要求まで消去しない。`thumbnail_keep_projection` が現在の利用元を合成し、
+`install_thumbnail_keep_projection` が同じ viewer context の保持・退去・キューを調整する。
+
+| 利用元 | 投影の正本 | worker 側の範囲 |
+| --- | --- | --- |
+| 通常グリッド | 既存の可視範囲・タッチ追加行・VRAM上限を反映した keep slice | bbox |
+| ページ移動先 | items 世代が一致する navigation sequence の target pages | bbox・優先 |
+| 詳細ホバー | 現在の hover idx | bbox・優先 |
+| 表示中のしおりパネル | 現 container と loaded bookmark の typed page identity に一致する既存 keep 候補 | bbox・優先 |
+| 静止画シーク | 既存の `still_seek_thumbnail_pages` | sparse exact set・優先 |
+
+合成済みの keep / bbox からグリッドの元範囲を逆算しない。しおりの新しいページは既存 ensure が
+keep へ入れてから要求し、次の投影は現在の membership と実パネルの表示条件で保持・失効を決める。
+navigation / bookmark の ensure は既存 bbox と union してから worker へ公開する。
+離れた still seek ページは bbox を広げず、従来の exact set で読み込みを許可する。
+
+最後の利用元が離れたページだけを退去し、未処理キューやUI側のbacklog / finalize待ちから
+実際に取り除いた要求の `requested` を解除する。worker が既に pop して処理中の要求は、結果・cancel・error・finalized の
+既存通知で終える。`SourceGenerated` は画像到着後に Loaded となっても cache 確定通知まで
+requested を保持し、同じページの重複 decode を防ぐ。
+
+しおり候補照合は loaded bookmark の typed HashSet と keep 候補を使い O(B+K) に留める。
+フォルダ本の適格性に必要な全画像分類は既存 `ViewerNavigationCaches` の context / source 世代で
+memo 化する。製本・synthetic 等の既存短絡条件を維持し、毎フレームの全件走査を増やさない。
+独立レビューと回帰の結果は [v3.7.0 作業台帳](v3.7.0-priority-work.md) に記録する。
+
 ## 2. フルスクリーン表示パイプライン
 
 ### 2.1 エントリポイント
@@ -1308,10 +1337,12 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 で区別する。拡大時はさらに、
 生成元となった source pixel 領域の x / y / width / height を記録する。
 
-静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
-実表示と固定状態から解決した `StillSeekGeometry::reserved_height`、上部情報バー固定時は
-`TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
-両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
+静止画の最終フィット矩形は `fullscreen_media_rect_with_geometry` が所有する。
+active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeometry` の
+下部予約量・有効gap・上部予約量を使い、上下を同時に除外した同一矩形を、
+単ページ・見開き・連結読み・入力座標へ渡す。単独入口の `fullscreen_media_rect` は同じ解決を行うwrapperである。
+極小の外枠では `min(1, viewport_height)` の画像領域を保ち、controlsを先にfitしてから任意gapへ
+残りを配分する。上部固定バー自身の描画を高さ44pt未満へ再設計する変更は含めない。
 固定領域の予約は各バーの描画可否と同じ述語を使う。特に編集／注釈・範囲キャプチャ・音楽ビューで
 上部バーを抑止するときは `TOP_BAR_HEIGHT` も予約せず、非表示バー由来の黒帯を残さない。
 上端の原画プレビュー・スライドショー進捗インジケータと、下端の比較ピンインジケータも
@@ -1362,9 +1393,29 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
-列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer の X/Y を
-保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ押下時点からの総 x 移動量と
-同じ高さ preset の `window_cell_width_points()` を渡し、整数 source position へ丸めて先頭 / 末尾で
+静止画の高さは専用の `StillSeekStripHeight` と5段階の独立値で保存する。既定は
+最小36 / 小48 / 中72 / 大104 / 最大144、各値は36～320のlogical point（100%表示時のpx相当）。
+閲覧中は下部バー右端のフィルムボタンから、列の表示 / 非表示と5段階を同じ menu popup で
+選べる。各行は環境設定に保存済みの現在値を表示し、選択は既存の Settings setter / save と
+`StillSeekGeometry` へ合流するため、main / F12 と本・通常画像で同じ設定を使う。popup の開閉は
+viewport ごとの egui memory が所有し、新しい App state は持たない。popup 表示中は下部バーを維持し、
+Escape・矢印・Enter、pointer・touch は popup を優先して背面のページ移動や fullscreen close に流さない。
+動画・音声のシークストリップも専用の `SeekStripHeight` と独立した5段階値を持ち、同じ既定値と
+36～320の解決時clampを使う。旧4段階の保存名と既定の大は保ち、静止画の値とは共有しない。
+動画側は `NativeBarLockState` が段階と値をsource切替・main/F12間へ運ぶ。実効下部バー、strip、
+top lock、固定gapは `VideoSeekGeometry` がviewport内で一度解決し、paint / hit / 映像予約 / hover /
+波形要求が同じ矩形を読む。操作面を優先して残余だけをgapへ使い、上部HUDとstripを重ねない。
+正の極小stripではcell・鍵・notice・範囲文字を同じbody clipへ収め、文字は実galleyに合わせて
+連続縮小・省略する。0領域だけ描画と新規material要求を止め、Primary dragの所有はreleaseまで保つ。
+周辺表示のdragは押下時のセル幅または波形の帯幅・時間幅を保持するため、途中の高さ変更で着地が
+飛ばない。0寸法中は新規material要求だけを止め、進行中gestureのreleaseは押下時尺度で完了する。
+現在のCentralPanel外枠から一度解決する `StillSeekGeometry` が、画像予約量・表示・入力・
+左右パネル・zoom・holdoverの実効寸法を共有する。小さい外枠ではbar、strip、gap、ボタンを
+同じ予算内へ収め、正の操作領域を寸法の下限だけで隠さない。holdoverも現在のchrome設定を使う。
+
+列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position、pointer の X/Y と
+`drag_step_width` を保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ
+押下時点からの総 x 移動量と保持した換算幅を渡し、整数 source position へ丸めて先頭 / 末尾で
 clamp する。右へ引くと中央 source position は小さくなる。判定順序も動画と同じく、まず
 `strip_drag_closes_downward` で下ドラッグ close を決め、close でない場合だけ中央を動かす。
 静止画側の呼び出し境界は `min(strip_rect.bottom(), full_rect.bottom() - 1 / pixels_per_point)`
@@ -2474,6 +2525,12 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   対象 idx を `ai_upscale_prefetch_forward / back` 件まで取得する。同じ更新入口から
   カラー化の final composite 先読みも行い、AI 使用ページは `final_ai_cache` 完成後、
   AI 不使用ページは edit pixels 準備後に 1 件ずつ final-effect worker へ送る。
+  対象列はアップスケール / ノイズ除去の final AI と、カラー化 / Creative LUT の
+  final effect で共通である。ページ単位の見開きでは表示単位の読み順先頭が現在 idx になり、
+  同じ見開きの相方が前方 1 枚目を使う。既定の後方 2 / 前方 3 は、表紙なしの 2 ページ見開きで
+  直前・直後の表示単位を両ページとも範囲へ含める。v3.7.0 では旧既定の前方 2 だけを版境界で
+  一度 3 へ移行し、保存済みの後方値は変更しない。表紙ありモードの末尾から先頭への循環は
+  この範囲計算へ含めない。
   ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を

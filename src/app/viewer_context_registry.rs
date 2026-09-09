@@ -3609,6 +3609,7 @@ mod tests {
                 origin_pointer: egui::pos2(100.0, 80.0),
                 layout_center_pos: 440,
                 page_pos_at_origin: 3,
+                drag_step_width: 40.0,
             };
             app.fs_seek_drag_active = true;
             app.pause_mounted_background_work_keep_current_frame();

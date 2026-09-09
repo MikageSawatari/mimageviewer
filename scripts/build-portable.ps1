@@ -12,12 +12,15 @@
 #   PS> scripts\build-portable.ps1
 #   PS> scripts\build-portable.ps1 -SkipBuild      (re-assemble only, reuse last core build)
 #   PS> scripts\build-portable.ps1 -SmokeTestScript (diagnostic package; no dist/zip/sign)
+#   PS> scripts\build-portable.ps1 -PreserveRuntime
 
 [CmdletBinding()]
 param(
     [switch] $SkipBuild,
     [switch] $Sign,
-    [switch] $SmokeTestScript
+    [switch] $SmokeTestScript,
+    # Never stop mImageViewer processes; fail before build or package replacement.
+    [switch] $PreserveRuntime
 )
 
 $ErrorActionPreference = 'Stop'
@@ -289,7 +292,14 @@ $stoppableProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
-if (-not $SmokeTestScript) {
+if ($PreserveRuntime) {
+    $running = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $stoppableProcessNames -contains $_.Name })
+    if ($running.Count -gt 0) {
+        $list = ($running | ForEach-Object { "{0}({1})" -f $_.Name, $_.Id }) -join ', '
+        throw ("[portable] mImageViewer is running: {0}. -PreserveRuntime refuses to stop it; close it and retry." -f $list)
+    }
+} elseif (-not $SmokeTestScript) {
     Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $stoppableProcessNames -contains $_.Name } |
         ForEach-Object {

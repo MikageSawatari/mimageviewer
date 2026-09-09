@@ -659,6 +659,12 @@ pub enum RingActionId {
     VideoMarkerNext,
     VideoTileMode,
     VideoExternalPlayer,
+    VideoSeekBackSmall,
+    VideoSeekForwardSmall,
+    VideoSeekBackMedium,
+    VideoSeekForwardMedium,
+    VideoSeekBackLarge,
+    VideoSeekForwardLarge,
     Unknown(String),
 }
 
@@ -1053,6 +1059,12 @@ impl RingActionId {
             Self::VideoMarkerNext => "video_marker_next",
             Self::VideoTileMode => "video_tile_mode",
             Self::VideoExternalPlayer => "video_external_player",
+            Self::VideoSeekBackSmall => "video_seek_back_small",
+            Self::VideoSeekForwardSmall => "video_seek_forward_small",
+            Self::VideoSeekBackMedium => "video_seek_back_medium",
+            Self::VideoSeekForwardMedium => "video_seek_forward_medium",
+            Self::VideoSeekBackLarge => "video_seek_back_large",
+            Self::VideoSeekForwardLarge => "video_seek_forward_large",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -1152,6 +1164,12 @@ impl RingActionId {
             "video_marker_next" => Self::VideoMarkerNext,
             "video_tile_mode" => Self::VideoTileMode,
             "video_external_player" => Self::VideoExternalPlayer,
+            "video_seek_back_small" => Self::VideoSeekBackSmall,
+            "video_seek_forward_small" => Self::VideoSeekForwardSmall,
+            "video_seek_back_medium" => Self::VideoSeekBackMedium,
+            "video_seek_forward_medium" => Self::VideoSeekForwardMedium,
+            "video_seek_back_large" => Self::VideoSeekBackLarge,
+            "video_seek_forward_large" => Self::VideoSeekForwardLarge,
             _ => return None,
         })
     }
@@ -1308,6 +1326,12 @@ impl RingActionId {
             Self::VideoMarkerNext => "次のマーカー",
             Self::VideoTileMode => "タイルモード",
             Self::VideoExternalPlayer => "外部プレイヤーで開く",
+            Self::VideoSeekBackSmall => "小シークで戻す",
+            Self::VideoSeekForwardSmall => "小シークで進める",
+            Self::VideoSeekBackMedium => "中シークで戻す",
+            Self::VideoSeekForwardMedium => "中シークで進める",
+            Self::VideoSeekBackLarge => "大シークで戻す",
+            Self::VideoSeekForwardLarge => "大シークで進める",
             Self::Unknown(_) => "不明なアクション",
         }
     }
@@ -1421,6 +1445,12 @@ impl RingActionId {
                     | Self::VideoMarkerNext
                     | Self::VideoTileMode
                     | Self::VideoExternalPlayer
+                    | Self::VideoSeekBackSmall
+                    | Self::VideoSeekForwardSmall
+                    | Self::VideoSeekBackMedium
+                    | Self::VideoSeekForwardMedium
+                    | Self::VideoSeekBackLarge
+                    | Self::VideoSeekForwardLarge
             ),
         }
     }
@@ -1428,6 +1458,31 @@ impl RingActionId {
     pub fn is_valid_for_mouse_button_context(&self, context: RingShortcutContext) -> bool {
         self.is_valid_for_context(context)
             && (context == RingShortcutContext::Grid || !self.is_location_navigation_action())
+    }
+
+    /// Whether this action may be selected for a physical Back / Forward / Middle button.
+    ///
+    /// This is intentionally separate from [`Self::is_valid_for_mouse_button_context`]. The
+    /// latter is the serialized-data contract used by `MouseButtonProfile::sanitize`; keeping
+    /// the six video seek values valid lets a future version restore the feature without erasing
+    /// an existing user's choice. v3.7 does not offer or execute those choices because some mouse
+    /// drivers deliver one physical press through more than one browser-navigation producer.
+    pub fn is_available_for_mouse_button_assignment(&self, context: RingShortcutContext) -> bool {
+        self.is_valid_for_mouse_button_context(context)
+            && !(context == RingShortcutContext::VideoFullscreen
+                && self.is_configurable_video_seek_action())
+    }
+
+    pub fn is_configurable_video_seek_action(&self) -> bool {
+        matches!(
+            self,
+            Self::VideoSeekBackSmall
+                | Self::VideoSeekForwardSmall
+                | Self::VideoSeekBackMedium
+                | Self::VideoSeekForwardMedium
+                | Self::VideoSeekBackLarge
+                | Self::VideoSeekForwardLarge
+        )
     }
 
     pub fn is_valid_for_right_drag_context(&self, context: RightDragContext) -> bool {
@@ -1539,6 +1594,12 @@ impl RingActionId {
                 Self::VideoMarkerNext,
                 Self::VideoTileMode,
                 Self::VideoExternalPlayer,
+                Self::VideoSeekBackSmall,
+                Self::VideoSeekForwardSmall,
+                Self::VideoSeekBackMedium,
+                Self::VideoSeekForwardMedium,
+                Self::VideoSeekBackLarge,
+                Self::VideoSeekForwardLarge,
             ],
         };
         actions.extend(Self::location_navigation_actions());
@@ -1548,7 +1609,7 @@ impl RingActionId {
     pub fn available_for_mouse_button_context(context: RingShortcutContext) -> Vec<Self> {
         Self::available_for_context(context)
             .into_iter()
-            .filter(|action| action.is_valid_for_mouse_button_context(context))
+            .filter(|action| action.is_available_for_mouse_button_assignment(context))
             .collect()
     }
 
@@ -1745,6 +1806,57 @@ fn default_mouse_button_profile() -> MouseButtonProfile {
     )
 }
 
+/// Action assigned to an unmodified wheel over the video/audio viewer after
+/// higher-priority regions and display modes have declined the event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoNormalWheelActionId {
+    #[default]
+    NavigateItems,
+    AdjustVolume,
+}
+
+/// Semantic action produced by an unmodified video/audio viewer wheel.
+///
+/// Both the native presenter and egui viewer route through this value so the
+/// wheel direction cannot drift between the two input owners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoNormalWheelResolvedAction {
+    NavigateDelta(i32),
+    VolumeStep(i32),
+}
+
+impl VideoNormalWheelActionId {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NavigateItems => "前後のファイルへ移動",
+            Self::AdjustVolume => "音量を上げる / 下げる",
+        }
+    }
+
+    pub fn available() -> &'static [Self] {
+        const AVAILABLE: &[VideoNormalWheelActionId] = &[
+            VideoNormalWheelActionId::NavigateItems,
+            VideoNormalWheelActionId::AdjustVolume,
+        ];
+        AVAILABLE
+    }
+
+    pub fn resolve(self, wheel_delta: f32) -> Option<VideoNormalWheelResolvedAction> {
+        let direction = if !wheel_delta.is_finite() || wheel_delta == 0.0 {
+            return None;
+        } else if wheel_delta > 0.0 {
+            1
+        } else {
+            -1
+        };
+        Some(match self {
+            Self::NavigateItems => VideoNormalWheelResolvedAction::NavigateDelta(-direction),
+            Self::AdjustVolume => VideoNormalWheelResolvedAction::VolumeStep(direction),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WheelPairActionId {
     None,
@@ -1932,6 +2044,8 @@ pub struct RingShortcutSettings {
     pub shift_wheel_pair: WheelPairActionId,
     #[serde(default)]
     pub alt_wheel_pair: WheelPairActionId,
+    #[serde(default)]
+    pub video_normal_wheel_action: VideoNormalWheelActionId,
     #[serde(default)]
     pub mouse_back_forward_action: MouseBackForwardActionId,
     #[serde(default = "default_mouse_button_profile")]
@@ -2173,6 +2287,7 @@ impl Default for RingShortcutSettings {
             gamepad_ring_enabled: true,
             shift_wheel_pair: WheelPairActionId::None,
             alt_wheel_pair: WheelPairActionId::None,
+            video_normal_wheel_action: VideoNormalWheelActionId::default(),
             mouse_back_forward_action: MouseBackForwardActionId::None,
             mouse_buttons_grid: default_mouse_button_profile(),
             mouse_buttons_image: default_mouse_button_profile(),
@@ -3596,9 +3711,143 @@ mod tests {
             RingActionId::available_for_mouse_button_context(RingShortcutContext::VideoFullscreen);
         assert!(video.contains(&RingActionId::GridHistoryForward));
         assert!(video.contains(&RingActionId::VideoMute));
+        for seek in [
+            RingActionId::VideoSeekBackSmall,
+            RingActionId::VideoSeekForwardSmall,
+            RingActionId::VideoSeekBackMedium,
+            RingActionId::VideoSeekForwardMedium,
+            RingActionId::VideoSeekBackLarge,
+            RingActionId::VideoSeekForwardLarge,
+        ] {
+            assert!(!video.contains(&seek));
+            assert!(seek.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+            assert!(
+                seek.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen),
+                "serialized mouse-button value must stay valid: {}",
+                seek.as_str()
+            );
+            assert!(
+                !seek
+                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "v3.7 must not offer video seek for a physical mouse button: {}",
+                seek.as_str()
+            );
+            assert!(!seek.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(!seek.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+            assert_eq!(RingActionId::from_str(seek.as_str()), Some(seek));
+        }
         assert!(!video.contains(&RingActionId::OpenDriveC));
         assert!(!video.contains(&RingActionId::OpenLocationRating1));
         assert!(!video.contains(&RingActionId::OpenFavorite1));
+    }
+
+    #[test]
+    fn deferred_video_mouse_seek_values_survive_sanitize_and_serde_round_trip() {
+        for (slot, seek) in [
+            (MouseButtonSlot::Back, RingActionId::VideoSeekBackSmall),
+            (
+                MouseButtonSlot::Forward,
+                RingActionId::VideoSeekForwardSmall,
+            ),
+            (MouseButtonSlot::Middle, RingActionId::VideoSeekBackMedium),
+            (MouseButtonSlot::Back, RingActionId::VideoSeekForwardMedium),
+            (MouseButtonSlot::Forward, RingActionId::VideoSeekBackLarge),
+            (MouseButtonSlot::Middle, RingActionId::VideoSeekForwardLarge),
+        ] {
+            let mut settings = RingShortcutSettings::default();
+            let profile = settings.mouse_button_profile_mut(RingShortcutContext::VideoFullscreen);
+            match slot {
+                MouseButtonSlot::Back => profile.back = seek.clone(),
+                MouseButtonSlot::Forward => profile.forward = seek.clone(),
+                MouseButtonSlot::Middle => profile.middle = seek.clone(),
+            }
+
+            settings.sanitize();
+            assert_eq!(
+                settings
+                    .mouse_button_profile(RingShortcutContext::VideoFullscreen)
+                    .action(slot),
+                seek,
+                "sanitize must preserve deferred value"
+            );
+
+            let json = serde_json::to_string(&settings).unwrap();
+            let mut loaded: RingShortcutSettings = serde_json::from_str(&json).unwrap();
+            loaded.sanitize();
+            assert_eq!(
+                loaded
+                    .mouse_button_profile(RingShortcutContext::VideoFullscreen)
+                    .action(slot),
+                seek,
+                "save/reopen must preserve deferred value"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_video_wheel_defaults_round_trip_and_reject_unknown_values() {
+        let defaults = RingShortcutSettings::default();
+        assert_eq!(
+            defaults.video_normal_wheel_action,
+            VideoNormalWheelActionId::NavigateItems
+        );
+        assert_eq!(
+            serde_json::to_string(&VideoNormalWheelActionId::AdjustVolume).unwrap(),
+            r#""adjust_volume""#
+        );
+        assert_eq!(
+            serde_json::from_str::<VideoNormalWheelActionId>(r#""adjust_volume""#).unwrap(),
+            VideoNormalWheelActionId::AdjustVolume
+        );
+
+        assert!(
+            serde_json::from_str::<VideoNormalWheelActionId>(r#""future-wheel""#).is_err(),
+            "future values must reach SettingsDb's incompatible-value protection"
+        );
+
+        let settings = RingShortcutSettings::default();
+        assert_eq!(
+            settings.mouse_buttons_video,
+            MouseButtonProfile::new(
+                RingActionId::GridHistoryBack,
+                RingActionId::GridHistoryForward,
+            )
+        );
+    }
+
+    #[test]
+    fn normal_video_wheel_resolves_shared_navigation_and_volume_directions() {
+        use VideoNormalWheelResolvedAction::{NavigateDelta, VolumeStep};
+
+        assert_eq!(
+            VideoNormalWheelActionId::NavigateItems.resolve(120.0),
+            Some(NavigateDelta(-1))
+        );
+        assert_eq!(
+            VideoNormalWheelActionId::NavigateItems.resolve(-120.0),
+            Some(NavigateDelta(1))
+        );
+        assert_eq!(
+            VideoNormalWheelActionId::AdjustVolume.resolve(0.25),
+            Some(VolumeStep(1))
+        );
+        assert_eq!(
+            VideoNormalWheelActionId::AdjustVolume.resolve(-0.25),
+            Some(VolumeStep(-1))
+        );
+        assert_eq!(VideoNormalWheelActionId::NavigateItems.resolve(0.0), None);
+        assert_eq!(
+            VideoNormalWheelActionId::AdjustVolume.resolve(f32::NAN),
+            None
+        );
+        assert_eq!(
+            VideoNormalWheelActionId::NavigateItems.resolve(f32::INFINITY),
+            None
+        );
+        assert_eq!(
+            VideoNormalWheelActionId::AdjustVolume.resolve(f32::NEG_INFINITY),
+            None
+        );
     }
 
     #[test]

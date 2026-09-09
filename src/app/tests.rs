@@ -11,6 +11,9 @@ use tempfile::TempDir;
 #[path = "tests/detached_binding_identity.rs"]
 mod detached_binding_identity;
 
+#[path = "tests/prefetch_201.rs"]
+mod prefetch_201;
+
 #[test]
 fn collect_image_indices_builds_the_still_list_once_for_repeated_calls() {
     let mut app = setup_app_for_test();
@@ -5286,13 +5289,13 @@ fn interleaved_prefetch_targets_boundary_cases() {
         "forward=back=0 → 空"
     );
 
-    // 非対称: forward >> back の典型ケース (settings 既定: forward=2, back=1)
+    // 非対称: forward >> back の旧既定ケース (forward=2, back=1)
     // pos=2, n=5 → forward d=1→3, back d=1→1, forward d=2→4 (back d=2 は無し)
     let small: Vec<usize> = vec![10, 20, 30, 40, 50];
     assert_eq!(
         interleaved_prefetch_targets(&small, 2, 5, 2, 1),
         vec![40, 20, 50],
-        "デフォルト forward=2 back=1 のインタリーブ順序 (= settings 既定値の代表ケース)"
+        "旧既定 forward=2 back=1 のインタリーブ順序"
     );
 
     // forward が n を越える: 末尾を超えたらスキップ
@@ -39403,6 +39406,77 @@ mod edit_materialize_worker_tests {
 }
 
 #[cfg(all(test, windows))]
+mod native_video_zoom_wheel_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn insert_flat_video_with_region(app: &mut App) -> (usize, u64) {
+        let path = PathBuf::from(r"C:\clips\flat-zoom.mp4");
+        let idx = app.items.len();
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        let source_epoch = player
+            .native_source_epoch()
+            .expect("stream-ready test player has a native output epoch");
+        player.set_native_overlay_input_routing_for_test(
+            crate::video::native_presenter::NativeOverlayInputRouting {
+                video_region: Some(crate::video::native_presenter::NativeVideoInputRegion {
+                    origin_points: [0.0, 0.0],
+                    size_points: [640.0, 360.0],
+                }),
+                ..Default::default()
+            },
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        (idx, source_epoch)
+    }
+
+    #[test]
+    fn video_zoom_wheel_applies_once_for_the_current_source_and_rejects_stale_source() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (idx, source_epoch) = insert_flat_video_with_region(&mut app);
+        app.fullscreen_idx = Some(idx);
+        app.video_zoom_state = Some(crate::video::zoom_view::VideoZoomState::new());
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch.wrapping_add(1),
+            crate::video::NativeVideoOutputEvent::VideoZoomWheel {
+                delta: 120,
+                pointer_points: [320.0, 180.0],
+            },
+        );
+        assert_eq!(
+            app.video_zoom_state.expect("zoom remains active").scale(),
+            1.0,
+            "a stale source epoch must not mutate the current zoom state"
+        );
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::VideoZoomWheel {
+                delta: 120,
+                pointer_points: [320.0, 180.0],
+            },
+        );
+        let scale = app.video_zoom_state.expect("zoom remains active").scale();
+        assert!((scale - 1.2).abs() < f32::EPSILON, "scale={scale}");
+    }
+}
+
+#[cfg(all(test, windows))]
 mod native_video_rating_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
@@ -54817,6 +54891,7 @@ mod still_window_mode_key_tests {
             y: 10,
             shift: false,
             ctrl: false,
+            alt: false,
         }));
         assert!(
             !app.native_video_event_blocked_by_parked_live_filter(&wheel),
@@ -55120,6 +55195,7 @@ mod still_window_mode_key_tests {
             y: 10,
             shift: false,
             ctrl: false,
+            alt: false,
         };
         let left_down = NativeVideoMouseButtonEvent {
             button: NativeVideoMouseButton::Left,
@@ -55289,6 +55365,7 @@ mod still_window_mode_key_tests {
             y: 70,
             shift: false,
             ctrl: false,
+            alt: false,
         };
         for event in [
             Ev::Window(WinEv::KeyDown(key)),
@@ -55595,6 +55672,7 @@ mod still_window_mode_key_tests {
                     y: 10,
                     shift: false,
                     ctrl: false,
+                    alt: false,
                 })
             ))
         );
@@ -55711,6 +55789,7 @@ mod still_window_mode_key_tests {
             y: 34,
             shift: false,
             ctrl: false,
+            alt: false,
         };
 
         app.handle_native_video_output_event(&ctx, video, 0, Ev::Window(WinEv::MouseWheel(wheel)));
@@ -70727,6 +70806,10 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::BottomBarLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues {
+                maximum: 240,
+                ..Default::default()
+            },
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
@@ -70741,6 +70824,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::BottomBarLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_strip_height_values:
+                crate::video::seek_strip_layout::SeekStripHeightValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
@@ -70759,6 +70844,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         app.settings
             .set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
         app.settings.fullscreen_fixed_bar_gap_px = 6;
+        app.settings.video_seek_strip_height_values.maximum = 240;
 
         let state = app.native_bar_lock_state();
 
@@ -70768,5 +70854,6 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             crate::settings::BottomBarLock::BarAndStrip
         );
         assert_eq!(state.fixed_bar_gap_px, 6);
+        assert_eq!(state.seek_strip_height_values.maximum, 240);
     }
 }

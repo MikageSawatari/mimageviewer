@@ -160,8 +160,12 @@ pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VideoSeekGeometry {
     normal_seek_bar_visible: bool,
+    /// overlay 内へ収めた実際の下部バー矩形。
+    normal_bar_rect: egui::Rect,
     normal_bar_height: f32,
     strip_layout: crate::video::seek_strip_layout::SeekStripLayout,
+    top_reserved_points: f32,
+    bottom_reserved_points: f32,
     thumbnail_strip_visible_for_preview_policy: bool,
 }
 
@@ -170,23 +174,142 @@ impl VideoSeekGeometry {
         overlay_size: egui::Vec2,
         normal_seek_bar_visible: bool,
         strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+        strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
         span: crate::video::seek_strip_layout::SeekStripSpan,
         aspect: Option<f32>,
         thumbnail_strip_visible_for_preview_policy: bool,
+        top_locked: bool,
+        bottom_lock: BottomBarLock,
+        fixed_bar_gap_px: u32,
+        strip_reserves_space: bool,
     ) -> Self {
-        let normal_bar_height = resolved_video_bottom_bar_height(normal_seek_bar_visible);
+        let overlay_w = overlay_size.x.max(0.0);
+        let overlay_h = overlay_size.y.max(0.0);
+        let requested_bar_height = resolved_video_bottom_bar_height(normal_seek_bar_visible);
+        let bar_height_budget = if bottom_lock.bar_locked() {
+            (overlay_h - 1.0).max(0.0)
+        } else {
+            overlay_h
+        };
+        let normal_bar_height = requested_bar_height.min(bar_height_budget);
+        let normal_bar_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, overlay_h - normal_bar_height),
+            egui::vec2(overlay_w, normal_bar_height),
+        );
+        // 上部 HUD は固定でなくても hover 中に同時表示される。strip は常にその通常領域と
+        // 下部バーのあいだへ収め、利用者指定が大きくても HUD 同士を重ねない。
+        let strip_top_limit = HUD_TOP_HEIGHT.min(normal_bar_rect.min.y);
+        let mut available_strip_height = (normal_bar_rect.min.y - strip_top_limit).max(0.0);
+        if bottom_lock.strip_locked() && strip_reserves_space {
+            // 実操作面 (top/bar/strip) を先に保ち、狭い場合は設定 gap から縮める。
+            // gap を先取りすると大きな設定値だけで strip が消える。
+            let top_reservation = if top_locked { HUD_TOP_HEIGHT } else { 0.0 };
+            let bottom_without_strip = normal_bar_height;
+            available_strip_height = available_strip_height
+                .min((overlay_h - top_reservation - bottom_without_strip - 1.0).max(0.0));
+        }
+        let strip_height_points = strip_height_values
+            .points(strip_height)
+            .min(available_strip_height);
+        let strip_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, normal_bar_rect.min.y - strip_height_points),
+            egui::vec2(overlay_w, strip_height_points),
+        );
+        let strip_layout = crate::video::seek_strip_layout::SeekStripLayout::resolve(
+            strip_rect,
+            strip_height,
+            strip_height_values,
+            span,
+            aspect,
+        );
+        let (top_reserved_points, bottom_reserved_points) = video_bar_reserved_points(
+            VideoVisualLayout {
+                compact: false,
+                pixels_per_point: 1.0,
+                top_bar_locked: top_locked,
+                bottom_lock,
+                bottom_bar_height: normal_bar_height,
+                seek_strip_visible_points: if strip_reserves_space {
+                    strip_layout.rect.height()
+                } else {
+                    0.0
+                },
+                fixed_bar_gap_px,
+                info_panel_reserved: false,
+            },
+            overlay_h,
+        );
         Self {
             normal_seek_bar_visible,
+            normal_bar_rect,
             normal_bar_height,
-            strip_layout: crate::video::seek_strip_layout::SeekStripLayout::resolve(
-                overlay_size,
-                normal_bar_height,
-                strip_height,
-                span,
-                aspect,
-            ),
+            strip_layout,
+            top_reserved_points,
+            bottom_reserved_points,
             thumbnail_strip_visible_for_preview_policy,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeBottomHudRows {
+    seek_row_rect: egui::Rect,
+    controls_row_rect: egui::Rect,
+    button_size: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeSeekRowRects {
+    bar_rect: egui::Rect,
+    hit_rect: egui::Rect,
+}
+
+fn native_seek_row_rects(seek_row_rect: egui::Rect) -> NativeSeekRowRects {
+    if seek_row_rect.width() <= 0.0 || seek_row_rect.height() <= 0.0 {
+        return NativeSeekRowRects {
+            bar_rect: egui::Rect::NOTHING,
+            hit_rect: egui::Rect::NOTHING,
+        };
+    }
+    let side_pad = 10.0_f32.min(seek_row_rect.width() * 0.5);
+    let hit_rect = egui::Rect::from_min_max(
+        egui::pos2(seek_row_rect.min.x + side_pad, seek_row_rect.min.y),
+        egui::pos2(seek_row_rect.max.x - side_pad, seek_row_rect.max.y),
+    );
+    let bar_height = 8.0_f32.min(hit_rect.height());
+    NativeSeekRowRects {
+        bar_rect: egui::Rect::from_center_size(
+            hit_rect.center(),
+            egui::vec2(hit_rect.width(), bar_height),
+        ),
+        hit_rect,
+    }
+}
+
+fn native_bottom_hud_rows(
+    hud_rect: egui::Rect,
+    normal_seek_bar_visible: bool,
+) -> NativeBottomHudRows {
+    let controls_row_height = HUD_CONTROLS_ROW_HEIGHT.min(hud_rect.height().max(0.0));
+    let seek_row_height = if normal_seek_bar_visible {
+        (hud_rect.height() - controls_row_height)
+            .max(0.0)
+            .min(HUD_SEEK_ROW_HEIGHT)
+    } else {
+        0.0
+    };
+    let seek_row_rect = egui::Rect::from_min_max(
+        hud_rect.min,
+        egui::pos2(hud_rect.max.x, hud_rect.min.y + seek_row_height),
+    );
+    let controls_row_rect = egui::Rect::from_min_max(
+        egui::pos2(hud_rect.min.x, hud_rect.max.y - controls_row_height),
+        hud_rect.max,
+    );
+    NativeBottomHudRows {
+        seek_row_rect,
+        controls_row_rect,
+        button_size: 28.0_f32.min(controls_row_rect.height().max(0.0)),
     }
 }
 
@@ -219,12 +342,143 @@ const SEEK_PREVIEW_GAP: f32 = 14.0;
 const SEEK_PREVIEW_SCREEN_MARGIN: f32 = 8.0;
 const SEEK_PREVIEW_ACTION_BAR_HEIGHT: f32 = 38.0;
 
+#[cfg(test)]
 fn native_seek_strip_range_text_pos(strip_rect: egui::Rect) -> egui::Pos2 {
     let lock_rect = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect);
     egui::pos2(
         lock_rect.min.x - SEEK_STRIP_RANGE_LOCK_GAP,
         strip_rect.min.y + 5.0,
     )
+}
+
+fn fitted_strip_text_galley(
+    painter: &egui::Painter,
+    text: &str,
+    rect: egui::Rect,
+    max_font_size: f32,
+    color: egui::Color32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let width = rect.width();
+    let height = rect.height();
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || !max_font_size.is_finite()
+        || max_font_size <= 0.0
+    {
+        return None;
+    }
+    // Bound the initial em by both axes. This lets a positive sub-point rect start near a
+    // drawable size even though the shared top-HUD truncator intentionally rejects <1pt widths.
+    let mut font_size = max_font_size
+        .min(height * 0.72)
+        .min(width * 0.72)
+        .max(f32::MIN_POSITIVE);
+    // Font fallback line metrics can be taller than the requested em size. Resolve the actual
+    // galley, then reduce continuously until both dimensions fit instead of using a visibility
+    // threshold for small positive rectangles. The local >=1pt layout width preserves the
+    // shared helper's contract; this function alone owns the smaller body clip.
+    for _ in 0..16 {
+        let galley = layout_truncated_to_width(
+            painter,
+            text,
+            crate::ui_fonts::hud_text_font(font_size),
+            color,
+            width.max(1.0),
+            96,
+        );
+        if let Some(galley) = galley {
+            let size = galley.size();
+            if size.x <= width + f32::EPSILON && size.y <= height + f32::EPSILON {
+                return Some(galley);
+            }
+            let fit = (width / size.x.max(f32::EPSILON))
+                .min(height / size.y.max(f32::EPSILON))
+                .clamp(0.1, 0.98);
+            font_size *= fit * 0.98;
+        } else {
+            // At this font the ellipsis itself did not fit the shared helper's 1pt floor.
+            // Retry smaller instead of turning a positive strip into a hidden-label branch.
+            font_size *= 0.5;
+        }
+        if !font_size.is_finite() || font_size <= 0.0 {
+            break;
+        }
+    }
+    None
+}
+
+fn paint_fitted_strip_text_centered(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    max_font_size: f32,
+    color: egui::Color32,
+) -> Option<egui::Rect> {
+    let galley = fitted_strip_text_galley(painter, text, rect, max_font_size, color)?;
+    let pos = rect.center() - galley.size() * 0.5;
+    let shape_rect = egui::Rect::from_min_size(pos, galley.size());
+    painter.galley(pos, galley, color);
+    Some(shape_rect)
+}
+
+fn paint_fitted_strip_text_left_centered(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    preferred_center_y: f32,
+    text: &str,
+    max_font_size: f32,
+    color: egui::Color32,
+) -> Option<egui::Rect> {
+    let galley = fitted_strip_text_galley(painter, text, rect, max_font_size, color)?;
+    let pos = egui::pos2(
+        rect.min.x,
+        (preferred_center_y - galley.size().y * 0.5)
+            .clamp(rect.min.y, (rect.max.y - galley.size().y).max(rect.min.y)),
+    );
+    let shape_rect = egui::Rect::from_min_size(pos, galley.size());
+    painter.galley(pos, galley, color);
+    Some(shape_rect)
+}
+
+fn paint_fitted_strip_range_text(
+    painter: &egui::Painter,
+    strip_rect: egui::Rect,
+    text: &str,
+) -> Option<egui::Rect> {
+    let lock_rect = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect);
+    let text_rect = egui::Rect::from_min_max(
+        strip_rect.min,
+        egui::pos2(
+            (lock_rect.min.x - SEEK_STRIP_RANGE_LOCK_GAP).max(strip_rect.min.x),
+            strip_rect.max.y,
+        ),
+    );
+    let galley = fitted_strip_text_galley(
+        painter,
+        text,
+        text_rect,
+        11.0,
+        egui::Color32::from_gray(232),
+    )?;
+    let pos = egui::pos2(
+        text_rect.max.x - galley.size().x,
+        (strip_rect.min.y + 5.0).clamp(
+            text_rect.min.y,
+            (text_rect.max.y - galley.size().y).max(text_rect.min.y),
+        ),
+    );
+    let shape_rect = egui::Rect::from_min_size(pos, galley.size());
+    // Keep the established one-point shadow at normal sizes. Both shapes use the body's
+    // dedicated clip, so even a sub-line-height positive strip cannot paint into another HUD.
+    painter.galley(
+        pos + egui::vec2(1.0, 1.0),
+        galley.clone(),
+        egui::Color32::from_black_alpha(220),
+    );
+    painter.galley(pos, galley, egui::Color32::from_gray(232));
+    Some(shape_rect)
 }
 
 fn seek_strip_body_accepts_pointer(lock_rect: egui::Rect, pointer: egui::Pos2) -> bool {
@@ -446,7 +700,9 @@ fn video_zoom_takes_the_wheel(video_zoom_active: bool, region_owns_wheel: bool) 
 
 fn immediate_native_wheel_command(
     delta: i16,
+    shift: bool,
     ctrl: bool,
+    alt: bool,
     tile_overlay_visible: bool,
     region_owns_wheel: bool,
 ) -> Option<NativeOverlayCommand> {
@@ -455,12 +711,81 @@ fn immediate_native_wheel_command(
             delta: if delta > 0 { -1 } else { 1 },
         })
     } else if !ctrl && !region_owns_wheel {
-        Some(NativeOverlayCommand::NavigateItem {
-            delta: if delta < 0 { 1 } else { -1 },
-            via_wheel: true,
-        })
+        if shift || alt {
+            Some(NativeOverlayCommand::NavigateItem {
+                delta: if delta < 0 { 1 } else { -1 },
+                via_wheel: true,
+            })
+        } else {
+            Some(NativeOverlayCommand::NormalWheel {
+                delta: i32::from(delta),
+            })
+        }
     } else {
         None
+    }
+}
+
+struct NativeWheelPlan {
+    disposition: NativeOverlayInputDisposition,
+    command: Option<NativeOverlayCommand>,
+    deliver_to_egui: bool,
+}
+
+fn plan_native_wheel(
+    wheel: crate::video::native_window::NativeVideoMouseWheelEvent,
+    pointer_points: [f32; 2],
+    region_owns_wheel: bool,
+    panorama_active: bool,
+    video_zoom_active: bool,
+    tile_overlay_visible: bool,
+) -> NativeWheelPlan {
+    if region_owns_wheel {
+        return NativeWheelPlan {
+            disposition: NativeOverlayInputDisposition::OverlayRegion,
+            command: None,
+            deliver_to_egui: true,
+        };
+    }
+    if panorama_takes_the_wheel(panorama_active, false) {
+        return NativeWheelPlan {
+            disposition: NativeOverlayInputDisposition::Command,
+            command: Some(NativeOverlayCommand::PanoramaWheel {
+                delta: i32::from(wheel.delta),
+            }),
+            deliver_to_egui: false,
+        };
+    }
+    if video_zoom_takes_the_wheel(video_zoom_active, false) {
+        return NativeWheelPlan {
+            disposition: NativeOverlayInputDisposition::Command,
+            command: Some(NativeOverlayCommand::VideoZoomWheel {
+                delta: i32::from(wheel.delta),
+                pointer_points,
+            }),
+            deliver_to_egui: false,
+        };
+    }
+    if let Some(command) = immediate_native_wheel_command(
+        wheel.delta,
+        wheel.shift,
+        wheel.ctrl,
+        wheel.alt,
+        tile_overlay_visible,
+        false,
+    ) {
+        return NativeWheelPlan {
+            disposition: NativeOverlayInputDisposition::Command,
+            command: Some(command),
+            deliver_to_egui: false,
+        };
+    }
+    NativeWheelPlan {
+        disposition: NativeOverlayInputDisposition::AppRemainder(
+            NativeOverlayInputRouting::default(),
+        ),
+        command: None,
+        deliver_to_egui: false,
     }
 }
 
@@ -519,6 +844,46 @@ fn draw_native_seek_strip(
     use crate::video::seek_strip_layout::SeekStripSpan;
 
     let strip_rect = layout.rect;
+    if !strip_rect.width().is_finite()
+        || !strip_rect.height().is_finite()
+        || strip_rect.width() <= 0.0
+        || strip_rect.height() <= 0.0
+    {
+        // 0 領域で max(1) の画像・波形要求を作らない。再び正領域になったフレームでは
+        // request key を必ず作り直す。
+        *last_window_request = None;
+        if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+            && let Some(origin) = drag_origin.take()
+            && let Some(pointer) = ctx
+                .input(|input| input.pointer.latest_pos())
+                .or(cursor_hover_pos)
+        {
+            if crate::video::seek_strip::strip_drag_closes_downward(
+                origin.pointer,
+                pointer,
+                strip_rect.max.y,
+            ) {
+                commands.push(NativeOverlayCommand::CloseSeekStrip {
+                    cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                });
+            } else {
+                let center = match layout.span {
+                    SeekStripSpan::Window => {
+                        crate::video::seek_strip::seek_strip_center_at_drag_pointer(origin, pointer)
+                    }
+                    SeekStripSpan::Whole => {
+                        crate::video::seek_strip::seek_strip_center_at_press_axis_pointer(
+                            origin, pointer,
+                        )
+                    }
+                };
+                if let Some(center) = center {
+                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                }
+            }
+        }
+        return NativeSeekStripPreviewHover::Outside;
+    }
     let cell_width = layout.cell_width;
     // 全体表示のセル数は帯そのもの。周辺表示だけが端の外へ 1 枚ずつ余分に要る。
     let visible_count = layout.whole_cell_count.unwrap_or_else(|| {
@@ -563,7 +928,9 @@ fn draw_native_seek_strip(
         .show(ctx, |ui| {
             ui.set_min_size(strip_rect.size());
             let local_rect = ui.min_rect();
-            let painter = ui.painter().clone();
+            // Strip body chrome is always clipped to the fitted body. Hover preview rendering is
+            // intentionally outside this function/clip so it can remain above the strip.
+            let painter = ui.painter().with_clip_rect(local_rect);
             painter.rect_filled(
                 local_rect,
                 0.0,
@@ -578,14 +945,14 @@ fn draw_native_seek_strip(
             match strip.center {
                 crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                     if let Some(notice) = strip.thumbnail_notice {
-                        painter.text(
-                            egui::pos2(
-                                (axis_origin_x + local_rect.max.x) * 0.5,
-                                local_rect.center().y,
+                        let _ = paint_fitted_strip_text_centered(
+                            &painter,
+                            egui::Rect::from_min_max(
+                                egui::pos2(axis_origin_x, local_rect.min.y),
+                                local_rect.max,
                             ),
-                            egui::Align2::CENTER_CENTER,
                             notice.label(),
-                            crate::ui_fonts::hud_text_font(14.0),
+                            14.0,
                             egui::Color32::from_gray(210),
                         );
                     } else {
@@ -643,22 +1010,22 @@ fn draw_native_seek_strip(
                                     }
                                 }
                                 Some(NativeOverlaySeekStripCellContent::Failed { reason }) => {
-                                    painter.text(
-                                        cell_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
+                                    let _ = paint_fitted_strip_text_centered(
+                                        &painter,
+                                        cell_rect,
                                         reason,
-                                        crate::ui_fonts::hud_text_font(13.0),
+                                        13.0,
                                         egui::Color32::from_gray(190),
                                     );
                                 }
                                 Some(NativeOverlaySeekStripCellContent::RetryPending {
                                     reason,
                                 }) => {
-                                    painter.text(
-                                        cell_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
+                                    let _ = paint_fitted_strip_text_centered(
+                                        &painter,
+                                        cell_rect,
                                         reason,
-                                        crate::ui_fonts::hud_text_font(13.0),
+                                        13.0,
                                         egui::Color32::from_gray(160),
                                     );
                                 }
@@ -674,7 +1041,10 @@ fn draw_native_seek_strip(
                     }
                 }
                 crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
-                    let wave_rect = local_rect.shrink2(egui::vec2(2.0, 5.0));
+                    let wave_rect = local_rect.shrink2(egui::vec2(
+                        2.0_f32.min(local_rect.width() * 0.5),
+                        5.0_f32.min(local_rect.height() * 0.5),
+                    ));
                     painter.rect_filled(wave_rect, 3.0, egui::Color32::BLACK);
                     if let (Some(texture_id), Some(wave_image)) =
                         (wave_texture_id, strip.wave_image.as_ref())
@@ -707,14 +1077,14 @@ fn draw_native_seek_strip(
                             );
                         }
                     } else if let Some(notice) = strip.wave_notice {
-                        painter.text(
-                            egui::pos2(
-                                (axis_origin_x + wave_rect.max.x) * 0.5,
-                                wave_rect.center().y,
+                        let _ = paint_fitted_strip_text_centered(
+                            &painter,
+                            egui::Rect::from_min_max(
+                                egui::pos2(axis_origin_x, wave_rect.min.y),
+                                wave_rect.max,
                             ),
-                            egui::Align2::CENTER_CENTER,
                             notice.label(),
-                            crate::ui_fonts::hud_text_font(14.0),
+                            14.0,
                             egui::Color32::from_gray(210),
                         );
                     }
@@ -772,10 +1142,11 @@ fn draw_native_seek_strip(
                     );
                 }
             }
+            let marker_inset = 3.0_f32.min(local_rect.height() * 0.5);
             painter.line_segment(
                 [
-                    egui::pos2(marker_x, local_rect.min.y + 3.0),
-                    egui::pos2(marker_x, local_rect.max.y - 3.0),
+                    egui::pos2(marker_x, local_rect.min.y + marker_inset),
+                    egui::pos2(marker_x, local_rect.max.y - marker_inset),
                 ],
                 egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 92, 92)),
             );
@@ -792,22 +1163,7 @@ fn draw_native_seek_strip(
                     strip.range_value_secs,
                 );
                 let range_text = format!("{range_name} {range_value}");
-                let range_pos = native_seek_strip_range_text_pos(local_rect);
-                let range_font = crate::ui_fonts::hud_text_font(11.0);
-                painter.text(
-                    range_pos + egui::vec2(1.0, 1.0),
-                    egui::Align2::RIGHT_TOP,
-                    &range_text,
-                    range_font.clone(),
-                    egui::Color32::from_black_alpha(220),
-                );
-                painter.text(
-                    range_pos,
-                    egui::Align2::RIGHT_TOP,
-                    range_text,
-                    range_font,
-                    egui::Color32::from_gray(232),
-                );
+                let _ = paint_fitted_strip_range_text(&painter, local_rect, &range_text);
             }
 
             let lock_rect =
@@ -848,10 +1204,14 @@ fn draw_native_seek_strip(
                 && let Some(pointer) = response.interact_pointer_pos()
                 && seek_strip_body_accepts_pointer(lock_rect, pointer)
             {
-                *drag_origin = Some(crate::video::seek_strip::SeekStripDragOrigin::new(
+                *drag_origin = crate::video::seek_strip::SeekStripDragOrigin::new(
                     strip.center,
                     pointer,
-                ));
+                    cell_width,
+                    local_rect.width(),
+                    strip.waveform_span_secs,
+                    axis_origin_x,
+                );
             }
             // 全体表示では帯が動かないので、押した場所からの相対移動ではなく
             // **いまポインタが指している時刻**が答えになる。周辺表示は従来どおり
@@ -885,13 +1245,7 @@ fn draw_native_seek_strip(
                                   pointer: egui::Pos2| {
                 match layout.span {
                     SeekStripSpan::Window => {
-                        crate::video::seek_strip::seek_strip_center_at_drag_pointer(
-                            origin,
-                            pointer,
-                            cell_width,
-                            local_rect.width(),
-                            strip.waveform_span_secs,
-                        )
+                        crate::video::seek_strip::seek_strip_center_at_drag_pointer(origin, pointer)
                     }
                     SeekStripSpan::Whole => center_at_pointer(pointer),
                 }
@@ -977,7 +1331,7 @@ fn draw_native_seek_strip_menu_button(
     view: crate::video::seek_strip_layout::SeekStripView,
     menu_open: &mut bool,
     unavailable_tooltip: Option<&'static str>,
-) {
+) -> egui::Rect {
     use crate::video::seek_strip_layout::{SeekStripSpan, SeekStripView};
     let state = match view.mode() {
         None => crate::settings::VideoSeekStripState::None,
@@ -1040,6 +1394,7 @@ fn draw_native_seek_strip_menu_button(
     if !enabled {
         *menu_open = false;
     }
+    response.rect
 }
 
 /// 右下のストリップボタンから吊るすメニュー。非表示と 4 つの表示、そして高さを直接選ぶ。
@@ -1875,6 +2230,7 @@ struct NativeEguiOverlay {
     /// シークストリップの高さプリセット。**帯の矩形・セル寸法・映像の予約・波形ラスタの
     /// 要求は、すべてここから解決した 1 つの [`SeekStripLayout`] を見る。**
     seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
     seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
     seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
     /// App settings から同期される、左右パネル共通の表示モード。
@@ -2554,9 +2910,9 @@ pub struct NativeOverlayInputRouting {
     /// ParkedLive の inert/dimmed HUD。ボタン機能は App 側 filter で実行されないため、
     /// HUD chrome 上の raw mouse button も復帰クリックとして App へ流してよい。
     pub hud_dimmed: bool,
-    /// この egui パスが wheel イベントを `NavigateItem` / `TileColumnsDelta` コマンドへ
-    /// 変換したか。true のとき同じ raw wheel イベントを `Window(MouseWheel)` として App へ
-    /// 二重転送しない (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
+    /// この egui パスが wheel イベントを semantic wheel command へ変換したか。true のとき
+    /// 同じ raw wheel イベントを `Window(MouseWheel)` として App へ二重転送しない
+    /// (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
     /// タイルグリッドが `Order::Background` だと grid の余白上で egui の
     /// `wants_pointer_input()` が false になり、これが無いと Ctrl+ホイールでの列数変更が
     /// 2 ステップ進んでしまう。
@@ -2580,6 +2936,9 @@ pub struct NativeVideoInputRegion {
 
 pub struct NativeOverlayInputOutcome {
     pub routing: NativeOverlayInputRouting,
+    /// Per-event ownership decided in the same logical pass that handled the
+    /// corresponding native input. Entries always match the input batch order.
+    pub event_dispositions: Vec<NativeOverlayInputDisposition>,
     pub commands: Vec<NativeOverlayCommand>,
     pub(crate) window_intents: Vec<NativeWindowIntent>,
     /// CP5 で計算した HUD interactive regions (= 物理ピクセル単位 RECT 集合)。
@@ -2594,9 +2953,320 @@ impl NativeOverlayInputOutcome {
     fn empty() -> Self {
         Self {
             routing: NativeOverlayInputRouting::default(),
+            event_dispositions: Vec::new(),
             commands: Vec::new(),
             window_intents: Vec::new(),
             hud_regions: Vec::new(),
+        }
+    }
+}
+
+struct NativeOverlayLogicalOutput {
+    full_output: egui::FullOutput,
+    commands: Vec<NativeOverlayCommand>,
+    window_intents: Vec<NativeWindowIntent>,
+    pending_event_count: usize,
+    egui_run_ms: f64,
+    overlay_visible: bool,
+    hud_visible: bool,
+    perf_visible: bool,
+}
+
+#[derive(Default)]
+struct NativeOverlayLogicalBatch {
+    full_output: Option<egui::FullOutput>,
+    commands: Vec<NativeOverlayCommand>,
+    window_intents: Vec<NativeWindowIntent>,
+    pending_event_count: usize,
+    egui_run_ms: f64,
+    overlay_visible: bool,
+    hud_visible: bool,
+    perf_visible: bool,
+}
+
+impl NativeOverlayLogicalBatch {
+    fn append(&mut self, output: NativeOverlayLogicalOutput) {
+        if let Some(full_output) = self.full_output.as_mut() {
+            full_output.append(output.full_output);
+        } else {
+            self.full_output = Some(output.full_output);
+        }
+        self.commands.extend(output.commands);
+        self.window_intents.extend(output.window_intents);
+        self.pending_event_count = self
+            .pending_event_count
+            .saturating_add(output.pending_event_count);
+        self.egui_run_ms += output.egui_run_ms;
+        self.overlay_visible = output.overlay_visible;
+        self.hud_visible = output.hud_visible;
+        self.perf_visible = output.perf_visible;
+    }
+}
+
+struct NativeOverlayEventBatchRun {
+    event_dispositions: Vec<NativeOverlayInputDisposition>,
+    commands: Vec<NativeOverlayCommand>,
+    window_intents: Vec<NativeWindowIntent>,
+    routing: NativeOverlayInputRouting,
+}
+
+trait NativeLogicalBatchTarget {
+    fn batch_needs_render(&self) -> bool;
+    fn batch_hover_tooltip_repaint_needed(&self) -> bool;
+    fn batch_prepare(&mut self) -> Result<(), String>;
+    fn batch_input_routing(&self) -> NativeOverlayInputRouting;
+    fn batch_take_escape_consumed(&mut self) -> bool;
+    fn batch_push_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent);
+    fn batch_push_wheel(
+        &mut self,
+        wheel: crate::video::native_window::NativeVideoMouseWheelEvent,
+    ) -> NativeOverlayInputDisposition;
+    fn batch_render_logical_once(
+        &mut self,
+        preserve_earlier_repaint_deadline: bool,
+    ) -> Result<NativeOverlayLogicalOutput, String>;
+    fn batch_present(
+        &mut self,
+        batch: NativeOverlayLogicalBatch,
+        render_t0: Instant,
+    ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String>;
+}
+
+fn native_event_requires_ownership_commit(
+    event: &crate::video::native_window::NativeVideoWindowEvent,
+) -> bool {
+    use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
+    matches!(
+        event,
+        NativeEvent::KeyDown(_)
+            | NativeEvent::KeyUp(_)
+            | NativeEvent::Text(_)
+            | NativeEvent::Ime(_)
+            | NativeEvent::MouseButton(_)
+            | NativeEvent::Touch(_)
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NativeOverlayInputDisposition {
+    /// Non-wheel input uses the snapshot from the logical segment that handled it.
+    Routing(NativeOverlayInputRouting),
+    /// The presenter converted this wheel into one semantic command.
+    Command,
+    /// The presenter-local egui region received this wheel exactly once.
+    OverlayRegion,
+    /// No presenter owner accepted this wheel. The App may receive it only if
+    /// the routing snapshot from the same logical segment permits forwarding.
+    AppRemainder(NativeOverlayInputRouting),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeOverlaySegmentRouting {
+    text_input_active_seen: bool,
+    modal_dialog_active_seen: bool,
+}
+
+impl NativeOverlaySegmentRouting {
+    fn new(routing: NativeOverlayInputRouting) -> Self {
+        Self {
+            text_input_active_seen: routing.text_input_active,
+            modal_dialog_active_seen: routing.modal_dialog_active,
+        }
+    }
+
+    fn observe(&mut self, routing: NativeOverlayInputRouting) {
+        self.text_input_active_seen |= routing.text_input_active;
+        self.modal_dialog_active_seen |= routing.modal_dialog_active;
+    }
+
+    fn finish(
+        self,
+        mut routing_after: NativeOverlayInputRouting,
+        escape_consumed: bool,
+    ) -> NativeOverlayInputRouting {
+        routing_after.text_input_active |= self.text_input_active_seen;
+        routing_after.modal_dialog_active |= self.modal_dialog_active_seen || escape_consumed;
+        routing_after
+    }
+}
+
+fn native_routing_after_segment<T: NativeLogicalBatchTarget>(
+    target: &mut T,
+    segment_routing: NativeOverlaySegmentRouting,
+) -> NativeOverlayInputRouting {
+    segment_routing.finish(
+        target.batch_input_routing(),
+        target.batch_take_escape_consumed(),
+    )
+}
+
+fn assign_native_routing_segment(
+    event_dispositions: &mut [NativeOverlayInputDisposition],
+    event_range: std::ops::Range<usize>,
+    routing: NativeOverlayInputRouting,
+) {
+    for disposition in &mut event_dispositions[event_range] {
+        if matches!(disposition, NativeOverlayInputDisposition::Routing(_)) {
+            *disposition = NativeOverlayInputDisposition::Routing(routing);
+        }
+    }
+}
+
+fn run_native_event_batch<T: NativeLogicalBatchTarget>(
+    target: &mut T,
+    events: &[crate::video::native_window::NativeVideoWindowEvent],
+) -> Result<NativeOverlayEventBatchRun, String> {
+    use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
+
+    let render_t0 = Instant::now();
+    let mut event_dispositions = vec![NativeOverlayInputDisposition::default(); events.len()];
+    let mut logical_batch = NativeOverlayLogicalBatch::default();
+    let mut logical_pass_count = 0_usize;
+    let mut ownership_commit_pending = false;
+    let mut logical_input_pending =
+        target.batch_needs_render() || target.batch_hover_tooltip_repaint_needed();
+    let mut segment_start = 0_usize;
+    let mut segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
+    target.batch_prepare()?;
+
+    for (event_index, event) in events.iter().enumerate() {
+        if let NativeEvent::MouseWheel(wheel) = event {
+            if ownership_commit_pending && target.batch_needs_render() {
+                logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+                logical_pass_count += 1;
+                let routing = native_routing_after_segment(target, segment_routing);
+                assign_native_routing_segment(
+                    &mut event_dispositions,
+                    segment_start..event_index,
+                    routing,
+                );
+                segment_start = event_index;
+                segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
+            }
+            ownership_commit_pending = false;
+            event_dispositions[event_index] = target.batch_push_wheel(*wheel);
+            logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+            logical_pass_count += 1;
+            let routing = native_routing_after_segment(target, segment_routing);
+            assign_native_routing_segment(
+                &mut event_dispositions,
+                segment_start..event_index,
+                routing,
+            );
+            if matches!(
+                event_dispositions[event_index],
+                NativeOverlayInputDisposition::AppRemainder(_)
+            ) {
+                event_dispositions[event_index] =
+                    NativeOverlayInputDisposition::AppRemainder(routing);
+            }
+            segment_start = event_index + 1;
+            segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
+            logical_input_pending = false;
+        } else {
+            target.batch_push_event(event.clone());
+            segment_routing.observe(target.batch_input_routing());
+            ownership_commit_pending |= native_event_requires_ownership_commit(event);
+            logical_input_pending |= target.batch_needs_render();
+        }
+    }
+
+    if logical_input_pending {
+        logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+        logical_pass_count += 1;
+    }
+    let routing = native_routing_after_segment(target, segment_routing);
+    assign_native_routing_segment(
+        &mut event_dispositions,
+        segment_start..events.len(),
+        routing,
+    );
+
+    let (commands, window_intents) = if logical_pass_count == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        target.batch_present(logical_batch, render_t0)?
+    };
+    Ok(NativeOverlayEventBatchRun {
+        event_dispositions,
+        commands,
+        window_intents,
+        routing: target.batch_input_routing(),
+    })
+}
+
+impl NativeLogicalBatchTarget for NativeEguiOverlay {
+    fn batch_needs_render(&self) -> bool {
+        self.needs_render()
+    }
+
+    fn batch_hover_tooltip_repaint_needed(&self) -> bool {
+        self.hover_tooltip_repaint_needed()
+    }
+
+    fn batch_prepare(&mut self) -> Result<(), String> {
+        self.prepare_render_batch()
+    }
+
+    fn batch_input_routing(&self) -> NativeOverlayInputRouting {
+        self.input_routing()
+    }
+
+    fn batch_take_escape_consumed(&mut self) -> bool {
+        std::mem::take(&mut self.side_panel_escape_consumed)
+    }
+
+    fn batch_push_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
+        self.push_native_event(event);
+    }
+
+    fn batch_push_wheel(
+        &mut self,
+        wheel: crate::video::native_window::NativeVideoMouseWheelEvent,
+    ) -> NativeOverlayInputDisposition {
+        self.push_native_wheel_for_batch(wheel)
+    }
+
+    fn batch_render_logical_once(
+        &mut self,
+        preserve_earlier_repaint_deadline: bool,
+    ) -> Result<NativeOverlayLogicalOutput, String> {
+        self.render_logical_once(preserve_earlier_repaint_deadline)
+    }
+
+    fn batch_present(
+        &mut self,
+        batch: NativeOverlayLogicalBatch,
+        render_t0: Instant,
+    ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
+        self.present_logical_batch(batch, render_t0)
+    }
+}
+
+impl Default for NativeOverlayInputDisposition {
+    fn default() -> Self {
+        Self::Routing(NativeOverlayInputRouting::default())
+    }
+}
+
+impl NativeOverlayInputOutcome {
+    pub fn should_forward_to_ui(
+        &self,
+        event_index: usize,
+        event: &crate::video::native_window::NativeVideoWindowEvent,
+    ) -> bool {
+        match self
+            .event_dispositions
+            .get(event_index)
+            .copied()
+            .unwrap_or_default()
+        {
+            NativeOverlayInputDisposition::Routing(routing)
+            | NativeOverlayInputDisposition::AppRemainder(routing) => {
+                routing.should_forward_to_ui(event)
+            }
+            NativeOverlayInputDisposition::Command
+            | NativeOverlayInputDisposition::OverlayRegion => false,
         }
     }
 }
@@ -2867,7 +3537,7 @@ fn native_touch_panel_tap_command_dismisses_before_dispatch(
     matches!(
         command,
         crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome
-            | crate::video::native_touch::NativeVideoTouchCommand::SeekRelative { .. }
+            | crate::video::native_touch::NativeVideoTouchCommand::SeekMedium { .. }
     ) && (left_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
         || right_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle)
 }
@@ -2896,6 +3566,9 @@ pub enum NativeOverlayCommand {
     SeekRelative {
         delta_secs: f64,
     },
+    SeekMedium {
+        forward: bool,
+    },
     TouchChromeLearned,
     PanoramaDrag {
         delta_points: egui::Vec2,
@@ -2919,6 +3592,11 @@ pub enum NativeOverlayCommand {
     NavigateItem {
         delta: i32,
         via_wheel: bool,
+    },
+    /// Completely unmodified wheel. App resolves the current user setting so
+    /// presenter metadata never owns a second settings snapshot.
+    NormalWheel {
+        delta: i32,
     },
     TileColumnsDelta {
         delta: i32,
@@ -6148,11 +6826,7 @@ impl NativeRenderCore {
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) -> Result<NativeOverlayInputOutcome, String> {
         let mut outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
-            let modal_dialog_active_before_events = overlay.modal_dialog_active_for_routing();
-            overlay.push_native_events(events);
-            let mut outcome = overlay.render_if_dirty()?;
-            outcome.routing.modal_dialog_active |= modal_dialog_active_before_events;
-            outcome
+            overlay.render_native_event_batch(events)?
         } else {
             NativeOverlayInputOutcome::empty()
         };
@@ -6356,10 +7030,13 @@ impl NativeRenderCore {
         // ストリップの高さは overlay が持つので、presenter 側の field 比較では拾えない。
         // 「映像がいくつ譲っているか」を前後で見て、高さプリセットの変更でも transform を
         // 引き直す (`set_overlay_seek_strip` と同じ形)。
-        let strip_points_before = self
-            .egui_overlay
-            .as_ref()
-            .map_or(0.0, |overlay| overlay.seek_strip_visible_points());
+        let strip_points_before = self.egui_overlay.as_ref().map_or(0.0, |overlay| {
+            let overlay_size = egui::vec2(
+                self.width as f32 / overlay.pixels_per_point,
+                self.height as f32 / overlay.pixels_per_point,
+            );
+            overlay.seek_strip_visible_points(overlay_size)
+        });
         let mut layout_changed = self.video_top_bar_locked != requested.top_locked
             || self.video_bottom_lock != requested.bottom_lock
             || self.fullscreen_fixed_bar_gap_px != requested.fixed_bar_gap_px;
@@ -6369,10 +7046,13 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_bar_lock_state(requested);
         }
-        let strip_points_after = self
-            .egui_overlay
-            .as_ref()
-            .map_or(0.0, |overlay| overlay.seek_strip_visible_points());
+        let strip_points_after = self.egui_overlay.as_ref().map_or(0.0, |overlay| {
+            let overlay_size = egui::vec2(
+                self.width as f32 / overlay.pixels_per_point,
+                self.height as f32 / overlay.pixels_per_point,
+            );
+            overlay.seek_strip_visible_points(overlay_size)
+        });
         layout_changed |= strip_points_before != strip_points_after;
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
@@ -6802,10 +7482,13 @@ impl NativeRenderCore {
             bottom_bar_height,
             // 高さの正本は overlay が持つ (設定から `set_bar_lock_state` で届く)。
             // presenter 側に写しを置くと、どちらが本当か決められない値が 2 つになる。
-            seek_strip_visible_points: self
-                .egui_overlay
-                .as_ref()
-                .map_or(0.0, |overlay| overlay.seek_strip_visible_points()),
+            seek_strip_visible_points: self.egui_overlay.as_ref().map_or(0.0, |overlay| {
+                let overlay_size = egui::vec2(
+                    self.width as f32 / overlay.pixels_per_point,
+                    self.height as f32 / overlay.pixels_per_point,
+                );
+                overlay.seek_strip_visible_points(overlay_size)
+            }),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
             info_panel_reserved: self.video_info_panel_reserved,
         }
@@ -7442,6 +8125,8 @@ impl NativeEguiOverlay {
             bottom_lock: BottomBarLock::None,
             fixed_bar_gap_px: 0,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_strip_height_values:
+                crate::video::seek_strip_layout::SeekStripHeightValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Always,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Show,
             side_panel_mode: FsSidePanelMode::Hover,
@@ -7532,13 +8217,38 @@ impl NativeEguiOverlay {
         true
     }
 
-    fn push_native_events(
+    fn push_native_wheel_for_batch(
+        &mut self,
+        wheel: crate::video::native_window::NativeVideoMouseWheelEvent,
+    ) -> NativeOverlayInputDisposition {
+        self.event_count = self.event_count.saturating_add(1);
+        let event = crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel);
+        if self.hud_dimmed && Self::hud_dimmed_suppresses_overlay_pointer_event(&event) {
+            let was_visible = self.dimmed_hover_chrome_visible();
+            self.update_raw_hover_pos_from_native_event(&event);
+            self.clear_overlay_pointer_for_dimmed_hud();
+            if self.dimmed_hover_chrome_visible() != was_visible {
+                self.dirty = true;
+            }
+            return NativeOverlayInputDisposition::AppRemainder(
+                NativeOverlayInputRouting::default(),
+            );
+        }
+        self.push_native_wheel_event(wheel)
+    }
+
+    fn render_native_event_batch(
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
-    ) {
-        for event in events {
-            self.push_native_event(event.clone());
-        }
+    ) -> Result<NativeOverlayInputOutcome, String> {
+        let batch_run = run_native_event_batch(self, events)?;
+        Ok(NativeOverlayInputOutcome {
+            routing: batch_run.routing,
+            event_dispositions: batch_run.event_dispositions,
+            commands: batch_run.commands,
+            window_intents: batch_run.window_intents,
+            hud_regions: self.compute_hud_regions(),
+        })
     }
 
     /// Builds the Phase 1 touch exclusion approximation.
@@ -7632,11 +8342,9 @@ impl NativeEguiOverlay {
                     crate::video::native_touch::NativeVideoTouchCommand::ToggleChrome => {
                         self.native_touch.toggle_chrome();
                     }
-                    crate::video::native_touch::NativeVideoTouchCommand::SeekRelative {
-                        delta_secs,
-                    } => {
+                    crate::video::native_touch::NativeVideoTouchCommand::SeekMedium { forward } => {
                         self.pending_overlay_commands
-                            .push(NativeOverlayCommand::SeekRelative { delta_secs });
+                            .push(NativeOverlayCommand::SeekMedium { forward });
                     }
                     crate::video::native_touch::NativeVideoTouchCommand::PanoramaDrag {
                         delta_points,
@@ -7791,6 +8499,57 @@ impl NativeEguiOverlay {
         };
     }
 
+    fn push_native_wheel_event(
+        &mut self,
+        wheel: crate::video::native_window::NativeVideoMouseWheelEvent,
+    ) -> NativeOverlayInputDisposition {
+        let pos = self.native_pos(wheel.x, wheel.y);
+        let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt);
+        self.pointer_pos = Some(pos);
+        self.modifiers = modifiers;
+        // The ownership decision uses the same current pointer and panel
+        // latches as the logical pass that will consume this event.
+        self.update_side_panel_hover_latches();
+        let over_scroll_panel = self.pointer_over_scroll_panel(pos);
+        let modal_dialog_visible = self.bulk_bookmark_dialog.is_some()
+            || self.bookmark_title_edit.is_some()
+            || self.shortcut_help_open;
+        let pixels_per_point = self.pixels_per_point.max(f32::MIN_POSITIVE);
+        let over_seek_strip = self.bottom_hud_visible
+            && self.seek_strip.is_some()
+            && self.tile_overlay.is_none()
+            && self
+                .seek_strip_layout(egui::vec2(
+                    self.width as f32 / pixels_per_point,
+                    self.height as f32 / pixels_per_point,
+                ))
+                .rect
+                .contains(pos);
+        let region_owns_wheel =
+            pointer_region_owns_wheel(over_seek_strip, over_scroll_panel, modal_dialog_visible);
+        let plan = plan_native_wheel(
+            wheel,
+            [pos.x, pos.y],
+            region_owns_wheel,
+            self.panorama_pose.is_some() && !self.audio_only,
+            self.video_zoom_scale.is_some() && !self.audio_only,
+            self.tile_overlay.is_some(),
+        );
+        if let Some(command) = plan.command {
+            self.pending_overlay_commands.push(command);
+        }
+        self.pending_events.push(egui::Event::PointerMoved(pos));
+        if plan.deliver_to_egui {
+            self.pending_events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
+                modifiers,
+            });
+        }
+        self.dirty = true;
+        plan.disposition
+    }
+
     fn push_native_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
         use crate::video::native_window::{
             NativeVideoImeEvent, NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
@@ -7817,6 +8576,7 @@ impl NativeEguiOverlay {
                             || crate::keymap::native_video_context_shortcuts_help_key_down(&key))
                     {
                         self.shortcut_help_open = false;
+                        self.side_panel_escape_consumed = true;
                         self.dirty = true;
                     }
                     return;
@@ -7987,75 +8747,7 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseWheel(wheel) => {
-                let pos = self.native_pos(wheel.x, wheel.y);
-                let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, false);
-                self.pointer_pos = Some(pos);
-                self.modifiers = modifiers;
-                // 端パネルの開閉ラッチは render_once 冒頭でしか更新されないため、同一イベント
-                // バッチ内で端へ移動→即ホイールすると latch が stale のまま pointer_over_scroll_panel
-                // が誤判定し、パネル上ホイールが前後アイテム切替に化ける (Codex P2)。ここで現在の
-                // wheel 座標で latch を更新してから判定する。
-                self.update_side_panel_hover_latches();
-                let over_scroll_panel = self.pointer_over_scroll_panel(pos);
-                // テキスト入力中央モーダル (一括ブックマーク登録ダイアログ / 名称編集) が
-                // 出ているときは、ホイールで前後の動画に飛ばない (テキストや ScrollArea の
-                // スクロールに使う、ユーザー報告 2026-05-24)。bookmark title 編集は単行で
-                // スクロール不要だが、誤って動画切替されないようにこちらも対象に含める。
-                let modal_dialog_visible = self.bulk_bookmark_dialog.is_some()
-                    || self.bookmark_title_edit.is_some()
-                    || self.shortcut_help_open;
-                let pixels_per_point = self.pixels_per_point.max(f32::MIN_POSITIVE);
-                let over_seek_strip = self.bottom_hud_visible
-                    && self.seek_strip.is_some()
-                    && self.tile_overlay.is_none()
-                    && self
-                        .seek_strip_layout(egui::vec2(
-                            self.width as f32 / pixels_per_point,
-                            self.height as f32 / pixels_per_point,
-                        ))
-                        .rect
-                        .contains(pos);
-                let region_owns_wheel = pointer_region_owns_wheel(
-                    over_seek_strip,
-                    over_scroll_panel,
-                    modal_dialog_visible,
-                );
-                let panorama_wheel = panorama_takes_the_wheel(
-                    self.panorama_pose.is_some() && !self.audio_only,
-                    region_owns_wheel,
-                );
-                let video_zoom_wheel = video_zoom_takes_the_wheel(
-                    self.video_zoom_scale.is_some() && !self.audio_only,
-                    region_owns_wheel,
-                );
-                if panorama_wheel {
-                    self.pending_overlay_commands
-                        .push(NativeOverlayCommand::PanoramaWheel {
-                            delta: i32::from(wheel.delta),
-                        });
-                } else if video_zoom_wheel {
-                    self.pending_overlay_commands
-                        .push(NativeOverlayCommand::VideoZoomWheel {
-                            delta: i32::from(wheel.delta),
-                            pointer_points: [pos.x, pos.y],
-                        });
-                } else if let Some(command) = immediate_native_wheel_command(
-                    wheel.delta,
-                    wheel.ctrl,
-                    self.tile_overlay.is_some(),
-                    region_owns_wheel,
-                ) {
-                    self.pending_overlay_commands.push(command);
-                }
-                self.pending_events.push(egui::Event::PointerMoved(pos));
-                if !panorama_wheel && !video_zoom_wheel {
-                    self.pending_events.push(egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Line,
-                        delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
-                        modifiers,
-                    });
-                }
-                self.dirty = true;
+                let _ = self.push_native_wheel_event(wheel);
             }
             NativeEvent::MouseLeave => {
                 if self.window_observation.has_hud && self.window_observation.cursor_input_owned {
@@ -8391,6 +9083,7 @@ impl NativeEguiOverlay {
             && self.bottom_lock == lock.bottom_lock
             && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
             && self.seek_strip_height == lock.seek_strip_height
+            && self.seek_strip_height_values == lock.seek_strip_height_values
             && self.seek_hover_preview_mode == lock.seek_hover_preview_mode
             && self.seek_bar_with_strip == lock.seek_bar_with_strip
         {
@@ -8402,6 +9095,7 @@ impl NativeEguiOverlay {
         self.bottom_lock = lock.bottom_lock;
         self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
         self.seek_strip_height = lock.seek_strip_height;
+        self.seek_strip_height_values = lock.seek_strip_height_values;
         self.seek_hover_preview_mode = lock.seek_hover_preview_mode;
         self.seek_bar_with_strip = lock.seek_bar_with_strip;
         self.dirty = true;
@@ -8427,9 +9121,14 @@ impl NativeEguiOverlay {
             overlay_size,
             normal_seek_bar_visible,
             self.seek_strip_height,
+            self.seek_strip_height_values,
             span,
             aspect,
             strip_policy_visibility.thumbnail_strip_visible_for_preview_policy,
+            self.top_bar_locked,
+            self.bottom_lock,
+            self.fixed_bar_gap_px,
+            self.seek_strip_reserves_space(),
         )
     }
 
@@ -8445,9 +9144,9 @@ impl NativeEguiOverlay {
     /// 「場所を取るか」(`seek_strip_reserves_space`) と「いくつ取るか」(高さプリセット) を
     /// 1 か所で掛け合わせる。分けて持つと、片方だけ更新された経路で映像とストリップが
     /// 重なる。固定していないときに映像へ返す判断は `video_bar_reserved_points` が持つ。
-    fn seek_strip_visible_points(&self) -> f32 {
+    fn seek_strip_visible_points(&self, overlay_size: egui::Vec2) -> f32 {
         if self.seek_strip_reserves_space() {
-            self.seek_strip_height.points()
+            self.seek_geometry(overlay_size).strip_layout.rect.height()
         } else {
             0.0
         }
@@ -8457,19 +9156,25 @@ impl NativeEguiOverlay {
     /// 確保量を通す (`video_bar_reserved_points`)。compact 表示は映像側だけの
     /// 見せ方なので、全画面を置き換えるプレビューでは反映しない。
     fn video_content_rect_points(&self, overlay_w: f32, overlay_h: f32) -> egui::Rect {
+        let geometry = self.seek_geometry(egui::vec2(overlay_w, overlay_h));
         let layout = VideoVisualLayout {
             compact: false,
             pixels_per_point: 1.0,
             top_bar_locked: self.top_bar_locked,
             bottom_lock: self.bottom_lock,
-            bottom_bar_height: self
-                .seek_geometry(egui::vec2(overlay_w, overlay_h))
-                .normal_bar_height,
-            seek_strip_visible_points: self.seek_strip_visible_points(),
+            bottom_bar_height: geometry.normal_bar_height,
+            seek_strip_visible_points: if self.seek_strip_reserves_space() {
+                geometry.strip_layout.rect.height()
+            } else {
+                0.0
+            },
             fixed_bar_gap_px: self.fixed_bar_gap_px,
             info_panel_reserved: self.right_panel_reserves_space(),
         };
-        let (top, bottom) = video_bar_reserved_points(layout);
+        let (top, bottom) = (
+            geometry.top_reserved_points,
+            geometry.bottom_reserved_points,
+        );
         let top = top.min((overlay_h - 1.0).max(0.0));
         let bottom_edge = (overlay_h - bottom).max(top + 1.0).min(overlay_h);
         // 固定した右パネルの領域はプレビューにも渡す。片方だけ無視すると、切替中の
@@ -9136,6 +9841,7 @@ impl NativeEguiOverlay {
             // 必要があるため)。dirty 無しの場合は render はしないが regions だけ更新。
             return Ok(NativeOverlayInputOutcome {
                 routing: self.input_routing(),
+                event_dispositions: Vec::new(),
                 commands: Vec::new(),
                 window_intents: Vec::new(),
                 hud_regions: self.compute_hud_regions(),
@@ -9152,27 +9858,20 @@ impl NativeEguiOverlay {
         // これを OR して「受領時にテキスト入力中だったキーは App へ転送しない」を保証する。
         let text_input_active_before_events = self.text_input_active();
         let side_panel_escape_consumed = std::mem::take(&mut self.side_panel_escape_consumed);
-        let (commands, window_intents) = self.render_once()?;
-        // overlay が wheel を navigation / tile columns / strip range command に変換したフレームでは、
-        // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
-        let consumed_wheel = commands.iter().any(|c| {
-            matches!(
-                c,
-                NativeOverlayCommand::NavigateItem { .. }
-                    | NativeOverlayCommand::TileColumnsDelta { .. }
-                    | NativeOverlayCommand::StepSeekStripRange { .. }
-                    | NativeOverlayCommand::PanoramaWheel { .. }
-            )
-        });
+        let render_t0 = Instant::now();
+        self.prepare_render_batch()?;
+        let mut batch = NativeOverlayLogicalBatch::default();
+        batch.append(self.render_logical_once(false)?);
+        let (commands, window_intents) = self.present_logical_batch(batch, render_t0)?;
         let mut routing = self.input_routing();
         routing.text_input_active |= text_input_active_before_events;
-        routing.consumed_wheel = consumed_wheel;
         routing.modal_dialog_active |= side_panel_escape_consumed;
         // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
         // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
         routing.modal_dialog_active |= self.modal_dialog_active_for_routing();
         Ok(NativeOverlayInputOutcome {
             routing,
+            event_dispositions: Vec::new(),
             commands,
             window_intents,
             hud_regions: self.compute_hud_regions(),
@@ -9685,7 +10384,9 @@ impl NativeEguiOverlay {
             wants_keyboard_input: self.wants_keyboard_input,
             text_input_active: self.text_input_active(),
             hud_dimmed: self.hud_dimmed,
-            // consumed_wheel は commands を見て render_if_dirty 側で設定する。
+            modal_dialog_active: self.modal_dialog_active_for_routing(),
+            // Batch input uses per-event dispositions. This field remains for
+            // the non-batch/fallback routing contract.
             ..Default::default()
         }
     }
@@ -9820,7 +10521,10 @@ impl NativeEguiOverlay {
             && self.tile_overlay.is_none()
             && self.navigation_preview.is_none();
         let strip_points = if seek_strip_drawn {
-            self.seek_strip_height.points()
+            self.seek_geometry(egui::vec2(overlay_width_points, overlay_height_points))
+                .strip_layout
+                .rect
+                .height()
         } else {
             0.0
         };
@@ -10050,13 +10754,8 @@ impl NativeEguiOverlay {
         Ok(())
     }
 
-    fn render_once(
-        &mut self,
-    ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
-        let mut window_intents = Vec::new();
-        let render_t0 = Instant::now();
+    fn prepare_render_batch(&mut self) -> Result<(), String> {
         self.gpu_epoch.ensure_alive("overlay draw")?;
-        let first_render = self.render_count == 0;
         if self
             .toast
             .as_ref()
@@ -10064,12 +10763,31 @@ impl NativeEguiOverlay {
         {
             self.toast = None;
         }
-        let seek_status_active = self.update_seek_status_for_render(render_t0);
         self.sync_hover_thumbnail_texture();
         self.sync_navigation_preview_texture();
         self.sync_tile_overlay_textures();
         self.sync_seek_strip_textures();
         self.sync_jump_entry_textures();
+        Ok(())
+    }
+
+    fn render_once(
+        &mut self,
+    ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
+        let render_t0 = Instant::now();
+        self.prepare_render_batch()?;
+        let mut batch = NativeOverlayLogicalBatch::default();
+        batch.append(self.render_logical_once(false)?);
+        self.present_logical_batch(batch, render_t0)
+    }
+
+    fn render_logical_once(
+        &mut self,
+        preserve_earlier_repaint_deadline: bool,
+    ) -> Result<NativeOverlayLogicalOutput, String> {
+        let mut window_intents = Vec::new();
+        let render_t0 = Instant::now();
+        let seek_status_active = self.update_seek_status_for_render(render_t0);
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
@@ -10849,14 +11567,11 @@ impl NativeEguiOverlay {
             if bottom_hud_visible && bottom_bar_height > 0.0 {
                 egui::Area::new(egui::Id::new("native_video_seek_hud"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(
-                        0.0,
-                        (overlay_height_points - bottom_bar_height).max(0.0),
-                    ))
+                    .fixed_pos(seek_geometry.normal_bar_rect.min)
                     .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(overlay_width_points, bottom_bar_height));
+                        ui.set_min_size(seek_geometry.normal_bar_rect.size());
                         let hud_rect = ui.min_rect();
-                        let painter = ui.painter().clone();
+                        let painter = ui.painter().with_clip_rect(hud_rect);
                         let painter = &painter;
                         painter.rect_filled(
                             hud_rect,
@@ -10868,22 +11583,12 @@ impl NativeEguiOverlay {
                         // - コントロール行 (下段、`HUD_CONTROLS_ROW_HEIGHT` = 40pt): ボタン群 + 音量
                         // `center_y` はコントロール行内の縦中央 (= ボタン群の Y 基準) として使う。
                         // 旧 1 段構造の bar Y 共有から外し、bar は seek_row_rect 内に独立配置する。
-                        let seek_row_height = if normal_seek_bar_visible {
-                            HUD_SEEK_ROW_HEIGHT
-                        } else {
-                            0.0
-                        };
-                        let seek_row_rect = egui::Rect::from_min_max(
-                            hud_rect.min,
-                            egui::pos2(hud_rect.max.x, hud_rect.min.y + seek_row_height),
-                        );
-                        let controls_row_rect = egui::Rect::from_min_max(
-                            egui::pos2(hud_rect.min.x, seek_row_rect.max.y),
-                            hud_rect.max,
-                        );
+                        let rows = native_bottom_hud_rows(hud_rect, normal_seek_bar_visible);
+                        let seek_row_rect = rows.seek_row_rect;
+                        let controls_row_rect = rows.controls_row_rect;
 
                         let side_pad = 10.0;
-                        let btn_size = 28.0;
+                        let btn_size = rows.button_size;
                         let gap = 8.0;
                         // 動画 HUD 2 段化リデザイン (実機フィードバック反映): ボタン群の意味的境界に
                         // **追加の隙間** (= group_gap_extra) を入れて、4 グループ
@@ -11480,17 +12185,12 @@ impl NativeEguiOverlay {
                         // **フル幅** で seek_row_rect の左右 padding 内に展開する。コントロール行
                         // (下段) からは bar が消えるので、ボタンと時間表示の間は空きスペースになる。
                         // hit_rect は seek_row_rect 全体 (= 24pt) を覆い、bar のヒット領域を厚く取る。
-                        let bar_min_x = seek_row_rect.min.x + side_pad;
-                        let bar_max_x = (seek_row_rect.max.x - side_pad).max(bar_min_x + 1.0);
-                        let bar_center_y = seek_row_rect.center().y;
-                        let bar_rect = egui::Rect::from_min_max(
-                            egui::pos2(bar_min_x, bar_center_y - 4.0),
-                            egui::pos2(bar_max_x, bar_center_y + 4.0),
-                        );
-                        let hit_rect = egui::Rect::from_min_max(
-                            egui::pos2(bar_min_x, seek_row_rect.min.y),
-                            egui::pos2(bar_max_x, seek_row_rect.max.y),
-                        );
+                        let seek_row_geometry = native_seek_row_rects(seek_row_rect);
+                        let bar_rect = seek_row_geometry.bar_rect;
+                        let hit_rect = seek_row_geometry.hit_rect;
+                        let seek_row_available = normal_seek_bar_visible
+                            && hit_rect.width() > 0.0
+                            && hit_rect.height() > 0.0;
 
                         // time は right_controls クラスターの左端 (= 旧レイアウトと同じ位置)。
                         // right_controls_w に time_w が含まれているため、`right_controls_x` がそのまま
@@ -11502,11 +12202,19 @@ impl NativeEguiOverlay {
                             format_overlay_time(position_secs),
                             format_overlay_time(duration_secs)
                         );
-                        painter.text(
-                            egui::pos2(time_x, text_center_y),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            crate::ui_fonts::hud_text_font(14.0),
+                        let time_text_rect = egui::Rect::from_min_max(
+                            egui::pos2(time_x, controls_row_rect.min.y),
+                            egui::pos2(
+                                (time_x + time_w).min(controls_row_rect.max.x),
+                                controls_row_rect.max.y,
+                            ),
+                        );
+                        let _ = paint_fitted_strip_text_left_centered(
+                            painter,
+                            time_text_rect,
+                            text_center_y,
+                            &label,
+                            14.0,
                             egui::Color32::from_rgb(238, 238, 238),
                         );
 
@@ -11526,18 +12234,14 @@ impl NativeEguiOverlay {
                             egui::pos2(norm_rect.max.x + gap, center_y - 4.0),
                             egui::pos2(norm_rect.max.x + gap + vol_slider_w, center_y + 4.0),
                         );
-                        let seek_lock_rect = native_seek_bar_lock_button_rect(
-                            overlay_width_points,
-                            overlay_height_points,
-                            bottom_bar_height,
+                        let seek_lock_rect = native_seek_bar_lock_button_rect_in(
+                            controls_row_rect,
+                            btn_size,
                         );
-                        let seek_strip_selector_rect = native_seek_strip_selector_button_rect(
-                            overlay_width_points,
-                            overlay_height_points,
-                            bottom_bar_height,
-                        );
+                        let seek_strip_selector_rect =
+                            native_seek_strip_selector_button_rect_in(seek_lock_rect);
 
-                        if normal_seek_bar_visible {
+                        if seek_row_available {
                             painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
                             if position_controls_available {
                                 let progress =
@@ -11594,21 +12298,25 @@ impl NativeEguiOverlay {
                         }
 
                         let seek_resp = ui.interact(
-                            if normal_seek_bar_visible { hit_rect } else { egui::Rect::NOTHING },
+                            if seek_row_available {
+                                hit_rect
+                            } else {
+                                egui::Rect::NOTHING
+                            },
                             egui::Id::new("native_video_seek_hit"),
-                            if normal_seek_bar_visible && position_controls_available {
+                            if seek_row_available && position_controls_available {
                                 egui::Sense::click_and_drag()
                             } else {
                                 egui::Sense::hover()
                             },
                         );
-                        if normal_seek_bar_visible
+                        if seek_row_available
                             && position_controls_available
                             && seek_resp.hovered()
                         {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
-                        if normal_seek_bar_visible && position_controls_available {
+                        if seek_row_available && position_controls_available {
                             let target_at = |pos: egui::Pos2| {
                                 let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
                                 let frac =
@@ -12301,10 +13009,19 @@ impl NativeEguiOverlay {
             .get(&egui::ViewportId::ROOT)
             .map(|output| output.repaint_delay)
             .unwrap_or(Duration::MAX);
-        self.next_repaint_deadline = if repaint_delay == Duration::MAX {
+        let repaint_deadline = if repaint_delay == Duration::MAX {
             None
         } else {
             Instant::now().checked_add(repaint_delay)
+        };
+        self.next_repaint_deadline = if preserve_earlier_repaint_deadline {
+            match (self.next_repaint_deadline, repaint_deadline) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (Some(current), None) => Some(current),
+                (None, next) => next,
+            }
+        } else {
+            repaint_deadline
         };
         let now = Instant::now();
         self.schedule_seek_status_repaint(now);
@@ -12395,6 +13112,44 @@ impl NativeEguiOverlay {
             auto_hide_allowed: !cursor_blocking_overlay_visible,
         });
 
+        self.dirty = self.frame_step_hold.is_some()
+            || self.bookmark_title_edit.is_some()
+            || self.bulk_bookmark_dialog.is_some()
+            || self.shortcut_help_open
+            || left_panel_open_changed;
+
+        Ok(NativeOverlayLogicalOutput {
+            full_output,
+            commands,
+            window_intents,
+            pending_event_count,
+            egui_run_ms,
+            overlay_visible,
+            hud_visible,
+            perf_visible,
+        })
+    }
+
+    fn present_logical_batch(
+        &mut self,
+        batch: NativeOverlayLogicalBatch,
+        render_t0: Instant,
+    ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
+        let NativeOverlayLogicalBatch {
+            full_output,
+            commands,
+            window_intents,
+            pending_event_count,
+            egui_run_ms,
+            overlay_visible,
+            hud_visible,
+            perf_visible,
+        } = batch;
+        let full_output = full_output
+            .ok_or_else(|| "native overlay logical batch produced no output".to_string())?;
+        let first_render = self.render_count == 0;
+        let ppp = self.pixels_per_point;
+        let event_count = self.event_count;
         let shape_count = full_output.shapes.len();
         // Pure CPU tessellation is deliberately outside the epoch gate.
         let tessellate_t0 = Instant::now();
@@ -12526,11 +13281,6 @@ impl NativeEguiOverlay {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        self.dirty = self.frame_step_hold.is_some()
-            || self.bookmark_title_edit.is_some()
-            || self.bulk_bookmark_dialog.is_some()
-            || self.shortcut_help_open
-            || left_panel_open_changed;
         self.render_count = self.render_count.saturating_add(1);
         log_event(
             "egui_overlay_present",
@@ -13046,26 +13796,54 @@ pub(super) fn seek_strip_reserves_space(
 /// 映像の transform (物理 px) と、ナビゲーションプレビューの画像配置 (points) の
 /// 両方がここを通る。片方だけ別に数えると、切替中のプレビューだけ HUD を無視して
 /// 全画面に出る (backlog §1.162)。
-pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32) {
+pub(super) fn video_bar_reserved_points(
+    layout: VideoVisualLayout,
+    available_height_points: f32,
+) -> (f32, f32) {
     let gap_points = layout
         .fixed_bar_gap_px
         .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
-    let top = if layout.top_bar_locked {
-        HUD_TOP_HEIGHT + gap_points
+    let top_base = if layout.top_bar_locked {
+        HUD_TOP_HEIGHT
     } else {
         0.0
     };
-    let bottom = if layout.bottom_lock.bar_locked() {
-        let strip_height = if layout.bottom_lock.strip_locked() {
-            layout.seek_strip_visible_points.max(0.0)
-        } else {
-            0.0
-        };
-        layout.bottom_bar_height.max(0.0) + gap_points + strip_height
+    let bottom_bar = if layout.bottom_lock.bar_locked() {
+        layout.bottom_bar_height.max(0.0)
     } else {
         0.0
     };
-    (top, bottom)
+    let requested_strip = if layout.bottom_lock.strip_locked() {
+        layout.seek_strip_visible_points.max(0.0)
+    } else {
+        0.0
+    };
+    // Controls and strip are the interaction surfaces. Fit those before optional spacing so a
+    // large gap setting cannot hide the strip or move the media under the bottom controls.
+    let budget = (available_height_points.max(0.0) - 1.0).max(0.0);
+    let fitted_bottom_bar = bottom_bar.min(budget);
+    let fitted_top_base = top_base.min((budget - fitted_bottom_bar).max(0.0));
+    let fitted_strip = requested_strip.min((budget - fitted_top_base - fitted_bottom_bar).max(0.0));
+    let gap_count =
+        usize::from(layout.top_bar_locked) + usize::from(layout.bottom_lock.bar_locked());
+    let gap = if gap_count == 0 {
+        0.0
+    } else {
+        gap_points.min(
+            (budget - fitted_top_base - fitted_bottom_bar - fitted_strip).max(0.0)
+                / gap_count as f32,
+        )
+    };
+    (
+        fitted_top_base + if layout.top_bar_locked { gap } else { 0.0 },
+        fitted_bottom_bar
+            + fitted_strip
+            + if layout.bottom_lock.bar_locked() {
+                gap
+            } else {
+                0.0
+            },
+    )
 }
 
 /// 固定表示の右情報パネルが確保する量を **points** で返す。
@@ -13095,7 +13873,7 @@ pub(super) fn compute_video_visual_target_rect(
     } else {
         1.0
     };
-    let (top_points, bottom_points) = video_bar_reserved_points(layout);
+    let (top_points, bottom_points) = video_bar_reserved_points(layout, win_h / ppp);
     let top_reserved = top_points * ppp;
     let bottom_reserved = bottom_points * ppp;
     let content_top = top_reserved.min(win_h - 1.0);
@@ -13336,17 +14114,23 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripLayout, SeekStripSpan};
+    use crate::video::seek_strip_layout::{
+        SeekStripHeight, SeekStripHeightValues, SeekStripLayout, SeekStripSpan,
+    };
 
     /// 既定プリセットの帯の高さ。テストも実装と同じ解決経路を通す。
     const STRIP_HEIGHT: f32 = SeekStripHeight::Large.points();
 
     /// テストが使う帯の寸法。overlay の `seek_strip_layout` と同じ引数で解決する。
     fn test_strip_layout(overlay_size: egui::Vec2) -> SeekStripLayout {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT - STRIP_HEIGHT),
+            egui::vec2(overlay_size.x, STRIP_HEIGHT),
+        );
         SeekStripLayout::resolve(
-            overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            rect,
             SeekStripHeight::Large,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Window,
             None,
         )
@@ -13373,30 +14157,38 @@ mod tests {
     use super::{
         HUD_BOTTOM_HEIGHT, HUD_CONTROLS_ROW_HEIGHT, HUD_SEEK_ROW_HEIGHT, HUD_TOP_HEIGHT,
         NativeBarVisibilitySnapshot, NativeEguiOverlay, NativeJumpPanelVisibilityInputs,
-        NativeOverlayInputRouting, NativeOverlaySeekStrip, NativePixelSample,
-        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, PreparedVideoScaleSettings,
-        VideoOrientation, VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
+        NativeLogicalBatchTarget, NativeOverlayCommand, NativeOverlayInputDisposition,
+        NativeOverlayInputOutcome, NativeOverlayInputRouting, NativeOverlayLogicalBatch,
+        NativeOverlayLogicalOutput, NativeOverlaySeekStrip, NativeOverlaySegmentRouting,
+        NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
+        NativeWheelPlan, PreparedVideoScaleSettings, VideoOrientation,
+        VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
         VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
         compute_video_visual_target_rect, compute_video_visual_transform,
         compute_video_visual_transform_for_surface, configure_overlay_style,
-        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
-        effective_overlay_pixels_per_point, egui_key_from_virtual_key,
-        immediate_native_wheel_command, metadata_clean_text, native_jump_panel_visible_from_inputs,
-        native_panel_callout_hud_rects, native_panorama_projection_popup_hud_rect,
-        native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
-        native_touch_panel_handle_hud_rects,
+        consume_seek_strip_wheel, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        draw_native_seek_strip, draw_native_seek_strip_menu_button,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key, fitted_strip_text_galley,
+        immediate_native_wheel_command, metadata_clean_text, native_bottom_hud_rows,
+        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        native_panorama_projection_popup_hud_rect, native_right_panel_visible_from_inputs,
+        native_touch_owned_panel_sides, native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
-        native_video_fullscreen_shortcut_key, panorama_takes_the_wheel, pointer_region_owns_wheel,
-        sample_cpu_rgba_pixel, seek_strip_reserves_space, should_claim_text_input_focus,
-        validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
-        video_zoom_takes_the_wheel,
+        native_video_fullscreen_shortcut_key, paint_fitted_strip_range_text,
+        paint_fitted_strip_text_centered, paint_fitted_strip_text_left_centered,
+        panorama_takes_the_wheel, plan_native_wheel, pointer_region_owns_wheel,
+        run_native_event_batch, sample_cpu_rgba_pixel, seek_strip_reserves_space,
+        should_claim_text_input_focus, validate_prepared_video_scale_settings,
+        video_scale_signature_changed_fields, video_zoom_takes_the_wheel,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
     use crate::settings::{BottomBarLock, FsSidePanelMode};
     use crate::video::native_presenter::overlay_draw::{
-        NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
-        native_panel_callout_bar_rect, native_panel_top, native_seek_bar_lock_button_rect,
-        native_seek_strip_selector_button_rect, native_top_bar_lock_button_rect,
+        NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, draw_native_bar_lock_button,
+        native_panel_callout_arrow_direction, native_panel_callout_bar_rect, native_panel_top,
+        native_seek_bar_lock_button_rect, native_seek_bar_lock_button_rect_in,
+        native_seek_strip_selector_button_rect, native_seek_strip_selector_button_rect_in,
+        native_top_bar_lock_button_rect,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -13669,7 +14461,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// 360 中でも、ホイールを自分で使う領域の上では奪わない (§1.147)。
     ///
     /// 360 が取ると raw イベントすら積まれないので (呼び出し側は 360 のとき
@@ -13694,12 +14485,12 @@ mod tests {
                 "拡大表示が領域からホイールを奪っている"
             );
             assert!(
-                immediate_native_wheel_command(120, false, false, owns).is_none(),
+                immediate_native_wheel_command(120, false, false, false, false, owns).is_none(),
                 "領域の上なのに前後アイテム送りへ化けている"
             );
         }
 
-        // 何も無い所では従来どおり。360 が入っていれば視野角、無ければ前後アイテム。
+        // 何も無い所の完全な無修飾wheelは App が現在設定を解決する。
         let owns = pointer_region_owns_wheel(false, false, false);
         assert!(!owns);
         assert!(panorama_takes_the_wheel(true, owns));
@@ -13707,11 +14498,20 @@ mod tests {
         assert!(video_zoom_takes_the_wheel(true, owns));
         assert!(!video_zoom_takes_the_wheel(false, owns));
         assert!(matches!(
-            immediate_native_wheel_command(120, false, false, owns),
+            immediate_native_wheel_command(120, false, false, false, false, owns),
+            Some(crate::video::native_presenter::NativeOverlayCommand::NormalWheel { .. })
+        ));
+        assert!(matches!(
+            immediate_native_wheel_command(120, true, false, false, false, owns),
+            Some(crate::video::native_presenter::NativeOverlayCommand::NavigateItem { .. })
+        ));
+        assert!(matches!(
+            immediate_native_wheel_command(120, false, false, true, false, owns),
             Some(crate::video::native_presenter::NativeOverlayCommand::NavigateItem { .. })
         ));
     }
 
+    #[test]
     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_rect = test_strip_layout(overlay_size).rect;
@@ -13748,7 +14548,7 @@ mod tests {
             let mut commands = Vec::new();
             let mut wheel_remaining = true;
             assert!(
-                immediate_native_wheel_command(120, false, false, true).is_none(),
+                immediate_native_wheel_command(120, false, false, false, false, true).is_none(),
                 "wheel over the strip must not enqueue navigation before egui handles it"
             );
             let _ = ctx.run(
@@ -13846,9 +14646,12 @@ mod tests {
         crate::video::seek_strip_layout::SeekStripLayout,
     ) {
         let layout = SeekStripLayout::resolve(
-            overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT - 48.0),
+                egui::vec2(overlay_size.x, 48.0),
+            ),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             strip.cell_aspect,
         );
@@ -13889,15 +14692,143 @@ mod tests {
         (commands, layout)
     }
 
+    #[test]
+    fn zero_sized_strip_does_not_issue_thumbnail_or_waveform_work_and_rearms_request() {
+        let strip = whole_span_strip(crate::settings::VideoSeekStripMode::Waveform, 600.0, 1);
+        let layout = SeekStripLayout::resolve(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 0.0)),
+            SeekStripHeight::Maximum,
+            SeekStripHeightValues::default(),
+            SeekStripSpan::Whole,
+            strip.cell_aspect,
+        );
+        let ctx = egui::Context::default();
+        let mut drag_origin = None;
+        let mut last_request = Some((1, 2, 3, 4, 5, 6));
+        let mut commands = Vec::new();
+        assert_eq!(
+            draw_native_seek_strip(
+                &ctx,
+                layout,
+                crate::video::seek_strip_layout::SeekStripMarker::Center,
+                None,
+                true,
+                &strip,
+                false,
+                &std::collections::HashMap::new(),
+                None,
+                &mut drag_origin,
+                &mut last_request,
+                &mut commands,
+            ),
+            super::NativeSeekStripPreviewHover::Outside
+        );
+        assert!(last_request.is_none());
+        assert!(commands.is_empty());
+
+        drag_origin = crate::video::seek_strip::SeekStripDragOrigin::new(
+            strip.center,
+            egui::pos2(320.0, 0.0),
+            1.0,
+            640.0,
+            600.0,
+            320.0,
+        );
+        let release = egui::pos2(480.0, 0.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 64.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(release),
+                    egui::Event::PointerButton {
+                        pos: release,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = draw_native_seek_strip(
+                    ctx,
+                    layout,
+                    crate::video::seek_strip_layout::SeekStripMarker::Center,
+                    Some(release),
+                    true,
+                    &strip,
+                    false,
+                    &std::collections::HashMap::new(),
+                    None,
+                    &mut drag_origin,
+                    &mut last_request,
+                    &mut commands,
+                );
+            },
+        );
+        assert!(drag_origin.is_some());
+        assert!(commands.is_empty());
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 64.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(release),
+                    egui::Event::PointerButton {
+                        pos: release,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = draw_native_seek_strip(
+                    ctx,
+                    layout,
+                    crate::video::seek_strip_layout::SeekStripMarker::Center,
+                    Some(release),
+                    true,
+                    &strip,
+                    false,
+                    &std::collections::HashMap::new(),
+                    None,
+                    &mut drag_origin,
+                    &mut last_request,
+                    &mut commands,
+                );
+            },
+        );
+        assert!(drag_origin.is_none());
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            super::NativeOverlayCommand::CommitSeekStrip {
+                center: crate::video::seek_strip::SeekStripCenter::Waveform {
+                    center_time_secs
+                }
+            } if (*center_time_secs - 450.0).abs() < 1.0e-6
+        )));
+    }
+
     /// 全体表示が要求するのは「帯に収まる枚数」そのもの。周辺表示のように端の外へ
     /// 余分を足すと、軸が帯より長くなって最後のセルが画面から出る。
     #[test]
     fn the_whole_span_asks_for_exactly_the_cells_that_fill_the_band() {
         let overlay_size = egui::vec2(1920.0, 1080.0);
         let layout = SeekStripLayout::resolve(
-            overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT - 48.0),
+                egui::vec2(overlay_size.x, 48.0),
+            ),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         );
@@ -13928,9 +14859,12 @@ mod tests {
     fn clicking_the_whole_span_commits_the_time_under_the_pointer() {
         let overlay_size = egui::vec2(1920.0, 1080.0);
         let layout = SeekStripLayout::resolve(
-            overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT - 48.0),
+                egui::vec2(overlay_size.x, 48.0),
+            ),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         );
@@ -14021,9 +14955,12 @@ mod tests {
 
     fn layout_center(overlay_size: egui::Vec2) -> egui::Pos2 {
         SeekStripLayout::resolve(
-            overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT - 48.0),
+                egui::vec2(overlay_size.x, 48.0),
+            ),
             SeekStripHeight::Small,
+            SeekStripHeightValues::default(),
             SeekStripSpan::Whole,
             Some(16.0 / 9.0),
         )
@@ -14692,6 +15629,7 @@ mod tests {
             y: 100,
             shift: false,
             ctrl,
+            alt: false,
         })
     }
 
@@ -14714,6 +15652,361 @@ mod tests {
             shift: false,
             ctrl: false,
         })
+    }
+
+    fn wheel_at(x: i32, delta: i16, shift: bool, ctrl: bool, alt: bool) -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::MouseWheel(NativeVideoMouseWheelEvent {
+            delta,
+            x,
+            y: 100,
+            shift,
+            ctrl,
+            alt,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HeadlessWheelRegion {
+        Canvas,
+        SeekStrip,
+        ScrollPanel,
+    }
+
+    struct HeadlessNativeBatchTarget {
+        ctx: egui::Context,
+        routing: NativeOverlayInputRouting,
+        pending_events: Vec<egui::Event>,
+        pending_commands: Vec<NativeOverlayCommand>,
+        strip_rect: Option<egui::Rect>,
+        panel_rect: Option<egui::Rect>,
+        dirty: bool,
+        shortcut_help_open: bool,
+        escape_consumed: bool,
+        hud_dimmed: bool,
+        panorama_active: bool,
+        video_zoom_active: bool,
+        tile_overlay_visible: bool,
+        logical_passes: usize,
+        present_calls: usize,
+        strip_steps: Vec<crate::video::seek_strip::SeekStripRangeStep>,
+        panel_offsets: Vec<f32>,
+        panel_raw_deltas: Vec<f32>,
+        presented_platform_markers: Vec<String>,
+        presented_texture_ids: Vec<egui::TextureId>,
+        presented_shape_count: usize,
+        last_logical_shape_count: usize,
+    }
+
+    impl Default for HeadlessNativeBatchTarget {
+        fn default() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                routing: NativeOverlayInputRouting::default(),
+                pending_events: Vec::new(),
+                pending_commands: Vec::new(),
+                strip_rect: None,
+                panel_rect: None,
+                dirty: false,
+                shortcut_help_open: false,
+                escape_consumed: false,
+                hud_dimmed: false,
+                panorama_active: false,
+                video_zoom_active: false,
+                tile_overlay_visible: false,
+                logical_passes: 0,
+                present_calls: 0,
+                strip_steps: Vec::new(),
+                panel_offsets: Vec::new(),
+                panel_raw_deltas: Vec::new(),
+                presented_platform_markers: Vec::new(),
+                presented_texture_ids: Vec::new(),
+                presented_shape_count: 0,
+                last_logical_shape_count: 0,
+            }
+        }
+    }
+
+    impl HeadlessNativeBatchTarget {
+        fn region_at(&self, pos: egui::Pos2) -> HeadlessWheelRegion {
+            if self.strip_rect.is_some_and(|rect| rect.contains(pos)) {
+                HeadlessWheelRegion::SeekStrip
+            } else if self.panel_rect.is_some_and(|rect| rect.contains(pos)) {
+                HeadlessWheelRegion::ScrollPanel
+            } else {
+                HeadlessWheelRegion::Canvas
+            }
+        }
+
+        fn native_pos(wheel: NativeVideoMouseWheelEvent) -> egui::Pos2 {
+            egui::pos2(wheel.x as f32, wheel.y as f32)
+        }
+
+        fn draw_regions(
+            ctx: &egui::Context,
+            consume_strip: bool,
+        ) -> (
+            egui::Rect,
+            egui::Rect,
+            Vec<crate::video::seek_strip::SeekStripRangeStep>,
+            f32,
+        ) {
+            let strip_steps = consume_seek_strip_wheel(ctx, consume_strip);
+            let strip_size = egui::vec2(160.0, 160.0);
+            let strip = egui::Area::new(egui::Id::new("headless_native_wheel_strip"))
+                .fixed_pos(egui::pos2(200.0, 20.0))
+                .default_size(strip_size)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_min_size(strip_size);
+                    ui.set_max_size(strip_size);
+                    ui.allocate_exact_size(strip_size, egui::Sense::hover()).0
+                });
+            let mut panel_inner_rect = egui::Rect::NOTHING;
+            let mut panel_offset = 0.0;
+            egui::Area::new(egui::Id::new("headless_native_wheel_panel_area"))
+                .fixed_pos(egui::pos2(400.0, 20.0))
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_min_size(egui::vec2(220.0, 320.0));
+                    ui.set_max_size(egui::vec2(220.0, 320.0));
+                    let output = egui::ScrollArea::vertical()
+                        .id_salt("headless_native_wheel_panel")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            ui.allocate_space(egui::vec2(190.0, 1200.0));
+                        });
+                    panel_inner_rect = output.inner_rect;
+                    panel_offset = output.state.offset.y;
+                });
+            (strip.inner, panel_inner_rect, strip_steps, panel_offset)
+        }
+    }
+
+    impl NativeLogicalBatchTarget for HeadlessNativeBatchTarget {
+        fn batch_needs_render(&self) -> bool {
+            self.dirty
+        }
+
+        fn batch_hover_tooltip_repaint_needed(&self) -> bool {
+            false
+        }
+
+        fn batch_prepare(&mut self) -> Result<(), String> {
+            let mut rects = None;
+            let _ = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 360.0),
+                    )),
+                    time: Some(0.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let (strip, panel, _, _) = Self::draw_regions(ctx, false);
+                    rects = Some((strip, panel));
+                },
+            );
+            let (strip, panel) = rects.expect("headless regions");
+            assert!(
+                !strip.intersects(panel),
+                "headless region fixture overlaps: strip={strip:?} panel={panel:?}"
+            );
+            self.strip_rect = Some(strip);
+            self.panel_rect = Some(panel);
+            for (point, expected) in [
+                (egui::pos2(100.0, 100.0), HeadlessWheelRegion::Canvas),
+                (egui::pos2(250.0, 100.0), HeadlessWheelRegion::SeekStrip),
+                (egui::pos2(450.0, 100.0), HeadlessWheelRegion::ScrollPanel),
+            ] {
+                assert_eq!(
+                    self.region_at(point),
+                    expected,
+                    "headless point ownership mismatch: point={point:?} strip={strip:?} panel={panel:?}"
+                );
+            }
+            Ok(())
+        }
+
+        fn batch_input_routing(&self) -> NativeOverlayInputRouting {
+            NativeOverlayInputRouting {
+                modal_dialog_active: self.shortcut_help_open,
+                hud_dimmed: self.hud_dimmed,
+                ..self.routing
+            }
+        }
+
+        fn batch_take_escape_consumed(&mut self) -> bool {
+            std::mem::take(&mut self.escape_consumed)
+        }
+
+        fn batch_push_event(&mut self, event: NativeVideoWindowEvent) {
+            if let NativeVideoWindowEvent::KeyDown(key) = event {
+                if self.shortcut_help_open && (key.virtual_key == 0x1B || key.virtual_key == 0x70) {
+                    self.shortcut_help_open = false;
+                    self.escape_consumed = true;
+                    self.dirty = true;
+                    return;
+                }
+                if key.virtual_key == 0x70 {
+                    self.shortcut_help_open = true;
+                    self.dirty = true;
+                    return;
+                }
+            }
+            self.dirty = true;
+        }
+
+        fn batch_push_wheel(
+            &mut self,
+            wheel: NativeVideoMouseWheelEvent,
+        ) -> NativeOverlayInputDisposition {
+            self.dirty = true;
+            if self.hud_dimmed {
+                return NativeOverlayInputDisposition::AppRemainder(
+                    NativeOverlayInputRouting::default(),
+                );
+            }
+            let pos = Self::native_pos(wheel);
+            let region = self.region_at(pos);
+            let region_owns_wheel = region != HeadlessWheelRegion::Canvas;
+            let NativeWheelPlan {
+                disposition,
+                command,
+                deliver_to_egui,
+            } = plan_native_wheel(
+                wheel,
+                [pos.x, pos.y],
+                region_owns_wheel,
+                self.panorama_active,
+                self.video_zoom_active,
+                self.tile_overlay_visible,
+            );
+            if let Some(command) = command {
+                self.pending_commands.push(command);
+            }
+            self.pending_events.push(egui::Event::PointerMoved(pos));
+            if deliver_to_egui {
+                self.pending_events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
+                    modifiers: super::egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt),
+                });
+            }
+            disposition
+        }
+
+        fn batch_render_logical_once(
+            &mut self,
+            _preserve_earlier_repaint_deadline: bool,
+        ) -> Result<NativeOverlayLogicalOutput, String> {
+            let pass = self.logical_passes;
+            self.logical_passes += 1;
+            let events = std::mem::take(&mut self.pending_events);
+            let ctx = self.ctx.clone();
+            let mut strip_steps = Vec::new();
+            let mut panel_offset = None;
+            let mut panel_raw_delta = None;
+            let strip_rect = self.strip_rect.expect("prepared strip rect");
+            let panel_rect = self.panel_rect.expect("prepared panel rect");
+            let mut full_output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 360.0),
+                    )),
+                    time: Some((pass + 1) as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(
+                        ctx.input(|input| input.stable_dt) > 0.0,
+                        "headless logical pass clock must advance monotonically"
+                    );
+                    let pointer = ctx.input(|input| input.pointer.hover_pos());
+                    let over_strip = pointer.is_some_and(|pos| strip_rect.contains(pos));
+                    let over_panel = pointer.is_some_and(|pos| panel_rect.contains(pos));
+                    if over_panel {
+                        panel_raw_delta = Some(ctx.input(|input| input.raw_scroll_delta.y));
+                    }
+                    let (actual_strip, actual_panel, steps, offset) =
+                        Self::draw_regions(ctx, over_strip);
+                    assert_eq!(actual_strip, strip_rect);
+                    assert_eq!(actual_panel, panel_rect);
+                    strip_steps = steps;
+                    if over_panel {
+                        panel_offset = Some(offset);
+                    }
+                },
+            );
+            self.strip_steps.extend(strip_steps.iter().copied());
+            if let Some(offset) = panel_offset {
+                self.panel_offsets.push(offset);
+            }
+            if let Some(delta) = panel_raw_delta {
+                self.panel_raw_deltas.push(delta);
+            }
+            for step in strip_steps {
+                self.pending_commands
+                    .push(NativeOverlayCommand::StepSeekStripRange { step });
+            }
+            full_output
+                .platform_output
+                .commands
+                .push(egui::OutputCommand::CopyText(format!("pass-{pass}")));
+            full_output.textures_delta.set.push((
+                egui::TextureId::Managed(10_000 + pass as u64),
+                egui::epaint::ImageDelta::full(
+                    egui::ColorImage::new([1, 1], vec![egui::Color32::from_gray(pass as u8)]),
+                    egui::TextureOptions::NEAREST,
+                ),
+            ));
+            self.last_logical_shape_count = full_output.shapes.len();
+            self.dirty = false;
+            Ok(NativeOverlayLogicalOutput {
+                full_output,
+                commands: std::mem::take(&mut self.pending_commands),
+                window_intents: Vec::new(),
+                pending_event_count: 0,
+                egui_run_ms: 0.0,
+                overlay_visible: true,
+                hud_visible: true,
+                perf_visible: false,
+            })
+        }
+
+        fn batch_present(
+            &mut self,
+            batch: NativeOverlayLogicalBatch,
+            _render_t0: std::time::Instant,
+        ) -> Result<(Vec<NativeOverlayCommand>, Vec<super::NativeWindowIntent>), String> {
+            self.present_calls += 1;
+            let full_output = batch.full_output.expect("logical pass output");
+            self.presented_platform_markers = full_output
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) if text.starts_with("pass-") => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            self.presented_texture_ids = full_output
+                .textures_delta
+                .set
+                .iter()
+                .filter_map(|(id, _)| match id {
+                    egui::TextureId::Managed(id) if *id >= 10_000 => Some(*id),
+                    _ => None,
+                })
+                .map(egui::TextureId::Managed)
+                .collect();
+            self.presented_shape_count = full_output.shapes.len();
+            Ok((batch.commands, batch.window_intents))
+        }
     }
 
     #[test]
@@ -14773,36 +16066,395 @@ mod tests {
         assert_ne!(0.5_f32, 0.5_f32.max(1.0));
     }
 
+    fn input_outcome(
+        event_dispositions: Vec<NativeOverlayInputDisposition>,
+    ) -> NativeOverlayInputOutcome {
+        NativeOverlayInputOutcome {
+            routing: NativeOverlayInputRouting::default(),
+            event_dispositions,
+            commands: Vec::new(),
+            window_intents: Vec::new(),
+            hud_regions: Vec::new(),
+        }
+    }
+
     #[test]
-    fn native_overlay_does_not_double_forward_consumed_wheel() {
-        // overlay が wheel を NavigateItem / TileColumnsDelta コマンドへ変換済みなら、
-        // wants_pointer_input が false でも raw wheel を App へ転送しない
-        // (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
-        let consumed = NativeOverlayInputRouting {
-            wants_pointer_input: false,
-            consumed_wheel: true,
-            ..Default::default()
-        };
-        assert!(!consumed.should_forward_to_ui(&wheel(true)));
-        assert!(!consumed.should_forward_to_ui(&wheel(false)));
-
-        // 未消費 (= overlay 無効のフォールバック経路など) なら従来どおり
-        // wants_pointer_input 次第で転送する。
-        let fallback = NativeOverlayInputRouting {
-            wants_pointer_input: false,
-            consumed_wheel: false,
-            ..Default::default()
-        };
-        assert!(fallback.should_forward_to_ui(&wheel(true)));
-
-        // overlay UI 上 (wants_pointer_input=true) なら未消費でも転送しない。
-        let over_ui = NativeOverlayInputRouting {
+    fn wheel_event_disposition_prevents_double_forward_and_routes_only_the_remainder() {
+        let clear = NativeOverlayInputRouting::default();
+        let modal = NativeOverlayInputRouting {
             wants_pointer_input: true,
-            consumed_wheel: false,
+            modal_dialog_active: true,
+            hud_dimmed: true,
             ..Default::default()
         };
-        assert!(!over_ui.should_forward_to_ui(&wheel(true)));
-        assert!(!over_ui.should_forward_to_ui(&wheel(false)));
+        let outcome = input_outcome(vec![
+            NativeOverlayInputDisposition::Command,
+            NativeOverlayInputDisposition::OverlayRegion,
+            NativeOverlayInputDisposition::AppRemainder(clear),
+            NativeOverlayInputDisposition::AppRemainder(modal),
+        ]);
+
+        assert!(!outcome.should_forward_to_ui(0, &wheel(false)));
+        assert!(!outcome.should_forward_to_ui(1, &wheel(false)));
+        assert!(outcome.should_forward_to_ui(2, &wheel(false)));
+        assert!(
+            !outcome.should_forward_to_ui(3, &wheel(false)),
+            "a dimmed/modal App remainder remains inert instead of bypassing routing"
+        );
+    }
+
+    #[test]
+    fn transient_modal_protection_is_local_to_its_logical_segment() {
+        let clear = NativeOverlayInputRouting::default();
+        let modal = NativeOverlayInputRouting {
+            modal_dialog_active: true,
+            ..Default::default()
+        };
+
+        let mut first_segment = NativeOverlaySegmentRouting::new(clear);
+        first_segment.observe(modal);
+        first_segment.observe(clear);
+        let first_routing = first_segment.finish(clear, false);
+        assert!(first_routing.modal_dialog_active);
+
+        let second_routing = NativeOverlaySegmentRouting::new(clear).finish(clear, false);
+        assert!(!second_routing.modal_dialog_active);
+
+        let outcome = input_outcome(vec![
+            NativeOverlayInputDisposition::Routing(first_routing),
+            NativeOverlayInputDisposition::Command,
+            NativeOverlayInputDisposition::Routing(second_routing),
+        ]);
+        assert!(!outcome.should_forward_to_ui(0, &NativeVideoWindowEvent::KeyDown(key(0x0D))));
+        assert!(!outcome.should_forward_to_ui(1, &wheel(false)));
+        assert!(outcome.should_forward_to_ui(2, &NativeVideoWindowEvent::KeyDown(key(0x27))));
+
+        let escaped = NativeOverlaySegmentRouting::new(clear).finish(clear, true);
+        assert!(escaped.modal_dialog_active);
+    }
+
+    #[test]
+    fn native_batch_driver_keeps_mixed_wheel_owners_and_presents_once() {
+        for (events, canvas_index, canvas_delta, expected_strip_step) in [
+            (
+                vec![
+                    wheel_at(100, 120, false, false, false),
+                    wheel_at(250, 120, false, false, false),
+                ],
+                0,
+                120,
+                crate::video::seek_strip::SeekStripRangeStep::Narrower,
+            ),
+            (
+                vec![
+                    wheel_at(250, -120, false, false, false),
+                    wheel_at(100, -120, false, false, false),
+                ],
+                1,
+                -120,
+                crate::video::seek_strip::SeekStripRangeStep::Wider,
+            ),
+            (
+                vec![
+                    wheel_at(100, 120, false, false, false),
+                    wheel_at(250, -120, false, false, false),
+                ],
+                0,
+                120,
+                crate::video::seek_strip::SeekStripRangeStep::Wider,
+            ),
+            (
+                vec![
+                    wheel_at(250, 120, false, false, false),
+                    wheel_at(100, -120, false, false, false),
+                ],
+                1,
+                -120,
+                crate::video::seek_strip::SeekStripRangeStep::Narrower,
+            ),
+        ] {
+            let mut target = HeadlessNativeBatchTarget::default();
+            let run = run_native_event_batch(&mut target, &events).unwrap();
+
+            assert_eq!(target.logical_passes, 2);
+            assert_eq!(target.present_calls, 1);
+            assert_eq!(target.strip_steps, [expected_strip_step]);
+            assert_eq!(run.commands.len(), 2);
+            let strip_index = 1 - canvas_index;
+            assert_eq!(
+                run.event_dispositions[canvas_index],
+                NativeOverlayInputDisposition::Command
+            );
+            assert_eq!(
+                run.event_dispositions[strip_index],
+                NativeOverlayInputDisposition::OverlayRegion
+            );
+            assert_eq!(
+                run.commands
+                    .iter()
+                    .filter(|command| matches!(
+                        command,
+                        NativeOverlayCommand::NormalWheel { delta } if *delta == canvas_delta
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                run.commands
+                    .iter()
+                    .filter(|command| matches!(
+                        command,
+                        NativeOverlayCommand::StepSeekStripRange { step }
+                            if *step == expected_strip_step
+                    ))
+                    .count(),
+                1
+            );
+            let outcome = NativeOverlayInputOutcome {
+                routing: run.routing,
+                event_dispositions: run.event_dispositions,
+                commands: run.commands,
+                window_intents: run.window_intents,
+                hud_regions: Vec::new(),
+            };
+            assert!(!outcome.should_forward_to_ui(0, &events[0]));
+            assert!(!outcome.should_forward_to_ui(1, &events[1]));
+            assert_eq!(
+                target.presented_platform_markers,
+                ["pass-0".to_owned(), "pass-1".to_owned()]
+            );
+            assert_eq!(
+                target.presented_texture_ids,
+                [
+                    egui::TextureId::Managed(10_000),
+                    egui::TextureId::Managed(10_001)
+                ]
+            );
+            assert_eq!(
+                target.presented_shape_count,
+                target.last_logical_shape_count
+            );
+        }
+
+        for events in [
+            vec![
+                wheel_at(100, -120, false, false, false),
+                wheel_at(450, -120, false, false, false),
+            ],
+            vec![
+                wheel_at(450, -120, false, false, false),
+                wheel_at(100, -120, false, false, false),
+            ],
+            vec![
+                wheel_at(100, 120, false, false, false),
+                wheel_at(450, -120, false, false, false),
+            ],
+            vec![
+                wheel_at(450, -120, false, false, false),
+                wheel_at(100, 120, false, false, false),
+            ],
+        ] {
+            let mut target = HeadlessNativeBatchTarget::default();
+            let run = run_native_event_batch(&mut target, &events).unwrap();
+            assert_eq!(target.present_calls, 1);
+            assert_eq!(target.panel_raw_deltas.len(), 1);
+            assert!(target.panel_raw_deltas[0] < 0.0);
+            assert_eq!(target.panel_offsets.len(), 1);
+            assert!(target.panel_offsets[0] > 0.0);
+            assert_eq!(run.commands.len(), 1);
+            assert!(matches!(
+                run.commands[0],
+                NativeOverlayCommand::NormalWheel { .. }
+            ));
+            let outcome = NativeOverlayInputOutcome {
+                routing: run.routing,
+                event_dispositions: run.event_dispositions,
+                commands: run.commands,
+                window_intents: run.window_intents,
+                hud_regions: Vec::new(),
+            };
+            assert!(!outcome.should_forward_to_ui(0, &events[0]));
+            assert!(!outcome.should_forward_to_ui(1, &events[1]));
+        }
+
+        let event = wheel_at(100, 120, false, false, false);
+        let mut zoom = HeadlessNativeBatchTarget {
+            video_zoom_active: true,
+            ..Default::default()
+        };
+        let run = run_native_event_batch(&mut zoom, std::slice::from_ref(&event)).unwrap();
+        assert!(matches!(
+            run.commands.as_slice(),
+            [NativeOverlayCommand::VideoZoomWheel { .. }]
+        ));
+        let outcome = NativeOverlayInputOutcome {
+            routing: run.routing,
+            event_dispositions: run.event_dispositions,
+            commands: run.commands,
+            window_intents: run.window_intents,
+            hud_regions: Vec::new(),
+        };
+        assert!(!outcome.should_forward_to_ui(0, &event));
+    }
+
+    #[test]
+    fn native_batch_driver_delivers_each_region_wheel_once_and_keeps_priority() {
+        let mut strips = HeadlessNativeBatchTarget::default();
+        strips.tile_overlay_visible = true;
+        strips.panorama_active = true;
+        strips.video_zoom_active = true;
+        let strip_events = vec![
+            wheel_at(250, 120, false, true, false),
+            wheel_at(250, -120, false, false, false),
+        ];
+        let strip_run = run_native_event_batch(&mut strips, &strip_events).unwrap();
+        assert_eq!(strips.strip_steps.len(), 2);
+        assert_eq!(strip_run.commands.len(), 2);
+        assert!(
+            strip_run
+                .commands
+                .iter()
+                .all(|command| matches!(command, NativeOverlayCommand::StepSeekStripRange { .. }))
+        );
+        assert!(
+            strip_run
+                .event_dispositions
+                .iter()
+                .all(|disposition| *disposition == NativeOverlayInputDisposition::OverlayRegion)
+        );
+
+        let mut commands = HeadlessNativeBatchTarget::default();
+        commands.tile_overlay_visible = true;
+        let command_events = vec![
+            wheel_at(100, 120, false, true, false),
+            wheel_at(100, 120, true, false, false),
+            wheel_at(100, -120, false, false, true),
+        ];
+        let command_run = run_native_event_batch(&mut commands, &command_events).unwrap();
+        assert_eq!(command_run.commands.len(), 3);
+        assert!(matches!(
+            command_run.commands[0],
+            NativeOverlayCommand::TileColumnsDelta { .. }
+        ));
+        assert!(
+            command_run.commands[1..]
+                .iter()
+                .all(|command| matches!(command, NativeOverlayCommand::NavigateItem { .. }))
+        );
+        assert!(
+            command_run
+                .event_dispositions
+                .iter()
+                .all(|disposition| *disposition == NativeOverlayInputDisposition::Command)
+        );
+
+        let mut panel = HeadlessNativeBatchTarget::default();
+        let panel_events = vec![
+            wheel_at(450, -120, false, false, false),
+            wheel_at(450, 120, false, false, false),
+        ];
+        let panel_run = run_native_event_batch(&mut panel, &panel_events).unwrap();
+        assert!(
+            panel_run.commands.is_empty(),
+            "panel wheels emitted commands: commands={:?} strip={:?} panel={:?}",
+            panel_run.commands,
+            panel.strip_rect,
+            panel.panel_rect
+        );
+        assert_eq!(panel.panel_raw_deltas.len(), 2);
+        assert!(panel.panel_raw_deltas[0] * panel.panel_raw_deltas[1] < 0.0);
+        assert_eq!(panel.panel_offsets.len(), 2);
+        assert!(panel.panel_offsets[0] > 0.0);
+        assert!(panel.panel_offsets[1] <= panel.panel_offsets[0]);
+    }
+
+    #[test]
+    fn native_batch_driver_limits_transient_help_protection_to_its_segment() {
+        let events = vec![
+            NativeVideoWindowEvent::KeyDown(key(0x70)),
+            NativeVideoWindowEvent::KeyDown(key(0x70)),
+            wheel_at(100, 120, false, false, false),
+            NativeVideoWindowEvent::KeyDown(key(0x27)),
+        ];
+        let mut target = HeadlessNativeBatchTarget::default();
+        let run = run_native_event_batch(&mut target, &events).unwrap();
+        let outcome = NativeOverlayInputOutcome {
+            routing: run.routing,
+            event_dispositions: run.event_dispositions,
+            commands: run.commands,
+            window_intents: run.window_intents,
+            hud_regions: Vec::new(),
+        };
+        assert!(!outcome.should_forward_to_ui(0, &events[0]));
+        assert!(!outcome.should_forward_to_ui(1, &events[1]));
+        assert!(!outcome.should_forward_to_ui(2, &events[2]));
+        assert!(outcome.should_forward_to_ui(3, &events[3]));
+
+        let same_segment = vec![
+            NativeVideoWindowEvent::KeyDown(key(0x70)),
+            NativeVideoWindowEvent::KeyDown(key(0x70)),
+            NativeVideoWindowEvent::KeyDown(key(0x27)),
+        ];
+        let mut target = HeadlessNativeBatchTarget::default();
+        let run = run_native_event_batch(&mut target, &same_segment).unwrap();
+        let outcome = NativeOverlayInputOutcome {
+            routing: run.routing,
+            event_dispositions: run.event_dispositions,
+            commands: run.commands,
+            window_intents: run.window_intents,
+            hud_regions: Vec::new(),
+        };
+        assert!(
+            same_segment
+                .iter()
+                .enumerate()
+                .all(|(index, event)| !outcome.should_forward_to_ui(index, event))
+        );
+
+        let close_then_continue = vec![
+            NativeVideoWindowEvent::KeyDown(key(0x1B)),
+            wheel_at(100, 120, false, false, false),
+            NativeVideoWindowEvent::KeyDown(key(0x27)),
+        ];
+        let mut target = HeadlessNativeBatchTarget {
+            shortcut_help_open: true,
+            ..Default::default()
+        };
+        let run = run_native_event_batch(&mut target, &close_then_continue).unwrap();
+        let outcome = NativeOverlayInputOutcome {
+            routing: run.routing,
+            event_dispositions: run.event_dispositions,
+            commands: run.commands,
+            window_intents: run.window_intents,
+            hud_regions: Vec::new(),
+        };
+        assert!(!outcome.should_forward_to_ui(0, &close_then_continue[0]));
+        assert!(!outcome.should_forward_to_ui(1, &close_then_continue[1]));
+        assert!(outcome.should_forward_to_ui(2, &close_then_continue[2]));
+    }
+
+    #[test]
+    fn native_batch_driver_keeps_dimmed_modal_wheel_inert() {
+        let event = wheel_at(100, 120, false, true, false);
+        let mut target = HeadlessNativeBatchTarget {
+            routing: NativeOverlayInputRouting {
+                wants_pointer_input: true,
+                ..Default::default()
+            },
+            shortcut_help_open: true,
+            hud_dimmed: true,
+            ..Default::default()
+        };
+        let run = run_native_event_batch(&mut target, std::slice::from_ref(&event)).unwrap();
+        assert!(run.commands.is_empty());
+        let outcome = NativeOverlayInputOutcome {
+            routing: run.routing,
+            event_dispositions: run.event_dispositions,
+            commands: run.commands,
+            window_intents: run.window_intents,
+            hud_regions: Vec::new(),
+        };
+        assert!(!outcome.should_forward_to_ui(0, &event));
     }
 
     #[test]
@@ -15497,7 +17149,7 @@ mod tests {
     fn native_touch_panel_outside_taps_are_consumed_only_for_touch_owner() {
         use crate::ui_helpers::MetadataPanelOpenState::{ByPointer, ByTouchHandle, Closed};
         let seek =
-            crate::video::native_touch::NativeVideoTouchCommand::SeekRelative { delta_secs: 5.0 };
+            crate::video::native_touch::NativeVideoTouchCommand::SeekMedium { forward: true };
         assert!(native_touch_panel_tap_command_dismisses_before_dispatch(
             seek,
             ByTouchHandle,
@@ -16230,14 +17882,43 @@ mod tests {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_height = crate::video::seek_strip_layout::SeekStripHeight::Medium;
         let span = crate::video::seek_strip_layout::SeekStripSpan::Window;
-        let shown =
-            super::VideoSeekGeometry::resolve(overlay_size, true, strip_height, span, None, false);
-        let hidden =
-            super::VideoSeekGeometry::resolve(overlay_size, false, strip_height, span, None, false);
-        let legacy = crate::video::seek_strip_layout::SeekStripLayout::resolve(
+        let values = SeekStripHeightValues::default();
+        let shown = super::VideoSeekGeometry::resolve(
             overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            true,
             strip_height,
+            values,
+            span,
+            None,
+            false,
+            false,
+            BottomBarLock::None,
+            0,
+            false,
+        );
+        let hidden = super::VideoSeekGeometry::resolve(
+            overlay_size,
+            false,
+            strip_height,
+            values,
+            span,
+            None,
+            false,
+            false,
+            BottomBarLock::None,
+            0,
+            false,
+        );
+        let legacy = crate::video::seek_strip_layout::SeekStripLayout::resolve(
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    0.0,
+                    overlay_size.y - HUD_BOTTOM_HEIGHT - strip_height.points(),
+                ),
+                egui::vec2(overlay_size.x, strip_height.points()),
+            ),
+            strip_height,
+            SeekStripHeightValues::default(),
             span,
             None,
         );
@@ -16287,6 +17968,353 @@ mod tests {
         assert_eq!(
             hidden_panel.bottom() - shown_panel.bottom(),
             HUD_SEEK_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn custom_video_seek_heights_preserve_defaults_and_resolve_every_stage() {
+        let defaults = SeekStripHeightValues::default();
+        let expected = [
+            (SeekStripHeight::Maximum, 144.0, 215.0),
+            (SeekStripHeight::Large, 104.0, 152.0),
+            (SeekStripHeight::Medium, 72.0, 102.0),
+            (SeekStripHeight::Small, 48.0, 64.0),
+            (SeekStripHeight::Smallest, 36.0, 45.0),
+        ];
+        for (preset, height, cell_width) in expected {
+            let geometry = super::VideoSeekGeometry::resolve(
+                egui::vec2(1280.0, 720.0),
+                true,
+                preset,
+                defaults,
+                SeekStripSpan::Window,
+                None,
+                false,
+                false,
+                BottomBarLock::None,
+                0,
+                false,
+            );
+            assert_eq!(geometry.strip_layout.rect.height(), height);
+            assert_eq!(geometry.strip_layout.cell_width, cell_width);
+            assert_eq!(geometry.strip_layout.rect.max.y, 720.0 - HUD_BOTTOM_HEIGHT);
+            for pixels_per_point in [1.0, 1.25, 2.0] {
+                assert_eq!(
+                    geometry.strip_layout.wave_pixel_height(pixels_per_point),
+                    ((height - 10.0_f32) * pixels_per_point).round() as usize,
+                    "logical height must scale once at {pixels_per_point}x"
+                );
+            }
+        }
+
+        let custom = SeekStripHeightValues {
+            maximum: 300,
+            large: 180,
+            medium: 120,
+            small: 60,
+            smallest: 40,
+        };
+        for (preset, expected_height) in [
+            (SeekStripHeight::Maximum, 300.0),
+            (SeekStripHeight::Large, 180.0),
+            (SeekStripHeight::Medium, 120.0),
+            (SeekStripHeight::Small, 60.0),
+            (SeekStripHeight::Smallest, 40.0),
+        ] {
+            let geometry = super::VideoSeekGeometry::resolve(
+                egui::vec2(1920.0, 1080.0),
+                true,
+                preset,
+                custom,
+                SeekStripSpan::Window,
+                None,
+                false,
+                false,
+                BottomBarLock::None,
+                0,
+                false,
+            );
+            assert_eq!(geometry.strip_layout.rect.height(), expected_height);
+        }
+    }
+
+    #[test]
+    fn maximum_strip_fits_between_both_huds_and_locked_reservations_in_a_short_viewport() {
+        let values = SeekStripHeightValues {
+            maximum: 320,
+            ..SeekStripHeightValues::default()
+        };
+        let unlocked = super::VideoSeekGeometry::resolve(
+            egui::vec2(640.0, 200.0),
+            true,
+            SeekStripHeight::Maximum,
+            values,
+            SeekStripSpan::Window,
+            None,
+            false,
+            false,
+            BottomBarLock::None,
+            0,
+            false,
+        );
+        assert_eq!(
+            unlocked.normal_bar_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 136.0), egui::pos2(640.0, 200.0),)
+        );
+        assert_eq!(unlocked.strip_layout.rect.min.y, HUD_TOP_HEIGHT);
+        assert_eq!(
+            unlocked.strip_layout.rect.max.y,
+            unlocked.normal_bar_rect.min.y
+        );
+        assert_eq!(unlocked.strip_layout.rect.height(), 82.0);
+
+        let fixed = super::VideoSeekGeometry::resolve(
+            egui::vec2(640.0, 200.0),
+            true,
+            SeekStripHeight::Maximum,
+            values,
+            SeekStripSpan::Window,
+            None,
+            false,
+            true,
+            BottomBarLock::BarAndStrip,
+            20,
+            true,
+        );
+        assert_eq!(fixed.strip_layout.rect.height(), 81.0);
+        let reserved = super::video_bar_reserved_points(
+            VideoVisualLayout {
+                compact: false,
+                pixels_per_point: 1.0,
+                top_bar_locked: true,
+                bottom_lock: BottomBarLock::BarAndStrip,
+                bottom_bar_height: fixed.normal_bar_height,
+                seek_strip_visible_points: fixed.strip_layout.rect.height(),
+                fixed_bar_gap_px: 20,
+                info_panel_reserved: false,
+            },
+            200.0,
+        );
+        assert_eq!(reserved, (54.0, 145.0));
+        assert_eq!(reserved.0 + reserved.1, 199.0);
+    }
+
+    #[test]
+    fn tiny_positive_geometry_keeps_body_and_bottom_controls_inside_their_actual_rects() {
+        let geometry = super::VideoSeekGeometry::resolve(
+            egui::vec2(320.0, 124.0),
+            true,
+            SeekStripHeight::Maximum,
+            SeekStripHeightValues {
+                maximum: 320,
+                ..SeekStripHeightValues::default()
+            },
+            SeekStripSpan::Window,
+            None,
+            false,
+            false,
+            BottomBarLock::None,
+            0,
+            false,
+        );
+        assert_eq!(geometry.strip_layout.rect.height(), 6.0);
+        assert!(geometry.strip_layout.cell_height > 0.0);
+        assert!(geometry.strip_layout.cell_height <= geometry.strip_layout.rect.height());
+        let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(
+            geometry.strip_layout.rect,
+        );
+        assert!(geometry.strip_layout.rect.contains_rect(lock));
+
+        let rows = super::native_bottom_hud_rows(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 20.0)),
+            true,
+        );
+        assert_eq!(rows.button_size, 20.0);
+        assert!(rows.controls_row_rect.height() >= rows.button_size);
+        assert!(rows.seek_row_rect.height() >= 0.0);
+        let lock = native_seek_bar_lock_button_rect_in(rows.controls_row_rect, rows.button_size);
+        let selector = native_seek_strip_selector_button_rect_in(lock);
+        let hud_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 20.0));
+        assert!(hud_rect.contains_rect(lock));
+        assert!(hud_rect.contains_rect(selector));
+    }
+
+    #[test]
+    fn tiny_locked_bottom_bar_draw_and_reservation_share_the_same_media_boundary() {
+        for overlay_height in [20.0, 40.0] {
+            for bottom_lock in [BottomBarLock::BarOnly, BottomBarLock::BarAndStrip] {
+                let geometry = super::VideoSeekGeometry::resolve(
+                    egui::vec2(320.0, overlay_height),
+                    true,
+                    SeekStripHeight::Maximum,
+                    SeekStripHeightValues {
+                        maximum: 320,
+                        ..SeekStripHeightValues::default()
+                    },
+                    SeekStripSpan::Window,
+                    None,
+                    false,
+                    false,
+                    bottom_lock,
+                    crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX,
+                    true,
+                );
+                assert_eq!(geometry.normal_bar_height, overlay_height - 1.0);
+                assert_eq!(geometry.strip_layout.rect.height(), 0.0);
+                assert_eq!(geometry.bottom_reserved_points, overlay_height - 1.0);
+
+                let target = compute_video_visual_target_rect(
+                    320,
+                    overlay_height as u32,
+                    VideoVisualLayout {
+                        compact: false,
+                        pixels_per_point: 1.0,
+                        top_bar_locked: false,
+                        bottom_lock,
+                        bottom_bar_height: geometry.normal_bar_height,
+                        seek_strip_visible_points: geometry.strip_layout.rect.height(),
+                        fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX,
+                        info_panel_reserved: false,
+                    },
+                );
+                assert_eq!(target.y, 0.0);
+                assert_eq!(target.height, 1.0);
+                assert_eq!(target.y + target.height, geometry.normal_bar_rect.min.y);
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_bottom_hud_actual_responses_and_text_shapes_stay_in_their_fitted_rects() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let hud_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 20.0));
+        let rows = native_bottom_hud_rows(hud_rect, true);
+        let expected_lock =
+            native_seek_bar_lock_button_rect_in(rows.controls_row_rect, rows.button_size);
+        let expected_selector = native_seek_strip_selector_button_rect_in(expected_lock);
+        let mut actual_lock = None;
+        let mut actual_selector = None;
+        let mut time_shape = None;
+        let mut notice_shape = None;
+        let mut range_shape = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(hud_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::Area::new(egui::Id::new("tiny_bottom_hud_geometry_test"))
+                    .fixed_pos(hud_rect.min)
+                    .show(ctx, |ui| {
+                        ui.set_min_size(hud_rect.size());
+                        let painter = ui.painter().with_clip_rect(hud_rect);
+                        let mut commands = Vec::new();
+                        actual_lock = Some(draw_native_bar_lock_button(
+                            ui,
+                            &painter,
+                            expected_lock,
+                            "tiny_bottom_hud_lock_test",
+                            false,
+                            "test",
+                            crate::video::NativeVideoBar::Seek,
+                            &mut commands,
+                        ));
+                        let mut menu_open = false;
+                        actual_selector = Some(draw_native_seek_strip_menu_button(
+                            ui,
+                            &painter,
+                            expected_selector,
+                            crate::video::seek_strip_layout::SeekStripView::Hidden,
+                            &mut menu_open,
+                            None,
+                        ));
+                        time_shape = paint_fitted_strip_text_left_centered(
+                            &painter,
+                            egui::Rect::from_min_size(
+                                rows.controls_row_rect.min,
+                                egui::vec2(100.0, rows.controls_row_rect.height()),
+                            ),
+                            rows.controls_row_rect.center().y + 4.0,
+                            "00:00 / 10:00",
+                            14.0,
+                            egui::Color32::WHITE,
+                        );
+                        let strip_rect =
+                            egui::Rect::from_min_size(egui::pos2(0.0, 20.0), egui::vec2(80.0, 6.0));
+                        let strip_painter = ui.painter().with_clip_rect(strip_rect);
+                        notice_shape = paint_fitted_strip_text_centered(
+                            &strip_painter,
+                            egui::Rect::from_min_max(
+                                egui::pos2(strip_rect.center().x, strip_rect.min.y),
+                                strip_rect.max,
+                            ),
+                            "生成中…",
+                            14.0,
+                            egui::Color32::WHITE,
+                        );
+                        range_shape = paint_fitted_strip_range_text(
+                            &strip_painter,
+                            strip_rect,
+                            "画像間隔 15秒",
+                        );
+                    });
+            },
+        );
+
+        assert_eq!(actual_lock, Some(expected_lock));
+        assert_eq!(actual_selector, Some(expected_selector));
+        assert!(hud_rect.contains_rect(actual_lock.unwrap()));
+        assert!(hud_rect.contains_rect(actual_selector.unwrap()));
+        assert!(rows.controls_row_rect.contains_rect(time_shape.unwrap()));
+        let strip_rect = egui::Rect::from_min_size(egui::pos2(0.0, 20.0), egui::vec2(80.0, 6.0));
+        assert!(strip_rect.contains_rect(notice_shape.unwrap()));
+        assert!(strip_rect.contains_rect(range_shape.unwrap()));
+    }
+
+    #[test]
+    fn fitted_strip_text_preserves_short_normal_text_and_only_skips_empty_rects() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let text = "画像間隔 15秒";
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 104.0));
+        let galley =
+            fitted_strip_text_galley(&painter, text, rect, 11.0, egui::Color32::WHITE).unwrap();
+        assert_eq!(galley.text(), text);
+        assert!(galley.size().x <= rect.width());
+        assert!(galley.size().y <= rect.height());
+        for tiny_rect in [
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.5, 6.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 0.25)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.25, 0.25)),
+        ] {
+            let galley =
+                fitted_strip_text_galley(&painter, text, tiny_rect, 11.0, egui::Color32::WHITE)
+                    .expect("every finite positive body must retain a fitted text shape");
+            assert!(galley.size().x <= tiny_rect.width() + f32::EPSILON);
+            assert!(galley.size().y <= tiny_rect.height() + f32::EPSILON);
+            let clipped_painter = painter.with_clip_rect(tiny_rect);
+            let shape = paint_fitted_strip_text_centered(
+                &clipped_painter,
+                tiny_rect,
+                text,
+                11.0,
+                egui::Color32::WHITE,
+            )
+            .expect("positive body must emit its contained galley");
+            assert!(tiny_rect.contains_rect(shape));
+        }
+        assert!(
+            fitted_strip_text_galley(
+                &painter,
+                text,
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 0.0)),
+                11.0,
+                egui::Color32::WHITE,
+            )
+            .is_none()
         );
     }
 

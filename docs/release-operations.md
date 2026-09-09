@@ -32,6 +32,13 @@
 
 ---
 
+エージェントから配布ビルドする場合は `scripts/build-dist.ps1 -PreserveRuntime` を使う。
+稼働アプリとの競合は停止せず拒否し、APPDATAのVST3キャッシュを保持する。
+必須テスト・clean・埋め込み前の署名順は維持する。子の `test-full.ps1` 内でのみ
+クラッシュダイアログを抑止し、失敗の終了コードは保持する。
+通常データを使うアプリの起動や実機操作は、このビルド指定に含まれない。
+詳細は [開発ビルドとテスト](development-build-and-test.md) を参照。
+
 ## 2. ビルドの信頼性
 
 ### 2.1 stale core cache (最重要・過去に stale 出荷しかけた)
@@ -67,6 +74,12 @@
   または (B) cargo 3 段を直接実行する。どちらも stderr をリダイレクトしない。
 
 ### 2.3 3 段ビルドの正しいコマンド (順序不変: core → remote → launcher)
+
+署名時の補足: SimplySignログイン済みでも、制限された実行環境のsigntoolが
+`No certificates were found that met all the given criteria`で失敗する場合がある。
+v3.7.0では証明書一覧が見えていても非昇格の署名は失敗し、同一コマンドを承認済みの
+昇格環境で実行すると成功した。ログイン切れや秘密鍵故障と即断せず、実行hostと権限条件を照合する。
+証明書の選択条件を緩めたり、署名を省いたりしない。通常データ保持には`-PreserveRuntime`を維持する。
 
 ```
 # 本体 (package "mimageviewer" 内の bin なので -p 不要)

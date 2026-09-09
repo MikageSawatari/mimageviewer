@@ -456,6 +456,7 @@ pub struct NativeBarLockState {
     pub bottom_lock: crate::settings::BottomBarLock,
     pub fixed_bar_gap_px: u32,
     pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    pub seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
     pub seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
     pub seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
 }
@@ -690,6 +691,9 @@ pub enum NativeVideoOutputEvent {
     SeekRelative {
         delta_secs: f64,
     },
+    SeekMedium {
+        forward: bool,
+    },
     TouchChromeLearned,
     PanoramaDrag {
         delta_points: egui::Vec2,
@@ -713,6 +717,9 @@ pub enum NativeVideoOutputEvent {
     NavigateItem {
         delta: i32,
         via_wheel: bool,
+    },
+    NormalWheel {
+        delta: i32,
     },
     TileColumnsDelta {
         delta: i32,
@@ -4006,6 +4013,7 @@ fn send_native_overlay_command(
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
+        Command::SeekMedium { forward } => NativeVideoOutputEvent::SeekMedium { forward },
         Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
         Command::PanoramaDrag {
             delta_points,
@@ -4033,6 +4041,7 @@ fn send_native_overlay_command(
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
         }
+        Command::NormalWheel { delta } => NativeVideoOutputEvent::NormalWheel { delta },
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
         Command::RequestSeekThumbnail {
             target_secs,
@@ -6141,15 +6150,15 @@ fn run_native_video_output(
                 source.clock.is_seeking(),
                 source.clock.current_seek_serial(),
             );
-            let overlay_routing = match presenter.handle_window_events(&native_events) {
-                Ok(outcome) => {
+            let overlay_outcome = match presenter.handle_window_events(&native_events) {
+                Ok(mut outcome) => {
                     #[cfg(feature = "test-script")]
                     {
                         ui_smoke_render_succeeded = true;
                         ui_smoke_command_count = outcome.commands.len();
                     }
                     sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
-                    for command in outcome.commands {
+                    for command in std::mem::take(&mut outcome.commands) {
                         let event_epoch = source.source_epoch;
                         match command {
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
@@ -6168,6 +6177,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SeekRelative { delta_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SeekMedium {
+                                forward,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SeekMedium { forward },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TouchChromeLearned => {
@@ -6264,6 +6282,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::NavigateItem { delta, via_wheel },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::NormalWheel {
+                                delta,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::NormalWheel { delta },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {
@@ -6818,7 +6845,7 @@ fn run_native_video_output(
                             }
                         }
                     }
-                    outcome.routing
+                    Some(outcome)
                 }
                 Err(err) => {
                     crate::logger::log(format!(
@@ -6833,17 +6860,24 @@ fn run_native_video_output(
                             );
                         }
                     }
-                    crate::video::native_presenter::NativeOverlayInputRouting::default()
+                    None
                 }
             };
+            let overlay_routing = overlay_outcome
+                .as_ref()
+                .map_or_else(Default::default, |outcome| outcome.routing);
             publish_native_overlay_input_routing(
                 &ui_event_tx,
                 source.source_epoch,
                 &mut published_overlay_input_routing,
                 overlay_routing,
             );
-            for event in &native_events {
-                if overlay_routing.should_forward_to_ui(event) {
+            for (event_index, event) in native_events.iter().enumerate() {
+                let should_forward = overlay_outcome.as_ref().map_or_else(
+                    || overlay_routing.should_forward_to_ui(event),
+                    |outcome| outcome.should_forward_to_ui(event_index, event),
+                );
+                if should_forward {
                     send_native_output_event(
                         &ui_event_tx,
                         source.source_epoch,
@@ -6862,7 +6896,7 @@ fn run_native_video_output(
                     cur_presenter_hwnd,
                     geometry,
                 )?;
-                for envelope in &native_event_envelopes {
+                for (event_index, envelope) in native_event_envelopes.iter().enumerate() {
                     if let Some(metadata) = envelope.smoke_metadata {
                         let native_window::NativeVideoWindowEvent::MouseMove(mouse) =
                             &envelope.event
@@ -6884,8 +6918,12 @@ fn run_native_video_output(
                                 presenter_hwnd: cur_presenter_hwnd,
                                 geometry,
                                 geometry_version,
-                                raw_forwarded: overlay_routing
-                                    .should_forward_to_ui(&envelope.event),
+                                raw_forwarded: overlay_outcome.as_ref().map_or_else(
+                                    || overlay_routing.should_forward_to_ui(&envelope.event),
+                                    |outcome| {
+                                        outcome.should_forward_to_ui(event_index, &envelope.event)
+                                    },
+                                ),
                                 command_count: ui_smoke_command_count,
                                 source: envelope.source,
                                 event_x: mouse.x,
@@ -7944,6 +7982,14 @@ impl VideoPlayer {
         self.clock.set_playing(false);
         self.clock.set_paused_position(position_secs);
         self.clock.set_playing(was_playing);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_duration_for_test(&mut self, duration_secs: f64) {
+        self.info
+            .as_mut()
+            .expect("test player must have VideoInfo")
+            .duration_secs = duration_secs;
     }
 
     #[cfg(test)]
@@ -10083,6 +10129,21 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::overlay_input_routing_snapshot)
             .unwrap_or_default()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_native_overlay_input_routing_for_test(
+        &self,
+        routing: native_presenter::NativeOverlayInputRouting,
+    ) {
+        let output = self
+            .native_output
+            .as_ref()
+            .expect("test player must have native output");
+        *output
+            .overlay_input_routing
+            .lock()
+            .expect("test routing must not be poisoned") = routing;
     }
 
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。

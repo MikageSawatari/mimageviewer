@@ -362,8 +362,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 1. **Esc と修飾なし矢印ナビは固定扱いのまま残す。Enter / Backspace / Home / End / PageUp / PageDown は文脈別 `KeyAction` として扱う。**
    - 理由: Esc は再割当でモード脱出不能になりやすく、修飾なし矢印は RTL 反転・見開き 2 ページ送り・動画シーク粒度と絡む最低限の閲覧ナビ。
    - Enter / Backspace / Home / End / PageUp / PageDown は操作単位が明確になったため、コマンド設定・競合検出・ヘルプ表示へ載せる。
-2. **動画シーク (←→ + 修飾で 5/1/30 秒)** は修飾でgranularityを切替える特殊構造。
-   MVP では**固定**。カスタムするなら `VideoSeekFwd5/1/30` の 3 Action に分割して扱う。
+2. **動画シーク** は Small / Medium / Large の前後6 Action を使う。
+   Small の既定は Shift+左右、Large は Ctrl+左右、Medium は既定割り当てなし。
+   修飾なし左右は固定ナビゲーションのまま Medium の秒数を参照し、タイル中はカーソル移動する。
+   秒数は Settings で小1 / 中5 / 大30秒を既定に各1～600秒で設定し、同じ段階の実行経路で共有する。
 3. **IME ガード維持**: 文字キー Action は既存 `ime_input_active()` / `dialog_*_pressed` の
    ガードを**helper の外側で従来通り**通す。helper は純粋に「このキーが押されたか」だけ答える。
 4. **exact match**: §4 の「修飾完全一致」を helper 内で保証。同一キーに NONE と SHIFT が
@@ -524,7 +526,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
-  コンテキスト別に個別割り当て、通常ホイール、Ctrl+ホイール、クリックは固定。detached viewer
+  コンテキスト別に個別割り当て。動画・音声の修飾なしホイールは前後ファイル移動（既定）/
+  音量調整を選べる。その他の通常ホイール、Ctrl+ホイール、クリックは固定。detached viewer
   表示中はマウスイベントの受信面をコンテキスト解決へ明示的に渡し、`fullscreen_idx` だけから
   発火面を推定しない。
 
@@ -575,8 +578,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ### FsVideo (Ph5、VK 経路)
 - VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter` /
   VideoCloseFullscreen (既定未割り当て、動画フルスクリーンを閉じる追加キー)
-- VideoSeekBack/Fwd `←/→` (修飾なし 5 秒は固定) / VideoSeekBackSmall/ForwardSmall `Shift+←/→` (P) /
-  VideoSeekBackLarge/ForwardLarge `Ctrl+←/→` (P)
+- `←/→` (修飾なしキーは固定、中シークの設定秒数を使用) / VideoSeekBackSmall/ForwardSmall `Shift+←/→` (P) /
+  VideoSeekBackMedium/ForwardMedium (既定未割り当て) / VideoSeekBackLarge/ForwardLarge `Ctrl+←/→` (P)
 - VideoFrameStepBack/Fwd `Ctrl+Shift+←/→` (P)
 - VideoSeekStart `W` / VideoVolumeUp/Down `Shift+↑/↓` / VideoNextFile `↓` / VideoPrevFile `↑`
 - VideoMute `M` / VideoLoop `L` / VideoMarkerPrev `J` / VideoMarkerNext `K`
@@ -631,8 +634,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### 固定・対象外として明示するもの
 - Gamepad: `src/app/gamepad_input.rs` の閲覧専用ボタン/軸入力。
-- Mouse: 通常ホイール、Ctrl+ホイール、編集キャンバス上の筆系ツールに限定した Shift+ホイール、クリック、D&D、右クリックメニューは固定。
-  右ドラッグ、戻る/進むは `Settings.ring_shortcuts` で限定カスタマイズ。
+- Mouse: Ctrl+ホイール、編集キャンバス上の筆系ツールに限定した Shift+ホイール、クリック、D&D、右クリックメニューは固定。
+  右ドラッグ、戻る/進む、動画・音声の修飾なし通常ホイールは `Settings.ring_shortcuts` で限定カスタマイズ。
+  その他の通常ホイールは固定で、マウス入力全般は引き続き keymap.ini の対象外。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
   ファイル削除ワーカー起動。
 - OS 状態参照: native presenter の一部 routing。元画像表示の OS 状態参照は

@@ -1459,6 +1459,61 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-08 静止画シーク popup と native browser-key の1クリック1操作:**
+
+静止画の共有 fullscreen 下部バーに、既存 Settings の列表示 / 非表示と5段階高さを選ぶ
+viewport-local egui popup を追加した。main / F12 は同じ `ViewerContextBundle` 描画と設定保存を通り、
+popup open は egui memory が所有するため App / detached 専用 state は追加しない。入力 handler は
+native pending を先に drain した後、現在 viewport の popup が開いている間だけ fullscreen shortcut を
+配送せず、Escape・矢印・Enterをpopupへ残す。既存のtouch correlation済み論理clickをmenuの
+open commandへ渡すため、mouse / touchのどちらも1回だけtoggleする。
+
+native videoはpresenter WndProcが実 `VK_BROWSER_BACK/FORWARD` keydownをrouteへenqueueした時点で
+同じmessageの既定処理を止め、同一WndProcへの合成 `WM_APPCOMMAND` 再配送を防ぐ。direct
+`WM_APPCOMMAND`、KeyUp、他keyは維持する。XButton DOWN / UP / DBLCLKを処理済みとして統一し、
+DBLCLKを2回目の物理押下としてrouteする変更は別のWin32契約hardeningである。いずれもdetached
+predicate、viewport ID / recreate、runtime / host ownership、placement / focus、window lifecycleを
+変更せず、新しいbool / Option、時間窓、debounce、retryを追加しない。親と独立レビューは、既存の
+viewport input ownerとWndProc producer境界を揃える構造修正として合意した。
+
+**2026-09-08 §4.2: 動画入力の段階別シークと raw wheel の所有（設計合意、実装進行中）:**
+
+既存 native / egui / music / ring 入力は同じ小中大の設定値を使い、固定左右とタップは中を選ぶ。
+タップの秒数を source 固有 metadata へ複製すると切替時に既定へ戻り得るため、段階の意図を
+既存 source gate 経由で App へ運び、実行時の Settings から解決する。
+通常 wheel は同一 batch 内の最終 pointer で所有が変わる問題を避け、各 event の処理先を
+既存 input outcome 内で所有する。Command 化したものを egui / App へ二重投入せず、領域入力は
+元位置の実 handler へ配送する。論理 UI pass を wheel 境界で分けても、GPU 描画は最終出力を
+一回だけ送る。非 wheel の text / modal 保護と source epoch の判定、既存 egui 平滑処理は保つ。
+通常 wheel の Navigate / Volume も App の現在設定で一度解決し、Navigate の既存 epoch 不一致許容を
+保つ一方、Volume は古い source を拒否する。設定の任意 metadata への複製は不要とする。
+
+親 Astra と独立 Astra は、入力の配送・消費境界を揃える構造的修正と合意した。
+detached 専用 state、猶予時間、追加の描画ループ、入力の一時禁止は導入しない。
+host / binding / placement の所有は変更せず、実装担当が実 handler の mixed-batch 回帰で確認する。
+詳細は [実装計画](v3.7.0-input-and-still-seek-plan.md)。実アプリ操作は別途明示了承後。
+
+**2026-09-08 §1.200: 詳細表示と静止画シークの保持所有・段階別高さ（設計合意、実装進行中）:**
+
+利用者指定の今回の体制は親 Astra 設計・独立 Astra レビュー・Sol 実装であり、旧担当指定との
+移行範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) のとおり。構造制約は維持する。
+親と独立レビューは、ROOT の詳細 hover 終了が still seek の keep/request を消す根因を照合した。
+既存 grid / navigation target / details hover / still seek / 表示中の本ブックマークの owner から保持を合成し、最後の owner
+離脱時だけ取消・退去させる。新しい detached pending や focus・時間猶予・一括 reset は追加しない。
+still seek の worker 公開は限定 exact set のままとし、他 context の所有集合を変更しない。
+本ブックマークは現在の loaded membership と container / PageIdentity を既存 keep 候補に照合し、
+新しい全件走査や cache owner を増やさずに保持する。worker の bounded range も同じ union へ合流する。
+
+高さ設定は still 専用の5段階として動画から分け、実 viewport に収まる共通 geometry を
+描画・hit・画像予約・パネル・touch が共有する。detached に ROOT の最小窓サイズを仮定せず、
+窓の新しい最小サイズ制限を加えない。ドラッグ幅は既存 gesture の押下座標と共に保持する。
+極小領域のbar / stripを最低高の条件で消さず、ボタン・鍵・余白も同じ矩形へfitする。
+共有 `draw_icons.rs` はrect版のbuttonを加え、既存32pt APIをwrapperとして残す。
+stillだけがfitted rectを渡し、描画clip・hit・touch correlationを一致させる（親/独立Astraで追加境界を確認済み）。
+これらは所有と寸法の正本を揃える構造的修正と合意した。host / binding / placement / window
+lifecycle は変更しない。詳細と回帰要件は [実装計画](v3.7.0-input-and-still-seek-plan.md)。
+実アプリ検証は明示了承後のリリース前の枠に残す。
+
 **2026-09-08 §1.197 S3b: native上部ボタンの実描画観測（設計合意・未実装）:**
 
 利用者指定の親Astraと独立Astraで、既存render ownerに属する診断観測として合意した。

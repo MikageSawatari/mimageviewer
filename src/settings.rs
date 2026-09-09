@@ -4313,9 +4313,13 @@ pub struct Settings {
     /// 静止画ページシークバーに source page 単位のサムネイル列を表示する。
     #[serde(default = "default_still_seek_strip_visible")]
     pub still_seek_strip_visible: bool,
-    /// 静止画ページシークストリップの高さ (大 / 中 / 小 / 最小)。
-    #[serde(default = "default_still_seek_strip_height")]
-    pub still_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 静止画ページシークストリップの高さプリセット。
+    #[serde(default)]
+    pub still_seek_strip_height: StillSeekStripHeight,
+    /// 静止画ページシークストリップのプリセット別高さ。保存値はそのまま保持し、
+    /// 実描画時だけ安全範囲へ制限する。
+    #[serde(default)]
+    pub still_seek_strip_height_values: StillSeekStripHeightValues,
     /// 静止画ページシークのマウスオーバープレビュー表示方針。
     #[serde(default = "default_still_seek_hover_preview_mode")]
     pub still_seek_hover_preview_mode: StillSeekHoverPreviewMode,
@@ -4755,6 +4759,15 @@ pub struct Settings {
     /// 動画再生速度。HUD の速度ボタンから変更され、動画切替 / アプリ再起動後も維持する。
     #[serde(default = "default_video_playback_speed")]
     pub video_playback_speed: f64,
+    /// Relative seek distances selected by the Small / Medium / Large input
+    /// actions. Stored values are retained verbatim for forward compatibility;
+    /// every consumer resolves them through `video_seek_seconds`.
+    #[serde(default = "default_video_seek_small_secs")]
+    pub video_seek_small_secs: u32,
+    #[serde(default = "default_video_seek_medium_secs")]
+    pub video_seek_medium_secs: u32,
+    #[serde(default = "default_video_seek_large_secs")]
+    pub video_seek_large_secs: u32,
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
@@ -4777,9 +4790,12 @@ pub struct Settings {
     /// 場面と波形を行き来しても選択を保つ。
     #[serde(default)]
     pub video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan,
-    /// ストリップの高さ (大 / 中 / 小 / 最小)。
+    /// ストリップの高さ (最大 / 大 / 中 / 小 / 最小)。
     #[serde(default)]
     pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 動画・音声シークストリップの段階別高さ。静止画の値とは独立して保存する。
+    #[serde(default)]
+    pub video_seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
     /// `Shift+S` の巡回に含める表示。**機能自体の非表示ではない** — 外した表示も
     /// 右下のメニューからは選べる。全解除は `sanitize` が既定へ戻す。
     #[serde(default)]
@@ -5465,6 +5481,31 @@ fn default_video_playback_speed() -> f64 {
     1.0
 }
 
+pub const VIDEO_SEEK_SECONDS_MIN: u32 = 1;
+pub const VIDEO_SEEK_SECONDS_MAX: u32 = 600;
+pub const VIDEO_SEEK_SMALL_DEFAULT_SECS: u32 = 1;
+pub const VIDEO_SEEK_MEDIUM_DEFAULT_SECS: u32 = 5;
+pub const VIDEO_SEEK_LARGE_DEFAULT_SECS: u32 = 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoSeekStep {
+    Small,
+    Medium,
+    Large,
+}
+
+fn default_video_seek_small_secs() -> u32 {
+    VIDEO_SEEK_SMALL_DEFAULT_SECS
+}
+
+fn default_video_seek_medium_secs() -> u32 {
+    VIDEO_SEEK_MEDIUM_DEFAULT_SECS
+}
+
+fn default_video_seek_large_secs() -> u32 {
+    VIDEO_SEEK_LARGE_DEFAULT_SECS
+}
+
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS: f64 = 0.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
@@ -5620,6 +5661,112 @@ impl VideoSeekStripState {
     }
 }
 
+pub const STILL_SEEK_STRIP_HEIGHT_MIN_POINTS: u32 = 36;
+pub const STILL_SEEK_STRIP_HEIGHT_MAX_POINTS: u32 = 320;
+pub const STILL_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS: u32 = 36;
+pub const STILL_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS: u32 = 48;
+pub const STILL_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS: u32 = 72;
+pub const STILL_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS: u32 = 104;
+pub const STILL_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS: u32 = 144;
+
+/// 静止画ページシークストリップ専用の高さプリセット。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekStripHeight {
+    Maximum,
+    #[default]
+    Large,
+    Medium,
+    Small,
+    Smallest,
+}
+
+impl StillSeekStripHeight {
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "最大",
+            Self::Large => "大",
+            Self::Medium => "中",
+            Self::Small => "小",
+            Self::Smallest => "最小",
+        }
+    }
+}
+
+/// 静止画シークストリップのプリセット別高さ (100%表示時の logical point)。
+///
+/// 各値は独立して保存する。範囲外の保存値を起動時に書き換えず、[`Self::points`] で
+/// 選択した値を解決するときだけ 36..=320 へ制限する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillSeekStripHeightValues {
+    #[serde(default = "default_still_seek_strip_height_smallest_points")]
+    pub smallest: u32,
+    #[serde(default = "default_still_seek_strip_height_small_points")]
+    pub small: u32,
+    #[serde(default = "default_still_seek_strip_height_medium_points")]
+    pub medium: u32,
+    #[serde(default = "default_still_seek_strip_height_large_points")]
+    pub large: u32,
+    #[serde(default = "default_still_seek_strip_height_maximum_points")]
+    pub maximum: u32,
+}
+
+impl Default for StillSeekStripHeightValues {
+    fn default() -> Self {
+        Self {
+            smallest: STILL_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS,
+            small: STILL_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS,
+            medium: STILL_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS,
+            large: STILL_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS,
+            maximum: STILL_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS,
+        }
+    }
+}
+
+impl StillSeekStripHeightValues {
+    pub fn points(self, preset: StillSeekStripHeight) -> f32 {
+        let stored = match preset {
+            StillSeekStripHeight::Maximum => self.maximum,
+            StillSeekStripHeight::Large => self.large,
+            StillSeekStripHeight::Medium => self.medium,
+            StillSeekStripHeight::Small => self.small,
+            StillSeekStripHeight::Smallest => self.smallest,
+        };
+        stored.clamp(
+            STILL_SEEK_STRIP_HEIGHT_MIN_POINTS,
+            STILL_SEEK_STRIP_HEIGHT_MAX_POINTS,
+        ) as f32
+    }
+}
+
+fn default_still_seek_strip_height_smallest_points() -> u32 {
+    STILL_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS
+}
+
+fn default_still_seek_strip_height_small_points() -> u32 {
+    STILL_SEEK_STRIP_HEIGHT_SMALL_DEFAULT_POINTS
+}
+
+fn default_still_seek_strip_height_medium_points() -> u32 {
+    STILL_SEEK_STRIP_HEIGHT_MEDIUM_DEFAULT_POINTS
+}
+
+fn default_still_seek_strip_height_large_points() -> u32 {
+    STILL_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS
+}
+
+fn default_still_seek_strip_height_maximum_points() -> u32 {
+    STILL_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS
+}
+
 /// 静止画シーク位置へ追従するサムネイルプレビューの表示方針。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -5730,10 +5877,6 @@ impl VideoSeekBarWithStrip {
 
 fn default_still_seek_strip_visible() -> bool {
     false
-}
-
-fn default_still_seek_strip_height() -> crate::video::seek_strip_layout::SeekStripHeight {
-    crate::video::seek_strip_layout::SeekStripHeight::Large
 }
 
 fn default_still_seek_hover_preview_mode() -> StillSeekHoverPreviewMode {
@@ -5901,11 +6044,14 @@ fn default_folder_thumb_sort() -> SortOrder {
 fn default_folder_thumb_depth() -> u32 {
     3
 }
+
+const AI_PREFETCH_FORWARD_LEGACY_DEFAULT: usize = 2;
+
 fn default_ai_upscale_prefetch_back() -> usize {
-    1
+    2
 }
 fn default_ai_upscale_prefetch_forward() -> usize {
-    2
+    3
 }
 fn default_retained_final_ai_cache_max_entries() -> usize {
     RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT
@@ -6294,7 +6440,8 @@ impl Default for Settings {
             fullscreen_seek_bar_locked: false,
             still_seek_strip_locked: false,
             still_seek_strip_visible: default_still_seek_strip_visible(),
-            still_seek_strip_height: default_still_seek_strip_height(),
+            still_seek_strip_height: StillSeekStripHeight::default(),
+            still_seek_strip_height_values: StillSeekStripHeightValues::default(),
             still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
             still_seek_bar_with_strip: default_still_seek_bar_with_strip(),
             fullscreen_top_bar_locked: false,
@@ -6438,6 +6585,9 @@ impl Default for Settings {
             remote_video_hide_local_output: true,
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
+            video_seek_small_secs: default_video_seek_small_secs(),
+            video_seek_medium_secs: default_video_seek_medium_secs(),
+            video_seek_large_secs: default_video_seek_large_secs(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
             video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
             video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
@@ -6445,6 +6595,8 @@ impl Default for Settings {
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
             video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_strip_height_values:
+                crate::video::seek_strip_layout::SeekStripHeightValues::default(),
             video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
@@ -7252,6 +7404,17 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    /// Resolve a configurable relative-seek step without rewriting a stored
+    /// value merely because a newer build applies a narrower safe range.
+    pub fn video_seek_seconds(&self, step: VideoSeekStep) -> f64 {
+        let seconds = match step {
+            VideoSeekStep::Small => self.video_seek_small_secs,
+            VideoSeekStep::Medium => self.video_seek_medium_secs,
+            VideoSeekStep::Large => self.video_seek_large_secs,
+        };
+        seconds.clamp(VIDEO_SEEK_SECONDS_MIN, VIDEO_SEEK_SECONDS_MAX) as f64
+    }
+
     /// 現在の表示フィールドを共通値として退避し、お気に入り専用値を有効値へ載せる。
     pub(crate) fn apply_favorite_view_overlay(
         &mut self,
@@ -7513,11 +7676,43 @@ impl Settings {
         changed
     }
 
+    /// v3.7.0 changes the paged final-pipeline prefetch default so the current
+    /// spread partner and both pages of the next spread fit in the forward
+    /// window. A stored `2` is ambiguous (old default or an explicit choice),
+    /// so it is advanced once at the v3.7.0 boundary and remains selectable
+    /// thereafter. The backward value is deliberately never migrated.
+    fn migrate_ai_prefetch_forward_for_spreads(
+        &mut self,
+        previous_last_seen_version: Option<&str>,
+        current_version: &str,
+    ) -> bool {
+        if self.ai_upscale_prefetch_forward != AI_PREFETCH_FORWARD_LEGACY_DEFAULT {
+            return false;
+        }
+
+        if !crate::version_highlights::ai_prefetch_spread_default_upgrade_required(
+            previous_last_seen_version,
+            current_version,
+        ) {
+            return false;
+        }
+
+        self.ai_upscale_prefetch_forward = default_ai_upscale_prefetch_forward();
+        true
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
     /// 変更確認など「clean install と upgrade を区別したい」用途でこのメタ情報を使う。
     pub fn load_with_meta() -> SettingsLoadResult {
+        Self::load_with_meta_for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// 実行中の package version を明示してロードする内部実装。
+    /// 公開入口は常に `CARGO_PKG_VERSION` を渡し、版境界をまたぐ永続化テストだけが
+    /// 将来版を注入する。
+    fn load_with_meta_for_version(current_version: &str) -> SettingsLoadResult {
         let data_dir = crate::data_dir::get();
         let outcome = crate::settings_db::boot_settings_db(&data_dir);
         let source = outcome.source;
@@ -7619,8 +7814,11 @@ impl Settings {
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
         // - 新版は `settings.db` を `settings.db.preupgrade-v<old>` に `VACUUM INTO` snapshot
-        let current_version = env!("CARGO_PKG_VERSION");
         let grid_click_selection_mode_migrated = settings.migrate_grid_click_selection_to_explorer(
+            previous_last_seen_version.as_deref(),
+            current_version,
+        );
+        let ai_prefetch_forward_migrated = settings.migrate_ai_prefetch_forward_for_spreads(
             previous_last_seen_version.as_deref(),
             current_version,
         );
@@ -7685,6 +7883,7 @@ impl Settings {
             || video_seek_strip_waveform_span_sanitized
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
+            || ai_prefetch_forward_migrated
             || legacy_keymap_import.changed
             || version_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -8995,9 +9194,10 @@ mod tests {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert!(!loaded.still_seek_strip_locked);
         assert!(!loaded.still_seek_strip_visible);
+        assert_eq!(loaded.still_seek_strip_height, StillSeekStripHeight::Large);
         assert_eq!(
-            loaded.still_seek_strip_height,
-            crate::video::seek_strip_layout::SeekStripHeight::Large
+            loaded.still_seek_strip_height_values,
+            StillSeekStripHeightValues::default()
         );
         assert_eq!(
             loaded.still_seek_hover_preview_mode,
@@ -9030,6 +9230,89 @@ mod tests {
         assert_eq!(
             restored.video_seek_bar_with_strip,
             VideoSeekBarWithStrip::Hide
+        );
+    }
+
+    #[test]
+    fn still_seek_strip_height_preserves_legacy_names_and_resolves_independent_values() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{"still_seek_strip_height":"smallest","still_seek_strip_height_values":{"smallest":1,"small":47,"medium":73,"large":105,"maximum":999}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.still_seek_strip_height,
+            StillSeekStripHeight::Smallest
+        );
+        assert_eq!(
+            settings
+                .still_seek_strip_height_values
+                .points(settings.still_seek_strip_height),
+            STILL_SEEK_STRIP_HEIGHT_MIN_POINTS as f32
+        );
+        assert_eq!(
+            settings
+                .still_seek_strip_height_values
+                .points(StillSeekStripHeight::Maximum),
+            STILL_SEEK_STRIP_HEIGHT_MAX_POINTS as f32
+        );
+
+        settings.sanitize();
+        let stored = serde_json::to_value(&settings).unwrap();
+        assert_eq!(stored["still_seek_strip_height"], "smallest");
+        assert_eq!(stored["still_seek_strip_height_values"]["smallest"], 1);
+        assert_eq!(stored["still_seek_strip_height_values"]["maximum"], 999);
+
+        for (saved, expected) in [
+            ("large", StillSeekStripHeight::Large),
+            ("medium", StillSeekStripHeight::Medium),
+            ("small", StillSeekStripHeight::Small),
+            ("smallest", StillSeekStripHeight::Smallest),
+            ("maximum", StillSeekStripHeight::Maximum),
+        ] {
+            let parsed: Settings = serde_json::from_value(serde_json::json!({
+                "still_seek_strip_height": saved
+            }))
+            .unwrap();
+            assert_eq!(parsed.still_seek_strip_height, expected);
+        }
+
+        let non_monotonic: Settings = serde_json::from_str(
+            r#"{"still_seek_strip_height":"small","still_seek_strip_height_values":{"smallest":36,"small":200,"medium":72,"large":40,"maximum":144}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            non_monotonic
+                .still_seek_strip_height_values
+                .points(StillSeekStripHeight::Small),
+            200.0
+        );
+        assert_eq!(
+            non_monotonic
+                .still_seek_strip_height_values
+                .points(StillSeekStripHeight::Large),
+            40.0
+        );
+
+        let partial: Settings =
+            serde_json::from_str(r#"{"still_seek_strip_height_values":{"maximum":180}}"#).unwrap();
+        assert_eq!(partial.still_seek_strip_height_values.maximum, 180);
+        assert_eq!(
+            partial.still_seek_strip_height_values.smallest,
+            STILL_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS
+        );
+        assert_eq!(
+            partial.still_seek_strip_height_values.large,
+            STILL_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS
+        );
+    }
+
+    #[test]
+    fn still_seek_strip_height_unknown_value_keeps_strict_settings_protection() {
+        assert!(
+            serde_json::from_str::<Settings>(
+                r#"{"still_seek_strip_height":"future_height","video_seek_strip_height":"smallest"}"#
+            )
+            .is_err()
         );
     }
 
@@ -9079,15 +9362,24 @@ mod tests {
         );
     }
 
-    /// 表示範囲・高さ・巡回対象は保存され、既定は従来の見え方のまま。
+    /// 表示範囲・高さ・段階別の実寸・巡回対象は保存され、既定は従来の見え方のまま。
     #[test]
     fn video_seek_strip_span_height_and_cycle_round_trip_with_the_shipped_defaults() {
-        use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripSpan};
+        use crate::video::seek_strip_layout::{
+            SeekStripHeight, SeekStripHeightValues, SeekStripSpan,
+            VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS,
+            VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS,
+            VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS,
+        };
 
         // 既定は出荷済みの見え方 (周辺表示・大) で、更新しても見た目が変わらない。
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Window);
         assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Large);
+        assert_eq!(
+            loaded.video_seek_strip_height_values,
+            SeekStripHeightValues::default()
+        );
         assert_eq!(
             loaded.video_seek_strip_cycle,
             crate::video::seek_strip_layout::SeekStripCycleSet::default()
@@ -9096,17 +9388,65 @@ mod tests {
         let mut settings = Settings::default();
         settings.video_seek_strip_span = SeekStripSpan::Whole;
         settings.video_seek_strip_height = SeekStripHeight::Smallest;
+        settings.video_seek_strip_height_values.maximum = 288;
+        settings.video_seek_strip_height_values.large = 96;
         settings.video_seek_strip_cycle.waveform_whole = false;
         let stored = serde_json::to_value(settings).unwrap();
         assert_eq!(stored["video_seek_strip_span"], "whole");
         assert_eq!(stored["video_seek_strip_height"], "smallest");
+        assert_eq!(stored["video_seek_strip_height_values"]["maximum"], 288);
+        assert_eq!(stored["video_seek_strip_height_values"]["large"], 96);
         assert_eq!(stored["video_seek_strip_cycle"]["waveform_whole"], false);
 
         let loaded: Settings = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Whole);
         assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Smallest);
+        assert_eq!(loaded.video_seek_strip_height_values.maximum, 288);
+        assert_eq!(loaded.video_seek_strip_height_values.large, 96);
         assert!(!loaded.video_seek_strip_cycle.waveform_whole);
         assert!(loaded.video_seek_strip_cycle.thumbnails_window);
+
+        // 保存値は丸めず、解決時だけ 36..=320 に制限する。項目欠落は段階別既定値。
+        let loaded: Settings = serde_json::from_str(
+            r#"{"video_seek_strip_height":"maximum","video_seek_strip_height_values":{"maximum":999,"smallest":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.video_seek_strip_height_values.maximum, 999);
+        assert_eq!(loaded.video_seek_strip_height_values.smallest, 1);
+        assert_eq!(
+            loaded
+                .video_seek_strip_height_values
+                .points(SeekStripHeight::Maximum),
+            320.0
+        );
+        assert_eq!(
+            loaded
+                .video_seek_strip_height_values
+                .points(SeekStripHeight::Smallest),
+            36.0
+        );
+        assert_eq!(
+            loaded.video_seek_strip_height_values.large,
+            VIDEO_SEEK_STRIP_HEIGHT_LARGE_DEFAULT_POINTS
+        );
+        assert_eq!(
+            SeekStripHeightValues::default().maximum,
+            VIDEO_SEEK_STRIP_HEIGHT_MAXIMUM_DEFAULT_POINTS
+        );
+        assert_eq!(
+            SeekStripHeightValues::default().smallest,
+            VIDEO_SEEK_STRIP_HEIGHT_SMALLEST_DEFAULT_POINTS
+        );
+    }
+
+    #[test]
+    fn video_seek_strip_height_unknown_value_keeps_strict_settings_protection() {
+        assert!(
+            serde_json::from_str::<Settings>(
+                r#"{"video_seek_strip_height":"future_height","still_seek_strip_height":"smallest"}"#
+            )
+            .is_err()
+        );
     }
 
     /// 巡回対象を全部外した設定は読み込みで既定へ戻す。そのままだと `Shift+S` が
@@ -9686,6 +10026,116 @@ mod tests {
                 "previous={previous}, current={current}"
             );
         }
+    }
+
+    #[test]
+    fn ai_prefetch_defaults_cover_adjacent_spreads() {
+        let settings = Settings::default();
+        assert_eq!(settings.ai_upscale_prefetch_forward, 3);
+        assert_eq!(settings.ai_upscale_prefetch_back, 2);
+
+        let deserialized: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(deserialized.ai_upscale_prefetch_forward, 3);
+        assert_eq!(deserialized.ai_upscale_prefetch_back, 2);
+    }
+
+    #[test]
+    fn pre_v3_7_upgrade_moves_only_the_legacy_forward_default() {
+        let mut settings = Settings::default();
+        settings.ai_upscale_prefetch_forward = AI_PREFETCH_FORWARD_LEGACY_DEFAULT;
+        settings.ai_upscale_prefetch_back = 1;
+
+        assert!(settings.migrate_ai_prefetch_forward_for_spreads(
+            Some("3.6.0"),
+            crate::version_highlights::AI_PREFETCH_SPREAD_DEFAULT_VERSION,
+        ));
+        assert_eq!(settings.ai_upscale_prefetch_forward, 3);
+        assert_eq!(
+            settings.ai_upscale_prefetch_back, 1,
+            "the user's stored backward window is outside this migration"
+        );
+    }
+
+    #[test]
+    fn ai_prefetch_upgrade_waits_for_v3_7_and_runs_only_across_its_boundary() {
+        for (previous, current) in [
+            (Some("3.5.0"), "3.6.0"),
+            (Some("3.7.0"), "3.7.1"),
+            (Some("3.8.0"), "4.0.0"),
+            (None, "3.7.0"),
+            (Some("unknown"), "3.7.0"),
+        ] {
+            let mut settings = Settings::default();
+            settings.ai_upscale_prefetch_forward = AI_PREFETCH_FORWARD_LEGACY_DEFAULT;
+
+            assert!(
+                !settings.migrate_ai_prefetch_forward_for_spreads(previous, current),
+                "previous={previous:?}, current={current}"
+            );
+            assert_eq!(
+                settings.ai_upscale_prefetch_forward, AI_PREFETCH_FORWARD_LEGACY_DEFAULT,
+                "previous={previous:?}, current={current}"
+            );
+        }
+
+        let mut skipped_release = Settings::default();
+        skipped_release.ai_upscale_prefetch_forward = AI_PREFETCH_FORWARD_LEGACY_DEFAULT;
+        assert!(skipped_release.migrate_ai_prefetch_forward_for_spreads(Some("3.6.4"), "3.8.0",));
+        assert_eq!(skipped_release.ai_upscale_prefetch_forward, 3);
+    }
+
+    #[test]
+    fn ai_prefetch_upgrade_preserves_nonlegacy_forward_choices() {
+        for stored in [0, 1, 3, 4, 10] {
+            let mut settings = Settings::default();
+            settings.ai_upscale_prefetch_forward = stored;
+
+            assert!(!settings.migrate_ai_prefetch_forward_for_spreads(
+                Some("3.6.0"),
+                crate::version_highlights::AI_PREFETCH_SPREAD_DEFAULT_VERSION,
+            ));
+            assert_eq!(settings.ai_upscale_prefetch_forward, stored);
+        }
+    }
+
+    #[test]
+    fn ai_prefetch_upgrade_persists_once_across_real_settings_db_reloads() {
+        let _env = setup_backup_env();
+
+        // DB を現行版として作り、旧既定の前方 2 と利用者が保存した後方 7 を置く。
+        let _ = Settings::load_with_meta_for_version("3.6.0");
+        let mut older = Settings::default();
+        older.ai_upscale_prefetch_forward = AI_PREFETCH_FORWARD_LEGACY_DEFAULT;
+        older.ai_upscale_prefetch_back = 7;
+        older.last_seen_version = Some("3.6.0".to_owned());
+        older.save();
+
+        // 新セッションの v3.7.0 初回ロードで前方だけが 3 になり、その結果が DB へ残る。
+        reset_backup_state_for_test();
+        let upgraded = Settings::load_with_meta_for_version("3.7.0");
+        assert_eq!(
+            upgraded.meta.previous_last_seen_version.as_deref(),
+            Some("3.6.0")
+        );
+        assert_eq!(upgraded.settings.ai_upscale_prefetch_forward, 3);
+        assert_eq!(upgraded.settings.ai_upscale_prefetch_back, 7);
+        assert_eq!(
+            upgraded.settings.last_seen_version.as_deref(),
+            Some("3.7.0")
+        );
+
+        // 移行後に利用者が前方 2 を選び直した場合、同じ版の次回起動では変えない。
+        let mut user_choice = upgraded.settings;
+        user_choice.ai_upscale_prefetch_forward = AI_PREFETCH_FORWARD_LEGACY_DEFAULT;
+        user_choice.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load_with_meta_for_version("3.7.0");
+        assert_eq!(
+            reloaded.meta.previous_last_seen_version.as_deref(),
+            Some("3.7.0")
+        );
+        assert_eq!(reloaded.settings.ai_upscale_prefetch_forward, 2);
+        assert_eq!(reloaded.settings.ai_upscale_prefetch_back, 7);
     }
 
     #[test]
@@ -12178,6 +12628,12 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
+        assert_eq!(loaded.video_seek_small_secs, VIDEO_SEEK_SMALL_DEFAULT_SECS);
+        assert_eq!(
+            loaded.video_seek_medium_secs,
+            VIDEO_SEEK_MEDIUM_DEFAULT_SECS
+        );
+        assert_eq!(loaded.video_seek_large_secs, VIDEO_SEEK_LARGE_DEFAULT_SECS);
         assert_eq!(
             loaded.erase_inpaint_mono_tolerance,
             default_erase_inpaint_mono_tolerance()
@@ -12611,6 +13067,24 @@ mod tests {
         s.video_playback_speed = f64::NAN;
         s.sanitize();
         assert_eq!(s.video_playback_speed, 1.0);
+    }
+
+    #[test]
+    fn video_seek_steps_resolve_independently_without_rewriting_stored_values() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Small), 1.0);
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Medium), 5.0);
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Large), 30.0);
+
+        settings.video_seek_small_secs = 0;
+        settings.video_seek_medium_secs = 17;
+        settings.video_seek_large_secs = 999;
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Small), 1.0);
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Medium), 17.0);
+        assert_eq!(settings.video_seek_seconds(VideoSeekStep::Large), 600.0);
+        assert_eq!(settings.video_seek_small_secs, 0);
+        assert_eq!(settings.video_seek_medium_secs, 17);
+        assert_eq!(settings.video_seek_large_secs, 999);
     }
 
     #[test]

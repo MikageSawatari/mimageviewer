@@ -98,6 +98,19 @@ const BUTTON_REPEAT_INTERVAL: Duration = Duration::from_millis(95);
 const SHOULDER_REPEAT_INTERVAL: Duration = Duration::from_millis(260);
 const STICK_STEP_INTERVAL: Duration = Duration::from_millis(110);
 const TRIGGER_STEP_INTERVAL: Duration = Duration::from_millis(150);
+
+fn video_seek_ring_action(action: &RingActionId) -> Option<(crate::settings::VideoSeekStep, bool)> {
+    use crate::settings::VideoSeekStep;
+    match action {
+        RingActionId::VideoSeekBackSmall => Some((VideoSeekStep::Small, false)),
+        RingActionId::VideoSeekForwardSmall => Some((VideoSeekStep::Small, true)),
+        RingActionId::VideoSeekBackMedium => Some((VideoSeekStep::Medium, false)),
+        RingActionId::VideoSeekForwardMedium => Some((VideoSeekStep::Medium, true)),
+        RingActionId::VideoSeekBackLarge => Some((VideoSeekStep::Large, false)),
+        RingActionId::VideoSeekForwardLarge => Some((VideoSeekStep::Large, true)),
+        _ => None,
+    }
+}
 const DEADZONE: f32 = 0.25;
 const TRIGGER_THRESHOLD: f32 = 0.35;
 const PAN_SPEED_PX_PER_SEC: f32 = 720.0;
@@ -5150,6 +5163,13 @@ impl App {
             ));
             return None;
         }
+        if !action.is_available_for_mouse_button_assignment(context) {
+            crate::logger::log(format!(
+                "[input-nav] source={source} ignored deferred mouse button action={} context={context:?}",
+                action.as_str()
+            ));
+            return None;
+        }
         if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored mouse button action={} during edit mode",
@@ -5942,6 +5962,34 @@ impl App {
                     && !self.copy_item_file_name_to_clipboard(ctx, fs_idx)
                 {
                     self.show_feedback_toast("ファイル名をコピーできません".to_string());
+                }
+                None
+            }
+            action @ (RingActionId::VideoSeekBackSmall
+            | RingActionId::VideoSeekForwardSmall
+            | RingActionId::VideoSeekBackMedium
+            | RingActionId::VideoSeekForwardMedium
+            | RingActionId::VideoSeekBackLarge
+            | RingActionId::VideoSeekForwardLarge)
+                if context == RingShortcutContext::VideoFullscreen =>
+            {
+                let (step, forward) =
+                    video_seek_ring_action(&action).expect("guarded video seek ring action");
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    let seconds = self.settings.video_seek_seconds(step);
+                    let delta_secs = if forward { seconds } else { -seconds };
+                    if self.fs_music_view_active(fs_idx) {
+                        self.music_seek_relative(fs_idx, delta_secs);
+                    } else {
+                        #[cfg(windows)]
+                        self.native_video_seek_relative_with_hint(fs_idx, delta_secs);
+                        #[cfg(not(windows))]
+                        if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+                            self.fs_cache.get(&fs_idx)
+                        {
+                            let _ = player.seek_relative(delta_secs);
+                        }
+                    }
                 }
                 None
             }
@@ -7898,7 +7946,7 @@ mod tests {
         right_drag_press_suppresses_context_menu, ring_direction_from_dpad_buttons,
         ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
         ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
-        update_mouse_middle_click_state,
+        update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
 
@@ -8486,6 +8534,42 @@ mod tests {
     fn video_speed_picker_uses_hud_choices() {
         assert_eq!(cycle_video_playback_speed(1.0, 1), 1.25);
         assert_eq!(cycle_video_playback_speed(0.5, -1), 3.0);
+    }
+
+    #[test]
+    fn video_seek_ring_actions_preserve_step_and_direction() {
+        use crate::ring_shortcut::RingActionId;
+        use crate::settings::VideoSeekStep;
+
+        for (action, expected) in [
+            (
+                RingActionId::VideoSeekBackSmall,
+                (VideoSeekStep::Small, false),
+            ),
+            (
+                RingActionId::VideoSeekForwardSmall,
+                (VideoSeekStep::Small, true),
+            ),
+            (
+                RingActionId::VideoSeekBackMedium,
+                (VideoSeekStep::Medium, false),
+            ),
+            (
+                RingActionId::VideoSeekForwardMedium,
+                (VideoSeekStep::Medium, true),
+            ),
+            (
+                RingActionId::VideoSeekBackLarge,
+                (VideoSeekStep::Large, false),
+            ),
+            (
+                RingActionId::VideoSeekForwardLarge,
+                (VideoSeekStep::Large, true),
+            ),
+        ] {
+            assert_eq!(video_seek_ring_action(&action), Some(expected));
+        }
+        assert_eq!(video_seek_ring_action(&RingActionId::VideoMute), None);
     }
 
     #[test]

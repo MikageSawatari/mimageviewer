@@ -24,6 +24,7 @@
 #   PS> scripts\build-dist.ps1
 #   PS> scripts\build-dist.ps1 -SkipVst3Bridge
 #   PS> scripts\build-dist.ps1 -SkipRustTests
+#   PS> scripts\build-dist.ps1 -PreserveRuntime
 #
 # Sub-scripts are launched in a child PowerShell (powershell -File) so their
 # `exit` ends only the child and the exit code comes back via $LASTEXITCODE;
@@ -34,13 +35,44 @@ param(
     [switch] $SkipVst3Bridge,
     # Use only when the identical source tree already passed test-full.ps1.
     [switch] $SkipRustTests,
-    [switch] $NoSign
+    [switch] $NoSign,
+    # Agent-safe mode: never stop mImageViewer processes or modify its APPDATA cache.
+    [switch] $PreserveRuntime
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Get-Location).Path
 $scripts = Join-Path $repoRoot 'scripts'
+$expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$workspaceTargetDir = Join-Path $repoRoot 'target'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
+
+if ($PreserveRuntime) {
+    if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-dist] -PreserveRuntime must be run from the repository root: $expectedRepoRoot"
+    }
+    $configuredTarget = if ($env:CARGO_TARGET_DIR) {
+        $targetCandidate = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+            $env:CARGO_TARGET_DIR
+        } else {
+            Join-Path $repoRoot $env:CARGO_TARGET_DIR
+        }
+        [System.IO.Path]::GetFullPath($targetCandidate)
+    } else {
+        [System.IO.Path]::GetFullPath($workspaceTargetDir)
+    }
+    if (-not $configuredTarget.Equals([System.IO.Path]::GetFullPath($workspaceTargetDir), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-dist] -PreserveRuntime refuses a Cargo target outside the repository target directory: $configuredTarget"
+    }
+    foreach ($targetPath in @($workspaceTargetDir, $portableTargetDir)) {
+        if (Test-Path -LiteralPath $targetPath) {
+            $targetItem = Get-Item -LiteralPath $targetPath -Force
+            if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "[build-dist] -PreserveRuntime refuses a reparse-point Cargo target: $($targetItem.FullName)"
+            }
+        }
+    }
+}
 
 # Code signing is ON by default for distribution builds; pass -NoSign to skip it.
 # Assert the signing certificate up front (SimplySign Desktop must be running and
@@ -81,7 +113,9 @@ if ($SkipRustTests) {
     Write-Warning '[build-dist] (1/6) Rust test gate skipped; use only for an unchanged tested tree'
 } else {
     Write-Host '[build-dist] (1/6) scripts\test-full.ps1'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-full.ps1')
+    $testArgs = @()
+    if ($PreserveRuntime) { $testArgs += '-SuppressCrashDialogs' }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-full.ps1') @testArgs
     if ($LASTEXITCODE -ne 0) {
         throw ("[build-dist] Rust test gate failed (exit {0})" -f $LASTEXITCODE)
     }
@@ -109,6 +143,7 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (e
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
+if ($PreserveRuntime) { $releaseArgs += '-PreserveRuntime' }
 Write-Host ("[build-dist] (4/6) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-release.ps1') @releaseArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-release.ps1 failed (exit {0})" -f $LASTEXITCODE) }
@@ -140,6 +175,7 @@ if ($sign) {
 # --- 4. Portable (into target-portable; its app package was cleaned above) ---
 $portableArgs = @()
 if ($sign) { $portableArgs += '-Sign' }
+if ($PreserveRuntime) { $portableArgs += '-PreserveRuntime' }
 Write-Host "[build-dist] (6/6) build-portable.ps1"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1') @portableArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit {0})" -f $LASTEXITCODE) }

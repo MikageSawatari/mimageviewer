@@ -419,6 +419,7 @@ pub struct NativeVideoMouseWheelEvent {
     pub y: i32,
     pub shift: bool,
     pub ctrl: bool,
+    pub alt: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1837,6 +1838,14 @@ unsafe extern "system" fn wnd_proc(
                 }
                 return LRESULT(0);
             }
+            // Browser Back/Forward は上で既に 1 回 enqueue 済み。ここから
+            // DefWindowProcW へ渡すと WM_APPCOMMAND が生成され、本 wndproc の
+            // WM_APPCOMMAND branch が scan_code=0 の合成 KeyDown をもう 1 回流す。
+            // 実機ログでは実 KeyDown (scan 0x69/0x6A, extended) と合成 KeyDown が
+            // 同時刻に並び、1 クリックで同じ seek action が 2 回実行されていた。
+            if native_browser_keydown_message_handled(msg, wparam.0 as u32) {
+                return LRESULT(0);
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYUP | WM_SYSKEYUP => {
@@ -2024,14 +2033,11 @@ unsafe extern "system" fn wnd_proc(
                     native_mouse_button_event(msg, wparam, lparam),
                 ));
             }
-            // WM_XBUTTONUP に対して DefWindowProc に流すと、Windows が
-            // APPCOMMAND_BROWSER_BACKWARD/FORWARD を合成して WM_APPCOMMAND を再送する
-            // ([MS docs: Mouse Input Overview](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-mouse-input))。
-            // 進む/戻るは既に MouseButton(Extra1/Extra2) で処理しているので、その後
-            // WM_APPCOMMAND を本ファイル下の handler が再度拾うと 1 押下 = 2 ナビになる。
-            // TRUE (= 処理済み) を返して APPCOMMAND 合成を抑止 (Codex 2 周目 P2)。
-            // APPCOMMAND 経路は driver / AHK が WM_APPCOMMAND を直接送る場合のみに限定する。
-            if msg == WM_XBUTTONUP {
+            // MouseButton(Extra1/Extra2) として decode 済みの XButton message は、この
+            // HWND が DOWN / UP / DBLCLK を一括所有する。2 回目の物理押下を表す DBLCLK も
+            // 自前 route へ流しているため、Win32 の処理済み契約に従って全種で TRUE を返す。
+            // Browser-key の二重配送防止は上の WM_KEYDOWN branch が所有する。
+            if native_xbutton_message_handled(msg) {
                 return LRESULT(1);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -2301,6 +2307,7 @@ fn native_mouse_wheel_event(
         y: point.y,
         shift: mouse_shift(wparam),
         ctrl: mouse_ctrl(wparam),
+        alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0,
     }
 }
 
@@ -2316,6 +2323,19 @@ fn mouse_message_is_down(msg: u32) -> bool {
             | WM_MBUTTONDBLCLK
             | WM_XBUTTONDBLCLK
     )
+}
+
+/// Native presenter/HUD が decode 済みの XButton message を既定処理へ渡さないための
+/// 共有 ownership 判定。`CS_DBLCLKS` では 2 回目の down が `WM_XBUTTONDBLCLK` に
+/// 置き換わるため、DOWN / UP / DBLCLK の 3 種を同じ HWND がすべて処理済みにする。
+pub(super) const fn native_xbutton_message_handled(msg: u32) -> bool {
+    matches!(msg, WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK)
+}
+
+/// Browser key は native route へ enqueue した時点で処理済みとし、既定処理による
+/// `WM_APPCOMMAND` 再生成を止める。direct `WM_APPCOMMAND` は別 branch で扱う。
+const fn native_browser_keydown_message_handled(msg: u32, virtual_key: u32) -> bool {
+    matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && matches!(virtual_key, 0xA6 | 0xA7)
 }
 
 fn mouse_shift(wparam: WPARAM) -> bool {
@@ -2415,6 +2435,64 @@ mod tests {
         let result = unsafe { wnd_proc(HWND::default(), WM_SETCURSOR, WPARAM(0), LPARAM(trigger)) };
 
         assert_eq!(result, LRESULT(1));
+    }
+
+    #[test]
+    fn native_xbutton_messages_are_fully_owned_after_decode() {
+        for msg in [WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK] {
+            assert!(
+                native_xbutton_message_handled(msg),
+                "processed XButton message 0x{msg:04x} must not reach DefWindowProc"
+            );
+        }
+        for msg in [
+            WM_LBUTTONDOWN,
+            WM_LBUTTONUP,
+            WM_LBUTTONDBLCLK,
+            WM_RBUTTONDOWN,
+            WM_MBUTTONUP,
+        ] {
+            assert!(!native_xbutton_message_handled(msg));
+        }
+    }
+
+    #[test]
+    fn native_xbutton_decode_preserves_single_and_double_click_press_count() {
+        let wparam = WPARAM(1_usize << 16);
+        let lparam = LPARAM(0);
+        let single = [WM_XBUTTONDOWN, WM_XBUTTONUP];
+        let double = [WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONUP];
+        let press_count = |messages: &[u32]| {
+            messages
+                .iter()
+                .map(|msg| native_mouse_button_event(*msg, wparam, lparam))
+                .filter(|event| event.down)
+                .count()
+        };
+
+        assert_eq!(press_count(&single), 1);
+        assert_eq!(press_count(&double), 2);
+        let second_press = native_mouse_button_event(WM_XBUTTONDBLCLK, wparam, lparam);
+        assert_eq!(second_press.button, NativeVideoMouseButton::Extra1);
+        assert!(second_press.down);
+        assert!(second_press.double_click);
+    }
+
+    #[test]
+    fn native_browser_keydown_is_owned_before_default_appcommand_generation() {
+        for msg in [WM_KEYDOWN, WM_SYSKEYDOWN] {
+            for virtual_key in [0xA6, 0xA7] {
+                assert!(native_browser_keydown_message_handled(msg, virtual_key));
+            }
+        }
+        for virtual_key in [0x20, 0x25, 0x27] {
+            assert!(!native_browser_keydown_message_handled(
+                WM_KEYDOWN,
+                virtual_key
+            ));
+        }
+        assert!(!native_browser_keydown_message_handled(WM_KEYUP, 0xA6));
+        assert!(!native_browser_keydown_message_handled(WM_APPCOMMAND, 0xA6));
     }
 
     fn attach_span_sample_points(fields: &[(&'static str, serde_json::Value)]) -> Vec<String> {

@@ -28,7 +28,33 @@ witnessは`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-feat
 で確認する。これらは通常coreの代わりにはせず、featureなしのcore checkと全体gateを維持する。
 実アプリを使う検証範囲は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) を参照。
 
+### 作業中のPCと通常データを保持する配布ビルド
+
+エージェントによる配布ビルドには `.\scripts\build-dist.ps1 -PreserveRuntime` を使う。
+稼働中のmImageViewerがあれば停止せず失敗し、通常APPDATAのVST3展開キャッシュも削除しない。
+子のrelease/portableビルドへ同じ指定を渡す。引数なしの従来CLI動作は変更しない。
+この指定は必須テストや署名を省略するものではなく、アプリの起動・操作を許可するものでもない。
+
+同経路では `test-full.ps1 -SuppressCrashDialogs` を子プロセス内で適用する。
+Windowsのクラッシュダイアログだけをそのプロセスで抑え、元のerror modeを終了時に復元する。
+テストの非ゼロ終了は失敗のままとし、自動再試行や期待値変更は行わない。
+スクリプトの回帰確認は `scripts/test-release-build-safety.ps1` を参照する。
+
 ## 軽量化している範囲
+
+### ビルドキャッシュの容量管理
+
+リリース成果物と検証記録を確保した区切りで、`target`の容量内訳を確認する。
+容量が大きい場合、同じ出力先を使うCargo/rustcが停止した後に
+`target/debug/incremental`と`target/dev-runtime/incremental`を優先して整理する。
+これらは再生成可能だが、削除後の初回ビルドは遅くなる。通常の開発反復では毎回削除しない。
+
+`target`には配布・確認用exeだけでなく、`v370-work`等の検証記録、使い捨て環境、
+過去の調査用コピーやdata directoryも存在する。`target`全体を無条件に削除したり、
+引数なしの`cargo clean`を定期処理へ組み込んだりしない。`deps`や古いコピーの追加整理は、
+再ビルドの負担と保持対象を確認して別に判断する。
+削除前に絶対パスが当該repositoryの対象profile配下であることとreparse pointを確認し、
+他系統のビルドや証跡・利用者データに触れない。実施前後の容量と削除対象を記録する。
 
 ### テストプロファイル
 
