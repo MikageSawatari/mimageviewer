@@ -1,8 +1,8 @@
 //! フォルダ側サイドカー (`mimageviewer.dat`) の統合テスト。
 //!
 //! 主な検証対象は「フォルダを丸ごと別ドライブへ移動 → 中央 DB は空 → サイドカーからの復元」
-//! というシナリオ。GUI 起動を避けるため、[`mimageviewer::sidecar::import_to_dbs`] を
-//! 直接叩き、中央 DB と同じ `open_at()` で一時ファイルを開く。
+//! というシナリオ。GUI 起動を避けるため、既存 import API と transactional import engine を
+//! 直接呼び、中央 DB と同じ `open_at()` で一時ファイルを開く。
 //!
 //! # テストシナリオ
 //!
@@ -17,16 +17,25 @@
 //! | 7 | SidecarFile flush → load ラウンドトリップ | 値が保存される |
 //! | 8 | 空エントリ → ファイル削除 | flush で .dat が消える |
 //! | 9 | 読み取り専用相当 (存在しないフォルダ) | flush が panic しない |
+//! | 10 | 430 mixed edit fields | 一つの atomic batch で復元される |
+//! | 11 | 不正 mask を含む family | valid row と marker も書かれない |
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
 
 use mimageviewer::adjustment::AdjustParams;
 use mimageviewer::adjustment_db::{AdjustmentDb, normalize_path};
+use mimageviewer::export_crop::{CropAspectMode, CropRect, CropSettings};
 use mimageviewer::mask_db::{MaskDb, compress_mask};
 use mimageviewer::sidecar::{
-    self, SIDECAR_FILENAME, SidecarFile, SidecarMask, reconstruct_image_key,
+    self, SIDECAR_FILENAME, SidecarFile, SidecarImportLoad, SidecarMask, reconstruct_image_key,
     reconstruct_virtual_key,
+};
+use mimageviewer::sidecar_import::{
+    ImportFamilies, ImportFamilyOutcome, SidecarImportCompletion, commit as commit_atomic,
+    prepare as prepare_atomic,
 };
 
 // ── ヘルパー ────────────────────────────────────────────────────────
@@ -487,4 +496,183 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
             .brightness,
         2.71
     );
+}
+
+fn init_atomic_edit_stores(data_dir: &Path) {
+    drop(AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap());
+    drop(MaskDb::open_at(&data_dir.join("mask.db")).unwrap());
+    drop(mimageviewer::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).unwrap());
+    drop(
+        mimageviewer::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
+            .unwrap(),
+    );
+    drop(mimageviewer::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).unwrap());
+    drop(mimageviewer::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap());
+}
+
+// §1.209 の報告 fixture と同じ 430 edit fields:
+// adjust 379 + mask 40 + local 7 + crop 1 + comic 3。
+#[test]
+fn atomic_import_430_mixed_fields_commits_once_and_records_marker() {
+    use comic_core::{AnnotationObject, TextBlock};
+    use local_adjust_core::{LocalAdjustmentLayer, LocalEffect, LocalMask};
+
+    let media = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    init_atomic_edit_stores(data.path());
+
+    let mut sidecar = SidecarFile::new(media.path().to_path_buf());
+    for index in 0..379 {
+        let name = format!("image-{index:03}.jpg");
+        sidecar.set_adjust(&name, sample_params(index as f32 / 10.0));
+        if index < 40 {
+            let raw = compress_mask(&sample_mask_8x8());
+            sidecar.set_mask(&name, SidecarMask::from_raw(&raw, &[], 8, 8));
+        }
+        if index < 7 {
+            sidecar.set_local_adjust_layers(
+                &name,
+                Arc::new(vec![LocalAdjustmentLayer::new(
+                    "fixture",
+                    LocalMask::Full,
+                    LocalEffect::None,
+                )]),
+            );
+        }
+        if index == 0 {
+            sidecar.set_export_crop(
+                &name,
+                CropSettings {
+                    rect: CropRect {
+                        min_x: 1.0,
+                        min_y: 2.0,
+                        max_x: 63.0,
+                        max_y: 62.0,
+                    },
+                    aspect_mode: CropAspectMode::Free,
+                    source_size: Some([64, 64]),
+                },
+            );
+        }
+        if index < 3 {
+            sidecar.set_comic(
+                &name,
+                vec![AnnotationObject::new_text(
+                    1,
+                    (10.0, 20.0),
+                    TextBlock {
+                        text: format!("fixture {index}"),
+                        ..TextBlock::default()
+                    },
+                )],
+            );
+        }
+    }
+    assert!(sidecar.flush_blocking());
+
+    let load_started = std::time::Instant::now();
+    let loaded = match SidecarFile::load_for_import(media.path()) {
+        SidecarImportLoad::Loaded(loaded) => loaded,
+        _ => panic!("fixture sidecar was not loaded from disk"),
+    };
+    let load_elapsed = load_started.elapsed();
+    let cancel = AtomicBool::new(false);
+    let prepared = prepare_atomic(
+        loaded,
+        ImportFamilies {
+            edits: true,
+            tags: false,
+        },
+        &cancel,
+    )
+    .unwrap();
+    let SidecarImportCompletion::Current { result, .. } =
+        commit_atomic(data.path(), prepared, &cancel)
+    else {
+        panic!("unchanged fixture must complete with a current source");
+    };
+    let ImportFamilyOutcome::Applied(report) = result.edits else {
+        panic!("mixed fixture edit import did not apply");
+    };
+
+    assert_eq!(report.stats.imported_adjust, 379);
+    assert_eq!(report.stats.imported_mask, 40);
+    assert_eq!(report.stats.imported_local_adjust, 7);
+    assert_eq!(report.stats.imported_export_crop, 1);
+    assert_eq!(report.stats.imported_comic, 3);
+    assert!(report.transaction_committed);
+    assert!(report.sync_marker_recorded);
+    assert!(matches!(result.tags, ImportFamilyOutcome::NotRequested));
+    eprintln!(
+        "sidecar-430 load_ms={:.3} prepare_ms={:.3} transaction_ms={:.3} commit_ms={:.3} \
+         engine_ms={:.3} end_to_end_ms={:.3}",
+        load_elapsed.as_secs_f64() * 1000.0,
+        result.prepare_elapsed.as_secs_f64() * 1000.0,
+        report.transaction_elapsed.as_secs_f64() * 1000.0,
+        result.commit_elapsed.as_secs_f64() * 1000.0,
+        (result.prepare_elapsed + result.commit_elapsed).as_secs_f64() * 1000.0,
+        (load_elapsed + result.prepare_elapsed + result.commit_elapsed).as_secs_f64() * 1000.0,
+    );
+
+    let first_key = reconstruct_image_key(media.path(), "image-000.jpg");
+    assert_eq!(
+        AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+            .unwrap()
+            .get_page_params(&first_key)
+            .unwrap()
+            .brightness,
+        0.0
+    );
+    assert_eq!(
+        MaskDb::open_at(&data.path().join("mask.db"))
+            .unwrap()
+            .get(&first_key, 8, 8)
+            .unwrap(),
+        sample_mask_8x8()
+    );
+    assert!(
+        AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+            .unwrap()
+            .sidecar_sync_get(&normalize_path(media.path()))
+            .is_some()
+    );
+}
+
+#[test]
+fn invalid_mask_fails_prepare_without_writing_rows_or_marker() {
+    let media = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    init_atomic_edit_stores(data.path());
+    let mut sidecar = SidecarFile::new(media.path().to_path_buf());
+    sidecar.set_adjust("broken.jpg", sample_params(8.0));
+    sidecar.set_mask(
+        "broken.jpg",
+        SidecarMask::from_raw(b"not-deflate", &[], 8, 8),
+    );
+    assert!(sidecar.flush_blocking());
+    let loaded = match SidecarFile::load_for_import(media.path()) {
+        SidecarImportLoad::Loaded(loaded) => loaded,
+        _ => panic!("invalid-mask fixture did not load"),
+    };
+    let cancel = AtomicBool::new(false);
+    let prepared = prepare_atomic(
+        loaded,
+        ImportFamilies {
+            edits: true,
+            tags: false,
+        },
+        &cancel,
+    )
+    .unwrap();
+    let SidecarImportCompletion::Current { result, .. } =
+        commit_atomic(data.path(), prepared, &cancel)
+    else {
+        panic!("unchanged invalid-field fixture must retain a current source");
+    };
+    assert!(matches!(result.edits, ImportFamilyOutcome::Failed(_)));
+
+    let key = reconstruct_image_key(media.path(), "broken.jpg");
+    let db = AdjustmentDb::open_at(&data.path().join("adjustment.db")).unwrap();
+    assert!(db.get_page_params(&key).is_none());
+    assert_eq!(db.sidecar_sync_get(&normalize_path(media.path())), None);
 }
