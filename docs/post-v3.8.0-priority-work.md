@@ -85,3 +85,79 @@ Windows確認buildは省略し、続くP1製品修正の確認buildへまとめ�
 メニューmodal loopのrelease取落しは未測定の仮説、levelから新しい押下を作る経路は
 コード上の事実として区別する。新規pressなしの再武装を止め、短押し・長押し・ring/gesture・
 edit modeと動画経路の正しい入力処理は維持する。
+
+## 利用者の追加指定・実機枠
+
+利用者は§1.209・§1.208・§1.210を次版で修正することを再指定し、離席中の
+実機テストを明示許可した（「このあと、あす9時くらいまでは離席」）。
+親は安全側に9/11 09:00 JSTを締切として伝え、3件を中心に合計60〜90分程度、
+使い捨てportable/合成fixtureのみ、前面ウィンドウ・mouse/keyを使う検証へ限定した。
+アプリの通常APPDATAや既存データは操作せず、検証窓外は非対話作業だけを続ける。
+許可は実施結果ではない。修正・非対話gate・portable準備後に各scenarioを記録して実行する。
+
+他セッションのバックログ追加§1.211〜§1.214は利用者のコミット依頼に従い
+`6440856fe`で文書1ファイルだけ記録済み。§1.212の見送り、§1.211の再現待ちを維持し、
+今回の3件の修正を差し置いて未確認の仕様変更を実装しない。
+
+## 9/11 未明の実装区切り
+
+§1.208は音声viewportへの入力所有権移行をtyped stateへまとめ、既存の一度限りの
+Visible/Focus要求に対する `Some(true)` の確認後にpresenterを隠す変更を検証中。
+LiveMediaのparkでcontext IDが変わる箇所、snapshotのindex再対応、取消・動画復帰も
+同じ所有権へ追従させる。独立検収・実機確認はまだ完了していない。
+
+§1.209はUI未配線のbatch import engineを先行実装した。合成430 fieldの初回計測は
+約21 msだが、これは製品のUI停止解消を示す結果ではない。Appへの非同期配線には、
+既存の編集・タグ・copy/move・rename workerとのDB書込競合を解消し、利用者の編集意図を
+失わない調整が必要と判明した。UIのbusy timeout延長や、補正前画像を先に表示する変更は
+採らない。Stage 1を限定検収し、Stage 2の影響範囲を設計書に整理してから組み込む。
+§1.210は§1.208と同じファイルを使うため、その検証区切り後に実装する。
+
+Stage 1は独立検収とlib 17件・integration 14件を通過し、`5db8df1ee`でmasterへ記録した。
+最終430 field fixtureはloadを含め36.617 ms、edit family 1 transaction/1 commit。
+製品への配線はなく、§1.209のUI停止修正完了とは扱わない。Stage 2は最低22 source file、
+20〜35時間と見積もり、利用者へ範囲拡大の確認を提示中。返答前に配線を進めない。
+外部sidecarを長期間write/delete禁止にする案は撤回し、commit直前再検証を復旧snapshotの
+線形化点とする。既存中央DBを優先する仕様を維持し、内部編集の競合対策へ範囲を絞る。
+
+dupe側Phase 1は独立branchの`98dc41f4b`で保存済みと引き渡された。
+similar_index moduleは67成功/5 ignored、core check・glyph・fmt・diff成功、独立r3承認。
+masterへのmerge・機能再有効化はしていない。Phase 2の照合高速化、性能A/B、全体gate、
+最終snapshot・確認buildは未完了であり、この狭域成功だけで再有効化を判断しない。
+
+§1.208・§1.210は最終コード/設計の独立検収を通過。§1.210の入力stateは
+ViewerContextBundleが所有し、通常の描画mount/depositでは保持、別context・fork・close・
+index-space変更では契約に従い退役する。焦点テストはreducer 6件、bundle 2件、snapshot 1件成功。
+統合checkpointは `target/next-version-work/fullscreen-input-lifecycle-20260911/checkpoint-manifest.json`。
+全体gate、確認build、実機結果は後続記録を参照し、checkpoint作成だけでは成功扱いにしない。
+
+## 9/11 早朝の検証結果と引継ぎ
+
+normal core check、fmt、UI glyph、viewer_context_audit、`test-full.ps1 -SuppressCrashDialogs`は成功。
+本体libは8123成功/43 ignoredで、§1.208の最終pointer分類と§1.210の回帰を含む。
+UI snapshot 48件、sidecar integration 14件、vendor egui/egui-wgpu/eframeも成功した。
+normal `build-dev.ps1` と `prepare-portable-smoke.ps1 -TestScript`も成功。
+
+- 統合記録: `target/next-version-work/fullscreen-input-lifecycle-20260911/integrated-verification-manifest.json`
+  (SHA256 `E5EC9403D1700C8E3793B941EFED69A5F8B0A8A5B49909359FE6352E259897C6`)
+- normal core: `target/dev-runtime/mimageviewer-core.exe`
+  (SHA256 `CD0C1B058D0B106BD1F8F9FCBFBCA85AB81D194B2F1A5633323AE4CA2C5EC522`)
+- portable core: `target/portable-smoke/mimageviewer.exe`
+  (SHA256 `EA3CCF0FC0AE0EA44C7D1840C1499BDBABF2B059378A510C13EA80487C79E9FE`)
+
+実機は環境不成立として閉じた。初回はnative動画にegui側の入力待機条件を要求したharnessが
+操作前にtimeoutし、Skyの状態取得も応答しなかった。条件修正後の2回目も、返却Windowへの
+screenshot-only取得が`timeout_ms=60000`指定でも約389秒応答せず、親が停止した。
+両試行の外部click/keyは0件。§1.208は実機未検証、§1.210は未実行、VSTありも未検証であり、
+製品PASS/FAILはいずれも判定しない。アプリは終了し、通常APPDATAを使用していない。
+記録は `target/next-version-work/live-evidence/live-verification-summary.md`
+(SHA256 `186D42BB21CA9FEA3DF8C4AB4595D91BBDAC8BCD225CF7A4E10125BAEE181FA9`)。
+
+実機後にbacklogと本台帳だけを更新した。統合manifestに記録された製品source 7件は
+再照合して差異0であり、成功済みgate/buildは再利用する。Windows native変更の製品commitは
+AGENTS.mdの実機確認条件に従い利用者の確認待ち。対象差分とbuildを保持し、再開時に
+♪/Zの再生継続、右クリックメニューを閉じた後の再出現、長押し/F12を確認する。
+
+類似検索側は小DB11件の同値・取消等の回帰も成功し、大規模合成DBのA/B測定へ進む。
+実DB・通常APPDATA・アプリは使わず、9/11 09:00 JSTまでに大規模実行を終了する枠を引き渡した。
+masterへのmerge・再有効化は依然未実施。

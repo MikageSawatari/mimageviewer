@@ -212,6 +212,23 @@ secondary_released / context_menu` が出るので、**press に対応する rel
   [:14111](../src/app/native_video.rs:14111)) に影響しない
 - 編集モード中 (`RightDragContext::EditMode`) の早期 return が生きている
 
+#### 実装 (2026-09-11、自動検証済み・実機未検証)
+
+旧 `fs_secondary_press_start` を、押下 edge だけで武装する typed
+`FullscreenSecondaryPress` に置き換えた。owner は `ViewerContextId`、items generation、対象
+index、`RightDragContext` を一体で保持し、同じ index を表示する別 window が状態を消費できない。
+`secondary_down` は武装後の生存判定にだけ使い、release が欠けた `down=false`、移動、modal、
+Edit、mode / owner 変更を terminal とする。短押し / 長押しの既存 action と閾値は維持する。
+
+状態は `ViewerContextBundle` が所有する。通常の detached mount → deposit → remount は同じ
+owner の押下を保つ一方、LiveMedia fork、別 index の open、close、snapshot index-space 置換では
+退役させる。これにより F12 window の複数 frame にまたがる短押し / 長押しを維持しながら、
+sibling context への誤帰属を防ぐ。pure reducer、ordinary detached roundtrip、sibling 分離、fork /
+snapshot terminal の回帰を追加した。焦点9件・全体gate・独立レビュー・確認用buildは成功。
+portable実機確認は§1.208の操作ツール画像取得が応答しないため中止し、本件の実入力は未実施。
+修正済みとして出荷判断する前に、短右クリック→外側左クリックでメニューが再出現しないことと、
+長押し・F12別窓の操作を実機で確認する。
+
 - 規模 / 優先度: Small / **P1**。
 
 ### 1.209 サイドカーの取り込みが UI スレッドを数十秒止める (2026-09-11)
@@ -233,6 +250,13 @@ poll/keep/pre_grid/grid がすべて 0 で、`load_folder` 自体が時間を使
 対応方針は [UI 応答性](ui-responsiveness.md) §2 の worker 化テンプレに従う。キャンセル、
 結果適用時の世代整合、1 フレーム予算、perf 計装を揃える。証跡は v3.8.0 公開時の
 ポータブル smoke ログ (`D:\mImageViewer_portable_v3.8.0\data\logs\`)。
+
+**進捗 (2026-09-11): Stage 1のみ完了、UI停止は未修正。** `5db8df1ee`でUI未配線の
+transactional import engineを記録。lib 17件・integration 14件・独立検収を通過し、
+合成430 fieldは読み込み込み36.617 ms、edit familyは1 transaction/1 commitだった。
+Appへの非同期配線は、同時編集を失わない書込調整とviewer continuationが必要で最低22 source
+file・20〜35時間の見込み。範囲拡大を利用者へ確認中で、返答までは組み込まない。
+詳細は [非同期化設計](sidecar-import-async-plan.md)。
 
 ### 1.208 動画フルスクリーンで音声モードへ切り替えると再生が終了する (2026-09-11)
 
@@ -268,6 +292,14 @@ VST3 を同梱しないポータブル版で必ず再現した。`vst3_enabled` 
 列挙してから修正する。VST の有無で分岐している現状は、同じ「presenter は隠れているが
 セッションは生きている」状態を 2 通りに扱っているので、状態の表し方から見直す。
 回帰は presentation ごとに音声モードの enter / exit と再生継続を検証する。
+
+**進捗 (2026-09-11): 実装・自動検証済み、実機未検証。** 上記は調査時の経路。
+修正ではtyped runtimeが音声viewportへの入力所有権移行を持ち、既存の一度限りの
+Visible/Focus要求に対する `Some(true)` を確認してからpresenterを隠す。窓のpark移送、
+取消、VST切替、動画復帰も同じownerへ対応させ、独立検収と全体gateを通過した。
+確認用normal/portable buildも成功。実機初回は操作前のharness条件不成立で終了し、
+操作ツールの画像取得も応答しなかった。♪・Zの実入力は0件であり、再生継続の実機合格とはしない。
+VSTありの実機経路も未検証。証跡の所在は [優先作業台帳](post-v3.8.0-priority-work.md) を参照。
 
 ### 1.207 フォルダバーをツールバーの並べ替え対象へ統合する — 外部SNS要望 (2026-09-10)
 
