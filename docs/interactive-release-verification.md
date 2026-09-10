@@ -50,3 +50,21 @@ click、wheel、key、panは送らない。この具体scenarioの実行了承�
 
 リリース記録には、了承した検証範囲・実行日時・成果物とscenarioの証跡・各結果・
 未実施理由を残す。既存の必須テスト、実機確認、通常データ保護の条件は維持する。
+
+## Windowsの入力デスクトップを開始前に確認する
+
+同じWindows sessionでも、テストプロセスのdesktopと実入力desktopが異なる場合がある。
+2026-09-10のCodex実行では、通常のsandbox経路で起動したrunnerが
+`CodexSandboxDesktop-...`、実入力先が`Default`だった。ウィンドウ描画は進むが
+foregroundを得られず、複数窓の操作待ちやnative入力の環境失敗になった。
+これは製品機能の不合格とは分けて記録する。
+
+実機suiteの開始前に、読み取り専用でsession、thread desktop、input desktop、
+foregroundの取得を確認する。不一致ならアプリを起動して再試行を重ねず、
+正規の承認付き実行経路が利用可能かを確認する。同日の`exec_command`では
+`require_escalated`の承認付き読み取りが`Default`上で実行されることを確認した。
+この確認は個別実行の環境証拠であり、将来の実行先を無条件に保証しない。
+
+sandbox内からdesktopを切り替えたり、入力先の検証を外したりして成立させない。
+通常デスクトップで実行できる場合も、具体suiteの利用者了承、隔離データ、exact PID/HWND、
+再試行上限はそのまま適用する。環境不成立だったrunの証拠と回数も残す。
