@@ -8884,7 +8884,7 @@ impl FsNavigationDisplayDemand {
         {
             return None;
         }
-        let navigation_pages = presentation_pages
+        let mut navigation_pages = presentation_pages
             .iter()
             .filter_map(|page| {
                 (page.role == crate::ui_fullscreen::SpreadPageRole::Navigation).then_some(page.idx)
@@ -8896,6 +8896,9 @@ impl FsNavigationDisplayDemand {
         {
             return None;
         }
+        // Navigation identity has always been direction-independent. Keep that canonical
+        // projection sorted while presentation retains its exact screen order and roles.
+        navigation_pages.sort_unstable();
         Some(Self {
             navigation_pages,
             presentation_pages,
@@ -26781,6 +26784,10 @@ impl App {
         if self.items_generation != items_generation {
             // Exact seek indices belong to the items identity, not the current page.
             self.clear_still_seek_thumbnail_requests();
+            // The page layout describes the last frame painted from this exact items identity.
+            // Reused numeric indices in the next generation must not capture its pairing or
+            // occurrence roles as a navigation holdover.
+            self.fullscreen_page_layout.clear();
             // A Display target names pages in the old items identity and cannot be remapped
             // after this owner changes generation. FolderItems is different: it deliberately
             // spans the folder install and binds to the new generation after the items arrive.
@@ -55243,6 +55250,9 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        // A true viewer close ends ownership of the last painted page layout. Temporary context
+        // parking does not enter this teardown and therefore keeps its context-local layout.
+        self.fullscreen_page_layout.clear();
         self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
         self.fs_pdf_display_target = None;
         // `close_fullscreen` is also used as a generic teardown from

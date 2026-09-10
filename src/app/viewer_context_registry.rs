@@ -1322,6 +1322,9 @@ impl ViewerContextBundle {
             if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
                 shared.clear();
             }
+            // This bundle can be rebuilt for another physical source without first becoming the
+            // mounted App. Its last painted layout belongs to the old items identity.
+            self.fullscreen_page_layout.clear();
         }
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
@@ -3767,6 +3770,66 @@ mod tests {
             explicit.fullscreen_page_layout.kind(),
             crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_cover_painted_layout_identity_is_retired_only_for_the_context_that_changes_or_closes()
+    {
+        use crate::displayed_image_transform::FullscreenPageLayoutKind;
+
+        let mut app = crate::app::setup_app_for_test();
+        let first = app.build_window_context_for_test(719, |app| {
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Spread);
+        });
+        let second = app.build_window_context_for_test(720, |app| {
+            app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+                "c:/second/0.png",
+            ))];
+            app.thumbnails = vec![crate::app::ThumbnailState::Pending];
+            app.fullscreen_idx = Some(0);
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Continuous);
+        });
+
+        let first_bundle = app.viewer_contexts.table.at_rest_mut(first).unwrap();
+        first_bundle.set_items_generation(first_bundle.items_generation.wrapping_add(1));
+        assert_eq!(
+            first_bundle.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Empty
+        );
+        assert_eq!(
+            app.viewer_contexts
+                .table
+                .at_rest(second)
+                .unwrap()
+                .fullscreen_page_layout
+                .kind(),
+            FullscreenPageLayoutKind::Continuous
+        );
+
+        app.with_viewer_context(first, |app| {
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Single);
+        })
+        .unwrap();
+        app.with_viewer_context(second, |app| {
+            app.close_fullscreen();
+            assert_eq!(
+                app.fullscreen_page_layout.kind(),
+                FullscreenPageLayoutKind::Empty
+            );
+        })
+        .unwrap();
+        app.with_viewer_context(first, |app| {
+            assert_eq!(
+                app.fullscreen_page_layout.kind(),
+                FullscreenPageLayoutKind::Single,
+                "closing the second viewer must not retire the first viewer's painted layout"
+            );
+        })
+        .unwrap();
     }
 
     #[cfg(windows)]

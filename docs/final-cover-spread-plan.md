@@ -10,10 +10,10 @@
 
 | 段階 | 成果物 | 現在の状態 |
 | --- | --- | --- |
-| A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 実装・狭域テスト13件・fmt・独立レビュー完了 |
-| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r3 source凍結、独立レビューP1/P2解消、修正後狭域35件・core check・fmt/glyph完了 |
+| A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 全gate指摘のcanonical navigation投影・旧schema互換を修正、focusedと独立delta検収完了 |
+| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r6でprevious capture・layout寿命・target identity修正、focusedと独立delta検収完了 |
 | C Remote | sparse presentation wire、live設定snapshot、typed設定書込、Webのnavと描画分離、protocol互換 | source凍結・独立レビュー・Node388件・IPC55件・Rust狭域とRemote check完了 |
-| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 追加snapshot3枚の生成・PNG視認・通常比較完了。shared fullgate・build・実機は未実施 |
+| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 追加snapshot3枚完了。初回fullgateは本体8061成功/7失敗/43除外、原因確認中。vendor・build・実機は未完了 |
 
 Aの成功だけでは機能完成・利用者検証可能とは扱わない。各段階のsource変更は実装担当、凍結差分レビューは別担当とし、既存検証を重複実行しない。Cargo枠はAのcheckと狭い回帰に限定して借用し、結果とログを共有して返却する。次段階の重い検証はあらためて所有調整する。
 
@@ -158,6 +158,34 @@ B2r3は上記2修正・回帰と3snapshot fixtureを追加して凍結。target/
 B2r3狭域検証完了。`final_cover`27件（P1の通常Double第2ページ回帰を含む）とfilter外8コマンド各1件がPASS、計35件。追加8件はexternal policy・display occurrence・continuous mixed owner・source keep・通常spread同値・Remote live settings・container上限2件。core binとmimageviewer-remoteのcargo check、cargo fmt --all -- --check、check_ui_glyphs.pyもexit0（危険文字0）。同freezeのMANIFEST.txt SHA256 372b341d4132ffc1ee3fd8e2b1a1a3aafe3a57fa6495fc0df40fb71cfa569f62に実行記録を保存。24 source hashは不変、Remote11fileも既承認hash一致。cargo/rustc停止確認後に親へ枠を返却した。独立レビューはsnapshot fixture/helper・4文書も含めP1/P2なしで静的承認。snapshot生成・PNG視認、shared fullgate、利用者build、実機は引き続き未実施。
 
 追加snapshot3枚の生成とPNG視認を完了。実装担当と親がLTR/RTLの左右配置、両方4/4のページ番号、設定の文字・配置を確認した。UPDATE_SNAPSHOTS解除後の通常比較も2exact各1件PASS。sourceはB2r3から不変、新規PNGはtests/snapshots/final_cover_spread_ltr_last_page.png、final_cover_spread_rtl_last_page.png、preferences_final_cover_spread_setting.pngのみ。MANIFEST.txt最終SHA256 8ac25dd1a023da0cd9f187142e515d211dddf32d5c6c5d50f217cceb36a762e4b。cargo/rustc停止確認後にGPU/Cargo枠を返却した。この段階を機能branchの限定commitとして保存し、masterへの統合は行わない。shared fullgate・利用者build・実機は別段階で残す。
+
+機能branchの限定commitはd70692837e0686d780e6a7f89c3bcf2b7b957372。直後の独立PNG確認でRTLのページ番号欠落が疑われたためfullgate開始前に一時停止したが、保存済み原本の同座標crop `(660,376)-(710,410)` はLTR/RTLともRGBA SHA256 a64cb827041fff379e313ab759206910f4f464a81c2f24bd15694a389a0d9d2e、白文字31px・bbox `(673,385)-(698,393)` で完全一致した。親の原寸再表示と独立reviewerのread-only画素照合でも両方4/4を確認し、指摘を撤回した。inline画像の目視判定による誤報であり、製品・fixture・PNGには変更を加えない。3snapshot承認と通常比較PASSは有効。訂正後、親から貸与された枠でshared fullgateへ進む。
+
+fullgateは`test-full.ps1 -SuppressCrashDialogs`、CARGO_BUILD_JOBS=1、既存targetで実行する。初回launcherがPowerShell7のPSHOME下にpowershell.exeを探して起動前に失敗したため、WindowsPowerShellの既知絶対pathへ修正した。初回は製品テスト未実行としてtarget/final-cover-spread-full-gate-20260910/launcher-attempt1.txtに分離し、正常起動後はlogs/test-full.stdout.log・test-full.stderr.logへ保存する。crash suppression active・workspace cargo test開始・dupeのcargo/rustc実processを担当が確認してから開始済みとした。通常APPDATA索引processを停止しない。
+
+fullgate成功後は親の条件付き承認により`build-dev.ps1`を使う。停止対象のdupe固有target/dev-runtime/core・remoteにresidentがないことをpreflightで確認し、存在する場合は停止せず報告する。master/通常APPDATAのprocessには触れない。新たなportableは作らず、通常featureのcore+Remote成果物を渡す。buildとagentによる起動は別であり、成果物は起動しない。利用者が起動するときは通常APPDATAprofileを使うことと、既存mIV終了が必要なことを明記する。
+
+初回fullgateはexit101。本体は8061 passed / 7 failed / 43 ignored、実行324秒。後続workspace target/doctestは継続したがvendor3crateは本体失敗により未開始。cargo/rustc停止確認後に枠を返却し、buildは保留した。失敗は次の7件で、まだ一律にfixture追随と判断しない。
+
+| 失敗test | 観測 | 原因確認の担当 |
+| --- | --- | --- |
+| batch_restore_database_opens_are_constant_for_one_and_hundred_candidates | inventory期待値追随。新storeでDB open count 29→30、候補数に依存しない契約は維持 | 実装担当 |
+| migrates_folder_prefix_keys | 製品の旧schema互換漏れ。新tableなしでrename/copy/probeがerror | 新descriptorだけtyped optional-table契約。共通store境界の他descriptor/実在tableのSQL・破損・権限errorは従来どおり。旧/新tableを実経路で回帰 |
+| copy_path_covers_all_unique_stores_for_image_zip_and_pdf_faces | inventory期待値追随。descriptor22→23、unique21→22 | 実装担当 |
+| every_page_anchor_is_indexed_and_every_page_has_an_entry | 新設定の検索索引への実装漏れ | spread/final-cover anchorを既存検索indexへ追加 |
+| preferences_viewer_notice_visibility_snapshot | 新設定増加でscrollbarの長さが10px変化、可視本文は同じ | 差の証拠を保持して既存golden1枚だけ更新 |
+| navigation_topology_post_poll_rebind_replaces_same_frame_page_turn_decision_cache | fixture/API追随漏れ。test-only旧pair helperが本番の同frame decision cache更新を迂回 | 独立確認済み。本番composition helperをテストで通し、PassThrough/Deferred/true期待は保持 |
+| spread_shift_capture_keeps_previous_pairing_for_both_directions_and_repeat | 製品P1。shift変更後のcanonical再計算が直前paintのpairをprevious captureへ保存しない | 独立確認済み。有効な描画済みlayoutのscreen-order role occurrenceを正本にし、layoutなし時のみcanonical。LTR/RTL・初回/反復の既存期待と補助captureを保持 |
+
+製品不具合・fixture期待値・環境のどれかを根拠とともに分類し、focused回帰と独立delta確認後、未実施vendorも含む全gateを再実行する。既存のreadiness・旧schema互換・navigation identity・shift時の実表示保存を弱めて成功させない。
+
+B2r4の4source修正を凍結してfocused開始。初回は追加test fixtureのE0502で実行前に停止し、screen_pagesを呼出し前に取得するtest-only修正後のpatch SHA256は28aa19b05aa3d5a8ff12b27e74bdcdff5e61eb9c16e8bdb1eecc962e2a4b41ee。validation-r1へ分けて再開した。独立reviewはoptional-table・inventory・検索index・post-poll修正を確認したが、painted layoutの寿命に追加P2を検出。layoutにはitems_generationがなく、同idxでのitems交換やclose→reopen後に古いrole/pairを再利用できる。新しい並列generation fieldを足さず、既存items世代変更と真のsession closeでlayoutを自context内で退役させる。同世代shift・park/一時非activeは保持し、世代交換/reopenでcanonicalへ戻る回帰と兄弟context保持を追加して再検収する。
+
+B2r4-r1のfocusedはrestore件数・rename suite・設定検索suite・post-poll exactがPASS。spread-shiftはprevious pairが直った後、target actual `[2,1]` / expected `[1,2]` で失敗した。独立調査でPhase A以前はbegin/bind/rebindがsortしたcanonical navigation集合をidentityに使っていたと確認し、fixture追随ではなくPhase Aの製品P2と分類。typed demand constructorでNavigation投影だけcanonical sortし、presentationはscreen exactのまま保持する。observerもNavigation投影の照合だけcanonical化し、全presentationのrole/順序照合は弱めない。shift traceはtargetのpresentation順から作り、canonical navigation順を流用しない。外部BothPagesの読書順とこの内部identityのsortは別契約である。
+
+B2r5は中央lifecycleのlayout退役とcanonical Navigation投影を加えて6sourceを凍結し、7exactすべて1/1 PASS（shift、補助painted capture、RTL navigation/presentation、generation、true close、context隔離、post-poll）。既存preferences snapshotも完全修飾exactで更新・通常比較ともrunning1 / PASS、fmt全体check exit0。golden差はscrollbar内22px、bbox `(544,76)-(551,79)` のみで本文pixel不変。親も新PNGを確認した。source/goldenを保存した最終freezeはtarget/final-cover-spread-phase-b2r6-20260910、MANIFEST SHA256 8acb48578b3a3596d586c9b18d5d2e6ff2716eb4ceaf601ce69b3499fd07f6b2、patch SHA256 30e6a3ec3750377d8177f629196360b7f908828975fb66b2f91cd4cf0c61286d。cargo/rustc停止確認後に枠返却、独立delta検収待ち。初回B2r4-r0のartifactはin-place更新され原本を保存できていなかったため、HISTORYにその制約・当時patch SHA・残存compile-red logを明記し、後から保存済みと扱わない。
+
+B2r6の最終独立reviewはP1/P2なしで承認。中央setterはitems世代が変わる場合だけ自owner layoutを退役し、registry swapでcontext ownershipを保持する。真closeはmounted ownerだけ、park/mountやsource不変のcancel/errorへclearを追加しないことを確認した。Navigationのcanonical sortと全presentationのscreen exact照合、7exact・snapshot・fmt・6source/golden hashの一致も独立照合済み。限定commit後に未実施vendorを含む全gateを再実行する。
 
 ## 後続の受入確認
 

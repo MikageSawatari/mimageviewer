@@ -9339,6 +9339,25 @@ impl App {
         self.capture_fs_display_unit_with_rendition(None, idx)
     }
 
+    /// Resolve the last unit painted by this mounted viewer context. Paged rendering clears and
+    /// rebuilds `fullscreen_page_layout` before input arbitration, and the registry swaps that
+    /// owner with its context, so an occurrence bound to the current navigation anchor is the
+    /// exact source presentation for a navigation holdover. A missing or unrelated layout falls
+    /// back to the canonical composition below.
+    fn painted_spread_display_composition(
+        &self,
+        navigation_anchor_idx: usize,
+    ) -> Option<SpreadDisplayComposition> {
+        if !self.spread_mode.is_spread() || self.fullscreen_idx != Some(navigation_anchor_idx) {
+            return None;
+        }
+        let mut pages = self.fullscreen_page_layout.spread_occurrences()?.to_vec();
+        if self.spread_mode.is_rtl() {
+            pages.reverse();
+        }
+        SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
+    }
+
     fn capture_fs_navigation_display_unit(
         &mut self,
         ctx: &egui::Context,
@@ -9352,7 +9371,9 @@ impl App {
         rendition_ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<FsDisplayUnitHoldover> {
-        let composition = self.spread_display_composition_for_anchor(idx);
+        let composition = self
+            .painted_spread_display_composition(idx)
+            .unwrap_or_else(|| self.spread_display_composition_for_anchor(idx));
         let pair = composition.spread_pair(self.spread_mode);
         let mut unit =
             self.capture_fs_display_unit_with_rendition_for_pair(rendition_ctx, idx, pair)?;
@@ -12887,17 +12908,37 @@ impl SpreadDisplayComposition {
         if pages.is_empty() || !pages.contains(&navigation_anchor_idx) {
             return None;
         }
-        Some(Self {
+        Self::from_presentation_pages(
             navigation_anchor_idx,
-            pages: pages
+            pages
                 .iter()
                 .copied()
-                .map(|idx| SpreadPageOccurrence {
-                    idx,
-                    role: SpreadPageRole::Navigation,
-                    navigation_anchor_idx,
-                })
+                .map(|idx| SpreadPageOccurrence::navigation(idx, navigation_anchor_idx))
                 .collect(),
+        )
+    }
+
+    fn from_presentation_pages(
+        navigation_anchor_idx: usize,
+        pages: Vec<SpreadPageOccurrence>,
+    ) -> Option<Self> {
+        if !(1..=2).contains(&pages.len())
+            || pages
+                .iter()
+                .any(|page| page.navigation_anchor_idx != navigation_anchor_idx)
+            || !pages.iter().any(|page| {
+                page.role == SpreadPageRole::Navigation && page.idx == navigation_anchor_idx
+            })
+        {
+            return None;
+        }
+        let mut distinct = std::collections::HashSet::with_capacity(pages.len());
+        if !pages.iter().all(|page| distinct.insert(page.idx)) {
+            return None;
+        }
+        Some(Self {
+            navigation_anchor_idx,
+            pages,
         })
     }
 
@@ -23721,32 +23762,6 @@ impl App {
         Some(decision)
     }
 
-    #[cfg(test)]
-    fn revalidate_fs_page_turn_decision_for_spread_pair(
-        &mut self,
-        ctx: &egui::Context,
-        fs_idx: usize,
-        spread_pair: SpreadPair,
-    ) -> Option<FsPageTurnDecision> {
-        if !self.reconcile_fs_navigation_sequence_to_spread_pair(fs_idx, spread_pair) {
-            return None;
-        }
-        let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
-        let mut perf = None;
-        self.resolve_bound_fs_navigation_sequence_target_with_perf(
-            ctx,
-            fs_idx,
-            original_preview_active,
-            &mut perf,
-        );
-        let (rendition_sequence_active, passthrough_rendition_ready) =
-            self.fs_navigation_sequence_rendition_state(fs_idx);
-        Some(page_turn_decision_for_inputs(
-            rendition_sequence_active,
-            passthrough_rendition_ready,
-        ))
-    }
-
     pub(crate) fn fs_page_turn_decision_for_frame(
         &mut self,
         ctx: &egui::Context,
@@ -24224,10 +24239,13 @@ impl App {
             .iter()
             .map(|page| page.occurrence)
             .collect::<Vec<_>>();
-        let presented_navigation_pages = presented_occurrences
+        let mut presented_navigation_pages = presented_occurrences
             .iter()
             .filter_map(|page| (page.role == SpreadPageRole::Navigation).then_some(page.idx))
             .collect::<Vec<_>>();
+        // Target navigation identity is canonical and direction-independent; presentation
+        // occurrence order remains the exact screen order checked above.
+        presented_navigation_pages.sort_unstable();
         if !fully_live
             || presented_occurrences != target.presentation_pages()
             || presented_navigation_pages != target.pages()
@@ -49991,6 +50009,17 @@ mod tests {
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
             ));
         }
+        let navigation_anchor_idx = app.fullscreen_idx.expect("test fullscreen anchor");
+        let reading_pages = if app.spread_mode.is_rtl() {
+            vec![right, left]
+        } else {
+            vec![left, right]
+        };
+        let composition =
+            SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, &reading_pages)
+                .expect("test pair contains its navigation anchor");
+        let screen_pages = composition.pages_in_screen_order(app.spread_mode);
+        assert!(app.fullscreen_page_layout.rebind_occurrences(&screen_pages));
     }
 
     fn sorted_pair_pages(pair: SpreadPair) -> Vec<usize> {
@@ -50083,26 +50112,35 @@ mod tests {
                     (first_previous_pages, first_target_pages.clone())
                 );
 
-                if let Some(sequence) = app
+                let first_presentation_pages = app
                     .fs_holdover_tex
                     .as_mut()
                     .and_then(FsHoldover::navigation_sequence_mut)
-                    && let FsNavigationSequenceTarget::Display(target) = &mut sequence.target
-                {
-                    target.phase = navigation_presenting(
-                        target.pages().to_vec(),
-                        FsNavigationPresentation::Rendition,
-                    );
-                }
-                let first_trace = first_target_pages
+                    .and_then(|sequence| match &mut sequence.target {
+                        FsNavigationSequenceTarget::Display(target) => {
+                            let demand = target.phase.demand().clone();
+                            let presentation_pages = demand.presentation_pages().to_vec();
+                            target.phase = FsNavigationTargetPhase::Presenting {
+                                demand,
+                                presentation: FsNavigationPresentation::Rendition,
+                            };
+                            Some(presentation_pages)
+                        }
+                        FsNavigationSequenceTarget::FolderItems { .. }
+                        | FsNavigationSequenceTarget::AwaitingPassword { .. } => None,
+                    })
+                    .unwrap();
+                let first_trace = first_presentation_pages
                     .iter()
-                    .map(|idx| {
-                        navigation_trace_page(
-                            *idx,
+                    .map(|occurrence| {
+                        let mut page = navigation_trace_page(
+                            occurrence.idx,
                             first_target_idx,
-                            egui::TextureId::Managed(100 + *idx as u64),
+                            egui::TextureId::Managed(100 + occurrence.idx as u64),
                             FsDisplayUnitPageProvenance::Live,
-                        )
+                        );
+                        page.occurrence = *occurrence;
+                        page
                     })
                     .collect::<Vec<_>>();
                 app.observe_fs_navigation_sequence_presented(&first_trace);
@@ -50133,6 +50171,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn navigation_capture_keeps_the_painted_final_cover_occurrences_after_pairing_changes() {
+        let ctx = egui::Context::default();
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = final_cover_local_test_app(4);
+            app.spread_mode = mode;
+            app.fullscreen_idx = Some(3);
+            for idx in [0usize, 3] {
+                let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                    [2, 3],
+                    egui::Color32::from_gray(40 + idx as u8),
+                ));
+                let texture = ctx.load_texture(
+                    format!("painted-final-cover-{mode:?}-{idx}"),
+                    pixels.as_ref().clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Static {
+                        tex: texture,
+                        pixels,
+                        source_dims: Some([2, 3]),
+                        load_seq: idx as u64,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+            }
+
+            let painted = app.spread_display_composition_for_anchor(3);
+            let painted_screen = painted.pages_in_screen_order(mode);
+            assert!(painted_screen.iter().any(|page| {
+                page.role == SpreadPageRole::FrontCoverSupplement && page.idx == 0
+            }));
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Spread);
+            for occurrence in &painted_screen {
+                app.fullscreen_page_layout.push(navigator_test_transform(
+                    occurrence.idx,
+                    crate::rotation_db::Rotation::None,
+                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                ));
+            }
+            assert!(
+                app.fullscreen_page_layout
+                    .rebind_occurrences(&painted_screen)
+            );
+
+            // The shift mutates the canonical unit before navigation capture. The holdover must
+            // still use the unit that was actually painted, including its supplement role.
+            app.spread_shift_anchor_idx = Some(2);
+            assert_ne!(
+                app.spread_display_composition_for_anchor(3)
+                    .pages_in_screen_order(mode),
+                painted_screen
+            );
+            let captured = app
+                .capture_fs_display_unit(3)
+                .expect("painted final-cover unit is capturable");
+            assert_eq!(
+                captured
+                    .pages
+                    .iter()
+                    .map(|page| page.occurrence)
+                    .collect::<Vec<_>>(),
+                painted_screen
+            );
+        }
+    }
+
+    #[test]
+    fn rtl_navigation_demand_keeps_canonical_identity_and_exact_screen_presentation() {
+        let screen = vec![
+            SpreadPageOccurrence::navigation(2, 2),
+            SpreadPageOccurrence::navigation(1, 2),
+        ];
+        let demand =
+            crate::app::FsNavigationDisplayDemand::from_presentation(2, screen.clone()).unwrap();
+        assert_eq!(demand.navigation_pages(), &[1, 2]);
+        assert_eq!(demand.presentation_pages(), screen.as_slice());
+
+        let mut app = crate::app::setup_app_for_test();
+        app.items_generation = 19;
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/book/1.png")),
+            GridItem::Image(PathBuf::from("c:/book/2.png")),
+            GridItem::Image(PathBuf::from("c:/book/3.png")),
+        ];
+        app.fullscreen_idx = Some(2);
+        app.fs_nav_locked_gen = Some(19);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 19,
+                anchor_idx: 2,
+                accept_rendition: true,
+                phase: FsNavigationTargetPhase::Presenting {
+                    demand,
+                    presentation: FsNavigationPresentation::Rendition,
+                },
+            }),
+        }));
+        let trace = screen
+            .iter()
+            .map(|occurrence| FsDisplayUnitTracePage {
+                occurrence: *occurrence,
+                texture_id: egui::TextureId::Managed(300 + occurrence.idx as u64),
+                provenance: FsDisplayUnitPageProvenance::Live,
+                source: stringify!(thumbnail),
+            })
+            .collect::<Vec<_>>();
+        app.observe_fs_navigation_sequence_presented(&trace);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    fn install_test_final_cover_layout(app: &mut crate::app::AppTestEnvForTest) {
+        let composition = app.spread_display_composition_for_anchor(3);
+        let screen = composition.pages_in_screen_order(app.spread_mode);
+        assert!(
+            screen
+                .iter()
+                .any(|page| { page.role == SpreadPageRole::FrontCoverSupplement && page.idx == 0 })
+        );
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Spread);
+        for occurrence in &screen {
+            app.fullscreen_page_layout.push(navigator_test_transform(
+                occurrence.idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            ));
+        }
+        assert!(app.fullscreen_page_layout.rebind_occurrences(&screen));
+    }
+
+    #[test]
+    fn final_cover_item_generation_change_retires_the_last_painted_spread_layout() {
+        let mut app = final_cover_local_test_app(4);
+        app.fullscreen_idx = Some(3);
+        install_test_final_cover_layout(&mut app);
+        assert!(app.painted_spread_display_composition(3).is_some());
+
+        app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::Off;
+        app.bump_items_generation();
+
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Empty
+        );
+        assert!(app.painted_spread_display_composition(3).is_none());
+        assert_eq!(
+            app.spread_display_composition_for_anchor(3)
+                .pages_in_reading_order(),
+            &[SpreadPageOccurrence::navigation(3, 3)]
+        );
+    }
+
+    #[test]
+    fn final_cover_true_close_retires_layout_before_a_same_index_reopen() {
+        let mut app = final_cover_local_test_app(4);
+        app.fullscreen_idx = Some(3);
+        install_test_final_cover_layout(&mut app);
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Empty
+        );
+        app.fullscreen_idx = Some(3);
+        assert!(app.painted_spread_display_composition(3).is_none());
     }
 
     #[test]
@@ -50387,10 +50603,10 @@ mod tests {
         assert_eq!(before.paint_source(), FsPageTurnPaintSource::Materialized);
 
         app.record_page_dims_for_spread(2, (1600, 900));
-        let pair = app.resolve_spread_pair(1);
-        assert_eq!(pair, SpreadPair::Single);
+        let composition = app.spread_display_composition_for_anchor(1);
+        assert_eq!(composition.spread_pair(app.spread_mode), SpreadPair::Single);
         let rebound = app
-            .revalidate_fs_page_turn_decision_for_spread_pair(&ctx, 1, pair)
+            .revalidate_fs_page_turn_decision_for_display_composition(&ctx, 1, &composition)
             .expect("post-poll topology changed");
         assert_eq!(rebound.paint_source(), FsPageTurnPaintSource::PassThrough);
 
