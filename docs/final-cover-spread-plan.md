@@ -13,7 +13,9 @@
 | A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 修正・独立検収・再fullgate完了 |
 | B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r6でprevious capture・layout寿命・target identity修正、独立検収・再fullgate完了 |
 | C Remote | sparse presentation wire、live設定snapshot、typed設定書込、Webのnavと描画分離、protocol互換 | source凍結・独立レビュー・Node388件・IPC55件・Rust狭域とRemote check完了 |
-| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 再fullgate・snapshot・core/Remote確認build完了。利用者の実機確認は未実施 |
+| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 再fullgate・snapshot・core/Remote確認build完了。利用者が本体/Remote/連結/F12/ずらしの動作良好を報告。master統合後の検証は別途 |
+
+利用者から確認buildで「本体・Remoteとも動作良好、連結読みも問題なし、F12でも動作、ずらしも問題なさそう」との実機結果を受領した。個別の全体/本別設定や全形式の全組合せを網羅した報告とは区別する。機能側の自動検証・独立レビューとこの実機確認に基づきmaster統合へ進める状態と判断する。確認時のmasterは3b0f9e800で、本機能の分岐後にnative click smoke関連4commitがある。読み取りmerge-treeでは競合markerなしだが、master作業ツリーには別作業の未コミット変更があるため、その所有担当と区切りを調整する。既存変更のstash/取り込み/破棄は行わず、実mergeと統合後検証はmaster担当で実施する。
 
 Aの成功だけでは機能完成・利用者検証可能とは扱わない。各段階のsource変更は実装担当、凍結差分レビューは別担当とし、既存検証を重複実行しない。Cargo枠はAのcheckと狭い回帰に限定して借用し、結果とログを共有して返却する。次段階の重い検証はあらためて所有調整する。
 
