@@ -1776,6 +1776,22 @@ Canvasのgeometry/version照合を上部chrome inventory版から分離した。
 実行条件・証跡は[自動化設計の検証記録](ui-smoke-automation-plan.md#検証記録)を参照。
 症状修正やzoom/button/panの実機成功の代用にはしない。
 
+**2026-09-10 §1.197 S3b: native上部ボタンclickのexact receipt（実装・非対話検証、live未実施）:**
+
+hoverで観測した同じ`native_top_panorama` Responseのcontrol centerへ、外部ownerが一回のLeft
+Down/Upを送る。既存DetachedViewerChild/PresenterOnly、source epoch、placement generation、
+host/backend/overlay owner、named tokenをprepareからWndProc、pump/render、実Responseのcommand
+index、既存`TogglePanorama` event、通常App handlerまで保持する。通常variant・分類・handler・
+dispatch→Set/ReleaseCapture順は変更しない。非360動画のhandler前後が`panorama=false,
+zoom=None`から`panorama=false, zoom=Some(1.0)`になった場合だけApp効果を認める。
+
+runner内の専用helper threadはcurrent SIDのlocal-only named pipeと一実行sessionでAppを認証し、
+Down挿入直後からUp cleanupを単独所有する。runnerはfinallyでhelperをjoinし、releaseが
+`ConfirmedReleased`またはDown前の`NoOwnedDown`と確認できた場合だけexact portable Appの終了を
+許可する。`StillRunning`、`Unknown`、`ConfirmedOutstanding`ではkillしない。App timeout・非0・
+script/prepare失敗はhelper結果で上書きしない。通常profileは対象外で、実SendInputによるliveは
+具体的な対話検証了承まで未実施とする。wheel/panは後続checkpointに残す。
+
 **2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
 
 利用者指定の親Astra設計・Sol前提検証・独立Astraレビューで、同じwheelをsemanticな

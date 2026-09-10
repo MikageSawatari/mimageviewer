@@ -19,7 +19,7 @@ Automation must not pass this switch until that approval has been obtained.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'StillStripDrag')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'StillStripDrag')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -40,6 +40,8 @@ $exe = Join-Path $smokeRoot 'mimageviewer.exe'
 $dataDir = Join-Path $smokeRoot 'data'
 $marker = Join-Path $dataDir '.disposable-smoke-data'
 $buildManifest = Join-Path $smokeRoot '.test-script-build.json'
+$buttonHelperRoot = Join-Path $PSScriptRoot 'ui-smoke\button-helper'
+$buttonHelperIntegrationPath = Join-Path $buttonHelperRoot 'RunnerIntegration.ps1'
 
 function Get-NormalizedPath {
     param([string] $Path)
@@ -257,7 +259,10 @@ function Stop-ExactUiSmokeProcess {
     try {
         $script:process.Refresh()
         if (-not $script:process.HasExited) {
-            # Future button-helper cleanup must complete before this exact kill.
+            if (-not $script:mayTerminateExactApp) {
+                Write-UiSmokeEvent 'exact App termination blocked: native button release state is not safe'
+                return
+            }
             $script:process.Kill()
             $script:process.WaitForExit()
         }
@@ -268,6 +273,58 @@ function Stop-ExactUiSmokeProcess {
     }
     catch {
         [void]$script:archiveErrors.Add("process cleanup: $($_.Exception.Message)")
+    }
+}
+
+function Finalize-UiSmokeButtonHelper {
+    if ($Scenario -ne 'NativeTopPanoramaClick') { return }
+    if (-not (Get-Command -Name 'Resolve-UiSmokeButtonHelperFinalization' -CommandType Function -ErrorAction SilentlyContinue)) {
+        if ($script:buttonHelperStarted) {
+            throw 'native button helper started without its runner finalization policy'
+        }
+        return
+    }
+
+    $script:buttonHelperJoinAttempted = $null -ne $script:buttonHelperHandle
+    $script:mayTerminateExactApp = -not $script:buttonHelperStarted
+    if ($null -ne $script:buttonHelperHandle) {
+        # Close the App-kill interlock before requesting owner cleanup. It opens
+        # again only from the helper's typed safe-to-terminate result.
+        $script:mayTerminateExactApp = $false
+        try {
+            $script:buttonHelperStatus = $script:buttonHelperHandle.CancelAndJoin(
+                'ui-smoke runner finalization',
+                5000)
+        }
+        catch {
+            $script:buttonHelperFinalizationError = $_.Exception.Message
+            Write-UiSmokeEvent "button helper finalization failed: $($script:buttonHelperFinalizationError)"
+        }
+    }
+
+    $resolved = Resolve-UiSmokeButtonHelperFinalization `
+        $script:runExitCode `
+        $script:runPhase `
+        $script:failureMessage `
+        $true `
+        $script:buttonHelperStarted `
+        $script:buttonHelperStatus
+    $script:runExitCode = $resolved.ExitCode
+    $script:runPhase = $resolved.Phase
+    $script:failureMessage = $resolved.Failure
+    $script:buttonHelperFailure = $resolved.HelperFailure
+    $script:buttonHelperSucceeded = $resolved.HelperSucceeded
+    $script:mayTerminateExactApp = $resolved.MayTerminateApp
+    if ($null -ne $script:buttonHelperStatus) {
+        Write-UiSmokeEvent (
+            'button helper terminal={0} release={1} joined={2} safe_to_terminate={3}' -f
+                $script:buttonHelperStatus.TerminalKind,
+                $script:buttonHelperStatus.ReleaseState,
+                $script:buttonHelperStatus.Joined,
+                $script:buttonHelperStatus.SafeToTerminateApp)
+    }
+    elseif ($script:buttonHelperStarted) {
+        Write-UiSmokeEvent 'button helper terminal unavailable; exact App termination remains blocked'
     }
 }
 
@@ -385,6 +442,25 @@ function Save-UiSmokeEvidence {
         executable_sha256 = $script:validatedExeHash
         failure = $script:failureMessage
         archive_errors = @($script:archiveErrors)
+        button_helper_required = ($Scenario -eq 'NativeTopPanoramaClick')
+        button_helper_pipe = $script:buttonHelperPipeName
+        button_helper_session = $script:buttonHelperSession
+        button_helper_server_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $PID } else { $null }
+        button_helper_expected_app_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $script:startedPid } else { $null }
+        button_helper_started = $script:buttonHelperStarted
+        button_helper_join_attempted = $script:buttonHelperJoinAttempted
+        button_helper_joined = if ($null -ne $script:buttonHelperStatus) { [bool]$script:buttonHelperStatus.Joined } else { $null }
+        button_helper_safe_to_terminate_app = if ($null -ne $script:buttonHelperStatus) { [bool]$script:buttonHelperStatus.SafeToTerminateApp } else { $null }
+        button_helper_succeeded = $script:buttonHelperSucceeded
+        button_helper_release_state = if ($null -ne $script:buttonHelperStatus) { [string]$script:buttonHelperStatus.ReleaseState } else { $null }
+        button_helper_terminal_kind = if ($null -ne $script:buttonHelperStatus) { [string]$script:buttonHelperStatus.TerminalKind } else { $null }
+        button_helper_owner_phase = if ($null -ne $script:buttonHelperStatus) { [string]$script:buttonHelperStatus.OwnerPhase } else { $null }
+        button_helper_primary_failure = if ($null -ne $script:buttonHelperStatus) { [string]$script:buttonHelperStatus.PrimaryFailure } else { $null }
+        button_helper_detail = if ($null -ne $script:buttonHelperStatus) { [string]$script:buttonHelperStatus.Detail } else { $null }
+        button_helper_cleanup_attempts = if ($null -ne $script:buttonHelperStatus) { [int]$script:buttonHelperStatus.CleanupAttempts } else { $null }
+        button_helper_failure = $script:buttonHelperFailure
+        button_helper_finalization_error = $script:buttonHelperFinalizationError
+        exact_app_termination_permitted = $script:mayTerminateExactApp
     }
     try {
         Write-UiSmokeJson (Join-Path $script:runDir 'run-metadata.json') $metadata
@@ -397,6 +473,18 @@ function Save-UiSmokeEvidence {
 
 function Complete-UiSmokeRun {
     try {
+        try {
+            Finalize-UiSmokeButtonHelper
+        }
+        catch {
+            $script:mayTerminateExactApp = $false
+            Write-UiSmokeEvent "button helper aggregation failed: $($_.Exception.Message)"
+            if ($script:runExitCode -eq 0) {
+                $script:runExitCode = 2
+                $script:runPhase = 'button-helper-failed'
+                $script:failureMessage = 'native button helper aggregation failed'
+            }
+        }
         try {
             Stop-ExactUiSmokeProcess
         }
@@ -465,6 +553,16 @@ $script:fixtureDir = $null
 $script:fixtureGeneratorPath = $null
 $script:fixtureGeneratorDependencyPath = $null
 $script:fixtureGeneratorPdfDependencyPath = $null
+$script:mayTerminateExactApp = $true
+$script:buttonHelperHandle = $null
+$script:buttonHelperStatus = $null
+$script:buttonHelperStarted = $false
+$script:buttonHelperJoinAttempted = $false
+$script:buttonHelperSucceeded = $false
+$script:buttonHelperPipeName = $null
+$script:buttonHelperSession = $null
+$script:buttonHelperFailure = $null
+$script:buttonHelperFinalizationError = $null
 
 try {
     Initialize-UiSmokeEvidence
@@ -473,7 +571,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'StillStripDrag')
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'StillStripDrag')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -585,8 +683,12 @@ if ($script:archiveErrors.Count -gt 0) {
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
-    { $_ -in @('NativeMouseMove', 'NativeTopPanoramaHover') } {
-        $scenarioSlug = if ($Scenario -eq 'NativeMouseMove') { 'native-mouse-move' } else { 'native-top-panorama-hover' }
+    { $_ -in @('NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick') } {
+        $scenarioSlug = switch ($Scenario) {
+            'NativeMouseMove' { 'native-mouse-move' }
+            'NativeTopPanoramaHover' { 'native-top-panorama-hover' }
+            'NativeTopPanoramaClick' { 'native-top-panorama-click' }
+        }
         $scenarioRoot = Join-Path $targetRoot (Join-Path 'ui-smoke' $scenarioSlug)
         $candidateScriptPath = Join-Path $PSScriptRoot (Join-Path 'ui-smoke' ($scenarioSlug + '.rhai'))
         $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
@@ -724,6 +826,20 @@ $arguments = @(
     if ($script:fixtureGeneratorPdfDependencyPath) {
         Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPdfDependencyPath 'inputs/fixture-generator-pdf-dependency.py' 'fixture-generator-pdf-dependency'
     }
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
+        if (-not (Test-Path -LiteralPath $buttonHelperIntegrationPath -PathType Leaf)) {
+            throw '[ui-smoke] native button helper runner integration is missing'
+        }
+        Assert-NoReparsePath $buttonHelperRoot $repoRoot 'ui-smoke-button-helper'
+        Assert-NoReparseTree $buttonHelperRoot 'ui-smoke-button-helper'
+        . $buttonHelperIntegrationPath
+        Import-UiSmokeButtonHelperTypes $buttonHelperRoot
+        Try-AddUiSmokeEvidenceDirectory $buttonHelperRoot 'inputs/button-helper' 'button-helper-source'
+        $script:buttonHelperPipeName = 'miv-ui-smoke-button-{0}-{1}' -f `
+            $PID,
+            ([Guid]::NewGuid().ToString('N').Substring(0, 16))
+        $script:buttonHelperSession = [Guid]::NewGuid().ToString('D')
+    }
     if ($script:archiveErrors.Count -gt 0) {
         throw '[ui-smoke] scenario inputs could not be preserved before launch'
     }
@@ -734,8 +850,43 @@ $arguments = @(
     $script:runPhase = 'running'
     $scenarioClock = [System.Diagnostics.Stopwatch]::StartNew()
     $timeoutMilliseconds = [long]$TimeoutSeconds * 1000L
-    $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
+        $script:process = Invoke-WithUiSmokeButtonHelperEnvironment `
+            $script:buttonHelperPipeName `
+            $script:buttonHelperSession `
+            ([uint32]$PID) `
+            {
+                Start-Process `
+                -FilePath $exe `
+                -ArgumentList (Join-NativeArguments $arguments) `
+                -PassThru
+            }
+    }
+    else {
+        $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
+    }
     $script:startedPid = $script:process.Id
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
+        $remainingAcceptMilliseconds = [long]$timeoutMilliseconds - $scenarioClock.ElapsedMilliseconds
+        if ($remainingAcceptMilliseconds -le 0) {
+            throw '[ui-smoke] scenario deadline expired before the native button helper could start'
+        }
+        $acceptTimeoutMilliseconds = [int][Math]::Min(
+            [long][int]::MaxValue,
+            $remainingAcceptMilliseconds)
+        $script:buttonHelperHandle = [Miv.UiSmoke.ButtonHelperDraft.ButtonHelperRunnerApi]::Start(
+            $script:buttonHelperPipeName,
+            $script:buttonHelperSession,
+            [uint32]$script:startedPid,
+            $acceptTimeoutMilliseconds)
+        $script:buttonHelperStarted = $true
+        Write-UiSmokeEvent (
+            'button helper started pipe={0} session={1} server_pid={2} expected_app_pid={3}' -f
+                $script:buttonHelperPipeName,
+                $script:buttonHelperSession,
+                $PID,
+                $script:startedPid)
+    }
     Write-UiSmokeEvent "started PID: $($script:startedPid)"
 
     $focusStartMilliseconds = $scenarioClock.ElapsedMilliseconds

@@ -586,9 +586,25 @@ overlay ownerを同じlossless `SequencedNativeOutputEvent`で運ぶ。通常の
 逆遷移、Responseなし/disabled、present前のlogical pass、次frameへ残ったtagは成功にしない。
 このcheckpointは通常/`test-script` core check、feature限定のbroker・実egui Response・
 logical batch・output bus・通常App handler回帰を非対話で確認する範囲である。
-Rhai API、`scripts/ui-smoke.ps1`、外部helper hostとの起動/終了接続はまだ公開せず、
-実SendInputとportable liveも未実施である。従って「実click確認済み」や「zoom確認済み」には
-読み替えない。
+このproducer checkpointではRhai API、`scripts/ui-smoke.ps1`、外部helper hostとの起動/終了接続を
+まだ公開せず、実SendInputとportable liveも未実施だった。従って、このcheckpoint単体を
+「実click確認済み」や「zoom確認済み」には読み替えない。
+
+2026-09-10のrunner接続checkpointでは、`NativeTopPanoramaClick`のRhai APIとscenarioを追加し、
+既検収のhelperとproducerを`ui-smoke.ps1`から接続した。runnerは一実行だけのpipe名・session nonce・
+自processのserver PIDをportable Appへ継承し、起動後に得たexact App PIDをhelperへ渡す。
+App clientはserver PID、helperはcurrent SID/local-only pipe、session、App PIDとprocess creation identityを
+相互に照合する。Rhaiはhidden top barの実MouseMoveからenabledな実Responseを取得し、その同じ
+named token/control centerへ一回だけLeft Down/Upを要求する。成功には両stepのWndProc/process/thread・
+pump/render、Response command index、通常TogglePanorama handlerの`None -> Some(1.0)`、pointer/drag解除、
+helperの`ConfirmedReleased`がすべて必要である。
+
+runnerのfinallyはhelperの`CancelAndJoin`を先に実行する。`StillRunning`、release `Unknown`、
+`ConfirmedOutstanding`ではexact portable Appのkillも許可しない。helper成功はApp timeout・非0終了・
+prepare/script失敗のexit/phase/reasonを上書きしない。helperがDown前に止まった状態と、Down後に
+解放を確認した状態も`ReleaseState`で分けてrun metadataへ残す。PowerShellのpure policy、loader、
+approval guardとRhai compileを非対話で検証する。実SendInputを使うportable liveは別途具体的な
+了承を得るまで未実施であり、この接続完了だけで実click/zoom PASSとは扱わない。
 
 通常操作の現在target検証と、既に挿入したDownのcleanup解放証明は型で分ける。
 cleanupの権限は保存済みのtagged/validated Downとown Up挿入から取り、元HWND消失後も

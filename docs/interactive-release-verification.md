@@ -41,6 +41,13 @@ PC使用の了承を明確にする運用である。
 click、wheel、key、panは送らない。この具体scenarioの実行了承が届くまでは
 `-InteractiveApproved`を付けず、portable artifactの準備と非対話検証までに留める。
 
+`NativeTopPanoramaClick`は単独で約2分を見込み、同じ使い捨て動画と別窓を使う。上端36ptへの
+MouseMove 1件で実`native_top_panorama` Responseを表示し、そのcontrol centerへLeft Down/Upを
+各1件送る。外部helperがUpの送信と解放確認を所有し、runnerはhelperをjoinしてからだけexact
+portable Appを終了できる。通常handlerの非360動画zoom `None -> Some(1.0)`までを確認するが、
+wheel/panやGPU scanoutの確認には読み替えない。このscenario名、所要時間、前面windowとmouseの
+使用、使い捨てdataを示した実行了承が届くまでは、buildと非対話検証だけに留める。
+
 ## データ保護と記録
 
 実行了承は、通常profileの起動許可を兼ねない。エージェントは引き続き

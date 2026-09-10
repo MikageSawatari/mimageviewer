@@ -889,7 +889,16 @@ impl RunnerBridge {
     }
 
     #[cfg(feature = "test-script")]
-    fn reveal_native_top_panorama(&self, timeout: Duration) -> Result<Map, String> {
+    fn reveal_native_top_panorama_receipts(
+        &self,
+        timeout: Duration,
+    ) -> Result<
+        (
+            crate::video::native_ui_smoke::NativeUiSmokeMoveReceipt,
+            crate::video::native_ui_smoke::NativeUiSmokeNamedControlReceipt,
+        ),
+        String,
+    > {
         if timeout.is_zero() {
             return Err(
                 "reveal_native_top_panorama timeout_ms must be greater than zero".to_string(),
@@ -916,6 +925,12 @@ impl RunnerBridge {
                 deadline,
                 || self.validate_selected_owner_fresh(&identity, deadline),
             )?;
+        Ok((move_receipt, target_receipt))
+    }
+
+    #[cfg(feature = "test-script")]
+    fn reveal_native_top_panorama(&self, timeout: Duration) -> Result<Map, String> {
+        let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(timeout)?;
         let mut result = Map::new();
         result.insert(
             "mouse".into(),
@@ -924,6 +939,52 @@ impl RunnerBridge {
         result.insert(
             "target".into(),
             Dynamic::from(native_named_control_receipt_to_rhai_map(target_receipt)),
+        );
+        Ok(result)
+    }
+
+    #[cfg(feature = "test-script")]
+    fn click_native_top_panorama(&self, timeout: Duration) -> Result<Map, String> {
+        if timeout.is_zero() {
+            return Err(
+                "click_native_top_panorama timeout_ms must be greater than zero".to_string(),
+            );
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "click_native_top_panorama timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        let host_incarnation = identity
+            .host_incarnation()
+            .ok_or_else(|| "native button target has no detached host incarnation".to_string())?;
+        let backend_token = identity.backend_token();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(remaining)?;
+        self.validate_selected_owner_fresh(&identity, deadline)?;
+        let prepared = crate::video::native_ui_smoke::prepare_native_top_panorama_click(
+            &target_receipt,
+            host_incarnation,
+            backend_token,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let click_receipt = crate::video::native_ui_smoke::click_prepared_native_top_panorama(
+            prepared,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let mut result = Map::new();
+        result.insert(
+            "mouse".into(),
+            Dynamic::from(native_mouse_receipt_to_rhai_map(move_receipt)),
+        );
+        result.insert(
+            "target".into(),
+            Dynamic::from(native_named_control_receipt_to_rhai_map(target_receipt)),
+        );
+        result.insert(
+            "click".into(),
+            Dynamic::from(native_top_panorama_click_receipt_to_rhai_map(click_receipt)),
         );
         Ok(result)
     }
@@ -1049,6 +1110,76 @@ fn native_named_control_receipt_to_rhai_map(
         }
     };
     map.insert("classification".into(), Dynamic::from(classification));
+    map
+}
+
+#[cfg(feature = "test-script")]
+fn native_button_delivery_to_rhai_map(
+    delivery: crate::video::native_ui_smoke::NativeUiSmokeButtonDelivery,
+) -> Map {
+    let mut map = Map::new();
+    map.insert("token".into(), saturating_rhai_int(delivery.token).into());
+    map.insert(
+        "receiver_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", delivery.receiver_hwnd)),
+    );
+    map.insert(
+        "receiver_process_id".into(),
+        saturating_rhai_int(u64::from(delivery.receiver_process_id)).into(),
+    );
+    map.insert(
+        "receiver_thread_id".into(),
+        saturating_rhai_int(u64::from(delivery.receiver_thread_id)).into(),
+    );
+    map.insert(
+        "actual_client_x".into(),
+        rhai::INT::from(delivery.actual_client_x).into(),
+    );
+    map.insert(
+        "actual_client_y".into(),
+        rhai::INT::from(delivery.actual_client_y).into(),
+    );
+    map.insert(
+        "actual_screen_x".into(),
+        rhai::INT::from(delivery.actual_screen_x).into(),
+    );
+    map.insert(
+        "actual_screen_y".into(),
+        rhai::INT::from(delivery.actual_screen_y).into(),
+    );
+    map
+}
+
+#[cfg(feature = "test-script")]
+fn native_top_panorama_click_receipt_to_rhai_map(
+    receipt: crate::video::native_ui_smoke::NativeUiSmokeTopPanoramaClickReceipt,
+) -> Map {
+    let mut map = Map::new();
+    map.insert(
+        "gesture_id".into(),
+        saturating_rhai_int(receipt.gesture_id).into(),
+    );
+    map.insert(
+        "down".into(),
+        Dynamic::from(native_button_delivery_to_rhai_map(receipt.down)),
+    );
+    map.insert(
+        "up".into(),
+        Dynamic::from(native_button_delivery_to_rhai_map(receipt.up)),
+    );
+    map.insert(
+        "app_video_zoom_scale".into(),
+        rhai::FLOAT::from(receipt.app_video_zoom_scale).into(),
+    );
+    map.insert(
+        "app_panorama_active".into(),
+        receipt.app_panorama_active.into(),
+    );
+    map.insert("pointer_released".into(), receipt.pointer_released.into());
+    map.insert(
+        "drag_latches_released".into(),
+        receipt.drag_latches_released.into(),
+    );
     map
 }
 
@@ -1338,6 +1469,24 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .reveal_native_top_panorama(timeout)
                     .map_err(|message| {
                         native_mouse_environment_error(&native_top_panorama_bridge, message)
+                    })
+            },
+        );
+
+        let native_top_panorama_click_bridge = bridge.clone();
+        engine.register_fn(
+            "click_native_top_panorama",
+            move |timeout_ms: rhai::INT| -> Result<Map, Box<EvalAltResult>> {
+                let timeout = checked_duration(timeout_ms, "click_native_top_panorama timeout_ms")?;
+                if timeout.is_zero() {
+                    return Err(rhai_error(
+                        "click_native_top_panorama timeout_ms must be greater than zero",
+                    ));
+                }
+                native_top_panorama_click_bridge
+                    .click_native_top_panorama(timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_top_panorama_click_bridge, message)
                     })
             },
         );
@@ -3353,11 +3502,43 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn native_top_panorama_click_rejects_a_zero_timeout_before_any_ui_input() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("click_native_top_panorama(0);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("greater than zero")
+        ));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::RunAction { .. } | UiCommand::Key(_)))
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_top_panorama_hover_scenario_compiles_with_the_registered_api() {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("scripts/ui-smoke/native-top-panorama-hover.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_click_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/native-top-panorama-click.rhai"),
         )
         .unwrap();
         build_engine(bridge).compile(&source).unwrap();
