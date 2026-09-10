@@ -975,6 +975,17 @@ struct SequencedNativeOutputEvent {
     sequence: u64,
     source_epoch: u64,
     event: NativeVideoOutputEvent,
+    #[cfg(feature = "test-script")]
+    ui_smoke_button_dispatch: Option<native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
+}
+
+#[cfg(windows)]
+pub(crate) struct NativeVideoOutputEventEnvelope {
+    pub(crate) source_epoch: u64,
+    pub(crate) event: NativeVideoOutputEvent,
+    #[cfg(feature = "test-script")]
+    pub(crate) ui_smoke_button_dispatch:
+        Option<native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
 }
 
 #[cfg(windows)]
@@ -1026,11 +1037,39 @@ fn native_output_event_bus(
 #[cfg(windows)]
 impl NativeOutputEventSender {
     pub(crate) fn send(&self, source_epoch: u64, event: NativeVideoOutputEvent) {
+        self.send_inner(
+            source_epoch,
+            event,
+            #[cfg(feature = "test-script")]
+            None,
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn send_with_ui_smoke_button_dispatch(
+        &self,
+        source_epoch: u64,
+        event: NativeVideoOutputEvent,
+        dispatch: native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+    ) {
+        self.send_inner(source_epoch, event, Some(dispatch));
+    }
+
+    fn send_inner(
+        &self,
+        source_epoch: u64,
+        event: NativeVideoOutputEvent,
+        #[cfg(feature = "test-script")] ui_smoke_button_dispatch: Option<
+            native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+        >,
+    ) {
         let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
         let queued = SequencedNativeOutputEvent {
             sequence,
             source_epoch,
             event,
+            #[cfg(feature = "test-script")]
+            ui_smoke_button_dispatch,
         };
         if let Some(slot) = native_output_event_latest_slot(&queued.event) {
             match self.shared.latest.lock() {
@@ -1057,7 +1096,7 @@ impl NativeOutputEventSender {
 
 #[cfg(windows)]
 impl NativeOutputEventReceiver {
-    fn drain(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    fn drain(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
         match self.shared.latest.lock() {
             Ok(mut latest) => events.extend(latest.iter_mut().filter_map(Option::take)),
@@ -1066,7 +1105,12 @@ impl NativeOutputEventReceiver {
         events.sort_unstable_by_key(|event| event.sequence);
         events
             .into_iter()
-            .map(|event| (event.source_epoch, event.event))
+            .map(|event| NativeVideoOutputEventEnvelope {
+                source_epoch: event.source_epoch,
+                event: event.event,
+                #[cfg(feature = "test-script")]
+                ui_smoke_button_dispatch: event.ui_smoke_button_dispatch,
+            })
             .collect()
     }
 }
@@ -2077,6 +2121,8 @@ fn unpack_native_video_canvas_color(packed: u32) -> [u8; 3] {
 
 #[cfg(windows)]
 pub(crate) struct NativeVideoOutput {
+    #[cfg(feature = "test-script")]
+    ui_smoke_output_id: native_ui_smoke::NativeUiSmokeOutputId,
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
@@ -2170,6 +2216,11 @@ struct NativeVideoOutputThreads {
 
 #[cfg(windows)]
 impl NativeVideoOutput {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn ui_smoke_output_id(&self) -> native_ui_smoke::NativeUiSmokeOutputId {
+        self.ui_smoke_output_id
+    }
+
     #[cfg(test)]
     pub(crate) fn disconnected_for_test() -> Self {
         Self::disconnected_for_test_with_event_sender(Arc::new(VideoUiWake::default())).0
@@ -2189,6 +2240,8 @@ impl NativeVideoOutput {
             Arc::clone(&hwnd),
         ));
         let output = Self {
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: native_ui_smoke::allocate_output_id(),
             cancel: Arc::new(AtomicBool::new(false)),
             hwnd,
             hud_hwnd: Arc::new(AtomicU64::new(0)),
@@ -2352,6 +2405,8 @@ impl NativeVideoOutput {
             }
         };
         Some(Self {
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: native_ui_smoke_output_id,
             cancel,
             hwnd,
             hud_hwnd,
@@ -2855,13 +2910,13 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetNormalizeOverlayState { state });
     }
 
-    pub(crate) fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    pub(crate) fn drain_events(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
         let mut events = rx.drain();
         let mut latest_routing = None;
-        events.retain(|(_, event)| match event {
+        events.retain(|envelope| match &envelope.event {
             NativeVideoOutputEvent::OverlayInputRouting(routing) => {
                 latest_routing = Some(*routing);
                 false
@@ -6268,7 +6323,7 @@ fn run_native_video_output(
             #[cfg(feature = "test-script")]
             let mut ui_smoke_render_succeeded = false;
             #[cfg(feature = "test-script")]
-            let mut ui_smoke_command_count = 0_usize;
+            let mut ui_smoke_geometry_version = None;
             presenter.update_overlay_video_state(
                 source.clock.now_secs(),
                 f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
@@ -6286,10 +6341,55 @@ fn run_native_video_output(
                     #[cfg(feature = "test-script")]
                     {
                         ui_smoke_render_succeeded = true;
-                        ui_smoke_command_count = outcome.commands.len();
+                        ui_smoke_geometry_version = publish_ui_smoke_inventory(
+                            &ui_smoke_render_publisher,
+                            &presenter,
+                            source.source_epoch,
+                            cur_generation,
+                            cur_placement,
+                            cur_owner_hwnd,
+                            cur_presenter_hwnd,
+                        )?;
                     }
                     sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
-                    for command in std::mem::take(&mut outcome.commands) {
+                    #[cfg(feature = "test-script")]
+                    let mut ui_smoke_dispatch_by_command = std::collections::HashMap::new();
+                    #[cfg(feature = "test-script")]
+                    for attribution in &outcome.ui_smoke_command_attributions {
+                        let is_exact_producer = outcome
+                            .commands
+                            .get(attribution.command_index)
+                            .is_some_and(|command| {
+                                matches!(
+                                    command,
+                                    crate::video::native_presenter::NativeOverlayCommand::TogglePanorama
+                                )
+                            });
+                        if !is_exact_producer {
+                            native_ui_smoke::record_render_failure(
+                                attribution.metadata,
+                                "native_top_panorama command attribution did not name its producer command",
+                            );
+                            continue;
+                        }
+                        if let Some(dispatch) =
+                            native_ui_smoke::claim_presented_button_dispatch(attribution.metadata)
+                        {
+                            if ui_smoke_dispatch_by_command
+                                .insert(attribution.command_index, dispatch)
+                                .is_some()
+                            {
+                                native_ui_smoke::record_render_failure(
+                                    attribution.metadata,
+                                    "native_top_panorama producer command had duplicate attribution",
+                                );
+                            }
+                        }
+                    }
+                    for (command_index, command) in std::mem::take(&mut outcome.commands)
+                        .into_iter()
+                        .enumerate()
+                    {
                         let event_epoch = source.source_epoch;
                         match command {
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
@@ -6362,6 +6462,17 @@ fn run_native_video_output(
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePanorama => {
+                                #[cfg(feature = "test-script")]
+                                if let Some(dispatch) =
+                                    ui_smoke_dispatch_by_command.remove(&command_index)
+                                {
+                                    ui_event_tx.send_with_ui_smoke_button_dispatch(
+                                        event_epoch,
+                                        NativeVideoOutputEvent::TogglePanorama,
+                                        dispatch,
+                                    );
+                                    continue;
+                                }
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
@@ -7029,29 +7140,40 @@ fn run_native_video_output(
             #[cfg(feature = "test-script")]
             if ui_smoke_render_succeeded {
                 let geometry = presenter.ui_smoke_canvas_geometry();
-                let geometry_version = publish_ui_smoke_inventory(
-                    &ui_smoke_render_publisher,
-                    &presenter,
-                    source.source_epoch,
-                    cur_generation,
-                    cur_placement,
-                    cur_owner_hwnd,
-                    cur_presenter_hwnd,
-                )?
-                .ok_or_else(|| {
+                let geometry_version = ui_smoke_geometry_version.ok_or_else(|| {
                     "native mouse render completed without a committed UI observation".to_string()
                 })?;
                 for (event_index, envelope) in native_event_envelopes.iter().enumerate() {
                     if let Some(metadata) = envelope.smoke_metadata {
-                        let native_window::NativeVideoWindowEvent::MouseMove(mouse) =
-                            &envelope.event
-                        else {
-                            native_ui_smoke::record_render_failure(
-                                metadata,
-                                "tagged native mouse event was not a mouse move at the render tail",
-                            );
-                            continue;
+                        let (input_kind, event_x, event_y) = match &envelope.event {
+                            native_window::NativeVideoWindowEvent::MouseMove(mouse) => (
+                                native_ui_smoke::NativeUiSmokeInputKind::MouseMove,
+                                mouse.x,
+                                mouse.y,
+                            ),
+                            native_window::NativeVideoWindowEvent::MouseButton(button)
+                                if button.button == native_window::NativeVideoMouseButton::Left =>
+                            {
+                                (
+                                    if button.down {
+                                        native_ui_smoke::NativeUiSmokeInputKind::LeftButtonDown
+                                    } else {
+                                        native_ui_smoke::NativeUiSmokeInputKind::LeftButtonUp
+                                    },
+                                    button.x,
+                                    button.y,
+                                )
+                            }
+                            _ => {
+                                native_ui_smoke::record_render_failure(
+                                    metadata,
+                                    "tagged native mouse event had an unsupported render-tail kind",
+                                );
+                                continue;
+                            }
                         };
+                        let (pointer_released, drag_latches_released) =
+                            presenter.ui_smoke_pointer_release_state();
                         native_ui_smoke::record_render_receipt(
                             metadata,
                             native_ui_smoke::NativeUiSmokeRenderReceipt {
@@ -7073,10 +7195,13 @@ fn run_native_video_output(
                                         },
                                     ),
                                 ),
-                                command_count: ui_smoke_command_count,
                                 source: envelope.source,
-                                event_x: mouse.x,
-                                event_y: mouse.y,
+                                event_x,
+                                event_y,
+                                input_kind,
+                                event_count: native_event_envelopes.len(),
+                                pointer_released,
+                                drag_latches_released,
                             },
                         );
                     }
@@ -9788,6 +9913,15 @@ impl VideoPlayer {
             .map(NativeVideoOutput::source_epoch)
     }
 
+    #[cfg(feature = "test-script")]
+    pub(crate) fn native_ui_smoke_output_id(
+        &self,
+    ) -> Option<native_ui_smoke::NativeUiSmokeOutputId> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::ui_smoke_output_id)
+    }
+
     /// App が信頼する現在の presenter placement 世代 (native_output があるときのみ)。
     /// close イベントの世代がこの値より小さければ stale として棄却する。
     #[cfg(windows)]
@@ -10298,7 +10432,7 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn drain_native_presenter_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    pub(crate) fn drain_native_presenter_events(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::drain_events)
@@ -11447,6 +11581,8 @@ mod tests {
                 y: 0,
                 shift: false,
                 ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
             })
         };
         let extra_down = event(NativeVideoMouseButton::Extra1, true);
@@ -12318,17 +12454,50 @@ mod tests {
         let events = rx.drain();
         assert_eq!(events.len(), 2);
         assert!(matches!(
-            &events[0].1,
+            &events[0].event,
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse)
             ) if mouse.x == 30 && mouse.y == 40
         ));
         assert!(matches!(
-            events[1].1,
+            events[1].event,
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::KeyDown(_)
             )
         ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn native_output_event_bus_keeps_exact_button_dispatch_on_existing_toggle_variant() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let dispatch = crate::video::native_ui_smoke::button_dispatch_metadata_for_test(51, 52);
+        tx.send(10, super::NativeVideoOutputEvent::TogglePanorama);
+        tx.send_with_ui_smoke_button_dispatch(
+            11,
+            super::NativeVideoOutputEvent::TogglePanorama,
+            dispatch,
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::TogglePanorama
+        ));
+        assert_eq!(events[0].ui_smoke_button_dispatch, None);
+        assert!(matches!(
+            events[1].event,
+            super::NativeVideoOutputEvent::TogglePanorama
+        ));
+        assert_eq!(events[1].source_epoch, 11);
+        assert_eq!(events[1].ui_smoke_button_dispatch, Some(dispatch));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -12378,13 +12547,11 @@ mod tests {
 
         let events = rx.drain();
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_epoch, 41);
         assert!(matches!(
-            events[0],
-            (
-                41,
-                super::NativeVideoOutputEvent::SetPanoramaProjection(
-                    crate::panorama::PanoProjection::Equidistant
-                )
+            events[0].event,
+            super::NativeVideoOutputEvent::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant
             )
         ));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));

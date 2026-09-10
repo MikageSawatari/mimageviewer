@@ -2176,6 +2176,10 @@ struct NativeEguiOverlay {
     ui_smoke_owner: Arc<crate::video::native_ui_smoke::NativeUiSmokeOverlayOwner>,
     #[cfg(feature = "test-script")]
     ui_smoke_committed: Option<crate::video::native_ui_smoke::NativeUiSmokeCommittedInventory>,
+    #[cfg(feature = "test-script")]
+    ui_smoke_pending_button_up_metadata: Option<NativeUiSmokePendingButtonUp>,
+    #[cfg(feature = "test-script")]
+    ui_smoke_presented_command_attributions: Vec<NativeUiSmokeCommandAttribution>,
     health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     window_epoch: u64,
     surface: wgpu::Surface<'static>,
@@ -2422,6 +2426,23 @@ struct NativeEguiOverlay {
     // state, and input ownership do not live on the render thread.
     /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
     normalize_state: crate::video::normalize_types::NormalizeOverlayState,
+}
+
+#[cfg(feature = "test-script")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeUiSmokePendingButtonUp {
+    Unique(crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata),
+    Ambiguous,
+}
+
+#[cfg(feature = "test-script")]
+fn take_unique_ui_smoke_button_up(
+    pending: &mut Option<NativeUiSmokePendingButtonUp>,
+) -> Option<crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata> {
+    match pending.take() {
+        Some(NativeUiSmokePendingButtonUp::Unique(metadata)) => Some(metadata),
+        None | Some(NativeUiSmokePendingButtonUp::Ambiguous) => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3119,6 +3140,8 @@ pub struct NativeOverlayInputOutcome {
     /// corresponding native input. Entries always match the input batch order.
     pub event_dispositions: Vec<NativeOverlayInputDisposition>,
     pub commands: Vec<NativeOverlayCommand>,
+    #[cfg(feature = "test-script")]
+    pub(crate) ui_smoke_command_attributions: Vec<NativeUiSmokeCommandAttribution>,
     pub(crate) window_intents: Vec<NativeWindowIntent>,
     /// CP5 で計算した HUD interactive regions (= 物理ピクセル単位 RECT 集合)。
     /// 表示中の bar / panel / popup / hover thumbnail などの矩形を含む。
@@ -3128,12 +3151,21 @@ pub struct NativeOverlayInputOutcome {
     pub hud_regions: Vec<RECT>,
 }
 
+#[cfg(feature = "test-script")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeUiSmokeCommandAttribution {
+    pub(crate) command_index: usize,
+    pub(crate) metadata: crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata,
+}
+
 impl NativeOverlayInputOutcome {
     fn empty() -> Self {
         Self {
             routing: NativeOverlayInputRouting::default(),
             event_dispositions: Vec::new(),
             commands: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
             window_intents: Vec::new(),
             hud_regions: Vec::new(),
         }
@@ -3151,6 +3183,8 @@ struct NativeOverlayLogicalOutput {
     perf_visible: bool,
     #[cfg(feature = "test-script")]
     ui_smoke_inventory: crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory,
+    #[cfg(feature = "test-script")]
+    ui_smoke_command_attribution: Option<NativeUiSmokeCommandAttribution>,
 }
 
 #[derive(Default)]
@@ -3165,16 +3199,25 @@ struct NativeOverlayLogicalBatch {
     perf_visible: bool,
     #[cfg(feature = "test-script")]
     ui_smoke_inventory: Option<crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory>,
+    #[cfg(feature = "test-script")]
+    ui_smoke_command_attributions: Vec<NativeUiSmokeCommandAttribution>,
 }
 
 impl NativeOverlayLogicalBatch {
     fn append(&mut self, output: NativeOverlayLogicalOutput) {
+        #[cfg(feature = "test-script")]
+        let command_offset = self.commands.len();
         if let Some(full_output) = self.full_output.as_mut() {
             full_output.append(output.full_output);
         } else {
             self.full_output = Some(output.full_output);
         }
         self.commands.extend(output.commands);
+        #[cfg(feature = "test-script")]
+        if let Some(mut attribution) = output.ui_smoke_command_attribution {
+            attribution.command_index = attribution.command_index.saturating_add(command_offset);
+            self.ui_smoke_command_attributions.push(attribution);
+        }
         self.window_intents.extend(output.window_intents);
         self.pending_event_count = self
             .pending_event_count
@@ -7747,6 +7790,17 @@ impl NativeRenderCore {
         }
     }
 
+    #[cfg(feature = "test-script")]
+    pub(crate) fn ui_smoke_pointer_release_state(&self) -> (bool, bool) {
+        let Some(overlay) = self.egui_overlay.as_ref() else {
+            return (false, false);
+        };
+        (
+            !overlay.egui_ctx.input(|input| input.pointer.any_down()),
+            overlay.seek_row_gesture.is_none() && overlay.seek_strip_drag_origin.is_none(),
+        )
+    }
+
     fn pixel_probe_due(&mut self) -> bool {
         if !self.pixel_probe_enabled {
             return false;
@@ -8249,6 +8303,10 @@ impl NativeEguiOverlay {
             ui_smoke_owner,
             #[cfg(feature = "test-script")]
             ui_smoke_committed: None,
+            #[cfg(feature = "test-script")]
+            ui_smoke_pending_button_up_metadata: None,
+            #[cfg(feature = "test-script")]
+            ui_smoke_presented_command_attributions: Vec::new(),
             health,
             window_epoch,
             surface,
@@ -8501,11 +8559,27 @@ impl NativeEguiOverlay {
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) -> Result<NativeOverlayInputOutcome, String> {
-        let batch_run = run_native_event_batch(self, events)?;
+        #[cfg(feature = "test-script")]
+        self.ui_smoke_presented_command_attributions.clear();
+        let batch_run = match run_native_event_batch(self, events) {
+            Ok(batch) => batch,
+            Err(error) => {
+                #[cfg(feature = "test-script")]
+                {
+                    self.ui_smoke_pending_button_up_metadata = None;
+                    self.ui_smoke_presented_command_attributions.clear();
+                }
+                return Err(error);
+            }
+        };
         Ok(NativeOverlayInputOutcome {
             routing: batch_run.routing,
             event_dispositions: batch_run.event_dispositions,
             commands: batch_run.commands,
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: std::mem::take(
+                &mut self.ui_smoke_presented_command_attributions,
+            ),
             window_intents: batch_run.window_intents,
             hud_regions: self.compute_hud_regions(),
         })
@@ -8986,6 +9060,35 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseButton(button) => {
+                #[cfg(feature = "test-script")]
+                if button.button == NativeVideoMouseButton::Left && !button.down {
+                    if let Some(metadata) = button.smoke_metadata {
+                        match self.ui_smoke_pending_button_up_metadata {
+                            None => {
+                                self.ui_smoke_pending_button_up_metadata =
+                                    Some(NativeUiSmokePendingButtonUp::Unique(metadata));
+                            }
+                            Some(NativeUiSmokePendingButtonUp::Unique(previous)) => {
+                                crate::video::native_ui_smoke::record_render_failure(
+                                    previous,
+                                    "multiple tagged button-up events reached one logical pass",
+                                );
+                                crate::video::native_ui_smoke::record_render_failure(
+                                    metadata,
+                                    "multiple tagged button-up events reached one logical pass",
+                                );
+                                self.ui_smoke_pending_button_up_metadata =
+                                    Some(NativeUiSmokePendingButtonUp::Ambiguous);
+                            }
+                            Some(NativeUiSmokePendingButtonUp::Ambiguous) => {
+                                crate::video::native_ui_smoke::record_render_failure(
+                                    metadata,
+                                    "multiple tagged button-up events reached one logical pass",
+                                );
+                            }
+                        }
+                    }
+                }
                 let pos = self.native_pos(button.x, button.y);
                 let modifiers = egui_modifiers(button.shift, button.ctrl, false);
                 self.pointer_pos = Some(pos);
@@ -10103,6 +10206,8 @@ impl NativeEguiOverlay {
                 routing: self.input_routing(),
                 event_dispositions: Vec::new(),
                 commands: Vec::new(),
+                #[cfg(feature = "test-script")]
+                ui_smoke_command_attributions: Vec::new(),
                 window_intents: Vec::new(),
                 hud_regions: self.compute_hud_regions(),
             });
@@ -10133,6 +10238,10 @@ impl NativeEguiOverlay {
             routing,
             event_dispositions: Vec::new(),
             commands,
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: std::mem::take(
+                &mut self.ui_smoke_presented_command_attributions,
+            ),
             window_intents,
             hud_regions: self.compute_hud_regions(),
         })
@@ -11326,6 +11435,11 @@ impl NativeEguiOverlay {
         let ui_smoke_named_control_allowed = ui_smoke_eligibility.named_control;
         #[cfg(feature = "test-script")]
         let mut ui_smoke_native_top_panorama = None;
+        #[cfg(feature = "test-script")]
+        let ui_smoke_button_up_metadata =
+            take_unique_ui_smoke_button_up(&mut self.ui_smoke_pending_button_up_metadata);
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_command_attribution = None;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -11586,6 +11700,10 @@ impl NativeEguiOverlay {
                     &mut commands,
                     #[cfg(feature = "test-script")]
                     &mut ui_smoke_native_top_panorama,
+                    #[cfg(feature = "test-script")]
+                    ui_smoke_button_up_metadata,
+                    #[cfg(feature = "test-script")]
+                    &mut ui_smoke_command_attribution,
                 );
             }
             if checked {
@@ -13358,6 +13476,8 @@ impl NativeEguiOverlay {
                 self.width,
                 self.height,
             ),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attribution,
         })
     }
 
@@ -13377,6 +13497,8 @@ impl NativeEguiOverlay {
             perf_visible,
             #[cfg(feature = "test-script")]
             ui_smoke_inventory,
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions,
         } = batch;
         let full_output = full_output
             .ok_or_else(|| "native overlay logical batch produced no output".to_string())?;
@@ -13516,6 +13638,7 @@ impl NativeEguiOverlay {
                     logical,
                 ),
             );
+            self.ui_smoke_presented_command_attributions = ui_smoke_command_attributions;
         }
         let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
         let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
@@ -16404,6 +16527,8 @@ mod tests {
             y: 100,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         })
     }
 
@@ -16765,6 +16890,8 @@ mod tests {
                         640,
                         360,
                     ),
+                #[cfg(feature = "test-script")]
+                ui_smoke_command_attribution: None,
             })
         }
 
@@ -16872,6 +16999,8 @@ mod tests {
             routing: NativeOverlayInputRouting::default(),
             event_dispositions,
             commands: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
             window_intents: Vec::new(),
             hud_regions: Vec::new(),
         }
@@ -17021,6 +17150,8 @@ mod tests {
                 commands: run.commands,
                 window_intents: run.window_intents,
                 hud_regions: Vec::new(),
+                #[cfg(feature = "test-script")]
+                ui_smoke_command_attributions: Vec::new(),
             };
             assert!(!outcome.should_forward_to_ui(0, &events[0]));
             assert!(!outcome.should_forward_to_ui(1, &events[1]));
@@ -17077,6 +17208,8 @@ mod tests {
                 commands: run.commands,
                 window_intents: run.window_intents,
                 hud_regions: Vec::new(),
+                #[cfg(feature = "test-script")]
+                ui_smoke_command_attributions: Vec::new(),
             };
             assert!(!outcome.should_forward_to_ui(0, &events[0]));
             assert!(!outcome.should_forward_to_ui(1, &events[1]));
@@ -17098,6 +17231,8 @@ mod tests {
             commands: run.commands,
             window_intents: run.window_intents,
             hud_regions: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
         };
         assert!(!outcome.should_forward_to_ui(0, &event));
     }
@@ -17156,6 +17291,76 @@ mod tests {
         );
         assert!(hidden_bar.top_hover_activation);
         assert!(!hidden_bar.named_control);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn ui_smoke_button_up_attribution_is_one_logical_pass_only() {
+        let metadata = crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata {
+            token: 0x1234,
+            receiver_hwnd: 0x200,
+            receiver_process_id: 11,
+            receiver_thread_id: 12,
+        };
+        let mut pending = Some(super::NativeUiSmokePendingButtonUp::Unique(metadata));
+        assert_eq!(
+            super::take_unique_ui_smoke_button_up(&mut pending),
+            Some(metadata)
+        );
+        assert!(pending.is_none());
+        assert_eq!(super::take_unique_ui_smoke_button_up(&mut pending), None);
+
+        let mut ambiguous = Some(super::NativeUiSmokePendingButtonUp::Ambiguous);
+        assert_eq!(super::take_unique_ui_smoke_button_up(&mut ambiguous), None);
+        assert!(ambiguous.is_none());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn ui_smoke_command_attribution_offsets_across_logical_passes() {
+        let metadata = crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata {
+            token: 0x2234,
+            receiver_hwnd: 0x200,
+            receiver_process_id: 13,
+            receiver_thread_id: 14,
+        };
+        let mut target = HeadlessNativeBatchTarget::default();
+        target.batch_prepare().unwrap();
+        target
+            .pending_commands
+            .push(NativeOverlayCommand::TogglePanorama);
+        let mut first = target.batch_render_logical_once(false).unwrap();
+        first.ui_smoke_command_attribution = Some(super::NativeUiSmokeCommandAttribution {
+            command_index: 0,
+            metadata,
+        });
+        target
+            .pending_commands
+            .push(NativeOverlayCommand::TogglePanorama);
+        let mut second = target.batch_render_logical_once(true).unwrap();
+        second.ui_smoke_command_attribution = Some(super::NativeUiSmokeCommandAttribution {
+            command_index: 0,
+            metadata: crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata {
+                token: 0x2235,
+                ..metadata
+            },
+        });
+
+        let mut batch = NativeOverlayLogicalBatch::default();
+        batch.append(first);
+        batch.append(second);
+        assert_eq!(batch.commands.len(), 2);
+        assert_eq!(batch.ui_smoke_command_attributions.len(), 2);
+        assert_eq!(batch.ui_smoke_command_attributions[0].command_index, 0);
+        assert_eq!(batch.ui_smoke_command_attributions[1].command_index, 1);
+        assert_eq!(
+            batch
+                .ui_smoke_inventory
+                .as_ref()
+                .and_then(|inventory| inventory.top_hover_min_y()),
+            Some(1.0),
+            "the final pass inventory remains the presented inventory"
+        );
     }
 
     #[test]
@@ -17245,6 +17450,8 @@ mod tests {
             commands: run.commands,
             window_intents: run.window_intents,
             hud_regions: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
         };
         assert!(!outcome.should_forward_to_ui(0, &events[0]));
         assert!(!outcome.should_forward_to_ui(1, &events[1]));
@@ -17264,6 +17471,8 @@ mod tests {
             commands: run.commands,
             window_intents: run.window_intents,
             hud_regions: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
         };
         assert!(
             same_segment
@@ -17288,6 +17497,8 @@ mod tests {
             commands: run.commands,
             window_intents: run.window_intents,
             hud_regions: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
         };
         assert!(!outcome.should_forward_to_ui(0, &close_then_continue[0]));
         assert!(!outcome.should_forward_to_ui(1, &close_then_continue[1]));
@@ -17314,6 +17525,8 @@ mod tests {
             commands: run.commands,
             window_intents: run.window_intents,
             hud_regions: Vec::new(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_command_attributions: Vec::new(),
         };
         assert!(!outcome.should_forward_to_ui(0, &event));
     }

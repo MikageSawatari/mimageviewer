@@ -70098,7 +70098,8 @@ impl App {
         #[cfg(windows)]
         let music_shell_before = self.music_vst_shell.as_ref().map(|s| s.fs_idx);
         #[cfg(windows)]
-        let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
+        let mut native_events: Vec<(usize, crate::video::NativeVideoOutputEventEnvelope)> =
+            Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
         #[cfg(windows)]
         let mut anime4k_info_ready_indices: Vec<usize> = Vec::new();
@@ -70236,7 +70237,7 @@ impl App {
                         player
                             .drain_native_presenter_events()
                             .into_iter()
-                            .map(|(epoch, event)| (*idx, epoch, event)),
+                            .map(|event| (*idx, event)),
                     );
                 }
                 if do_save {
@@ -70316,7 +70317,9 @@ impl App {
             }
         }
         #[cfg(windows)]
-        for (idx, epoch, event) in native_events {
+        for (idx, envelope) in native_events {
+            let epoch = envelope.source_epoch;
+            let event = envelope.event;
             // CloseFullscreen はこのバッチが属していた presenter を破棄する。以降の
             // イベントは破棄済み presenter 由来なので、新しい presenter に誤適用しない
             // ようバッチを打ち切る (Codex P2: 新 presenter は source_epoch=0 から始まり、
@@ -70334,6 +70337,15 @@ impl App {
             let shell_before_event = self.music_vst_shell.is_some();
             let audio_mode_before_event = self.video_audio_mode.is_none();
             let vst_host_before_event = self.video_audio_vst.is_some();
+            #[cfg(feature = "test-script")]
+            self.handle_native_video_output_event_with_ui_smoke_dispatch(
+                ctx,
+                idx,
+                epoch,
+                event,
+                envelope.ui_smoke_button_dispatch,
+            );
+            #[cfg(not(feature = "test-script"))]
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if was_fullscreen && self.fullscreen_idx.is_none() {
                 break;

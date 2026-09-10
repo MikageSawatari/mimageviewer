@@ -574,6 +574,22 @@ reducer 16件とhelper 54件が成功した。manifestは
 このcheckpointはnative inserterを構築せず、実SendInput、Rust/App receipt、
 `scripts/ui-smoke.ps1`へのscenario接続を完了したとは扱わない。
 
+2026-09-10の次checkpointでは、実`native_top_panorama` Responseから既存
+`NativeOverlayCommand::TogglePanorama`が生成されたcommand indexだけへ、`test-script`
+限定のbutton dispatch metadataを付けるRust側producer→App経路を実装した。frame内の
+command数や後続の状態値から操作を推定しない。実WndProcで確認したtoken・HWND・process・
+thread、prepared時のnamed token、output/source/placement/generation、host/presenter、
+overlay ownerを同じlossless `SequencedNativeOutputEvent`で運ぶ。通常のTogglePanorama variant、
+分類、source/current/ParkedLive/VST gate、handlerは変更せず、そのhandlerが完了した直後の
+非360状態`panorama=false, zoom=None`から`panorama=false, zoom=Some(1.0)`への遷移だけを
+当該gestureのApp receiptとする。gate拒否、別gesture、同frameの無関係Toggle、既にzoom中の
+逆遷移、Responseなし/disabled、present前のlogical pass、次frameへ残ったtagは成功にしない。
+このcheckpointは通常/`test-script` core check、feature限定のbroker・実egui Response・
+logical batch・output bus・通常App handler回帰を非対話で確認する範囲である。
+Rhai API、`scripts/ui-smoke.ps1`、外部helper hostとの起動/終了接続はまだ公開せず、
+実SendInputとportable liveも未実施である。従って「実click確認済み」や「zoom確認済み」には
+読み替えない。
+
 通常操作の現在target検証と、既に挿入したDownのcleanup解放証明は型で分ける。
 cleanupの権限は保存済みのtagged/validated Downとown Up挿入から取り、元HWND消失後も
 別windowへtargetを付け替えない。現在のhelper-thread input desktop/accessとphysical Upを

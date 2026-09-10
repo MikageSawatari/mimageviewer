@@ -240,6 +240,8 @@ mod native_extra_button_press_tests {
             y: 80,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         }
     }
 
@@ -2879,7 +2881,15 @@ impl App {
         else {
             return;
         };
-        for (_epoch, event) in events {
+        for envelope in events {
+            #[cfg(feature = "test-script")]
+            if let Some(dispatch) = envelope.ui_smoke_button_dispatch {
+                crate::video::native_ui_smoke::record_button_app_dispatch_rejected(
+                    dispatch,
+                    "tagged TogglePanorama reached the source-swap pending drain",
+                );
+            }
+            let event = envelope.event;
             match event {
                 // window close (× / Alt+F4) も退避中 committed で gate する。通常経路の
                 // `handle_native_video_window_event` は fs_cache committed を見るため
@@ -4821,6 +4831,52 @@ impl App {
         source_epoch: u64,
         event: crate::video::NativeVideoOutputEvent,
     ) {
+        self.handle_native_video_output_event_inner(
+            ctx,
+            fs_idx,
+            source_epoch,
+            event,
+            #[cfg(feature = "test-script")]
+            None,
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(super) fn handle_native_video_output_event_with_ui_smoke_dispatch(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::NativeVideoOutputEvent,
+        dispatch: Option<crate::video::native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
+    ) {
+        self.handle_native_video_output_event_inner(ctx, fs_idx, source_epoch, event, dispatch);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_output_event_inner(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::NativeVideoOutputEvent,
+        #[cfg(feature = "test-script")] dispatch: Option<
+            crate::video::native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+        >,
+    ) {
+        #[cfg(feature = "test-script")]
+        let actual_ui_smoke_output = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_ui_smoke_output_id(),
+            _ => None,
+        });
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_dispatch_guard =
+            crate::video::native_ui_smoke::NativeUiSmokeAppDispatchGuard::new(
+                dispatch,
+                actual_ui_smoke_output,
+                source_epoch,
+                matches!(&event, crate::video::NativeVideoOutputEvent::TogglePanorama),
+            );
         // native video window は winit 管理外の独立 HWND / egui Context である。
         // raw key の text-input 抑止と IME 判定は `NativeOverlayInputRouting` が command / event
         // 発行前に所有する。ここから先で App viewport の `ime_input_active()` を再適用すると、
@@ -5187,7 +5243,20 @@ impl App {
                 self.apply_native_video_zoom_wheel(ctx, fs_idx, delta, pointer_points);
             }
             crate::video::NativeVideoOutputEvent::TogglePanorama => {
+                #[cfg(feature = "test-script")]
+                let ui_smoke_before = crate::video::native_ui_smoke::NativeUiSmokeAppEffect {
+                    panorama_active: self.is_panorama_mode_active(fs_idx),
+                    video_zoom_scale: self.video_zoom_state.map(|state| state.scale()),
+                };
                 self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
+                #[cfg(feature = "test-script")]
+                ui_smoke_dispatch_guard.complete(
+                    ui_smoke_before,
+                    crate::video::native_ui_smoke::NativeUiSmokeAppEffect {
+                        panorama_active: self.is_panorama_mode_active(fs_idx),
+                        video_zoom_scale: self.video_zoom_state.map(|state| state.scale()),
+                    },
+                );
             }
             crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
                 if self.native_video_panorama_input_active(fs_idx)
@@ -14239,6 +14308,8 @@ mod configurable_video_seek_dispatch_tests {
             y: 80,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         }
     }
 

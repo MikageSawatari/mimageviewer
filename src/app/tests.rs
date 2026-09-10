@@ -40193,6 +40193,38 @@ mod native_video_display_mode_input_tests {
         assert!(app.video_zoom_state.is_some());
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn tagged_toggle_panorama_uses_the_existing_handler_and_exact_none_to_one_effect() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let current = insert_video(&mut app, "C:/clips/tagged-toggle.mp4", 1920, 1080);
+        app.fullscreen_idx = Some(current);
+        let source_epoch = app
+            .fs_cache
+            .get(&current)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+                _ => None,
+            })
+            .expect("test native source epoch");
+
+        app.handle_native_video_output_event_with_ui_smoke_dispatch(
+            &ctx,
+            current,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::TogglePanorama,
+            Some(crate::video::native_ui_smoke::button_dispatch_metadata_for_test(61, 62)),
+        );
+
+        assert_eq!(
+            app.video_zoom_state.map(|state| state.scale()),
+            Some(1.0),
+            "the tagged event must use the same normal TogglePanorama handler"
+        );
+        assert!(!app.is_panorama_mode_active(current));
+    }
+
     #[test]
     fn generic_video_v_prefers_panorama_when_the_current_video_is_360() {
         let _input_guard = fullscreen_fixed_key_test_guard();
@@ -55967,6 +55999,8 @@ mod still_window_mode_key_tests {
             y: 10,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let left_up = NativeVideoMouseButtonEvent {
             down: false,
@@ -56035,6 +56069,8 @@ mod still_window_mode_key_tests {
             y: 50,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let right_up = NativeVideoMouseButtonEvent {
             down: false,
@@ -56191,6 +56227,8 @@ mod still_window_mode_key_tests {
             y: 300,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let down_event = Ev::Window(WinEv::MouseButton(right_down));
         assert!(app.native_video_output_event_allowed_while_parked_live(&down_event));
@@ -56470,6 +56508,8 @@ mod still_window_mode_key_tests {
             y: 10,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let left_up = NativeVideoMouseButtonEvent {
             down: false,
@@ -56550,6 +56590,8 @@ mod still_window_mode_key_tests {
             y: 34,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let left_up = NativeVideoMouseButtonEvent {
             down: false,
@@ -56602,6 +56644,8 @@ mod still_window_mode_key_tests {
                 y: 180,
                 shift: false,
                 ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
             }
         }
 
@@ -56676,6 +56720,8 @@ mod still_window_mode_key_tests {
             y: 34,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         };
         let left_up = NativeVideoMouseButtonEvent {
             down: false,

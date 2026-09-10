@@ -880,6 +880,8 @@ unsafe extern "system" fn hud_wnd_proc(
                         y,
                         shift,
                         ctrl,
+                        #[cfg(feature = "test-script")]
+                        smoke_metadata: None,
                     },
                 ));
 

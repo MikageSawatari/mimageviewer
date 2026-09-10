@@ -342,10 +342,23 @@ impl NativeVideoWindowEventSink {
     pub(crate) fn send_window_message(
         &self,
         hwnd: HWND,
-        event: NativeVideoWindowEvent,
+        mut event: NativeVideoWindowEvent,
         entry: Option<super::native_ui_smoke::NativeUiSmokeMessageEntry>,
-    ) {
+    ) -> Option<super::native_ui_smoke::NativeUiSmokeMessageMetadata> {
         let smoke_metadata = super::native_ui_smoke::message_metadata(hwnd, &event, entry);
+        if let NativeVideoWindowEvent::MouseButton(button) = &mut event {
+            button.smoke_metadata = smoke_metadata;
+            if button.button == NativeVideoMouseButton::Left {
+                super::native_ui_smoke::record_wndproc_button_identity(
+                    smoke_metadata,
+                    if button.down {
+                        super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonDown
+                    } else {
+                        super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonUp
+                    },
+                );
+            }
+        }
         let envelope = NativeVideoWindowEventEnvelope {
             sequence: 0,
             epoch: self.epoch,
@@ -355,6 +368,7 @@ impl NativeVideoWindowEventSink {
             smoke_metadata,
         };
         self.dispatch(envelope);
+        smoke_metadata
     }
 
     fn dispatch(&self, envelope: NativeVideoWindowEventEnvelope) {
@@ -530,6 +544,8 @@ pub(super) fn emit_synthetic_mouse_button_cleanup(
                 y: 0,
                 shift: false,
                 ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
             },
         ));
     }
@@ -572,6 +588,8 @@ pub(super) fn emit_synthetic_extra_button_release_if_held(
             y: 0,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         },
     ));
 }
@@ -604,6 +622,8 @@ pub struct NativeVideoMouseButtonEvent {
     pub y: i32,
     pub shift: bool,
     pub ctrl: bool,
+    #[cfg(feature = "test-script")]
+    pub(crate) smoke_metadata: Option<super::native_ui_smoke::NativeUiSmokeMessageMetadata>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1947,8 +1967,9 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     #[cfg(feature = "test-script")]
     // Capture before touch-source/debug helpers, then compare with the value read at the
-    // established metadata match point. This trace is observational and MouseMove-only.
-    let ui_smoke_message_entry = if msg == WM_MOUSEMOVE {
+    // established metadata match point. This trace is observational and covers only the
+    // explicitly prepared move or ordinary left-button edge.
+    let ui_smoke_message_entry = if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
         super::native_ui_smoke::capture_message_entry()
     } else {
         None
@@ -2232,7 +2253,18 @@ unsafe extern "system" fn wnd_proc(
                         window_generation: state.generation,
                     });
                 let event = native_mouse_button_event(owner, msg, wparam, lparam);
+                #[cfg(feature = "test-script")]
+                let mut smoke_metadata = None;
                 if let Some(sink) = state.event_sink.as_ref() {
+                    #[cfg(feature = "test-script")]
+                    {
+                        smoke_metadata = sink.send_window_message(
+                            hwnd,
+                            NativeVideoWindowEvent::MouseButton(event),
+                            ui_smoke_message_entry,
+                        );
+                    }
+                    #[cfg(not(feature = "test-script"))]
                     sink.send(NativeVideoWindowEvent::MouseButton(event));
                 }
                 if event.down {
@@ -2253,10 +2285,37 @@ unsafe extern "system" fn wnd_proc(
                             msg,
                         );
                     }
+                    #[cfg(feature = "test-script")]
+                    if event.button == NativeVideoMouseButton::Left {
+                        let capture_owned =
+                            unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
+                                == hwnd
+                                && state.held_mouse_buttons.debug_bits()
+                                    & NativeHeldMouseButtons::LEFT
+                                    != 0;
+                        super::native_ui_smoke::record_wndproc_button_state(
+                            smoke_metadata,
+                            super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonDown,
+                            capture_owned,
+                        );
+                    }
                 } else if state.held_mouse_buttons.release(event.button) {
                     unsafe {
                         let _ = ReleaseCapture();
                     }
+                }
+                #[cfg(feature = "test-script")]
+                if !event.down && event.button == NativeVideoMouseButton::Left {
+                    let capture_released =
+                        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
+                            != hwnd
+                            && state.held_mouse_buttons.debug_bits() & NativeHeldMouseButtons::LEFT
+                                == 0;
+                    super::native_ui_smoke::record_wndproc_button_state(
+                        smoke_metadata,
+                        super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonUp,
+                        capture_released,
+                    );
                 }
             }
             // MouseButton(Extra1/Extra2) として decode 済みの XButton message は、この
@@ -2558,6 +2617,8 @@ fn native_mouse_button_event(
         y: signed_high_word(lparam.0),
         shift: mouse_shift(wparam),
         ctrl: mouse_ctrl(wparam),
+        #[cfg(feature = "test-script")]
+        smoke_metadata: None,
     }
 }
 
@@ -2870,6 +2931,8 @@ mod tests {
                 y: 0,
                 shift: false,
                 ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
             },
         ));
 
@@ -3225,6 +3288,8 @@ mod tests {
                 super::super::native_ui_smoke::NativeUiSmokeMessageMetadata {
                     token,
                     receiver_hwnd: 0x200,
+                    receiver_process_id: 1,
+                    receiver_thread_id: 2,
                 },
             ),
         };

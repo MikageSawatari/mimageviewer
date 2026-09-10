@@ -2335,6 +2335,8 @@ pub(super) fn draw_native_top_button(
         commands,
         #[cfg(feature = "test-script")]
         None,
+        #[cfg(feature = "test-script")]
+        None,
     )
 }
 
@@ -2357,6 +2359,10 @@ fn draw_native_top_button_enabled(
     #[cfg(feature = "test-script")] observation_out: Option<
         &mut Option<crate::video::native_ui_smoke::NativeUiSmokeControlObservation>,
     >,
+    #[cfg(feature = "test-script")] command_attribution_out: Option<(
+        crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata,
+        &mut Option<crate::video::native_presenter::NativeUiSmokeCommandAttribution>,
+    )>,
 ) -> egui::Rect {
     let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
     let sense = if enabled {
@@ -2412,6 +2418,15 @@ fn draw_native_top_button_enabled(
     }
     let resp = resp.hover_tip_dark(tooltip);
     if enabled && resp.clicked() {
+        #[cfg(feature = "test-script")]
+        if let Some((metadata, attribution_out)) = command_attribution_out {
+            *attribution_out = Some(
+                crate::video::native_presenter::NativeUiSmokeCommandAttribution {
+                    command_index: commands.len(),
+                    metadata,
+                },
+            );
+        }
         commands.push(command);
     }
     *x -= width + gap;
@@ -4325,6 +4340,12 @@ pub(super) fn draw_native_top_bar(
     #[cfg(feature = "test-script")] native_top_panorama_observation_out: &mut Option<
         crate::video::native_ui_smoke::NativeUiSmokeControlObservation,
     >,
+    #[cfg(feature = "test-script")] native_top_panorama_button_up_metadata: Option<
+        crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata,
+    >,
+    #[cfg(feature = "test-script")] native_top_panorama_command_attribution_out: &mut Option<
+        crate::video::native_presenter::NativeUiSmokeCommandAttribution,
+    >,
 ) -> NativeTopBarLayout {
     *panorama_projection_popup_rect_out = None;
     if panorama_pose.is_none() || audio_only {
@@ -4491,6 +4512,9 @@ pub(super) fn draw_native_top_bar(
                 commands,
                 #[cfg(feature = "test-script")]
                 Some(native_top_panorama_observation_out),
+                #[cfg(feature = "test-script")]
+                native_top_panorama_button_up_metadata
+                    .map(|metadata| (metadata, native_top_panorama_command_attribution_out)),
             );
             include_native_top_bar_control(&mut controls_rect, panorama_rect);
             if let Some(pose) = panorama_pose.filter(|_| panorama_active) {
@@ -4558,6 +4582,8 @@ pub(super) fn draw_native_top_bar(
                     commands,
                     #[cfg(feature = "test-script")]
                     None,
+                    #[cfg(feature = "test-script")]
+                    None,
                 );
                 include_native_top_bar_control(&mut controls_rect, reset_rect);
             }
@@ -4577,6 +4603,8 @@ pub(super) fn draw_native_top_bar(
                     "表示位置と倍率をリセット",
                     NativeOverlayCommand::ResetVideoZoom,
                     commands,
+                    #[cfg(feature = "test-script")]
+                    None,
                     #[cfg(feature = "test-script")]
                     None,
                 );
@@ -4665,6 +4693,8 @@ pub(super) fn draw_native_top_bar(
                     .as_str(),
                     NativeOverlayCommand::ToggleTileMode,
                     commands,
+                    #[cfg(feature = "test-script")]
+                    None,
                     #[cfg(feature = "test-script")]
                     None,
                 );
@@ -7609,6 +7639,10 @@ mod tests {
                 &mut commands,
                 #[cfg(feature = "test-script")]
                 &mut None,
+                #[cfg(feature = "test-script")]
+                None,
+                #[cfg(feature = "test-script")]
+                &mut None,
             ));
         });
         layout.expect("the native top bar must publish its drawn layout")
@@ -7703,6 +7737,8 @@ mod tests {
                     false,
                     &mut commands,
                     &mut observation,
+                    None,
+                    &mut None,
                 );
             });
             observation.expect("native_top_panorama response observation")
@@ -7726,6 +7762,148 @@ mod tests {
         assert_eq!(enabled.rect, enabled.interact_rect);
         assert!(enabled.clip_rect.contains(enabled.rect.center()));
         assert_eq!(enabled.layer_id.order, egui::Order::Foreground);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_click_attributes_only_its_exact_response_command_index() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let metadata = test_overlay_metadata(
+            "test".to_string(),
+            Err(crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic),
+        );
+        let metadata_state = Arc::new(Mutex::new(Some(metadata)));
+        let message_metadata = crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata {
+            token: 0x4455,
+            receiver_hwnd: 0x200,
+            receiver_process_id: 17,
+            receiver_thread_id: 18,
+        };
+        let captured = Arc::new(Mutex::new((
+            Vec::<NativeOverlayCommand>::new(),
+            None::<crate::video::native_presenter::NativeUiSmokeCommandAttribution>,
+            None::<crate::video::native_ui_smoke::NativeUiSmokeControlObservation>,
+        )));
+        let captured_for_ui = Arc::clone(&captured);
+        let metadata_for_ui = Arc::clone(&metadata_state);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1_200.0, 80.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut commands = vec![NativeOverlayCommand::TogglePanorama];
+                let mut observation = None;
+                let mut attribution = None;
+                let mut popup_open = false;
+                let mut popup_rect = None;
+                let metadata = metadata_for_ui.lock().unwrap().clone();
+                let _ = draw_native_top_bar(
+                    ctx,
+                    1_200.0,
+                    80.0,
+                    0.0,
+                    100.0,
+                    metadata.as_ref(),
+                    None,
+                    None,
+                    &mut popup_open,
+                    &mut popup_rect,
+                    "test-video.mp4",
+                    false,
+                    false,
+                    false,
+                    false,
+                    crate::settings::FsSidePanelMode::Hover,
+                    false,
+                    false,
+                    &mut commands,
+                    &mut observation,
+                    Some(message_metadata),
+                    &mut attribution,
+                );
+                *captured_for_ui.lock().unwrap() = (commands, attribution, observation);
+            });
+        harness.step();
+        let center = captured
+            .lock()
+            .unwrap()
+            .2
+            .expect("actual native_top_panorama Response")
+            .rect
+            .center();
+        harness.hover_at(center);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.0.len(), 2);
+            assert!(
+                captured
+                    .0
+                    .iter()
+                    .all(|command| matches!(command, NativeOverlayCommand::TogglePanorama))
+            );
+            assert_eq!(
+                captured.1,
+                Some(
+                    crate::video::native_presenter::NativeUiSmokeCommandAttribution {
+                        command_index: 1,
+                        metadata: message_metadata,
+                    }
+                )
+            );
+        }
+
+        harness.run();
+        assert_eq!(
+            captured.lock().unwrap().1,
+            None,
+            "tag metadata must not attach to an unrelated later frame without Response.clicked()"
+        );
+
+        *metadata_state.lock().unwrap() = None;
+        harness.step();
+        let center = captured
+            .lock()
+            .unwrap()
+            .2
+            .expect("disabled native_top_panorama Response")
+            .rect
+            .center();
+        harness.hover_at(center);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.0.len(), 1);
+        assert!(matches!(
+            captured.0.first(),
+            Some(NativeOverlayCommand::TogglePanorama)
+        ));
+        assert_eq!(
+            captured.1, None,
+            "a disabled Response must not produce or inherit button attribution"
+        );
     }
 
     fn test_conditional_top_bar_layout(
@@ -7768,6 +7946,10 @@ mod tests {
                     false,
                     false,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
+                    #[cfg(feature = "test-script")]
+                    None,
                     #[cfg(feature = "test-script")]
                     &mut None,
                 ));
@@ -8076,6 +8258,10 @@ mod tests {
                     false,
                     false,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
+                    #[cfg(feature = "test-script")]
+                    None,
                     #[cfg(feature = "test-script")]
                     &mut None,
                 );

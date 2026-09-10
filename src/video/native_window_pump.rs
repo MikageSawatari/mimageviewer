@@ -15,9 +15,10 @@ use super::native_cursor::{
     reduce_cursor_routing_batch,
 };
 use super::native_window::{
-    NativeCursorOwnershipEdge, NativeVideoTouchPhase, NativeVideoWindowEvent,
-    NativeVideoWindowEventEnvelope, NativeVideoWindowSource, NativeWindowEventReceiver,
-    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeVideoMouseButton, NativeVideoTouchPhase,
+    NativeVideoWindowEvent, NativeVideoWindowEventEnvelope, NativeVideoWindowSource,
+    NativeWindowEventReceiver, NativeWindowEventRoute, native_window_event_route,
+    post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -1417,7 +1418,7 @@ impl PumpRuntime {
         let active_before_drain = cursor_input_epoch(self.state);
         let mut cursor_events = Vec::new();
         #[cfg(feature = "test-script")]
-        let mut ui_smoke_cursor_receipts = Vec::new();
+        let mut ui_smoke_input_receipts = Vec::new();
         for envelope in self.pump_events.drain() {
             let epoch = WindowEpoch(envelope.epoch);
             if !self.hosts.contains_key(&epoch) {
@@ -1426,16 +1427,38 @@ impl PumpRuntime {
             if let Some(event) = cursor_routing_event_for_epoch(active_before_drain, &envelope) {
                 cursor_events.push(event);
                 #[cfg(feature = "test-script")]
-                if let (Some(metadata), NativeVideoWindowEvent::MouseMove(mouse)) =
-                    (envelope.smoke_metadata, &envelope.event)
-                {
-                    ui_smoke_cursor_receipts.push((
-                        epoch,
-                        metadata,
-                        envelope.source,
-                        mouse.x,
-                        mouse.y,
-                    ));
+                if let Some(metadata) = envelope.smoke_metadata {
+                    let receipt = match &envelope.event {
+                        NativeVideoWindowEvent::MouseMove(mouse) => Some((
+                            super::native_ui_smoke::NativeUiSmokeInputKind::MouseMove,
+                            mouse.x,
+                            mouse.y,
+                        )),
+                        NativeVideoWindowEvent::MouseButton(button)
+                            if button.button == NativeVideoMouseButton::Left =>
+                        {
+                            Some((
+                                if button.down {
+                                    super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonDown
+                                } else {
+                                    super::native_ui_smoke::NativeUiSmokeInputKind::LeftButtonUp
+                                },
+                                button.x,
+                                button.y,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some((kind, x, y)) = receipt {
+                        ui_smoke_input_receipts.push((
+                            epoch,
+                            metadata,
+                            envelope.source,
+                            x,
+                            y,
+                            kind,
+                        ));
+                    }
                 }
             }
             match envelope.event {
@@ -1512,7 +1535,9 @@ impl PumpRuntime {
             self.apply_cursor_icon(epoch, icon);
             self.record_cursor_health(epoch);
             #[cfg(feature = "test-script")]
-            for (receipt_epoch, metadata, source, event_x, event_y) in ui_smoke_cursor_receipts {
+            for (receipt_epoch, metadata, source, event_x, event_y, input_kind) in
+                ui_smoke_input_receipts
+            {
                 if receipt_epoch != epoch {
                     continue;
                 }
@@ -1533,6 +1558,7 @@ impl PumpRuntime {
                         source,
                         event_x,
                         event_y,
+                        input_kind,
                     },
                 );
             }
