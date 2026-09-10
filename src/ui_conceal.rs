@@ -94,7 +94,7 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        let target_idx = match self.resolve_spread_pair(fs_idx) {
+        let target_idx = match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
         };
@@ -135,12 +135,12 @@ impl App {
             return false;
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(requested_fs_idx);
-        let current_target = self
-            .fullscreen_idx
-            .map(|idx| match self.resolve_spread_pair(idx) {
-                crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
-                crate::ui_fullscreen::SpreadPair::Single => idx,
-            });
+        let current_target =
+            self.fullscreen_idx
+                .map(|idx| match self.resolve_visible_spread_pair(idx) {
+                    crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
+                    crate::ui_fullscreen::SpreadPair::Single => idx,
+                });
         if current_target != Some(target_idx) {
             return false;
         }

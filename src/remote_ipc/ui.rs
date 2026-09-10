@@ -1,10 +1,11 @@
 use mimageviewer_ipc::{
     RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState,
-    RemoteAiModelCatalog, RemoteAiModelOption, RemoteItemState, RemoteReadingDirection,
-    RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
-    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
-    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus, TailnetProbe,
-    VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
+    RemoteAiModelCatalog, RemoteAiModelOption, RemoteFinalCoverSpreadPreference, RemoteItemState,
+    RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource,
+    RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    TailnetProbe, VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError,
+    VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -1818,6 +1819,10 @@ impl crate::app::App {
                 spread_mode,
                 reading_direction,
             } => self.persist_remote_spread(address, *spread_mode, *reading_direction),
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address,
+                preference,
+            } => self.persist_remote_final_cover_spread_preference(address, *preference),
             RemoteWriteRequest::RecordReadingProgress {
                 address,
                 context_address,
@@ -2043,6 +2048,47 @@ impl crate::app::App {
             Err(error) => {
                 crate::logger::log(format!(
                     "remote_ipc: UI write failed kind=set_spread duration_ms={:.1} error={error}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "spread.db への保存に失敗しました",
+                )
+            }
+        }
+    }
+
+    fn persist_remote_final_cover_spread_preference(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        preference: RemoteFinalCoverSpreadPreference,
+    ) -> RemoteWriteResponse {
+        let key = match remote_spread_key(address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let Some(db) = self.spread_db.as_mut() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "spread.db を開けなかったため保存できません",
+            );
+        };
+        let started = std::time::Instant::now();
+        match db.set_final_cover_spread_preference(
+            &key.exact,
+            key.fallback.as_deref(),
+            core_final_cover_spread_preference(preference),
+        ) {
+            Ok(()) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write applied kind=set_final_cover_spread_preference duration_ms={:.1}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write failed kind=set_final_cover_spread_preference duration_ms={:.1} error={error}",
                     started.elapsed().as_secs_f64() * 1000.0
                 ));
                 write_error(
@@ -3716,6 +3762,18 @@ fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
         RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
         RemoteSpreadMode::SplitLtr => crate::settings::SpreadMode::SplitLtr,
         RemoteSpreadMode::SplitRtl => crate::settings::SpreadMode::SplitRtl,
+    }
+}
+
+fn core_final_cover_spread_preference(
+    preference: RemoteFinalCoverSpreadPreference,
+) -> crate::settings::FinalCoverSpreadPreference {
+    match preference {
+        RemoteFinalCoverSpreadPreference::FollowGlobal => {
+            crate::settings::FinalCoverSpreadPreference::FollowGlobal
+        }
+        RemoteFinalCoverSpreadPreference::On => crate::settings::FinalCoverSpreadPreference::On,
+        RemoteFinalCoverSpreadPreference::Off => crate::settings::FinalCoverSpreadPreference::Off,
     }
 }
 

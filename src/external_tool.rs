@@ -861,17 +861,17 @@ pub(crate) fn external_tool_menu_items(
         .collect()
 }
 
-/// 見開きを 2 件で渡すときの順序。
-///
-/// **画面の左右ではなく読み順で返す。** `resolve_visible_spread_pair` が返すのは画面上の
-/// 左右で、右綴じでは右が先のページになる。ツールが受け取る順は綴じ方向によらず
-/// 「先のページが先」であってほしいので、ページ番号の昇順に直す。
-fn spread_reading_order(left: usize, right: usize) -> (usize, usize) {
-    if left <= right {
-        (left, right)
-    } else {
-        (right, left)
+fn spread_both_pages_order(
+    pages_in_reading_order: &[crate::ui_fullscreen::SpreadPageOccurrence],
+) -> Option<[usize; 2]> {
+    match pages_in_reading_order {
+        [first, second] => Some([first.idx, second.idx]),
+        _ => None,
     }
+}
+
+fn merged_spread_screen_order(left: usize, right: usize) -> [usize; 2] {
+    [left, right]
 }
 
 /// この viewport が外部ツールの modal を描くか。
@@ -2225,15 +2225,24 @@ impl crate::app::App {
             // 現在ページ 1 件。呼び出し側の従来経路をそのまま使う。
             SpreadPolicy::MainPageOnly => Ok(None),
             SpreadPolicy::BothPages => {
-                let (first, second) = spread_reading_order(left, right);
                 let mut expanded = Vec::with_capacity(2);
-                for index in [first, second] {
+                let reading_order = self
+                    .resolve_visible_spread_presentation_in_reading_order(fs_idx)
+                    .and_then(|pages| spread_both_pages_order(&pages))
+                    .ok_or_else(|| "表示中の見開き順を確定できませんでした".to_string())?;
+                // BothPages has always handed separate tool invocations their pages in reading
+                // order. The typed presentation keeps the final-cover supplement after `last`
+                // without changing ordinary RTL behavior.
+                for index in reading_order {
                     let target = LaunchTarget::from_grid_item(self.items.get(index));
                     expanded.push(self.materialize_target(tool, &target)?);
                 }
                 Ok(Some(expanded))
             }
-            SpreadPolicy::Merged => Ok(Some(vec![self.merged_spread_target(tool, left, right)?])),
+            SpreadPolicy::Merged => {
+                let [left, right] = merged_spread_screen_order(left, right);
+                Ok(Some(vec![self.merged_spread_target(tool, left, right)?]))
+            }
         }
     }
 
@@ -3653,12 +3662,27 @@ mod tests {
         );
     }
 
-    /// 右綴じ (画面の右が先のページ) でも、ツールが受け取る順は読み順。
     #[test]
-    fn a_spread_is_handed_over_in_reading_order_not_screen_order() {
-        assert_eq!(spread_reading_order(4, 5), (4, 5));
-        assert_eq!(spread_reading_order(5, 4), (4, 5));
-        assert_eq!(spread_reading_order(7, 7), (7, 7));
+    fn a_spread_is_handed_over_in_the_policy_specific_order() {
+        let ordinary_rtl = [
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(4, 5),
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(5, 5),
+        ];
+        assert_eq!(
+            spread_both_pages_order(&ordinary_rtl),
+            Some([4, 5]),
+            "ordinary RTL BothPages keeps the established reading order"
+        );
+        let final_cover = [
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(9, 9),
+            crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 9),
+        ];
+        assert_eq!(spread_both_pages_order(&final_cover), Some([9, 0]));
+        assert_eq!(
+            merged_spread_screen_order(0, 9),
+            [0, 9],
+            "RTL Merged keeps the physical left-to-right composition"
+        );
     }
 
     #[test]

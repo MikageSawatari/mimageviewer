@@ -1803,6 +1803,9 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::RemoteArchiveResult { .. } => "アーカイブ準備結果を取得中".to_owned(),
         ClientMessage::Write { request, .. } => match request {
             RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
+            RemoteWriteRequest::SetFinalCoverSpreadPreference { .. } => {
+                "末尾の表紙見開き設定を書き込み中"
+            }
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",

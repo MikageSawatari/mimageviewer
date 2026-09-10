@@ -10966,7 +10966,7 @@ impl App {
 
     fn current_local_adjust_edit_idx(&mut self) -> Option<usize> {
         let fs_root_idx = self.fullscreen_idx?;
-        let (fs_idx, _) = match self.resolve_spread_pair(fs_root_idx) {
+        let (fs_idx, _) = match self.resolve_visible_spread_pair(fs_root_idx) {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {
                     AdjustSpreadTarget::Left => left,
@@ -14559,7 +14559,7 @@ impl App {
         let spread_lr_from_pivot = self.page_edit_spread_pair();
         // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
         let mut switch_target_to: Option<usize> = None;
-        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {
@@ -15488,7 +15488,7 @@ impl App {
         // 見開き Double 表示中は adjust_spread_target に応じて左/右ページを編集対象に。
         // Single では fs_root_idx をそのまま使う。以降の `fs_idx` は編集対象 idx を指し、
         // 補正値読み書きパスは単ページ経路と同一。
-        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {

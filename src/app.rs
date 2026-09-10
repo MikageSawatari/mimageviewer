@@ -8408,10 +8408,10 @@ pub(crate) struct FsDisplayUnitHoldover {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
-    /// Capture-time index retained for tracing and `fullscreen_page_layout` identity only.
+    /// Capture-time occurrence retained for tracing and `fullscreen_page_layout` identity only.
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
-    pub(crate) idx: usize,
+    pub(crate) occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
     pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) rotation: crate::rotation_db::Rotation,
     /// Capture-time canonical dimensions used only for page layout. PDF pages retain their
@@ -8427,6 +8427,12 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     pub(crate) trace_load_seq: u64,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
+}
+
+impl FsDisplayUnitHoldoverPage {
+    pub(crate) fn idx(&self) -> usize {
+        self.occurrence.idx
+    }
 }
 
 /// One accepted manual-browsing target and the complete display unit held while
@@ -8774,16 +8780,23 @@ impl FsNavigationSequence {
         }
     }
 
-    pub(crate) fn target_pages_for_generation(&self, items_generation: u64) -> &[usize] {
+    pub(crate) fn target_presentation_page_indices_for_generation(
+        &self,
+        items_generation: u64,
+    ) -> Vec<usize> {
         match &self.target {
             FsNavigationSequenceTarget::Display(target)
                 if target.items_generation == items_generation =>
             {
-                target.pages()
+                target
+                    .presentation_pages()
+                    .iter()
+                    .map(|page| page.idx)
+                    .collect()
             }
             FsNavigationSequenceTarget::FolderItems { .. }
             | FsNavigationSequenceTarget::AwaitingPassword { .. }
-            | FsNavigationSequenceTarget::Display(_) => &[],
+            | FsNavigationSequenceTarget::Display(_) => Vec::new(),
         }
     }
 }
@@ -9043,6 +9056,9 @@ pub(crate) struct PageEditSpreadPivot {
     pub saved_mode: crate::settings::SpreadMode,
     /// (left_idx, right_idx)。LTR / RTL のいずれでも「画面上の左/右」の意味で固定。
     pub pair: (usize, usize),
+    /// Canonical reader position. A presentation-only cover may be either physical side, but
+    /// leaving the tool must restore the navigation target rather than that source occurrence.
+    pub navigation_anchor_idx: usize,
 }
 
 impl App {
@@ -9055,12 +9071,13 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> (usize, Option<PageEditSpreadPivot>) {
-        match self.resolve_spread_pair(fs_idx) {
+        match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => (
                 left,
                 Some(PageEditSpreadPivot {
                     saved_mode: self.spread_mode,
                     pair: (left, right),
+                    navigation_anchor_idx: fs_idx,
                 }),
             ),
             // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
@@ -9114,17 +9131,27 @@ impl App {
             .map(|pivot| pivot.pair)
     }
 
+    fn page_edit_navigation_anchor_idx(&self) -> Option<usize> {
+        self.erase_spread_ctx
+            .or(self.conceal_spread_ctx)
+            .or(self.text_spread_ctx)
+            .or(self.export_crop_spread_ctx)
+            .or(self.sns_split_spread_ctx)
+            .or(self.local_adjust_spread_ctx)
+            .map(|pivot| pivot.navigation_anchor_idx)
+    }
+
     /// 退避しておいた見開きへ戻す。
     ///
-    /// ページ位置は左ページに揃える (`resolve_spread_pair` が同じペアを返すので、
-    /// 元と同じ見開きが再構築される)。
+    /// ページ位置は退避した navigation anchor に揃える。通常見開きでは従来の anchor、
+    /// 末尾表紙 supplement では末尾ページへ戻るので、画面上の左ページから推測しない。
     pub(crate) fn leave_page_edit_single_view(&mut self, pivot: Option<PageEditSpreadPivot>) {
         let Some(pivot) = pivot else {
             return;
         };
-        self.cancel_superseded_fs_navigation_display_target(pivot.pair.0);
+        self.cancel_superseded_fs_navigation_display_target(pivot.navigation_anchor_idx);
         self.spread_mode = pivot.saved_mode;
-        self.fullscreen_idx = Some(pivot.pair.0);
+        self.fullscreen_idx = Some(pivot.navigation_anchor_idx);
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
     }
@@ -14272,7 +14299,7 @@ pub struct App {
     pub(crate) erase_preview_cache:
         std::collections::HashMap<usize, crate::app::ErasePreviewCacheEntry>,
     /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
-    /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
+    /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を保存済み navigation anchor に
     /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
     /// (表紙・末尾奇数・横長画像) から入った場合は `None`。
     /// 2 値を 1 構造体にまとめてあるのは「mode と pair は常に同時に set / take される」
@@ -32290,7 +32317,7 @@ impl App {
         };
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let is_spread_double = matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
         if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double)
@@ -34920,9 +34947,7 @@ impl App {
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
             .map(|sequence| {
-                sequence
-                    .target_pages_for_generation(self.items_generation)
-                    .to_vec()
+                sequence.target_presentation_page_indices_for_generation(self.items_generation)
             })
             .unwrap_or_default()
     }
@@ -40037,7 +40062,7 @@ impl App {
             return None;
         }
         let fs_idx = self.fullscreen_idx?;
-        match self.resolve_visible_spread_pair(fs_idx) {
+        match self.resolve_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } if fs_idx == left => {
                 Some(right)
             }
@@ -43737,12 +43762,7 @@ impl App {
                     } else {
                         None
                     };
-                    let spread_other: Option<usize> = match app.resolve_spread_pair(fs_idx) {
-                        crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                            Some(if left == fs_idx { right } else { left })
-                        }
-                        _ => None,
-                    };
+                    let spread_other: Option<usize> = app.displayed_spread_partner(fs_idx);
                     let mut targets: Vec<usize> = Vec::with_capacity(2);
                     targets.push(fs_idx);
                     if let Some(other) = spread_other {
@@ -54615,10 +54635,16 @@ impl App {
         let keep_back = pf_back + 1;
         let keep_forward = pf_forward + 1;
 
-        let keep_set: std::collections::HashSet<usize> = (pos.saturating_sub(keep_back)
+        let mut keep_set: std::collections::HashSet<usize> = (pos.saturating_sub(keep_back)
             ..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
             .collect();
+
+        // The final-cover supplement intentionally reuses page 0 far outside the last page's
+        // positional prefetch window. Treat the actual presentation partner as display-critical
+        // before trimming any source/GPU caches; navigation and page count remain unchanged.
+        let displayed_partner = self.displayed_spread_partner(current_idx);
+        keep_set.extend(displayed_partner);
 
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
@@ -54647,7 +54673,6 @@ impl App {
         // 昇格は**表示中のページ**に属する。見開きでは相方も表示中なので止めない。
         // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
         // decode 済み backlog も捨てる。
-        let displayed_partner = self.displayed_spread_partner(current_idx);
         self.discard_animation_expansion_confirmation_outside_display(
             current_idx,
             displayed_partner,
@@ -55522,7 +55547,10 @@ impl App {
     /// `fullscreen_idx` は別々に進むことがある。終了時に同期しておくと、動画を右クリックで
     /// 閉じた場合も画像と同じく「今見ていた場所」へスクロールして戻れる。
     fn restore_grid_cursor_to_fullscreen_item(&mut self) {
-        let Some(idx) = self.fullscreen_idx else {
+        let Some(idx) = self
+            .page_edit_navigation_anchor_idx()
+            .or(self.fullscreen_idx)
+        else {
             return;
         };
         #[cfg(windows)]
@@ -56522,14 +56550,19 @@ impl App {
             // visible_indices から外れても、表示中ページの派生キャッシュは守る。
             let mut keep = std::collections::HashSet::new();
             keep.insert(current_idx);
+            keep.extend(self.displayed_spread_partner(current_idx));
             return keep;
         };
         let n = image_indices.len();
         let keep_back = self.settings.prefetch_back + 1;
         let keep_forward = self.settings.prefetch_forward + 1;
-        (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
+        let mut keep = (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
-            .collect()
+            .collect::<std::collections::HashSet<_>>();
+        // Presentation-only roles consume the same source/edit/AI pipeline as navigation pages.
+        // Keep the distant front-cover source while it is attached to the final singleton.
+        keep.extend(self.displayed_spread_partner(current_idx));
+        keep
     }
 
     /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
@@ -59504,7 +59537,7 @@ impl App {
 
             if self.reading_flow.is_paged()
                 && let Some(fs_idx) = self.fullscreen_idx
-                && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
+                && (idx == fs_idx || self.displayed_spread_partner(fs_idx) == Some(idx))
                 && let Some(previous) = self.capture_fs_display_unit(fs_idx)
             {
                 self.fs_holdover_tex = Some(FsHoldover::FinalEffectSourceReload(
@@ -60760,7 +60793,7 @@ impl App {
 
     /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
     pub(crate) fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
-        match self.resolve_spread_pair(current) {
+        match self.resolve_visible_spread_pair(current) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => {
                 Some(if left == current { right } else { left })
             }
@@ -60897,10 +60930,8 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return (HashSet::new(), HashSet::new());
         };
-        let page_indices = match self.resolve_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
-        };
+        let mut page_indices = vec![fs_idx];
+        page_indices.extend(self.displayed_spread_partner(fs_idx));
         let mut display_keys = HashSet::with_capacity(page_indices.len());
         let mut pending_keys = HashSet::with_capacity(page_indices.len());
         for idx in page_indices {
@@ -65617,7 +65648,7 @@ impl App {
     /// に応じた左/右ページの idx。フルスクリーンを開いていなければ None。
     pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
         let fs_idx = self.fullscreen_idx?;
-        Some(match self.resolve_spread_pair(fs_idx) {
+        Some(match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => {
                 match self.adjust_spread_target {
                     AdjustSpreadTarget::Left => left,
@@ -67047,7 +67078,7 @@ impl App {
             return;
         }
         let is_spread_double = matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
         if !self.panorama_entry_allowed(fs_idx, is_spread_double) {
@@ -71424,12 +71455,7 @@ impl App {
                     None
                 };
                 // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
-                let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
-                    crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                        Some(if left == fs_idx { right } else { left })
-                    }
-                    _ => None,
-                };
+                let spread_other = self.displayed_spread_partner(fs_idx);
                 // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
                 // 解像度へ再レンダして AI を起動する。
                 // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。

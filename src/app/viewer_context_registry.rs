@@ -3042,6 +3042,41 @@ impl App {
         }
     }
 
+    /// A global final-cover setting is shared by every viewer context, while the geometry and
+    /// interaction owners it changes are context-local. Reset parked owners in place without
+    /// mounting them or cancelling unrelated workers; their navigation demand is rebound by the
+    /// normal renderer after that context is mounted again.
+    pub(crate) fn invalidate_final_cover_spread_display_in_parked_contexts(&mut self) {
+        for id in self.viewer_contexts.table.other_ids() {
+            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
+                continue;
+            };
+            if bundle.final_cover_spread_preference
+                != crate::settings::FinalCoverSpreadPreference::FollowGlobal
+            {
+                continue;
+            }
+            bundle.similar_panel.preview.invalidate();
+            bundle
+                .fs_lanczos_cache
+                .retain_similar_preview_resource(None);
+            bundle.fullscreen_navigator_interaction.invalidate();
+            if matches!(
+                bundle.fs_holdover_tex,
+                Some(crate::app::FsHoldover::FinalEffectSourceReload(_))
+            ) {
+                bundle.fs_holdover_tex = None;
+            }
+            bundle.fullscreen_page_layout.clear();
+            bundle.fs_vertical_scroll = 0.0;
+            bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_free_rotation = 0.0;
+            bundle.fs_vertical_cache_keep_set.clear();
+            bundle.continuous_page_transitions.clear();
+            bundle.slideshow_scroll_range_cache = None;
+        }
+    }
+
     pub(in crate::app) fn with_viewer_context_ref<R>(
         &self,
         id: ViewerContextId,
@@ -3697,6 +3732,41 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_final_cover_change_invalidates_only_parked_follow_global_geometry() {
+        use crate::settings::FinalCoverSpreadPreference;
+
+        let mut app = crate::app::setup_app_for_test();
+        let inherited = app.build_window_context_for_test(717, |app| {
+            app.final_cover_spread_preference = FinalCoverSpreadPreference::FollowGlobal;
+            app.fs_vertical_scroll = 123.0;
+            app.fullscreen_page_layout
+                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+        });
+        let explicit = app.build_window_context_for_test(718, |app| {
+            app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
+            app.fs_vertical_scroll = 456.0;
+            app.fullscreen_page_layout
+                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+        });
+
+        app.invalidate_final_cover_spread_display_in_parked_contexts();
+
+        let inherited = app.viewer_contexts.table.at_rest(inherited).unwrap();
+        assert_eq!(inherited.fs_vertical_scroll, 0.0);
+        assert_eq!(
+            inherited.fullscreen_page_layout.kind(),
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+        );
+        let explicit = app.viewer_contexts.table.at_rest(explicit).unwrap();
+        assert_eq!(explicit.fs_vertical_scroll, 456.0);
+        assert_eq!(
+            explicit.fullscreen_page_layout.kind(),
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
+        );
     }
 
     #[cfg(windows)]

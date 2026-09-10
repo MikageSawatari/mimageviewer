@@ -2872,6 +2872,18 @@ pub enum FinalCoverSpreadPreference {
 }
 
 impl FinalCoverSpreadPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体に従う",
+            Self::On => "オン",
+            Self::Off => "オフ",
+        }
+    }
+
     pub(crate) fn effective(self, global_enabled: bool) -> bool {
         match self {
             Self::FollowGlobal => global_enabled,

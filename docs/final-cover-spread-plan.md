@@ -4,20 +4,20 @@
 
 2026-09-10、利用者依頼により調査・設計着手。基準masterは4a60d770c49ecce1792031ae388af9a92eb9e5c9、作業場所はC:/home/mimageviewer-dupe、機能branchはcodex/final-cover-spread。duplicate-detectionの履歴を保持する。v3.8.0の公開には未完成の変更を混ぜず、masterへのmerge/push/公開/version変更は行わない。
 
-親が設計・文書、implement_resume（Sol/xhigh）が唯一のsource/test writer、review_resume（別Sol/xhigh）が独立設計・完成差分レビューを担当。旧ClaudeCode設計検収指定は現AGENTSの開発役割へ移管し、公開責任は変更しない。大きなCargo/GPU処理はmaster親タスクとの所有調整後に行う。アプリ操作は個別suiteの明示了承後のみ、通常profileのagent起動や実データ変更は行わない。
+親が設計・文書、implement_resume（Sol/xhigh）が本体source/test、remote_cover_design（Sol/xhigh）がRemote source/test、review_resume（別Sol/xhigh）が独立設計・完成差分レビューを担当。Phase Aは単独writerで完了し、次段から下記のファイル所有で分担する。旧ClaudeCode設計検収指定は現AGENTSの開発役割へ移管し、公開責任は変更しない。大きなCargo/GPU処理はmaster親タスクとの所有調整後に行う。アプリ操作は個別suiteの明示了承後のみ、通常profileのagent起動や実データ変更は行わない。
 
 ### 実装と検証の区切り
 
 | 段階 | 成果物 | 現在の状態 |
 | --- | --- | --- |
 | A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 実装・狭域テスト13件・fmt・独立レビュー完了 |
-| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | 未完了 |
-| C Remote | sparse presentation wire、live設定snapshot、typed設定書込、Webのnavと描画分離、protocol互換 | 設計調査完了、未実装 |
-| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 未実施 |
+| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r3 source凍結、独立レビューP1/P2解消、修正後狭域35件・core check・fmt/glyph完了 |
+| C Remote | sparse presentation wire、live設定snapshot、typed設定書込、Webのnavと描画分離、protocol互換 | source凍結・独立レビュー・Node388件・IPC55件・Rust狭域とRemote check完了 |
+| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 追加snapshot3枚の生成・PNG視認・通常比較完了。shared fullgate・build・実機は未実施 |
 
 Aの成功だけでは機能完成・利用者検証可能とは扱わない。各段階のsource変更は実装担当、凍結差分レビューは別担当とし、既存検証を重複実行しない。Cargo枠はAのcheckと狭い回帰に限定して借用し、結果とログを共有して返却する。次段階の重い検証はあらためて所有調整する。
 
-Phase A凍結後、本体表示とRemote実装を分担する予定。Remote担当候補はremote_cover_designで、crates/remote-ipc、crates/remote-web、src/remote_ipcを所有する。settings_dbのlive snapshot APIと共通compositionの公開境界を確定してから編集開始を指示する。それまではsource writerを増やさない。共有settings/spread_db/metadata/renameはmain実装担当の所有を維持する。
+Phase A commit 93a41f82eの後、本体表示とRemote実装の分担開始を承認した。Remote担当はcrates/remote-ipc、crates/remote-web、src/remote_ipc、src/settings_db.rsを専有する。本体担当はapp/app配下/ui_fullscreen/座標変換/local UIを所有する。共有settings/spread_db/metadata/renameは本体担当の所有を維持するが、凍結APIの変更は先に担当間で調整する。docsとcommitは親が担当する。formatterも各自の所有ファイルに限定し、全体formatで相手の編集中ファイルを書き換えない。Cargo枠は返却済みのため次の検証前に再調整する。
 
 ## 利用者が確定した要件
 
@@ -117,7 +117,47 @@ cargo test -p mimageviewer --lib final_coverの初回はtest-only compileでexit
 
 Phase Bは共通composition取得→phaseの全slot需要/ready/failure/observer→paged layout/trace→continuous occurrence/keep→編集復帰と各操作→設定UI/invalidationの順に接続する。Remoteは共有builderを使う別所有へ分ける。Phase Aの再検証前に新source変更を混ぜない。
 
+Phase B前提の独立確認で、page_order_lockedをeligibilityへ要求すると普通の全画像folderを誤除外すると判明した。この条件は採用しない。TopLevelGridSurface::Folder、全itemがpage-data、現在の読書順が全itemの一意完全列、非synthetic/search、stack_viewとstack_mode_requestedの両方なしを確認する。通常folderの手動Cover modeも対象とし、独自sortは追加しない。stackのasync準備中も除外する。localのcurrent fullscreen anchorはNavigation role内であることを確認して全occurrenceへtyped rebindし、Remote向けのunit anchor/APIは変えない。この境界は独立Solが承認し、普通folder包含とstack準備中除外の回帰を本体担当へ依頼済み。
+
 最終再検証は同じ11 source hashで完了。`cargo test -p mimageviewer --lib final_cover -- --nocapture` は12/12 PASS（final-cover-tests-green-2.*）、通常見開き同値回帰1件は1/1 PASS（spread-role-equivalence.*）、`cargo fmt --check` はexit 0（cargo-fmt-check.*）。独立Solが実ログ・hashを照合しP1/P2なしでPhase Aを最終承認した。これは共通基盤のcheckpointであり、機能全体のfull gate・利用者build・実機確認は未実施。
+
+Phase B1はui_fullscreen.rsのeligibility、全phaseのrole付きdemand bind/rebind、全presentation readiness、occurrence順とNavigation投影を確認するobserver、paged render/capture/visible-pairを接続した段階。Cargo未実行で、完成判定ではない。レビュー用snapshotはtarget/final-cover-spread-phase-b1-20260910、base93a41f82e、source SHA256 2095ffec7936929f65bb17beea1fdfdc18afd09330be88783fce8f58487fa9f8、patch SHA256 47c5e0a4b663f050f50bce70092a000a0de2b9c7da2443d31943c1d3fb7d6128。current sourceは後続continuous実装で変わるため、B1の独立レビューはこのsnapshotを対象にし、最終時には最新差分との整合を別途確認する。
+
+Remoteはwire/server/live snapshotを先に実装し独立レビューへ渡した。Web表示は後続実装中。サーバー対象ファイルを凍結したまま別のWebファイルへ進み、レビューと実装の対象差分を分離する。これらのRust変更もまだCargo未検証。
+
+Remoteの小SQL保存は既存SetSpreadと同じ単一UI drain/FIFOとApp所有の既存DB handleを利用する。web-remote-planの既存write契約を独立レビューで確認し、cold open/走査を含まない1 statementの追加として採用した。このvariantだけ別workerへ分けて保存順序を二重所有にしない。遅延を示す実測が出た場合は既存計測logを根拠に全spread writeの共通writerを検討する。
+
+B1の性能確認では、完全列proofのall-items走査とHashSet構築が各composition取得で繰り返される点を指摘した。既存SpreadDisplayUnitsCacheのitems generation/nav tokenに従う派生情報へ寄せ、view/search/stackなど軽い条件だけを都度評価する境界を本体担当が検討中。補助OFFや非Coverにも毎frameの新しいO(N)検証を追加しない。
+
+B1独立レビューはP1×1/P2×2を指摘し、本体担当が修正中。(1) continuous分岐前にpaged navのdemandを作るとstill-unitの実paintと分裂するため、continuousは既存still nav/unit ownerから同一compositionを需要と描画へ渡す。(2) 既存nav Arc/exact identityとitems/order identityで完全列proofを保持し、landscape/rotation epochではproofを再走査しない。既存beforeにも全unit builderはあるため、その処理全体が新規の負荷であるとは扱わない。(3) deferral/decision probeの旧navigation-only pagesを全presentationへそろえる。修正後deltaの独立再確認が必要。
+
+Remote server/wireは混合ZIP levelのP2を修正し、独立レビューが該当条件と回帰を確認してP1/P2なしで静的承認。Webでは旧payloadのpresentation不在/nullだけを互換fallbackとし、明示invalid配列は状態commit前にrejectして既存load/errorへ戻す契約へ修正中。Rust検証とWeb最終レビューはまだ未完了。
+
+Webの明示invalid修正後snapshotはtarget/codex-final-cover-remote/web.patch、SHA256 68f3041cade4708fc68c779a9ff5b59d2b7ea998145f45a83c98cbbc4263fda5。同ディレクトリの9 suiteログは合計387/387 PASS（app-runtime 104、command-core 128、document-double-tap 7、local-settings 11、page-coordinator 27、page-timings 6、pwa 42、video-stream 50、viewer-position 12）。Nodeのtest dispatcherはsandbox EPERMのため各test moduleを直接実行した。実アプリ操作はしていない。独立Webレビューへ渡し、Rust側の実行検証は引き続き待ち。
+
+RemoteのRust検証予定はprotocol crate、live settings snapshot、ZIP mixed/nested、sparse presentation/complete条件、frame境界を含む。frame境界は2件に分ける。container_accepts_one_hundred_thousand_short_entries_and_truncates_the_nextで10万件の完全短path payloadに補助2slotを含めて64MiB未満を確認し、10万1件のcount truncationも確認する。container_long_entries_and_page_groups_stay_below_the_ipc_frame_limitは400文字pathのbyte truncation後のpayloadを確認するもので、truncatedのため補助なしとなる。最終compileはcore binとmimageviewer-remoteを対象に含める。core source編集中はCargoを起動せず、統合した凍結差分で一担当が実行する。
+
+Web snapshot独立レビューはP1なし、P2×2と回帰不足1件を指摘。(1) presentation内の同一address重複を拒否する。(2) prefetchをasync処理前にgroup identityで一意化し、方向別HUDも重複させず、容量に必要なunique presentation resourcesを含める。(3) invalid応答時の旧state維持を、normalizerと無関係なsnapshot自己比較ではなく実applyContainerDataとstate/position/history ownerを通す回帰で確認する。Remote担当へ一括修正を依頼し、修正deltaと関連Node結果を再確認する。387件greenだけでこの区切りを最終承認したとは扱わない。
+
+Web修正後の最終snapshotは同web.patch、SHA256 da5ad2ba8a1f20168ff770eccd1191c86876eed748ab927f79b61cba489e8501。旧snapshotはweb-pre-review-68F3041C.patchとして保存した。3指摘を修正し、実applyContainerDataとViewerPositionOwnerを通す回帰を含む9 suite計388/388 PASS（app-runtimeのみ105へ増加）。独立Solがhash・コードdelta・最終ログを確認してP1/P2なしでWebを承認した。app-runtime-review.log/pwa-review.logは修正前のreview-red各1failで、最終9ログとは区別する。Remote sourceを凍結し、Rustの統合検証を待つ。
+
+B2統合freezeはtarget/final-cover-spread-phase-b2-20260910。本体13fileのpatch SHA256 9c634f517e20078eb38f23ef2ddf5f73227c57ba4baadd186c4ebcd88c394af6、Remoteを含む24 source fileのpatch SHA256 e63e07c941062abce12def68ecbf84f487a748e1a27f169fe8acc3f98972382d。integrated-source-hashes.tsvに対象hashを保存し、Remote11fileも既承認manifestと全件一致を確認した。この同じsourceを本体独立レビューと狭域Cargoへ渡し、実行中は編集しない。次のCargo枠は元タスクから貸与済みで、jobs1/既存target/非UIの開始を連絡した。fullgate・確認buildは別調整であり、まだ実施していない。
+
+初回統合検証でIPCは55/55 PASS。本体libはtest/API追随漏れによるcompile exit101でテスト未実行となり、実装担当がclosure・既存unit helper名・test environment型の3箇所を修正した。旧B2 freezeは失効し、再freezeはtarget/final-cover-spread-phase-b2r1-20260910、body patch SHA256 68b9bfaf2beef3d44ebe646fc222cc2a2d9586caf68d0bd8791716a8057d5310、統合patch SHA256 7db996f547e8f54261dcd7c283bb9d49c0b3909ffbe710eb3538da085d184f7c。Remote11file hashは不変。独立レビューは既存確認を保持してこの修正deltaを追加確認する。以降は広いcover文字列filterを避け、final_coverと必要な個別回帰、Remote live settings・frame境界を実行する。snapshot追加と実行、fullgate、確認buildは依然未実施。
+
+再試行b2r1もtest fixtureの可変receiverとitems_generation参照が重なるE0502でcompile exit101。世代値を呼出し前に取得するtest-only修正後のfreezeはtarget/final-cover-spread-phase-b2r2-20260910、body patch SHA256 bc294a8d577a4c471c21fd66f1736eee79b04146978fdd7705315fb4e4ab8ad9、統合patch SHA256 4d35c2656de0f1ac38c37d3bf1214fb130fe887566632d5c547e3134706eb155。Remote11fileは引き続き不変。2回のcompile-redログも保存し、テストの実行失敗と区別する。
+
+b2r2の`cargo test -p mimageviewer --lib final_cover`は26/26 PASS、8082 filtered、exit0（compile2分58秒、test2.21秒）。最終logは同freeze/logs/cargo-test-lib-final-cover.log、SHA256 04cc9ba5593585f502f5eb8702f2c77052b50424b3bb65b3de9a5bb786f41d93。親が実ログを確認した。masterのportable/test-script準備buildへCargo枠を返すため、次commandは起動せずcargo/rustc停止を担当が確認。残り個別回帰・core/Remote check・fmt/glyphは再貸与後に実行する。sourceは独立レビュー対象として凍結を維持する。
+
+B2r2独立レビューでP1×1/P2×1を検出し、修正へ戻った。(1) 連結読みの通常Double第2ページをcurrentとして開くとphaseだけrequested anchorへrebindされ、actual unit/paintはcanonical先頭anchorのままになりexact all-Live観測が終端しない。current unitのtyped rebindをactual drawまで通し、通常Double第2ページの回帰を追加する。(2) external BothPagesが画面順になり既存RTLの読み順を逆転していた。既存external-tool-launch-planの契約を親も照合し、BothPagesはreading order、Mergedはscreen orderへ分離する。補助付きBothPagesは[last, front]であり、source idxの数値sortで[front, last]へ戻してはいけない。Cargo枠返却中にこの2件のソース・回帰を一括修正し、新freezeのdeltaを独立確認する。
+
+snapshotは既存goldenを作り直さず3枚を追加する予定。末尾補助のLTR/RTLは異なる模様の両textureを用い、productionのcomposition・draw_fs_spread・ページ番号算出/overlayを通して位置とN/Nを確認する。設定は既存preferences snapshotでは新checkboxが画面外のため、checkboxと説明の表示だけを最小helperに分けてfocused dark snapshotで確認する。保存/invalidationのownerは移動しない。連結読みの重複occurrenceは既存production layoutを通す回帰で検証し、画面全体snapshotの追加は行わない。source準備は承認済み、headless実行とPNG確認は未実施。
+
+B2r3は上記2修正・回帰と3snapshot fixtureを追加して凍結。target/final-cover-spread-phase-b2r3-20260910、body patch SHA256 a5ed94f007cf5c49588b77d5eb12e932bf2db476f3670d9766c8e60699332425、統合patch SHA256 31c0926fa338a0970ca27b04a76df6fc6bf459fbbe36e6942e71a1e4842b2d80。Remote11fileは既承認hashのまま。本体差分の独立再確認と狭域Cargoを開始し、sourceは再び凍結した。親から再貸与された枠はjobs1/既存target/非UIに限定し、GPU snapshot・fullgate・確認buildは別枠とする。親の実機確認が先行する場合はcommand終了区切りで返却する。
+
+B2r3狭域検証完了。`final_cover`27件（P1の通常Double第2ページ回帰を含む）とfilter外8コマンド各1件がPASS、計35件。追加8件はexternal policy・display occurrence・continuous mixed owner・source keep・通常spread同値・Remote live settings・container上限2件。core binとmimageviewer-remoteのcargo check、cargo fmt --all -- --check、check_ui_glyphs.pyもexit0（危険文字0）。同freezeのMANIFEST.txt SHA256 372b341d4132ffc1ee3fd8e2b1a1a3aafe3a57fa6495fc0df40fb71cfa569f62に実行記録を保存。24 source hashは不変、Remote11fileも既承認hash一致。cargo/rustc停止確認後に親へ枠を返却した。独立レビューはsnapshot fixture/helper・4文書も含めP1/P2なしで静的承認。snapshot生成・PNG視認、shared fullgate、利用者build、実機は引き続き未実施。
+
+追加snapshot3枚の生成とPNG視認を完了。実装担当と親がLTR/RTLの左右配置、両方4/4のページ番号、設定の文字・配置を確認した。UPDATE_SNAPSHOTS解除後の通常比較も2exact各1件PASS。sourceはB2r3から不変、新規PNGはtests/snapshots/final_cover_spread_ltr_last_page.png、final_cover_spread_rtl_last_page.png、preferences_final_cover_spread_setting.pngのみ。MANIFEST.txt最終SHA256 8ac25dd1a023da0cd9f187142e515d211dddf32d5c6c5d50f217cceb36a762e4b。cargo/rustc停止確認後にGPU/Cargo枠を返却した。この段階を機能branchの限定commitとして保存し、masterへの統合は行わない。shared fullgate・利用者build・実機は別段階で残す。
 
 ## 後続の受入確認
 

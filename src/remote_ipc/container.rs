@@ -12,10 +12,11 @@ use mimageviewer_ipc::{
     FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
     PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
     RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
-    RemoteEntryKind, RemotePageDisplaySlot, RemotePageRenderContext, RemoteReadingDirection,
-    RemoteSpreadMode, RemoteSubresource, RemoteWriteError, RemoteWriteErrorCode,
-    RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, ThumbnailError, ThumbnailErrorCode,
-    ThumbnailResponse,
+    RemoteEntryKind, RemoteFinalCoverSpreadPreference, RemotePageDisplaySlot,
+    RemotePagePresentationRole, RemotePagePresentationSlot, RemotePageRenderContext,
+    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
+    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{
@@ -752,6 +753,7 @@ fn remote_auto_trim_cache_key(
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     listing_settings: RemoteListingSettingsSource,
+    reading_settings: RemoteReadingSettingsSource,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
@@ -778,6 +780,28 @@ enum RemoteListingSettingsSource {
     Live,
     #[cfg(test)]
     Snapshot(crate::settings_db::RemoteListingSettings),
+}
+
+enum RemoteReadingSettingsSource {
+    Live,
+    #[cfg(test)]
+    Snapshot(crate::settings_db::RemoteReadingSettings),
+}
+
+impl RemoteReadingSettingsSource {
+    fn load(
+        &self,
+        fallback: &crate::settings::Settings,
+    ) -> Result<crate::settings_db::RemoteReadingSettings, crate::settings_db::SettingsDbError>
+    {
+        match self {
+            Self::Live => {
+                crate::settings_db::with_db_result(|db| db.load_remote_reading_settings(fallback))
+            }
+            #[cfg(test)]
+            Self::Snapshot(settings) => Ok(*settings),
+        }
+    }
 }
 
 impl RemoteListingSettingsSource {
@@ -1897,6 +1921,9 @@ struct SpreadPayload {
     configured: RemoteSpreadMode,
     effective: RemoteSpreadMode,
     reading_direction: RemoteReadingDirection,
+    final_cover_preference: RemoteFinalCoverSpreadPreference,
+    final_cover_enabled: bool,
+    spread_page_gap_px: u32,
     image_count: usize,
     video_count: usize,
     other_count: usize,
@@ -2142,7 +2169,17 @@ impl ContainerEngine {
         let listing_settings = RemoteListingSettingsSource::Snapshot(
             crate::settings_db::RemoteListingSettings::from_settings(&settings),
         );
-        Self::new_inner(settings, None, None, adjustment_settings, listing_settings)
+        let reading_settings = RemoteReadingSettingsSource::Snapshot(
+            crate::settings_db::RemoteReadingSettings::from_settings(&settings),
+        );
+        Self::new_inner(
+            settings,
+            None,
+            None,
+            adjustment_settings,
+            listing_settings,
+            reading_settings,
+        )
     }
 
     pub(super) fn new_with_session(
@@ -2155,6 +2192,7 @@ impl ContainerEngine {
             Some(session),
             AdjustmentSettingsSource::Live,
             RemoteListingSettingsSource::Live,
+            RemoteReadingSettingsSource::Live,
         )
     }
 
@@ -2169,12 +2207,16 @@ impl ContainerEngine {
         let listing_settings = RemoteListingSettingsSource::Snapshot(
             crate::settings_db::RemoteListingSettings::from_settings(&settings),
         );
+        let reading_settings = RemoteReadingSettingsSource::Snapshot(
+            crate::settings_db::RemoteReadingSettings::from_settings(&settings),
+        );
         Self::new_inner(
             settings,
             Some(ResumeReader::Error(error)),
             None,
             adjustment_settings,
             listing_settings,
+            reading_settings,
         )
     }
 
@@ -2184,6 +2226,7 @@ impl ContainerEngine {
         session: Option<super::session::SessionHandle>,
         adjustment_settings: AdjustmentSettingsSource,
         listing_settings: RemoteListingSettingsSource,
+        reading_settings: RemoteReadingSettingsSource,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db =
@@ -2210,6 +2253,7 @@ impl ContainerEngine {
         Self {
             settings: Arc::new(settings),
             listing_settings,
+            reading_settings,
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
@@ -2706,7 +2750,8 @@ impl ContainerEngine {
             self.canonicalize_write_address(context_address)?;
         }
         match request {
-            RemoteWriteRequest::SetSpread { address, .. } => {
+            RemoteWriteRequest::SetSpread { address, .. }
+            | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. } => {
                 let resolved = self
                     .resolve(address)
                     .map_err(remote_write_error_from_media)?;
@@ -2728,7 +2773,7 @@ impl ContainerEngine {
                 supported.then_some(()).ok_or_else(|| {
                     RemoteWriteError::new(
                         RemoteWriteErrorCode::Unsupported,
-                        "見開き設定を書き込めるコンテナではありません",
+                        "読書設定を書き込めるコンテナではありません",
                     )
                 })
             }
@@ -4460,7 +4505,21 @@ impl ContainerEngine {
             items.push(item.clone());
             entries.push(entry);
         }
-        let spread = self.spread_payload(request, resolved, &items, Some(&source_items), None);
+        let canonical_image_book = !source_items.is_empty()
+            && source_items
+                .iter()
+                .all(|item| matches!(item, crate::grid_item::GridItem::Image(_)));
+        let complete_book_eligible =
+            canonical_image_book && entries.len() == total && !byte_truncated;
+        let spread = self.spread_payload(
+            request,
+            resolved,
+            &items,
+            Some(&source_items),
+            None,
+            canonical_image_book,
+            complete_book_eligible,
+        )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
@@ -4481,10 +4540,12 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            final_cover_spread_preference: spread.final_cover_preference,
+            final_cover_spread_enabled: spread.final_cover_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
-            spread_page_gap_px: self.settings.spread_page_gap_px,
+            spread_page_gap_px: spread.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit,
             truncated,
@@ -4548,6 +4609,10 @@ impl ContainerEngine {
         let (items, _) =
             tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
         let total = items.len();
+        let canonical_image_book = !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item, crate::grid_item::GridItem::ZipImage { .. }));
         let at_resume_root = effective_segments == root_segments;
         let resume_page =
             self.resume_page_for_items(&address, &resolved.logical, &items, at_resume_root);
@@ -4585,13 +4650,17 @@ impl ContainerEngine {
             entries.push(entry);
         }
         let items = bounded_items;
+        let complete_book_eligible =
+            canonical_image_book && entries.len() == total && !byte_truncated;
         let spread = self.spread_payload(
             request,
             resolved,
             &items,
             None,
             Some((&effective_segments, &resolved.logical)),
-        );
+            true,
+            complete_book_eligible,
+        )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
@@ -4623,10 +4692,12 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            final_cover_spread_preference: spread.final_cover_preference,
+            final_cover_spread_enabled: spread.final_cover_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
-            spread_page_gap_px: self.settings.spread_page_gap_px,
+            spread_page_gap_px: spread.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit,
             truncated,
@@ -4674,7 +4745,16 @@ impl ContainerEngine {
             entries.push(entry);
         }
         let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
-        let spread = self.spread_payload(request, resolved, &items, None, None);
+        let complete_book_eligible = entries.len() == page_count as usize && !byte_truncated;
+        let spread = self.spread_payload(
+            request,
+            resolved,
+            &items,
+            None,
+            None,
+            true,
+            complete_book_eligible,
+        )?;
         let (entry_limit, truncated) =
             container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
         Ok(ContainerPayload {
@@ -4695,10 +4775,12 @@ impl ContainerEngine {
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
+            final_cover_spread_preference: spread.final_cover_preference,
+            final_cover_spread_enabled: spread.final_cover_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
-            spread_page_gap_px: self.settings.spread_page_gap_px,
+            spread_page_gap_px: spread.spread_page_gap_px,
             page_groups: spread.groups,
             entry_limit,
             truncated,
@@ -4712,31 +4794,39 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         source_items: Option<&[crate::grid_item::GridItem]>,
         zip_context: Option<(&[String], &Path)>,
-    ) -> SpreadPayload {
+        use_book_defaults: bool,
+        complete_book_eligible: bool,
+    ) -> Result<SpreadPayload, MediaError> {
+        let reading_settings = self
+            .reading_settings
+            .load(&self.settings)
+            .map_err(remote_reading_settings_error)?;
         let key = if let Some((segments, root)) = zip_context {
             crate::spread_db::container_key_with_fallback(root, segments)
         } else {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (stored_mode, stored_direction) =
+        let (stored_mode, stored_direction, final_cover_preference) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref());
         let source_items = source_items.unwrap_or(items);
-        let defaults = if crate::app::physical_page_order_locked(
-            &self.settings,
-            &resolved.logical,
-            source_items,
-        ) {
-            crate::app::SpreadRestoreDefaults::for_book(&self.settings)
+        let (default_mode, default_direction) = if use_book_defaults {
+            (
+                reading_settings.default_spread_mode,
+                reading_settings.default_reading_direction,
+            )
         } else {
-            crate::app::SpreadRestoreDefaults::NON_BOOK
+            (
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Ltr,
+            )
         };
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
             stored_mode,
             stored_direction,
-            defaults.spread_mode(),
-            defaults.reading_direction(),
+            default_mode,
+            default_direction,
             request.force_single_page,
         );
         let (image_count, video_count, other_count) =
@@ -4748,42 +4838,66 @@ impl ContainerEngine {
         } else {
             self.cached_landscape_flags(&resolved.logical, items)
         };
-        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
+        let final_cover_enabled =
+            final_cover_preference.effective(reading_settings.final_cover_spread_enabled);
+        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_composition(
             items,
             core_spread_mode(effective),
             &landscape,
+            final_cover_enabled,
+            complete_book_eligible,
         );
+        let container_address = page_identity_from_resolved(resolved, &request.address.subresource);
         let groups = index_groups
             .into_iter()
             .filter_map(|group| {
-                let container_address =
-                    page_identity_from_resolved(resolved, &request.address.subresource);
                 let pages = group
                     .indices
-                    .into_iter()
-                    .filter_map(|index| grid_item_address(&container_address, items.get(index)?))
+                    .iter()
+                    .filter_map(|&index| grid_item_address(&container_address, items.get(index)?))
                     .collect::<Vec<_>>();
                 let anchor = if effective.is_rtl() && pages.len() == 2 {
                     pages.get(1).cloned()
                 } else {
                     pages.first().cloned()
                 }?;
+                let presentation = match group.presentation {
+                    Some(occurrences) => Some(
+                        occurrences
+                            .into_iter()
+                            .map(|occurrence| {
+                                Some(RemotePagePresentationSlot {
+                                    address: grid_item_address(
+                                        &container_address,
+                                        items.get(occurrence.idx)?,
+                                    )?,
+                                    role: remote_page_presentation_role(occurrence.role),
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    ),
+                    None => None,
+                };
                 Some(PageGroup {
                     anchor,
                     pages,
+                    presentation,
                     slice: crate::ui_fullscreen::remote_page_slice(group.slice),
                 })
             })
             .collect::<Vec<_>>();
-        SpreadPayload {
+        Ok(SpreadPayload {
             configured,
             effective,
             reading_direction,
+            final_cover_preference: remote_final_cover_preference(final_cover_preference),
+            final_cover_enabled,
+            spread_page_gap_px: reading_settings.spread_page_gap_px,
             image_count,
             video_count,
             other_count,
             groups,
-        }
+        })
     }
 
     fn stored_spread_state(
@@ -4793,6 +4907,7 @@ impl ContainerEngine {
     ) -> (
         Option<crate::settings::SpreadMode>,
         Option<crate::settings::ReadingDirection>,
+        crate::settings::FinalCoverSpreadPreference,
     ) {
         let db = self
             .spread_db
@@ -4802,7 +4917,11 @@ impl ContainerEngine {
             .as_ref()
             .map(|db| db.get_state_with_fallback(key, fallback))
             .unwrap_or_default();
-        (stored.mode, stored.direction)
+        let final_cover_preference = db
+            .as_ref()
+            .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
+            .unwrap_or_default();
+        (stored.mode, stored.direction, final_cover_preference)
     }
 
     fn remote_view_trim_plan(
@@ -6405,6 +6524,16 @@ fn remote_adjustment_settings_error(error: crate::settings_db::SettingsDbError) 
     )
 }
 
+fn remote_reading_settings_error(error: crate::settings_db::SettingsDbError) -> MediaError {
+    crate::logger::log(format!(
+        "remote_ipc: live reading settings read failed: {error}"
+    ));
+    media_error(
+        MediaErrorCode::Internal,
+        "最新の読書設定を読み込めませんでした",
+    )
+}
+
 fn validated_context(
     page_index: usize,
     page_count: usize,
@@ -6550,6 +6679,29 @@ fn remote_reading_direction(
     match direction {
         crate::settings::ReadingDirection::Ltr => RemoteReadingDirection::Ltr,
         crate::settings::ReadingDirection::Rtl => RemoteReadingDirection::Rtl,
+    }
+}
+
+fn remote_final_cover_preference(
+    preference: crate::settings::FinalCoverSpreadPreference,
+) -> RemoteFinalCoverSpreadPreference {
+    match preference {
+        crate::settings::FinalCoverSpreadPreference::FollowGlobal => {
+            RemoteFinalCoverSpreadPreference::FollowGlobal
+        }
+        crate::settings::FinalCoverSpreadPreference::On => RemoteFinalCoverSpreadPreference::On,
+        crate::settings::FinalCoverSpreadPreference::Off => RemoteFinalCoverSpreadPreference::Off,
+    }
+}
+
+fn remote_page_presentation_role(
+    role: crate::ui_fullscreen::SpreadPageRole,
+) -> RemotePagePresentationRole {
+    match role {
+        crate::ui_fullscreen::SpreadPageRole::Navigation => RemotePagePresentationRole::Navigation,
+        crate::ui_fullscreen::SpreadPageRole::FrontCoverSupplement => {
+            RemotePagePresentationRole::FrontCoverSupplement
+        }
     }
 }
 
@@ -7144,6 +7296,7 @@ mod tests {
             .map(|entry| PageGroup {
                 anchor: entry.address.clone(),
                 pages: vec![entry.address.clone()],
+                presentation: None,
                 slice: mimageviewer_ipc::RemotePageSlice::Full,
             })
             .collect();
@@ -7163,6 +7316,8 @@ mod tests {
             configured_spread_mode: RemoteSpreadMode::Single,
             effective_spread_mode: RemoteSpreadMode::Single,
             reading_direction: RemoteReadingDirection::Ltr,
+            final_cover_spread_preference: RemoteFinalCoverSpreadPreference::FollowGlobal,
+            final_cover_spread_enabled: true,
             image_count: total,
             video_count: 0,
             other_count: 0,
@@ -7176,7 +7331,19 @@ mod tests {
     #[test]
     fn container_accepts_one_hundred_thousand_short_entries_and_truncates_the_next() {
         let (entries, byte_truncated) = test_container_entries(CONTAINER_ENTRY_LIMIT, "C:/p.pdf");
-        let payload = test_container_payload(CONTAINER_ENTRY_LIMIT, entries, byte_truncated);
+        let mut payload = test_container_payload(CONTAINER_ENTRY_LIMIT, entries, byte_truncated);
+        let first = payload.entries.first().unwrap().address.clone();
+        let last = payload.entries.last().unwrap().address.clone();
+        payload.page_groups.last_mut().unwrap().presentation = Some(vec![
+            RemotePagePresentationSlot {
+                address: last,
+                role: RemotePagePresentationRole::Navigation,
+            },
+            RemotePagePresentationSlot {
+                address: first,
+                role: RemotePagePresentationRole::FrontCoverSupplement,
+            },
+        ]);
 
         assert_eq!(payload.entries.len(), CONTAINER_ENTRY_LIMIT);
         assert!(!payload.truncated);
@@ -10075,7 +10242,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_spread_defaults_follow_the_core_book_predicate_and_keep_stored_values() {
+    fn folder_spread_defaults_include_complete_plain_image_books_and_keep_stored_values() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         let image_only = root.join("image-only");
@@ -10097,7 +10264,7 @@ mod tests {
         let engine = ContainerEngine::new(crate::settings::Settings {
             favorites: vec![favorite.clone()],
             auto_fullscreen_zip_pdf: true,
-            auto_fullscreen_image_folders: true,
+            auto_fullscreen_image_folders: false,
             default_spread_mode: crate::settings::SpreadMode::RtlCover,
             default_reading_direction: crate::settings::ReadingDirection::Rtl,
             ..Default::default()
@@ -10201,24 +10368,163 @@ mod tests {
                     content_type: None,
                 }
             };
-            let spread = engine.spread_payload(
-                &ContainerRequest {
-                    address: RemoteAddress::file(path.to_string_lossy().into_owned()),
-                    spread_mode: None,
-                    reading_direction: None,
-                    force_single_page: false,
-                },
-                &resolved,
-                &[item],
-                None,
-                None,
-            );
+            let spread = engine
+                .spread_payload(
+                    &ContainerRequest {
+                        address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                        spread_mode: None,
+                        reading_direction: None,
+                        force_single_page: false,
+                    },
+                    &resolved,
+                    &[item],
+                    None,
+                    None,
+                    true,
+                    true,
+                )
+                .unwrap();
             assert_eq!(spread.configured, RemoteSpreadMode::LtrCover);
             assert_eq!(spread.effective, RemoteSpreadMode::LtrCover);
             assert_eq!(spread.image_count, 1);
             assert_eq!(spread.video_count, 0);
             assert_eq!(spread.other_count, 0);
         }
+    }
+
+    #[test]
+    fn zip_final_cover_requires_an_all_image_level_but_allows_nested_image_books() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("book.zip");
+        write_remote_ai_test_zip(
+            &zip_path,
+            &[
+                ("root-cover.jpg", b"root"),
+                ("chapter/000.jpg", b"cover"),
+                ("chapter/001.jpg", b"one"),
+                ("chapter/002.jpg", b"two"),
+                ("chapter/003.jpg", b"three"),
+            ],
+        );
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            final_cover_spread_enabled: true,
+            ..Default::default()
+        });
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let request = |subresource| ContainerRequest {
+            address: RemoteAddress {
+                path: zip_path.to_string_lossy().into_owned(),
+                subresource,
+            },
+            spread_mode: Some(RemoteSpreadMode::LtrCover),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: false,
+        };
+
+        let ContainerResponse::Success(root_payload) =
+            engine.container(request(RemoteSubresource::File))
+        else {
+            panic!("mixed ZIP root enumeration failed");
+        };
+        assert!(
+            root_payload
+                .page_groups
+                .iter()
+                .all(|group| group.presentation.is_none())
+        );
+
+        let ContainerResponse::Success(nested_payload) =
+            engine.container(request(RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".to_owned(),
+            }))
+        else {
+            panic!("nested ZIP image book enumeration failed");
+        };
+        assert_eq!(nested_payload.entries.len(), 4);
+        assert!(nested_payload.page_groups[0].presentation.is_none());
+        assert!(
+            nested_payload
+                .page_groups
+                .last()
+                .unwrap()
+                .presentation
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn final_cover_presentation_is_sparse_and_requires_a_complete_book() {
+        let temp = tempfile::tempdir().unwrap();
+        let pages = (0..4)
+            .map(|index| {
+                let path = temp.path().join(format!("{index:03}.jpg"));
+                std::fs::write(&path, b"not-an-image").unwrap();
+                crate::grid_item::GridItem::Image(path)
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_existing(temp.path().to_string_lossy().as_ref()).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            final_cover_spread_enabled: true,
+            ..Default::default()
+        });
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let request = ContainerRequest {
+            address: RemoteAddress::file(temp.path().to_string_lossy().into_owned()),
+            spread_mode: Some(RemoteSpreadMode::LtrCover),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: false,
+        };
+
+        let complete = engine
+            .spread_payload(&request, &resolved, &pages, None, None, true, true)
+            .unwrap();
+        assert_eq!(complete.groups.len(), 3);
+        assert!(complete.groups[0].presentation.is_none());
+        assert_eq!(complete.groups[0].pages.len(), 1);
+        let last = complete.groups.last().unwrap();
+        assert_eq!(last.pages.len(), 1);
+        let presentation = last.presentation.as_ref().unwrap();
+        assert_eq!(presentation.len(), 2);
+        assert_eq!(presentation[0].address, last.pages[0]);
+        assert_eq!(presentation[0].role, RemotePagePresentationRole::Navigation);
+        assert_eq!(presentation[1].address, complete.groups[0].pages[0]);
+        assert_eq!(
+            presentation[1].role,
+            RemotePagePresentationRole::FrontCoverSupplement
+        );
+
+        let incomplete = engine
+            .spread_payload(&request, &resolved, &pages, None, None, true, false)
+            .unwrap();
+        assert!(
+            incomplete
+                .groups
+                .iter()
+                .all(|group| group.presentation.is_none())
+        );
+        assert_eq!(
+            incomplete
+                .groups
+                .iter()
+                .map(|group| (&group.anchor, &group.pages, group.slice))
+                .collect::<Vec<_>>(),
+            complete
+                .groups
+                .iter()
+                .map(|group| (&group.anchor, &group.pages, group.slice))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

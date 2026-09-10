@@ -6351,7 +6351,7 @@ impl App {
 
     fn current_fullscreen_spread_is_double(&mut self, fs_idx: usize) -> bool {
         matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         )
     }
@@ -6377,7 +6377,7 @@ impl App {
     }
 
     fn cycle_ring_transparent_background(&mut self, fs_idx: usize) {
-        let idxs: Vec<usize> = match self.resolve_spread_pair(fs_idx) {
+        let idxs: Vec<usize> = match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
             crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
         };

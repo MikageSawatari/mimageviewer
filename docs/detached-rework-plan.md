@@ -1454,6 +1454,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-10 末尾に表紙を添える見開き（機能branchで実装・独立レビュー・狭域検証済み、未統合）**
+
+親と独立Sol/xhighは、NavigationとFrontCoverSupplementを同じtyped composition / demandに所有させる構造を事前確認した。利用者指定の役割移行により旧ClaudeCode検収は独立Solへ移管し、実装Solとは別担当とする。B2r3差分は独立レビューP1/P2解消・狭域35件・snapshot3枚確認済み。全体gate・実機確認はまだ完了していない。
+
+通常/F12共通のapp.rs・ui_fullscreen.rs・displayed_image_transform.rsで、読書位置をNavigation、実画素の読み込み・描画・保持を全presentationへ投影する。既存navigation phaseがこのdemandを所有し、補助画像だけ別pending状態を追加しない。連結読みでは同じ表紙をunit anchorとroleで区別し、残存unitの需要の和集合からsource保持を決める。viewer_context_registry.rsでは本単位設定を既存context所有境界へ接続する。viewport生成・host identity・配置・focusやgeometryで症状を回避する変更ではない。
+
+適用対象と設計判断、凍結差分、レビュー指摘と検証記録は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。masterへは未統合であり、本項は完成・出荷承認を示さない。
+
 **2026-09-08 別バージョン検索C: viewer別本照会の需要と終了（実装・関連回帰・独立Solレビュー済み、全体gate/実機は後続）**
 
 本タスクの最新利用者指定により、親Astra/mediumと独立Sol/xhighが設計を確認し、実装Sol/xhighを別担当とする。

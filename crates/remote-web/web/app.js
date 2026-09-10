@@ -1400,6 +1400,8 @@ const state = {
   effectiveSpreadMode: SpreadMode.SINGLE,
   readingDirection: ReadingDirection.LTR,
   spreadPageGapPx: 0,
+  finalCoverSpreadPreference: "follow_global",
+  finalCoverSpreadEnabled: true,
   forceSinglePage: false,
   localSettings: LOCAL_SETTINGS_LOAD.settings,
   localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
@@ -2835,6 +2837,21 @@ function dispatchCommand(requested, meta = {}) {
     } else if (requested.name === CommandName.TOGGLE_BOOKMARK) {
       toggleViewerBookmark().catch(() => {});
       handled = true;
+    } else if (
+      [
+        CommandName.FINAL_COVER_FOLLOW_GLOBAL,
+        CommandName.FINAL_COVER_ON,
+        CommandName.FINAL_COVER_OFF,
+      ].includes(requested.name)
+    ) {
+      const preferences = {
+        [CommandName.FINAL_COVER_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.FINAL_COVER_ON]: "on",
+        [CommandName.FINAL_COVER_OFF]: "off",
+      };
+      handled = requestFinalCoverSpreadPreference(
+        preferences[requested.name]
+      );
     } else if (requested.name.startsWith("spread_")) {
       const spreadModes = {
         [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
@@ -4163,7 +4180,16 @@ function containerForceSinglePage(options = {}) {
   }).forceSinglePage;
 }
 
-function applyContainerData(address, data, forceSinglePage, options = {}) {
+export function applyContainerData(address, data, forceSinglePage, options = {}) {
+  // Validate the entire role-aware response before changing container, entries,
+  // navigation ownership, or the position/history owner. A malformed explicit
+  // presentation must leave the previously displayed book intact.
+  const nextEntries = data.entries ?? [];
+  const nextImages = nextEntries.filter((entry) => entry.kind === "image");
+  const nextPageGroups = normalizeContainerPageGroups(
+    data.page_groups ?? [],
+    nextImages
+  );
   const effectiveAddress = data.effective_address ?? address;
   const nextPrefetchContextIdentity = addressIdentity(effectiveAddress);
   if (state.pagePrefetchContextIdentity !== nextPrefetchContextIdentity) {
@@ -4187,6 +4213,10 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
     effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
     readingDirection: data.reading_direction ?? ReadingDirection.LTR,
+    finalCoverSpreadPreference: normalizeFinalCoverSpreadPreference(
+      data.final_cover_spread_preference
+    ),
+    finalCoverSpreadEnabled: data.final_cover_spread_enabled !== false,
     imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
     videoCount: Math.max(0, Math.floor(Number(data.video_count) || 0)),
     otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
@@ -4201,8 +4231,8 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     favoriteForPath(effectiveAddress.path)?.name ??
     "項目";
   state.folderPath = effectiveAddress.path;
-  state.entries = data.entries ?? [];
-  state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.entries = nextEntries;
+  state.images = nextImages;
   state.thumbAspectHeightRatio =
     Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
     Number(data.thumb_aspect_height_ratio) > 0
@@ -4212,8 +4242,10 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   state.effectiveSpreadMode = state.container.effectiveSpreadMode;
   state.readingDirection = state.container.readingDirection;
   state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.finalCoverSpreadPreference = state.container.finalCoverSpreadPreference;
+  state.finalCoverSpreadEnabled = state.container.finalCoverSpreadEnabled;
   state.forceSinglePage = forceSinglePage;
-  setContainerPageGroups(data.page_groups ?? []);
+  setContainerPageGroups(data.page_groups ?? [], nextPageGroups);
   const resumeEntryIndex = state.container.resumePage
     ? state.entries.findIndex(
         (entry) =>
@@ -4229,6 +4261,46 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
       ? folderHash(effectiveAddress.path)
       : containerHash(effectiveAddress);
   state.gridReturnHash = rootReturnHash;
+}
+
+export function containerRuntimeStateForTest() {
+  if (!RUNTIME_TEST_MODE) return null;
+  const position = viewerPositionOwner.current();
+  const positionIdentity = (snapshot) => snapshot
+    ? {
+        groupIndex: snapshot.groupIndex,
+        groupIdentity: snapshot.groupIdentity,
+        contextIdentity: snapshot.contextIdentity,
+      }
+    : null;
+  return {
+    container: state.container ? structuredClone(state.container) : null,
+    entries: state.entries.map(entryIdentity),
+    images: state.images.map(entryIdentity),
+    pageGroups: state.pageGroups.map((group) => ({
+      anchor: entryIdentity(group.anchor),
+      navigation: pageGroupNavigationEntries(group).map(entryIdentity),
+      presentation: pageGroupPresentationSlots(group).map(({ entry, role }) => ({
+        entry: entryIdentity(entry),
+        role,
+      })),
+      slice: group.slice,
+    })),
+    seekPageGroups: state.seekPageGroups.map((group) => [...group]),
+    pageGroupIndex: state.pageGroupIndex,
+    imageIndex: state.imageIndex,
+    position: {
+      requested: positionIdentity(position.requested),
+      displayed: positionIdentity(position.displayed),
+    },
+    history: {
+      state: globalThis.history?.state
+        ? structuredClone(globalThis.history.state)
+        : null,
+      href: String(globalThis.location?.href ?? ""),
+      hash: String(globalThis.location?.hash ?? ""),
+    },
+  };
 }
 
 export function containerInitialImageIndex({ openMode, resumePage, images }) {
@@ -4256,7 +4328,8 @@ function setSinglePageGroups() {
   const previousPosition = viewerPositionOwner.current();
   state.pageGroups = state.images.map((entry) => ({
     anchor: entry,
-    entries: [entry],
+    navigationEntries: [entry],
+    presentationSlots: [{ entry, role: "navigation" }],
     slice: PageSlice.FULL,
   }));
   state.seekPageGroups = state.images.map((_, index) => [index]);
@@ -4265,6 +4338,8 @@ function setSinglePageGroups() {
   state.effectiveSpreadMode = SpreadMode.SINGLE;
   state.readingDirection = ReadingDirection.LTR;
   state.spreadPageGapPx = 0;
+  state.finalCoverSpreadPreference = "follow_global";
+  state.finalCoverSpreadEnabled = true;
   state.forceSinglePage = false;
 }
 
@@ -4277,42 +4352,154 @@ function applyCollectionSpreadData(data, forceSinglePage) {
   setContainerPageGroups(data.page_groups ?? []);
 }
 
-function setContainerPageGroups(groups) {
+function setContainerPageGroups(groups, preparedGroups = null) {
   const previousPosition = viewerPositionOwner.current();
-  const byAddress = new Map(
-    state.images.map((entry) => [addressIdentity(entryAddress(entry)), entry])
+  state.pageGroups = preparedGroups ?? normalizeContainerPageGroups(groups, state.images);
+  const imageIndexes = new Map(
+    state.images.map((entry, index) => [entryIdentity(entry), index])
   );
-  state.pageGroups = groups
+  state.seekPageGroups = state.pageGroups.map((group) =>
+    pageGroupNavigationEntries(group)
+      .map((entry) => imageIndexes.get(entryIdentity(entry)))
+      .filter((index) => Number.isInteger(index))
+  );
+  reanchorViewerPageGroups(previousPosition);
+}
+
+export function normalizeContainerPageGroups(groups, images) {
+  const byAddress = new Map(
+    images.map((entry) => [addressIdentity(entryAddress(entry)), entry])
+  );
+  const normalized = groups
     .map((group) => {
-      const entries = (group.pages ?? [])
+      const explicitPresentation =
+        group.presentation !== undefined && group.presentation !== null;
+      const navigationEntries = (group.pages ?? [])
         .map((address) => byAddress.get(addressIdentity(address)))
         .filter(Boolean);
       const anchor = byAddress.get(addressIdentity(group.anchor));
-      if (!anchor || entries.length !== (group.pages ?? []).length) return null;
+      if (
+        !anchor ||
+        navigationEntries.length !== (group.pages ?? []).length ||
+        !navigationEntries.length ||
+        !navigationEntries.some(
+          (entry) => entryIdentity(entry) === entryIdentity(anchor)
+        )
+      ) {
+        if (explicitPresentation) {
+          throw new TypeError("ページの表示構成が不正です。");
+        }
+        return null;
+      }
       // 分割中は同じ entries を持つ group が 2 つ並ぶ。左右はここから先、表示と位置
       // 復元の両方が読む。知らない値が来たら分割なしとして扱う。
       const slice = Object.values(PageSlice).includes(group.slice)
         ? group.slice
         : PageSlice.FULL;
-      return { anchor, entries, slice };
+      const presentationSlots = normalizePagePresentationSlots(
+        group.presentation,
+        navigationEntries,
+        byAddress,
+        anchor
+      );
+      if (presentationSlots === null) {
+        throw new TypeError("ページの表示構成が不正です。");
+      }
+      return { anchor, navigationEntries, presentationSlots, slice };
     })
     .filter(Boolean);
-  if (!state.pageGroups.length && state.images.length) {
-    state.pageGroups = state.images.map((entry) => ({
+  if (!normalized.length && images.length) {
+    return images.map((entry) => ({
       anchor: entry,
-      entries: [entry],
+      navigationEntries: [entry],
+      presentationSlots: [{ entry, role: "navigation" }],
       slice: PageSlice.FULL,
     }));
   }
-  const imageIndexes = new Map(
-    state.images.map((entry, index) => [entryIdentity(entry), index])
+  return normalized;
+}
+
+const PAGE_PRESENTATION_ROLES = new Set([
+  "navigation",
+  "front_cover_supplement",
+]);
+
+export function normalizeFinalCoverSpreadPreference(value) {
+  return ["follow_global", "on", "off"].includes(value)
+    ? value
+    : "follow_global";
+}
+
+export function finalCoverSpreadWriteRequest(address, preference) {
+  const normalized = normalizeFinalCoverSpreadPreference(preference);
+  if (!remoteAddressLooksValid(address) || normalized !== preference) return null;
+  return {
+    kind: "set_final_cover_spread_preference",
+    address,
+    preference: normalized,
+  };
+}
+
+export function pageGroupNavigationEntries(group) {
+  return group?.navigationEntries ?? group?.entries ?? [];
+}
+
+export function pageGroupPresentationSlots(group) {
+  const slots = group?.presentationSlots;
+  if (Array.isArray(slots) && slots.length) return slots;
+  return pageGroupNavigationEntries(group).map((entry) => ({
+    entry,
+    role: "navigation",
+  }));
+}
+
+export function normalizePagePresentationSlots(
+  presentation,
+  navigationEntries,
+  byAddress,
+  anchor = null
+) {
+  const fallback = (navigationEntries ?? []).map((entry) => ({
+    entry,
+    role: "navigation",
+  }));
+  const anchorInNavigation =
+    anchor === null ||
+    fallback.some(
+      ({ entry }) => entryIdentity(entry) === entryIdentity(anchor)
+    );
+  if (presentation === undefined || presentation === null) return fallback;
+  if (
+    !Array.isArray(presentation) ||
+    !presentation.length ||
+    presentation.length > MAX_VIEWER_VISIBLE_PAGES ||
+    !fallback.length ||
+    !anchorInNavigation
+  ) return null;
+  const slots = presentation.map((slot) => ({
+    entry: byAddress.get(addressIdentity(slot?.address)),
+    role: slot?.role,
+  }));
+  if (
+    slots.some(({ entry, role }) => !entry || !PAGE_PRESENTATION_ROLES.has(role))
+  ) return null;
+  const slotIdentities = slots.map(({ entry }) =>
+    addressIdentity(entryAddress(entry))
   );
-  state.seekPageGroups = state.pageGroups.map((group) =>
-    group.entries
-      .map((entry) => imageIndexes.get(entryIdentity(entry)))
-      .filter((index) => Number.isInteger(index))
-  );
-  reanchorViewerPageGroups(previousPosition);
+  if (new Set(slotIdentities).size !== slotIdentities.length) return null;
+  if (
+    slots.filter(({ role }) => role === "front_cover_supplement").length !== 1
+  ) return null;
+  const navigationIdentities = slots
+    .filter(({ role }) => role === "navigation")
+    .map(({ entry }) => entryIdentity(entry));
+  if (
+    navigationIdentities.length !== fallback.length ||
+    navigationIdentities.some(
+      (identity, index) => identity !== entryIdentity(fallback[index].entry)
+    )
+  ) return null;
+  return slots;
 }
 
 /// このページを含む表示単位を探す規則。
@@ -4326,7 +4513,9 @@ function setContainerPageGroups(groups) {
 export function pageGroupIndexIn(groups, entry, slice = null) {
   const identity = entryIdentity(entry);
   const contains = (group) =>
-    (group?.entries ?? []).some((page) => entryIdentity(page) === identity);
+    pageGroupNavigationEntries(group).some(
+      (page) => entryIdentity(page) === identity
+    );
   if (slice !== null) {
     const exact = (groups ?? []).findIndex(
       (group) => contains(group) && (group.slice ?? PageSlice.FULL) === slice
@@ -4340,24 +4529,35 @@ function pageGroupIndexForEntry(entry, slice = null) {
   return pageGroupIndexIn(state.pageGroups, entry, slice);
 }
 
-function pageRenderContextForEntry(entry) {
-  const contextAddress = state.container?.address;
-  const groupIndex = pageGroupIndexForEntry(entry);
-  const group = state.pageGroups[groupIndex];
+export function pageRenderContextForSlot(
+  group,
+  pageIndex,
+  contextAddress = state.container?.address
+) {
   if (!contextAddress || !group) return null;
-  const pageIndex = group.entries.findIndex(
-    (page) => entryIdentity(page) === entryIdentity(entry)
-  );
-  if (pageIndex < 0) return null;
-  const partnerIndex = viewerSpreadPartnerIndex(group.entries.length, pageIndex);
+  const slots = pageGroupPresentationSlots(group);
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= slots.length) {
+    return null;
+  }
+  const partnerIndex = viewerSpreadPartnerIndex(slots.length, pageIndex);
   const spreadPartner = partnerIndex === null
     ? null
-    : entryAddress(group.entries[partnerIndex]);
+    : entryAddress(slots[partnerIndex].entry);
   return {
     context_address: contextAddress,
-    display_slot: viewerPageDisplaySlot(group.entries.length, pageIndex),
+    display_slot: viewerPageDisplaySlot(slots.length, pageIndex),
     spread_partner: spreadPartner,
   };
+}
+
+export function pageGroupPresentationIdentity(group) {
+  if (!group) return "";
+  return [
+    group.slice ?? PageSlice.FULL,
+    ...pageGroupPresentationSlots(group).map(
+      ({ entry, role }) => `${role}:${entryIdentity(entry)}`
+    ),
+  ].join("\n");
 }
 
 function currentPageGroup() {
@@ -4387,8 +4587,7 @@ function captureViewerPageGroupRequest(
     pageGroups: state.pageGroups,
     group,
     groupIndex,
-    groupIdentity: [group.slice ?? PageSlice.FULL, ...group.entries.map(entryIdentity)]
-      .join("\n"),
+    groupIdentity: pageGroupPresentationIdentity(group),
     contextIdentity: viewerPageContextIdentity(),
   };
 }
@@ -4421,7 +4620,9 @@ function viewerPagePresentation(
   const group = state.pageGroups[groupIndex];
   if (!group) return null;
   return {
-    name: group.entries.map((entry) => entry.name).join(" / "),
+    name: pageGroupPresentationSlots(group)
+      .map(({ entry }) => entry.name)
+      .join(" / "),
     seekState: viewerSeekSnapshot(groupIndex),
     positionSnapshot,
   };
@@ -4483,6 +4684,12 @@ function openViewerPagePosition(viewer, groupIndex) {
   })) return snapshot;
   reanchorViewerPageGroups();
   return null;
+}
+
+export function openViewerPagePositionForTest(viewer, groupIndex) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  return Boolean(openViewerPagePosition(viewer, groupIndex));
 }
 
 function resolveReanchoredViewerPosition(snapshot, viewer = state.viewer) {
@@ -4977,6 +5184,45 @@ function requestSpreadMode(mode) {
           writeError instanceof Error
             ? writeError.message
             : "見開き設定を保存できませんでした。"
+        );
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
+    }
+  });
+  return true;
+}
+
+function requestFinalCoverSpreadPreference(preference) {
+  const normalized = normalizeFinalCoverSpreadPreference(preference);
+  if (!state.container || normalized !== preference) return false;
+  const address = state.container.address;
+  const writeRequest = finalCoverSpreadWriteRequest(address, normalized);
+  if (!writeRequest) return false;
+  const identity = activeSpreadContextIdentity();
+  const sequence = ++spreadWriteSequence;
+  state.finalCoverSpreadPreference = normalized;
+  state.container.finalCoverSpreadPreference = normalized;
+  spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
+    let writeError = null;
+    try {
+      await apiAddressPostJson("/api/write", writeRequest);
+    } catch (error) {
+      writeError = error;
+    }
+    if (
+      sequence === spreadWriteSequence &&
+      activeSpreadContextIdentity() === identity
+    ) {
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(),
+        "final_cover_spread_refresh"
+      );
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(
+          writeError instanceof Error
+            ? writeError.message
+            : "末尾の表紙見開き設定を保存できませんでした。"
         );
       } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
         state.viewer?.showBoundaryMessage(refresh.message);
@@ -6451,7 +6697,11 @@ function viewerImageFailureForDisplay(
 ) {
   if (
     result?.outcome === ViewerGroupLoadOutcome.FAILED &&
-    (renderTrigger === "spread_refresh" || renderTrigger === "viewport_resize")
+    (
+      renderTrigger === "spread_refresh" ||
+      renderTrigger === "final_cover_spread_refresh" ||
+      renderTrigger === "viewport_resize"
+    )
   ) {
     const originalMessage = typeof result.message === "string"
       ? result.message.trim()
@@ -6493,12 +6743,14 @@ async function updateViewerImage(
   }
   updateDecodedPageUnitWindow(state.pageGroupIndex);
   const loadRequest = captureViewerPageGroupRequest(viewer, state.pageGroupIndex);
-  const identity = group.entries.map(entryIdentity).join("\n");
+  const presentationSlots = pageGroupPresentationSlots(group);
+  const presentationEntries = presentationSlots.map(({ entry }) => entry);
+  const identity = pageGroupPresentationIdentity(group);
   const remoteSessionIdSnapshot = state.remoteSessionId;
   const remoteSessionCacheEpochSnapshot = state.remoteSessionCacheEpoch;
   const generationSnapshot = viewerPageGroupGenerationSnapshot(
     state.remoteStateGeneration,
-    group.entries.length
+    presentationEntries.length
   );
   // 例外も 3 outcome の境界の内側で受ける。ここを抜けると呼び出し側の
   // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
@@ -6508,14 +6760,14 @@ async function updateViewerImage(
   let loadGroupReached = false;
   let displayRequestId = null;
   try {
-    const infos = await Promise.all(group.entries.map(imageInfo));
+    const infos = await Promise.all(presentationEntries.map(imageInfo));
     const contextExit = viewerImageUpdateContextExitReason({
       viewerMatches: state.viewer === viewer,
       sessionMatches: state.remoteSessionId === remoteSessionIdSnapshot,
       cacheEpochMatches:
         state.remoteSessionCacheEpoch === remoteSessionCacheEpochSnapshot,
       groupMatches:
-        currentPageGroup()?.entries.map(entryIdentity).join("\n") === identity,
+        pageGroupPresentationIdentity(currentPageGroup()) === identity,
     });
     if (contextExit) {
       return supersedeViewerImageUpdate(
@@ -6532,13 +6784,15 @@ async function updateViewerImage(
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationEntries.length > 1 ? state.spreadPageGapPx : 0,
     });
-    pages = group.entries.map((entry, pageIndex) => ({
+    pages = presentationSlots.map(({ entry, role }, pageIndex) => ({
       entry,
+      role,
       info: infos[pageIndex],
       request: imageRequest(entry, infos[pageIndex], viewer.stage, {
         layout: layout.pages[pageIndex],
+        renderContext: pageRenderContextForSlot(group, pageIndex),
         remoteStateGeneration: generationSnapshot.pages[pageIndex],
         remoteSessionId: remoteSessionIdSnapshot,
         remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
@@ -6557,7 +6811,7 @@ async function updateViewerImage(
     loadGroupReached = true;
     result = await viewer.loadGroup({
       pages,
-      name: group.entries.map((entry) => entry.name).join(" / "),
+      name: presentationEntries.map((entry) => entry.name).join(" / "),
       fitMode: state.fitMode,
       gap: layout.gap,
       index: state.pageGroupIndex,
@@ -6658,7 +6912,7 @@ async function updateViewerImage(
   if (refreshPlan.bookmarks) state.commandMenu?.refreshBookmarks();
   state.commandMenu?.refreshViewTrim();
   observeReadingProgress();
-  if (group.entries.every((entry) => entry.address)) {
+  if (presentationEntries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
     queuePageDecodeAhead();
     return VIEWER_GROUP_LOAD_APPLIED;
@@ -6676,7 +6930,7 @@ async function updateViewerImage(
 }
 
 function decodedPageUnitKey(group) {
-  return group?.entries?.map(entryIdentity).join("\n") ?? "";
+  return pageGroupPresentationIdentity(group);
 }
 function viewerHasCommittedDecodedUnit(viewer) {
   const currentKey = decodedPageUnitKey(currentPageGroup());
@@ -6692,7 +6946,8 @@ function updateDecodedPageUnitWindow(currentIndex = state.pageGroupIndex) {
   const units = indexes
     .map((index) => ({ index, group: state.pageGroups[index] }))
     .filter(({ group }) =>
-      group?.entries?.length && group.entries.every((entry) => entry.address)
+      pageGroupPresentationSlots(group).length &&
+      pageGroupPresentationSlots(group).every(({ entry }) => entry.address)
     )
     .map(({ index, group }) => ({
       index,
@@ -6751,7 +7006,10 @@ async function schedulePageDecodeAhead(viewer) {
   const renderRevisionSnapshot = state.pageRenderRevision;
   const units = updateDecodedPageUnitWindow(groupIndexSnapshot);
   const plans = await Promise.all(units.map(async ({ group, key }) => {
-    const infos = await Promise.all(group.entries.map(imageInfo));
+    const presentationSlots = pageGroupPresentationSlots(group);
+    const infos = await Promise.all(
+      presentationSlots.map(({ entry }) => imageInfo(entry))
+    );
     const layout = viewerSlicedSpreadLayout({
       mode: fitModeSnapshot,
       pages: infos,
@@ -6759,20 +7017,22 @@ async function schedulePageDecodeAhead(viewer) {
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationSlots.length > 1 ? state.spreadPageGapPx : 0,
     });
     const pageGenerations = viewerPageGroupGenerationSnapshot(
       generationSnapshot,
-      group.entries.length
+      presentationSlots.length
     );
     return {
       key,
-      pages: group.entries.map((entry, pageIndex) => ({
+      pages: presentationSlots.map(({ entry, role }, pageIndex) => ({
         entry,
+        role,
         info: infos[pageIndex],
         request: imageRequest(entry, infos[pageIndex], viewer.stage, {
           prefetch: true,
           layout: layout.pages[pageIndex],
+          renderContext: pageRenderContextForSlot(group, pageIndex),
           previewRevision: renderRevisionSnapshot,
           remoteStateGeneration: pageGenerations.pages[pageIndex],
           remoteSessionId: sessionSnapshot,
@@ -6815,9 +7075,70 @@ async function schedulePageDecodeAhead(viewer) {
   }
 }
 
+export function pagePrefetchTargetGroups(indexes, images, groups) {
+  const targets = new Map();
+  for (const index of indexes ?? []) {
+    const entry = images?.[index];
+    if (!entry?.address) continue;
+    const groupIndex = pageGroupIndexIn(groups, entry);
+    const targetGroup = groups?.[groupIndex];
+    if (!targetGroup) continue;
+    const groupKey = pageGroupPresentationIdentity(targetGroup);
+    const existing = targets.get(groupKey);
+    if (existing) {
+      if (!existing.navigationIndexes.includes(index)) {
+        existing.navigationIndexes.push(index);
+      }
+      continue;
+    }
+    targets.set(groupKey, {
+      groupKey,
+      targetGroup,
+      navigationIndexes: [index],
+    });
+  }
+  return [...targets.values()];
+}
+
+export function pagePrefetchRequestKeys(indexes, requestPlans) {
+  const selectedIndexes = new Set(indexes ?? []);
+  return [
+    ...new Set(
+      (requestPlans ?? [])
+        .filter((plan) =>
+          plan.navigationIndexes?.some((index) => selectedIndexes.has(index))
+        )
+        .flatMap((plan) => plan.requests ?? [])
+        .map((request) => request.cacheKey)
+        .filter(Boolean)
+    ),
+  ];
+}
+
+export function pagePrefetchResourceLimit(
+  currentGroup,
+  requestPlans,
+  effectiveWindow
+) {
+  const plannedResourceCount = new Set(
+    (requestPlans ?? [])
+      .flatMap((plan) => plan.requests ?? [])
+      .map((request) => request.cacheKey)
+      .filter(Boolean)
+  ).size;
+  const presentationResourceCount = pageGroupPresentationSlots(currentGroup).length;
+  return Math.max(
+    pageResourceCacheLimit({
+      visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+      ...effectiveWindow,
+    }),
+    Math.max(1, presentationResourceCount + plannedResourceCount)
+  );
+}
+
 async function schedulePagePrefetch(viewer) {
   const group = currentPageGroup();
-  const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
+  const currentIdentity = pageGroupPresentationIdentity(group);
   const effectiveWindow = pagePrefetchWindow({
     configuredAhead: state.localSettings.prefetchAhead,
     configuredBehind: state.localSettings.prefetchBehind,
@@ -6825,7 +7146,7 @@ async function schedulePagePrefetch(viewer) {
   });
   hudState.pagePrefetch = null;
   updateHud();
-  const visibleIndexes = (group?.entries ?? [])
+  const visibleIndexes = pageGroupNavigationEntries(group)
     .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
     .filter((index) => index >= 0);
   const indexes = pagePrefetchPlan({
@@ -6841,14 +7162,17 @@ async function schedulePagePrefetch(viewer) {
     ahead: effectiveWindow.ahead,
     behind: effectiveWindow.behind,
   });
-  const requests = await Promise.all(
-    indexes.map(async (index) => {
-      const entry = state.images[index];
-      if (!entry?.address) return null;
-      const groupIndex = pageGroupIndexForEntry(entry);
-      const targetGroup = state.pageGroups[groupIndex];
-      if (!targetGroup) return null;
-      const infos = await Promise.all(targetGroup.entries.map(imageInfo));
+  const targetGroups = pagePrefetchTargetGroups(
+    indexes,
+    state.images,
+    state.pageGroups
+  );
+  const requestPlans = await Promise.all(
+    targetGroups.map(async ({ groupKey, targetGroup, navigationIndexes }) => {
+      const presentationSlots = pageGroupPresentationSlots(targetGroup);
+      const infos = await Promise.all(
+        presentationSlots.map(({ entry: page }) => imageInfo(page))
+      );
       const layout = viewerSlicedSpreadLayout({
         mode: state.fitMode,
         pages: infos,
@@ -6856,15 +7180,19 @@ async function schedulePagePrefetch(viewer) {
         viewportWidth: viewer.stage.clientWidth || window.innerWidth,
         viewportHeight: viewer.stage.clientHeight || window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
-        gap: targetGroup.entries.length > 1 ? state.spreadPageGapPx : 0,
+        gap: presentationSlots.length > 1 ? state.spreadPageGapPx : 0,
       });
-      const pageIndex = targetGroup.entries.findIndex(
-        (page) => entryIdentity(page) === entryIdentity(entry)
-      );
-      return imageRequest(entry, infos[pageIndex], viewer.stage, {
-        prefetch: true,
-        layout: layout.pages[pageIndex],
-      });
+      return {
+        groupKey,
+        navigationIndexes,
+        requests: presentationSlots.map(({ entry: page }, pageIndex) =>
+          imageRequest(page, infos[pageIndex], viewer.stage, {
+            prefetch: true,
+            layout: layout.pages[pageIndex],
+            renderContext: pageRenderContextForSlot(targetGroup, pageIndex),
+          })
+        ),
+      };
     })
   );
   const latestEffectiveWindow = pagePrefetchWindow({
@@ -6874,28 +7202,28 @@ async function schedulePagePrefetch(viewer) {
   });
   if (
     state.viewer !== viewer ||
-    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== currentIdentity ||
+    pageGroupPresentationIdentity(currentPageGroup()) !== currentIdentity ||
     latestEffectiveWindow.ahead !== effectiveWindow.ahead ||
     latestEffectiveWindow.behind !== effectiveWindow.behind
   ) {
     return;
   }
-  const requestsByIndex = new Map(
-    indexes.map((index, requestIndex) => [index, requests[requestIndex]])
-  );
   hudState.pagePrefetch = {
-    behindKeys: hudPlan.behindIndexes
-      .map((index) => requestsByIndex.get(index)?.cacheKey)
-      .filter(Boolean),
-    aheadKeys: hudPlan.aheadIndexes
-      .map((index) => requestsByIndex.get(index)?.cacheKey)
-      .filter(Boolean),
+    behindKeys: pagePrefetchRequestKeys(hudPlan.behindIndexes, requestPlans),
+    aheadKeys: pagePrefetchRequestKeys(hudPlan.aheadIndexes, requestPlans),
   };
-  pageResourceCache.setLimit(pageResourceCacheLimit({
-    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
-    ...effectiveWindow,
-  }));
-  pageDemandAdapter.setPlan(requests.filter(Boolean));
+  pageResourceCache.setLimit(
+    pagePrefetchResourceLimit(group, requestPlans, effectiveWindow)
+  );
+  pageDemandAdapter.setPlan(
+    [
+      ...new Map(
+        requestPlans
+          .flatMap((plan) => plan.requests)
+          .map((request) => [request.cacheKey, request])
+      ).values(),
+    ]
+  );
   pageResourceCache.trimUnprotected("window_out");
   updateHud();
 }
@@ -6910,6 +7238,7 @@ export function imageRequest(
     targetPxOverride = null,
     adjustmentPreview = null,
     previewRevision = null,
+    renderContext = null,
     remoteStateGeneration = state.remoteStateGeneration,
     remoteSessionId = state.remoteSessionId,
     remoteSessionCacheEpoch = state.remoteSessionCacheEpoch,
@@ -6917,7 +7246,6 @@ export function imageRequest(
 ) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
-    const renderContext = pageRenderContextForEntry(entry);
     const resolvedLayout = layout ?? viewerImageLayout({
         mode: state.fitMode,
         sourceWidth: info.width,
@@ -8114,7 +8442,13 @@ function remoteBookContainerIdentity(address) {
   return address?.path ?? "";
 }
 
-export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
+export function viewerMenuDefinitions({
+  hasContainer,
+  barsVisible,
+  supportsFinalCoverSetting = false,
+  finalCoverPreference = "follow_global",
+  finalCoverEnabled = true,
+}) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
   const mainActions = [
     [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
@@ -8186,6 +8520,29 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
         [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
         [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
         [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        ...(supportsFinalCoverSetting
+          ? [
+              [
+                CommandName.FINAL_COVER_FOLLOW_GLOBAL,
+                `${finalCoverPreference === "follow_global" ? "✓ " : ""}末尾に表紙: 全体設定に従う`,
+                finalCoverPreference === "follow_global"
+                  ? finalCoverEnabled
+                    ? "現在 ON"
+                    : "現在 OFF"
+                  : "全体設定",
+              ],
+              [
+                CommandName.FINAL_COVER_ON,
+                `${finalCoverPreference === "on" ? "✓ " : ""}末尾に表紙: ON`,
+                "この本",
+              ],
+              [
+                CommandName.FINAL_COVER_OFF,
+                `${finalCoverPreference === "off" ? "✓ " : ""}末尾に表紙: OFF`,
+                "この本",
+              ],
+            ]
+          : []),
       ],
     },
     position: {
@@ -8204,6 +8561,9 @@ function menuDefinition(context, page = "main") {
     const definitions = viewerMenuDefinitions({
       hasContainer: Boolean(state.container || refreshableCollectionRoute()),
       barsVisible: state.viewerBarsVisible,
+      supportsFinalCoverSetting: Boolean(state.container),
+      finalCoverPreference: state.finalCoverSpreadPreference,
+      finalCoverEnabled: state.finalCoverSpreadEnabled,
     });
     return definitions[page] ?? definitions.main;
   }
@@ -8554,7 +8914,7 @@ export class ViewerViewTrimPanel {
   renderState() {
     const value = this.serverState;
     if (!value) return;
-    const isSpread = (currentPageGroup()?.entries.length ?? 0) === 2;
+    const isSpread = pageGroupPresentationSlots(currentPageGroup()).length === 2;
     const manual = value.apply_mode === "book";
     this.modeSelect.value = value.apply_mode;
     this.enabledInput.checked = value.book_settings.enabled;
@@ -9721,29 +10081,29 @@ export class ViewerAdjustmentPanel {
 
   currentTarget() {
     const group = currentPageGroup();
-    const entry = group?.entries[this.targetIndex];
+    const slot = pageGroupPresentationSlots(group)[this.targetIndex];
+    const entry = slot?.entry;
     const address = entry ? entryAddress(entry) : null;
     if (!entry || !address?.path) return null;
     return {
       entry,
       address,
       pageIndex: this.targetIndex,
-      identity: `${state.pageGroupIndex}\n${addressIdentity(address)}`,
+      renderContext: pageRenderContextForSlot(group, this.targetIndex),
+      identity: `${state.pageGroupIndex}\n${pageGroupPresentationIdentity(group)}\n${this.targetIndex}`,
     };
   }
 
   async refresh() {
     const group = currentPageGroup();
-    const nextGroupIdentity = `${state.pageGroupIndex}\n${(group?.entries ?? [])
-      .map(entryIdentity)
-      .join("\n")}`;
+    const nextGroupIdentity = `${state.pageGroupIndex}\n${pageGroupPresentationIdentity(group)}`;
     if (this.groupIdentity !== nextGroupIdentity) {
       this.groupIdentity = nextGroupIdentity;
       this.targetIndex = 0;
       this.previewEpoch += 1;
       this.previewQueue.clear();
     }
-    this.targetRow.hidden = (group?.entries.length ?? 0) !== 2;
+    this.targetRow.hidden = pageGroupPresentationSlots(group).length !== 2;
     this.syncTargetButtons();
     const target = this.currentTarget();
     if (!target) {
@@ -9827,6 +10187,7 @@ export class ViewerAdjustmentPanel {
       targetPxOverride: 768,
       adjustmentPreview: { scope: job.scope, values: job.values },
       previewRevision: `preview-${state.pageRenderRevision}-${job.sequence}`,
+      renderContext: job.renderContext,
     });
     if (job.cancelled) return;
     job.controller = new AbortController();

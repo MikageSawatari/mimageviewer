@@ -1468,7 +1468,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
     FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
-            idx: page_idx,
+            occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
             layout_size: texture.size_vec2(),
             post_filter: crate::adjustment::PostFilter::None,
             trace_key: None,
@@ -19878,6 +19878,7 @@ mod favorite_adjustment_defaults_tests {
         app.text_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Rtl,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.text_mode = true;
 
@@ -19919,6 +19920,7 @@ mod favorite_adjustment_defaults_tests {
         app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.fs_zoom = 2.0;
         app.fs_pan = egui::Vec2::new(50.0, 30.0);
@@ -20595,6 +20597,68 @@ mod favorite_adjustment_defaults_tests {
             app.reconcile_page_edit_spread_pivots();
             assert_eq!(app.spread_mode, SpreadMode::Ltr, "ツール {index}");
             assert_eq!(app.fullscreen_idx, Some(pivot.pair.0), "ツール {index}");
+        }
+    }
+
+    #[test]
+    fn final_cover_edit_uses_the_actual_page_but_restores_and_closes_at_the_last_anchor() {
+        use crate::settings::{FinalCoverSpreadPreference, SpreadMode};
+
+        for (mode, screen_pair) in [
+            (SpreadMode::LtrCover, (3, 0)),
+            (SpreadMode::RtlCover, (0, 3)),
+        ] {
+            let mut app = setup_app();
+            app.current_folder = Some(std::path::PathBuf::from("c:/book"));
+            app.top_level_grid_view
+                .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+            app.items = (0..4)
+                .map(|idx| {
+                    crate::grid_item::GridItem::Image(std::path::PathBuf::from(format!(
+                        "c:/book/{idx}.jpg"
+                    )))
+                })
+                .collect();
+            app.visible_indices = (0..4).collect();
+            app.details_order = (0..4).collect();
+            app.viewer_navigation_caches.invalidate();
+            app.spread_mode = mode;
+            app.settings.final_cover_spread_enabled = true;
+            app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
+            app.fullscreen_idx = Some(3);
+
+            let (_, pivot) = app.plan_page_edit_pivot(3);
+            let pivot = pivot.expect("final singleton has a presentation supplement");
+            assert_eq!(pivot.pair, screen_pair);
+            assert_eq!(pivot.navigation_anchor_idx, 3);
+
+            // Select the physical cover source, as a left/right switch inside the editor does.
+            app.enter_page_edit_single_view(0);
+            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_mode = true;
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(0),
+                "actual edit source remains the cover"
+            );
+
+            app.local_adjust_mode = false;
+            app.reconcile_page_edit_spread_pivots();
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(3),
+                "cancel restores navigation anchor"
+            );
+            assert_eq!(app.spread_mode, mode);
+
+            // Closing or switching books tears the editor down instead of restoring the spread,
+            // but the grid/resume cursor still comes from the saved navigation anchor.
+            app.enter_page_edit_single_view(0);
+            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_mode = true;
+            app.close_fullscreen();
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(3));
         }
     }
 
@@ -26479,6 +26543,7 @@ mod favorite_adjustment_defaults_tests {
         app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.fs_zoom = 2.0;
         app.fs_pan = egui::Vec2::new(50.0, 30.0);
@@ -26511,6 +26576,7 @@ mod favorite_adjustment_defaults_tests {
         app.export_crop_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.fs_zoom = 2.0;
         app.fs_pan = egui::Vec2::new(50.0, 30.0);
@@ -27109,7 +27175,7 @@ mod favorite_adjustment_defaults_tests {
             panic!("folder navigation must own a captured display unit");
         };
         assert_eq!(unit.pages.len(), 1);
-        assert_eq!(unit.pages[0].idx, idx);
+        assert_eq!(unit.pages[0].idx(), idx);
         assert_eq!(unit.pages[0].texture.id(), texture_id);
     }
 
@@ -27231,7 +27297,7 @@ mod favorite_adjustment_defaults_tests {
                 panic!("folder navigation must retain a display unit");
             };
             assert_eq!(
-                unit.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+                unit.pages.iter().map(|page| page.idx()).collect::<Vec<_>>(),
                 expected_indices,
             );
             assert_eq!(
@@ -30446,6 +30512,7 @@ mod favorite_adjustment_defaults_tests {
         app.local_adjust_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
 
         // 左ページで「投げ縄を描きかけ、図形を 1 つ選び、ドラッグ単位 Undo の退避も
@@ -30521,6 +30588,7 @@ mod favorite_adjustment_defaults_tests {
         app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.erase_mode = true;
         app.fs_nav_locked_gen = Some(app.items_generation);
@@ -30580,6 +30648,7 @@ mod favorite_adjustment_defaults_tests {
         app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
@@ -31602,7 +31671,9 @@ mod pipeline_cache_refactor_tests {
             target_idx,
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
-                    idx: page_idx,
+                    occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
+                        page_idx, target_idx,
+                    ),
                     layout_size: texture.size_vec2(),
                     post_filter: crate::adjustment::PostFilter::None,
                     trace_key: None,
@@ -32582,6 +32653,48 @@ mod pipeline_cache_refactor_tests {
                 .map(FsHoldover::primary_texture_id),
             Some(existing_id),
             "a non-current page reload must not mutate the current viewer holdover"
+        );
+    }
+
+    #[test]
+    fn final_cover_source_reload_captures_the_complete_visible_unit() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from("C:/pics/final-cover-book"));
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        for page in 0..4 {
+            push_image(&mut app, &format!("C:/pics/final-cover-book/{page}.jpg"));
+        }
+        app.rebuild_visible_indices();
+        app.details_order = (0..app.items.len()).collect();
+        app.viewer_navigation_caches.invalidate();
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        app.settings.final_cover_spread_enabled = true;
+        app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On;
+        app.settings.global_preset.colorize.mode = ColorizeMode::MonochromeOnly;
+        app.fullscreen_idx = Some(3);
+
+        let _ = populate_all_idx_caches(&mut app, &ctx, 0, "final_cover_reload_cover");
+        let _ = populate_all_idx_caches(&mut app, &ctx, 3, "final_cover_reload_last");
+        app.capture_final_effect_source_reload_holdover(0);
+
+        let FsHoldover::FinalEffectSourceReload(holdover) =
+            app.fs_holdover_tex.as_ref().expect("visible unit is held")
+        else {
+            panic!("source reload must use its display-only owner");
+        };
+        assert_eq!(
+            holdover
+                .previous
+                .pages
+                .iter()
+                .map(|page| page.occurrence)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::ui_fullscreen::SpreadPageOccurrence::navigation(3, 3),
+                crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 3),
+            ]
         );
     }
 
@@ -37074,6 +37187,60 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.fs_pending.contains_key(&right),
             "先読みウィンドウが相方の昇格をキャンセルしている"
+        );
+    }
+
+    #[test]
+    fn paged_final_cover_partner_survives_the_last_pages_keep_trim() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(PathBuf::from("C:/book"));
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        for page in 0..8 {
+            push_image(&mut app, &format!("C:/book/{page}.jpg"));
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = (0..app.items.len()).collect();
+        app.viewer_navigation_caches.invalidate();
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        app.settings.final_cover_spread_enabled = true;
+        app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On;
+        app.settings.prefetch_back = 0;
+        app.settings.prefetch_forward = 0;
+        let last = app.items.len() - 1;
+        app.fullscreen_idx = Some(last);
+
+        for idx in [0, last] {
+            let pixels = Arc::new(egui::ColorImage::filled(
+                [1, 1],
+                egui::Color32::from_gray(80 + idx as u8),
+            ));
+            let texture = ctx.load_texture(
+                format!("final-cover-keep-{idx}"),
+                pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex: texture,
+                    pixels,
+                    source_dims: Some([1, 1]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+
+        assert_eq!(app.displayed_spread_partner(last), Some(0));
+        assert!(app.compute_keep_set(last).contains(&0));
+        app.update_prefetch_window(last);
+
+        assert!(app.fs_cache.contains_key(&last));
+        assert!(
+            app.fs_cache.contains_key(&0),
+            "the distant cover source is still part of the visible final unit"
         );
     }
 
@@ -53689,6 +53856,7 @@ mod still_window_mode_key_tests {
             app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
                 saved_mode: crate::settings::SpreadMode::Ltr,
                 pair: (idx, idx),
+                navigation_anchor_idx: idx,
             });
             insert_static_fs_entry(app, &ctx, idx, "pause_foreground_modes");
         });
@@ -71368,6 +71536,7 @@ mod sns_split_p2_transition_tests {
         app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
             saved_mode: crate::settings::SpreadMode::Ltr,
             pair: (0, 1),
+            navigation_anchor_idx: 0,
         });
     }
 

@@ -2491,6 +2491,10 @@ mod tests {
         };
         vec![
             write_request(),
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: container.clone(),
+                preference: mimageviewer_ipc::RemoteFinalCoverSpreadPreference::On,
+            },
             RemoteWriteRequest::RecordReadingProgress {
                 address: page.clone(),
                 context_address: container.clone(),
