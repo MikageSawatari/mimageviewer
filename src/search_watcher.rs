@@ -98,6 +98,14 @@ impl FsWatcher {
     pub fn favorite_id(&self) -> Uuid {
         self.favorite_id
     }
+
+    /// The debounce worker is the last in-process link from notify to both metadata and similar
+    /// consumers. A terminal worker means the recursive watch can no longer be treated as ready.
+    pub fn is_stopped(&self) -> bool {
+        self.thread_handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
 }
 
 impl Drop for FsWatcher {
@@ -200,6 +208,19 @@ struct PendingEntry {
 /// 1 件の notify::Event を pending map に吸収する。
 fn absorb_event(event: &Event, pending: &mut HashMap<PathBuf, PendingEntry>) {
     use notify::event::{ModifyKind, RenameMode};
+    if event.need_rescan()
+        || event.paths.is_empty()
+        || matches!(event.kind, EventKind::Any | EventKind::Other)
+    {
+        pending.insert(
+            PathBuf::from(OVERFLOW_MARKER_PATH),
+            PendingEntry {
+                kind: ChangeKind::Upsert,
+                last_seen: Instant::now(),
+            },
+        );
+        return;
+    }
     let kind = match event.kind {
         // **Windows rename の正確な分解** (docs/search-test-plan.md rename バグ):
         // `ReadDirectoryChangesW` は rename を
@@ -218,11 +239,7 @@ fn absorb_event(event: &Event, pending: &mut HashMap<PathBuf, PendingEntry>) {
         EventKind::Create(_) | EventKind::Modify(_) => ChangeKind::Upsert,
         EventKind::Remove(_) => ChangeKind::Remove,
         EventKind::Access(_) => return, // 読み取りアクセスは無視
-        EventKind::Any | EventKind::Other => {
-            // バッファオーバーフロー等の可能性 — 呼び出し側ではエラーとして
-            // OVERFLOW_MARKER_PATH が飛ぶが、ここは upsert として扱うのが安全
-            ChangeKind::Upsert
-        }
+        EventKind::Any | EventKind::Other => unreachable!("handled as overflow above"),
     };
     let now = Instant::now();
     for path in &event.paths {
@@ -332,5 +349,39 @@ mod tests {
             );
         }
         assert_eq!(pending.len(), 1, "同じ path は 1 エントリに集約");
+    }
+
+    #[test]
+    fn unknown_or_pathless_events_become_one_overflow_marker() {
+        let mut pending = HashMap::new();
+        absorb_event(
+            &make_event(EventKind::Any, vec![PathBuf::from("C:/ignored")]),
+            &mut pending,
+        );
+        absorb_event(
+            &make_event(EventKind::Create(CreateKind::Any), Vec::new()),
+            &mut pending,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .get(&PathBuf::from(OVERFLOW_MARKER_PATH))
+                .expect("unknown watcher state must request repair")
+                .kind,
+            ChangeKind::Upsert
+        );
+    }
+
+    #[test]
+    fn notify_rescan_flag_becomes_an_overflow_marker() {
+        let mut event = make_event(
+            EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any)),
+            vec![PathBuf::from("C:/a/b.jpg")],
+        );
+        event.attrs.set_flag(notify::event::Flag::Rescan);
+        let mut pending = HashMap::new();
+        absorb_event(&event, &mut pending);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&PathBuf::from(OVERFLOW_MARKER_PATH)));
     }
 }

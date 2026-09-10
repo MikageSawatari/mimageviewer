@@ -592,7 +592,7 @@ cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未�
 | --- | --- | --- |
 | Ctrl+G クエリワーカー (`global_search::run`) | クエリ変更 / フィルタ変更 / バー閉じ / folder 遷移 / `GlobalSearchHandle` drop | `Arc<AtomicBool>` を Tantivy ページングループ頭と post-filter ループ頭で check。pending/debounce 中は App が `ActivityGate::bump()` を継続し、背景インデクサの walker/ingest を次 checkpoint で待たせる |
 | IndexerSupervisor (メタ / 別バージョン共有 watcher) | `IndexerManager::sync_with_favorites` で両方 OFF 化、App drop | 全停止対象へ先に cancel を通知し、join は専用 thread へ移す。FsWatcher はお気に入りごとに 1 本だけ持つ |
-| 別バージョン索引 scheduler | 対象 favorite の変更、App drop | 対象 snapshot の変更時は現在の旧 snapshot 走査を cancel。watcher 通知は走査を中断せず revision に coalesce し、終了後に最新 snapshot を再照合する。App drop は cancel を立て、UI thread で join しない |
+| 別バージョン索引 scheduler | 対象 favorite/password の変更、watch gap、App drop | 通常 watcher 通知は event sequence 付き directory scope へまとめ、Full 開始後の変更を後続 Delta で照合する。設定変更・監視欠落の repair Full と purge は epoch/最終 keep-root 集合で所有し、未実行の削除義務を引き継ぐ。取消後も必要な pending job を選び直し、DB change sequence まで検索 snapshot が公開されてから完了とする。App drop は cancel を立て、UI thread で join しない。独立ブランチの検証状況は [増分照合計画](similar-index-incremental-reconcile-plan.md) |
 | walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
 | tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
 

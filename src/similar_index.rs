@@ -1,6 +1,6 @@
 //! お気に入り配下の「別バージョン」索引ジョブと遅延ロード線形検索。
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -23,6 +23,7 @@ use crate::similar_image::{
 };
 use crate::similar_search_array::{self, SearchRecord, SearchSnapshot};
 use image::GenericImageView;
+use uuid::Uuid;
 
 /// §9.5 の単体画像帯。いずれも実測済みで、索引ジョブの採否には使わない。
 pub const NEARLY_IDENTICAL_MAX_DISTANCE: u32 = 8;
@@ -48,6 +49,7 @@ const INDEX_PER_VOLUME_OUTSTANDING_LIMIT: usize = 8;
 const INDEX_ACTIVE_GLOBAL_OUTSTANDING_LIMIT: usize = 1;
 const INDEX_ACTIVE_PER_VOLUME_OUTSTANDING_LIMIT: usize = 1;
 const INDEX_LIMIT_RECHECK: Duration = Duration::from_millis(50);
+const DIRTY_SCOPE_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexStage {
@@ -80,11 +82,40 @@ pub struct RunningProgress {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexDegradedReason {
+    FilesystemObservationIncomplete,
+    ArrayPublication(String),
+    WatchUnavailable,
+}
+
+impl IndexDegradedReason {
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::FilesystemObservationIncomplete => {
+                "ファイルの確認が完了しませんでした。既存の索引は保持されています".to_owned()
+            }
+            Self::ArrayPublication(detail) => {
+                format!("検索用一覧への反映を確認できませんでした: {detail}")
+            }
+            Self::WatchUnavailable => {
+                "一部フォルダーの監視を確認できません。索引は作成済みです".to_owned()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IndexProgress {
     Idle,
     Running(RunningProgress),
+    AwaitingWatch(IndexReport),
+    AwaitingArray(IndexReport),
     Complete(IndexReport),
     Cancelled(IndexReport),
+    Degraded {
+        report: IndexReport,
+        reason: IndexDegradedReason,
+    },
     Failed(String),
 }
 
@@ -495,10 +526,14 @@ impl SimilarIndexManager {
                 known_book_store: Mutex::new(ObservedBookStore::Unobserved),
                 prefill_db: Arc::new(Mutex::new(None)),
                 enabled_roots: Arc::clone(&enabled_roots),
-                active_cancel: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
                 array_update: Mutex::new(ArrayUpdateState::default()),
+                array_changed: Condvar::new(),
                 compaction_running: AtomicBool::new(false),
+                #[cfg(test)]
+                full_jobs_started: AtomicU64::new(0),
+                #[cfg(test)]
+                delta_jobs_started: AtomicU64::new(0),
             }
         });
         Self {
@@ -534,15 +569,20 @@ impl SimilarIndexManager {
         favorites: &[crate::settings::FavoriteEntry],
         pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+        excluded_roots: Vec<PathBuf>,
     ) {
-        let roots: Vec<PathBuf> = favorites
+        let roots: Vec<ConfiguredRoot> = favorites
             .iter()
             .filter(|favorite| favorite.auto_index_similar)
-            .map(|favorite| favorite.path.clone())
+            .map(|favorite| ConfiguredRoot {
+                favorite_id: favorite.id,
+                key: crate::search_index_db::normalize_path(&favorite.path),
+                path: favorite.path.clone(),
+            })
             .collect();
         let should_load = !roots.is_empty();
         self.scheduler
-            .configure(roots, pdf_passwords, activity_gate);
+            .configure(roots, pdf_passwords, activity_gate, excluded_roots);
         if should_load {
             start_memory_load(
                 &self.data_dir,
@@ -553,12 +593,6 @@ impl SimilarIndexManager {
                 Some(Arc::downgrade(&self.scheduler)),
             );
         }
-    }
-
-    /// favorite を OFF にしたとき、その範囲だけを worker 上で即時削除する。
-    /// 後続の全走査が中断・失敗しても、OFF にした範囲の行を残さない。
-    pub fn purge_disabled_favorite(&self, root: &Path) {
-        self.scheduler.queue_purge(root.to_path_buf());
     }
 
     /// メタデータ索引 supervisor の watcher から再照合を要求する軽量 notifier。
@@ -575,13 +609,26 @@ impl SimilarIndexManager {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reconcile_job_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.scheduler.full_jobs_started.load(Ordering::Acquire),
+            self.scheduler.delta_jobs_started.load(Ordering::Acquire),
+        )
+    }
+
     /// 同じ表示項目と同じメモリ snapshot への照会は Arc ごと再利用する。
     /// 線形走査と SQLite point lookup は worker 上だけで行う。
     pub fn query_item(&self, item_key: &str) -> Arc<ItemQuery> {
         if !self.item_is_enabled(item_key) {
             return Arc::new(ItemQuery::NotIndexed);
         }
-        let running = matches!(self.progress(), IndexProgress::Running(_));
+        let running = matches!(
+            self.progress(),
+            IndexProgress::Running(_)
+                | IndexProgress::AwaitingWatch(_)
+                | IndexProgress::AwaitingArray(_)
+        );
         let index = {
             let state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
@@ -729,11 +776,15 @@ impl SimilarIndexManager {
 
     /// 走査中に Complete 済みの旧 snapshot を表示しているかを UI へ伝える。
     pub fn query_results_are_stale(&self) -> bool {
-        matches!(self.progress(), IndexProgress::Running(_))
-            && matches!(
-                &*self.memory.lock().unwrap_or_else(|e| e.into_inner()),
-                MemoryState::Ready(_)
-            )
+        matches!(
+            self.progress(),
+            IndexProgress::Running(_)
+                | IndexProgress::AwaitingWatch(_)
+                | IndexProgress::AwaitingArray(_)
+        ) && matches!(
+            &*self.memory.lock().unwrap_or_else(|e| e.into_inner()),
+            MemoryState::Ready(_)
+        )
     }
 
     /// お気に入り編集の状態表示用集計。署名本体は読まず、DB I/O は専用 worker で行う。
@@ -949,24 +1000,537 @@ impl Drop for SimilarIndexManager {
 
 #[derive(Clone)]
 struct SchedulerConfig {
-    roots: Vec<PathBuf>,
+    roots: Vec<ConfiguredRoot>,
+    excluded_roots: Vec<PathBuf>,
+    excluded_root_keys: Vec<String>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+    password_revision: u64,
     activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
 }
 
-#[derive(Default)]
+impl SchedulerConfig {
+    fn scan_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self
+            .roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    fn normalized_roots(&self) -> Vec<String> {
+        let mut roots = self
+            .roots
+            .iter()
+            .map(|root| root.key.clone())
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfiguredRoot {
+    favorite_id: Uuid,
+    path: PathBuf,
+    key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchHealth {
+    Pending,
+    Ready,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootWatchState {
+    root_key: String,
+    registration_generation: u64,
+    health: WatchHealth,
+    gap_epoch: u64,
+    repaired_gap_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimilarWatchRegistration {
+    favorite_id: Uuid,
+    root_key: String,
+    registration_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullReason {
+    Initial,
+    Reconfigure,
+    Overflow,
+    WatchRecovery,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FullIntent {
+    config_epoch: u64,
+    required_gap_epoch: u64,
+    reason: FullReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DirtyScope {
+    DirectoryContents(PathBuf),
+    Subtree(PathBuf),
+    RemovedPrefix(PathBuf),
+    RootRepair(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangedPathObservation {
+    File,
+    Directory,
+    Missing,
+    Unknown,
+}
+
+impl DirtyScope {
+    fn path(&self) -> &Path {
+        match self {
+            Self::DirectoryContents(path)
+            | Self::Subtree(path)
+            | Self::RemovedPrefix(path)
+            | Self::RootRepair(path) => path,
+        }
+    }
+
+    fn normalized_identity(&self) -> (u8, String) {
+        let kind = match self {
+            Self::DirectoryContents(_) => 0,
+            Self::Subtree(_) => 1,
+            Self::RemovedPrefix(_) => 2,
+            Self::RootRepair(_) => 3,
+        };
+        (kind, crate::search_index_db::normalize_path(self.path()))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DirtyScopeSet {
+    latest_by_scope: BTreeMap<DirtyScope, u64>,
+    normalized_identities: HashMap<(u8, String), DirtyScope>,
+    covering_scopes: BTreeMap<String, DirtyScope>,
+}
+
+impl DirtyScopeSet {
+    fn insert(&mut self, scope: DirtyScope, event_seq: u64) {
+        let identity = scope.normalized_identity();
+        if let Some(existing) = self.normalized_identities.get(&identity).cloned() {
+            self.latest_by_scope
+                .entry(existing)
+                .and_modify(|latest| *latest = (*latest).max(event_seq));
+            return;
+        }
+
+        // A RootRepair is the bounded, lossless replacement for every scope below a
+        // configured root.  An older Subtree for the same root must not swallow it:
+        // Subtree deliberately leaves destructive RemovedPrefix scopes independent,
+        // while RootRepair absorbs them too.
+        let allow_subtree_cover = matches!(
+            scope,
+            DirtyScope::DirectoryContents(_) | DirtyScope::Subtree(_)
+        );
+        if let Some(existing) = self.covering_scope(&identity.1, allow_subtree_cover) {
+            self.latest_by_scope
+                .entry(existing)
+                .and_modify(|latest| *latest = (*latest).max(event_seq));
+            return;
+        }
+
+        let mut latest = event_seq;
+        if matches!(scope, DirtyScope::Subtree(_) | DirtyScope::RootRepair(_)) {
+            let root_repair = matches!(scope, DirtyScope::RootRepair(_));
+            let dominated = self
+                .normalized_identities
+                .iter()
+                .filter(|((kind, key), _)| {
+                    (root_repair || *kind != 2)
+                        && (key == &identity.1
+                            || key_is_under_any(key, std::slice::from_ref(&identity.1)))
+                })
+                .map(|(_, existing)| existing.clone())
+                .collect::<Vec<_>>();
+            for existing in dominated {
+                if let Some(absorbed) = self.latest_by_scope.remove(&existing) {
+                    latest = latest.max(absorbed);
+                }
+            }
+            self.rebuild_indexes();
+        }
+        self.latest_by_scope.insert(scope.clone(), latest);
+        self.normalized_identities
+            .insert(identity.clone(), scope.clone());
+        if matches!(scope, DirtyScope::Subtree(_) | DirtyScope::RootRepair(_)) {
+            self.covering_scopes.insert(identity.1, scope);
+        }
+    }
+
+    fn retain_after(&mut self, absorbed_through: u64) {
+        self.latest_by_scope
+            .retain(|_, latest| *latest > absorbed_through);
+        self.rebuild_indexes();
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (scope, latest) in other.latest_by_scope {
+            self.insert(scope, latest);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.latest_by_scope.is_empty()
+    }
+
+    fn scopes(&self) -> impl Iterator<Item = &DirtyScope> {
+        self.latest_by_scope.keys()
+    }
+
+    fn len(&self) -> usize {
+        self.latest_by_scope.len()
+    }
+
+    fn covering_scope(&self, key: &str, allow_subtree: bool) -> Option<DirtyScope> {
+        let mut candidate = Some(key);
+        while let Some(current) = candidate {
+            if let Some(scope) = self.covering_scopes.get(current)
+                && (matches!(scope, DirtyScope::RootRepair(_))
+                    || allow_subtree && matches!(scope, DirtyScope::Subtree(_)))
+            {
+                return Some(scope.clone());
+            }
+            candidate = normalized_parent(current);
+        }
+        None
+    }
+
+    fn coalesce_root(&mut self, root: PathBuf, event_seq: u64) {
+        self.insert(DirtyScope::RootRepair(root), event_seq);
+    }
+
+    fn has_scope_under(&self, root: &Path) -> bool {
+        let root_key = crate::search_index_db::normalize_path(root);
+        self.normalized_identities
+            .keys()
+            .any(|(_, key)| key_is_under_any(key, std::slice::from_ref(&root_key)))
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.normalized_identities.clear();
+        self.covering_scopes.clear();
+        for scope in self.latest_by_scope.keys() {
+            let identity = scope.normalized_identity();
+            self.normalized_identities
+                .insert(identity.clone(), scope.clone());
+            if matches!(scope, DirtyScope::Subtree(_) | DirtyScope::RootRepair(_)) {
+                self.covering_scopes.insert(identity.1, scope.clone());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileJobKind {
+    Full(FullIntent),
+    Delta,
+    Purge,
+}
+
+#[derive(Clone, Debug)]
+struct RunningReconcileJob {
+    kind: ReconcileJobKind,
+    config_epoch: u64,
+    start_event_seq: u64,
+    repairs_watch_gap: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+struct ReconcileJobPlan {
+    running: RunningReconcileJob,
+    config: SchedulerConfig,
+    purge_roots: BTreeSet<PathBuf>,
+    dirty: DirtyScopeSet,
+}
+
+#[derive(Debug)]
+enum SchedulerPhase {
+    Idle,
+    Starting,
+    Running(RunningReconcileJob),
+    AwaitingArray(RunningReconcileJob),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuccessfulJobDisposition {
+    Complete,
+    MoreWork,
+    AwaitingWatch,
+    DegradedWatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptedJobDisposition {
+    RestartWorker,
+    AwaitingWatch,
+    Stopped,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArrayAckWaitError {
+    Cancelled,
+    Failed(String),
+}
+
+impl SchedulerPhase {
+    fn is_worker_active(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn cancel(&self) {
+        let cancel = match self {
+            Self::Running(job) | Self::AwaitingArray(job) => Some(&job.cancel),
+            Self::Idle | Self::Starting => None,
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 struct SchedulerState {
-    config: Option<SchedulerConfig>,
+    desired_config: Option<SchedulerConfig>,
+    config_epoch: u64,
+    next_watch_generation: u64,
+    next_gap_epoch: u64,
+    next_event_seq: u64,
+    watch_by_root: BTreeMap<Uuid, RootWatchState>,
+    pending_full: Option<FullIntent>,
+    dirty: DirtyScopeSet,
     pending_purge_roots: BTreeSet<PathBuf>,
-    revision: u64,
-    worker_running: bool,
+    phase: SchedulerPhase,
     shutdown: bool,
+}
+
+impl Default for SchedulerState {
+    fn default() -> Self {
+        Self {
+            desired_config: None,
+            config_epoch: 0,
+            next_watch_generation: 0,
+            next_gap_epoch: 0,
+            next_event_seq: 0,
+            watch_by_root: BTreeMap::new(),
+            pending_full: None,
+            dirty: DirtyScopeSet::default(),
+            pending_purge_roots: BTreeSet::new(),
+            phase: SchedulerPhase::Idle,
+            shutdown: false,
+        }
+    }
+}
+
+impl SchedulerState {
+    fn merge_full_intent(&mut self, intent: FullIntent) {
+        let should_replace = self.pending_full.is_none_or(|pending| {
+            intent.config_epoch > pending.config_epoch
+                || intent.config_epoch == pending.config_epoch
+                    && intent.required_gap_epoch > pending.required_gap_epoch
+        });
+        if should_replace {
+            self.pending_full = Some(intent);
+        }
+    }
+
+    fn bound_dirty_scopes(&mut self, preferred_root: Option<PathBuf>) {
+        if self.dirty.len() <= DIRTY_SCOPE_LIMIT {
+            return;
+        }
+        let latest = self.next_event_seq;
+        let mut roots = self
+            .desired_config
+            .as_ref()
+            .map(|config| config.roots.clone())
+            .unwrap_or_default();
+        if let Some(preferred_root) = preferred_root {
+            roots.sort_by_key(|root| (root.path != preferred_root, root.key.clone()));
+        }
+        for root in roots {
+            if self.dirty.len() <= DIRTY_SCOPE_LIMIT {
+                break;
+            }
+            if self.dirty.has_scope_under(&root.path) {
+                self.dirty.coalesce_root(root.path, latest);
+            }
+        }
+    }
+
+    fn watches_are_terminal(&self) -> bool {
+        let Some(config) = self.desired_config.as_ref() else {
+            return true;
+        };
+        config.roots.iter().all(|root| {
+            self.watch_by_root
+                .get(&root.favorite_id)
+                .is_some_and(|watch| watch.health != WatchHealth::Pending)
+        })
+    }
+
+    fn has_unavailable_watch(&self) -> bool {
+        self.watch_by_root
+            .values()
+            .any(|watch| watch.health == WatchHealth::Unavailable)
+    }
+
+    fn has_runnable_work(&self) -> bool {
+        if self.shutdown || self.phase.is_worker_active() || self.desired_config.is_none() {
+            return false;
+        }
+        if !self.pending_purge_roots.is_empty() {
+            return true;
+        }
+        if self.pending_full.is_some() {
+            return self.watches_are_terminal();
+        }
+        !self.dirty.is_empty()
+    }
+
+    fn reserve_worker_if_runnable(&mut self) -> bool {
+        if self.has_runnable_work() {
+            self.phase = SchedulerPhase::Starting;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_next_job(&mut self) -> Option<ReconcileJobPlan> {
+        if self.shutdown {
+            return None;
+        }
+        let config = self.desired_config.clone()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let start_event_seq = self.next_event_seq;
+        let (kind, purge_roots, dirty) = if !self.pending_purge_roots.is_empty() {
+            (
+                ReconcileJobKind::Purge,
+                std::mem::take(&mut self.pending_purge_roots),
+                DirtyScopeSet::default(),
+            )
+        } else if self.pending_full.is_some() && self.watches_are_terminal() {
+            let intent = self.pending_full.take().expect("pending full disappeared");
+            (
+                ReconcileJobKind::Full(intent),
+                BTreeSet::new(),
+                DirtyScopeSet::default(),
+            )
+        } else if self.pending_full.is_none() && !self.dirty.is_empty() {
+            (
+                ReconcileJobKind::Delta,
+                BTreeSet::new(),
+                std::mem::take(&mut self.dirty),
+            )
+        } else {
+            self.phase = SchedulerPhase::Idle;
+            return None;
+        };
+        let repairs_watch_gap = match kind {
+            ReconcileJobKind::Full(intent) => self.watch_by_root.values().all(|watch| {
+                watch.health == WatchHealth::Ready && watch.gap_epoch <= intent.required_gap_epoch
+            }),
+            ReconcileJobKind::Delta | ReconcileJobKind::Purge => false,
+        };
+        let running = RunningReconcileJob {
+            kind,
+            config_epoch: self.config_epoch,
+            start_event_seq,
+            repairs_watch_gap,
+            cancel,
+        };
+        self.phase = SchedulerPhase::Running(running.clone());
+        Some(ReconcileJobPlan {
+            running,
+            config,
+            purge_roots,
+            dirty,
+        })
+    }
+
+    fn restore_unfinished_job(&mut self, plan: &ReconcileJobPlan, purge_committed: bool) {
+        if !purge_committed {
+            self.pending_purge_roots
+                .extend(plan.purge_roots.iter().cloned());
+        }
+        if self.config_epoch != plan.running.config_epoch {
+            return;
+        }
+        match plan.running.kind {
+            ReconcileJobKind::Full(intent) => self.merge_full_intent(intent),
+            ReconcileJobKind::Delta => {
+                self.dirty.merge(plan.dirty.clone());
+                self.bound_dirty_scopes(None);
+            }
+            ReconcileJobKind::Purge => {}
+        }
+    }
+
+    fn finish_successful_job(&mut self, plan: &ReconcileJobPlan) -> SuccessfulJobDisposition {
+        if let ReconcileJobKind::Full(intent) = plan.running.kind {
+            self.dirty.retain_after(plan.running.start_event_seq);
+            for watch in self.watch_by_root.values_mut() {
+                if plan.running.repairs_watch_gap && watch.gap_epoch <= intent.required_gap_epoch {
+                    watch.repaired_gap_epoch = watch.gap_epoch;
+                }
+            }
+        }
+        if self.pending_full.is_some() && !self.watches_are_terminal() {
+            SuccessfulJobDisposition::AwaitingWatch
+        } else if !self.pending_purge_roots.is_empty()
+            || self.pending_full.is_some()
+            || !self.dirty.is_empty()
+        {
+            SuccessfulJobDisposition::MoreWork
+        } else if self.has_unavailable_watch() {
+            SuccessfulJobDisposition::DegradedWatch
+        } else {
+            SuccessfulJobDisposition::Complete
+        }
+    }
+
+    fn settle_interrupted_job(
+        &mut self,
+        plan: &ReconcileJobPlan,
+        purge_committed: bool,
+    ) -> InterruptedJobDisposition {
+        self.restore_unfinished_job(plan, purge_committed);
+        self.phase = SchedulerPhase::Idle;
+        if self.shutdown {
+            InterruptedJobDisposition::Stopped
+        } else if self.has_runnable_work() {
+            self.phase = SchedulerPhase::Starting;
+            InterruptedJobDisposition::RestartWorker
+        } else if self.pending_full.is_some() && !self.watches_are_terminal() {
+            InterruptedJobDisposition::AwaitingWatch
+        } else {
+            InterruptedJobDisposition::Stopped
+        }
+    }
 }
 
 #[derive(Default)]
 struct ArrayUpdateState {
     requested: bool,
     running: bool,
+    required_through: Option<crate::similar_db::StoreWatermark>,
+    last_error: Option<String>,
 }
 
 struct SimilarIndexScheduler {
@@ -983,10 +1547,14 @@ struct SimilarIndexScheduler {
     known_book_store: Mutex<ObservedBookStore>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
-    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<SchedulerState>,
     array_update: Mutex<ArrayUpdateState>,
+    array_changed: Condvar,
     compaction_running: AtomicBool,
+    #[cfg(test)]
+    full_jobs_started: AtomicU64,
+    #[cfg(test)]
+    delta_jobs_started: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1201,9 +1769,57 @@ impl ArrayRefreshNotifier {
 }
 
 impl SimilarIndexNotifier {
-    pub fn request_reconcile(&self) {
+    /// Reserve one watcher generation before its thread starts.  Every terminal and event call
+    /// must carry the returned token; a late supervisor can then never mutate a reconfigured root.
+    pub fn begin_watch(&self, favorite_id: Uuid, root: &Path) -> Option<SimilarWatchRegistration> {
+        self.scheduler.upgrade()?.begin_watch(favorite_id, root)
+    }
+
+    pub fn watch_ready(&self, registration: &SimilarWatchRegistration) {
         if let Some(scheduler) = self.scheduler.upgrade() {
-            scheduler.request_reconcile();
+            scheduler.set_watch_health(registration, WatchHealth::Ready, None);
+        }
+    }
+
+    pub fn watch_unavailable(
+        &self,
+        registration: &SimilarWatchRegistration,
+        reason: impl Into<String>,
+    ) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.set_watch_health(registration, WatchHealth::Unavailable, Some(reason.into()));
+        }
+    }
+
+    pub fn request_change(
+        &self,
+        registration: &SimilarWatchRegistration,
+        path: PathBuf,
+        kind: crate::search_watcher::ChangeKind,
+    ) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.request_change(registration, path, kind);
+        }
+    }
+
+    pub fn request_full(&self, registration: &SimilarWatchRegistration) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.request_full(registration, FullReason::Manual);
+        }
+    }
+
+    pub fn request_overflow(&self, registration: &SimilarWatchRegistration) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.request_full(registration, FullReason::Overflow);
+        }
+    }
+
+    /// Startup can fail before any supervisor is constructed.  Convert every still-pending root
+    /// into a finite terminal so the initial filesystem snapshot can run, while keeping progress
+    /// explicitly degraded rather than claiming a reliable watcher.
+    pub fn finish_watch_bootstrap(&self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.finish_watch_bootstrap();
         }
     }
 }
@@ -1212,7 +1828,7 @@ impl SimilarIndexScheduler {
     fn book_query_dispatch_decision(&self) -> BookQueryDispatchDecision<Arc<BookQuery>> {
         let (shutdown, worker_running) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (state.shutdown, state.worker_running)
+            (state.shutdown, state.phase.is_worker_active())
         };
         if shutdown {
             return BookQueryDispatchDecision::Complete(BookQueryTerminal::Failed(
@@ -1234,7 +1850,8 @@ impl SimilarIndexScheduler {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .worker_running
+            .phase
+            .is_worker_active()
     }
 
     fn observe_book_store(&self, store_id: [u8; 16]) {
@@ -1262,109 +1879,464 @@ impl SimilarIndexScheduler {
 
     fn configure(
         self: &Arc<Self>,
-        mut roots: Vec<PathBuf>,
+        mut roots: Vec<ConfiguredRoot>,
         pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+        mut excluded_roots: Vec<PathBuf>,
     ) {
-        roots.sort();
-        roots.dedup();
-        let normalized = roots
+        roots.sort_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then_with(|| left.favorite_id.cmp(&right.favorite_id))
+        });
+        roots.dedup_by(|left, right| left.favorite_id == right.favorite_id);
+        excluded_roots.sort();
+        excluded_roots.dedup();
+        let mut normalized = roots
+            .iter()
+            .map(|root| root.key.clone())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        let mut excluded_root_keys = excluded_roots
             .iter()
             .map(|root| crate::search_index_db::normalize_path(root))
             .collect::<Vec<_>>();
+        excluded_root_keys.sort();
+        excluded_root_keys.dedup();
         *self
             .enabled_roots
             .write()
             .unwrap_or_else(|e| e.into_inner()) = normalized;
 
-        let (roots_changed, should_start) = {
+        let password_revision = pdf_passwords.configuration_revision();
+        let should_start = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.shutdown {
                 return;
             }
-            let had_roots = state
-                .config
+            let previous = state.desired_config.clone();
+            let roots_changed = previous.as_ref().is_none_or(|config| {
+                config.roots != roots || config.excluded_roots != excluded_roots
+            });
+            let password_changed = previous
                 .as_ref()
-                .is_some_and(|config| !config.roots.is_empty());
-            let roots_changed = state
-                .config
+                .is_none_or(|config| config.password_revision != password_revision);
+            let previous_root_paths = previous
                 .as_ref()
-                .is_none_or(|config| config.roots != roots);
-            let has_roots = !roots.is_empty();
-            state.config = Some(SchedulerConfig {
+                .map(|config| {
+                    config
+                        .roots
+                        .iter()
+                        .map(|root| root.path.clone())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let next_root_paths = roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<BTreeSet<_>>();
+            state.desired_config = Some(SchedulerConfig {
                 roots,
+                excluded_roots,
+                excluded_root_keys,
                 pdf_passwords,
+                password_revision,
                 activity_gate,
             });
-            if !roots_changed {
+            if !roots_changed && !password_changed {
                 return;
             }
-            state.revision = state.revision.wrapping_add(1);
-            let should_start = !state.worker_running && (had_roots || has_roots);
-            if should_start {
-                state.worker_running = true;
+            state.config_epoch = state.config_epoch.wrapping_add(1).max(1);
+            let config_epoch = state.config_epoch;
+            state
+                .pending_purge_roots
+                .extend(previous_root_paths.difference(&next_root_paths).cloned());
+            if roots_changed {
+                let old_watches = std::mem::take(&mut state.watch_by_root);
+                let desired_roots = state
+                    .desired_config
+                    .as_ref()
+                    .map(|config| config.roots.clone())
+                    .unwrap_or_default();
+                for root in desired_roots {
+                    let retained = old_watches
+                        .get(&root.favorite_id)
+                        .filter(|watch| watch.root_key == root.key);
+                    let watch = if let Some(retained) = retained {
+                        retained.clone()
+                    } else {
+                        RootWatchState {
+                            root_key: root.key,
+                            // Generation zero is the unclaimed configuration placeholder. The
+                            // first supervisor may claim it without creating a watch gap; every
+                            // later registration replaces a real lifecycle and must repair one.
+                            registration_generation: 0,
+                            health: WatchHealth::Pending,
+                            gap_epoch: 0,
+                            repaired_gap_epoch: 0,
+                        }
+                    };
+                    state.watch_by_root.insert(root.favorite_id, watch);
+                }
             }
-            (roots_changed, should_start)
+            let reason = if previous.is_none() {
+                FullReason::Initial
+            } else {
+                FullReason::Reconfigure
+            };
+            if !next_root_paths.is_empty() || !previous_root_paths.is_empty() {
+                let required_gap_epoch = state.next_gap_epoch;
+                state.merge_full_intent(FullIntent {
+                    config_epoch,
+                    required_gap_epoch,
+                    reason,
+                });
+            }
+            state.phase.cancel();
+            state.reserve_worker_if_runnable()
         };
-        debug_assert!(roots_changed);
         self.retain_loaded_snapshot_during_run();
-        // 対象変更時だけ現在の旧 snapshot 走査を止める。watcher 通知は coalesce し、
-        // 進行中の一巡を完了させてから最新状態をもう一度照合する。
-        if let Some(cancel) = self
-            .active_cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            cancel.store(true, Ordering::Relaxed);
-        }
         self.book_query.hard_invalidate();
         if should_start {
             self.spawn_worker();
         }
     }
 
-    fn request_reconcile(self: &Arc<Self>) {
+    fn begin_watch(
+        self: &Arc<Self>,
+        favorite_id: Uuid,
+        root: &Path,
+    ) -> Option<SimilarWatchRegistration> {
+        let root_key = crate::search_index_db::normalize_path(root);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown
-            || state
-                .config
-                .as_ref()
-                .is_none_or(|config| config.roots.is_empty())
+            || !state
+                .desired_config
+                .as_ref()?
+                .roots
+                .iter()
+                .any(|configured| {
+                    configured.favorite_id == favorite_id && configured.key == root_key
+                })
         {
-            return;
+            return None;
         }
-        state.revision = state.revision.wrapping_add(1);
-        let should_start = !state.worker_running;
-        if should_start {
-            state.worker_running = true;
+        let previous = state.watch_by_root.get(&favorite_id).cloned()?;
+        let replacement = previous.registration_generation != 0;
+        if replacement {
+            state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
         }
+        let gap_epoch = if replacement {
+            state.next_gap_epoch
+        } else {
+            previous.gap_epoch
+        };
+        let repaired_gap_epoch = previous.repaired_gap_epoch;
+        if replacement {
+            let config_epoch = state.config_epoch;
+            state.merge_full_intent(FullIntent {
+                config_epoch,
+                required_gap_epoch: gap_epoch,
+                reason: FullReason::WatchRecovery,
+            });
+            state.phase.cancel();
+        }
+        state.next_watch_generation = state.next_watch_generation.wrapping_add(1).max(1);
+        let generation = state.next_watch_generation;
+        state.watch_by_root.insert(
+            favorite_id,
+            RootWatchState {
+                root_key: root_key.clone(),
+                registration_generation: generation,
+                health: WatchHealth::Pending,
+                gap_epoch,
+                repaired_gap_epoch,
+            },
+        );
+        let registration = SimilarWatchRegistration {
+            favorite_id,
+            root_key,
+            registration_generation: generation,
+        };
         drop(state);
+        if replacement {
+            self.mark_awaiting_watch_if_terminal();
+        }
+        Some(registration)
+    }
+
+    fn mark_awaiting_watch_if_terminal(&self) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        let report = match &*progress {
+            IndexProgress::Complete(report)
+            | IndexProgress::Cancelled(report)
+            | IndexProgress::AwaitingWatch(report)
+            | IndexProgress::AwaitingArray(report) => Some(report.clone()),
+            IndexProgress::Degraded { report, .. } => Some(report.clone()),
+            IndexProgress::Idle | IndexProgress::Running(_) | IndexProgress::Failed(_) => None,
+        };
+        if let Some(report) = report {
+            *progress = IndexProgress::AwaitingWatch(report);
+        }
+    }
+
+    fn registration_is_current(
+        state: &SchedulerState,
+        registration: &SimilarWatchRegistration,
+    ) -> bool {
+        state
+            .watch_by_root
+            .get(&registration.favorite_id)
+            .is_some_and(|watch| {
+                watch.root_key == registration.root_key
+                    && watch.registration_generation == registration.registration_generation
+            })
+    }
+
+    fn set_watch_health(
+        self: &Arc<Self>,
+        registration: &SimilarWatchRegistration,
+        health: WatchHealth,
+        reason: Option<String>,
+    ) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown || !Self::registration_is_current(&state, registration) {
+                return;
+            }
+            let previous = state
+                .watch_by_root
+                .get(&registration.favorite_id)
+                .map(|watch| watch.health)
+                .expect("validated watch disappeared");
+            if previous == health {
+                return;
+            }
+            if health == WatchHealth::Unavailable {
+                let (gap_epoch, repaired_gap_epoch) = state
+                    .watch_by_root
+                    .get(&registration.favorite_id)
+                    .map(|watch| (watch.gap_epoch, watch.repaired_gap_epoch))
+                    .expect("validated watch disappeared");
+                let gap_epoch = if gap_epoch <= repaired_gap_epoch {
+                    state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
+                    state.next_gap_epoch
+                } else {
+                    gap_epoch
+                };
+                if let Some(watch) = state.watch_by_root.get_mut(&registration.favorite_id) {
+                    watch.health = health;
+                    watch.gap_epoch = gap_epoch;
+                }
+                let config_epoch = state.config_epoch;
+                state.merge_full_intent(FullIntent {
+                    config_epoch,
+                    required_gap_epoch: gap_epoch,
+                    reason: FullReason::WatchRecovery,
+                });
+                if let Some(reason) = reason {
+                    crate::logger::log(format!(
+                        "similar watcher unavailable favorite={} root={} reason={reason}",
+                        registration.favorite_id, registration.root_key
+                    ));
+                }
+            } else {
+                let recovering_gap = state
+                    .watch_by_root
+                    .get(&registration.favorite_id)
+                    .filter(|watch| watch.gap_epoch > watch.repaired_gap_epoch)
+                    .map_or(0, |watch| watch.gap_epoch);
+                if let Some(watch) = state.watch_by_root.get_mut(&registration.favorite_id) {
+                    watch.health = health;
+                }
+                if recovering_gap > 0 {
+                    let config_epoch = state.config_epoch;
+                    state.merge_full_intent(FullIntent {
+                        config_epoch,
+                        required_gap_epoch: recovering_gap,
+                        reason: FullReason::WatchRecovery,
+                    });
+                }
+            }
+            state.reserve_worker_if_runnable()
+        };
         if should_start {
             self.spawn_worker();
         }
     }
 
-    fn queue_purge(self: &Arc<Self>, root: PathBuf) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.shutdown {
-            return;
+    fn finish_watch_bootstrap(self: &Arc<Self>) {
+        let registrations = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .watch_by_root
+                .iter()
+                .filter(|(_, watch)| watch.health == WatchHealth::Pending)
+                .map(|(favorite_id, watch)| SimilarWatchRegistration {
+                    favorite_id: *favorite_id,
+                    root_key: watch.root_key.clone(),
+                    registration_generation: watch.registration_generation,
+                })
+                .collect::<Vec<_>>()
+        };
+        for registration in registrations {
+            self.set_watch_health(
+                &registration,
+                WatchHealth::Unavailable,
+                Some("watch supervisor was not constructed".to_owned()),
+            );
         }
-        state.pending_purge_roots.insert(root);
-        state.revision = state.revision.wrapping_add(1);
-        if let Some(cancel) = self
-            .active_cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
+    }
+
+    fn request_change(
+        self: &Arc<Self>,
+        registration: &SimilarWatchRegistration,
+        path: PathBuf,
+        kind: crate::search_watcher::ChangeKind,
+    ) {
         {
-            cancel.store(true, Ordering::Relaxed);
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown
+                || !Self::registration_is_current(&state, registration)
+                || state
+                    .watch_by_root
+                    .get(&registration.favorite_id)
+                    .is_none_or(|watch| watch.health != WatchHealth::Ready)
+            {
+                return;
+            }
         }
-        let should_start = !state.worker_running && state.config.is_some();
+        // Filesystem metadata may block on a sleeping disk or UNC share. Observe it before the
+        // coordinator lock so UI-side progress/configuration reads never wait behind filesystem
+        // I/O. The worker validates existence again before any destructive publication.
+        let upsert_observation = (kind == crate::search_watcher::ChangeKind::Upsert).then(|| {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => ChangedPathObservation::Directory,
+                Ok(_) => ChangedPathObservation::File,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ChangedPathObservation::Missing
+                }
+                Err(_) => ChangedPathObservation::Unknown,
+            }
+        });
+        self.request_change_observed(registration, path, kind, upsert_observation);
+    }
+
+    fn request_change_observed(
+        self: &Arc<Self>,
+        registration: &SimilarWatchRegistration,
+        path: PathBuf,
+        kind: crate::search_watcher::ChangeKind,
+        upsert_observation: Option<ChangedPathObservation>,
+    ) {
+        let path_key = crate::search_index_db::normalize_path(&path);
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown || !Self::registration_is_current(&state, registration) {
+                return;
+            }
+            if state
+                .watch_by_root
+                .get(&registration.favorite_id)
+                .is_none_or(|watch| watch.health != WatchHealth::Ready)
+            {
+                return;
+            }
+            let Some(config) = state.desired_config.as_ref() else {
+                return;
+            };
+            if !key_is_under_any(&path_key, std::slice::from_ref(&registration.root_key))
+                || key_is_under_any(&path_key, &config.excluded_root_keys)
+            {
+                return;
+            }
+            let dirty_root = config
+                .roots
+                .iter()
+                .find(|root| root.favorite_id == registration.favorite_id)
+                .map(|root| root.path.clone());
+            state.next_event_seq = state.next_event_seq.wrapping_add(1).max(1);
+            let event_seq = state.next_event_seq;
+            if let Some(parent) = path.parent() {
+                state.dirty.insert(
+                    DirtyScope::DirectoryContents(parent.to_path_buf()),
+                    event_seq,
+                );
+            }
+            match (kind, upsert_observation) {
+                (
+                    crate::search_watcher::ChangeKind::Upsert,
+                    Some(ChangedPathObservation::Directory),
+                ) => {
+                    state.dirty.insert(DirtyScope::Subtree(path), event_seq);
+                }
+                (
+                    crate::search_watcher::ChangeKind::Upsert,
+                    Some(ChangedPathObservation::Missing),
+                ) => {
+                    // Windows RenameMode::Both is delivered as two Upserts by the shared
+                    // watcher. The old side has disappeared by this boundary and therefore
+                    // owns a destructive prefix observation as well as its parent's contents.
+                    state
+                        .dirty
+                        .insert(DirtyScope::RemovedPrefix(path), event_seq);
+                }
+                (crate::search_watcher::ChangeKind::Upsert, Some(ChangedPathObservation::File)) => {
+                    // The parent contents scope performs the observation. A permission or
+                    // transient metadata failure must never be reclassified as a deletion.
+                }
+                (
+                    crate::search_watcher::ChangeKind::Upsert,
+                    Some(ChangedPathObservation::Unknown),
+                ) => {
+                    // The worker retries the observation recursively. It must not reduce an
+                    // unknown directory to its parent's non-recursive contents.
+                    state.dirty.insert(DirtyScope::Subtree(path), event_seq);
+                }
+                (crate::search_watcher::ChangeKind::Upsert, None) => {
+                    debug_assert!(false, "Upsert requires a filesystem observation");
+                }
+                (crate::search_watcher::ChangeKind::Remove, None) => {
+                    state
+                        .dirty
+                        .insert(DirtyScope::RemovedPrefix(path), event_seq);
+                }
+                (crate::search_watcher::ChangeKind::Remove, Some(_)) => {
+                    debug_assert!(false, "Remove unexpectedly observed as Upsert");
+                }
+            }
+            state.bound_dirty_scopes(dirty_root);
+            state.reserve_worker_if_runnable()
+        };
         if should_start {
-            state.worker_running = true;
+            self.spawn_worker();
         }
-        drop(state);
+    }
+
+    fn request_full(self: &Arc<Self>, registration: &SimilarWatchRegistration, reason: FullReason) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown || !Self::registration_is_current(&state, registration) {
+                return;
+            }
+            if reason == FullReason::Overflow {
+                state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
+                let gap_epoch = state.next_gap_epoch;
+                if let Some(watch) = state.watch_by_root.get_mut(&registration.favorite_id) {
+                    watch.gap_epoch = gap_epoch;
+                }
+            }
+            let config_epoch = state.config_epoch;
+            let required_gap_epoch = state.next_gap_epoch;
+            state.merge_full_intent(FullIntent {
+                config_epoch,
+                required_gap_epoch,
+                reason,
+            });
+            state.phase.cancel();
+            state.reserve_worker_if_runnable()
+        };
         if should_start {
             self.spawn_worker();
         }
@@ -1377,10 +2349,7 @@ impl SimilarIndexScheduler {
             .spawn(move || scheduler.worker_loop())
         {
             {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .worker_running = false;
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).phase = SchedulerPhase::Idle;
             }
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::Failed(format!("similar index worker start failed: {error}"));
@@ -1411,84 +2380,278 @@ impl SimilarIndexScheduler {
         );
 
         loop {
-            let (revision, config, cancel, purge_roots) = {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.shutdown {
+            let Some(plan) = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_next_job()
+            else {
+                return;
+            };
+            if !self.job_is_current(&plan.running) {
+                self.restore_unfinished_plan(&plan, false);
+                if !self.continue_worker_if_runnable() {
                     return;
                 }
-                let Some(config) = state.config.clone() else {
-                    drop(state);
-                    self.finish_worker(IndexProgress::Idle);
-                    return;
-                };
-                let cancel = Arc::new(AtomicBool::new(false));
-                *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Arc::clone(&cancel));
-                let purge_roots = std::mem::take(&mut state.pending_purge_roots);
-                (state.revision, config, cancel, purge_roots)
-            };
+                continue;
+            }
+            #[cfg(test)]
+            match plan.running.kind {
+                ReconcileJobKind::Full(_) => {
+                    self.full_jobs_started.fetch_add(1, Ordering::AcqRel);
+                }
+                ReconcileJobKind::Delta => {
+                    self.delta_jobs_started.fetch_add(1, Ordering::AcqRel);
+                }
+                ReconcileJobKind::Purge => {}
+            }
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::Running(RunningProgress {
                     stage: IndexStage::Opening,
                     current_path: None,
                     report: IndexReport::default(),
                 });
-            let keep_roots = config
-                .roots
+            let keep_roots = plan.config.normalized_roots();
+            let purge_roots = plan
+                .purge_roots
                 .iter()
                 .map(|root| crate::search_index_db::normalize_path(root))
                 .collect::<Vec<_>>();
-            let purge_roots = purge_roots
-                .iter()
-                .map(|root| crate::search_index_db::normalize_path(root))
-                .collect::<Vec<_>>();
-            let outcome = db
-                .purge_roots_except(&purge_roots, &keep_roots)
-                .map_err(|error| format!("disabled favorite purge failed: {error}"))
-                .and_then(|purged| {
-                    if purged > 0 {
-                        self.request_array_refresh();
+            let purge_result = db
+                .purge_roots_except_if(&purge_roots, &keep_roots, || {
+                    self.job_is_current(&plan.running)
+                })
+                .map_err(|error| format!("disabled favorite purge failed: {error}"));
+            let purge_committed = matches!(
+                &purge_result,
+                Ok(crate::similar_db::ConditionalCommit::Committed(_))
+            );
+            let outcome = purge_result.and_then(|purge| {
+                let purged = match purge {
+                    crate::similar_db::ConditionalCommit::Committed(removed) => removed,
+                    crate::similar_db::ConditionalCommit::Skipped => {
+                        return Ok(ScanJobOutcome {
+                            report: IndexReport::default(),
+                            prune_safe: false,
+                        });
                     }
-                    let array_refresh = ArrayRefreshNotifier {
-                        scheduler: Arc::downgrade(&self),
-                    };
-                    run_index_job(
+                };
+                let array_refresh = ArrayRefreshNotifier {
+                    scheduler: Arc::downgrade(&self),
+                };
+                let scan = match plan.running.kind {
+                    ReconcileJobKind::Full(_) => run_index_job(
                         &db,
-                        &config.roots,
-                        &config.pdf_passwords,
-                        config.activity_gate.as_deref(),
-                        &cancel,
+                        &plan.config.scan_roots(),
+                        &plan.config.excluded_root_keys,
+                        &plan.config.pdf_passwords,
+                        plan.config.activity_gate.as_deref(),
+                        &plan.running.cancel,
                         &self.progress,
                         &array_refresh,
-                    )
-                    .map(|mut report| {
-                        report.removed = report.removed.saturating_add(purged as u64);
-                        report
-                    })
-                });
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.shutdown {
+                    ),
+                    ReconcileJobKind::Delta => run_delta_index_job(
+                        &db,
+                        &plan.dirty,
+                        &plan.config,
+                        &plan.running.cancel,
+                        &self.progress,
+                        &array_refresh,
+                    ),
+                    ReconcileJobKind::Purge => Ok(ScanJobOutcome {
+                        report: IndexReport::default(),
+                        prune_safe: true,
+                    }),
+                }?;
+                let mut report = scan.report;
+                report.removed = report.removed.saturating_add(purged as u64);
+                Ok(ScanJobOutcome {
+                    report,
+                    prune_safe: scan.prune_safe,
+                })
+            });
+
+            let cancelled = plan.running.cancel.load(Ordering::Acquire);
+            let current_epoch = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .config_epoch;
+            let stale = current_epoch != plan.running.config_epoch;
+            if cancelled || stale {
+                let report = outcome
+                    .as_ref()
+                    .map(|outcome| outcome.report.clone())
+                    .unwrap_or_default();
+                match self.settle_interrupted_plan(&plan, purge_committed, report) {
+                    InterruptedJobDisposition::RestartWorker => continue,
+                    InterruptedJobDisposition::AwaitingWatch
+                    | InterruptedJobDisposition::Stopped => {
+                        self.book_query.soft_refresh();
+                        return;
+                    }
+                }
+            }
+
+            let outcome = match outcome {
+                Ok(outcome) if outcome.prune_safe => outcome,
+                Ok(outcome) => {
+                    self.restore_unfinished_plan(&plan, purge_committed);
+                    *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                        IndexProgress::Degraded {
+                            report: outcome.report,
+                            reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                        };
+                    self.stop_worker();
+                    self.book_query.soft_refresh();
+                    return;
+                }
+                Err(error) => {
+                    self.restore_unfinished_plan(&plan, purge_committed);
+                    *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                        IndexProgress::Failed(error);
+                    self.stop_worker();
+                    self.book_query.soft_refresh();
+                    return;
+                }
+            };
+
+            let watermark = match db.change_watermark() {
+                Ok(watermark) => watermark,
+                Err(error) => {
+                    self.restore_unfinished_plan(&plan, purge_committed);
+                    *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                        IndexProgress::Failed(format!(
+                            "similar index publication watermark failed: {error}"
+                        ));
+                    self.stop_worker();
+                    return;
+                }
+            };
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.shutdown {
+                    return;
+                }
+                state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+            }
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                IndexProgress::AwaitingArray(outcome.report.clone());
+            self.request_array_refresh_through(watermark);
+            if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
+                match error {
+                    ArrayAckWaitError::Cancelled => {
+                        match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
+                            InterruptedJobDisposition::RestartWorker => continue,
+                            InterruptedJobDisposition::AwaitingWatch
+                            | InterruptedJobDisposition::Stopped => {
+                                self.book_query.soft_refresh();
+                                return;
+                            }
+                        }
+                    }
+                    ArrayAckWaitError::Failed(error) => {
+                        self.restore_unfinished_plan(&plan, purge_committed);
+                        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                            IndexProgress::Degraded {
+                                report: outcome.report,
+                                reason: IndexDegradedReason::ArrayPublication(error),
+                            };
+                        self.stop_worker();
+                        self.book_query.soft_refresh();
+                        return;
+                    }
+                }
+            }
+
+            if !self.job_is_current(&plan.running) {
+                match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
+                    InterruptedJobDisposition::RestartWorker => continue,
+                    InterruptedJobDisposition::AwaitingWatch
+                    | InterruptedJobDisposition::Stopped => {
+                        self.book_query.soft_refresh();
+                        return;
+                    }
+                }
+            }
+
+            let disposition = self.finish_successful_plan(&plan);
+            *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = match disposition {
+                SuccessfulJobDisposition::DegradedWatch => IndexProgress::Degraded {
+                    report: outcome.report,
+                    reason: IndexDegradedReason::WatchUnavailable,
+                },
+                SuccessfulJobDisposition::AwaitingWatch => {
+                    IndexProgress::AwaitingWatch(outcome.report)
+                }
+                SuccessfulJobDisposition::MoreWork => IndexProgress::Running(RunningProgress {
+                    stage: IndexStage::Opening,
+                    current_path: None,
+                    report: outcome.report,
+                }),
+                SuccessfulJobDisposition::Complete => IndexProgress::Complete(outcome.report),
+            };
+            self.book_query.soft_refresh();
+            if !self.continue_worker_if_runnable() {
                 return;
             }
-            let dirty = state.revision != revision;
-            if dirty {
-                drop(state);
-                continue;
-            }
-            let next = match outcome {
-                Ok(report) if cancel.load(Ordering::Relaxed) => IndexProgress::Cancelled(report),
-                Ok(report) => IndexProgress::Complete(report),
-                Err(error) => IndexProgress::Failed(error),
-            };
-            state.worker_running = false;
-            *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            drop(state);
-            *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
-            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
-            self.request_array_refresh();
-            self.book_query.soft_refresh();
-            return;
         }
+    }
+
+    fn job_is_current(&self, job: &RunningReconcileJob) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !state.shutdown
+            && state.config_epoch == job.config_epoch
+            && !job.cancel.load(Ordering::Acquire)
+    }
+
+    fn restore_unfinished_plan(&self, plan: &ReconcileJobPlan, purge_committed: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.restore_unfinished_job(plan, purge_committed);
+    }
+
+    fn finish_successful_plan(&self, plan: &ReconcileJobPlan) -> SuccessfulJobDisposition {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.finish_successful_job(plan)
+    }
+
+    fn settle_interrupted_plan(
+        &self,
+        plan: &ReconcileJobPlan,
+        purge_committed: bool,
+        report: IndexReport,
+    ) -> InterruptedJobDisposition {
+        let disposition = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle_interrupted_job(plan, purge_committed);
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = match disposition {
+            InterruptedJobDisposition::RestartWorker => IndexProgress::Running(RunningProgress {
+                stage: IndexStage::Opening,
+                current_path: None,
+                report,
+            }),
+            InterruptedJobDisposition::AwaitingWatch => IndexProgress::AwaitingWatch(report),
+            InterruptedJobDisposition::Stopped => IndexProgress::Cancelled(report),
+        };
+        disposition
+    }
+
+    fn continue_worker_if_runnable(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.phase = SchedulerPhase::Idle;
+        if state.has_runnable_work() {
+            state.phase = SchedulerPhase::Starting;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stop_worker(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).phase = SchedulerPhase::Idle;
     }
 
     /// Index schedulerが存続する間、scan/purgeとthumbnail prefillは同じSQLite mutex ownerを
@@ -1514,9 +2677,34 @@ impl SimilarIndexScheduler {
     }
 
     fn request_array_refresh(self: &Arc<Self>) {
+        self.start_array_refresh(None);
+    }
+
+    fn request_array_refresh_through(
+        self: &Arc<Self>,
+        watermark: crate::similar_db::StoreWatermark,
+    ) {
+        self.start_array_refresh(Some(watermark));
+    }
+
+    fn start_array_refresh(self: &Arc<Self>, watermark: Option<crate::similar_db::StoreWatermark>) {
         let should_start = {
             let mut state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
             state.requested = true;
+            state.last_error = None;
+            if let Some(watermark) = watermark {
+                state.required_through = Some(match state.required_through {
+                    Some(current) if current.store_id == watermark.store_id => {
+                        crate::similar_db::StoreWatermark {
+                            store_id: current.store_id,
+                            through_change_seq: current
+                                .through_change_seq
+                                .max(watermark.through_change_seq),
+                        }
+                    }
+                    _ => watermark,
+                });
+            }
             if state.running {
                 false
             } else {
@@ -1531,14 +2719,73 @@ impl SimilarIndexScheduler {
                 .spawn(move || scheduler.array_update_loop())
             {
                 {
-                    self.array_update
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .running = false;
+                    let mut state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
+                    state.running = false;
+                    state.last_error =
+                        Some(format!("similar array update worker start failed: {error}"));
                 }
                 crate::logger::log(format!("similar array update worker start failed: {error}"));
+                self.array_changed.notify_all();
                 self.book_query.soft_refresh();
             }
+        }
+    }
+
+    fn snapshot_reaches(
+        snapshot: &SearchSnapshot,
+        watermark: crate::similar_db::StoreWatermark,
+    ) -> bool {
+        snapshot.base.store_id == watermark.store_id
+            && snapshot.applied_seq >= watermark.through_change_seq
+    }
+
+    fn wait_for_array_ack(
+        &self,
+        watermark: crate::similar_db::StoreWatermark,
+        cancel: &AtomicBool,
+    ) -> Result<(), ArrayAckWaitError> {
+        loop {
+            if cancel.load(Ordering::Acquire)
+                || self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shutdown
+            {
+                return Err(ArrayAckWaitError::Cancelled);
+            }
+            let awaiting_initial_load = {
+                let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+                match &*memory {
+                    MemoryState::Ready(snapshot) if Self::snapshot_reaches(snapshot, watermark) => {
+                        return Ok(());
+                    }
+                    MemoryState::Failed(error) => {
+                        return Err(ArrayAckWaitError::Failed(error.clone()));
+                    }
+                    MemoryState::Missing => {
+                        return Err(ArrayAckWaitError::Failed(
+                            "similar array publication source is missing".to_owned(),
+                        ));
+                    }
+                    MemoryState::Loading => true,
+                    MemoryState::Unloaded | MemoryState::Ready(_) => false,
+                }
+            };
+            let state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(error) = state.last_error.clone() {
+                return Err(ArrayAckWaitError::Failed(error));
+            }
+            if !awaiting_initial_load && !state.running && !state.requested {
+                return Err(ArrayAckWaitError::Failed(
+                    "similar array publication worker stopped before the requested watermark"
+                        .to_owned(),
+                ));
+            }
+            let _ = self
+                .array_changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -1615,14 +2862,36 @@ impl SimilarIndexScheduler {
                                 started.elapsed().as_secs_f64() * 1000.0
                             ));
                         }
-                        if let Some(active) = active
-                            && active.should_compact()
+                        if active
+                            .as_ref()
+                            .is_some_and(|active| active.should_compact())
                         {
-                            self.start_compaction(db, active);
+                            self.start_compaction(
+                                db,
+                                Arc::clone(active.as_ref().expect("checked active snapshot")),
+                            );
+                        }
+                        if let Some(active) = active {
+                            let mut state =
+                                self.array_update.lock().unwrap_or_else(|e| e.into_inner());
+                            if state
+                                .required_through
+                                .is_some_and(|required| Self::snapshot_reaches(&active, required))
+                            {
+                                state.required_through = None;
+                            }
+                            state.last_error = None;
+                            drop(state);
+                            self.array_changed.notify_all();
                         }
                     }
                     Err(error) => {
-                        crate::logger::log(format!("similar array update failed: {error}"))
+                        crate::logger::log(format!("similar array update failed: {error}"));
+                        self.array_update
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .last_error = Some(error);
+                        self.array_changed.notify_all();
                     }
                 }
             }
@@ -1631,6 +2900,8 @@ impl SimilarIndexScheduler {
                 continue;
             }
             state.running = false;
+            drop(state);
+            self.array_changed.notify_all();
             return;
         }
     }
@@ -1741,36 +3012,30 @@ impl SimilarIndexScheduler {
     }
 
     fn finish_worker(&self, progress: IndexProgress) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.worker_running = false;
-        }
-        *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).phase = SchedulerPhase::Idle;
         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = progress;
         self.book_query.soft_refresh();
     }
 
     fn shutdown(&self) {
         {
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .shutdown = true;
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.shutdown = true;
+            state.phase.cancel();
         }
-        if let Some(cancel) = self
-            .active_cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            cancel.store(true, Ordering::Relaxed);
-        }
+        self.array_changed.notify_all();
         self.book_query.shutdown();
     }
 }
 
 fn key_is_under_any(key: &str, roots: &[String]) -> bool {
     crate::similar_db::key_is_under_any(key, roots)
+}
+
+fn normalized_parent(key: &str) -> Option<&str> {
+    let trimmed = key.trim_end_matches('/');
+    let separator = trimmed.rfind('/')?;
+    (separator > 2).then_some(&trimmed[..separator])
 }
 
 enum MemoryState {
@@ -2922,6 +4187,7 @@ impl<'a> ScanAggregate<'a> {
 
 enum ScanWork {
     Directory(PathBuf),
+    DirectoryContents(PathBuf),
     LooseImage {
         candidate: FileCandidate,
         page_index: Option<u32>,
@@ -2938,7 +4204,7 @@ enum ScanWork {
 impl ScanWork {
     fn path(&self) -> &Path {
         match self {
-            Self::Directory(path) => path,
+            Self::Directory(path) | Self::DirectoryContents(path) => path,
             Self::LooseImage { candidate, .. } | Self::Zip(candidate) | Self::Pdf(candidate) => {
                 &candidate.path
             }
@@ -2951,15 +4217,54 @@ impl ScanWork {
     }
 }
 
+struct ScanJobOutcome {
+    report: IndexReport,
+    prune_safe: bool,
+}
+
+#[derive(Default)]
+struct DeltaPublication {
+    loose_items: Mutex<Vec<StoredItem>>,
+    completed_containers: Mutex<Vec<(String, u64)>>,
+}
+
+impl DeltaPublication {
+    fn stage_loose(&self, item: StoredItem) {
+        self.loose_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(item);
+    }
+
+    fn stage_container(&self, container_key: String, generation: u64) {
+        self.completed_containers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((container_key, generation));
+    }
+
+    fn into_parts(self) -> (Vec<StoredItem>, Vec<(String, u64)>) {
+        (
+            self.loose_items
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+            self.completed_containers
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+}
+
 fn run_index_job(
     db: &SimilarDb,
     roots: &[PathBuf],
+    excluded_root_keys: &[String],
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
-) -> Result<IndexReport, String> {
+) -> Result<ScanJobOutcome, String> {
     db.cleanup_incomplete()
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
     set_stage(progress, IndexStage::Scanning, None);
@@ -2979,11 +4284,13 @@ fn run_index_job(
                     &queue,
                     &aggregate,
                     db,
+                    excluded_root_keys,
                     pdf_passwords,
                     activity_gate,
                     cancel,
                     progress,
                     array_refresh,
+                    None,
                 )
             }));
         }
@@ -3003,39 +4310,250 @@ fn run_index_job(
     if cancel.load(Ordering::Relaxed) {
         db.cleanup_incomplete()
             .map_err(|error| format!("cancel cleanup failed: {error}"))?;
-        return Ok(aggregate.report);
+        return Ok(ScanJobOutcome {
+            report: aggregate.report,
+            prune_safe: false,
+        });
     }
     set_stage(progress, IndexStage::Pruning, None);
     if aggregate.prune_safe {
-        aggregate.report.removed =
-            db.prune_except_seen(&aggregate.seen_items, &aggregate.seen_containers)
-                .map_err(|error| format!("stale row prune failed: {error}"))? as u64;
+        let completed_at_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let (removed, _) = db
+            .finalize_full_reconcile_if(
+                &aggregate.seen_items,
+                &aggregate.seen_containers,
+                current_hash_version(),
+                completed_at_unix_secs,
+                CompletedIndexStats {
+                    password_required_pdfs: aggregate.report.password_required_pdfs,
+                    corrupt_containers: aggregate.report.corrupt_containers,
+                    zero_page_containers: aggregate.report.zero_page_containers,
+                    decode_failures: aggregate.report.decode_failures,
+                    io_failures: aggregate.report.io_failures,
+                },
+                || !cancel.load(Ordering::Acquire),
+            )
+            .map_err(|error| format!("full reconcile publish failed: {error}"))?;
+        aggregate.report.removed = removed as u64;
         if aggregate.report.removed > 0 {
             array_refresh.request();
         }
     }
     publish_report(progress, &aggregate.report);
-    let completed_at_unix_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    db.record_completed_index(
-        current_hash_version(),
-        completed_at_unix_secs,
-        CompletedIndexStats {
-            password_required_pdfs: aggregate.report.password_required_pdfs,
-            corrupt_containers: aggregate.report.corrupt_containers,
-            zero_page_containers: aggregate.report.zero_page_containers,
-            decode_failures: aggregate.report.decode_failures,
-            io_failures: aggregate.report.io_failures,
-        },
-    )
-    .map_err(|error| format!("index summary publish failed: {error}"))?;
-    Ok(aggregate.report)
+    Ok(ScanJobOutcome {
+        report: aggregate.report,
+        prune_safe: aggregate.prune_safe,
+    })
+}
+
+fn run_delta_index_job(
+    db: &SimilarDb,
+    dirty: &DirtyScopeSet,
+    config: &SchedulerConfig,
+    cancel: &Arc<AtomicBool>,
+    progress: &Arc<Mutex<IndexProgress>>,
+    _array_refresh: &ArrayRefreshNotifier,
+) -> Result<ScanJobOutcome, String> {
+    db.cleanup_incomplete()
+        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
+    set_stage(progress, IndexStage::Scanning, None);
+    let root_keys = config.normalized_roots();
+    let mut active_scopes = Vec::new();
+    let mut initial = Vec::new();
+    for scope in dirty.scopes() {
+        let path = match scope {
+            DirtyScope::DirectoryContents(path)
+            | DirtyScope::Subtree(path)
+            | DirtyScope::RemovedPrefix(path)
+            | DirtyScope::RootRepair(path) => path,
+        };
+        let key = crate::search_index_db::normalize_path(path);
+        if !key_is_under_any(&key, &root_keys) || key_is_under_any(&key, &config.excluded_root_keys)
+        {
+            continue;
+        }
+        let metadata = std::fs::metadata(path);
+        match (scope, metadata) {
+            (DirtyScope::DirectoryContents(path), Ok(metadata)) if metadata.is_dir() => {
+                initial.push(ScanWork::DirectoryContents(path.clone()).tagged());
+                active_scopes.push(scope.clone());
+            }
+            (DirtyScope::Subtree(path), Ok(metadata)) if metadata.is_dir() => {
+                initial.push(ScanWork::Directory(path.clone()).tagged());
+                active_scopes.push(scope.clone());
+            }
+            (DirtyScope::Subtree(path), Err(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // The producer could only classify this path conservatively.  A confirmed
+                // disappearance at the worker boundary owns the whole former subtree,
+                // including nested rows that the paired parent scan cannot see.
+                active_scopes.push(DirtyScope::RemovedPrefix(path.clone()));
+            }
+            (DirtyScope::RootRepair(path), Ok(metadata)) if metadata.is_dir() => {
+                initial.push(ScanWork::Directory(path.clone()).tagged());
+                active_scopes.push(scope.clone());
+            }
+            (DirtyScope::RootRepair(path), Err(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                active_scopes.push(DirtyScope::RemovedPrefix(path.clone()));
+            }
+            (DirtyScope::RootRepair(path), Ok(_)) => {
+                crate::logger::log(format!(
+                    "similar delta observation incomplete: repair root is not a directory: {}",
+                    path.display()
+                ));
+                return Ok(ScanJobOutcome {
+                    report: IndexReport::default(),
+                    prune_safe: false,
+                });
+            }
+            (DirtyScope::RemovedPrefix(_), Err(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                active_scopes.push(scope.clone());
+            }
+            (
+                DirtyScope::DirectoryContents(_)
+                | DirtyScope::Subtree(_)
+                | DirtyScope::RootRepair(_),
+                Err(error),
+            ) if error.kind() != std::io::ErrorKind::NotFound => {
+                crate::logger::log(format!(
+                    "similar delta observation incomplete for {}: {error}",
+                    path.display()
+                ));
+                return Ok(ScanJobOutcome {
+                    report: IndexReport::default(),
+                    prune_safe: false,
+                });
+            }
+            (DirtyScope::RemovedPrefix(_), Err(error)) => {
+                crate::logger::log(format!(
+                    "similar delta removal observation incomplete for {}: {error}",
+                    path.display()
+                ));
+                return Ok(ScanJobOutcome {
+                    report: IndexReport::default(),
+                    prune_safe: false,
+                });
+            }
+            (DirtyScope::RootRepair(_), Err(error)) => {
+                debug_assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+                return Ok(ScanJobOutcome {
+                    report: IndexReport::default(),
+                    prune_safe: false,
+                });
+            }
+            (DirtyScope::DirectoryContents(_) | DirtyScope::Subtree(_), _)
+            | (DirtyScope::RemovedPrefix(_), Ok(_)) => {
+                // A vanished scan scope is covered by the paired parent/removal observation;
+                // a remove followed by re-create keeps the current filesystem object.
+            }
+        }
+    }
+
+    let aggregate = ScanAggregate::new(progress);
+    let publication = DeltaPublication::default();
+    let queue = BoundedWorkQueue::new(initial);
+    let deferred_refresh = ArrayRefreshNotifier {
+        scheduler: Weak::new(),
+    };
+    let worker_result = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(INDEX_GLOBAL_OUTSTANDING_LIMIT);
+        for _ in 0..INDEX_GLOBAL_OUTSTANDING_LIMIT {
+            workers.push(scope.spawn(|| {
+                scan_worker_loop(
+                    &queue,
+                    &aggregate,
+                    db,
+                    &config.excluded_root_keys,
+                    &config.pdf_passwords,
+                    config.activity_gate.as_deref(),
+                    cancel,
+                    progress,
+                    &deferred_refresh,
+                    Some(&publication),
+                )
+            }));
+        }
+        for worker in workers {
+            if worker.join().is_err() {
+                return Err("similar index delta worker panicked".to_owned());
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = worker_result {
+        db.cleanup_incomplete()
+            .map_err(|cleanup| format!("{error}; generation cleanup failed: {cleanup}"))?;
+        return Err(error);
+    }
+    let mut aggregate = aggregate.snapshot();
+    if cancel.load(Ordering::Relaxed) {
+        db.cleanup_incomplete()
+            .map_err(|error| format!("cancel cleanup failed: {error}"))?;
+        return Ok(ScanJobOutcome {
+            report: aggregate.report,
+            prune_safe: false,
+        });
+    }
+    set_stage(progress, IndexStage::Pruning, None);
+    if aggregate.prune_safe {
+        let mut directory_contents = Vec::new();
+        let mut subtrees = Vec::new();
+        let mut removed_prefixes = Vec::new();
+        for scope in &active_scopes {
+            let (target, path) = match scope {
+                DirtyScope::DirectoryContents(path) => (&mut directory_contents, path),
+                DirtyScope::Subtree(path) | DirtyScope::RootRepair(path) => (&mut subtrees, path),
+                DirtyScope::RemovedPrefix(path) => (&mut removed_prefixes, path),
+            };
+            target.push(crate::search_index_db::normalize_path(path));
+        }
+        let completed_at_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let (loose_items, completed_containers) = publication.into_parts();
+        aggregate.report.removed = match db.publish_delta_reconcile_if(
+            &loose_items,
+            &completed_containers,
+            &directory_contents,
+            &subtrees,
+            &removed_prefixes,
+            &aggregate.seen_items,
+            &aggregate.seen_containers,
+            current_hash_version(),
+            completed_at_unix_secs,
+            || !cancel.load(Ordering::Acquire),
+        ) {
+            Ok(removed) => removed as u64,
+            Err(error) => {
+                db.cleanup_incomplete().map_err(|cleanup| {
+                    format!("delta publish failed: {error}; generation cleanup failed: {cleanup}")
+                })?;
+                return Err(format!("delta publish failed: {error}"));
+            }
+        };
+    } else {
+        db.cleanup_incomplete()
+            .map_err(|error| format!("incomplete delta cleanup failed: {error}"))?;
+    }
+    publish_report(progress, &aggregate.report);
+    Ok(ScanJobOutcome {
+        report: aggregate.report,
+        prune_safe: aggregate.prune_safe,
+    })
 }
 
 struct ScanContext<'a> {
     db: &'a SimilarDb,
+    excluded_root_keys: &'a [String],
     pdf_passwords: &'a crate::pdf_passwords::PdfPasswordStore,
     cancel: &'a Arc<AtomicBool>,
     aggregate: &'a ScanAggregate<'a>,
@@ -3045,6 +4563,7 @@ struct ScanContext<'a> {
     /// 走査漏れと削除を区別できない I/O failure が 1 件でもあれば prune しない。
     prune_safe: bool,
     array_refresh: &'a ArrayRefreshNotifier,
+    delta_publication: Option<&'a DeltaPublication>,
 }
 
 #[derive(Clone)]
@@ -3058,11 +4577,13 @@ fn scan_worker_loop(
     queue: &BoundedWorkQueue<ScanWork>,
     aggregate: &ScanAggregate<'_>,
     db: &SimilarDb,
+    excluded_root_keys: &[String],
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
+    delta_publication: Option<&DeltaPublication>,
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
@@ -3070,6 +4591,7 @@ fn scan_worker_loop(
         set_stage(progress, IndexStage::Scanning, Some(path.clone()));
         let mut context = ScanContext {
             db,
+            excluded_root_keys,
             pdf_passwords,
             cancel,
             aggregate,
@@ -3078,12 +4600,16 @@ fn scan_worker_loop(
             seen_containers: HashSet::new(),
             prune_safe: true,
             array_refresh,
+            delta_publication,
         };
         let result = if context.cancelled() {
             Ok(Vec::new())
         } else {
             match work {
-                ScanWork::Directory(directory) => context.discover_directory(&directory),
+                ScanWork::Directory(directory) => context.discover_directory(&directory, true),
+                ScanWork::DirectoryContents(directory) => {
+                    context.discover_directory(&directory, false)
+                }
                 ScanWork::LooseImage {
                     candidate,
                     page_index,
@@ -3127,11 +4653,47 @@ impl ScanContext<'_> {
         );
     }
 
-    fn discover_directory(&mut self, directory: &Path) -> Result<Vec<ScanWork>, String> {
+    fn publish_loose_item(&self, item: StoredItem) -> Result<(), String> {
+        if let Some(publication) = self.delta_publication {
+            publication.stage_loose(item);
+            Ok(())
+        } else {
+            if self
+                .db
+                .upsert_loose_item_if(&item, || !self.cancelled())
+                .map_err(db_error)?
+            {
+                self.array_refresh.request();
+            }
+            Ok(())
+        }
+    }
+
+    fn finish_container(&self, container_key: &str, generation: u64) -> Result<(), String> {
+        if let Some(publication) = self.delta_publication {
+            publication.stage_container(container_key.to_owned(), generation);
+            Ok(())
+        } else {
+            self.db
+                .complete_container_if(container_key, generation, || !self.cancelled())
+                .map_err(db_error)?;
+            self.array_refresh.request();
+            Ok(())
+        }
+    }
+
+    fn discover_directory(
+        &mut self,
+        directory: &Path,
+        recursive: bool,
+    ) -> Result<Vec<ScanWork>, String> {
         if self.cancelled() {
             return Ok(Vec::new());
         }
         let directory_key = crate::search_index_db::normalize_path(directory);
+        if key_is_under_any(&directory_key, self.excluded_root_keys) {
+            return Ok(Vec::new());
+        }
         if !self.aggregate.mark_directory_visited(directory_key.clone()) {
             return Ok(Vec::new());
         }
@@ -3269,8 +4831,10 @@ impl ScanContext<'_> {
         }
         work.extend(zips.into_iter().map(ScanWork::Zip));
         work.extend(pdfs.into_iter().map(ScanWork::Pdf));
-        for child in subdirectories {
-            work.push(ScanWork::Directory(child));
+        if recursive {
+            for child in subdirectories {
+                work.push(ScanWork::Directory(child));
+            }
         }
         self.publish();
         Ok(work)
@@ -3299,9 +4863,7 @@ impl ScanContext<'_> {
         }
         match self.build_file_item(&key, ItemKind::Image, None, page_index, candidate) {
             Ok(item) => {
-                if self.db.upsert_loose_item(&item).map_err(db_error)? {
-                    self.array_refresh.request();
-                }
+                self.publish_loose_item(item)?;
                 self.report.indexed += 1;
             }
             Err(error) => self.decode_error(&candidate.path, error),
@@ -3408,10 +4970,7 @@ impl ScanContext<'_> {
             self.report.processed += 1;
             self.publish();
         }
-        self.db
-            .complete_container(container_key, generation)
-            .map_err(db_error)?;
-        self.array_refresh.request();
+        self.finish_container(container_key, generation)?;
         self.report.indexed += images.len() as u64;
         self.report.containers_completed += 1;
         Ok(())
@@ -3423,6 +4982,9 @@ impl ScanContext<'_> {
         let entries = match crate::zip_loader::enumerate_image_entries(&candidate.path) {
             Ok(entries) => entries,
             Err(error) => {
+                if self.cancelled() {
+                    return Ok(());
+                }
                 self.db
                     .record_container_failure(
                         &container_key,
@@ -3443,6 +5005,9 @@ impl ScanContext<'_> {
         let page_count = u32::try_from(entries.len())
             .map_err(|_| format!("too many ZIP pages: {}", candidate.path.display()))?;
         if page_count == 0 {
+            if self.cancelled() {
+                return Ok(());
+            }
             self.report.zero_page_containers += 1;
             self.report
                 .errors
@@ -3526,10 +5091,7 @@ impl ScanContext<'_> {
             self.report.processed += 1;
             self.publish();
         }
-        self.db
-            .complete_container(&container_key, generation)
-            .map_err(db_error)?;
-        self.array_refresh.request();
+        self.finish_container(&container_key, generation)?;
         self.report.indexed += entries.len() as u64;
         self.report.containers_completed += 1;
         Ok(())
@@ -3569,6 +5131,9 @@ impl ScanContext<'_> {
         let page_count = u32::try_from(pages.len())
             .map_err(|_| format!("too many PDF pages: {}", candidate.path.display()))?;
         if page_count == 0 {
+            if self.cancelled() {
+                return Ok(());
+            }
             self.report.zero_page_containers += 1;
             self.report
                 .errors
@@ -3648,10 +5213,7 @@ impl ScanContext<'_> {
             self.report.processed += 1;
             self.publish();
         }
-        self.db
-            .complete_container(&container_key, generation)
-            .map_err(db_error)?;
-        self.array_refresh.request();
+        self.finish_container(&container_key, generation)?;
         self.report.indexed += pages.len() as u64;
         self.report.containers_completed += 1;
         Ok(())
@@ -4739,6 +6301,7 @@ mod tests {
         let report = run_index_job(
             &db,
             &[root.path().to_path_buf()],
+            &[],
             &passwords,
             None,
             &cancel,
@@ -4747,7 +6310,8 @@ mod tests {
                 scheduler: Weak::new(),
             },
         )
-        .unwrap();
+        .unwrap()
+        .report;
         assert_eq!(report.discovered, 6);
         assert_eq!(report.processed, 6);
         assert_eq!(report.indexed, 6);
@@ -5077,6 +6641,7 @@ mod tests {
                     Vec::new(),
                     crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
                     None,
+                    Vec::new(),
                 );
                 let _ = off_done_tx.send(());
             });
@@ -5138,6 +6703,7 @@ mod tests {
                     Vec::new(),
                     crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
                     None,
+                    Vec::new(),
                 );
                 let _ = off_done_tx.send(());
             });
@@ -5486,6 +7052,7 @@ mod tests {
             &[favorite],
             crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
             None,
+            Vec::new(),
         );
 
         assert!(!matches!(
@@ -5500,13 +7067,27 @@ mod tests {
         let library = temp.path().join("library");
         std::fs::create_dir(&library).unwrap();
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let favorite_id = Uuid::new_v4();
 
         // Manager::configure 側の eager 呼び出しを通さず、scheduler の実行開始だけを使う。
+        let library_key = crate::search_index_db::normalize_path(&library);
         manager.scheduler.configure(
-            vec![library],
+            vec![ConfiguredRoot {
+                favorite_id,
+                path: library.clone(),
+                key: library_key,
+            }],
             crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
             None,
+            Vec::new(),
         );
+        let registration = manager
+            .scheduler
+            .begin_watch(favorite_id, &library)
+            .expect("configured root accepts its watcher");
+        manager
+            .scheduler
+            .set_watch_health(&registration, WatchHealth::Ready, None);
 
         for _ in 0..100 {
             if !matches!(*manager.memory.lock().unwrap(), MemoryState::Unloaded) {
@@ -5644,10 +7225,12 @@ mod tests {
             report: IndexReport::default(),
             seen_items: HashSet::new(),
             seen_containers: HashSet::new(),
+            excluded_root_keys: &[],
             prune_safe: true,
             array_refresh: &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
+            delta_publication: None,
         };
         let unchanged = FileCandidate {
             path: PathBuf::from("this-file-does-not-exist.png"),
@@ -6610,6 +8193,805 @@ mod tests {
                 prototype.quality,
             );
         }
+    }
+
+    fn coordinator_state_with_watch(
+        favorite_id: Uuid,
+        root: &Path,
+        health: WatchHealth,
+    ) -> SchedulerState {
+        let configured_root = ConfiguredRoot {
+            favorite_id,
+            path: root.to_path_buf(),
+            key: crate::search_index_db::normalize_path(root),
+        };
+        let mut state = SchedulerState {
+            desired_config: Some(SchedulerConfig {
+                roots: vec![configured_root.clone()],
+                excluded_roots: Vec::new(),
+                excluded_root_keys: Vec::new(),
+                pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+                password_revision: 0,
+                activity_gate: None,
+            }),
+            config_epoch: 7,
+            ..SchedulerState::default()
+        };
+        state.watch_by_root.insert(
+            favorite_id,
+            RootWatchState {
+                root_key: configured_root.key,
+                registration_generation: 11,
+                health,
+                gap_epoch: 0,
+                repaired_gap_epoch: 0,
+            },
+        );
+        state
+    }
+
+    fn initial_full_intent() -> FullIntent {
+        FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 0,
+            reason: FullReason::Initial,
+        }
+    }
+
+    #[test]
+    fn incremental_reconcile_full_watermark_absorbs_only_events_at_or_before_its_start() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let scope = DirtyScope::DirectoryContents(root.join("book"));
+        state.next_event_seq = 1;
+        state.dirty.insert(scope.clone(), 1);
+        state.pending_full = Some(initial_full_intent());
+
+        let plan = state.take_next_job().expect("initial Full is runnable");
+        assert!(matches!(plan.running.kind, ReconcileJobKind::Full(_)));
+        assert!(plan.running.repairs_watch_gap);
+        assert_eq!(plan.running.start_event_seq, 1);
+        state.next_event_seq = 2;
+        state.dirty.insert(scope.clone(), 2);
+
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::MoreWork
+        );
+        assert_eq!(state.dirty.latest_by_scope.get(&scope), Some(&2));
+        state.phase = SchedulerPhase::Idle;
+        let next = state
+            .take_next_job()
+            .expect("post-Full event remains dirty");
+        assert!(matches!(next.running.kind, ReconcileJobKind::Delta));
+        assert_eq!(next.dirty.latest_by_scope.get(&scope), Some(&2));
+    }
+
+    #[test]
+    fn incremental_reconcile_dominated_child_promotes_its_post_full_sequence() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let ancestor = DirtyScope::Subtree(root.join("book"));
+        state.next_event_seq = 1;
+        state.dirty.insert(ancestor.clone(), 1);
+        state.pending_full = Some(initial_full_intent());
+        let plan = state.take_next_job().expect("Full starts at sequence 1");
+
+        state.next_event_seq = 2;
+        state
+            .dirty
+            .insert(DirtyScope::DirectoryContents(root.join("book/chapter")), 2);
+        assert_eq!(state.dirty.latest_by_scope.get(&ancestor), Some(&2));
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::MoreWork
+        );
+        assert_eq!(state.dirty.latest_by_scope.get(&ancestor), Some(&2));
+    }
+
+    #[test]
+    fn incremental_reconcile_full_intent_keeps_the_newest_root_gap_and_reason() {
+        let mut state = SchedulerState {
+            config_epoch: 7,
+            ..SchedulerState::default()
+        };
+        state.merge_full_intent(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 9,
+            reason: FullReason::Overflow,
+        });
+        state.merge_full_intent(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 3,
+            reason: FullReason::WatchRecovery,
+        });
+        assert_eq!(
+            state.pending_full,
+            Some(FullIntent {
+                config_epoch: 7,
+                required_gap_epoch: 9,
+                reason: FullReason::Overflow,
+            })
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_older_ready_transition_cannot_replace_another_roots_overflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().join("similar"));
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let favorite_a = Uuid::new_v4();
+        let favorite_b = Uuid::new_v4();
+        let mut state = coordinator_state_with_watch(favorite_a, &root_a, WatchHealth::Pending);
+        let configured_b = ConfiguredRoot {
+            favorite_id: favorite_b,
+            path: root_b.clone(),
+            key: crate::search_index_db::normalize_path(&root_b),
+        };
+        state
+            .desired_config
+            .as_mut()
+            .unwrap()
+            .roots
+            .push(configured_b.clone());
+        state.watch_by_root.get_mut(&favorite_a).unwrap().gap_epoch = 3;
+        state.watch_by_root.insert(
+            favorite_b,
+            RootWatchState {
+                root_key: configured_b.key,
+                registration_generation: 12,
+                health: WatchHealth::Ready,
+                gap_epoch: 9,
+                repaired_gap_epoch: 0,
+            },
+        );
+        state.next_gap_epoch = 9;
+        state.pending_full = Some(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 9,
+            reason: FullReason::Overflow,
+        });
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let registration_a = SimilarWatchRegistration {
+            favorite_id: favorite_a,
+            root_key: crate::search_index_db::normalize_path(&root_a),
+            registration_generation: 11,
+        };
+
+        manager
+            .scheduler
+            .set_watch_health(&registration_a, WatchHealth::Ready, None);
+        assert_eq!(
+            manager.scheduler.state.lock().unwrap().pending_full,
+            Some(FullIntent {
+                config_epoch: 7,
+                required_gap_epoch: 9,
+                reason: FullReason::Overflow,
+            })
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_purge_completion_waits_for_the_watch_barrier() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Pending);
+        state.pending_full = Some(initial_full_intent());
+        state.pending_purge_roots.insert(root.join("removed"));
+        let plan = state
+            .take_next_job()
+            .expect("Purge may run before watch Ready");
+        assert!(matches!(plan.running.kind, ReconcileJobKind::Purge));
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::AwaitingWatch
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_dirty_burst_coalesces_to_a_bounded_root_repair() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let active_cancel = Arc::new(AtomicBool::new(false));
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Full(initial_full_intent()),
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::clone(&active_cancel),
+        });
+        state.dirty.insert(DirtyScope::Subtree(root.clone()), 0);
+        for sequence in 1..=10_000_u64 {
+            state.next_event_seq = sequence;
+            state.dirty.insert(
+                DirtyScope::RemovedPrefix(root.join(format!("removed-{sequence}"))),
+                sequence,
+            );
+            state.bound_dirty_scopes(Some(root.clone()));
+        }
+        assert_eq!(state.dirty.len(), 1);
+        assert_eq!(
+            state
+                .dirty
+                .latest_by_scope
+                .get(&DirtyScope::RootRepair(root.clone())),
+            Some(&10_000)
+        );
+        assert!(
+            !state
+                .dirty
+                .latest_by_scope
+                .contains_key(&DirtyScope::Subtree(root)),
+            "RootRepair must replace an existing Subtree so destructive children are bounded"
+        );
+        assert!(!active_cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn incremental_reconcile_delta_failure_merges_running_and_new_scopes() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let first = DirtyScope::DirectoryContents(root.join("first"));
+        let second = DirtyScope::Subtree(root.join("second"));
+        state.next_event_seq = 1;
+        state.dirty.insert(first.clone(), 1);
+        let plan = state.take_next_job().expect("dirty scope starts Delta");
+        assert!(matches!(plan.running.kind, ReconcileJobKind::Delta));
+        state.next_event_seq = 2;
+        state.dirty.insert(second.clone(), 2);
+
+        state.restore_unfinished_job(&plan, false);
+        assert_eq!(state.dirty.latest_by_scope.get(&first), Some(&1));
+        assert_eq!(state.dirty.latest_by_scope.get(&second), Some(&2));
+    }
+
+    #[test]
+    fn incremental_reconcile_cancelled_full_keeps_the_newer_overflow_repair() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        let plan = state.take_next_job().expect("initial Full starts");
+        state.pending_full = Some(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 9,
+            reason: FullReason::Overflow,
+        });
+
+        state.restore_unfinished_job(&plan, false);
+        assert_eq!(state.pending_full.unwrap().required_gap_epoch, 9);
+    }
+
+    #[test]
+    fn incremental_reconcile_skipped_purge_survives_a_new_configuration_epoch() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let removed = root.join("removed");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.pending_purge_roots.insert(removed.clone());
+        state.pending_full = Some(initial_full_intent());
+        let plan = state
+            .take_next_job()
+            .expect("Purge precedes replacement Full");
+        assert!(matches!(plan.running.kind, ReconcileJobKind::Purge));
+
+        state.config_epoch = 8;
+        state.restore_unfinished_job(&plan, false);
+        assert!(
+            state.pending_purge_roots.contains(&removed),
+            "an uncommitted purge obligation survives into the new epoch"
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_watcher_barrier_has_a_finite_degraded_terminal() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Pending);
+        state.pending_full = Some(initial_full_intent());
+        assert!(!state.has_runnable_work());
+
+        let watch = state.watch_by_root.get_mut(&favorite_id).unwrap();
+        watch.health = WatchHealth::Unavailable;
+        watch.gap_epoch = 1;
+        state.next_gap_epoch = 1;
+        state.pending_full = Some(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 1,
+            reason: FullReason::WatchRecovery,
+        });
+        assert!(state.has_runnable_work());
+        let plan = state
+            .take_next_job()
+            .expect("Unavailable is a terminal barrier state");
+        assert!(!plan.running.repairs_watch_gap);
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::DegradedWatch
+        );
+        assert_eq!(
+            state
+                .watch_by_root
+                .get(&favorite_id)
+                .unwrap()
+                .repaired_gap_epoch,
+            0,
+            "a Full that finishes while the watcher is unavailable cannot close its gap"
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_subtree_dominates_non_destructive_descendants() {
+        let root = PathBuf::from("c:/library/book");
+        let mut dirty = DirtyScopeSet::default();
+        dirty.insert(DirtyScope::DirectoryContents(root.clone()), 1);
+        dirty.insert(DirtyScope::DirectoryContents(root.join("chapter")), 2);
+        dirty.insert(DirtyScope::RemovedPrefix(root.join("gone")), 3);
+        dirty.insert(DirtyScope::Subtree(root.clone()), 4);
+
+        assert_eq!(dirty.latest_by_scope.len(), 2);
+        assert_eq!(
+            dirty
+                .latest_by_scope
+                .get(&DirtyScope::Subtree(root.clone())),
+            Some(&4)
+        );
+        assert_eq!(
+            dirty
+                .latest_by_scope
+                .get(&DirtyScope::RemovedPrefix(root.join("gone"))),
+            Some(&3)
+        );
+
+        let mut equivalent = DirtyScopeSet::default();
+        equivalent.insert(
+            DirtyScope::DirectoryContents(PathBuf::from("C:/LIBRARY/BOOK")),
+            1,
+        );
+        equivalent.insert(
+            DirtyScope::DirectoryContents(PathBuf::from("c:/library/book")),
+            2,
+        );
+        assert_eq!(equivalent.latest_by_scope.len(), 1);
+        assert_eq!(equivalent.latest_by_scope.values().copied().next(), Some(2));
+    }
+
+    #[test]
+    fn incremental_reconcile_overflow_coalesces_and_rejects_old_watch_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let favorite_id = Uuid::new_v4();
+        let root = temp.path().join("library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let active_cancel = Arc::new(AtomicBool::new(false));
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::clone(&active_cancel),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let current = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+
+        manager
+            .scheduler
+            .request_full(&current, FullReason::Overflow);
+        manager
+            .scheduler
+            .request_full(&current, FullReason::Overflow);
+        let after_overflow = manager.scheduler.state.lock().unwrap();
+        assert!(active_cancel.load(Ordering::Acquire));
+        assert_eq!(after_overflow.next_gap_epoch, 2);
+        assert_eq!(after_overflow.pending_full.unwrap().required_gap_epoch, 2);
+        drop(after_overflow);
+
+        let stale = SimilarWatchRegistration {
+            registration_generation: 10,
+            ..current
+        };
+        manager.scheduler.request_full(&stale, FullReason::Manual);
+        assert_eq!(
+            manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .pending_full
+                .unwrap()
+                .required_gap_epoch,
+            2
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_replacing_a_ready_watch_records_one_repair_gap() {
+        for awaiting_array in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+            let favorite_id = Uuid::new_v4();
+            let root = temp.path().join("library");
+            let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+            state.pending_full = Some(initial_full_intent());
+            let plan = state.take_next_job().expect("initial Full starts");
+            if awaiting_array {
+                state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+            }
+            *manager.scheduler.state.lock().unwrap() = state;
+            *manager.scheduler.progress.lock().unwrap() = if awaiting_array {
+                IndexProgress::AwaitingArray(IndexReport::default())
+            } else {
+                IndexProgress::Running(RunningProgress {
+                    stage: IndexStage::Scanning,
+                    current_path: None,
+                    report: IndexReport::default(),
+                })
+            };
+
+            manager
+                .scheduler
+                .begin_watch(favorite_id, &root)
+                .expect("configured watch can be replaced");
+            assert!(plan.running.cancel.load(Ordering::Acquire));
+            assert_eq!(
+                manager
+                    .scheduler
+                    .settle_interrupted_plan(&plan, false, IndexReport::default(),),
+                InterruptedJobDisposition::AwaitingWatch
+            );
+            let state = manager.scheduler.state.lock().unwrap();
+            let watch = state.watch_by_root.get(&favorite_id).unwrap();
+            assert_eq!(watch.health, WatchHealth::Pending);
+            assert_eq!(watch.gap_epoch, 1);
+            assert_eq!(state.next_gap_epoch, 1);
+            assert_eq!(state.pending_full.unwrap().required_gap_epoch, 1);
+            assert!(matches!(state.phase, SchedulerPhase::Idle));
+            assert!(matches!(
+                manager.scheduler.progress.lock().unwrap().clone(),
+                IndexProgress::AwaitingWatch(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn incremental_reconcile_unknown_upsert_remains_a_recursive_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().join("similar"));
+        let favorite_id = Uuid::new_v4();
+        let root = temp.path().join("library");
+        let changed = root.join("book");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let registration = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+
+        manager.scheduler.request_change_observed(
+            &registration,
+            changed.clone(),
+            crate::search_watcher::ChangeKind::Upsert,
+            Some(ChangedPathObservation::Unknown),
+        );
+        assert!(
+            manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .dirty
+                .latest_by_scope
+                .contains_key(&DirtyScope::Subtree(changed))
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_missing_subtree_reobservation_prunes_nested_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("removed-book");
+        let stale_path = missing.join("nested").join("old.png");
+        let favorite_id = Uuid::new_v4();
+        let state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let config = state.desired_config.unwrap();
+        let db = crate::similar_db::SimilarDb::open_at(&temp.path().join("similar.db")).unwrap();
+        let stale_key = crate::search_index_db::normalize_path(&stale_path);
+        let stale = row(1, &stale_key, [7; 32], 10).item;
+        db.upsert_loose_item(&stale).unwrap();
+        let mut dirty = DirtyScopeSet::default();
+        dirty.insert(DirtyScope::Subtree(missing), 1);
+
+        let outcome = run_delta_index_job(
+            &db,
+            &dirty,
+            &config,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.prune_safe);
+        assert_eq!(outcome.report.removed, 1);
+        assert!(
+            db.load_search_rows(current_hash_version())
+                .unwrap()
+                .is_empty(),
+            "confirmed Subtree disappearance must prune every nested stale row"
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_root_repair_keeps_dirty_work_when_reobservation_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_root = temp.path().join("configured-root");
+        std::fs::write(&configured_root, b"temporarily not a directory").unwrap();
+        let favorite_id = Uuid::new_v4();
+        let state = coordinator_state_with_watch(favorite_id, &configured_root, WatchHealth::Ready);
+        let config = state.desired_config.unwrap();
+        let mut dirty = DirtyScopeSet::default();
+        dirty.insert(DirtyScope::RootRepair(configured_root), 1);
+        let db = crate::similar_db::SimilarDb::open_at(&temp.path().join("similar.db")).unwrap();
+        let progress = Arc::new(Mutex::new(IndexProgress::Idle));
+
+        let outcome = run_delta_index_job(
+            &db,
+            &dirty,
+            &config,
+            &Arc::new(AtomicBool::new(false)),
+            &progress,
+            &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+        )
+        .unwrap();
+        assert!(!outcome.prune_safe);
+    }
+
+    #[test]
+    fn incremental_reconcile_missing_upsert_side_of_directory_rename_owns_removed_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let old = root.join("old-book");
+        let renamed = root.join("renamed-book");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::rename(&old, &renamed).unwrap();
+        let manager = SimilarIndexManager::new(temp.path().join("similar"));
+        let favorite_id = Uuid::new_v4();
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let registration = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+
+        manager.scheduler.request_change(
+            &registration,
+            old.clone(),
+            crate::search_watcher::ChangeKind::Upsert,
+        );
+
+        let state = manager.scheduler.state.lock().unwrap();
+        assert!(
+            state
+                .dirty
+                .latest_by_scope
+                .contains_key(&DirtyScope::RemovedPrefix(old))
+        );
+        assert!(
+            state
+                .dirty
+                .latest_by_scope
+                .contains_key(&DirtyScope::DirectoryContents(root))
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_array_ack_requires_store_and_change_sequence() {
+        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+            records: Vec::new().into_boxed_slice(),
+            store_id: [3; 16],
+            applied_seq: 8,
+        });
+        assert!(SimilarIndexScheduler::snapshot_reaches(
+            &snapshot,
+            crate::similar_db::StoreWatermark {
+                store_id: [3; 16],
+                through_change_seq: 8,
+            }
+        ));
+        assert!(!SimilarIndexScheduler::snapshot_reaches(
+            &snapshot,
+            crate::similar_db::StoreWatermark {
+                store_id: [3; 16],
+                through_change_seq: 9,
+            }
+        ));
+        assert!(!SimilarIndexScheduler::snapshot_reaches(
+            &snapshot,
+            crate::similar_db::StoreWatermark {
+                store_id: [4; 16],
+                through_change_seq: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn incremental_reconcile_cancelled_array_wait_is_not_a_publication_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let favorite_id = Uuid::new_v4();
+        let root = temp.path().join("library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.next_event_seq = 1;
+        state
+            .dirty
+            .insert(DirtyScope::DirectoryContents(root.join("changed")), 1);
+        let plan = state.take_next_job().expect("Delta starts");
+        state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+        *manager.scheduler.state.lock().unwrap() = state;
+        *manager.scheduler.progress.lock().unwrap() =
+            IndexProgress::AwaitingArray(IndexReport::default());
+        let registration = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+        manager
+            .scheduler
+            .request_full(&registration, FullReason::Manual);
+        let watermark = crate::similar_db::StoreWatermark {
+            store_id: [7; 16],
+            through_change_seq: 1,
+        };
+        assert_eq!(
+            manager
+                .scheduler
+                .wait_for_array_ack(watermark, &plan.running.cancel),
+            Err(ArrayAckWaitError::Cancelled)
+        );
+        assert_eq!(
+            manager
+                .scheduler
+                .settle_interrupted_plan(&plan, false, IndexReport::default(),),
+            InterruptedJobDisposition::RestartWorker
+        );
+        assert!(matches!(
+            manager.scheduler.progress.lock().unwrap().clone(),
+            IndexProgress::Running(_)
+        ));
+        let mut state = manager.scheduler.state.lock().unwrap();
+        assert!(matches!(state.phase, SchedulerPhase::Starting));
+        let replacement = state.take_next_job().expect("queued Full is reselected");
+        assert!(matches!(
+            replacement.running.kind,
+            ReconcileJobKind::Full(FullIntent {
+                reason: FullReason::Manual,
+                ..
+            })
+        ));
+        assert!(
+            !state.dirty.is_empty(),
+            "the interrupted Delta remains queued behind the required Full"
+        );
+        drop(state);
+
+        let mut shutdown_state =
+            coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        shutdown_state.next_event_seq = 1;
+        shutdown_state
+            .dirty
+            .insert(DirtyScope::DirectoryContents(root.join("shutdown")), 1);
+        let shutdown_plan = shutdown_state.take_next_job().expect("Delta starts");
+        shutdown_state.phase = SchedulerPhase::AwaitingArray(shutdown_plan.running.clone());
+        shutdown_state.shutdown = true;
+        assert_eq!(
+            shutdown_state.settle_interrupted_job(&shutdown_plan, false),
+            InterruptedJobDisposition::Stopped
+        );
+        assert!(matches!(shutdown_state.phase, SchedulerPhase::Idle));
+        assert!(!shutdown_state.has_runnable_work());
+    }
+
+    #[test]
+    fn incremental_reconcile_activity_does_not_restart_but_password_change_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        std::fs::create_dir(&root).unwrap();
+        let mut favorite = crate::settings::FavoriteEntry::new("library".to_owned(), root);
+        favorite.auto_index_similar = true;
+        let manager = SimilarIndexManager::new(temp.path().join("similar"));
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let first_gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        manager.configure(
+            &[favorite.clone()],
+            passwords.clone(),
+            Some(first_gate),
+            Vec::new(),
+        );
+        let first_epoch = manager.scheduler.state.lock().unwrap().config_epoch;
+
+        let replacement_gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        manager.configure(
+            &[favorite.clone()],
+            passwords,
+            Some(Arc::clone(&replacement_gate)),
+            Vec::new(),
+        );
+        {
+            let state = manager.scheduler.state.lock().unwrap();
+            assert_eq!(state.config_epoch, first_epoch);
+            assert!(Arc::ptr_eq(
+                state
+                    .desired_config
+                    .as_ref()
+                    .and_then(|config| config.activity_gate.as_ref())
+                    .unwrap(),
+                &replacement_gate
+            ));
+        }
+
+        let mut changed_passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        changed_passwords.bump_credential_revision_for_test(Path::new("c:/book.pdf"));
+        manager.configure(&[favorite], changed_passwords, None, Vec::new());
+        assert_eq!(
+            manager.scheduler.state.lock().unwrap().config_epoch,
+            first_epoch + 1
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_degraded_progress_names_the_failed_boundary() {
+        assert!(
+            IndexDegradedReason::FilesystemObservationIncomplete
+                .user_message()
+                .contains("既存の索引は保持")
+        );
+        assert!(
+            IndexDegradedReason::ArrayPublication("履歴不足".to_owned())
+                .user_message()
+                .contains("検索用一覧")
+        );
+        assert!(
+            IndexDegradedReason::WatchUnavailable
+                .user_message()
+                .contains("監視")
+        );
     }
 
     /// 半径を超えたと分かった時点で打ち切っても、半径内の距離は完全一致する。

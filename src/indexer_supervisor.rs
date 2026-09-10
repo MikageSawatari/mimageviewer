@@ -33,9 +33,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 use uuid::Uuid;
@@ -47,6 +45,15 @@ use crate::ingest_worker::{IngestSession, IngestStats};
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_walker::{self, CandidateFile, ScanParams};
 use crate::search_watcher::{ChangeKind, DebouncedChange, FsWatcher, OVERFLOW_MARKER_PATH};
+
+const WATCH_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+const WATCH_HEALTH_POLL: Duration = Duration::from_secs(1);
 
 /// Supervisor が UI に返す進捗・状態スナップショット。
 #[derive(Clone, Debug, Default)]
@@ -245,6 +252,10 @@ pub fn spawn(
     let excluded_roots = params.excluded_roots.clone();
     let enable_metadata_index = params.enable_metadata_index;
     let similar_notifier = params.similar_notifier.clone();
+    let similar_registration = similar_notifier
+        .as_ref()
+        .and_then(|notifier| notifier.begin_watch(fav_id, &root));
+    let registration_on_spawn_failure = similar_registration.clone();
     let cancel_cl = Arc::clone(&cancel);
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
@@ -263,6 +274,7 @@ pub fn spawn(
                 excluded_roots,
                 enable_metadata_index,
                 similar_notifier,
+                similar_registration,
                 meta_db,
                 fts,
                 writer,
@@ -276,8 +288,22 @@ pub fn spawn(
                 change_rx,
             );
             let _ = finished_tx.send(());
-        })
-        .expect("failed to spawn indexer supervisor");
+        });
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            if let (Some(notifier), Some(registration)) = (
+                params.similar_notifier.as_ref(),
+                registration_on_spawn_failure.as_ref(),
+            ) {
+                notifier.watch_unavailable(
+                    registration,
+                    format!("supervisor worker start failed: {error}"),
+                );
+            }
+            panic!("failed to spawn indexer supervisor: {error}");
+        }
+    };
 
     SupervisorHandle {
         favorite_id: fav_id,
@@ -298,6 +324,7 @@ fn supervisor_loop(
     excluded_roots: Vec<PathBuf>,
     enable_metadata_index: bool,
     similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
+    similar_registration: Option<crate::similar_index::SimilarWatchRegistration>,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
@@ -313,13 +340,33 @@ fn supervisor_loop(
     let session = IngestSession::new(favorite_id, favorite_root.clone(), &meta_db, &fts)
         .with_activity_gate(&activity_gate);
 
-    // 1. Watcher 起動 (drop で停止)。失敗しても初期スキャンは動かす。
-    let watcher = FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()).ok();
-    if watcher.is_none() {
-        crate::logger::log(format!(
-            "indexer[{favorite_id}]: FsWatcher start failed (will still run initial scan)"
-        ));
-    }
+    // 1. Watcher registration is a barrier for the similar index.  Publish its terminal
+    // immediately after recursive registration, before the metadata scan can hold this thread.
+    let mut watch_retry_attempt = 0usize;
+    let mut watcher = match FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()) {
+        Ok(watcher) => {
+            if let (Some(notifier), Some(registration)) =
+                (similar_notifier.as_ref(), similar_registration.as_ref())
+            {
+                notifier.watch_ready(registration);
+            }
+            Some(watcher)
+        }
+        Err(error) => {
+            crate::logger::log(format!(
+                "indexer[{favorite_id}]: FsWatcher start failed (will still run initial scan): {error}"
+            ));
+            if let (Some(notifier), Some(registration)) =
+                (similar_notifier.as_ref(), similar_registration.as_ref())
+            {
+                notifier.watch_unavailable(registration, error.to_string());
+            }
+            None
+        }
+    };
+    let mut next_watch_retry = watcher
+        .is_none()
+        .then(|| Instant::now() + WATCH_RETRY_DELAYS[0]);
 
     // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
     if enable_metadata_index {
@@ -366,6 +413,76 @@ fn supervisor_loop(
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        if watcher.as_ref().is_some_and(FsWatcher::is_stopped) {
+            watcher.take();
+            watch_retry_attempt = 0;
+            next_watch_retry = Some(Instant::now() + WATCH_RETRY_DELAYS[0]);
+            if let (Some(notifier), Some(registration)) =
+                (similar_notifier.as_ref(), similar_registration.as_ref())
+            {
+                notifier.watch_unavailable(registration, "watch debounce worker ended");
+            }
+            crate::logger::log(format!(
+                "indexer[{favorite_id}]: watch debounce worker ended; scheduling registration retry"
+            ));
+        }
+        if watcher.is_none() && next_watch_retry.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            match FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()) {
+                Ok(next) => {
+                    watcher = Some(next);
+                    next_watch_retry = None;
+                    watch_retry_attempt = 0;
+                    // Registration only closes the OS-watcher gap. Repair metadata while the
+                    // Similar side remains Unavailable, then publish Ready so both consumers
+                    // cross the same gap barrier.
+                    if enable_metadata_index {
+                        run_initial_scan(
+                            favorite_id,
+                            &favorite_root,
+                            &session,
+                            &writer,
+                            &io_sem,
+                            &excluded_roots,
+                            Arc::clone(&cancel),
+                            &stats,
+                            &progress,
+                        );
+                        mark_activity(&stats);
+                        progress.clear();
+                    }
+                    if !cancel.load(Ordering::SeqCst) {
+                        if let (Some(notifier), Some(registration)) =
+                            (similar_notifier.as_ref(), similar_registration.as_ref())
+                        {
+                            notifier.watch_ready(registration);
+                        }
+                    }
+                    crate::logger::log(format!(
+                        "indexer[{favorite_id}]: FsWatcher registration recovered"
+                    ));
+                }
+                Err(error) => {
+                    watch_retry_attempt = watch_retry_attempt.saturating_add(1);
+                    if let (Some(notifier), Some(registration)) =
+                        (similar_notifier.as_ref(), similar_registration.as_ref())
+                    {
+                        notifier.watch_unavailable(registration, error.to_string());
+                    }
+                    next_watch_retry = WATCH_RETRY_DELAYS
+                        .get(watch_retry_attempt)
+                        .map(|delay| Instant::now() + *delay);
+                    crate::logger::log(format!(
+                        "indexer[{favorite_id}]: FsWatcher retry {} failed: {error}",
+                        watch_retry_attempt + 1
+                    ));
+                }
+            }
+        }
+        let retry_wait = next_watch_retry
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(WATCH_HEALTH_POLL)
+            .min(WATCH_HEALTH_POLL);
         select! {
             recv(cmd_rx) -> msg => {
                 match msg {
@@ -373,6 +490,11 @@ fn supervisor_loop(
                     Ok(SupervisorCommand::FullRescan) => {
                         if cancel.load(Ordering::SeqCst) {
                             break;
+                        }
+                        if let (Some(notifier), Some(registration)) =
+                            (similar_notifier.as_ref(), similar_registration.as_ref())
+                        {
+                            notifier.request_full(registration);
                         }
                         if enable_metadata_index {
                             run_initial_scan(
@@ -388,8 +510,9 @@ fn supervisor_loop(
                             );
                             mark_activity(&stats);
                         }
-                        if let Some(notifier) = &similar_notifier {
-                            notifier.request_reconcile();
+                        if watcher.is_none() && next_watch_retry.is_none() {
+                            watch_retry_attempt = 0;
+                            next_watch_retry = Some(Instant::now() + WATCH_RETRY_DELAYS[0]);
                         }
                         progress.clear();
                     }
@@ -414,6 +537,11 @@ fn supervisor_loop(
                                 "indexer[{favorite_id}]: watcher overflow, running full rescan"
                             ));
                             stats.lock().unwrap().overflowed = true;
+                            if let (Some(notifier), Some(registration)) =
+                                (similar_notifier.as_ref(), similar_registration.as_ref())
+                            {
+                                notifier.request_overflow(registration);
+                            }
                             if enable_metadata_index {
                                 run_initial_scan(
                                     favorite_id,
@@ -428,12 +556,10 @@ fn supervisor_loop(
                                 );
                                 mark_activity(&stats);
                             }
-                            if let Some(notifier) = &similar_notifier {
-                                notifier.request_reconcile();
-                            }
                             progress.clear();
                             continue;
                         }
+                        let similar_path = path.clone();
                         if enable_metadata_index {
                             apply_single_change(
                                 &session,
@@ -448,14 +574,24 @@ fn supervisor_loop(
                             );
                             mark_activity(&stats);
                         }
-                        if let Some(notifier) = &similar_notifier {
-                            notifier.request_reconcile();
+                        if let (Some(notifier), Some(registration)) =
+                            (similar_notifier.as_ref(), similar_registration.as_ref())
+                        {
+                            notifier.request_change(registration, similar_path, kind);
                         }
                         progress.clear();
                     }
-                    Err(_) => break, // watcher ended
+                    Err(_) => {
+                        if let (Some(notifier), Some(registration)) =
+                            (similar_notifier.as_ref(), similar_registration.as_ref())
+                        {
+                            notifier.watch_unavailable(registration, "watch event channel ended");
+                        }
+                        break;
+                    }
                 }
             }
+            default(retry_wait) => {}
         }
     }
 
@@ -904,6 +1040,12 @@ mod tests {
 
         let queued = rx.recv().unwrap();
         assert!(accept_change_unless_cancelled(&cancel, queued).is_none());
+    }
+
+    #[test]
+    fn incremental_reconcile_watch_health_poll_is_shorter_than_retry_backoff() {
+        assert!(WATCH_HEALTH_POLL <= Duration::from_secs(1));
+        assert!(WATCH_HEALTH_POLL <= WATCH_RETRY_DELAYS[0]);
     }
 
     /// ZIP はアイテム索引の対象外なので、notify 差分追従の候補ビルダは ZIP に対し

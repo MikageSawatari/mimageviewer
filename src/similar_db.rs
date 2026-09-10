@@ -129,6 +129,19 @@ pub struct BaseSearchRows {
     pub records: Vec<BaseSearchRow>,
 }
 
+/// Immutable-array publication target captured after a reconcile's final write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoreWatermark {
+    pub(crate) store_id: [u8; 16],
+    pub(crate) through_change_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionalCommit<T> {
+    Committed(T),
+    Skipped,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseSearchRow {
     pub item_id: u64,
@@ -913,8 +926,19 @@ impl SimilarDb {
 
     /// 単独画像を差分 upsert する。戻り値は再計算した行なら true。
     pub fn upsert_loose_item(&self, item: &StoredItem) -> rusqlite::Result<bool> {
+        self.upsert_loose_item_if(item, || true)
+    }
+
+    pub(crate) fn upsert_loose_item_if(
+        &self,
+        item: &StoredItem,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<bool> {
         debug_assert!(item.container_key.is_none());
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_publish() {
+            return Ok(false);
+        }
         let transaction = write_transaction(&mut conn)?;
         let existing = load_item_raw(&transaction, &item.item_key)?;
         if existing.as_ref().is_some_and(|existing| {
@@ -927,6 +951,9 @@ impl SimilarDb {
             return Ok(false);
         }
         publish_item(&transaction, existing.as_ref(), item)?;
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         transaction.commit()?;
         Ok(true)
     }
@@ -1114,52 +1141,27 @@ impl SimilarDb {
 
     /// staging 行数を確認し、公開世代を 1 transaction で置換する。
     pub fn complete_container(&self, container_key: &str, generation: u64) -> rusqlite::Result<()> {
+        self.complete_container_if(container_key, generation, || true)
+            .map(|_| ())
+    }
+
+    pub(crate) fn complete_container_if(
+        &self,
+        container_key: &str,
+        generation: u64,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<bool> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_publish() {
+            return Ok(false);
+        }
         let transaction = write_transaction(&mut conn)?;
-        let expected = building_page_count(&transaction, container_key, generation)?;
-        let actual = transaction.query_row(
-            "SELECT COUNT(*) FROM item_build WHERE container_key = ?1 AND generation = ?2",
-            params![container_key, generation],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if actual != expected {
+        complete_container_transaction(&transaction, container_key, generation)?;
+        if !should_publish() {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let staged = load_staged_items(&transaction, container_key, generation)?;
-        let staged_keys = staged
-            .iter()
-            .map(|item| item.item_key.as_str())
-            .collect::<HashSet<_>>();
-        let old_container_rows = load_items_for_container_raw(&transaction, container_key)?;
-        for old in old_container_rows {
-            if !staged_keys.contains(old.item.item_key.as_str()) {
-                delete_item_with_change(&transaction, &old)?;
-            }
-        }
-        for item in &staged {
-            let existing = load_item_raw(&transaction, &item.item_key)?;
-            publish_item(&transaction, existing.as_ref(), item)?;
-        }
-        transaction.execute(
-            "INSERT INTO container
-             (container_key, kind, page_count, scan_state, generation, mtime, file_size)
-             SELECT container_key, kind, page_count, ?3, generation, mtime, file_size
-             FROM container_build WHERE container_key = ?1 AND generation = ?2
-             ON CONFLICT(container_key) DO UPDATE SET
-               kind=excluded.kind, page_count=excluded.page_count,
-               scan_state=excluded.scan_state, generation=excluded.generation,
-               mtime=excluded.mtime, file_size=excluded.file_size",
-            params![container_key, generation, ScanState::Complete as i64],
-        )?;
-        transaction.execute(
-            "DELETE FROM item_build WHERE container_key = ?1 AND generation = ?2",
-            params![container_key, generation],
-        )?;
-        transaction.execute(
-            "DELETE FROM container_build WHERE container_key = ?1 AND generation = ?2",
-            params![container_key, generation],
-        )?;
-        transaction.commit()
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// 失敗した新規 container は Failed として残す。再索引なら旧 Complete を保つ。
@@ -1268,6 +1270,18 @@ impl SimilarDb {
         search_store_id(&conn)
     }
 
+    /// Capture store identity and the latest committed change in one read snapshot.
+    pub(crate) fn change_watermark(&self) -> rusqlite::Result<StoreWatermark> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let watermark = StoreWatermark {
+            store_id: search_store_id(&transaction)?,
+            through_change_seq: latest_change_seq(&transaction)?,
+        };
+        transaction.commit()?;
+        Ok(watermark)
+    }
+
     pub fn load_item_changes_after(&self, after_seq: u64) -> rusqlite::Result<ItemChangeBatch> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // 読み取り専用。ここで書くなら `write_transaction` に替えること。
@@ -1327,46 +1341,14 @@ impl SimilarDb {
     ) -> rusqlite::Result<StoredIndexSummary> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = write_transaction(&mut conn)?;
-        let registered_items = transaction.query_row(
-            "SELECT COUNT(*) FROM item i
-             LEFT JOIN container c ON c.container_key = i.container_key
-             WHERE i.hash_version = ?1
-               AND (i.container_key IS NULL OR c.scan_state = ?2)",
-            params![hash_version, ScanState::Complete as i64],
-            |row| row.get::<_, i64>(0),
-        )?;
-        transaction.execute(
-            "INSERT INTO index_run
-             (singleton, hash_version, completed_at_unix_secs, registered_items,
-              password_required_pdfs, corrupt_containers, zero_page_containers,
-              decode_failures, io_failures)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(singleton) DO UPDATE SET
-               hash_version=excluded.hash_version,
-               completed_at_unix_secs=excluded.completed_at_unix_secs,
-               registered_items=excluded.registered_items,
-               password_required_pdfs=excluded.password_required_pdfs,
-               corrupt_containers=excluded.corrupt_containers,
-               zero_page_containers=excluded.zero_page_containers,
-               decode_failures=excluded.decode_failures,
-               io_failures=excluded.io_failures",
-            params![
-                hash_version,
-                completed_at_unix_secs,
-                registered_items,
-                i64::try_from(stats.password_required_pdfs).unwrap_or(i64::MAX),
-                i64::try_from(stats.corrupt_containers).unwrap_or(i64::MAX),
-                i64::try_from(stats.zero_page_containers).unwrap_or(i64::MAX),
-                i64::try_from(stats.decode_failures).unwrap_or(i64::MAX),
-                i64::try_from(stats.io_failures).unwrap_or(i64::MAX),
-            ],
+        let summary = record_completed_index_transaction(
+            &transaction,
+            hash_version,
+            completed_at_unix_secs,
+            stats,
         )?;
         transaction.commit()?;
-        Ok(StoredIndexSummary {
-            completed_at_unix_secs,
-            registered_items: u64::try_from(registered_items).unwrap_or(0),
-            stats,
-        })
+        Ok(summary)
     }
 
     pub fn load_index_summary(
@@ -1562,36 +1544,141 @@ impl SimilarDb {
     ) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = write_transaction(&mut conn)?;
-        let item_keys = {
-            let mut statement = transaction.prepare("SELECT item_key FROM item")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let container_keys = {
-            let mut statement = transaction.prepare("SELECT container_key FROM container")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut removed = 0;
-        for key in item_keys {
-            if !seen_items.contains(&key) {
-                if let Some(row) = load_item_raw(&transaction, &key)? {
-                    delete_item_with_change(&transaction, &row)?;
-                    removed += 1;
-                }
-            }
+        let removed = prune_except_seen_transaction(&transaction, seen_items, seen_containers)?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_full_reconcile_if(
+        &self,
+        seen_items: &HashSet<String>,
+        seen_containers: &HashSet<String>,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+        stats: CompletedIndexStats,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<(usize, StoredIndexSummary)> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
         }
-        for key in container_keys {
-            if !seen_containers.contains(&key) {
-                for row in load_items_for_container_raw(&transaction, &key)? {
-                    delete_item_with_change(&transaction, &row)?;
-                    removed += 1;
-                }
-                removed += transaction
-                    .execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
-            }
+        let transaction = write_transaction(&mut conn)?;
+        let removed = prune_except_seen_transaction(&transaction, seen_items, seen_containers)?;
+        let summary = record_completed_index_transaction(
+            &transaction,
+            hash_version,
+            completed_at_unix_secs,
+            stats,
+        )?;
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        transaction.commit()?;
+        Ok((removed, summary))
+    }
+
+    /// Remove stale rows only inside successfully observed delta scopes.
+    ///
+    /// A directory-content scope owns its loose children, file containers, and an image-book
+    /// container whose key is the directory itself.  A subtree/removal scope owns every key below
+    /// it.  Seen containers protect their previous Complete pages when enumeration, password, or
+    /// decoding failed; only a successful replacement generation may retire those pages.
+    pub fn prune_scopes_except_seen(
+        &self,
+        directory_contents: &[String],
+        subtrees: &[String],
+        removed_prefixes: &[String],
+        seen_items: &HashSet<String>,
+        seen_containers: &HashSet<String>,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = write_transaction(&mut conn)?;
+        let removed = prune_scopes_transaction(
+            &transaction,
+            directory_contents,
+            subtrees,
+            removed_prefixes,
+            seen_items,
+            seen_containers,
+        )?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    /// Atomically publish every successfully prepared row for one delta batch and retire only
+    /// rows inside the scopes observed by that same batch. Container pages remain in the existing
+    /// build tables until this transaction, while loose rows stay in memory, so book/loose
+    /// representation changes are never visible half-applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_delta_reconcile(
+        &self,
+        loose_items: &[StoredItem],
+        completed_containers: &[(String, u64)],
+        directory_contents: &[String],
+        subtrees: &[String],
+        removed_prefixes: &[String],
+        seen_items: &HashSet<String>,
+        seen_containers: &HashSet<String>,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+    ) -> rusqlite::Result<usize> {
+        self.publish_delta_reconcile_if(
+            loose_items,
+            completed_containers,
+            directory_contents,
+            subtrees,
+            removed_prefixes,
+            seen_items,
+            seen_containers,
+            hash_version,
+            completed_at_unix_secs,
+            || true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_delta_reconcile_if(
+        &self,
+        loose_items: &[StoredItem],
+        completed_containers: &[(String, u64)],
+        directory_contents: &[String],
+        subtrees: &[String],
+        removed_prefixes: &[String],
+        seen_items: &HashSet<String>,
+        seen_containers: &HashSet<String>,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_publish() {
+            return Ok(0);
+        }
+        let transaction = write_transaction(&mut conn)?;
+        for item in loose_items {
+            debug_assert!(item.container_key.is_none());
+            let existing = load_item_raw(&transaction, &item.item_key)?;
+            publish_item(&transaction, existing.as_ref(), item)?;
+        }
+        for (container_key, generation) in completed_containers {
+            complete_container_transaction(&transaction, container_key, *generation)?;
+        }
+        let removed = prune_scopes_transaction(
+            &transaction,
+            directory_contents,
+            subtrees,
+            removed_prefixes,
+            seen_items,
+            seen_containers,
+        )?;
+        refresh_index_summary_count_transaction(
+            &transaction,
+            hash_version,
+            completed_at_unix_secs,
+        )?;
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
         }
         transaction.commit()?;
         Ok(removed)
@@ -1606,11 +1693,26 @@ impl SimilarDb {
         purge_roots: &[String],
         keep_roots: &[String],
     ) -> rusqlite::Result<usize> {
+        match self.purge_roots_except_if(purge_roots, keep_roots, || true)? {
+            ConditionalCommit::Committed(removed) => Ok(removed),
+            ConditionalCommit::Skipped => unreachable!("unconditional purge was skipped"),
+        }
+    }
+
+    pub(crate) fn purge_roots_except_if(
+        &self,
+        purge_roots: &[String],
+        keep_roots: &[String],
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<ConditionalCommit<usize>> {
         if purge_roots.is_empty() {
-            return Ok(0);
+            return Ok(ConditionalCommit::Committed(0));
         }
 
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_publish() {
+            return Ok(ConditionalCommit::Skipped);
+        }
         let transaction = write_transaction(&mut conn)?;
         let should_purge =
             |key: &str| key_is_under_any(key, purge_roots) && !key_is_under_any(key, keep_roots);
@@ -1668,8 +1770,28 @@ impl SimilarDb {
              WHERE singleton = 1",
             [ScanState::Complete as i64],
         )?;
+        if !should_publish() {
+            return Ok(ConditionalCommit::Skipped);
+        }
         transaction.commit()?;
-        Ok(removed)
+        Ok(ConditionalCommit::Committed(removed))
+    }
+
+    /// Refresh the corpus count after a successful delta without replacing the last full-run
+    /// failure summary with statistics from one dirty directory.
+    pub fn refresh_index_summary_count(
+        &self,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = write_transaction(&mut conn)?;
+        refresh_index_summary_count_transaction(
+            &transaction,
+            hash_version,
+            completed_at_unix_secs,
+        )?;
+        transaction.commit()
     }
 
     #[cfg(test)]
@@ -1691,6 +1813,173 @@ pub(crate) fn key_is_under_any(key: &str, roots: &[String]) -> bool {
     })
 }
 
+fn normalized_parent(key: &str) -> Option<&str> {
+    key.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn record_completed_index_transaction(
+    transaction: &Transaction<'_>,
+    hash_version: i64,
+    completed_at_unix_secs: i64,
+    stats: CompletedIndexStats,
+) -> rusqlite::Result<StoredIndexSummary> {
+    let registered_items = transaction.query_row(
+        "SELECT COUNT(*) FROM item i
+         LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.hash_version = ?1
+           AND (i.container_key IS NULL OR c.scan_state = ?2)",
+        params![hash_version, ScanState::Complete as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO index_run
+         (singleton, hash_version, completed_at_unix_secs, registered_items,
+          password_required_pdfs, corrupt_containers, zero_page_containers,
+          decode_failures, io_failures)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(singleton) DO UPDATE SET
+           hash_version=excluded.hash_version,
+           completed_at_unix_secs=excluded.completed_at_unix_secs,
+           registered_items=excluded.registered_items,
+           password_required_pdfs=excluded.password_required_pdfs,
+           corrupt_containers=excluded.corrupt_containers,
+           zero_page_containers=excluded.zero_page_containers,
+           decode_failures=excluded.decode_failures,
+           io_failures=excluded.io_failures",
+        params![
+            hash_version,
+            completed_at_unix_secs,
+            registered_items,
+            i64::try_from(stats.password_required_pdfs).unwrap_or(i64::MAX),
+            i64::try_from(stats.corrupt_containers).unwrap_or(i64::MAX),
+            i64::try_from(stats.zero_page_containers).unwrap_or(i64::MAX),
+            i64::try_from(stats.decode_failures).unwrap_or(i64::MAX),
+            i64::try_from(stats.io_failures).unwrap_or(i64::MAX),
+        ],
+    )?;
+    Ok(StoredIndexSummary {
+        completed_at_unix_secs,
+        registered_items: u64::try_from(registered_items).unwrap_or(0),
+        stats,
+    })
+}
+
+fn prune_except_seen_transaction(
+    transaction: &Transaction<'_>,
+    seen_items: &HashSet<String>,
+    seen_containers: &HashSet<String>,
+) -> rusqlite::Result<usize> {
+    let item_keys = query_string_column(transaction, "SELECT item_key FROM item")?;
+    let container_keys = query_string_column(transaction, "SELECT container_key FROM container")?;
+    let mut removed = 0usize;
+    for key in item_keys {
+        let Some(row) = load_item_raw(transaction, &key)? else {
+            continue;
+        };
+        let protected_container = row
+            .item
+            .container_key
+            .as_ref()
+            .is_some_and(|container| seen_containers.contains(container));
+        if !seen_items.contains(&key) && !protected_container {
+            delete_item_with_change(transaction, &row)?;
+            removed += 1;
+        }
+    }
+    for key in container_keys {
+        if !seen_containers.contains(&key) {
+            for row in load_items_for_container_raw(transaction, &key)? {
+                delete_item_with_change(transaction, &row)?;
+                removed += 1;
+            }
+            removed +=
+                transaction.execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
+        }
+    }
+    Ok(removed)
+}
+
+fn prune_scopes_transaction(
+    transaction: &Transaction<'_>,
+    directory_contents: &[String],
+    subtrees: &[String],
+    removed_prefixes: &[String],
+    seen_items: &HashSet<String>,
+    seen_containers: &HashSet<String>,
+) -> rusqlite::Result<usize> {
+    let item_keys = query_string_column(transaction, "SELECT item_key FROM item")?;
+    let container_keys = query_string_column(transaction, "SELECT container_key FROM container")?;
+    let covered_container = |key: &str| {
+        directory_contents
+            .iter()
+            .any(|directory| key == directory || normalized_parent(key) == Some(directory.as_str()))
+            || key_is_under_any(key, subtrees)
+            || key_is_under_any(key, removed_prefixes)
+    };
+    let covered_loose = |key: &str| {
+        directory_contents
+            .iter()
+            .any(|directory| normalized_parent(key) == Some(directory.as_str()))
+            || key_is_under_any(key, subtrees)
+            || key_is_under_any(key, removed_prefixes)
+    };
+
+    let mut removed = 0usize;
+    for key in item_keys {
+        let Some(row) = load_item_raw(transaction, &key)? else {
+            continue;
+        };
+        let covered = row.item.container_key.as_ref().map_or_else(
+            || covered_loose(&row.item.item_key),
+            |container| covered_container(container),
+        );
+        let protected_container = row
+            .item
+            .container_key
+            .as_ref()
+            .is_some_and(|container| seen_containers.contains(container));
+        if covered && !seen_items.contains(&key) && !protected_container {
+            delete_item_with_change(transaction, &row)?;
+            removed += 1;
+        }
+    }
+    for key in container_keys {
+        if covered_container(&key) && !seen_containers.contains(&key) {
+            for row in load_items_for_container_raw(transaction, &key)? {
+                delete_item_with_change(transaction, &row)?;
+                removed += 1;
+            }
+            removed +=
+                transaction.execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
+        }
+    }
+    Ok(removed)
+}
+
+fn refresh_index_summary_count_transaction(
+    transaction: &Transaction<'_>,
+    hash_version: i64,
+    completed_at_unix_secs: i64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "UPDATE index_run
+         SET completed_at_unix_secs = ?2,
+             registered_items = (
+               SELECT COUNT(*) FROM item i
+               LEFT JOIN container c ON c.container_key = i.container_key
+               WHERE i.hash_version = ?1
+                 AND (i.container_key IS NULL OR c.scan_state = ?3)
+             )
+         WHERE singleton = 1",
+        params![
+            hash_version,
+            completed_at_unix_secs,
+            ScanState::Complete as i64
+        ],
+    )?;
+    Ok(())
+}
+
 fn query_string_column(transaction: &Transaction<'_>, sql: &str) -> rusqlite::Result<Vec<String>> {
     let mut statement = transaction.prepare(sql)?;
     statement
@@ -1709,6 +1998,56 @@ fn building_page_count(
         params![container_key, generation, ScanState::Building as i64],
         |row| row.get(0),
     )
+}
+
+fn complete_container_transaction(
+    transaction: &Transaction<'_>,
+    container_key: &str,
+    generation: u64,
+) -> rusqlite::Result<()> {
+    let expected = building_page_count(transaction, container_key, generation)?;
+    let actual = transaction.query_row(
+        "SELECT COUNT(*) FROM item_build WHERE container_key = ?1 AND generation = ?2",
+        params![container_key, generation],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if actual != expected {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let staged = load_staged_items(transaction, container_key, generation)?;
+    let staged_keys = staged
+        .iter()
+        .map(|item| item.item_key.as_str())
+        .collect::<HashSet<_>>();
+    for old in load_items_for_container_raw(transaction, container_key)? {
+        if !staged_keys.contains(old.item.item_key.as_str()) {
+            delete_item_with_change(transaction, &old)?;
+        }
+    }
+    for item in &staged {
+        let existing = load_item_raw(transaction, &item.item_key)?;
+        publish_item(transaction, existing.as_ref(), item)?;
+    }
+    transaction.execute(
+        "INSERT INTO container
+         (container_key, kind, page_count, scan_state, generation, mtime, file_size)
+         SELECT container_key, kind, page_count, ?3, generation, mtime, file_size
+         FROM container_build WHERE container_key = ?1 AND generation = ?2
+         ON CONFLICT(container_key) DO UPDATE SET
+           kind=excluded.kind, page_count=excluded.page_count,
+           scan_state=excluded.scan_state, generation=excluded.generation,
+           mtime=excluded.mtime, file_size=excluded.file_size",
+        params![container_key, generation, ScanState::Complete as i64],
+    )?;
+    transaction.execute(
+        "DELETE FROM item_build WHERE container_key = ?1 AND generation = ?2",
+        params![container_key, generation],
+    )?;
+    transaction.execute(
+        "DELETE FROM container_build WHERE container_key = ?1 AND generation = ?2",
+        params![container_key, generation],
+    )?;
+    Ok(())
 }
 
 fn item_params(item: &StoredItem, generation: Option<i64>) -> Vec<rusqlite::types::Value> {
@@ -4002,6 +4341,189 @@ mod tests {
                 .unwrap()
                 .registered_items,
             2
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_skipped_conditional_purge_rolls_back_and_is_typed() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/a.jpg", None, None, 1))
+            .unwrap();
+        let before = db.load_search_rows(current_hash_version()).unwrap();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = db
+            .purge_roots_except_if(&["c:/library".to_owned()], &[], || {
+                checks.fetch_add(1, Ordering::AcqRel) == 0
+            })
+            .unwrap();
+        assert_eq!(result, ConditionalCommit::Skipped);
+        assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+
+        assert_eq!(
+            db.purge_roots_except_if(&["c:/library".to_owned()], &[], || false)
+                .unwrap(),
+            ConditionalCommit::Skipped
+        );
+        assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+    }
+
+    #[test]
+    fn incremental_reconcile_failed_container_keeps_previous_complete_pages() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let generation = db
+            .begin_container_build("c:/library/book.zip", ContainerKind::Zip, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            generation,
+            &item(
+                "c:/library/book.zip\u{1f}001.jpg",
+                Some("c:/library/book.zip"),
+                Some(0),
+                7,
+            ),
+        )
+        .unwrap();
+        db.complete_container("c:/library/book.zip", generation)
+            .unwrap();
+
+        let seen_containers = HashSet::from(["c:/library/book.zip".to_owned()]);
+        assert_eq!(
+            db.prune_except_seen(&HashSet::new(), &seen_containers)
+                .unwrap(),
+            0
+        );
+        let rows = db.load_search_rows(current_hash_version()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item.item_key, "c:/library/book.zip\u{1f}001.jpg");
+    }
+
+    #[test]
+    fn incremental_reconcile_delta_publish_switches_book_to_loose_atomically() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let book = "c:/library/book";
+        let page_key = "c:/library/book/001.jpg";
+        let generation = db
+            .begin_container_build(book, ContainerKind::ImageFolder, 1, 1, 0)
+            .unwrap();
+        db.stage_item(generation, &item(page_key, Some(book), Some(0), 1))
+            .unwrap();
+        db.complete_container(book, generation).unwrap();
+
+        let loose = item(page_key, None, Some(0), 2);
+        let seen_items = HashSet::from([page_key.to_owned()]);
+        db.publish_delta_reconcile(
+            &[loose],
+            &[],
+            &[book.to_owned()],
+            &[],
+            &[],
+            &seen_items,
+            &HashSet::new(),
+            current_hash_version(),
+            123,
+        )
+        .unwrap();
+
+        let rows = db.load_search_rows(current_hash_version()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item.item_key, page_key);
+        assert_eq!(rows[0].item.container_key, None);
+        assert!(db.load_complete_containers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_reconcile_failed_delta_publish_rolls_back_the_scope() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/keep.jpg", None, None, 1))
+            .unwrap();
+        let before = db.load_search_rows(current_hash_version()).unwrap();
+        let new_item = item("c:/library/new.jpg", None, None, 2);
+        let seen_items = HashSet::from([new_item.item_key.clone()]);
+
+        assert!(
+            db.publish_delta_reconcile(
+                &[new_item],
+                &[("c:/library/missing.zip".to_owned(), 99)],
+                &["c:/library".to_owned()],
+                &[],
+                &[],
+                &seen_items,
+                &HashSet::new(),
+                current_hash_version(),
+                124,
+            )
+            .is_err()
+        );
+        assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+    }
+
+    #[test]
+    fn incremental_reconcile_cancelled_delta_rolls_back_rows_prune_and_summary() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/keep.jpg", None, None, 1))
+            .unwrap();
+        let previous_summary = db
+            .record_completed_index(current_hash_version(), 100, CompletedIndexStats::default())
+            .unwrap();
+        let before = db.load_search_rows(current_hash_version()).unwrap();
+        let new_item = item("c:/library/new.jpg", None, None, 2);
+        let seen_items = HashSet::from([new_item.item_key.clone()]);
+        let publish_checks = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            db.publish_delta_reconcile_if(
+                &[new_item],
+                &[],
+                &["c:/library".to_owned()],
+                &[],
+                &[],
+                &seen_items,
+                &HashSet::new(),
+                current_hash_version(),
+                200,
+                || publish_checks.fetch_add(1, Ordering::AcqRel) == 0,
+            )
+            .is_err()
+        );
+        assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+        assert_eq!(
+            db.load_index_summary(current_hash_version()).unwrap(),
+            Some(previous_summary)
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_cancelled_full_rolls_back_prune_and_completion_summary() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for (key, marker) in [("c:/library/keep.jpg", 1), ("c:/library/stale.jpg", 2)] {
+            db.upsert_loose_item(&item(key, None, None, marker))
+                .unwrap();
+        }
+        let previous_summary = db
+            .record_completed_index(current_hash_version(), 100, CompletedIndexStats::default())
+            .unwrap();
+        let before = db.load_search_rows(current_hash_version()).unwrap();
+        let publish_checks = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(
+            db.finalize_full_reconcile_if(
+                &HashSet::from(["c:/library/keep.jpg".to_owned()]),
+                &HashSet::new(),
+                current_hash_version(),
+                200,
+                CompletedIndexStats {
+                    io_failures: 1,
+                    ..CompletedIndexStats::default()
+                },
+                || publish_checks.fetch_add(1, Ordering::AcqRel) == 0,
+            )
+            .is_err()
+        );
+        assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+        assert_eq!(
+            db.load_index_summary(current_hash_version()).unwrap(),
+            Some(previous_summary)
         );
     }
 }

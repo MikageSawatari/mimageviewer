@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn similar_only_favorite_uses_existing_supervisor_watcher() {
+    fn incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("similar-only");
         std::fs::create_dir_all(&root).unwrap();
@@ -1157,12 +1157,13 @@ mod tests {
         let mut favorite = mk_fav("similar", &root, false);
         favorite.auto_index_similar = true;
 
-        manager.sync_with_favorites(&[favorite.clone()]);
         similar.configure(
-            &[favorite],
+            &[favorite.clone()],
             crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
-            Some(activity_gate),
+            Some(Arc::clone(&activity_gate)),
+            Vec::new(),
         );
+        manager.sync_with_favorites(&[favorite.clone()]);
 
         assert_eq!(manager.supervisor_count(), 1);
         wait_until("similar-only watcher did not start", || {
@@ -1186,6 +1187,7 @@ mod tests {
                 matches!(progress, crate::similar_index::IndexProgress::Complete(_))
             },
         );
+        assert_eq!(similar.reconcile_job_counts_for_test(), (1, 0));
 
         // 同じ supervisor の watcher が追加と変更を類似索引へ渡すことを確認する。
         // 類似索引用の watcher を別に作る実装では、この結合テストを満たせない。
@@ -1220,6 +1222,157 @@ mod tests {
                 .iter()
                 .any(|row| row.item.item_key == item_key && row.item.width == 37)
         });
+
+        let renamed_path = root.join("renamed.png");
+        std::fs::rename(&image_path, &renamed_path).unwrap();
+        let renamed_key = crate::similar_index::item_key_for_file(&renamed_path);
+        wait_until("shared watcher did not reconcile both rename sides", || {
+            let rows = db
+                .load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap();
+            rows.iter().all(|row| row.item.item_key != item_key)
+                && rows.iter().any(|row| row.item.item_key == renamed_key)
+        });
+        std::fs::remove_file(&renamed_path).unwrap();
+        wait_until("shared watcher did not remove the deleted image", || {
+            db.load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap()
+                .iter()
+                .all(|row| row.item.item_key != renamed_key)
+        });
+        let (full_jobs, delta_jobs) = similar.reconcile_job_counts_for_test();
+        assert_eq!(
+            full_jobs, 1,
+            "ordinary shared-watcher events must not restart the full reconcile"
+        );
+        assert!(
+            delta_jobs >= 2,
+            "add/change/rename/remove should converge through one or more delta batches"
+        );
+
+        // A metadata-only setting change replaces the shared supervisor while the Similar
+        // configuration remains identical. The registration handoff owns one repair gap rather
+        // than silently accepting the new watcher as an uninterrupted lifecycle.
+        favorite.auto_index_metadata = true;
+        manager.sync_with_favorites(&[favorite]);
+        wait_until_with(
+            || {
+                format!(
+                    "replacement watcher repair stalled: {:?}",
+                    similar.progress()
+                )
+            },
+            || {
+                let (full_jobs, _) = similar.reconcile_job_counts_for_test();
+                full_jobs >= 2
+                    && matches!(
+                        similar.progress(),
+                        crate::similar_index::IndexProgress::Complete(_)
+                    )
+            },
+        );
+        assert_eq!(
+            similar.reconcile_job_counts_for_test().0,
+            2,
+            "one shared-watcher replacement owns exactly one repair Full"
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_watch_recovery_repairs_metadata_and_similar_together() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("recovering-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
+        let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            Arc::clone(&fts),
+        );
+        let similar_data = tmp.path().join("similar");
+        let similar = crate::similar_index::SimilarIndexManager::new(similar_data.clone());
+        let activity_gate = Arc::new(ActivityGate::new(0));
+        let mut manager = IndexerManager {
+            meta_db: Arc::clone(&meta),
+            fts,
+            writer,
+            io_sem: Arc::new(GlobalIoSemaphore::new(1)),
+            activity_gate: Arc::clone(&activity_gate),
+            excluded_roots: Vec::new(),
+            similar_notifier: Some(similar.notifier()),
+            supervisors: HashMap::new(),
+            favorite_info: HashMap::new(),
+            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_diag: StartupDiag::default(),
+        };
+        let mut favorite = mk_fav("recovering", &root, false);
+        favorite.auto_index_similar = true;
+        similar.configure(
+            &[favorite.clone()],
+            crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            Some(Arc::clone(&activity_gate)),
+            Vec::new(),
+        );
+        manager.sync_with_favorites(&[favorite.clone()]);
+        wait_until("initial similar reconciliation did not complete", || {
+            matches!(
+                similar.progress(),
+                crate::similar_index::IndexProgress::Complete(_)
+            )
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+        favorite.auto_index_metadata = true;
+        manager.sync_with_favorites(&[favorite]);
+        wait_until_with(
+            || {
+                format!(
+                    "watch unavailability was not observed: {:?}",
+                    similar.progress()
+                )
+            },
+            || {
+                similar.reconcile_job_counts_for_test().0 >= 2
+                    && matches!(
+                        similar.progress(),
+                        crate::similar_index::IndexProgress::Degraded { .. }
+                    )
+            },
+        );
+
+        std::fs::create_dir_all(&root).unwrap();
+        let recovered = root.join("recovered.png");
+        image::RgbImage::from_fn(29, 23, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 5) as u8, ((x + y) * 7) as u8])
+        })
+        .save(&recovered)
+        .unwrap();
+        let recovered_key = crate::search_index_db::normalize_path(&recovered);
+        let similar_key = crate::similar_index::item_key_for_file(&recovered);
+        let db = crate::similar_db::SimilarDb::open_at(&crate::similar_db::SimilarDb::db_path_at(
+            &similar_data,
+        ))
+        .unwrap();
+        wait_until_with(
+            || format!("shared watch recovery stalled: {:?}", similar.progress()),
+            || {
+                meta.get(&recovered_key).unwrap().is_some()
+                    && db
+                        .load_search_rows(crate::similar_db::current_hash_version())
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.item.item_key == similar_key)
+                    && matches!(
+                        similar.progress(),
+                        crate::similar_index::IndexProgress::Complete(_)
+                    )
+            },
+        );
+        assert_eq!(
+            similar.reconcile_job_counts_for_test().0,
+            3,
+            "initial, unavailable snapshot, and one recovered-gap Full are expected"
+        );
     }
 
     #[test]

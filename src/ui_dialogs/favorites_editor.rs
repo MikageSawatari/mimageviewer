@@ -756,15 +756,41 @@ impl App {
                                 crate::similar_index::IndexStage::Scanning => "画像を確認中",
                                 crate::similar_index::IndexStage::Pruning => "更新内容を整理中",
                             };
-                            let mut message = format!(
-                                "{stage} {}/{}",
-                                format_count(progress.report.processed),
-                                format_count(progress.report.discovered)
-                            );
+                            let mut message = match progress.stage {
+                                crate::similar_index::IndexStage::Opening => stage.to_owned(),
+                                crate::similar_index::IndexStage::Scanning => format!(
+                                    "{stage}  確認済み {} 件（発見済み {} 件・総数未確定）",
+                                    format_count(progress.report.processed),
+                                    format_count(progress.report.discovered)
+                                ),
+                                crate::similar_index::IndexStage::Pruning => format!(
+                                    "{stage}  確認済み {} 件（発見済み {} 件）",
+                                    format_count(progress.report.processed),
+                                    format_count(progress.report.discovered)
+                                ),
+                            };
                             if let Some(path) = &progress.current_path {
                                 message.push_str(&format!("  {}", path.display()));
                             }
                             active.push(("別バージョン".to_owned(), message));
+                        }
+                        crate::similar_index::IndexProgress::AwaitingArray(_) => {
+                            active.push((
+                                "別バージョン".to_owned(),
+                                "検索用一覧へ反映中".to_owned(),
+                            ));
+                        }
+                        crate::similar_index::IndexProgress::AwaitingWatch(_) => {
+                            active.push((
+                                "別バージョン".to_owned(),
+                                "フォルダー監視の準備待ち".to_owned(),
+                            ));
+                        }
+                        crate::similar_index::IndexProgress::Degraded { reason, .. } => {
+                            active.push((
+                                "別バージョン".to_owned(),
+                                format!("更新未完了: {}", reason.user_message()),
+                            ));
                         }
                         crate::similar_index::IndexProgress::Failed(error) => {
                             active.push(("別バージョン".to_owned(), format!("失敗: {error}")));
@@ -1023,7 +1049,12 @@ fn draw_similar_index_summary(
 
     match status {
         IndexSummaryStatus::NoIndex => {
-            if !matches!(progress, crate::similar_index::IndexProgress::Running(_)) {
+            if !matches!(
+                progress,
+                crate::similar_index::IndexProgress::Running(_)
+                    | crate::similar_index::IndexProgress::AwaitingWatch(_)
+                    | crate::similar_index::IndexProgress::AwaitingArray(_)
+            ) {
                 ui.label(
                     egui::RichText::new("  別バージョン: 索引なし")
                         .size(11.0)
@@ -1079,15 +1110,22 @@ fn draw_similar_index_summary(
         }
     }
 
-    if let crate::similar_index::IndexProgress::Running(running) = progress {
+    let current_report = match progress {
+        crate::similar_index::IndexProgress::Running(running) => Some(&running.report),
+        crate::similar_index::IndexProgress::AwaitingWatch(report)
+        | crate::similar_index::IndexProgress::AwaitingArray(report)
+        | crate::similar_index::IndexProgress::Degraded { report, .. } => Some(report),
+        _ => None,
+    };
+    if let Some(report) = current_report {
         draw_similar_failure_breakdown(
             ui,
             "今回",
-            running.report.password_required_pdfs,
-            running.report.corrupt_containers,
-            running.report.zero_page_containers,
-            running.report.decode_failures,
-            running.report.io_failures,
+            report.password_required_pdfs,
+            report.corrupt_containers,
+            report.zero_page_containers,
+            report.decode_failures,
+            report.io_failures,
         );
     }
 }
@@ -1197,13 +1235,18 @@ fn draw_similar_state_inline(
     const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
     const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
     let (label, color) = match progress {
-        crate::similar_index::IndexProgress::Running(_) => ("⏳ 作成中", YELLOW),
+        crate::similar_index::IndexProgress::Running(_)
+        | crate::similar_index::IndexProgress::AwaitingArray(_) => ("⏳ 作成中", YELLOW),
+        crate::similar_index::IndexProgress::AwaitingWatch(_) => ("⏳ 監視準備中", YELLOW),
         crate::similar_index::IndexProgress::Failed(_) => {
             ("⚠ 作成失敗", ui.visuals().error_fg_color)
         }
+        crate::similar_index::IndexProgress::Degraded { .. } => {
+            ("⚠ 更新未完了", ui.visuals().error_fg_color)
+        }
         crate::similar_index::IndexProgress::Idle => ("⏳ 起動中", YELLOW),
-        crate::similar_index::IndexProgress::Complete(_)
-        | crate::similar_index::IndexProgress::Cancelled(_) => ("✅ 監視中", GREEN),
+        crate::similar_index::IndexProgress::Complete(_) => ("✅ 監視中", GREEN),
+        crate::similar_index::IndexProgress::Cancelled(_) => ("⚠ 中断", YELLOW),
     };
     ui.label(egui::RichText::new(label).size(11.0).color(color));
 }

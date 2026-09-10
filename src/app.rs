@@ -21513,24 +21513,33 @@ impl App {
     /// OFF 時の削除も同じ worker へ渡し、後続の全走査の完走には依存させない。
     pub(crate) fn apply_favorite_similar_index_change(
         &mut self,
-        favorite_path: &std::path::Path,
-        new_on: bool,
+        _favorite_path: &std::path::Path,
+        _new_on: bool,
     ) {
         self.similar_index.configure(
             &self.settings.favorites,
             self.pdf_passwords.clone(),
             Some(Arc::clone(&self.activity_gate)),
+            vec![self.settings.books_root_path()],
         );
-        if !new_on {
-            self.similar_index.purge_disabled_favorite(favorite_path);
-        }
         if let Some(manager) = self.indexer_manager.as_mut() {
             manager.sync_with_favorites(&self.settings.favorites);
+        } else if self.startup_done {
+            self.similar_index.notifier().finish_watch_bootstrap();
         }
     }
 
     pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
         self.similar_index.progress()
+    }
+
+    fn refresh_similar_index_password_config(&self) {
+        self.similar_index.configure(
+            &self.settings.favorites,
+            self.pdf_passwords.clone(),
+            Some(Arc::clone(&self.activity_gate)),
+            vec![self.settings.books_root_path()],
+        );
     }
 
     pub(crate) fn query_similar_item(
@@ -21568,14 +21577,15 @@ impl App {
         #[cfg(windows)]
         self.kick_off_vst3_startup_load();
         let favorites = self.settings.favorites.clone();
+        let excluded_roots = vec![self.settings.books_root_path()];
         self.similar_index.configure(
             &favorites,
             self.pdf_passwords.clone(),
             Some(Arc::clone(&self.activity_gate)),
+            excluded_roots.clone(),
         );
         let similar_notifier = self.similar_index.notifier();
         let speed = self.settings.indexer_speed_profile;
-        let excluded_roots = vec![self.settings.books_root_path()];
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
@@ -21592,9 +21602,12 @@ impl App {
                         speed,
                         activity_gate,
                         excluded_roots,
-                        similar_notifier,
+                        similar_notifier.clone(),
                         Some(hook),
                     );
+                    if mgr.is_none() {
+                        similar_notifier.finish_watch_bootstrap();
+                    }
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
                     let _ = tx.send(mgr);
                 }
@@ -21613,6 +21626,9 @@ impl App {
                 self.similar_index.notifier(),
                 Some(hook),
             );
+            if self.indexer_manager.is_none() {
+                self.similar_index.notifier().finish_watch_bootstrap();
+            }
             self.startup_done = true;
             self.housekeeping_armed = true;
             return;
@@ -22331,6 +22347,7 @@ impl App {
         if matches!(
             self.similar_index.progress(),
             crate::similar_index::IndexProgress::Running(_)
+                | crate::similar_index::IndexProgress::AwaitingArray(_)
         ) {
             return true;
         }
@@ -25117,6 +25134,7 @@ impl App {
                     if save_path == pdf_path {
                         self.pdf_passwords.set(&save_path, &pw);
                         self.pdf_passwords.save();
+                        self.refresh_similar_index_password_config();
                         self.invalidate_details_pdf_page_count(&save_path);
                     }
                 }
@@ -25237,6 +25255,7 @@ impl App {
                         self.pdf_current_password = None;
                         self.pdf_passwords.remove(&pdf_path);
                         self.pdf_passwords.save();
+                        self.refresh_similar_index_password_config();
                         self.invalidate_details_pdf_page_count(&pdf_path);
                     }
                     self.prepare_deferred_reopen_for_pdf_password_prompt();
@@ -29708,6 +29727,7 @@ impl App {
         for path in purged_pdf_password_paths {
             self.pdf_passwords.remove(path);
         }
+        self.refresh_similar_index_password_config();
         for path in removed {
             let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
                 continue;
