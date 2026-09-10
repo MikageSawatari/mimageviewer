@@ -749,53 +749,10 @@ impl App {
                             }
                         }
                     }
-                    match &similar_progress {
-                        crate::similar_index::IndexProgress::Running(progress) => {
-                            let stage = match progress.stage {
-                                crate::similar_index::IndexStage::Opening => "準備中",
-                                crate::similar_index::IndexStage::Scanning => "画像を確認中",
-                                crate::similar_index::IndexStage::Pruning => "更新内容を整理中",
-                            };
-                            let mut message = match progress.stage {
-                                crate::similar_index::IndexStage::Opening => stage.to_owned(),
-                                crate::similar_index::IndexStage::Scanning => format!(
-                                    "{stage}  確認済み {} 件（発見済み {} 件・総数未確定）",
-                                    format_count(progress.report.processed),
-                                    format_count(progress.report.discovered)
-                                ),
-                                crate::similar_index::IndexStage::Pruning => format!(
-                                    "{stage}  確認済み {} 件（発見済み {} 件）",
-                                    format_count(progress.report.processed),
-                                    format_count(progress.report.discovered)
-                                ),
-                            };
-                            if let Some(path) = &progress.current_path {
-                                message.push_str(&format!("  {}", path.display()));
-                            }
-                            active.push(("別バージョン".to_owned(), message));
-                        }
-                        crate::similar_index::IndexProgress::AwaitingArray(_) => {
-                            active.push((
-                                "別バージョン".to_owned(),
-                                "検索用一覧へ反映中".to_owned(),
-                            ));
-                        }
-                        crate::similar_index::IndexProgress::AwaitingWatch(_) => {
-                            active.push((
-                                "別バージョン".to_owned(),
-                                "フォルダー監視の準備待ち".to_owned(),
-                            ));
-                        }
-                        crate::similar_index::IndexProgress::Degraded { reason, .. } => {
-                            active.push((
-                                "別バージョン".to_owned(),
-                                format!("更新未完了: {}", reason.user_message()),
-                            ));
-                        }
-                        crate::similar_index::IndexProgress::Failed(error) => {
-                            active.push(("別バージョン".to_owned(), format!("失敗: {error}")));
-                        }
-                        _ => {}
+                    if let Some(message) =
+                        similar_index_progress_presentation(true, &similar_progress).activity
+                    {
+                        active.push(("別バージョン".to_owned(), message));
                     }
                     // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
                     // 「処理速度 = Σ(各 rate_per_sec)」。各 supervisor のサンプルがまだ
@@ -848,17 +805,7 @@ impl App {
                         );
                     } else {
                         for (name, msg) in &active {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  {}: {}",
-                                    name,
-                                    truncate_name(msg, 100),
-                                ))
-                                .size(11.0)
-                                .monospace()
-                                .color(ui.visuals().weak_text_color()),
-                            )
-                            .on_hover_text(format!("{name}: {msg}"));
+                            draw_background_indexer_activity_row(ui, name, msg);
                         }
                     }
                     draw_similar_index_summary(ui, &similar_summary, &similar_progress);
@@ -1038,6 +985,94 @@ impl App {
             self.cc.show = true;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimilarIndexProgressTone {
+    Weak,
+    Pending,
+    Complete,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SimilarIndexProgressPresentation {
+    inline_label: &'static str,
+    inline_tone: SimilarIndexProgressTone,
+    activity: Option<String>,
+}
+
+fn similar_index_progress_presentation(
+    enabled: bool,
+    progress: &crate::similar_index::IndexProgress,
+) -> SimilarIndexProgressPresentation {
+    use crate::similar_index::{IndexProgress, IndexStage};
+
+    let activity = match progress {
+        IndexProgress::Running(progress) => {
+            let stage = match progress.stage {
+                IndexStage::Opening => "準備中",
+                IndexStage::Scanning => "画像を確認中",
+                IndexStage::Pruning => "更新内容を整理中",
+            };
+            let mut message = match progress.stage {
+                IndexStage::Opening => stage.to_owned(),
+                IndexStage::Scanning => format!(
+                    "{stage}  確認済み {} 件（発見済み {} 件・総数未確定）",
+                    format_count(progress.report.processed),
+                    format_count(progress.report.discovered)
+                ),
+                IndexStage::Pruning => format!(
+                    "{stage}  確認済み {} 件（発見済み {} 件）",
+                    format_count(progress.report.processed),
+                    format_count(progress.report.discovered)
+                ),
+            };
+            if let Some(path) = &progress.current_path {
+                message.push_str(&format!("  {}", path.display()));
+            }
+            Some(message)
+        }
+        IndexProgress::AwaitingArray(_) => Some("検索用一覧へ反映中".to_owned()),
+        IndexProgress::AwaitingWatch(_) => Some("フォルダー監視の準備待ち".to_owned()),
+        IndexProgress::Degraded { reason, .. } => {
+            Some(format!("更新未完了: {}", reason.user_message()))
+        }
+        IndexProgress::Failed(error) => Some(format!("失敗: {error}")),
+        IndexProgress::Idle | IndexProgress::Complete(_) | IndexProgress::Cancelled(_) => None,
+    };
+
+    let (inline_label, inline_tone) = if !enabled {
+        ("—", SimilarIndexProgressTone::Weak)
+    } else {
+        match progress {
+            IndexProgress::Running(_) | IndexProgress::AwaitingArray(_) => {
+                ("⏳ 作成中", SimilarIndexProgressTone::Pending)
+            }
+            IndexProgress::AwaitingWatch(_) => ("⏳ 監視準備中", SimilarIndexProgressTone::Pending),
+            IndexProgress::Failed(_) => ("⚠ 作成失敗", SimilarIndexProgressTone::Error),
+            IndexProgress::Degraded { .. } => ("⚠ 更新未完了", SimilarIndexProgressTone::Error),
+            IndexProgress::Idle => ("⏳ 起動中", SimilarIndexProgressTone::Pending),
+            IndexProgress::Complete(_) => ("✅ 監視中", SimilarIndexProgressTone::Complete),
+            IndexProgress::Cancelled(_) => ("⚠ 中断", SimilarIndexProgressTone::Pending),
+        }
+    };
+
+    SimilarIndexProgressPresentation {
+        inline_label,
+        inline_tone,
+        activity,
+    }
+}
+
+fn draw_background_indexer_activity_row(ui: &mut egui::Ui, name: &str, message: &str) {
+    ui.label(
+        egui::RichText::new(format!("  {}: {}", name, truncate_name(message, 100),))
+            .size(11.0)
+            .monospace()
+            .color(ui.visuals().weak_text_color()),
+    )
+    .on_hover_text(format!("{name}: {message}"));
 }
 
 fn draw_similar_index_summary(
@@ -1224,36 +1259,29 @@ fn draw_similar_state_inline(
     on: bool,
     progress: &crate::similar_index::IndexProgress,
 ) {
-    if !on {
-        ui.label(
-            egui::RichText::new("—")
-                .size(11.0)
-                .color(ui.visuals().weak_text_color()),
-        );
-        return;
-    }
     const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
     const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
-    let (label, color) = match progress {
-        crate::similar_index::IndexProgress::Running(_)
-        | crate::similar_index::IndexProgress::AwaitingArray(_) => ("⏳ 作成中", YELLOW),
-        crate::similar_index::IndexProgress::AwaitingWatch(_) => ("⏳ 監視準備中", YELLOW),
-        crate::similar_index::IndexProgress::Failed(_) => {
-            ("⚠ 作成失敗", ui.visuals().error_fg_color)
-        }
-        crate::similar_index::IndexProgress::Degraded { .. } => {
-            ("⚠ 更新未完了", ui.visuals().error_fg_color)
-        }
-        crate::similar_index::IndexProgress::Idle => ("⏳ 起動中", YELLOW),
-        crate::similar_index::IndexProgress::Complete(_) => ("✅ 監視中", GREEN),
-        crate::similar_index::IndexProgress::Cancelled(_) => ("⚠ 中断", YELLOW),
+    let presentation = similar_index_progress_presentation(on, progress);
+    let color = match presentation.inline_tone {
+        SimilarIndexProgressTone::Weak => ui.visuals().weak_text_color(),
+        SimilarIndexProgressTone::Pending => YELLOW,
+        SimilarIndexProgressTone::Complete => GREEN,
+        SimilarIndexProgressTone::Error => ui.visuals().error_fg_color,
     };
-    ui.label(egui::RichText::new(label).size(11.0).color(color));
+    ui.label(
+        egui::RichText::new(presentation.inline_label)
+            .size(11.0)
+            .color(color),
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::favorites_editor_dialog_geometry;
+    use super::{
+        SimilarIndexProgressPresentation, SimilarIndexProgressTone,
+        draw_background_indexer_activity_row, draw_similar_state_inline,
+        favorites_editor_dialog_geometry, similar_index_progress_presentation,
+    };
 
     #[test]
     fn favorites_editor_dialog_geometry_stays_inside_small_window() {
@@ -1275,5 +1303,251 @@ mod tests {
         assert_eq!(safe_rect.size(), egui::vec2(1248.0, 968.0));
         assert_eq!(dialog_size, egui::vec2(1180.0, 800.0));
         assert_eq!(min_dialog_size, egui::vec2(820.0, 420.0));
+    }
+
+    fn report() -> crate::similar_index::IndexReport {
+        crate::similar_index::IndexReport {
+            discovered: 1_500,
+            processed: 1_234,
+            ..Default::default()
+        }
+    }
+
+    fn running(
+        stage: crate::similar_index::IndexStage,
+        current_path: Option<&str>,
+    ) -> crate::similar_index::IndexProgress {
+        crate::similar_index::IndexProgress::Running(crate::similar_index::RunningProgress {
+            stage,
+            current_path: current_path.map(std::path::PathBuf::from),
+            report: report(),
+        })
+    }
+
+    #[test]
+    fn similar_index_progress_presentation_covers_every_variant_stage_and_reason() {
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+        use SimilarIndexProgressTone::{Complete, Error, Pending};
+
+        let cases = vec![
+            (
+                IndexProgress::Idle,
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 起動中",
+                    inline_tone: Pending,
+                    activity: None,
+                },
+            ),
+            (
+                running(IndexStage::Opening, None),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some("準備中".to_owned()),
+                },
+            ),
+            (
+                running(IndexStage::Scanning, Some("book.jpg")),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some(
+                        "画像を確認中  確認済み 1,234 件（発見済み 1,500 件・総数未確定）  book.jpg"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                running(IndexStage::Pruning, None),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some(
+                        "更新内容を整理中  確認済み 1,234 件（発見済み 1,500 件）".to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::AwaitingWatch(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 監視準備中",
+                    inline_tone: Pending,
+                    activity: Some("フォルダー監視の準備待ち".to_owned()),
+                },
+            ),
+            (
+                IndexProgress::AwaitingArray(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some("検索用一覧へ反映中".to_owned()),
+                },
+            ),
+            (
+                IndexProgress::Complete(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "✅ 監視中",
+                    inline_tone: Complete,
+                    activity: None,
+                },
+            ),
+            (
+                IndexProgress::Cancelled(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 中断",
+                    inline_tone: Pending,
+                    activity: None,
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: ファイルの確認が完了しませんでした。既存の索引は保持されています"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::ArrayPublication("接続が切れました".to_owned()),
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: 検索用一覧への反映を確認できませんでした: 接続が切れました"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::WatchUnavailable,
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: 一部フォルダーの監視を確認できません。索引は作成済みです"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Failed("DBを開けません".to_owned()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 作成失敗",
+                    inline_tone: Error,
+                    activity: Some("失敗: DBを開けません".to_owned()),
+                },
+            ),
+        ];
+
+        for (progress, expected) in cases {
+            assert_eq!(
+                similar_index_progress_presentation(true, &progress),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn similar_index_progress_presentation_disables_only_the_inline_status() {
+        let progress = running(crate::similar_index::IndexStage::Scanning, None);
+        let presentation = similar_index_progress_presentation(false, &progress);
+
+        assert_eq!(presentation.inline_label, "—");
+        assert_eq!(presentation.inline_tone, SimilarIndexProgressTone::Weak);
+        assert_eq!(
+            presentation.activity.as_deref(),
+            Some("画像を確認中  確認済み 1,234 件（発見済み 1,500 件・総数未確定）")
+        );
+    }
+
+    #[test]
+    fn similar_index_progress_snapshot_dark() {
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+        use egui_kittest::Harness;
+
+        let fixtures = vec![
+            ("無効", false, IndexProgress::Complete(report())),
+            ("確認中", true, running(IndexStage::Scanning, None)),
+            ("整理中", true, running(IndexStage::Pruning, None)),
+            ("監視待ち", true, IndexProgress::AwaitingWatch(report())),
+            ("一覧反映", true, IndexProgress::AwaitingArray(report())),
+            (
+                "確認失敗",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                },
+            ),
+            (
+                "反映失敗",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::ArrayPublication("接続が切れました".to_owned()),
+                },
+            ),
+            (
+                "監視不能",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::WatchUnavailable,
+                },
+            ),
+        ];
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 270.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("別バージョン索引の進行状態").strong());
+                    ui.separator();
+                    egui::Grid::new("similar_index_progress_snapshot")
+                        .num_columns(3)
+                        .spacing(egui::vec2(10.0, 5.0))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (fixture_label, enabled, progress) in &fixtures {
+                                ui.label(egui::RichText::new(*fixture_label).size(11.0));
+                                draw_similar_state_inline(ui, *enabled, progress);
+                                if let Some(activity) =
+                                    similar_index_progress_presentation(*enabled, progress).activity
+                                {
+                                    draw_background_indexer_activity_row(
+                                        ui,
+                                        "別バージョン",
+                                        &activity,
+                                    );
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        harness.run();
+        harness.snapshot("favorites_similar_index_progress_dark");
     }
 }

@@ -277,8 +277,18 @@ Sol / xhigh の独立限定検収も完了し、P1/P2・blocking 所見なし。
 
 所有契約は Full job 内に限定する。`run_index_job` がローカル変数として inventory を所有し、`thread::scope` 内の workers は `ScanPass::Full(&inventory)` で借用する。scope の join 完了後だけ by-value finalizer へ移し、取消・error・prune-unsafe return では通常の Rust drop により解放する。`ScanJobOutcome` は report/prune-safe だけを返し、coordinator・progress・Delta は inventory を保持しない。allocator による Private Bytes の残留と live owner の残留を混同しない。既存の独立レビューと有効な狭域回帰を根拠とし、記録のためだけに同じ測定を再実行しない。
 
+独立担当もこの所有契約を再実行なしで限定確認した。根拠は Clone 不可の `FullReconcileInventory`、値所有の `finalize_full_reconcile_inventory_if`、別経路の `run_delta_index_job`。有効な回帰は `full_reconcile_inventory_obeys_pause_before_loading_and_cancel`、`full_reconcile_inventory_loader_polls_cancellation_during_row_scan`、`full_reconcile_inventory_cancelled_finalize_rolls_back_everything`、`full_reconcile_inventory_matches_legacy_freshness_and_prune` と `...edge_case_matrix`。Delta の load 0 は `incremental_reconcile_missing_subtree_reobservation_prunes_nested_prefix` が確認する。destructor 回数を直接数える専用テストではなく、drop は Rust の所有構造、テストは取消 rollback・no-load・publish 結果をそれぞれ根拠とする。
+
 進捗の製品実装自体は完了済み。`IndexProgress` の Running/AwaitingWatch/AwaitingArray/Degraded 等を `src/ui_dialogs/favorites_editor.rs` が直接描画し、Scanning の確認済み・発見済み・総数未確定、監視準備待ち、検索用一覧への反映中、typed reason を区別する。未完なのはこの描画の snapshot coverage であり、scheduler の是正を最初から実装する必要はない。
 
 次の担当範囲は同ファイルの inline match を小さな実描画 helper へ切り出し、dialog と `tests/ui_snapshot.rs` の小 scene が同じ helper を呼ぶ境界だけとする。対応 snapshot asset も更新する。新 state・ETA・DB API・scheduler API は追加せず、`src/similar_index.rs` と `src/app.rs` は変更不要。docs の証跡追記は親が担当する。
 
 受入条件は、Scanning の未知総数を割合や残数にしないこと、AwaitingArray を Complete/監視中と表示しないこと、AwaitingWatch/Degraded を区別すること。全 `IndexProgress` variant と `FilesystemObservationIncomplete` / `ArrayPublication` / `WatchUnavailable` の reason mapping は純粋テストで確認し、snapshot はテスト側に文言を再実装しない。小さな headless snapshot と helper テストで確認する。Cancelled 詳細行非表示など既存の別仕様を変更せず、live UI 操作はこの小変更に含めない。これは次の設計整理であり、今回の有限測定後に実装・compile を開始していない。
+
+### 進捗表示の検証実装
+
+Phase 2 を `aea120cf6` に保存してから開始。`favorites_editor` は private module のため、snapshot policy に従い同 module の lib unit test から実描画 helper を呼ぶ方式とした。外部 integration test 向けの公開 API は追加しない。既存 inline/activity の presentation mapper と activity row helper を共用し、表示文言・色・順序・truncate/hover は維持した。scheduler/DB/enum に変更はない。
+
+全 variant/stage・3 Degraded reason・disabled を確認する純粋テスト 2 件、snapshot 生成 1 件と通常比較 1 件が成功。glyph 0、fmt/diff check 0。root は `tests/snapshots/favorites_similar_index_progress_dark.png` を目視し、8 行の無効/Scanning/Pruning/待機 2 種/未完了 3 理由が読め、欠け・tofu・意図外の折返しがないことを確認した。証跡は `target/similar-index-incremental-ui-20260911/freeze-r2/` と同親 directory の各 log/exit 記録。全体 gate と normal 確認 build は独立最終検収後に実施する。
+
+独立 Sol / xhigh の最終差分検収も P1/P2 なしで承認。`freeze-r2/review-approval.md` SHA256 は `F8AF863C36ABCB3A3BFCC37AB99F1A99746C0AD059D8711C47D45C0085194DCE`。既存表示契約・pure mapper・実描画経路・検証ログと目視結果を照合済み。
