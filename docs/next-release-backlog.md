@@ -24,6 +24,117 @@
 ---
 
 ## 1. 優先候補
+### 1.214 チェック件数オーバーレイを半透明にする — 利用者要望 (2026-09-11)
+
+- 出典: 利用者報告 (2026-09-11)。一覧で複数選択したとき右上に出る件数表示が、
+  右上のサムネイルのチェックを隠してしまう。「選択中は背景色が変わるので判別は付くが、
+  隠れるのが気になる」。
+- **一関数で済む (確認済み)。** [ui_main.rs:195](../src/ui_main.rs:195) の
+  `checked_selection_overlay_fill` が `Color32::from_rgb` を返しているだけなので、
+  `from_rgba_unmultiplied` にして alpha を入れる。描画側は
+  [`show_checked_selection_overlay`](../src/ui_main.rs:205) の `Frame::popup().fill(...)` が
+  この値をそのまま使う。
+- **決めること**: alpha 値。文字 (`warn_fg_color`) と枠線の可読性を保つ範囲で選ぶ。
+  light / dark で別の色を返しているので、両方で見る。
+- 回帰確認: light / dark 双方で件数と「選択解除」ボタンが読めること。
+  下のサムネイルのチェックマークが透けて見えること。UI スナップショットの更新が要るなら
+  [ui-snapshot-policy.md](ui-snapshot-policy.md) に従う。
+- 規模 / 優先度: Small / P3。
+
+### 1.213 通常動画のナビゲーターを出せるか — 描画経路が静止画と違う (2026-09-11)
+
+- 出典: 利用者要望 (2026-09-11)。v3.7.0 の通常動画ズームを使ってみて、静止画のナビゲーター
+  (拡大中に全体と現在位置を示す小窓) が動画にも欲しくなった。「負荷が高くなりそうですかね？」
+- **利用者が心配していた「OS 側で拡大する設定があるから重ねられないのでは」は当たらない (確認済み)。**
+  ズーム中は OS 任せの設定が自動的に上書きされる:
+
+  ```rust
+  fn effective_video_scale_filter(filter: VideoScaleFilter, video_zoom_active: bool) -> VideoScaleFilter {
+      if video_zoom_active && filter == VideoScaleFilter::OsDefault {
+          VideoScaleFilter::Standard
+  ```
+  ([render_core.rs:2104](../src/video/native_presenter/render_core.rs:2104))
+
+  サーフェスも表示領域全体を取る (`full_display_region = panorama_active || video_zoom_active`、
+  [surface_policy.rs:177](../src/video/native_presenter/surface_policy.rs:177))。
+  テスト `video_zoom_uses_the_full_display_region_even_with_os_default` あり。
+  **ズーム中は必ず mIV のシェーダが表示領域いっぱいのサーフェスへ解決している。**
+
+- **本当の論点は「どこに描くか」。**
+  - **presenter (D3D11) 側**: フレームは既に手元にあるので、いま拡大表示で出している矩形の
+    隣にもう 1 枚描くだけ。**毎フレームのコストは小さい見込み**。ただし静止画のナビは egui 実装
+    (`fs_navigator_*` 群、[ui_fullscreen.rs:2356](../src/ui_fullscreen.rs:2356) 以降) なので、
+    枠・ドラッグ・表示根拠 (Fixed / Hold) を**別実装で作り直す**ことになる
+  - **egui overlay 側**: UI はそのまま使えるが、**動画のフレームは egui のテクスチャではない**。
+    毎フレーム渡す経路が要る。**安くない**
+- **未確認**: presenter 側に描いた場合の実コスト。上は構造からの見込みで、測っていない。
+- **関連**: §1.200 (一時表示ナビゲーターの未開始クリックが消える) は静止画側の既知の不具合。
+  動画へ広げるなら、その所有境界の整理を先に済ませたほうがよい。
+- 規模 / 優先度: Medium / P3。**どちらに描くかを決めるまで見積もらない。**
+
+### 1.212 通常動画をウィンドウより小さく縮小できない — 見送り判断の記録 (2026-09-11)
+
+- 出典: 利用者要望 (2026-09-11)。静止画はウィンドウより小さくできるが、動画は画面に
+  合わせた状態が下限になっている。「画像と同じようにできると不都合が出ますか」。
+- **方針 (2026-09-11 利用者判断): 見送る。** 静止画と動きが揃うこと以外に用途を思いつかず、
+  必要な場面が出てから判断する。**安いことと要ることは別**という整理。
+- **ただし「複雑になるから」ではない。以下は確認済み。**
+  - 止めているのは `VIDEO_ZOOM_MIN_SCALE = 1.0` ([zoom_view.rs:8](../src/video/zoom_view.rs:8))
+    だけで、使用は 2 か所 ([:154](../src/video/zoom_view.rs:154) の clamp、
+    [:244](../src/video/zoom_view.rs:244) の guard)
+  - **映像より広い範囲を指して外側を黒で埋める経路は既にある。**doc に明記
+    ([:57](../src/video/zoom_view.rs:57)): 「At fit scale one extent can exceed the encoded image
+    and its origin becomes negative. Those coordinates deliberately describe letterbox pixels;
+    the resolver returns black outside the source」。**等倍でも毎回この経路を通っている**
+    (縦横比が違えば必ず letterbox になるため)
+  - パンも既に正しい。`clamped_source_center` は `extent >= source_axis` のとき軸を中央固定
+    ([:226](../src/video/zoom_view.rs:226))。縮小時に欲しい挙動そのもの
+  - つまり作業は「下限定数を下げる」「下限値を決める」「リセット時の初期値と極端に小さい倍率での
+    縮小フィルタを確認する」程度。**Small**
+- やるときに決めること: 下限値。極端な縮小での見た目 (背景の面積) をどこまで許すか。
+- 規模 / 優先度: Small / P3 (**現時点では実施しない**)。
+
+### 1.211 全体表示のサムネイルストリップが中央半分の幅になる — 再現待ち (2026-09-11)
+
+**利用者報告のみ。開発機で再現できていない。原因も特定できていない。**
+
+- 出典: 利用者報告 (2026-09-11)。「シークバーを固定解除状態で、サムネイルシークバー (全体) の
+  場合に、シークバーの表示/非表示をカーソルを動かして試していると、たまにまたサムネイル
+  シークバーのサムネイルが中央半分くらいの幅だけになることがあります」。
+- **報告が 2 通りに読める。**利用者へ切り分けを質問済み (2026-09-11)。
+  - (a) 枠は端まで並んでいて、**絵が入っているのが中央の半分だけ** → §1.189 と同じ形。
+    修正しきれていない経路が残っていることになる
+  - (b) **枠の列そのものが中央に寄っている** → 軸とレイアウトの食い違い
+  「**また**」と書かれているので (a) の可能性がある。
+- **操作は標準の自動出入り。**固定を外すと下部シークバーはカーソルで出入りする
+  ([seek_strip.rs:924](../src/video/seek_strip.rs:924) の `HudHidden` 参照)。§1.146 で扱った
+  「HUD が隠れてもストリップを保持する」経路を通る。
+
+#### コードから確認できたこと (原因ではなく、除外できた説明)
+
+- **セル幅は必ず帯の全幅を割る。**`cell_width: rect.width() / count as f32`
+  ([seek_strip_layout.rs:470](../src/video/seek_strip_layout.rs:470))。
+  **枚数がいくつでもレイアウト上は端まで埋まる**ので、(b) が起きるとしたら
+  「軸の枚数 < レイアウトの枚数」の食い違いしかない (軸の枚数ぶんしか描かず、中心は
+  `cell_count/2` に固定されるので中央に寄る)
+- **枚数は帯の「高さ」由来。**`ideal_width = cell_height * aspect`
+  ([:505](../src/video/seek_strip_layout.rs:505))。`cell_height` は `rect.height()` から来る。
+  **高さが小さいと枚数は増える**ので、「出入り途中の小さい値で枚数が減る」という説明は
+  方向が逆で成り立たない
+- **0 領域には既にガードがある。**幅か高さが 0 以下のフレームでは要求キーを捨てて作り直す
+  ([render_core.rs:978](../src/video/native_presenter/render_core.rs:978))。
+  素直な経路は塞がれている
+
+#### 次にやること
+
+1. 利用者の回答で (a) / (b) を確定する
+2. (a) なら §1.189 / §1.186 の残り経路を疑う。(b) なら
+   `rebuild_whole_axis_if_needed` ([native_video.rs:389](../src/app/native_video.rs:389)) の
+   `visible_count` と、presenter 側の要求 dedup (`last_window_request`) の寿命差を見る
+3. **推測で直さない。**再現するまで実装に入らない
+
+- 規模 / 優先度: 不明 / P2 (再現待ち)。
+
 ### 1.210 右クリックメニューが、閉じた後の左クリックで出直して抜けられない — 再現条件確定 (2026-09-11)
 
 **P1。操作不能になる。** 出典: 利用者報告 (2026-09-11) と開発機での再現確認。
