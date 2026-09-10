@@ -611,7 +611,7 @@ zoom/raw-wheel/navigationの非発行、Appの同context/source/zoom不変を揃
 strip rangeがWholeの仕様上no-opをスクロール機能成功とみなさず、Window spanの段変更を
 確認する場合はその前提を明示する。
 
-### 上部ボタンの観測契約（hover-only実装済み・live未実施）
+### 上部ボタンの観測契約（hover-only実装済み・live確認済み）
 
 親Astraと独立Astraのsource照合により、最初の対象を上部hover入口と
 `native_top_panorama`に限定する。既存catalogへ実renderの観測を加え、別のglobal widget表は作らない。
@@ -696,5 +696,14 @@ S3bの上部hover入口と実Response観測は2026-09-10に実装した。`Nativ
 Rhai/runner接続とfeature限定回帰を非対話で検証し、test-script付きportable artifactも準備した。
 同日の非対話検証ではmain 8029件（43件ignored）、UI snapshot 48件、vendor 25/9/15件、
 PowerShell 5.1/7 parserとapproval guardを通過した。
-対話liveは未実施であり、ボタンclick、zoom wheel、pan、thumbnail pixelの成功へ読み替えない。
+2026-09-10 10:16〜10:18の承認済みDefault desktop実行で、MultiWindowPdf、StillStripDrag、
+NativeMouseMove、NativeTopPanoramaHoverの4項目がすべてexit 0となった。静止画列は実アプリへの
+synthetic egui pointer、動画は実Windows MouseMove（2点配送と上HUD表示用1点）で確認した。
+上HUDは同じowner/sourceの実enabled Response、位置・clip・DPIまでを検証した。
+ボタンclick、zoom wheel、pan、thumbnail pixelの成功へは読み替えない。
+先行7runはCodexの隔離desktopと実入力desktopの不一致で入力前に停止しており、製品不合格とは
+分けて証拠を保持した。実行方式を改める前に追加了承を取得し、同じsource/artifactを再利用した。
+最終証拠は`target/next-version-work/logs/ui-smoke-default-desktop-suite-20260910.json`
+（SHA256 `387A045F05C538A8E4BC2D8A3E2ECA374DDC41C074CC384373408F5D6964CCE6`）。
+Idle198Convergenceは通常版の索引更新負荷が継続しているため、このsuiteでは未実施。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。
