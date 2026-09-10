@@ -24,6 +24,61 @@
 ---
 
 ## 1. 優先候補
+### 1.209 サイドカーの取り込みが UI スレッドを数十秒止める (2026-09-11)
+
+**P1。v3.8.0 のポータブル smoke で発見。出荷済みの既存不具合で、v3.8.0 の退行ではない。**
+データベースが空の状態で `mimageviewer.dat` のあるフォルダを初めて開くと、取り込みが終わるまで
+アプリ全体が固まる。実測では 430 件 (adjust 379 / mask 40 / local-adjust 7 / crop 1 / comic 3) の
+取り込みに **約 47 秒**かかり、その間 `App::update` の heartbeat が止まって panic.log へ
+`UI THREAD HANG suspected: no App::update heartbeat for 45955ms` が記録された。
+
+`load_folder` から `App::import_sidecar_to_dbs` を同期呼び出ししている
+([src/app.rs](../src/app.rs) の `sli_sidecar_import` 直前)。`[SLOW FRAME] 47169.9ms` の内訳は
+poll/keep/pre_grid/grid がすべて 0 で、`load_folder` 自体が時間を使っている。
+
+取り込み済みのデータベースでは no-op になるため通常環境では気づきにくく、新規 data ディレクトリ
+(ポータブル版の初回、新規インストール、data-dir 隔離起動) で必ず出る。1 件あたり約 110 ms は
+1 件ごとのコミットを疑わせるので、worker 化と併せて取り込み側のトランザクション粒度も確認する。
+
+対応方針は [UI 応答性](ui-responsiveness.md) §2 の worker 化テンプレに従う。キャンセル、
+結果適用時の世代整合、1 フレーム予算、perf 計装を揃える。証跡は v3.8.0 公開時の
+ポータブル smoke ログ (`D:\mImageViewer_portable_v3.8.0\data\logs\`)。
+
+### 1.208 動画フルスクリーンで音声モードへ切り替えると再生が終了する (2026-09-11)
+
+**P1。v3.8.0 のポータブル smoke で発見。出荷済みの既存不具合で、v3.8.0 の退行ではない。**
+動画をフルスクリーン表示中に HUD の ♪ ボタンで音声モードへ切り替えると、再生が止まって
+フルスクリーンも閉じる。ウィンドウ内表示 (MainWindow) では再生が続き、正常に復帰できる。
+
+**VST3 を有効にしていない場合だけ発生する。** 利用者の通常環境は VST3 が ON のため再現せず、
+VST3 を同梱しないポータブル版で必ず再現した。`vst3_enabled` の既定は false なので、
+**既定設定のインストーラ版でも同じ条件が成立する**。
+
+根因は [src/app/native_video.rs](../src/app/native_video.rs) の
+`native_video_presenter_hwnd_for_focus_guard`。音声モード中は presenter を hide するため、
+`video_audio_mode.is_some() && video_audio_vst.is_none()` で「前面 native presenter なし」と
+報告する。VST 表示中は presenter を un-hide するのでこの early-return を通らない。
+フルスクリーン presentation ではこの false が main フォーカスガードの
+`should_close_fullscreen_from_main_focus` を成立させ、`close_fullscreen()` がセッションごと
+終了させる。ポータブル smoke のログに順序が残っている。
+
+```
+132.655  [video-audio] enter result ... outcome=entered
+132.717  [native-video] window hidden: hwnd=0x2c2020
+132.720  fullscreen: main focus guard closing session presentation=Fullscreen
+132.726  [decoder-lifecycle] video-decode thread exit: live_count=0
+132.745  [native-video] fullscreen presenter stopped
+```
+
+この early-return は `757d4d127` (2026-07-05、音楽機能の video->audio モード) で入り v2.3.0 から
+出荷済み。`should_close_fullscreen_from_main_focus` 本体は v3.7.0 から無変更。
+
+述語を 1 つ直して済ませず、音声モードで presenter を hide する各 presentation
+(MainWindow / Fullscreen / detached / 複数ウィンドウ) でフォーカスガードの入力が何になるかを
+列挙してから修正する。VST の有無で分岐している現状は、同じ「presenter は隠れているが
+セッションは生きている」状態を 2 通りに扱っているので、状態の表し方から見直す。
+回帰は presentation ごとに音声モードの enter / exit と再生継続を検証する。
+
 ### 1.207 フォルダバーをツールバーの並べ替え対象へ統合する — 外部SNS要望 (2026-09-10)
 
 - 出典: X 上の「フォルダバーを他のツールバーと同じ列に表示したい」という要望。
