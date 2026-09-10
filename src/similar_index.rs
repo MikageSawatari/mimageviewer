@@ -15,8 +15,8 @@ use crate::similar_book_query::{
     BookQueryRuntime, BookQueryTerminal,
 };
 use crate::similar_db::{
-    CandidateIdentity, CompletedIndexStats, ContainerKind, Freshness, ItemKind, SimilarDb,
-    StoredItem, current_hash_version,
+    CandidateIdentity, CompletedIndexStats, ContainerKind, Freshness, FullReconcileInventory,
+    ItemKind, SimilarDb, StoredItem, current_hash_version,
 };
 use crate::similar_image::{
     PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
@@ -3942,6 +3942,27 @@ fn current_concurrency_limits(
     }
 }
 
+/// Waits until the existing activity policy permits at least one new scan unit.
+///
+/// A full inventory load is itself new scan work: it can lock and read millions of DB rows before
+/// the first filesystem work lease exists.  Reuse the same 0/1/full concurrency decision as the
+/// work queue, before taking the DB mutex.  In particular, ordinary foreground activity keeps the
+/// established one-worker allowance while an explicit pause remains a strict zero-worker barrier.
+fn wait_for_full_inventory_start(
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    cancel: &AtomicBool,
+) -> bool {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        if current_concurrency_limits(activity_gate).global > 0 {
+            return true;
+        }
+        std::thread::sleep(INDEX_LIMIT_RECHECK);
+    }
+}
+
 struct TaggedWork<T> {
     volume: VolumeKey,
     task: T,
@@ -4107,13 +4128,7 @@ impl<'a> ScanAggregate<'a> {
             .insert(directory_key)
     }
 
-    fn merge(
-        &self,
-        report: &mut IndexReport,
-        seen_items: &mut HashSet<String>,
-        seen_containers: &mut HashSet<String>,
-        prune_safe: bool,
-    ) {
+    fn merge(&self, report: &mut IndexReport, local_seen: &mut ScanLocalSeen, prune_safe: bool) {
         let published = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.report.discovered = state.report.discovered.saturating_add(report.discovered);
@@ -4154,8 +4169,10 @@ impl<'a> ScanAggregate<'a> {
                 .saturating_add(report.decode_failures);
             state.report.io_failures = state.report.io_failures.saturating_add(report.io_failures);
             state.report.errors.append(&mut report.errors);
-            state.seen_items.extend(seen_items.drain());
-            state.seen_containers.extend(seen_containers.drain());
+            if let ScanLocalSeen::Delta { items, containers } = local_seen {
+                state.seen_items.extend(items.drain());
+                state.seen_containers.extend(containers.drain());
+            }
             state.prune_safe &= prune_safe;
             report.discovered = 0;
             report.processed = 0;
@@ -4228,6 +4245,20 @@ struct DeltaPublication {
     completed_containers: Mutex<Vec<(String, u64)>>,
 }
 
+#[derive(Clone, Copy)]
+enum ScanPass<'a> {
+    Full(&'a FullReconcileInventory),
+    Delta(&'a DeltaPublication),
+}
+
+enum ScanLocalSeen {
+    Full,
+    Delta {
+        items: HashSet<String>,
+        containers: HashSet<String>,
+    },
+}
+
 impl DeltaPublication {
     fn stage_loose(&self, item: StoredItem) {
         self.loose_items
@@ -4265,8 +4296,24 @@ fn run_index_job(
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
 ) -> Result<ScanJobOutcome, String> {
+    if !wait_for_full_inventory_start(activity_gate, cancel) {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+        });
+    }
     db.cleanup_incomplete()
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
+    set_stage(progress, IndexStage::Opening, None);
+    let Some(inventory) = db
+        .load_full_reconcile_inventory(current_hash_version(), || !cancel.load(Ordering::Acquire))
+        .map_err(|error| format!("full reconcile inventory load failed: {error}"))?
+    else {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+        });
+    };
     set_stage(progress, IndexStage::Scanning, None);
     let aggregate = ScanAggregate::new(progress);
     let initial = roots
@@ -4290,7 +4337,7 @@ fn run_index_job(
                     cancel,
                     progress,
                     array_refresh,
-                    None,
+                    ScanPass::Full(&inventory),
                 )
             }));
         }
@@ -4322,9 +4369,8 @@ fn run_index_job(
             .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         let (removed, _) = db
-            .finalize_full_reconcile_if(
-                &aggregate.seen_items,
-                &aggregate.seen_containers,
+            .finalize_full_reconcile_inventory_if(
+                inventory,
                 current_hash_version(),
                 completed_at_unix_secs,
                 CompletedIndexStats {
@@ -4477,7 +4523,7 @@ fn run_delta_index_job(
                     cancel,
                     progress,
                     &deferred_refresh,
-                    Some(&publication),
+                    ScanPass::Delta(&publication),
                 )
             }));
         }
@@ -4558,12 +4604,11 @@ struct ScanContext<'a> {
     cancel: &'a Arc<AtomicBool>,
     aggregate: &'a ScanAggregate<'a>,
     report: IndexReport,
-    seen_items: HashSet<String>,
-    seen_containers: HashSet<String>,
+    local_seen: ScanLocalSeen,
     /// 走査漏れと削除を区別できない I/O failure が 1 件でもあれば prune しない。
     prune_safe: bool,
     array_refresh: &'a ArrayRefreshNotifier,
-    delta_publication: Option<&'a DeltaPublication>,
+    pass: ScanPass<'a>,
 }
 
 #[derive(Clone)]
@@ -4583,7 +4628,7 @@ fn scan_worker_loop(
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
-    delta_publication: Option<&DeltaPublication>,
+    pass: ScanPass<'_>,
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
@@ -4596,11 +4641,16 @@ fn scan_worker_loop(
             cancel,
             aggregate,
             report: IndexReport::default(),
-            seen_items: HashSet::new(),
-            seen_containers: HashSet::new(),
+            local_seen: match pass {
+                ScanPass::Full(_) => ScanLocalSeen::Full,
+                ScanPass::Delta(_) => ScanLocalSeen::Delta {
+                    items: HashSet::new(),
+                    containers: HashSet::new(),
+                },
+            },
             prune_safe: true,
             array_refresh,
-            delta_publication,
+            pass,
         };
         let result = if context.cancelled() {
             Ok(Vec::new())
@@ -4645,40 +4695,180 @@ impl ScanContext<'_> {
     }
 
     fn publish(&mut self) {
-        self.aggregate.merge(
-            &mut self.report,
-            &mut self.seen_items,
-            &mut self.seen_containers,
-            self.prune_safe,
-        );
+        self.aggregate
+            .merge(&mut self.report, &mut self.local_seen, self.prune_safe);
+    }
+
+    fn mark_item_seen(&mut self, item_key: &str) {
+        match (&self.pass, &mut self.local_seen) {
+            (ScanPass::Full(inventory), ScanLocalSeen::Full) => {
+                inventory.mark_item(item_key);
+            }
+            (ScanPass::Delta(_), ScanLocalSeen::Delta { items, .. }) => {
+                items.insert(item_key.to_owned());
+            }
+            _ => unreachable!("scan pass and local seen owner must match"),
+        }
+    }
+
+    fn mark_container_seen(&mut self, container_key: &str) {
+        match (&self.pass, &mut self.local_seen) {
+            (ScanPass::Full(inventory), ScanLocalSeen::Full) => {
+                inventory.observe_container(container_key);
+            }
+            (ScanPass::Delta(_), ScanLocalSeen::Delta { containers, .. }) => {
+                containers.insert(container_key.to_owned());
+            }
+            _ => unreachable!("scan pass and local seen owner must match"),
+        }
+    }
+
+    fn item_is_exact_current(
+        &mut self,
+        item_key: &str,
+        owner: Option<&str>,
+        page_index: Option<u32>,
+        candidate: &FileCandidate,
+    ) -> Result<bool, String> {
+        match self.pass {
+            ScanPass::Full(inventory) => Ok(inventory
+                .observe_item(
+                    item_key,
+                    owner,
+                    page_index,
+                    candidate.mtime,
+                    candidate.file_size,
+                )
+                .exact_current),
+            ScanPass::Delta(_) => {
+                self.mark_item_seen(item_key);
+                Ok(self
+                    .db
+                    .load_item(item_key, current_hash_version())
+                    .map_err(db_error)?
+                    .is_some_and(|existing| {
+                        existing.item.container_key.as_deref() == owner
+                            && existing.item.page_index == page_index
+                            && item_metadata_matches(&existing.item, candidate)
+                    }))
+            }
+        }
+    }
+
+    fn reusable_current_item(
+        &self,
+        item_key: &str,
+        owner: Option<&str>,
+        page_index: Option<u32>,
+        candidate: &FileCandidate,
+    ) -> Result<Option<StoredItem>, String> {
+        if let ScanPass::Full(inventory) = self.pass
+            && !inventory
+                .observe_item(
+                    item_key,
+                    owner,
+                    page_index,
+                    candidate.mtime,
+                    candidate.file_size,
+                )
+                .reusable_current_row
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .db
+            .load_item(item_key, current_hash_version())
+            .map_err(db_error)?
+            .filter(|existing| item_metadata_matches(&existing.item, candidate))
+            .map(|existing| existing.item))
+    }
+
+    fn container_observation(
+        &self,
+        container_key: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+    ) -> Result<crate::similar_db::FullContainerObservation, String> {
+        match self.pass {
+            ScanPass::Full(inventory) => Ok(inventory.container_observation(
+                container_key,
+                mtime,
+                file_size,
+                page_count,
+                current_hash_version(),
+            )),
+            ScanPass::Delta(_) => {
+                let freshness = self
+                    .db
+                    .container_freshness(
+                        container_key,
+                        mtime,
+                        file_size,
+                        page_count,
+                        current_hash_version(),
+                    )
+                    .map_err(db_error)?;
+                Ok(crate::similar_db::FullContainerObservation {
+                    freshness,
+                    member_count: 0,
+                })
+            }
+        }
+    }
+
+    fn preserve_current_container(&mut self, container_key: &str) -> Result<u64, String> {
+        match self.pass {
+            ScanPass::Full(inventory) => {
+                Ok(u64::from(inventory.container_member_count(container_key)))
+            }
+            ScanPass::Delta(_) => {
+                let keys = self
+                    .db
+                    .item_keys_for_container(container_key)
+                    .map_err(db_error)?;
+                let count = keys.len() as u64;
+                let ScanLocalSeen::Delta { items, .. } = &mut self.local_seen else {
+                    unreachable!("delta pass must own local seen sets")
+                };
+                items.extend(keys);
+                Ok(count)
+            }
+        }
     }
 
     fn publish_loose_item(&self, item: StoredItem) -> Result<(), String> {
-        if let Some(publication) = self.delta_publication {
-            publication.stage_loose(item);
-            Ok(())
-        } else {
-            if self
-                .db
-                .upsert_loose_item_if(&item, || !self.cancelled())
-                .map_err(db_error)?
-            {
-                self.array_refresh.request();
+        match self.pass {
+            ScanPass::Delta(publication) => {
+                publication.stage_loose(item);
+                Ok(())
             }
-            Ok(())
+            ScanPass::Full(_) => {
+                if self
+                    .db
+                    .upsert_loose_item_if(&item, || !self.cancelled())
+                    .map_err(db_error)?
+                {
+                    self.array_refresh.request();
+                }
+                Ok(())
+            }
         }
     }
 
     fn finish_container(&self, container_key: &str, generation: u64) -> Result<(), String> {
-        if let Some(publication) = self.delta_publication {
-            publication.stage_container(container_key.to_owned(), generation);
-            Ok(())
-        } else {
-            self.db
-                .complete_container_if(container_key, generation, || !self.cancelled())
-                .map_err(db_error)?;
-            self.array_refresh.request();
-            Ok(())
+        match self.pass {
+            ScanPass::Delta(publication) => {
+                publication.stage_container(container_key.to_owned(), generation);
+                Ok(())
+            }
+            ScanPass::Full(_) => {
+                self.db
+                    .complete_container_if(container_key, generation, || !self.cancelled())
+                    .map_err(db_error)?;
+                self.array_refresh.request();
+                Ok(())
+            }
         }
     }
 
@@ -4847,16 +5037,7 @@ impl ScanContext<'_> {
     ) -> Result<(), String> {
         self.report.discovered += 1;
         let key = crate::search_index_db::normalize_path(&candidate.path);
-        self.seen_items.insert(key.clone());
-        let existing = self
-            .db
-            .load_item(&key, current_hash_version())
-            .map_err(db_error)?;
-        if existing.as_ref().is_some_and(|existing| {
-            existing.item.container_key.is_none()
-                && existing.item.page_index == page_index
-                && item_metadata_matches(&existing.item, candidate)
-        }) {
+        if self.item_is_exact_current(&key, None, page_index, candidate)? {
             self.report.unchanged += 1;
             self.report.processed += 1;
             return Ok(());
@@ -4880,7 +5061,7 @@ impl ScanContext<'_> {
         images: &[FileCandidate],
     ) -> Result<(), String> {
         self.report.discovered += images.len() as u64;
-        self.seen_containers.insert(container_key.to_owned());
+        self.mark_container_seen(container_key);
         let metadata = std::fs::metadata(directory)
             .map_err(|error| format!("metadata {}: {error}", directory.display()))?;
         let mtime = crate::ui_helpers::mtime_secs(&metadata);
@@ -4893,42 +5074,28 @@ impl ScanContext<'_> {
         let page_count = u32::try_from(images.len())
             .map_err(|_| format!("too many pages in {}", directory.display()))?;
         let container_current = self
-            .db
-            .container_freshness(
-                container_key,
-                mtime,
-                file_size,
-                page_count,
-                current_hash_version(),
-            )
-            .map_err(db_error)?
+            .container_observation(container_key, mtime, file_size, page_count)?
+            .freshness
             == Freshness::Current;
         let mut every_page_current = container_current;
         if every_page_current {
             for (index, candidate) in images.iter().enumerate() {
                 let key = crate::search_index_db::normalize_path(&candidate.path);
-                let existing = self
-                    .db
-                    .load_item(&key, current_hash_version())
-                    .map_err(db_error)?;
-                if !existing.as_ref().is_some_and(|existing| {
-                    existing.item.container_key.as_deref() == Some(container_key)
-                        && existing.item.page_index == Some(index as u32)
-                        && item_metadata_matches(&existing.item, candidate)
-                }) {
+                if !self.item_is_exact_current(
+                    &key,
+                    Some(container_key),
+                    Some(index as u32),
+                    candidate,
+                )? {
                     every_page_current = false;
                     break;
                 }
             }
         }
         if every_page_current {
-            let keys = self
-                .db
-                .item_keys_for_container(container_key)
-                .map_err(db_error)?;
-            self.report.unchanged += keys.len() as u64;
-            self.report.processed += keys.len() as u64;
-            self.seen_items.extend(keys);
+            let count = self.preserve_current_container(container_key)?;
+            self.report.unchanged += count;
+            self.report.processed += count;
             return Ok(());
         }
         let generation = self
@@ -4946,7 +5113,7 @@ impl ScanContext<'_> {
                 return Ok(());
             }
             let key = crate::search_index_db::normalize_path(&candidate.path);
-            self.seen_items.insert(key.clone());
+            self.mark_item_seen(&key);
             let item = match self.build_file_item(
                 &key,
                 ItemKind::Image,
@@ -4978,7 +5145,7 @@ impl ScanContext<'_> {
 
     fn process_zip(&mut self, candidate: &FileCandidate) -> Result<(), String> {
         let container_key = crate::search_index_db::normalize_path(&candidate.path);
-        self.seen_containers.insert(container_key.clone());
+        self.mark_container_seen(&container_key);
         let entries = match crate::zip_loader::enumerate_image_entries(&candidate.path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -5028,24 +5195,18 @@ impl ScanContext<'_> {
             return Ok(());
         }
         if self
-            .db
-            .container_freshness(
+            .container_observation(
                 &container_key,
                 candidate.mtime,
                 candidate.file_size,
                 page_count,
-                current_hash_version(),
-            )
-            .map_err(db_error)?
+            )?
+            .freshness
             == Freshness::Current
         {
-            let keys = self
-                .db
-                .item_keys_for_container(&container_key)
-                .map_err(db_error)?;
-            self.report.unchanged += keys.len() as u64;
-            self.report.processed += keys.len() as u64;
-            self.seen_items.extend(keys);
+            let count = self.preserve_current_container(&container_key)?;
+            self.report.unchanged += count;
+            self.report.processed += count;
             return Ok(());
         }
         let generation = self
@@ -5063,7 +5224,7 @@ impl ScanContext<'_> {
                 return Ok(());
             }
             let key = crate::search_norm::zip_entry_key(&container_key, &entry.entry_name);
-            self.seen_items.insert(key.clone());
+            self.mark_item_seen(&key);
             let item = match self.build_encoded_item(
                 &key,
                 ItemKind::ZipPage,
@@ -5099,7 +5260,7 @@ impl ScanContext<'_> {
 
     fn process_pdf(&mut self, candidate: &FileCandidate) -> Result<(), String> {
         let container_key = crate::search_index_db::normalize_path(&candidate.path);
-        self.seen_containers.insert(container_key.clone());
+        self.mark_container_seen(&container_key);
         let password = self.pdf_passwords.get(&candidate.path);
         let pages = match crate::pdf_loader::enumerate_pages_with_cancel(
             &candidate.path,
@@ -5154,24 +5315,18 @@ impl ScanContext<'_> {
             return Ok(());
         }
         if self
-            .db
-            .container_freshness(
+            .container_observation(
                 &container_key,
                 candidate.mtime,
                 candidate.file_size,
                 page_count,
-                current_hash_version(),
-            )
-            .map_err(db_error)?
+            )?
+            .freshness
             == Freshness::Current
         {
-            let keys = self
-                .db
-                .item_keys_for_container(&container_key)
-                .map_err(db_error)?;
-            self.report.unchanged += keys.len() as u64;
-            self.report.processed += keys.len() as u64;
-            self.seen_items.extend(keys);
+            let count = self.preserve_current_container(&container_key)?;
+            self.report.unchanged += count;
+            self.report.processed += count;
             return Ok(());
         }
         let generation = self
@@ -5189,7 +5344,7 @@ impl ScanContext<'_> {
                 return Ok(());
             }
             let key = pdf_page_key(&container_key, page.page_num);
-            self.seen_items.insert(key.clone());
+            self.mark_item_seen(&key);
             let item = match self.build_pdf_item(
                 &key,
                 &container_key,
@@ -5227,18 +5382,10 @@ impl ScanContext<'_> {
         page_index: Option<u32>,
         candidate: &FileCandidate,
     ) -> Result<StoredItem, String> {
-        if let Some(existing) = self
-            .db
-            .load_item(key, current_hash_version())
-            .map_err(db_error)?
-            .filter(|existing| item_metadata_matches(&existing.item, candidate))
+        if let Some(existing) =
+            self.reusable_current_item(key, container_key, page_index, candidate)?
         {
-            return Ok(with_identity(
-                existing.item,
-                kind,
-                container_key,
-                page_index,
-            ));
+            return Ok(with_identity(existing, kind, container_key, page_index));
         }
         if let Some(prefill) = self.load_prefill(key, candidate)? {
             return Ok(with_identity(prefill, kind, container_key, page_index));
@@ -6282,6 +6429,112 @@ mod tests {
     }
 
     #[test]
+    fn full_reconcile_inventory_obeys_pause_before_loading_and_cancel() {
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+
+        let paused_db = SimilarDb::open_in_memory().unwrap();
+        let paused_gate = crate::activity_gate::ActivityGate::new(10_000);
+        paused_gate.set_paused(true);
+        let paused_cancel = Arc::new(AtomicBool::new(false));
+        let paused_progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let db = &paused_db;
+            let gate = &paused_gate;
+            let cancel = &paused_cancel;
+            let progress = &paused_progress;
+            let passwords = &passwords;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                run_index_job(
+                    db,
+                    &[],
+                    &[],
+                    passwords,
+                    Some(gate),
+                    cancel,
+                    progress,
+                    &ArrayRefreshNotifier {
+                        scheduler: Weak::new(),
+                    },
+                )
+                .unwrap()
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(INDEX_LIMIT_RECHECK * 3);
+            assert_eq!(
+                paused_db.full_inventory_load_count(),
+                0,
+                "an explicit pause must stop the inventory before it locks the DB"
+            );
+            paused_gate.set_paused(false);
+            assert!(worker.join().unwrap().prune_safe);
+        });
+        assert_eq!(paused_db.full_inventory_load_count(), 1);
+
+        let active_db = SimilarDb::open_in_memory().unwrap();
+        let active_gate = crate::activity_gate::ActivityGate::new(10_000);
+        active_gate.bump();
+        assert!(
+            run_index_job(
+                &active_db,
+                &[],
+                &[],
+                &passwords,
+                Some(&active_gate),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(Mutex::new(IndexProgress::Idle)),
+                &ArrayRefreshNotifier {
+                    scheduler: Weak::new(),
+                },
+            )
+            .unwrap()
+            .prune_safe,
+            "ordinary activity keeps the established one-worker allowance"
+        );
+        assert_eq!(active_db.full_inventory_load_count(), 1);
+
+        let cancelled_db = SimilarDb::open_in_memory().unwrap();
+        let cancelled_gate = crate::activity_gate::ActivityGate::new(10_000);
+        cancelled_gate.set_paused(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let db = &cancelled_db;
+            let gate = &cancelled_gate;
+            let cancel = &cancelled;
+            let progress = &cancelled_progress;
+            let passwords = &passwords;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                run_index_job(
+                    db,
+                    &[],
+                    &[],
+                    passwords,
+                    Some(gate),
+                    cancel,
+                    progress,
+                    &ArrayRefreshNotifier {
+                        scheduler: Weak::new(),
+                    },
+                )
+                .unwrap()
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(INDEX_LIMIT_RECHECK * 2);
+            cancelled.store(true, Ordering::Release);
+            assert!(!worker.join().unwrap().prune_safe);
+        });
+        assert_eq!(
+            cancelled_db.full_inventory_load_count(),
+            0,
+            "cancellation while paused must not enter the inventory loader"
+        );
+    }
+
+    #[test]
     fn concurrent_scan_keeps_container_publish_and_progress_counts_complete() {
         let root = tempfile::tempdir().unwrap();
         for book in ["book-a", "book-b"] {
@@ -7217,20 +7470,23 @@ mod tests {
         let progress = Arc::new(Mutex::new(IndexProgress::Idle));
         let aggregate = ScanAggregate::new(&progress);
         let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let publication = DeltaPublication::default();
         let context = ScanContext {
             db: &db,
             pdf_passwords: &passwords,
             cancel: &cancel,
             aggregate: &aggregate,
             report: IndexReport::default(),
-            seen_items: HashSet::new(),
-            seen_containers: HashSet::new(),
+            local_seen: ScanLocalSeen::Delta {
+                items: HashSet::new(),
+                containers: HashSet::new(),
+            },
             excluded_root_keys: &[],
             prune_safe: true,
             array_refresh: &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
-            delta_publication: None,
+            pass: ScanPass::Delta(&publication),
         };
         let unchanged = FileCandidate {
             path: PathBuf::from("this-file-does-not-exist.png"),
@@ -8740,6 +8996,11 @@ mod tests {
 
         assert!(outcome.prune_safe);
         assert_eq!(outcome.report.removed, 1);
+        assert_eq!(
+            db.full_inventory_load_count(),
+            0,
+            "Delta must never load the full reconcile inventory"
+        );
         assert!(
             db.load_search_rows(current_hash_version())
                 .unwrap()

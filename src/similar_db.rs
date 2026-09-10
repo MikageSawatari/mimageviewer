@@ -3,11 +3,13 @@
 //! `item` / `container` は検索に公開済みの世代だけを持つ。再索引中のページは
 //! staging 表へ書き、最後の transaction でだけ公開世代と入れ替える。
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -212,6 +214,247 @@ pub enum Freshness {
 
 pub struct SimilarDb {
     conn: Mutex<Connection>,
+    #[cfg(test)]
+    full_inventory_loads: AtomicUsize,
+}
+
+const FULL_INVENTORY_CANCEL_POLL_ROWS: usize = 4096;
+const FULL_INVENTORY_MAX_CAPACITY_HINT: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullItemObservation {
+    pub(crate) exact_current: bool,
+    pub(crate) reusable_current_row: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullContainerObservation {
+    pub(crate) freshness: Freshness,
+    pub(crate) member_count: u32,
+}
+
+struct FullInventoryItem {
+    item_id: u64,
+    owner: Option<u32>,
+    page_index: Option<i64>,
+    mtime: i64,
+    file_size: i64,
+    current_and_published: bool,
+}
+
+struct FullInventoryContainerSnapshot {
+    kind: i64,
+    page_count: Option<i64>,
+    scan_state: i64,
+    generation: i64,
+    mtime: i64,
+    file_size: i64,
+}
+
+struct FullInventoryContainer {
+    snapshot: Option<FullInventoryContainerSnapshot>,
+    member_count: u32,
+    all_members_current: bool,
+}
+
+/// A finite SQLite snapshot used only by one full reconcile.
+///
+/// Exact keys have one String owner in the maps. Scan workers only borrow this value and mark the
+/// word-packed bitsets; after every scoped worker joins, the owner is moved into the finalizer.
+pub(crate) struct FullReconcileInventory {
+    hash_version: i64,
+    items_by_key: HashMap<String, u32>,
+    items: Vec<FullInventoryItem>,
+    containers_by_key: HashMap<String, u32>,
+    containers: Vec<FullInventoryContainer>,
+    seen_item_words: Box<[AtomicU64]>,
+    seen_container_words: Box<[AtomicU64]>,
+    #[cfg(test)]
+    item_map_growths: usize,
+    #[cfg(test)]
+    item_record_growths: usize,
+    #[cfg(test)]
+    container_map_growths: usize,
+    #[cfg(test)]
+    container_record_growths: usize,
+}
+
+impl FullReconcileInventory {
+    pub(crate) fn observe_item(
+        &self,
+        item_key: &str,
+        owner: Option<&str>,
+        page_index: Option<u32>,
+        mtime: i64,
+        file_size: i64,
+    ) -> FullItemObservation {
+        let Some(&index) = self.items_by_key.get(item_key) else {
+            return FullItemObservation {
+                exact_current: false,
+                reusable_current_row: false,
+            };
+        };
+        mark_inventory_bit(&self.seen_item_words, index);
+        let item = &self.items[index as usize];
+        let owner_matches = match (item.owner, owner) {
+            (None, None) => true,
+            (Some(stored), Some(observed)) => self
+                .containers_by_key
+                .get(observed)
+                .is_some_and(|&current| current == stored),
+            _ => false,
+        };
+        let metadata_matches =
+            item.current_and_published && item.mtime == mtime && item.file_size == file_size;
+        FullItemObservation {
+            exact_current: metadata_matches
+                && owner_matches
+                && item.page_index == page_index.map(i64::from),
+            reusable_current_row: metadata_matches,
+        }
+    }
+
+    pub(crate) fn mark_item(&self, item_key: &str) {
+        if let Some(&index) = self.items_by_key.get(item_key) {
+            mark_inventory_bit(&self.seen_item_words, index);
+        }
+    }
+
+    pub(crate) fn observe_container(&self, container_key: &str) {
+        if let Some(&index) = self.containers_by_key.get(container_key) {
+            mark_inventory_bit(&self.seen_container_words, index);
+        }
+    }
+
+    pub(crate) fn container_member_count(&self, container_key: &str) -> u32 {
+        self.containers_by_key
+            .get(container_key)
+            .map_or(0, |&index| self.containers[index as usize].member_count)
+    }
+
+    pub(crate) fn container_observation(
+        &self,
+        container_key: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+        hash_version: i64,
+    ) -> FullContainerObservation {
+        let Some(&index) = self.containers_by_key.get(container_key) else {
+            return FullContainerObservation {
+                freshness: Freshness::Missing,
+                member_count: 0,
+            };
+        };
+        let container = &self.containers[index as usize];
+        let freshness = match container.snapshot.as_ref() {
+            Some(snapshot)
+                if snapshot.mtime == mtime
+                    && snapshot.file_size == file_size
+                    && snapshot.page_count == Some(i64::from(page_count))
+                    && snapshot.scan_state == ScanState::Complete as i64
+                    && container.all_members_current
+                    && hash_version == self.hash_version =>
+            {
+                Freshness::Current
+            }
+            Some(_) => Freshness::Stale,
+            None => Freshness::Missing,
+        };
+        FullContainerObservation {
+            freshness,
+            member_count: container.member_count,
+        }
+    }
+
+    fn item_seen(&self, index: u32) -> bool {
+        inventory_bit_is_set(&self.seen_item_words, index)
+    }
+
+    fn container_seen(&self, index: u32) -> bool {
+        inventory_bit_is_set(&self.seen_container_words, index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounting(&self) -> FullInventoryAccounting {
+        FullInventoryAccounting {
+            item_count: self.items.len(),
+            item_capacity: self.items.capacity(),
+            item_map_capacity: self.items_by_key.capacity(),
+            container_count: self.containers.len(),
+            container_capacity: self.containers.capacity(),
+            container_map_capacity: self.containers_by_key.capacity(),
+            key_bytes: self.items_by_key.keys().map(String::len).sum::<usize>()
+                + self
+                    .containers_by_key
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            item_record_capacity_bytes: self.items.capacity() * size_of::<FullInventoryItem>(),
+            container_record_capacity_bytes: self.containers.capacity()
+                * size_of::<FullInventoryContainer>(),
+            item_bitset_bytes: self.seen_item_words.len() * size_of::<AtomicU64>(),
+            container_bitset_bytes: self.seen_container_words.len() * size_of::<AtomicU64>(),
+            item_map_growths: self.item_map_growths,
+            item_record_growths: self.item_record_growths,
+            container_map_growths: self.container_map_growths,
+            container_record_growths: self.container_record_growths,
+        }
+    }
+}
+
+fn inventory_words(count: usize) -> rusqlite::Result<Box<[AtomicU64]>> {
+    let words = count.checked_add(63).ok_or_else(|| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other("inventory bitset overflow").into(),
+        )
+    })? / 64;
+    let mut values = Vec::new();
+    values.try_reserve_exact(words).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!("inventory bitset allocation failed: {error}")).into(),
+        )
+    })?;
+    values.resize_with(words, || AtomicU64::new(0));
+    Ok(values.into_boxed_slice())
+}
+
+fn mark_inventory_bit(words: &[AtomicU64], index: u32) {
+    let index = index as usize;
+    words[index / 64].fetch_or(1u64 << (index % 64), Ordering::Relaxed);
+}
+
+fn inventory_bit_is_set(words: &[AtomicU64], index: u32) -> bool {
+    let index = index as usize;
+    words[index / 64].load(Ordering::Relaxed) & (1u64 << (index % 64)) != 0
+}
+
+fn checked_inventory_index(len: usize) -> rusqlite::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other("full reconcile inventory exceeds u32 indices").into(),
+        )
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FullInventoryAccounting {
+    pub(crate) item_count: usize,
+    pub(crate) item_capacity: usize,
+    pub(crate) item_map_capacity: usize,
+    pub(crate) container_count: usize,
+    pub(crate) container_capacity: usize,
+    pub(crate) container_map_capacity: usize,
+    pub(crate) key_bytes: usize,
+    pub(crate) item_record_capacity_bytes: usize,
+    pub(crate) container_record_capacity_bytes: usize,
+    pub(crate) item_bitset_bytes: usize,
+    pub(crate) container_bitset_bytes: usize,
+    pub(crate) item_map_growths: usize,
+    pub(crate) item_record_growths: usize,
+    pub(crate) container_map_growths: usize,
+    pub(crate) container_record_growths: usize,
 }
 
 /// Metadata captured by the first read in a book-query transaction.
@@ -809,6 +1052,8 @@ impl SimilarDb {
         init_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_inventory_loads: AtomicUsize::new(0),
         })
     }
 
@@ -817,6 +1062,8 @@ impl SimilarDb {
         init_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_inventory_loads: AtomicUsize::new(0),
         })
     }
 
@@ -1547,6 +1794,401 @@ impl SimilarDb {
         let removed = prune_except_seen_transaction(&transaction, seen_items, seen_containers)?;
         transaction.commit()?;
         Ok(removed)
+    }
+
+    /// Loads the exact-key metadata snapshot owned by one full reconcile.
+    ///
+    /// The SQLite read transaction ends before this method returns. Scan workers may then borrow
+    /// the returned inventory without holding the DB mutex or pinning the WAL snapshot.
+    pub(crate) fn load_full_reconcile_inventory(
+        &self,
+        hash_version: i64,
+        should_continue: impl Fn() -> bool,
+    ) -> rusqlite::Result<Option<FullReconcileInventory>> {
+        #[cfg(test)]
+        self.full_inventory_loads.fetch_add(1, Ordering::Relaxed);
+
+        let mut conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        if !should_continue() {
+            return Ok(None);
+        }
+        let transaction = conn.transaction()?;
+        let capacity_hint = transaction
+            .query_row(
+                "SELECT registered_items FROM index_run WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|&value| value <= FULL_INVENTORY_MAX_CAPACITY_HINT)
+            .unwrap_or(0);
+
+        let allocation_error = |what: &'static str, error: std::collections::TryReserveError| {
+            rusqlite::Error::ToSqlConversionFailure(
+                std::io::Error::other(format!("{what} allocation failed: {error}")).into(),
+            )
+        };
+        let mut items_by_key = HashMap::new();
+        let mut items = Vec::new();
+        #[cfg(test)]
+        let mut item_map_growths = 0usize;
+        #[cfg(test)]
+        let mut item_record_growths = 0usize;
+        items_by_key
+            .try_reserve(capacity_hint)
+            .map_err(|error| allocation_error("full item key inventory", error))?;
+        items
+            .try_reserve(capacity_hint)
+            .map_err(|error| allocation_error("full item record inventory", error))?;
+        let mut containers_by_key = HashMap::new();
+        let mut containers = Vec::new();
+        #[cfg(test)]
+        let mut container_map_growths = 0usize;
+        #[cfg(test)]
+        let mut container_record_growths = 0usize;
+
+        {
+            let mut statement = transaction.prepare(
+                "SELECT container_key, kind, page_count, scan_state, generation, mtime, file_size
+                 FROM container ORDER BY container_key",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut loaded = 0usize;
+            while let Some(row) = rows.next()? {
+                if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+                    return Ok(None);
+                }
+                let index = checked_inventory_index(containers.len())?;
+                let key: String = row.get(0)?;
+                if containers_by_key.len() == containers_by_key.capacity() {
+                    #[cfg(test)]
+                    {
+                        container_map_growths += 1;
+                    }
+                    containers_by_key
+                        .try_reserve(containers_by_key.len().max(1_024))
+                        .map_err(|error| allocation_error("full container key inventory", error))?;
+                }
+                if containers.len() == containers.capacity() {
+                    #[cfg(test)]
+                    {
+                        container_record_growths += 1;
+                    }
+                    containers
+                        .try_reserve(containers.len().max(1_024))
+                        .map_err(|error| {
+                            allocation_error("full container record inventory", error)
+                        })?;
+                }
+                let replaced = containers_by_key.insert(key, index);
+                debug_assert!(replaced.is_none());
+                containers.push(FullInventoryContainer {
+                    snapshot: Some(FullInventoryContainerSnapshot {
+                        kind: row.get(1)?,
+                        page_count: row.get(2)?,
+                        scan_state: row.get(3)?,
+                        generation: row.get(4)?,
+                        mtime: row.get(5)?,
+                        file_size: row.get(6)?,
+                    }),
+                    member_count: 0,
+                    all_members_current: true,
+                });
+                loaded += 1;
+            }
+        }
+
+        {
+            let mut statement = transaction.prepare(
+                "SELECT item_id, item_key, container_key, page_index, mtime, file_size,
+                        hash_version
+                 FROM item ORDER BY item_id",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut loaded = 0usize;
+            while let Some(row) = rows.next()? {
+                if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+                    return Ok(None);
+                }
+                let owner = match row.get::<_, Option<String>>(2)? {
+                    Some(owner) => Some(match containers_by_key.get(&owner).copied() {
+                        Some(index) => index,
+                        None => {
+                            let index = checked_inventory_index(containers.len())?;
+                            if containers_by_key.len() == containers_by_key.capacity() {
+                                #[cfg(test)]
+                                {
+                                    container_map_growths += 1;
+                                }
+                                containers_by_key
+                                    .try_reserve(containers_by_key.len().max(1_024))
+                                    .map_err(|error| {
+                                        allocation_error("full container key inventory", error)
+                                    })?;
+                            }
+                            if containers.len() == containers.capacity() {
+                                #[cfg(test)]
+                                {
+                                    container_record_growths += 1;
+                                }
+                                containers
+                                    .try_reserve(containers.len().max(1_024))
+                                    .map_err(|error| {
+                                        allocation_error("full container record inventory", error)
+                                    })?;
+                            }
+                            containers_by_key.insert(owner, index);
+                            containers.push(FullInventoryContainer {
+                                snapshot: None,
+                                member_count: 0,
+                                all_members_current: true,
+                            });
+                            index
+                        }
+                    }),
+                    None => None,
+                };
+                let stored_hash_version: i64 = row.get(6)?;
+                let published = owner.is_none()
+                    || owner.is_some_and(|index| {
+                        containers[index as usize]
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|container| {
+                                container.scan_state == ScanState::Complete as i64
+                            })
+                    });
+                if let Some(index) = owner {
+                    let container = &mut containers[index as usize];
+                    container.member_count =
+                        container.member_count.checked_add(1).ok_or_else(|| {
+                            rusqlite::Error::ToSqlConversionFailure(
+                                std::io::Error::other("container member count exceeds u32").into(),
+                            )
+                        })?;
+                    container.all_members_current &= stored_hash_version == hash_version;
+                }
+                let index = checked_inventory_index(items.len())?;
+                let item_key: String = row.get(1)?;
+                if items_by_key.len() == items_by_key.capacity() {
+                    #[cfg(test)]
+                    {
+                        item_map_growths += 1;
+                    }
+                    items_by_key
+                        .try_reserve(items_by_key.len().max(1_024))
+                        .map_err(|error| {
+                            allocation_error("full item key inventory growth", error)
+                        })?;
+                }
+                if items.len() == items.capacity() {
+                    #[cfg(test)]
+                    {
+                        item_record_growths += 1;
+                    }
+                    items.try_reserve(items.len().max(1_024)).map_err(|error| {
+                        allocation_error("full item record inventory growth", error)
+                    })?;
+                }
+                let replaced = items_by_key.insert(item_key, index);
+                debug_assert!(replaced.is_none());
+                items.push(FullInventoryItem {
+                    item_id: i64_to_u64(row.get(0)?, 0)?,
+                    owner,
+                    page_index: row.get(3)?,
+                    mtime: row.get(4)?,
+                    file_size: row.get(5)?,
+                    current_and_published: stored_hash_version == hash_version && published,
+                });
+                loaded += 1;
+            }
+        }
+        if !should_continue() {
+            return Ok(None);
+        }
+        transaction.commit()?;
+        let seen_item_words = inventory_words(items.len())?;
+        let seen_container_words = inventory_words(containers.len())?;
+        Ok(Some(FullReconcileInventory {
+            hash_version,
+            items_by_key,
+            items,
+            containers_by_key,
+            containers,
+            seen_item_words,
+            seen_container_words,
+            #[cfg(test)]
+            item_map_growths,
+            #[cfg(test)]
+            item_record_growths,
+            #[cfg(test)]
+            container_map_growths,
+            #[cfg(test)]
+            container_record_growths,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_full_reconcile_inventory_if(
+        &self,
+        inventory: FullReconcileInventory,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+        stats: CompletedIndexStats,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<(usize, StoredIndexSummary)> {
+        let mut conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let transaction = write_transaction(&mut conn)?;
+
+        // Resolve owner indices through borrowed map keys. This owns only one pointer per
+        // container for the finalizer lifetime and never clones the exact String corpus.
+        let mut container_keys = Vec::new();
+        container_keys
+            .try_reserve_exact(inventory.containers.len())
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other(format!(
+                        "full finalizer owner index allocation failed: {error}"
+                    ))
+                    .into(),
+                )
+            })?;
+        container_keys.resize(inventory.containers.len(), None);
+        for (key, &index) in &inventory.containers_by_key {
+            container_keys[index as usize] = Some(key.as_str());
+        }
+        let mut owner_snapshot_unchanged = Vec::new();
+        owner_snapshot_unchanged
+            .try_reserve_exact(inventory.containers.len())
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other(format!(
+                        "full finalizer identity index allocation failed: {error}"
+                    ))
+                    .into(),
+                )
+            })?;
+        owner_snapshot_unchanged.resize(inventory.containers.len(), false);
+        for (key, &index) in &inventory.containers_by_key {
+            let container = &inventory.containers[index as usize];
+            owner_snapshot_unchanged[index as usize] = match container.snapshot.as_ref() {
+                Some(snapshot) => transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM container
+                       WHERE container_key = ?1 AND kind = ?2 AND page_count IS ?3
+                         AND scan_state = ?4 AND generation = ?5 AND mtime = ?6
+                         AND file_size = ?7
+                     )",
+                    params![
+                        key,
+                        snapshot.kind,
+                        snapshot.page_count,
+                        snapshot.scan_state,
+                        snapshot.generation,
+                        snapshot.mtime,
+                        snapshot.file_size,
+                    ],
+                    |row| row.get(0),
+                )?,
+                None => !transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM container WHERE container_key = ?1)",
+                    [key],
+                    |row| row.get::<_, bool>(0),
+                )?,
+            };
+        }
+
+        let mut removed = 0usize;
+        for (index, item) in inventory.items.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other("full item index exceeds u32").into(),
+                )
+            })?;
+            let protected_container = item
+                .owner
+                .is_some_and(|owner| inventory.container_seen(owner));
+            if inventory.item_seen(index) || protected_container {
+                continue;
+            }
+            if item
+                .owner
+                .is_some_and(|owner| !owner_snapshot_unchanged[owner as usize])
+            {
+                continue;
+            }
+            let owner = item.owner.and_then(|owner| container_keys[owner as usize]);
+            let item_id = i64::try_from(item.item_id).map_err(|_| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other("item_id exceeds SQLite INTEGER").into(),
+                )
+            })?;
+            let journaled = transaction.execute(
+                "INSERT INTO item_change (item_id, op, revision, pdq256, quality)
+                 SELECT item_id, 2, NULL, NULL, NULL FROM item
+                 WHERE item_id = ?1 AND container_key IS ?2",
+                params![item_id, owner],
+            )?;
+            if journaled == 0 {
+                continue;
+            }
+            let deleted = transaction.execute(
+                "DELETE FROM item WHERE item_id = ?1 AND container_key IS ?2",
+                params![item_id, owner],
+            )?;
+            debug_assert_eq!(deleted, 1);
+            removed += deleted;
+        }
+
+        for (key, &index) in &inventory.containers_by_key {
+            let container = &inventory.containers[index as usize];
+            let Some(snapshot) = container.snapshot.as_ref() else {
+                continue;
+            };
+            if inventory.container_seen(index) {
+                continue;
+            }
+            if !owner_snapshot_unchanged[index as usize] {
+                continue;
+            }
+            removed += transaction.execute(
+                "DELETE FROM container
+                 WHERE container_key = ?1 AND kind = ?2 AND page_count IS ?3
+                   AND scan_state = ?4 AND generation = ?5 AND mtime = ?6 AND file_size = ?7
+                   AND NOT EXISTS (
+                     SELECT 1 FROM item WHERE item.container_key = container.container_key
+                   )",
+                params![
+                    key,
+                    snapshot.kind,
+                    snapshot.page_count,
+                    snapshot.scan_state,
+                    snapshot.generation,
+                    snapshot.mtime,
+                    snapshot.file_size,
+                ],
+            )?;
+        }
+        let summary = record_completed_index_transaction(
+            &transaction,
+            hash_version,
+            completed_at_unix_secs,
+            stats,
+        )?;
+        if !should_publish() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        transaction.commit()?;
+        Ok((removed, summary))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_inventory_load_count(&self) -> usize {
+        self.full_inventory_loads.load(Ordering::Relaxed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4526,4 +5168,598 @@ mod tests {
             Some(previous_summary)
         );
     }
+
+    fn full_inventory(db: &SimilarDb) -> FullReconcileInventory {
+        db.load_full_reconcile_inventory(current_hash_version(), || true)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn finalize_inventory(db: &SimilarDb, inventory: FullReconcileInventory) -> usize {
+        db.finalize_full_reconcile_inventory_if(
+            inventory,
+            current_hash_version(),
+            456,
+            CompletedIndexStats::default(),
+            || true,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawFullItemState {
+        item_id: i64,
+        item_key: String,
+        revision: i64,
+        kind: i64,
+        container_key: Option<String>,
+        page_index: Option<i64>,
+        mtime: i64,
+        file_size: i64,
+        hash_version: i64,
+        pdq256: Vec<u8>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawFullContainerState {
+        container_key: String,
+        kind: i64,
+        page_count: Option<i64>,
+        scan_state: i64,
+        generation: i64,
+        mtime: i64,
+        file_size: i64,
+    }
+
+    fn raw_full_state(db: &SimilarDb) -> (Vec<RawFullItemState>, Vec<RawFullContainerState>) {
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        let items = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT item_id, item_key, revision, kind, container_key, page_index,
+                            mtime, file_size, hash_version, pdq256
+                     FROM item ORDER BY item_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok(RawFullItemState {
+                        item_id: row.get(0)?,
+                        item_key: row.get(1)?,
+                        revision: row.get(2)?,
+                        kind: row.get(3)?,
+                        container_key: row.get(4)?,
+                        page_index: row.get(5)?,
+                        mtime: row.get(6)?,
+                        file_size: row.get(7)?,
+                        hash_version: row.get(8)?,
+                        pdq256: row.get(9)?,
+                    })
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let containers = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT container_key, kind, page_count, scan_state, generation, mtime,
+                            file_size
+                     FROM container ORDER BY container_key",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok(RawFullContainerState {
+                        container_key: row.get(0)?,
+                        kind: row.get(1)?,
+                        page_count: row.get(2)?,
+                        scan_state: row.get(3)?,
+                        generation: row.get(4)?,
+                        mtime: row.get(5)?,
+                        file_size: row.get(6)?,
+                    })
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        (items, containers)
+    }
+
+    fn normalized_changes(db: &SimilarDb, after: u64) -> Vec<(u64, String)> {
+        let mut changes = db
+            .load_item_changes_after(after)
+            .unwrap()
+            .changes
+            .into_iter()
+            .map(|change| (change.item_id, format!("{:?}", change.op)))
+            .collect::<Vec<_>>();
+        changes.sort();
+        changes
+    }
+
+    fn populate_full_inventory_equivalence_matrix(db: &SimilarDb) {
+        for (key, marker) in [
+            ("keep", 1),
+            ("stale-loose", 2),
+            ("old-loose", 3),
+            ("orphan", 4),
+            ("remove-loose", 5),
+        ] {
+            db.upsert_loose_item(&item(key, None, None, marker))
+                .unwrap();
+        }
+        publish_test_book(
+            db,
+            "extra-book",
+            &[("extra-book/0", 6), ("extra-book/1", 7)],
+        );
+        let zero_generation = db
+            .begin_container_build("zero-book", ContainerKind::Zip, 0, 1, 2)
+            .unwrap();
+        db.complete_container("zero-book", zero_generation).unwrap();
+        publish_test_book(db, "old-hash-book", &[("old-hash-book/0", 8)]);
+        publish_test_book(db, "invalid-book", &[("invalid-book/0", 9)]);
+        publish_test_book(db, "stale-book", &[("stale-book/0", 10)]);
+        publish_test_book(db, "remove-book", &[("remove-book/0", 11)]);
+
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        conn.execute(
+            "UPDATE item SET container_key = 'missing-owner' WHERE item_key = 'orphan'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE item SET hash_version = ?1 WHERE item_key IN ('old-loose', 'old-hash-book/0')",
+            [current_hash_version() - 1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE container SET page_count = 1 WHERE container_key = 'extra-book'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE container SET scan_state = 99, page_count = -1
+             WHERE container_key = 'invalid-book'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn full_reconcile_inventory_matches_legacy_freshness_and_prune() {
+        fn populate(db: &SimilarDb) {
+            db.upsert_loose_item(&item("keep", None, None, 1)).unwrap();
+            db.upsert_loose_item(&item("remove", None, None, 2))
+                .unwrap();
+            publish_test_book(db, "book", &[("book/page", 3)]);
+        }
+
+        let legacy = SimilarDb::open_in_memory().unwrap();
+        let compact = SimilarDb::open_in_memory().unwrap();
+        populate(&legacy);
+        populate(&compact);
+        let legacy_start = legacy.load_item_changes_after(0).unwrap().latest_seq;
+        let compact_start = compact.load_item_changes_after(0).unwrap().latest_seq;
+
+        legacy
+            .finalize_full_reconcile_if(
+                &HashSet::from(["keep".to_owned()]),
+                &HashSet::from(["book".to_owned()]),
+                current_hash_version(),
+                456,
+                CompletedIndexStats::default(),
+                || true,
+            )
+            .unwrap();
+        let inventory = full_inventory(&compact);
+        assert_eq!(
+            inventory.observe_item("keep", None, None, 10, 20),
+            FullItemObservation {
+                exact_current: true,
+                reusable_current_row: true,
+            }
+        );
+        inventory.observe_container("book");
+        finalize_inventory(&compact, inventory);
+
+        assert_eq!(
+            legacy.load_search_rows(current_hash_version()).unwrap(),
+            compact.load_search_rows(current_hash_version()).unwrap()
+        );
+        assert_eq!(
+            legacy.load_complete_containers().unwrap(),
+            compact.load_complete_containers().unwrap()
+        );
+        let normalized_changes = |db: &SimilarDb, after| {
+            let mut changes = db
+                .load_item_changes_after(after)
+                .unwrap()
+                .changes
+                .into_iter()
+                .map(|change| (change.item_id, change.op))
+                .collect::<Vec<_>>();
+            changes.sort_by_key(|entry| entry.0);
+            changes
+        };
+        assert_eq!(
+            normalized_changes(&legacy, legacy_start),
+            normalized_changes(&compact, compact_start)
+        );
+        assert_eq!(
+            legacy.load_index_summary(current_hash_version()).unwrap(),
+            compact.load_index_summary(current_hash_version()).unwrap()
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_matches_legacy_edge_case_matrix() {
+        let legacy = SimilarDb::open_in_memory().unwrap();
+        let compact = SimilarDb::open_in_memory().unwrap();
+        populate_full_inventory_equivalence_matrix(&legacy);
+        populate_full_inventory_equivalence_matrix(&compact);
+        let legacy_start = legacy.load_item_changes_after(0).unwrap().latest_seq;
+        let compact_start = compact.load_item_changes_after(0).unwrap().latest_seq;
+        let inventory = full_inventory(&compact);
+
+        let item_cases = [
+            ("keep", None, None, 10, 20),
+            ("stale-loose", None, None, 11, 20),
+            ("old-loose", None, None, 10, 20),
+            ("orphan", Some("missing-owner"), None, 10, 20),
+        ];
+        let mut seen_items = HashSet::new();
+        for (key, owner, page_index, mtime, file_size) in item_cases {
+            let legacy_row = legacy.load_item(key, current_hash_version()).unwrap();
+            let legacy_reusable = legacy_row
+                .as_ref()
+                .is_some_and(|row| row.item.mtime == mtime && row.item.file_size == file_size);
+            let legacy_exact = legacy_row.as_ref().is_some_and(|row| {
+                row.item.mtime == mtime
+                    && row.item.file_size == file_size
+                    && row.item.container_key.as_deref() == owner
+                    && row.item.page_index == page_index
+            });
+            let observed = inventory.observe_item(key, owner, page_index, mtime, file_size);
+            assert_eq!(observed.exact_current, legacy_exact, "item case {key}");
+            assert_eq!(
+                observed.reusable_current_row, legacy_reusable,
+                "item reuse case {key}"
+            );
+            seen_items.insert(key.to_owned());
+        }
+
+        let container_cases = [
+            ("extra-book", 1, 2, 1),
+            ("zero-book", 1, 2, 0),
+            ("old-hash-book", 1, 2, 1),
+            ("invalid-book", 1, 2, 1),
+            ("stale-book", 2, 2, 1),
+        ];
+        let mut seen_containers = HashSet::new();
+        for (key, mtime, file_size, page_count) in container_cases {
+            let legacy_freshness = legacy
+                .container_freshness(key, mtime, file_size, page_count, current_hash_version())
+                .unwrap();
+            inventory.observe_container(key);
+            let observed = inventory.container_observation(
+                key,
+                mtime,
+                file_size,
+                page_count,
+                current_hash_version(),
+            );
+            assert_eq!(observed.freshness, legacy_freshness, "container case {key}");
+            seen_containers.insert(key.to_owned());
+        }
+
+        let stats = CompletedIndexStats {
+            password_required_pdfs: 1,
+            corrupt_containers: 2,
+            zero_page_containers: 3,
+            decode_failures: 4,
+            io_failures: 5,
+        };
+        let legacy_removed = legacy
+            .finalize_full_reconcile_if(
+                &seen_items,
+                &seen_containers,
+                current_hash_version(),
+                789,
+                stats,
+                || true,
+            )
+            .unwrap()
+            .0;
+        let compact_removed = compact
+            .finalize_full_reconcile_inventory_if(
+                inventory,
+                current_hash_version(),
+                789,
+                stats,
+                || true,
+            )
+            .unwrap()
+            .0;
+
+        assert_eq!(compact_removed, legacy_removed);
+        assert_eq!(raw_full_state(&compact), raw_full_state(&legacy));
+        assert_eq!(
+            compact.load_index_summary(current_hash_version()).unwrap(),
+            legacy.load_index_summary(current_hash_version()).unwrap()
+        );
+        assert_eq!(
+            normalized_changes(&compact, compact_start),
+            normalized_changes(&legacy, legacy_start),
+            "delete journal must match as a sorted multiset without hiding duplicates"
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_loader_polls_cancellation_during_row_scan() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value <= ?1
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, page_index, mtime, file_size,
+                    hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('cancel-%05d', value), 0, NULL, NULL, 1, 1,
+                        ?2, zeroblob(32), 1, 1, 1, 1
+                 FROM ids",
+                params![
+                    i64::try_from(FULL_INVENTORY_CANCEL_POLL_ROWS).unwrap(),
+                    current_hash_version()
+                ],
+            )
+            .unwrap();
+        }
+        let checks = AtomicUsize::new(0);
+
+        let loaded = db
+            .load_full_reconcile_inventory(current_hash_version(), || {
+                checks.fetch_add(1, Ordering::AcqRel) < 2
+            })
+            .unwrap();
+
+        assert!(
+            loaded.is_none(),
+            "periodic cancellation must abort the loader"
+        );
+        assert!(
+            checks.load(Ordering::Acquire) >= 3,
+            "the cancellation predicate must be checked again after the first row block"
+        );
+        db.upsert_loose_item(&item("after-cancel", None, None, 99))
+            .unwrap();
+    }
+
+    #[test]
+    fn full_reconcile_inventory_new_member_after_snapshot_survives() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "book", &[("book/old", 1)]);
+        let inventory = full_inventory(&db);
+        let before = db.load_item_changes_after(0).unwrap().latest_seq;
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            publish_item(&conn, None, &item("book/new", Some("book"), Some(1), 2)).unwrap();
+        }
+
+        assert_eq!(finalize_inventory(&db, inventory), 1);
+        let rows = db.load_search_rows(current_hash_version()).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item.item_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["book/new"]
+        );
+        assert_eq!(db.load_complete_containers().unwrap().len(), 1);
+        let deletes = db
+            .load_item_changes_after(before)
+            .unwrap()
+            .changes
+            .into_iter()
+            .filter(|change| change.op == ItemChangeOp::Delete)
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1, "one initial row is journaled once");
+    }
+
+    #[test]
+    fn full_reconcile_inventory_owner_changes_survive() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "old-book", &[("old-book/page", 1)]);
+        db.upsert_loose_item(&item("orphan", None, None, 2))
+            .unwrap();
+        db.upsert_loose_item(&item("move-to-book", None, None, 3))
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute(
+                "UPDATE item SET container_key = 'missing-owner' WHERE item_key = 'orphan'",
+                [],
+            )
+            .unwrap();
+        let inventory = full_inventory(&db);
+
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "UPDATE item SET container_key = NULL, page_index = NULL
+                 WHERE item_key IN ('old-book/page', 'orphan')",
+                [],
+            )
+            .unwrap();
+        }
+        let generation = db
+            .begin_container_build("new-book", ContainerKind::ImageFolder, 1, 1, 2)
+            .unwrap();
+        db.stage_item(
+            generation,
+            &item("move-to-book", Some("new-book"), Some(0), 4),
+        )
+        .unwrap();
+        db.complete_container("new-book", generation).unwrap();
+
+        assert_eq!(finalize_inventory(&db, inventory), 1);
+        let mut rows = db
+            .load_search_rows(current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.item.item_key, row.item.container_key))
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("move-to-book".to_owned(), Some("new-book".to_owned())),
+                ("old-book/page".to_owned(), None),
+                ("orphan".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            db.load_complete_containers()
+                .unwrap()
+                .into_iter()
+                .map(|container| container.container_key)
+                .collect::<Vec<_>>(),
+            vec!["new-book"]
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_same_container_key_rebuild_survives() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "book", &[("book/page", 1)]);
+        let inventory = full_inventory(&db);
+        let before = db.load_item_changes_after(0).unwrap().latest_seq;
+        publish_test_book(&db, "book", &[("book/page", 9)]);
+
+        assert_eq!(finalize_inventory(&db, inventory), 0);
+        let row = db
+            .load_item("book/page", current_hash_version())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.item.pdq256, [9; 32]);
+        assert_eq!(db.load_complete_containers().unwrap()[0].generation, 2);
+        assert!(
+            db.load_item_changes_after(before)
+                .unwrap()
+                .changes
+                .iter()
+                .all(|change| change.op != ItemChangeOp::Delete)
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_failed_container_keeps_previous_complete_pages() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "book", &[("book/page", 1)]);
+        let inventory = full_inventory(&db);
+        inventory.observe_container("book");
+
+        assert_eq!(finalize_inventory(&db, inventory), 0);
+        assert!(
+            db.load_item("book/page", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_invalid_container_state_is_stale_not_fatal() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "book", &[("book/page", 1)]);
+        db.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .execute(
+                "UPDATE container SET scan_state = 99, page_count = -1 WHERE container_key='book'",
+                [],
+            )
+            .unwrap();
+
+        let inventory = full_inventory(&db);
+        assert_eq!(
+            inventory
+                .container_observation("book", 1, 2, 1, current_hash_version())
+                .freshness,
+            Freshness::Stale
+        );
+        assert!(
+            !inventory
+                .observe_item("book/page", Some("book"), Some(0), 10, 20)
+                .reusable_current_row
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_cancelled_finalize_rolls_back_everything() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("remove", None, None, 1))
+            .unwrap();
+        let previous = db
+            .record_completed_index(current_hash_version(), 100, CompletedIndexStats::default())
+            .unwrap();
+        let before = db.load_item_changes_after(0).unwrap();
+        let inventory = full_inventory(&db);
+        let checks = AtomicUsize::new(0);
+
+        assert!(
+            db.finalize_full_reconcile_inventory_if(
+                inventory,
+                current_hash_version(),
+                200,
+                CompletedIndexStats::default(),
+                || checks.fetch_add(1, Ordering::AcqRel) == 0,
+            )
+            .is_err()
+        );
+        assert!(
+            db.load_item("remove", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(db.load_item_changes_after(0).unwrap(), before);
+        assert_eq!(
+            db.load_index_summary(current_hash_version()).unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn full_reconcile_inventory_uses_word_packed_seen_bits() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for index in 0..65 {
+            db.upsert_loose_item(&item(&format!("item-{index}"), None, None, index as u8))
+                .unwrap();
+        }
+        let inventory = full_inventory(&db);
+        let accounting = inventory.accounting();
+        assert_eq!(accounting.item_count, 65);
+        assert!(accounting.item_capacity >= accounting.item_count);
+        assert!(accounting.item_map_capacity >= accounting.item_count);
+        assert_eq!(accounting.container_count, 0);
+        assert!(accounting.container_capacity >= accounting.container_count);
+        assert_eq!(accounting.container_map_capacity, 0);
+        assert!(accounting.key_bytes >= "item-0".len() * 65);
+        assert!(accounting.item_record_capacity_bytes >= 65 * size_of::<FullInventoryItem>());
+        assert_eq!(accounting.container_record_capacity_bytes, 0);
+        assert_eq!(accounting.item_bitset_bytes, 16);
+        assert_eq!(accounting.container_bitset_bytes, 0);
+        assert!(accounting.item_map_growths >= 1);
+        assert!(accounting.item_record_growths >= 1);
+        assert_eq!(accounting.container_map_growths, 0);
+        assert_eq!(accounting.container_record_growths, 0);
+    }
 }
+
+#[cfg(test)]
+#[path = "similar_db/full_inventory_benchmark_tests.rs"]
+mod full_inventory_benchmark_tests;
