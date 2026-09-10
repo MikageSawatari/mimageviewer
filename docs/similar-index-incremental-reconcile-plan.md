@@ -6,6 +6,8 @@
 作業は `codex/similar-index-incremental-reconcile`、基点は `77a6f270e`。
 最初の検証までは master の休止版を取り込まず、その後の親の明示指示で確定済み `aa034d578`（休止版 `3f5481c14` を含む）の統合を開始した。master 作業ツリーの未コミット差分は取り込まない。master への逆方向の統合・再有効化・リリースは別判断とし、今回も `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
 
+その後、`aa034d578` との統合を `1c3b5861f` に保存し、この統合 hash を対象とする独立検収・焦点回帰・全体 gate・normal build も完了した。現在の確認バイナリは Paused 維持版。以下の統合前測定・build 記録と区別し、最新結果は末尾の「統合コミットの最終検証」を参照する。
+
 設計・進行は親、実装・テストは implement_resume、独立レビューは review_resume。
 実装とレビューは別の Sol / xhigh 担当。ソース・テストは実装担当だけが編集し、本書と README は親が編集する。
 旧資料の ClaudeCode 担当指定に代えて今回の利用者指定を適用する。detached 経路の変更は予定しない。
@@ -333,3 +335,20 @@ root もログを確認。証跡は `target/similar-index-incremental-final-gate
 中間競合解消版の関数列欠落と Option 呼出の後退は構文/差分検査で検出して修正し、その版は有効証拠に使わない。最終版は両 parent に対して意図外削除がないことを独立検収する。初期 App 回帰の即時進捗 assert 失敗も製品失敗とは混同せず、上記の実契約に沿う最終回帰を正本とする。
 
 最終 freeze は `target/similar-index-pause-integration-20260911/freeze-r1/MANIFEST.md`（SHA256 `C144B7F84B3035E9DB50752D0C5C75DD77C778258B3F6C66B4A56577BD6D96D3`）。39 staged paths / Rust 20 件の source が index と一致し、未解決競合は 0。独立最終承認は同 directory の `review-approval.md`（SHA256 `091FEA02DE65F4CB31271437A5A536296F2BEE8F1F8F2EF3F30C27D5FA21D424`）、統合範囲に残る P1/P2 なし。両 parent との照合で意図外削除がなく、Option 全入口・Paused 保存保護・Enabled 接続・失敗終端を確認した。本書の追記だけを freeze 後に追加し、コードを固定したまま merge commit と全体 gate/build へ進む。
+
+### 統合コミットの最終検証
+
+merge commit は `1c3b5861f73dc5760f3a3b673e409bda40628c41`、parents は `b7102a53ac086f9979ae7c8ba8eb2561fc817752` と指定どおり `aa034d57847f7f859fb34e51823ea1d5d4be667b`。親が後から追加した docs-only `e2d29dd85` や master の未コミット差分は取り込まず、全体 gate と build はこの統合 hash に固定した。以後は本書の結果追記のみ。
+
+`scripts/test-full.ps1 -SuppressCrashDialogs` は jobs=1、08:22:22–08:34:58 JST、native exit 0 / PASS。本体 8,148 passed / 0 failed / 44 ignored、UI snapshot 48 passed、workspace・統合/doc/補助 bin と vendor 3 crate まで成功。error mode を元の `0x00008001` に復元。証跡は `target/similar-index-pause-integration-20260911/fullgate-1c3b5861/`、stdout SHA256 `F454016CAD8D223DBB7CD846BD759AC2DB5F3247D1D814CF2F008A1A79684337`。root も run identity・native exit・集計・復元を確認した。
+
+その後 exact staged core/Remote resident が 0 と確認し、`scripts/build-dev.ps1` を通常 feature（portable/test-script なし）/jobs=1 で 08:35:26–08:44:29 JST に実行、native exit 0。core は更新、変更のない Remote は Cargo が前回成果物を再利用した。両方の最終 hash は root も実ファイルから計算して一致を確認した。
+
+| 成果物 | bytes | 更新時刻 JST | SHA256 |
+| --- | --- | --- | --- |
+| `target/dev-runtime/mimageviewer-core.exe` | 309,949,440 | 2026-09-11 08:44:27.8350397 | `94A30146DB515CDC86DA7D24A6F8087E2F1ABFC8FEC59C2945B6B67B22B8A1C7` |
+| `target/dev-runtime/mimageviewer-remote.exe` | 12,197,376 | 2026-09-11 07:45:16.8048088 | `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA` |
+
+build 証跡は同統合 artifact の `build-dev-1c3b5861/` にある `run.txt`、stdout/stderr、`artifacts.txt`、`validation-log-hashes.txt`、`final-state.txt`。終了時 clean、cargo/rustc 0、exact dev-runtime resident 0。アプリ起動・本番 DB/APPDATA 操作はなく、既知の大規模測定も再実行していない。
+
+Paused 維持の根拠は製品定数、App Option 単一所有、None での設定/store 保護回帰と入口検収。Enabled 側の根拠は App の初回 Full/password 更新 Full、共有 watcher の Full→Delta と復旧回帰。これらの成功は再有効化の承認とは別である。master への merge と製品再有効化は親へ引き渡す。実機の未確認項目は、類似 UI が非表示のままで通常の名前/metadata 索引と閲覧操作が動くこと。確認用コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため installed/tray 常駐版を先に終了する。エージェントは実行していない。
