@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
@@ -40,6 +41,30 @@ pub struct LegacyImportReport {
     pub imported_items: usize,
     pub inserted_tags: usize,
     pub skipped_decided_items: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedSidecarTagItem {
+    pub(crate) item_key: String,
+    tags: Vec<ItemTag>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidecarTagBatchReport {
+    pub(crate) imported_items: usize,
+    pub(crate) inserted_tags: usize,
+    pub(crate) skipped_decided_items: usize,
+    pub(crate) imported: Vec<(String, Vec<String>)>,
+    pub(crate) transaction_committed: bool,
+    pub(crate) sync_marker_recorded: bool,
+    pub(crate) transaction_elapsed: std::time::Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarTagBatchOutcome {
+    AlreadySynchronized,
+    Applied(SidecarTagBatchReport),
+    Cancelled,
 }
 
 pub const LEGACY_TANTIVY_IMPORTED_META: &str = "legacy_tantivy_imported";
@@ -342,6 +367,109 @@ impl TagsDb {
         upsert_item_state_tx(&tx, item_key, source::XMP_LEGACY, now)?;
         tx.commit()?;
         Ok(Some((self.display_tags_for_item(item_key), inserted)))
+    }
+
+    /// Import one sidecar snapshot in one WAL transaction.
+    ///
+    /// Both the durable decision row and legacy rows without a decision are
+    /// authoritative.  The checks live in the same IMMEDIATE transaction as
+    /// the inserts, so another connection cannot slip a user edit between the
+    /// check and the write.  A disk sync marker, when eligible, is committed in
+    /// this transaction too.  Pending writer sequence numbers are deliberately
+    /// represented by `None` and are never persisted as disk markers.
+    pub(crate) fn import_sidecar_tags_atomic(
+        &mut self,
+        folder_key: &str,
+        sync_marker: Option<i64>,
+        items: &[PreparedSidecarTagItem],
+        cancel: &AtomicBool,
+    ) -> Result<SidecarTagBatchOutcome, rusqlite::Error> {
+        if let Some(marker) = sync_marker
+            && self.sidecar_sync_get(folder_key) == Some(marker)
+        {
+            return Ok(SidecarTagBatchOutcome::AlreadySynchronized);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
+
+        self.rotate_backups_once();
+        let transaction_started = std::time::Instant::now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(marker) = sync_marker {
+            let current = tx
+                .query_row(
+                    "SELECT sidecar_mtime FROM tag_sidecar_sync WHERE folder_key = ?1",
+                    [folder_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if current == Some(marker) {
+                return Ok(SidecarTagBatchOutcome::AlreadySynchronized);
+            }
+        }
+        let mut report = SidecarTagBatchReport::default();
+        for item in items {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(SidecarTagBatchOutcome::Cancelled);
+            }
+            let decided_or_existing = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tag_item_state WHERE item_key = ?1
+                 ) OR EXISTS(
+                    SELECT 1 FROM item_tags WHERE item_key = ?1
+                 )",
+                [&item.item_key],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if decided_or_existing {
+                report.skipped_decided_items += 1;
+                continue;
+            }
+
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO item_tags (item_key, tag, tag_key, applied_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(item_key, tag_key) DO NOTHING",
+                )?;
+                for tag in &item.tags {
+                    inserted +=
+                        stmt.execute(params![item.item_key, tag.tag, tag.tag_key, tag.applied_at])?;
+                }
+            }
+            upsert_item_state_tx(&tx, &item.item_key, source::SIDECAR, now_unix_secs())?;
+            report.imported_items += 1;
+            report.inserted_tags += inserted;
+            report.imported.push((
+                item.item_key.clone(),
+                item.tags
+                    .iter()
+                    .map(|tag| format_display_tag(&tag.tag))
+                    .collect(),
+            ));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
+        if let Some(marker) = sync_marker {
+            tx.execute(
+                "INSERT INTO tag_sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
+                 ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = excluded.sidecar_mtime",
+                params![folder_key, marker],
+            )?;
+            report.sync_marker_recorded = true;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
+        tx.commit()?;
+        report.transaction_committed = true;
+        report.transaction_elapsed = transaction_started.elapsed();
+        Ok(SidecarTagBatchOutcome::Applied(report))
     }
 
     pub fn toggle_item_tag(
@@ -1029,6 +1157,31 @@ where
         );
     }
     by_key.into_values().collect()
+}
+
+pub(crate) fn prepare_sidecar_tag_item(
+    item_key: String,
+    tags: &[String],
+) -> Result<Option<PreparedSidecarTagItem>, String> {
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    let mut normalized = Vec::with_capacity(tags.len());
+    for raw in tags {
+        let display = normalize_tag_display_name(strip_display_hash(raw));
+        let tag_key = normalize_tag_key(&display);
+        if tag_key.is_empty()
+            || display.chars().count() > 64
+            || tag_display_name_has_whitespace(&display)
+        {
+            return Err(format!("invalid sidecar tag for {item_key}"));
+        }
+        normalized.push(display);
+    }
+    Ok(Some(PreparedSidecarTagItem {
+        item_key,
+        tags: collapse_tags(normalized, now_unix_secs()),
+    }))
 }
 
 /// SQL LIKE エスケープは [`crate::adjustment_db::escape_like_pattern`] を共有する

@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adjustment::AdjustParams;
 use crate::mask_db::Shape;
@@ -173,6 +174,209 @@ pub struct SidecarFile {
     dirty_since: Option<Instant>,
 }
 
+/// A disk snapshot used by the sidecar import path.
+///
+/// The digest identifies the bytes that were parsed.  The metadata values are
+/// captured both before and after the read; a file whose metadata identity
+/// changes during the read is not returned as [`SidecarImportLoad::Loaded`].
+/// The digest is checked again before commit, including changes that preserve
+/// length and mtime. `folder_key` prevents a token from one folder being reused
+/// for another folder with coincidentally identical bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SidecarDiskToken {
+    folder_key: String,
+    byte_len: u64,
+    modified_unix_nanos: i64,
+    sha256: [u8; 32],
+}
+
+impl SidecarDiskToken {
+    /// Stable identity stored in the existing INTEGER sync column.  It mixes
+    /// byte length, nanosecond timestamp, and the digest so changed bytes do not
+    /// look synchronized solely because their timestamps are equal. Old releases
+    /// stored whole seconds, so the first new comparison intentionally misses once.
+    pub(crate) fn sync_marker(&self) -> i64 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mimageviewer-sidecar-sync-v2");
+        hasher.update(self.byte_len.to_le_bytes());
+        hasher.update(self.modified_unix_nanos.to_le_bytes());
+        hasher.update(self.sha256);
+        let digest: [u8; 32] = hasher.finalize().into();
+        i64::from_le_bytes(digest[..8].try_into().expect("eight-byte marker slice"))
+    }
+
+    pub(crate) fn revalidate(&self, folder: &Path) -> Result<(), String> {
+        if crate::adjustment_db::normalize_path(folder) != self.folder_key {
+            return Err("sidecar token belongs to a different folder".to_string());
+        }
+        let path = folder.join(SIDECAR_FILENAME);
+        let before = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+            .and_then(|metadata| disk_metadata_identity(&metadata))?;
+        let data = std::fs::read(&path)
+            .map_err(|error| format!("cannot revalidate sidecar bytes: {error}"))?;
+        let after = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+            .and_then(|metadata| disk_metadata_identity(&metadata))?;
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let expected = DiskMetadataIdentity {
+            byte_len: self.byte_len,
+            modified_unix_nanos: self.modified_unix_nanos,
+        };
+        if before != after
+            || after != expected
+            || data.len() as u64 != self.byte_len
+            || digest != self.sha256
+        {
+            return Err("sidecar changed after its import snapshot was loaded".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Identity of the immutable snapshot returned for import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarImportSource {
+    Disk(SidecarDiskToken),
+    /// A newer in-process writer snapshot.  Its sequence is meaningful only in
+    /// this process and must never be persisted as a disk sync marker.
+    PendingWriter {
+        folder_key: String,
+        sequence: u64,
+        kind: PendingWriterKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingWriterKind {
+    Write,
+    Remove,
+}
+
+/// One immutable sidecar snapshot bound to the identity it was loaded from.
+///
+/// Its fields have no public constructor.  Consumers can inspect the sidecar,
+/// but only [`crate::sidecar_import::prepare`] can split the snapshot from its
+/// source token.  This prevents a token from one read being combined with the
+/// bytes parsed by another read and then advancing the wrong sync marker.
+pub struct LoadedSidecarImport {
+    sidecar: SidecarFile,
+    source: SidecarImportSource,
+}
+
+impl LoadedSidecarImport {
+    pub fn sidecar(&self) -> &SidecarFile {
+        &self.sidecar
+    }
+
+    pub(crate) fn into_parts(self) -> (SidecarFile, SidecarImportSource) {
+        (self.sidecar, self.source)
+    }
+}
+
+/// Typed load result for the sidecar import engine.
+///
+/// `SidecarFile::load` deliberately remains the forgiving UI/mirror API.  This
+/// result exists so import code cannot confuse an empty valid sidecar with a
+/// missing, unreadable, corrupt, future-version, or concurrently changing file
+/// and then incorrectly advance a sync marker.
+pub enum SidecarImportLoad {
+    Missing { sidecar: SidecarFile },
+    Loaded(LoadedSidecarImport),
+    Unreadable { sidecar: SidecarFile, error: String },
+    Corrupt { sidecar: SidecarFile, error: String },
+    UnsupportedVersion { sidecar: SidecarFile, version: u32 },
+    WriterFailed { sidecar: SidecarFile },
+    ChangedDuringRead { sidecar: SidecarFile },
+}
+
+impl SidecarImportLoad {
+    /// Preserve the historical forgiving load contract for existing callers.
+    pub fn into_sidecar(self) -> SidecarFile {
+        match self {
+            Self::Loaded(loaded) => loaded.sidecar,
+            Self::Missing { sidecar }
+            | Self::Unreadable { sidecar, .. }
+            | Self::Corrupt { sidecar, .. }
+            | Self::UnsupportedVersion { sidecar, .. }
+            | Self::WriterFailed { sidecar }
+            | Self::ChangedDuringRead { sidecar } => sidecar,
+        }
+    }
+}
+
+pub(crate) fn revalidate_import_source(
+    sidecar: &SidecarFile,
+    source: &SidecarImportSource,
+) -> Result<(), String> {
+    revalidate_import_source_from(sidecar, source, &writer().state)
+}
+
+fn revalidate_import_source_from(
+    sidecar: &SidecarFile,
+    source: &SidecarImportSource,
+    writer_state: &WriterState,
+) -> Result<(), String> {
+    let folder = sidecar.folder();
+    let folder_key = crate::adjustment_db::normalize_path(folder);
+    match source {
+        SidecarImportSource::Disk(token) => {
+            if writer_state.pending_import_snapshot(folder)?.is_some() {
+                return Err("disk sidecar snapshot was superseded by a pending write".to_string());
+            }
+            if writer_state.is_failed_for_import(folder)? {
+                return Err("sidecar writer failed after the disk snapshot was loaded".to_string());
+            }
+            token.revalidate(folder)
+        }
+        SidecarImportSource::PendingWriter {
+            folder_key: expected_folder_key,
+            sequence,
+            kind,
+        } => {
+            if &folder_key != expected_folder_key {
+                return Err("pending sidecar token belongs to a different folder".to_string());
+            }
+            let Some(current) = writer_state.pending_import_snapshot(folder)? else {
+                return Err("pending sidecar snapshot is no longer current".to_string());
+            };
+            let same_snapshot = match (kind, current.kind) {
+                (PendingWriterKind::Write, PendingWriterKind::Write) => {
+                    Arc::ptr_eq(&current.items, &sidecar.items)
+                }
+                (PendingWriterKind::Remove, PendingWriterKind::Remove) => sidecar.items.is_empty(),
+                _ => false,
+            };
+            if current.sequence != *sequence || !same_snapshot {
+                return Err("pending sidecar snapshot was superseded".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskMetadataIdentity {
+    byte_len: u64,
+    modified_unix_nanos: i64,
+}
+
+fn disk_metadata_identity(metadata: &std::fs::Metadata) -> Result<DiskMetadataIdentity, String> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("sidecar modified time is unavailable: {error}"))?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("sidecar modified time predates UNIX epoch: {error}"))?
+        .as_nanos();
+    let modified_unix_nanos = i64::try_from(nanos)
+        .map_err(|_| "sidecar modified time does not fit the sync marker".to_string())?;
+    Ok(DiskMetadataIdentity {
+        byte_len: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
 /// 実ファイル (フォルダ直下のメディア/コンテナ) のサイドカー相対キー。
 /// `App::sidecar_relative_key` の Image 系と `tag_write_worker` のタグバックアップが
 /// **同じ導出式を共有する** — 式が割れると同じ `.dat` 内でフィールドごとにキーが
@@ -206,6 +410,143 @@ impl SidecarFile {
     /// そちらを返す**。これが無いと、フォルダを離れて戻るだけで直前の編集が消えて見える。
     pub fn load(folder: &Path) -> Self {
         Self::load_from(folder, &writer().state)
+    }
+
+    /// Load a sidecar for central-DB import without collapsing terminal states.
+    ///
+    /// Pending writer data wins over disk, exactly as it does for [`Self::load`].
+    /// A pending snapshot has no durable disk identity, so callers may import it
+    /// but must leave the disk sync marker unchanged.
+    pub fn load_for_import(folder: &Path) -> SidecarImportLoad {
+        Self::load_for_import_from(folder, &writer().state)
+    }
+
+    fn load_for_import_from(folder: &Path, writer: &WriterState) -> SidecarImportLoad {
+        let folder_key = crate::adjustment_db::normalize_path(folder);
+        let pending = match writer.pending_import_snapshot(folder) {
+            Ok(pending) => pending,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        };
+        if let Some(pending) = pending {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.items = pending.items;
+            return SidecarImportLoad::Loaded(LoadedSidecarImport {
+                sidecar,
+                source: SidecarImportSource::PendingWriter {
+                    folder_key,
+                    sequence: pending.sequence,
+                    kind: pending.kind,
+                },
+            });
+        }
+        match writer.is_failed_for_import(folder) {
+            Ok(false) => {}
+            Ok(true) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::WriterFailed { sidecar };
+            }
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        }
+
+        let path = folder.join(SIDECAR_FILENAME);
+        let before = match std::fs::metadata(&path) {
+            Ok(metadata) => match disk_metadata_identity(&metadata) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let mut sidecar = Self::new(folder.to_path_buf());
+                    sidecar.disabled = true;
+                    return SidecarImportLoad::Unreadable { sidecar, error };
+                }
+            },
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SidecarImportLoad::Missing {
+                    sidecar: Self::new(folder.to_path_buf()),
+                };
+            }
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+        let after = match std::fs::metadata(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|metadata| disk_metadata_identity(&metadata))
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        };
+        if before != after || after.byte_len != data.len() as u64 {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.disabled = true;
+            return SidecarImportLoad::ChangedDuringRead { sidecar };
+        }
+
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let legacy_before = local_adjust_core::mask_codec::legacy_decode_count();
+        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
+        let parsed: SidecarJson = match serde_json::from_slice(&data) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Corrupt {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+        if parsed.version > CURRENT_VERSION {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.disabled = true;
+            return SidecarImportLoad::UnsupportedVersion {
+                sidecar,
+                version: parsed.version,
+            };
+        }
+
+        let mut sidecar = Self::new(folder.to_path_buf());
+        sidecar.items = parsed.items;
+        if local_adjust_core::mask_codec::legacy_decode_count() != legacy_before {
+            sidecar.mark_dirty();
+        }
+        SidecarImportLoad::Loaded(LoadedSidecarImport {
+            sidecar,
+            source: SidecarImportSource::Disk(SidecarDiskToken {
+                folder_key,
+                byte_len: before.byte_len,
+                modified_unix_nanos: before.modified_unix_nanos,
+                sha256: digest,
+            }),
+        })
     }
 
     /// [`SidecarFile::load`] の実体。writer を明示的に渡すのはテストのためだけで、
@@ -591,6 +932,12 @@ struct QueuedWrite {
     request: WriteRequest,
 }
 
+struct PendingImportSnapshot {
+    sequence: u64,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
+    kind: PendingWriterKind,
+}
+
 /// サイドカーの書き出しを 1 本のスレッドへ集約する。
 ///
 /// **プロセス内で 1 つだけ**存在する。読み手が pending を必ず見られることが
@@ -694,11 +1041,43 @@ impl WriterState {
         }
     }
 
+    /// Strict snapshot lookup for the import engine.  Unlike the forgiving UI
+    /// lookup, lock poisoning is a terminal error instead of being collapsed to
+    /// "nothing pending" and falling through to possibly stale disk bytes.
+    fn pending_import_snapshot(
+        &self,
+        folder: &Path,
+    ) -> Result<Option<PendingImportSnapshot>, String> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "sidecar writer pending state is unavailable".to_string())?;
+        let Some(queued) = pending.get(folder) else {
+            return Ok(None);
+        };
+        let (items, kind) = match &queued.request {
+            WriteRequest::Write(items) => (Arc::clone(items), PendingWriterKind::Write),
+            WriteRequest::Remove => (Arc::new(BTreeMap::new()), PendingWriterKind::Remove),
+        };
+        Ok(Some(PendingImportSnapshot {
+            sequence: queued.seq,
+            items,
+            kind,
+        }))
+    }
+
     fn is_failed(&self, folder: &Path) -> bool {
         self.failed
             .lock()
             .map(|failed| failed.contains(folder))
             .unwrap_or(false)
+    }
+
+    fn is_failed_for_import(&self, folder: &Path) -> Result<bool, String> {
+        self.failed
+            .lock()
+            .map(|failed| failed.contains(folder))
+            .map_err(|_| "sidecar writer failure state is unavailable".to_string())
     }
 
     fn write_one(&self, folder: &Path) {
@@ -1171,6 +1550,178 @@ mod tests {
             original,
             "corrupt sidecar must not be overwritten while disabled"
         );
+    }
+
+    #[test]
+    fn sidecar_import_load_keeps_disk_identity_and_terminal_states_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = SidecarFile::load_for_import(dir.path());
+        assert!(matches!(missing, SidecarImportLoad::Missing { .. }));
+
+        let path = dir.path().join(SIDECAR_FILENAME);
+        let bytes = br#"{"version":1,"items":{}}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("valid disk sidecar must produce a disk token");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        let SidecarImportSource::Disk(token) = source else {
+            panic!("valid disk sidecar must produce a disk token");
+        };
+        assert!(sidecar.items().is_empty());
+        assert_eq!(token.byte_len, bytes.len() as u64);
+        assert_eq!(token.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        assert_eq!(
+            token.folder_key,
+            crate::adjustment_db::normalize_path(dir.path())
+        );
+
+        std::fs::write(&path, b"not json").unwrap();
+        let corrupt = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::Corrupt { sidecar, .. } = corrupt else {
+            panic!("invalid JSON must remain distinguishable");
+        };
+        assert!(sidecar.disabled);
+
+        std::fs::write(&path, br#"{"version":999,"items":{}}"#).unwrap();
+        let future = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::UnsupportedVersion { sidecar, version } = future else {
+            panic!("future schema must remain distinguishable");
+        };
+        assert_eq!(version, 999);
+        assert!(sidecar.disabled);
+    }
+
+    #[test]
+    fn sidecar_import_pending_snapshot_has_no_disk_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        let mut items = BTreeMap::new();
+        items.insert("a.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(items)),
+        );
+
+        let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("pending writer snapshot must win over disk");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        let SidecarImportSource::PendingWriter {
+            folder_key,
+            sequence,
+            kind,
+        } = &source
+        else {
+            panic!("pending writer snapshot must produce a writer token");
+        };
+        assert_eq!(*sequence, 0);
+        assert_eq!(*kind, PendingWriterKind::Write);
+        assert_eq!(
+            folder_key,
+            &crate::adjustment_db::normalize_path(dir.path())
+        );
+        assert_eq!(sidecar.items().len(), 1);
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_ok());
+
+        let mut replacement = BTreeMap::new();
+        replacement.insert("b.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(replacement)),
+        );
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
+    }
+
+    #[test]
+    fn sidecar_import_pending_remove_remains_current_until_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
+
+        let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("pending remove must be represented as a current empty snapshot");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        assert!(sidecar.items().is_empty());
+        assert!(matches!(
+            &source,
+            SidecarImportSource::PendingWriter {
+                kind: PendingWriterKind::Remove,
+                ..
+            }
+        ));
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_ok());
+
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(BTreeMap::new())),
+        );
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
+    }
+
+    #[test]
+    fn sidecar_import_failed_writer_blocks_stale_disk() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut disk_sidecar = SidecarFile::new(media.path().to_path_buf());
+        disk_sidecar.set_adjust("old.jpg", sample_params());
+        assert!(disk_sidecar.flush_blocking());
+
+        let state = WriterState::default();
+        let mut replacement = BTreeMap::new();
+        replacement.insert("new.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            media.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(replacement)),
+        );
+        state.finish_write(media.path(), 0, false);
+
+        let loaded = SidecarFile::load_for_import_from(media.path(), &state);
+        let SidecarImportLoad::WriterFailed { sidecar } = loaded else {
+            panic!("a failed writer must stop strict import before stale disk is read");
+        };
+        assert!(sidecar.disabled);
+
+        let db = crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+            .unwrap();
+        let key = reconstruct_image_key(media.path(), "old.jpg");
+        assert!(db.get_page_params(&key).is_none());
+        assert_eq!(
+            db.sidecar_sync_get(&crate::adjustment_db::normalize_path(media.path())),
+            None
+        );
+    }
+
+    #[test]
+    fn sidecar_import_fails_closed_when_writer_state_is_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_state = WriterState::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pending_state.pending.lock().unwrap();
+            panic!("poison pending state");
+        }));
+        let SidecarImportLoad::Unreadable { sidecar, .. } =
+            SidecarFile::load_for_import_from(dir.path(), &pending_state)
+        else {
+            panic!("poisoned pending state must fail closed");
+        };
+        assert!(sidecar.disabled);
+
+        let failed_state = WriterState::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = failed_state.failed.lock().unwrap();
+            panic!("poison failed state");
+        }));
+        let SidecarImportLoad::Unreadable { sidecar, .. } =
+            SidecarFile::load_for_import_from(dir.path(), &failed_state)
+        else {
+            panic!("poisoned failure state must fail closed");
+        };
+        assert!(sidecar.disabled);
     }
 
     #[test]

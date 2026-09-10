@@ -53597,6 +53597,8 @@ mod tests {
         let activate = |app: &App| {
             let _ = app
                 .similar_index
+                .as_ref()
+                .expect("test explicitly enables the retained similar service")
                 .query_book(app.similar_panel.book_query_client(), "c:/books/render");
             assert!(matches!(
                 app.similar_panel.book_query_demand_for_test(),
@@ -62476,6 +62478,8 @@ mod tests {
         let chrome = app.capture_fs_navigation_chrome(3);
         let _ = app
             .similar_index
+            .as_ref()
+            .expect("test explicitly enables the retained similar service")
             .query_book(app.similar_panel.book_query_client(), "c:/seek");
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),

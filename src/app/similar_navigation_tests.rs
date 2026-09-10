@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::app::folder_scan::{OmittedFolderEntryCounts, ScanMediaKind};
 use crate::grid_item::{GridItem, ThumbnailState};

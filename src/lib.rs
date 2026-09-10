@@ -213,6 +213,7 @@ pub mod settings_restore;
 pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
+pub mod sidecar_import;
 mod similar_book_engine;
 mod similar_book_mih;
 mod similar_book_query;
@@ -275,7 +276,8 @@ mod ui_main;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
-    draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
+    draw_paused_metadata_panel_snapshot_fixture, draw_similar_panel_snapshot_fixture,
+    draw_similar_states_snapshot_fixture,
 };
 pub mod ui_music_panels;
 pub mod ui_music_spectrum;

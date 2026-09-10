@@ -3031,7 +3031,10 @@ impl App {
     }
 
     /// Poll only the viewer-owned Similar preview workers without mounting parked contexts.
-    pub(crate) fn poll_similar_preview_workers_in_all_contexts(&mut self, ctx: &egui::Context) {
+    pub(in crate::app) fn poll_similar_preview_workers_in_all_contexts(
+        &mut self,
+        ctx: &egui::Context,
+    ) {
         let passwords = self.pdf_passwords.clone();
         self.similar_panel.preview.poll_background(ctx, &passwords);
         for id in self.viewer_contexts.table.other_ids() {

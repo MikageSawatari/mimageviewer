@@ -267,7 +267,7 @@ impl IndexerManager {
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
         excluded_roots: Vec<std::path::PathBuf>,
-        similar_notifier: crate::similar_index::SimilarIndexNotifier,
+        similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         let data_dir = crate::data_dir::get();
@@ -283,7 +283,7 @@ impl IndexerManager {
             speed,
             activity_gate,
             excluded_roots,
-            Some(similar_notifier),
+            similar_notifier,
             progress,
         )
     }
@@ -423,6 +423,12 @@ impl IndexerManager {
     /// **UI スレッドから呼ぶ時の注意**: 停止対象には先に cancel を通知し、join は専用
     /// thread に逃がす。お気に入り編集画面の即時トグルから呼んでも待たない。
     pub fn sync_with_favorites(&mut self, favorites: &[FavoriteEntry]) {
+        // Notifier presence is the typed bridge from the optional similar-index service.  Use the
+        // same derived value everywhere below so a saved similar-only flag cannot create an empty
+        // watcher when that service is paused.
+        let effective_similar = |favorite: &FavoriteEntry| {
+            self.similar_notifier.is_some() && favorite.auto_index_similar
+        };
         // path 変更の検出は favorite_info 更新 **前** に行う (旧 path と比較するため)
         let config_changed: std::collections::HashSet<Uuid> = favorites
             .iter()
@@ -430,7 +436,7 @@ impl IndexerManager {
                 let (_, old_path, old_metadata, old_similar) = self.favorite_info.get(&f.id)?;
                 if old_path != &f.path
                     || *old_metadata != f.auto_index_metadata
-                    || *old_similar != f.auto_index_similar
+                    || *old_similar != effective_similar(f)
                 {
                     Some(f.id)
                 } else {
@@ -448,7 +454,7 @@ impl IndexerManager {
                     f.name.clone(),
                     f.path.clone(),
                     f.auto_index_metadata,
-                    f.auto_index_similar,
+                    effective_similar(f),
                 ),
             );
         }
@@ -456,7 +462,7 @@ impl IndexerManager {
         // 削除 / OFF 化 / **path 変更** されたものを drop 対象に含める
         let current_on_ids: std::collections::HashSet<Uuid> = favorites
             .iter()
-            .filter(|f| f.auto_index_metadata || f.auto_index_similar)
+            .filter(|f| f.auto_index_metadata || effective_similar(f))
             .map(|f| f.id)
             .collect();
         let to_stop: Vec<Uuid> = self
@@ -514,7 +520,8 @@ impl IndexerManager {
 
         // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)
         for f in favorites {
-            if !f.auto_index_metadata && !f.auto_index_similar {
+            let similar_enabled = effective_similar(f);
+            if !f.auto_index_metadata && !similar_enabled {
                 continue;
             }
             if self.supervisors.contains_key(&f.id) {
@@ -526,7 +533,7 @@ impl IndexerManager {
                     favorite_root: f.path.clone(),
                     excluded_roots: self.excluded_roots.clone(),
                     enable_metadata_index: f.auto_index_metadata,
-                    similar_notifier: if f.auto_index_similar {
+                    similar_notifier: if similar_enabled {
                         self.similar_notifier.clone()
                     } else {
                         None
@@ -937,6 +944,44 @@ mod tests {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());
         fav.auto_index_metadata = metadata;
         fav
+    }
+
+    #[test]
+    fn constructor_without_similar_bridge_ignores_saved_similar_flag_but_keeps_metadata_watcher() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let similar_db_path = crate::similar_db::SimilarDb::db_path_at(tmp.path());
+        let similar_base_path = crate::similar_search_array::base_path(tmp.path());
+        let db_sentinel = b"paused-invalid-similar-db";
+        let base_sentinel = b"paused-invalid-similar-base";
+        std::fs::write(&similar_db_path, db_sentinel).unwrap();
+        std::fs::write(&similar_base_path, base_sentinel).unwrap();
+        let mut favorite = mk_fav("paused", &root, false);
+        favorite.auto_index_similar = true;
+
+        let mut manager = IndexerManager::new_at(
+            tmp.path(),
+            &[favorite.clone()],
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            Vec::new(),
+        )
+        .expect("ordinary metadata stores still initialize");
+
+        assert_eq!(manager.supervisor_count(), 0);
+        assert_eq!(std::fs::read(&similar_db_path).unwrap(), db_sentinel);
+        assert_eq!(std::fs::read(&similar_base_path).unwrap(), base_sentinel);
+
+        favorite.auto_index_metadata = true;
+        manager.sync_with_favorites(&[favorite]);
+        assert_eq!(
+            manager.supervisor_count(),
+            1,
+            "the ordinary metadata watcher remains available"
+        );
+        assert_eq!(std::fs::read(&similar_db_path).unwrap(), db_sentinel);
+        assert_eq!(std::fs::read(&similar_base_path).unwrap(), base_sentinel);
     }
 
     // run_reconciliation の単体テスト。IndexerManager::new は APPDATA に

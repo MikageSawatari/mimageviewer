@@ -142,6 +142,7 @@ impl App {
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
+        let mut favorite_removed = false;
         let mut open_cache_creator = false;
         let has_favorites = !self.settings.favorites.is_empty();
         let (safe_rect, dialog_size, min_dialog_size) =
@@ -250,11 +251,17 @@ impl App {
             .iter()
             .map(|(id, h)| (*id, h.snapshot_stats()))
             .collect();
-        let similar_progress = self.similar_index_progress();
-        let similar_summary = self.similar_index.summary();
+        let similar_feature_enabled =
+            favorites_editor_similar_controls_visible(self.similar_feature_capability());
+        let similar_progress = similar_feature_enabled.then(|| self.similar_index_progress());
+        let similar_summary = self
+            .similar_index
+            .as_ref()
+            .filter(|_| similar_feature_enabled)
+            .map(crate::similar_index::SimilarIndexManager::summary);
         if matches!(
             similar_summary,
-            crate::similar_index::IndexSummaryStatus::Preparing
+            Some(crate::similar_index::IndexSummaryStatus::Preparing)
         ) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -425,13 +432,19 @@ impl App {
                     ui.label("お気に入りはまだ登録されていません。");
                     ui.add_space(4.0);
                 } else {
+                    let indexing_description = if similar_feature_enabled {
+                        "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
+                         アイテム検索 (Ctrl+G) と別バージョン検索ができます。\
+                         チェックを入れた項目はこの場で 1 回全走査し、以降は\
+                         ファイルの変更監視と起動時スキャンで自動更新します。"
+                    } else {
+                        "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
+                         アイテム検索 (Ctrl+G) ができます。\
+                         チェックを入れた項目はこの場で 1 回全走査し、以降は\
+                         ファイルの変更監視と起動時スキャンで自動更新します。"
+                    };
                     ui.label(
-                        egui::RichText::new(
-                            "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
-                             アイテム検索 (Ctrl+G) と別バージョン検索ができます。\
-                             チェックを入れた項目はこの場で 1 回全走査し、以降は\
-                             ファイルの変更監視と起動時スキャンで自動更新します。",
-                        )
+                        egui::RichText::new(indexing_description)
                         .weak()
                         .size(11.0),
                     );
@@ -470,12 +483,16 @@ impl App {
                                          ✅ 監視中 = 初期スキャン完了 + ファイルの変更を追従\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
                                         );
-                                    ui.label(egui::RichText::new("別バージョン索引").strong())
+                                    if similar_feature_enabled {
+                                        ui.label(
+                                            egui::RichText::new("別バージョン索引").strong(),
+                                        )
                                         .on_hover_text(
                                             "表示中の画像と同じ絵の別バージョンを検索\n\
                                              ✅ 監視中 = 初回作成完了 + ファイルの変更を追従\n\
                                              ⏳ 作成中 = バックグラウンドで画像を確認中",
                                         );
+                                    }
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
 
@@ -594,26 +611,32 @@ impl App {
                                             );
                                         });
 
-                                        // 別バージョン索引: チェック + 全体 worker の状態。
-                                        ui.horizontal(|ui| {
-                                            let similar_resp = ui.checkbox(
-                                                &mut self.settings.favorites[i].auto_index_similar,
-                                                "",
-                                            );
-                                            if similar_resp.changed() {
-                                                similar_index_toggles.push((
-                                                    fav_path.clone(),
+                                        if similar_feature_enabled {
+                                            // 別バージョン索引: チェック + 全体 worker の状態。
+                                            ui.horizontal(|ui| {
+                                                let similar_resp = ui.checkbox(
+                                                    &mut self.settings.favorites[i]
+                                                        .auto_index_similar,
+                                                    "",
+                                                );
+                                                if similar_resp.changed() {
+                                                    similar_index_toggles.push((
+                                                        fav_path.clone(),
+                                                        self.settings.favorites[i]
+                                                            .auto_index_similar,
+                                                    ));
+                                                    any_setting_dirty = true;
+                                                }
+                                                draw_similar_state_inline(
+                                                    ui,
                                                     self.settings.favorites[i]
                                                         .auto_index_similar,
-                                                ));
-                                                any_setting_dirty = true;
-                                            }
-                                            draw_similar_state_inline(
-                                                ui,
-                                                self.settings.favorites[i].auto_index_similar,
-                                                &similar_progress,
-                                            );
-                                        });
+                                                    similar_progress.as_ref().expect(
+                                                        "enabled similar feature has progress",
+                                                    ),
+                                                );
+                                            });
+                                        }
 
                                         // 操作 (↑ ↓ 削除)
                                         ui.horizontal(|ui| {
@@ -681,21 +704,23 @@ impl App {
                                 }
                             }
                         }
-                        if ui.button("別バージョン 全ON").clicked() {
-                            for f in &mut self.settings.favorites {
-                                if !f.auto_index_similar {
-                                    f.auto_index_similar = true;
-                                    similar_index_toggles.push((f.path.clone(), true));
-                                    any_setting_dirty = true;
+                        if similar_feature_enabled {
+                            if ui.button("別バージョン 全ON").clicked() {
+                                for f in &mut self.settings.favorites {
+                                    if !f.auto_index_similar {
+                                        f.auto_index_similar = true;
+                                        similar_index_toggles.push((f.path.clone(), true));
+                                        any_setting_dirty = true;
+                                    }
                                 }
                             }
-                        }
-                        if ui.button("別バージョン 全OFF").clicked() {
-                            for f in &mut self.settings.favorites {
-                                if f.auto_index_similar {
-                                    f.auto_index_similar = false;
-                                    similar_index_toggles.push((f.path.clone(), false));
-                                    any_setting_dirty = true;
+                            if ui.button("別バージョン 全OFF").clicked() {
+                                for f in &mut self.settings.favorites {
+                                    if f.auto_index_similar {
+                                        f.auto_index_similar = false;
+                                        similar_index_toggles.push((f.path.clone(), false));
+                                        any_setting_dirty = true;
+                                    }
                                 }
                             }
                         }
@@ -749,10 +774,12 @@ impl App {
                             }
                         }
                     }
-                    if let Some(message) =
-                        similar_index_progress_presentation(true, &similar_progress).activity
-                    {
-                        active.push(("別バージョン".to_owned(), message));
+                    if let Some(similar_progress) = similar_progress.as_ref() {
+                        if let Some(message) =
+                            similar_index_progress_presentation(true, similar_progress).activity
+                        {
+                            active.push(("別バージョン".to_owned(), message));
+                        }
                     }
                     // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
                     // 「処理速度 = Σ(各 rate_per_sec)」。各 supervisor のサンプルがまだ
@@ -808,7 +835,11 @@ impl App {
                             draw_background_indexer_activity_row(ui, name, msg);
                         }
                     }
-                    draw_similar_index_summary(ui, &similar_summary, &similar_progress);
+                    if let (Some(summary), Some(progress)) =
+                        (similar_summary.as_ref(), similar_progress.as_ref())
+                    {
+                        draw_similar_index_summary(ui, summary, progress);
+                    }
                     // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
                     // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -868,10 +899,13 @@ impl App {
                                 .weak(),
                         );
                         ui.add_space(8.0);
+                        let removal_description = if similar_feature_enabled {
+                            "コンテナ索引・アイテム索引・別バージョン索引・お気に入り標準設定・記憶した表示状態も解除されます。"
+                        } else {
+                            "コンテナ索引・アイテム索引・お気に入り標準設定・記憶した表示状態も解除されます。"
+                        };
                         ui.label(
-                            egui::RichText::new(
-                                "コンテナ索引・アイテム索引・別バージョン索引・お気に入り標準設定・記憶した表示状態も解除されます。",
-                            )
+                            egui::RichText::new(removal_description)
                             .weak(),
                         );
                         ui.add_space(8.0);
@@ -913,6 +947,7 @@ impl App {
             // 削除対象の favorite の索引データもクリーンアップする。
             // (フラグが OFF なら副作用なしなので害はない。ON→削除でも正しく掃除される。)
             let removed = self.settings.favorites.remove(i);
+            favorite_removed = true;
             if removed.auto_index_structure {
                 name_index_toggles.push((removed.id, removed.path.clone(), false));
             }
@@ -921,7 +956,9 @@ impl App {
             }
             // 旧版で OFF 後に残った行も含め、favorite 自体の削除では常に掃除を要求する。
             // 他の ON favorite と範囲が重なる行は SimilarDb 側が保持する。
-            similar_index_toggles.push((removed.path.clone(), false));
+            if similar_feature_enabled {
+                similar_index_toggles.push((removed.path.clone(), false));
+            }
             // 補正のお気に入り標準も即時に掃除する (次回起動時の prune_favorite_params
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
             // 効いたまま、という不整合を避ける。
@@ -944,6 +981,11 @@ impl App {
         }
         for (path, new_on) in &similar_index_toggles {
             self.apply_favorite_similar_index_change(path, *new_on);
+        }
+        if favorite_removed {
+            // A paused similar-only favorite has no toggle side effect, but the shared metadata
+            // manager still owns the canonical favorite snapshot.
+            self.sync_shared_favorite_indexers();
         }
 
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
@@ -1073,6 +1115,41 @@ fn draw_background_indexer_activity_row(ui: &mut egui::Ui, name: &str, message: 
             .color(ui.visuals().weak_text_color()),
     )
     .on_hover_text(format!("{name}: {message}"));
+}
+
+fn favorites_editor_similar_controls_visible(
+    capability: crate::similar_index::SimilarFeatureCapability,
+) -> bool {
+    capability.is_enabled()
+}
+
+#[cfg(test)]
+mod similar_control_visibility_tests {
+    use super::favorites_editor_similar_controls_visible;
+    use crate::settings::FavoriteEntry;
+    use crate::similar_index::SimilarFeatureCapability;
+    use std::path::PathBuf;
+
+    #[test]
+    fn row_and_bulk_similar_controls_share_capability_without_mutating_saved_value() {
+        let mut favorite = FavoriteEntry::new("before".to_owned(), PathBuf::from(r"C:\saved"));
+        favorite.auto_index_similar = true;
+        let controls_visible =
+            favorites_editor_similar_controls_visible(SimilarFeatureCapability::Paused);
+
+        assert!(
+            !controls_visible,
+            "row and bulk controls are both suppressed"
+        );
+        favorite.name = "after".to_owned();
+        assert!(
+            favorite.auto_index_similar,
+            "editing another visible field preserves the hidden saved flag"
+        );
+        assert!(favorites_editor_similar_controls_visible(
+            SimilarFeatureCapability::Enabled
+        ));
+    }
 }
 
 fn draw_similar_index_summary(

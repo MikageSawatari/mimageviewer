@@ -159,6 +159,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn video_audio_vst (self) -> Option < & 'a VideoAudioVstState >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn vst3_deferred_media_open (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_lanczos_cache (self) -> & 'a crate :: gpu_lanczos :: GpuLanczosCache",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn similar_panel (self) -> & 'a crate :: ui_metadata_panel :: SimilarPanelState",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn selected (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_state (self) -> Option < & 'a BookmarkViewState >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn archive_source_override (self) -> Option < & 'a Path >",
@@ -185,6 +186,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn poll_similar_preview_workers_in_all_contexts (& mut self , ctx : & egui :: Context ,)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",
@@ -1143,9 +1146,10 @@ fn analyze_test_api(
 ) -> Result<Vec<Violation>, String> {
     let file =
         syn::parse_file(source).map_err(|error| format!("cannot parse {path} for A6: {error}"))?;
+    let file_is_test = test_module_file || file.attrs.iter().any(cfg_implies_test_attribute);
     let mut visitor = TestApiVisitor {
         path,
-        cfg_test_depth: usize::from(test_module_file),
+        cfg_test_depth: usize::from(file_is_test),
         functions: Vec::new(),
         violations: Vec::new(),
     };
@@ -2068,6 +2072,23 @@ mod tests {
         "#;
         let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
         assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_honors_test_cfg_on_the_parsed_file_itself() {
+        let body = r#"
+            fn exercises_test_api(app: &mut App) {
+                app.helper_for_test();
+            }
+        "#;
+        for cfg in ["#![cfg(test)]", "#![cfg(all(test, windows))]"] {
+            let source = format!("{cfg}\n{body}");
+            let violations = analyze_test_api("src/fixture.rs", &source, false).unwrap();
+            assert!(!has_rule(&violations, Rule::A6), "{cfg}: {violations:#?}");
+        }
+
+        let violations = analyze_test_api("src/fixture.rs", body, false).unwrap();
+        assert!(has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
     #[test]

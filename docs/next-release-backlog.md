@@ -24,6 +24,283 @@
 ---
 
 ## 1. 優先候補
+### 1.214 チェック件数オーバーレイを半透明にする — 利用者要望 (2026-09-11)
+
+- 出典: 利用者報告 (2026-09-11)。一覧で複数選択したとき右上に出る件数表示が、
+  右上のサムネイルのチェックを隠してしまう。「選択中は背景色が変わるので判別は付くが、
+  隠れるのが気になる」。
+- **一関数で済む (確認済み)。** [ui_main.rs:195](../src/ui_main.rs:195) の
+  `checked_selection_overlay_fill` が `Color32::from_rgb` を返しているだけなので、
+  `from_rgba_unmultiplied` にして alpha を入れる。描画側は
+  [`show_checked_selection_overlay`](../src/ui_main.rs:205) の `Frame::popup().fill(...)` が
+  この値をそのまま使う。
+- **決めること**: alpha 値。文字 (`warn_fg_color`) と枠線の可読性を保つ範囲で選ぶ。
+  light / dark で別の色を返しているので、両方で見る。
+- 回帰確認: light / dark 双方で件数と「選択解除」ボタンが読めること。
+  下のサムネイルのチェックマークが透けて見えること。UI スナップショットの更新が要るなら
+  [ui-snapshot-policy.md](ui-snapshot-policy.md) に従う。
+- 規模 / 優先度: Small / P3。
+
+### 1.213 通常動画のナビゲーターを出せるか — 描画経路が静止画と違う (2026-09-11)
+
+- 出典: 利用者要望 (2026-09-11)。v3.7.0 の通常動画ズームを使ってみて、静止画のナビゲーター
+  (拡大中に全体と現在位置を示す小窓) が動画にも欲しくなった。「負荷が高くなりそうですかね？」
+- **利用者が心配していた「OS 側で拡大する設定があるから重ねられないのでは」は当たらない (確認済み)。**
+  ズーム中は OS 任せの設定が自動的に上書きされる:
+
+  ```rust
+  fn effective_video_scale_filter(filter: VideoScaleFilter, video_zoom_active: bool) -> VideoScaleFilter {
+      if video_zoom_active && filter == VideoScaleFilter::OsDefault {
+          VideoScaleFilter::Standard
+  ```
+  ([render_core.rs:2104](../src/video/native_presenter/render_core.rs:2104))
+
+  サーフェスも表示領域全体を取る (`full_display_region = panorama_active || video_zoom_active`、
+  [surface_policy.rs:177](../src/video/native_presenter/surface_policy.rs:177))。
+  テスト `video_zoom_uses_the_full_display_region_even_with_os_default` あり。
+  **ズーム中は必ず mIV のシェーダが表示領域いっぱいのサーフェスへ解決している。**
+
+- **本当の論点は「どこに描くか」。**
+  - **presenter (D3D11) 側**: フレームは既に手元にあるので、いま拡大表示で出している矩形の
+    隣にもう 1 枚描くだけ。**毎フレームのコストは小さい見込み**。ただし静止画のナビは egui 実装
+    (`fs_navigator_*` 群、[ui_fullscreen.rs:2356](../src/ui_fullscreen.rs:2356) 以降) なので、
+    枠・ドラッグ・表示根拠 (Fixed / Hold) を**別実装で作り直す**ことになる
+  - **egui overlay 側**: UI はそのまま使えるが、**動画のフレームは egui のテクスチャではない**。
+    毎フレーム渡す経路が要る。**安くない**
+- **未確認**: presenter 側に描いた場合の実コスト。上は構造からの見込みで、測っていない。
+- **関連**: §1.200 (一時表示ナビゲーターの未開始クリックが消える) は静止画側の既知の不具合。
+  動画へ広げるなら、その所有境界の整理を先に済ませたほうがよい。
+- 規模 / 優先度: Medium / P3。**どちらに描くかを決めるまで見積もらない。**
+
+### 1.212 通常動画をウィンドウより小さく縮小できない — 見送り判断の記録 (2026-09-11)
+
+- 出典: 利用者要望 (2026-09-11)。静止画はウィンドウより小さくできるが、動画は画面に
+  合わせた状態が下限になっている。「画像と同じようにできると不都合が出ますか」。
+- **方針 (2026-09-11 利用者判断): 見送る。** 静止画と動きが揃うこと以外に用途を思いつかず、
+  必要な場面が出てから判断する。**安いことと要ることは別**という整理。
+- **ただし「複雑になるから」ではない。以下は確認済み。**
+  - 止めているのは `VIDEO_ZOOM_MIN_SCALE = 1.0` ([zoom_view.rs:8](../src/video/zoom_view.rs:8))
+    だけで、使用は 2 か所 ([:154](../src/video/zoom_view.rs:154) の clamp、
+    [:244](../src/video/zoom_view.rs:244) の guard)
+  - **映像より広い範囲を指して外側を黒で埋める経路は既にある。**doc に明記
+    ([:57](../src/video/zoom_view.rs:57)): 「At fit scale one extent can exceed the encoded image
+    and its origin becomes negative. Those coordinates deliberately describe letterbox pixels;
+    the resolver returns black outside the source」。**等倍でも毎回この経路を通っている**
+    (縦横比が違えば必ず letterbox になるため)
+  - パンも既に正しい。`clamped_source_center` は `extent >= source_axis` のとき軸を中央固定
+    ([:226](../src/video/zoom_view.rs:226))。縮小時に欲しい挙動そのもの
+  - つまり作業は「下限定数を下げる」「下限値を決める」「リセット時の初期値と極端に小さい倍率での
+    縮小フィルタを確認する」程度。**Small**
+- やるときに決めること: 下限値。極端な縮小での見た目 (背景の面積) をどこまで許すか。
+- 規模 / 優先度: Small / P3 (**現時点では実施しない**)。
+
+### 1.211 全体表示のサムネイルストリップが中央半分の幅になる — 再現待ち (2026-09-11)
+
+**利用者報告のみ。開発機で再現できていない。原因も特定できていない。**
+
+- 出典: 利用者報告 (2026-09-11)。「シークバーを固定解除状態で、サムネイルシークバー (全体) の
+  場合に、シークバーの表示/非表示をカーソルを動かして試していると、たまにまたサムネイル
+  シークバーのサムネイルが中央半分くらいの幅だけになることがあります」。
+- **報告が 2 通りに読める。**利用者へ切り分けを質問済み (2026-09-11)。
+  - (a) 枠は端まで並んでいて、**絵が入っているのが中央の半分だけ** → §1.189 と同じ形。
+    修正しきれていない経路が残っていることになる
+  - (b) **枠の列そのものが中央に寄っている** → 軸とレイアウトの食い違い
+  「**また**」と書かれているので (a) の可能性がある。
+- **操作は標準の自動出入り。**固定を外すと下部シークバーはカーソルで出入りする
+  ([seek_strip.rs:924](../src/video/seek_strip.rs:924) の `HudHidden` 参照)。§1.146 で扱った
+  「HUD が隠れてもストリップを保持する」経路を通る。
+
+#### コードから確認できたこと (原因ではなく、除外できた説明)
+
+- **セル幅は必ず帯の全幅を割る。**`cell_width: rect.width() / count as f32`
+  ([seek_strip_layout.rs:470](../src/video/seek_strip_layout.rs:470))。
+  **枚数がいくつでもレイアウト上は端まで埋まる**ので、(b) が起きるとしたら
+  「軸の枚数 < レイアウトの枚数」の食い違いしかない (軸の枚数ぶんしか描かず、中心は
+  `cell_count/2` に固定されるので中央に寄る)
+- **枚数は帯の「高さ」由来。**`ideal_width = cell_height * aspect`
+  ([:505](../src/video/seek_strip_layout.rs:505))。`cell_height` は `rect.height()` から来る。
+  **高さが小さいと枚数は増える**ので、「出入り途中の小さい値で枚数が減る」という説明は
+  方向が逆で成り立たない
+- **0 領域には既にガードがある。**幅か高さが 0 以下のフレームでは要求キーを捨てて作り直す
+  ([render_core.rs:978](../src/video/native_presenter/render_core.rs:978))。
+  素直な経路は塞がれている
+
+#### 次にやること
+
+1. 利用者の回答で (a) / (b) を確定する
+2. (a) なら §1.189 / §1.186 の残り経路を疑う。(b) なら
+   `rebuild_whole_axis_if_needed` ([native_video.rs:389](../src/app/native_video.rs:389)) の
+   `visible_count` と、presenter 側の要求 dedup (`last_window_request`) の寿命差を見る
+3. **推測で直さない。**再現するまで実装に入らない
+
+- 規模 / 優先度: 不明 / P2 (再現待ち)。
+
+### 1.210 右クリックメニューが、閉じた後の左クリックで出直して抜けられない — 再現条件確定 (2026-09-11)
+
+**P1。操作不能になる。** 出典: 利用者報告 (2026-09-11) と開発機での再現確認。
+
+#### 再現条件 (確定)
+
+**操作カスタマイズ → 設定 > 右ドラッグ・右クリック** で、画像フルスクリーンが
+
+- 右クリック短押し = **右クリックメニューを表示**
+- 右ドラッグ = **未使用**
+
+の組み合わせのときだけ起きる。**右ドラッグをリングショートカットにすると回避できる** (利用者へ暫定回避として案内済み)。
+
+#### 症状
+
+メニューを出した後、**メニュー外を左クリックすると同じ場所にメニューが出直す**。
+繰り返すため、メニューをやめられない。フルスクリーンを閉じると解除される。
+
+#### 原因 (コードから確定した部分)
+
+**この経路は `RightDragMode::Disabled | Unknown(_)` の arm だけが持つ**
+([ui_fullscreen.rs:31688](../src/ui_fullscreen.rs:31688))。`RingShortcut` / `MouseGesture` の
+arm は `MouseFlickOutcome` の recognizer を通し、**`fs_secondary_press_start` に触らない**。
+リングにすると回避できる理由がこれで、**同じ「短押し / 長押し」の判定が 2 通りに実装されている**。
+
+`Disabled` arm は **level から event を作っている** ([:31695](../src/ui_fullscreen.rs:31695)):
+
+```rust
+} else if secondary_down && self.fs_secondary_press_start.is_none() {
+    // 押下開始を記録
+    self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
+}
+```
+
+press / release の **edge ではなく、`secondary_down` が真であるフレーム**で武装する。
+そして `secondary_down` は egui の pointer 状態
+([:31491](../src/ui_fullscreen.rs:31491) の `ctx.input(|i| i.pointer.secondary_down())`) で、
+OS 直読みではない。
+
+メニュー表示中はステートマシンごと止まる
+([:31611](../src/ui_fullscreen.rs:31611) の `fs_context_menu_idx.is_none()` ガード) ので、
+**閉じた直後のフレームで再武装する**。400ms 後に `current_pos` でメニューを開く
+([:31701](../src/ui_fullscreen.rs:31701)〜) ため、**位置がクリック地点になる**。
+フルスクリーンを閉じると `fs_secondary_press_start` がクリアされる
+([app.rs:55419](../src/app.rs:55419)) ので、そこで抜けられる。症状の 3 点すべてと一致する。
+
+メニューは Win32 `TrackPopupMenuEx` ([native_context_menu.rs:558](../src/native_context_menu.rs:558))。
+**「TrackPopupMenuEx を閉じたクリックは presenter の queue に遅れて届く」**という既知の
+コメントが動画側にある ([native_video.rs:13944](../src/app/native_video.rs:13944))。
+**静止画側には対応する扱いが無い。**
+
+#### 未確認
+
+`secondary_down` が真のままになる理由。Win32 メニューの modal loop 中に egui が release を
+取りこぼしているのが最有力だが、**測っていない**。`MIV_DETACHED_WINDOW_DEBUG=1` で起動すると
+`[detached-window-debug] right_drag_probe` 行に `secondary_down / secondary_pressed /
+secondary_released / context_menu` が出るので、**press に対応する release が来ているか**で判る。
+直す前に 1 回見ておくと、level → edge の修正が本当に効く経路か確定できる。
+
+#### 対応
+
+- **level ではなく edge で武装する。** `secondary_pressed` を起点にし、`secondary_down` は
+  継続判定にだけ使う。stale な level から新しい押下を捏造しない
+- できれば **3 つの arm を同じ recognizer へ寄せる**。「短押し / 長押し / ドラッグ」という
+  同じ問いに 2 つの実装がある状態そのものが原因なので、片方だけ直すと次も同じ形で出る
+- **症状パッチを入れない。** 「メニューを閉じた後 N ミリ秒は武装しない」のような時間任せの
+  抑止は、原因 (level から event を作っている) に対応していない
+
+#### 回帰確認
+
+- 右ドラッグ = 未使用 の設定で、メニュー → メニュー外を左クリック → **閉じるだけ**
+- 同設定で、長押しメニューと短押しアクションが**両方とも従来どおり**動く
+- 右ドラッグ = リングショートカット / マウスジェスチャの既存挙動が変わらない
+- 動画フルスクリーン側のメニュー経路 ([native_video.rs:13818](../src/app/native_video.rs:13818) /
+  [:14111](../src/app/native_video.rs:14111)) に影響しない
+- 編集モード中 (`RightDragContext::EditMode`) の早期 return が生きている
+
+#### 実装 (2026-09-11、自動検証済み・実機未検証)
+
+旧 `fs_secondary_press_start` を、押下 edge だけで武装する typed
+`FullscreenSecondaryPress` に置き換えた。owner は `ViewerContextId`、items generation、対象
+index、`RightDragContext` を一体で保持し、同じ index を表示する別 window が状態を消費できない。
+`secondary_down` は武装後の生存判定にだけ使い、release が欠けた `down=false`、移動、modal、
+Edit、mode / owner 変更を terminal とする。短押し / 長押しの既存 action と閾値は維持する。
+
+状態は `ViewerContextBundle` が所有する。通常の detached mount → deposit → remount は同じ
+owner の押下を保つ一方、LiveMedia fork、別 index の open、close、snapshot index-space 置換では
+退役させる。これにより F12 window の複数 frame にまたがる短押し / 長押しを維持しながら、
+sibling context への誤帰属を防ぐ。pure reducer、ordinary detached roundtrip、sibling 分離、fork /
+snapshot terminal の回帰を追加した。焦点9件・全体gate・独立レビュー・確認用buildは成功。
+portable実機確認は§1.208の操作ツール画像取得が応答しないため中止し、本件の実入力は未実施。
+修正済みとして出荷判断する前に、短右クリック→外側左クリックでメニューが再出現しないことと、
+長押し・F12別窓の操作を実機で確認する。
+
+- 規模 / 優先度: Small / **P1**。
+
+### 1.209 サイドカーの取り込みが UI スレッドを数十秒止める (2026-09-11)
+
+**P1。v3.8.0 のポータブル smoke で発見。出荷済みの既存不具合で、v3.8.0 の退行ではない。**
+データベースが空の状態で `mimageviewer.dat` のあるフォルダを初めて開くと、取り込みが終わるまで
+アプリ全体が固まる。実測では 430 件 (adjust 379 / mask 40 / local-adjust 7 / crop 1 / comic 3) の
+取り込みに **約 47 秒**かかり、その間 `App::update` の heartbeat が止まって panic.log へ
+`UI THREAD HANG suspected: no App::update heartbeat for 45955ms` が記録された。
+
+`load_folder` から `App::import_sidecar_to_dbs` を同期呼び出ししている
+([src/app.rs](../src/app.rs) の `sli_sidecar_import` 直前)。`[SLOW FRAME] 47169.9ms` の内訳は
+poll/keep/pre_grid/grid がすべて 0 で、`load_folder` 自体が時間を使っている。
+
+取り込み済みのデータベースでは no-op になるため通常環境では気づきにくく、新規 data ディレクトリ
+(ポータブル版の初回、新規インストール、data-dir 隔離起動) で必ず出る。1 件あたり約 110 ms は
+1 件ごとのコミットを疑わせるので、worker 化と併せて取り込み側のトランザクション粒度も確認する。
+
+対応方針は [UI 応答性](ui-responsiveness.md) §2 の worker 化テンプレに従う。キャンセル、
+結果適用時の世代整合、1 フレーム予算、perf 計装を揃える。証跡は v3.8.0 公開時の
+ポータブル smoke ログ (`D:\mImageViewer_portable_v3.8.0\data\logs\`)。
+
+**進捗 (2026-09-11): Stage 1のみ完了、UI停止は未修正。** `5db8df1ee`でUI未配線の
+transactional import engineを記録。lib 17件・integration 14件・独立検収を通過し、
+合成430 fieldは読み込み込み36.617 ms、edit familyは1 transaction/1 commitだった。
+Appへの非同期配線は、同時編集を失わない書込調整とviewer continuationが必要で最低22 source
+file・20〜35時間の見込み。範囲拡大を利用者へ確認中で、返答までは組み込まない。
+詳細は [非同期化設計](sidecar-import-async-plan.md)。
+
+### 1.208 動画フルスクリーンで音声モードへ切り替えると再生が終了する (2026-09-11)
+
+**P1。v3.8.0 のポータブル smoke で発見。出荷済みの既存不具合で、v3.8.0 の退行ではない。**
+動画をフルスクリーン表示中に HUD の ♪ ボタンで音声モードへ切り替えると、再生が止まって
+フルスクリーンも閉じる。ウィンドウ内表示 (MainWindow) では再生が続き、正常に復帰できる。
+
+**VST3 を有効にしていない場合だけ発生する。** 利用者の通常環境は VST3 が ON のため再現せず、
+VST3 を同梱しないポータブル版で必ず再現した。`vst3_enabled` の既定は false なので、
+**既定設定のインストーラ版でも同じ条件が成立する**。
+
+根因は [src/app/native_video.rs](../src/app/native_video.rs) の
+`native_video_presenter_hwnd_for_focus_guard`。音声モード中は presenter を hide するため、
+`video_audio_mode.is_some() && video_audio_vst.is_none()` で「前面 native presenter なし」と
+報告する。VST 表示中は presenter を un-hide するのでこの early-return を通らない。
+フルスクリーン presentation ではこの false が main フォーカスガードの
+`should_close_fullscreen_from_main_focus` を成立させ、`close_fullscreen()` がセッションごと
+終了させる。ポータブル smoke のログに順序が残っている。
+
+```
+132.655  [video-audio] enter result ... outcome=entered
+132.717  [native-video] window hidden: hwnd=0x2c2020
+132.720  fullscreen: main focus guard closing session presentation=Fullscreen
+132.726  [decoder-lifecycle] video-decode thread exit: live_count=0
+132.745  [native-video] fullscreen presenter stopped
+```
+
+この early-return は `757d4d127` (2026-07-05、音楽機能の video->audio モード) で入り v2.3.0 から
+出荷済み。`should_close_fullscreen_from_main_focus` 本体は v3.7.0 から無変更。
+
+述語を 1 つ直して済ませず、音声モードで presenter を hide する各 presentation
+(MainWindow / Fullscreen / detached / 複数ウィンドウ) でフォーカスガードの入力が何になるかを
+列挙してから修正する。VST の有無で分岐している現状は、同じ「presenter は隠れているが
+セッションは生きている」状態を 2 通りに扱っているので、状態の表し方から見直す。
+回帰は presentation ごとに音声モードの enter / exit と再生継続を検証する。
+
+**進捗 (2026-09-11): 実装・自動検証済み、実機未検証。** 上記は調査時の経路。
+修正ではtyped runtimeが音声viewportへの入力所有権移行を持ち、既存の一度限りの
+Visible/Focus要求に対する `Some(true)` を確認してからpresenterを隠す。窓のpark移送、
+取消、VST切替、動画復帰も同じownerへ対応させ、独立検収と全体gateを通過した。
+確認用normal/portable buildも成功。実機初回は操作前のharness条件不成立で終了し、
+操作ツールの画像取得も応答しなかった。♪・Zの実入力は0件であり、再生継続の実機合格とはしない。
+VSTありの実機経路も未検証。証跡の所在は [優先作業台帳](post-v3.8.0-priority-work.md) を参照。
+
 ### 1.207 フォルダバーをツールバーの並べ替え対象へ統合する — 外部SNS要望 (2026-09-10)
 
 - 出典: X 上の「フォルダバーを他のツールバーと同じ列に表示したい」という要望。

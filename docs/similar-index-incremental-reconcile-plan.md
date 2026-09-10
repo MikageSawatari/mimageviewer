@@ -4,7 +4,7 @@
 
 第一段階は `98dc41f4b`、第二段階の DB 読み取り削減は `aea120cf6`、進捗 UI の検証整備は `efa6f7ba2` に保存した。各独立レビュー、狭域回帰、合成 DB 4,627,166 行・キー長 80/120 UTF-8 bytes の AB/BA、進捗 snapshot、共有全体 gate、normal 確認 build は成功した。新方式の sampled peak Private Bytes は約 921/1,137 MiB。親は旧方式の peak より小さいことと「1 GB くらい」という目安を踏まえ、実アプリ全体の未測定という限界を残して現 inventory 表現の採用を承認した。追加 memory redesign/benchmark は行わない。アプリ起動・実機確認は未実施で、機能の再有効化や master 統合、リリース完了ではない。
 作業は `codex/similar-index-incremental-reconcile`、基点は `77a6f270e`。
-master の休止版 `3f5481c14` は取り込まない。統合・再有効化・リリースは別判断とし、後の統合では `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
+最初の検証までは master の休止版を取り込まず、その後の親の明示指示で確定済み `aa034d578`（休止版 `3f5481c14` を含む）の統合を開始した。master 作業ツリーの未コミット差分は取り込まない。master への逆方向の統合・再有効化・リリースは別判断とし、今回も `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
 
 設計・進行は親、実装・テストは implement_resume、独立レビューは review_resume。
 実装とレビューは別の Sol / xhigh 担当。ソース・テストは実装担当だけが編集し、本書と README は親が編集する。
@@ -311,3 +311,25 @@ root もログを確認。証跡は `target/similar-index-incremental-final-gate
 同 final-gate artifact の `build-dev.preflight.txt` / `.stdout.log` / `.stderr.log` / `.exit.txt` / `.result.json` に実行条件と結果を保存した。終了後 staged core/remote resident と cargo/rustc/link は 0。エージェントはアプリを起動せず、本番 DB/APPDATA を操作していない。
 
 残件は実機での進捗・監視収束・取消・操作応答確認、実アプリ全体 peak の未測定という限界、および親での休止版との統合・再有効化判断。全体 gate と確認 build は完了しており、再有効化や実機確認の成功とは扱わない。利用者が通常 profile で確認する場合のコマンドは、repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため、installed/tray 常駐版を先に終了する。今回このコマンドをエージェントは実行していない。
+
+## 確定 master との休止維持統合
+
+親から次の一まとまりとして、clean な `b7102a53a` へ master の確定済み `aa034d57847f7f859fb34e51823ea1d5d4be667b` だけを取り込む指示を受領した。merge-base は `77a6f270e`。master 作業ツリーを編集せず、未コミットの §1.208/§1.210 は対象外。実装と独立レビューは別の Sol / xhigh。既知の性能測定は再実行しない。
+
+採用契約は `PRODUCT_SIMILAR_FEATURE_CAPABILITY=Paused` と App の `Option<SimilarIndexManager>` を実行時の単一正本として維持すること。None では類似 configure・purge・password revision refresh・watch bootstrap・prefill・query を開始せず、保存設定・類似 DB/検索配列を休止のために変更しない。共有 IndexerManager は Option notifier から effective similar flag を導き、通常 metadata/名前索引と watcher は維持する。Enabled を明示したテスト経路は新しい Full/Delta と進捗 mapper を使う。
+
+`git merge --no-commit --no-ff aa034d578` の競合は `src/app.rs` と `src/ui_dialogs/favorites_editor.rs`。Option 内で新 configure/excluded roots と password refresh を接続し、起動・再同期・shared manager 生成失敗時の bootstrap を None で無操作にした。UI は Paused で類似 controls/summary/progress を隠し、Enabled の新表示は維持する。自動統合された shared watcher と capability 経路も検収対象とする。core check、fmt、glyph、diff check は成功し、統合後の焦点回帰と独立検収を進めている。統合 commit・全体 gate・normal build はその後に行う。アプリ起動・実データ操作・master への merge・再有効化は行わない。
+
+取り込んだ休止資料の公開担当「ClaudeCode」は当時の運用記録として保持する。今回の統合実装・検収の担当指定には利用者の Sol / xhigh 分担を優先し、公開資料の別作業は追加しない。
+
+### 統合時の失敗終端と焦点回帰
+
+独立検収で `poll_startup_init` の Disconnected 終端だけ Enabled manager の watch bootstrap を閉じない P2 を検出した。IndexerManager 生成 worker が結果送信前に異常終了した既存の失敗経路で、通常の None 返却時と同じ `finish_watch_bootstrap` を Some の場合に適用する。既存 Pending 登録を Unavailable へ移すだけで、新状態・再試行は追加しない。Paused/None は無操作を維持する。
+
+新しい App 回帰は、Pending 中の public progress は Idle が正常であることを踏まえ、disconnect 前の jobs=(0,0)、終端後の Full=1、password revision 更新後の Full=2 を有限待機で観測する。表示名をテスト都合で変更せず、下位実装だけでなく App 入口からの接続を確認した。Paused App の neutral 応答・保存 true/既存 store 保持・startup/password 無操作と合わせ 3 件成功。
+
+`target/similar-index-pause-integration-20260911/validation-r3/` には shared watcher Full/Delta、password reconfigure、notifier なしの通常 metadata 継続、paused capability、追加/編集 UI visibility、metadata panel、version highlights の成功も保存した。visibility の最初の filter は 0 件だったため検証とは数えず、修正 filter の各 1 件成功を使用する。
+
+中間競合解消版の関数列欠落と Option 呼出の後退は構文/差分検査で検出して修正し、その版は有効証拠に使わない。最終版は両 parent に対して意図外削除がないことを独立検収する。初期 App 回帰の即時進捗 assert 失敗も製品失敗とは混同せず、上記の実契約に沿う最終回帰を正本とする。
+
+最終 freeze は `target/similar-index-pause-integration-20260911/freeze-r1/MANIFEST.md`（SHA256 `C144B7F84B3035E9DB50752D0C5C75DD77C778258B3F6C66B4A56577BD6D96D3`）。39 staged paths / Rust 20 件の source が index と一致し、未解決競合は 0。独立最終承認は同 directory の `review-approval.md`（SHA256 `091FEA02DE65F4CB31271437A5A536296F2BEE8F1F8F2EF3F30C27D5FA21D424`）、統合範囲に残る P1/P2 なし。両 parent との照合で意図外削除がなく、Option 全入口・Paused 保存保護・Enabled 接続・失敗終端を確認した。本書の追記だけを freeze 後に追加し、コードを固定したまま merge commit と全体 gate/build へ進む。

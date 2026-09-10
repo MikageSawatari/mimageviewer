@@ -310,7 +310,7 @@ fn metadata_panel_information_tab_dark() {
         mimageviewer::os_theme::ResolvedTheme::Dark,
         egui::vec2(400.0, 260.0),
         None,
-        |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, false),
+        mimageviewer::draw_paused_metadata_panel_snapshot_fixture,
     );
 }
 
