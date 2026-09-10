@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::path_key;
-use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+use crate::settings::{FinalCoverSpreadPreference, ReadingDirection, ReadingFlow, SpreadMode};
 use rusqlite::{OpenFlags, OptionalExtension};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -63,6 +63,10 @@ impl SpreadDb {
             "CREATE TABLE IF NOT EXISTS spreads (
                 path TEXT PRIMARY KEY,
                 mode INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS final_cover_spreads (
+                path TEXT PRIMARY KEY,
+                preference INTEGER NOT NULL CHECK (preference BETWEEN 0 AND 2)
             )",
         )?;
         ensure_column(&conn, "flow", "INTEGER NOT NULL DEFAULT 0")?;
@@ -159,6 +163,59 @@ impl SpreadDb {
         }
     }
 
+    pub(crate) fn get_final_cover_spread_preference(
+        &self,
+        path: &Path,
+    ) -> Option<FinalCoverSpreadPreference> {
+        let key = normalize_path(path);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT preference FROM final_cover_spreads WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([&key], |row| row.get::<_, i32>(0))
+            .ok()
+            .and_then(FinalCoverSpreadPreference::from_int)
+    }
+
+    /// Resolve the exact book preference before its optional container fallback.
+    /// An exact `FollowGlobal` is a real value and deliberately blocks fallback.
+    /// Read-only handles for old databases have no `final_cover_spreads` table;
+    /// the failed lookup is treated as an inherited setting without migrating it.
+    pub(crate) fn get_final_cover_spread_preference_with_fallback(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> FinalCoverSpreadPreference {
+        self.get_final_cover_spread_preference(key)
+            .or_else(|| {
+                fallback.and_then(|fallback| self.get_final_cover_spread_preference(fallback))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Store a final-cover override without creating or modifying the legacy
+    /// `spreads` row. At a root key, following the global value needs no row;
+    /// at a nested key it is stored explicitly so that it blocks root fallback.
+    pub(crate) fn set_final_cover_spread_preference(
+        &self,
+        path: &Path,
+        fallback: Option<&Path>,
+        preference: FinalCoverSpreadPreference,
+    ) -> Result<(), rusqlite::Error> {
+        let key = normalize_path(path);
+        if preference == FinalCoverSpreadPreference::FollowGlobal && fallback.is_none() {
+            self.conn
+                .execute("DELETE FROM final_cover_spreads WHERE path = ?1", [&key])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET preference = ?2",
+                rusqlite::params![key, preference.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_mode_and_direction(
         &mut self,
         path: &Path,
@@ -235,15 +292,34 @@ impl SpreadDb {
     }
 
     /// 全レコードを削除 (リセット)
-    pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
-        self.conn.execute("DELETE FROM spreads", [])
+    pub fn clear_all(&mut self) -> Result<usize, rusqlite::Error> {
+        let transaction = self.conn.transaction()?;
+        let spreads = transaction.execute("DELETE FROM spreads", [])?;
+        let final_covers = transaction.execute("DELETE FROM final_cover_spreads", [])?;
+        transaction.commit()?;
+        Ok(spreads + final_covers)
     }
 
     /// 登録件数
     pub fn count(&self) -> usize {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM spreads", [], |row| row.get(0))
-            .unwrap_or(0)
+        let spreads = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM spreads", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap_or(0);
+        let final_cover_only = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM final_cover_spreads AS f
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM spreads AS s WHERE s.path = f.path
+                  )",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap_or(0);
+        spreads + final_cover_only
     }
 }
 
@@ -538,5 +614,105 @@ mod tests {
         assert_eq!(db.get(book), Some(SpreadMode::LtrCover));
         assert_eq!(db.get_flow(book), Some(ReadingFlow::Horizontal));
         assert_eq!(db.get_direction(book), Some(ReadingDirection::Ltr));
+    }
+
+    #[test]
+    fn final_cover_override_is_independent_and_exact_follow_global_blocks_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+
+        db.set(
+            root,
+            SpreadMode::RtlCover,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Ltr,
+        )
+        .unwrap();
+        db.set_final_cover_spread_preference(root, None, FinalCoverSpreadPreference::Off)
+            .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::Off
+        );
+
+        db.set_final_cover_spread_preference(
+            nested,
+            Some(root),
+            FinalCoverSpreadPreference::FollowGlobal,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(db.get(root), Some(SpreadMode::RtlCover));
+
+        db.set_final_cover_spread_preference(nested, Some(root), FinalCoverSpreadPreference::On)
+            .unwrap();
+        db.set_flow(
+            root,
+            ReadingFlow::Horizontal,
+            ReadingDirection::Rtl,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Ltr,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::On
+        );
+        assert_eq!(db.get_flow(root), Some(ReadingFlow::Horizontal));
+        assert_eq!(db.count(), 2, "paths shared by both tables count once");
+        assert_eq!(db.clear_all().unwrap(), 3);
+        assert_eq!(db.count(), 0);
+        assert!(db.get(root).is_none());
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+    }
+
+    #[test]
+    fn old_read_only_schema_inherits_final_cover_without_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spreads (path, mode) VALUES ('c:/books/legacy.zip', 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(
+                Path::new("C:/books/book.zip"),
+                None,
+            ),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(db.count(), 1);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(final_cover_spreads)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.is_empty());
     }
 }

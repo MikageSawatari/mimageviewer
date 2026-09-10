@@ -53,6 +53,7 @@ pub(crate) struct ContextRequest {
     pub(crate) legacy_seed_paths: Vec<PathBuf>,
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
+    pub(crate) spread_container_fallback: Option<PathBuf>,
     pub(crate) old_folder_pin_keys: HashSet<String>,
     pub(crate) folder_pin_paths: Vec<PathBuf>,
     pub(crate) folder_pin_aliases: Vec<(String, String)>,
@@ -78,6 +79,7 @@ pub(crate) struct ContainerStateResult {
     pub(crate) spread_mode: Option<crate::settings::SpreadMode>,
     pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
     pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
+    pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
 }
 
@@ -531,14 +533,22 @@ fn build_context_result(
     let container_state =
         if changed.container_state && spread_db.is_some() && container_trim_db.is_some() {
             request.spread_container_path.as_deref().map(|path| {
-                let spread_mode = spread_db.and_then(|db| db.get(path));
-                let reading_flow = spread_db.and_then(|db| db.get_flow(path));
-                let reading_direction = spread_db.and_then(|db| db.get_direction(path));
+                let fallback = request.spread_container_fallback.as_deref();
+                let stored = spread_db
+                    .map(|db| db.get_state_with_fallback(path, fallback))
+                    .unwrap_or_default();
+                let spread_mode = stored.mode;
+                let reading_flow = stored.flow;
+                let reading_direction = stored.direction;
+                let final_cover_spread_preference = spread_db
+                    .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
+                    .unwrap_or_default();
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
                 ContainerStateResult {
                     spread_mode,
                     reading_flow,
                     reading_direction,
+                    final_cover_spread_preference,
                     view_trim,
                 }
             })
@@ -661,6 +671,7 @@ mod tests {
                 legacy_seed_paths: vec![legacy_seed_path.clone()],
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -723,6 +734,7 @@ mod tests {
                 legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -752,6 +764,63 @@ mod tests {
             &cancel,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn final_cover_refresh_preserves_nested_fallback_and_explicit_follow_global() {
+        use crate::settings::FinalCoverSpreadPreference;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root = PathBuf::from("c:/books/outer.zip");
+        let nested = root.join("inner/book");
+        let spread_db = crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap();
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
+        spread_db
+            .set_final_cover_spread_preference(&root, None, FinalCoverSpreadPreference::Off)
+            .unwrap();
+
+        let refresh = || {
+            run(
+                data_dir.clone(),
+                vec![ContextRequest {
+                    context_id: ViewerContextId::for_test(0),
+                    items_generation: 1,
+                    items: Vec::new(),
+                    legacy_seed_paths: Vec::new(),
+                    current_rating_key: None,
+                    spread_container_path: Some(nested.clone()),
+                    spread_container_fallback: Some(root.clone()),
+                    old_folder_pin_keys: HashSet::new(),
+                    folder_pin_paths: Vec::new(),
+                    folder_pin_aliases: Vec::new(),
+                }],
+                ImportChangedSections {
+                    container_state: true,
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .expect("refresh should complete")
+            .contexts
+            .into_iter()
+            .next()
+            .and_then(|context| context.container_state)
+            .expect("container state should be rebuilt")
+            .final_cover_spread_preference
+        };
+
+        assert_eq!(refresh(), FinalCoverSpreadPreference::Off);
+
+        spread_db
+            .set_final_cover_spread_preference(
+                &nested,
+                Some(&root),
+                FinalCoverSpreadPreference::FollowGlobal,
+            )
+            .unwrap();
+        assert_eq!(refresh(), FinalCoverSpreadPreference::FollowGlobal);
     }
 
     #[test]
@@ -807,6 +876,7 @@ mod tests {
                 legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -867,6 +937,7 @@ mod tests {
                 legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: vec![effective],
                 folder_pin_aliases: vec![(literal_key.clone(), effective_key)],

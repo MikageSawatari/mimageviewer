@@ -9130,11 +9130,21 @@ impl App {
     ) -> bool {
         pages.sort_unstable();
         pages.dedup();
-        if pages.is_empty()
-            || pages
-                .iter()
-                .any(|page| !self.items.get(*page).is_some_and(GridItem::has_page_data))
-        {
+        let demand = crate::app::FsNavigationDisplayDemand::navigation_only(anchor_idx, pages);
+        self.rebind_fs_navigation_sequence_to_demand(anchor_idx, demand)
+    }
+
+    fn rebind_fs_navigation_sequence_to_demand(
+        &mut self,
+        anchor_idx: usize,
+        demand: crate::app::FsNavigationDisplayDemand,
+    ) -> bool {
+        if demand.presentation_pages().iter().any(|page| {
+            !self
+                .items
+                .get(page.idx)
+                .is_some_and(GridItem::has_page_data)
+        }) {
             return false;
         }
         let Some(FsNavigationSequenceTarget::Display(target)) = self
@@ -9147,14 +9157,14 @@ impl App {
         };
         if target.items_generation != self.items_generation
             || target.anchor_idx != anchor_idx
-            || target.pages() == pages
+            || target.phase.demand() == &demand
         {
             return false;
         }
         // The accepted anchor and rendition policy remain stable. A topology change invalidates
         // any readiness already established for the old unit, so every lifecycle phase returns
         // to the common all-page readiness gate while the same previous unit remains held.
-        target.phase = FsNavigationTargetPhase::Awaiting { pages };
+        target.phase = FsNavigationTargetPhase::Awaiting { demand };
         true
     }
 
@@ -9904,7 +9914,11 @@ impl App {
                 items_generation: self.items_generation,
                 anchor_idx: target_idx,
                 accept_rendition,
-                phase: FsNavigationTargetPhase::Awaiting { pages },
+                phase: FsNavigationTargetPhase::Awaiting {
+                    demand: crate::app::FsNavigationDisplayDemand::navigation_only(
+                        target_idx, pages,
+                    ),
+                },
             }),
         }));
         if let Some(trace) = self
@@ -9962,7 +9976,9 @@ impl App {
                 items_generation: self.items_generation,
                 anchor_idx: idx,
                 accept_rendition: true,
-                phase: FsNavigationTargetPhase::Awaiting { pages },
+                phase: FsNavigationTargetPhase::Awaiting {
+                    demand: crate::app::FsNavigationDisplayDemand::navigation_only(idx, pages),
+                },
             });
             return true;
         }
@@ -10035,7 +10051,11 @@ impl App {
         {
             return;
         }
-        let target_pages = target.pages().to_vec();
+        let target_pages = target
+            .presentation_pages()
+            .iter()
+            .map(|page| page.idx)
+            .collect::<Vec<_>>();
 
         if accept_rendition {
             let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
@@ -10077,8 +10097,7 @@ impl App {
                         ))
             }
         });
-        let materialized_failed = target
-            .pages()
+        let materialized_failed = target_pages
             .iter()
             .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
         let rendition_ready = accept_rendition
@@ -10096,13 +10115,12 @@ impl App {
                 ready
             });
         let rendition_failed = accept_rendition
-            && target
-                .pages()
+            && target_pages
                 .iter()
                 .any(|idx| matches!(self.thumbnails.get(*idx), Some(ThumbnailState::Failed)));
 
         let next_phase = navigation_target_next_phase(
-            &target_pages,
+            target.phase.demand(),
             materialized_ready,
             rendition_ready,
             materialized_failed,
@@ -10361,10 +10379,10 @@ impl App {
                     .as_mut()
                     .and_then(FsHoldover::navigation_sequence_mut)
                     && let FsNavigationSequenceTarget::Display(target) = &mut sequence.target
-                    && let FsNavigationTargetPhase::Ready { pages, .. } = &target.phase
+                    && let FsNavigationTargetPhase::Ready { demand, .. } = &target.phase
                 {
                     target.phase = FsNavigationTargetPhase::Presenting {
-                        pages: pages.clone(),
+                        demand: demand.clone(),
                         presentation,
                     };
                     if matches!(presentation, FsNavigationPresentation::Failure) {
@@ -12649,6 +12667,146 @@ struct SpreadDisplayUnit {
     pages: Vec<usize>,
 }
 
+/// A page's role inside one visible reading unit. Navigation is projected only
+/// from `Navigation`; supplements participate in the complete presentation but
+/// never add a seek/history/page-count target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SpreadPageRole {
+    Navigation,
+    FrontCoverSupplement,
+}
+
+/// Stable identity for one page occurrence in a visible unit. The same source
+/// index may appear once at the front of a book and once as the final unit's
+/// supplement, so an index alone is not an occurrence identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SpreadPageOccurrence {
+    pub(crate) idx: usize,
+    pub(crate) role: SpreadPageRole,
+    pub(crate) navigation_anchor_idx: usize,
+}
+
+/// Role-aware presentation of one existing navigation unit. `pages` stays in
+/// reading order; screen order is derived from the current spread direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SpreadDisplayComposition {
+    navigation_anchor_idx: usize,
+    pages: Vec<SpreadPageOccurrence>,
+}
+
+impl SpreadDisplayComposition {
+    fn from_navigation_pages(navigation_anchor_idx: usize, pages: &[usize]) -> Option<Self> {
+        if pages.is_empty() || !pages.contains(&navigation_anchor_idx) {
+            return None;
+        }
+        Some(Self {
+            navigation_anchor_idx,
+            pages: pages
+                .iter()
+                .copied()
+                .map(|idx| SpreadPageOccurrence {
+                    idx,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx,
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn navigation_anchor_idx(&self) -> usize {
+        self.navigation_anchor_idx
+    }
+
+    pub(crate) fn pages_in_reading_order(&self) -> &[SpreadPageOccurrence] {
+        &self.pages
+    }
+
+    pub(crate) fn navigation_pages(&self) -> Vec<usize> {
+        self.pages
+            .iter()
+            .filter_map(|page| (page.role == SpreadPageRole::Navigation).then_some(page.idx))
+            .collect()
+    }
+
+    pub(crate) fn pages_in_screen_order(
+        &self,
+        spread_mode: SpreadMode,
+    ) -> Vec<SpreadPageOccurrence> {
+        if self.pages.len() == 2 && spread_mode.is_rtl() {
+            self.pages.iter().rev().copied().collect()
+        } else {
+            self.pages.clone()
+        }
+    }
+}
+
+/// Shared local/Remote composition boundary. All page slices must come from the
+/// same canonical unit list and token; callers may not derive a different sort
+/// or treat a truncated list as the end of a book.
+fn compose_spread_navigation_unit(
+    navigation_anchor_idx: usize,
+    navigation_pages: &[usize],
+    first_unit_pages: &[usize],
+    last_unit_pages: &[usize],
+    is_last_unit: bool,
+    spread_mode: SpreadMode,
+    final_cover_enabled: bool,
+    complete_book_eligible: bool,
+) -> Option<SpreadDisplayComposition> {
+    let base =
+        SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, navigation_pages)?;
+    if !final_cover_enabled
+        || !complete_book_eligible
+        || !spread_mode.has_cover()
+        || !is_last_unit
+        || first_unit_pages.len() != 1
+        || last_unit_pages.len() != 1
+        || navigation_pages != last_unit_pages
+    {
+        return Some(base);
+    }
+    let cover_idx = first_unit_pages[0];
+    if cover_idx == navigation_anchor_idx {
+        return Some(base);
+    }
+    let mut pages = base.pages;
+    pages.push(SpreadPageOccurrence {
+        idx: cover_idx,
+        role: SpreadPageRole::FrontCoverSupplement,
+        navigation_anchor_idx,
+    });
+    Some(SpreadDisplayComposition {
+        navigation_anchor_idx,
+        pages,
+    })
+}
+
+/// Compose a cached navigation unit for painting without changing its unit
+/// count, anchor or seek topology. Eligibility is decided by the owning App
+/// from its complete stable-book view; this pure resolver additionally requires
+/// Cover mode and singleton endpoints from the same cached unit token.
+fn resolve_spread_display_composition(
+    units: &[SpreadDisplayUnit],
+    unit_pos: usize,
+    spread_mode: SpreadMode,
+    final_cover_enabled: bool,
+    complete_book_eligible: bool,
+) -> Option<SpreadDisplayComposition> {
+    let unit = units.get(unit_pos)?;
+    let first = units.first()?;
+    let last = units.last()?;
+    compose_spread_navigation_unit(
+        unit.anchor_idx(),
+        &unit.pages,
+        &first.pages,
+        &last.pages,
+        unit_pos + 1 == units.len(),
+        spread_mode,
+        final_cover_enabled,
+        complete_book_eligible,
+    )
+}
+
 #[derive(Clone, Debug)]
 struct SpreadDisplayUnitsToken {
     items_generation: u64,
@@ -12842,27 +13000,25 @@ impl SpreadDisplayUnit {
     }
 
     fn screen_pages(&self, spread_mode: SpreadMode) -> Vec<usize> {
-        if self.pages.len() == 2 && spread_mode.is_rtl() {
-            vec![self.pages[1], self.pages[0]]
-        } else {
-            self.pages.clone()
-        }
+        SpreadDisplayComposition::from_navigation_pages(self.anchor_idx(), &self.pages)
+            .expect("spread display unit has an anchor")
+            .pages_in_screen_order(spread_mode)
+            .into_iter()
+            .map(|page| page.idx)
+            .collect()
     }
 
     fn spread_pair(&self, spread_mode: SpreadMode) -> SpreadPair {
-        if self.pages.len() != 2 {
+        let screen =
+            SpreadDisplayComposition::from_navigation_pages(self.anchor_idx(), &self.pages)
+                .expect("spread display unit has an anchor")
+                .pages_in_screen_order(spread_mode);
+        if screen.len() != 2 {
             return SpreadPair::Single;
         }
-        if spread_mode.is_rtl() {
-            SpreadPair::Double {
-                left: self.pages[1],
-                right: self.pages[0],
-            }
-        } else {
-            SpreadPair::Double {
-                left: self.pages[0],
-                right: self.pages[1],
-            }
+        SpreadPair::Double {
+            left: screen[0].idx,
+            right: screen[1].idx,
         }
     }
 }
@@ -12986,6 +13142,9 @@ fn build_spread_display_units_with_predicates(
 pub(crate) struct RemotePageGroupSpec {
     pub(crate) indices: Vec<usize>,
     pub(crate) slice: crate::page_split::PageSlice,
+    /// Full screen-order presentation only when it differs from the navigation
+    /// pages. Ordinary groups omit it to keep Remote payload budgets stable.
+    pub(crate) presentation: Option<Vec<SpreadPageOccurrence>>,
 }
 
 impl RemotePageGroupSpec {
@@ -12993,6 +13152,7 @@ impl RemotePageGroupSpec {
         Self {
             indices,
             slice: crate::page_split::PageSlice::Full,
+            presentation: None,
         }
     }
 }
@@ -13001,6 +13161,16 @@ pub(crate) fn build_remote_spread_page_groups(
     items: &[GridItem],
     spread_mode: SpreadMode,
     is_landscape: &[bool],
+) -> Vec<RemotePageGroupSpec> {
+    build_remote_spread_page_groups_with_composition(items, spread_mode, is_landscape, false, false)
+}
+
+pub(crate) fn build_remote_spread_page_groups_with_composition(
+    items: &[GridItem],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+    final_cover_enabled: bool,
+    complete_book_eligible: bool,
 ) -> Vec<RemotePageGroupSpec> {
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
@@ -13014,6 +13184,7 @@ pub(crate) fn build_remote_spread_page_groups(
         .map(|step| RemotePageGroupSpec {
             indices: vec![step.source_idx],
             slice: step.slice,
+            presentation: None,
         })
         .collect();
     }
@@ -13023,19 +13194,39 @@ pub(crate) fn build_remote_spread_page_groups(
             .map(|idx| RemotePageGroupSpec::whole(vec![idx]))
             .collect();
     }
-    build_spread_display_units_with_predicates(
+    let units = build_spread_display_units_with_predicates(
         &nav,
         spread_mode,
         None,
         |_, idx| is_landscape.get(idx).copied().unwrap_or(false),
         |idx| is_spread_pairable_item(items.get(idx)),
-    )
-    .into_iter()
-    .map(|unit| match unit.spread_pair(spread_mode) {
-        SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
-        SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
-    })
-    .collect()
+    );
+    units
+        .iter()
+        .enumerate()
+        .map(|(unit_pos, unit)| {
+            let mut group = match unit.spread_pair(spread_mode) {
+                SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
+                SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
+            };
+            let composition = resolve_spread_display_composition(
+                &units,
+                unit_pos,
+                spread_mode,
+                final_cover_enabled,
+                complete_book_eligible,
+            )
+            .expect("remote unit position comes from the same non-empty unit list");
+            if composition
+                .pages_in_reading_order()
+                .iter()
+                .any(|page| page.role != SpreadPageRole::Navigation)
+            {
+                group.presentation = Some(composition.pages_in_screen_order(spread_mode));
+            }
+            group
+        })
+        .collect()
 }
 
 /// 本体の左右を、リモートの protocol 型へ写す。
@@ -13717,7 +13908,7 @@ fn fs_paint_page_changed_from_previous(
 /// Outside a burst `rendition_ready` is false, so a single press still shows the real page and
 /// nothing about ordinary reading changes.
 fn navigation_target_next_phase(
-    pages: &[usize],
+    demand: &crate::app::FsNavigationDisplayDemand,
     materialized_ready: bool,
     rendition_ready: bool,
     materialized_failed: bool,
@@ -13725,22 +13916,22 @@ fn navigation_target_next_phase(
 ) -> Option<FsNavigationTargetPhase> {
     if rendition_ready {
         Some(FsNavigationTargetPhase::Ready {
-            pages: pages.to_vec(),
+            demand: demand.clone(),
             presentation: FsNavigationPresentation::Rendition,
         })
     } else if materialized_ready {
         Some(FsNavigationTargetPhase::Ready {
-            pages: pages.to_vec(),
+            demand: demand.clone(),
             presentation: FsNavigationPresentation::Materialized,
         })
     } else if materialized_failed {
         Some(FsNavigationTargetPhase::Ready {
-            pages: pages.to_vec(),
+            demand: demand.clone(),
             presentation: FsNavigationPresentation::Failure,
         })
     } else if rendition_failed {
         Some(FsNavigationTargetPhase::RenditionFailed {
-            pages: pages.to_vec(),
+            demand: demand.clone(),
         })
     } else {
         None
@@ -46245,8 +46436,15 @@ mod tests {
         })
     }
 
+    fn navigation_demand(pages: Vec<usize>) -> crate::app::FsNavigationDisplayDemand {
+        let anchor_idx = pages[0];
+        crate::app::FsNavigationDisplayDemand::navigation_only(anchor_idx, pages)
+    }
+
     fn navigation_awaiting(pages: Vec<usize>) -> FsNavigationTargetPhase {
-        FsNavigationTargetPhase::Awaiting { pages }
+        FsNavigationTargetPhase::Awaiting {
+            demand: navigation_demand(pages),
+        }
     }
 
     fn navigation_ready(
@@ -46254,7 +46452,7 @@ mod tests {
         presentation: FsNavigationPresentation,
     ) -> FsNavigationTargetPhase {
         FsNavigationTargetPhase::Ready {
-            pages,
+            demand: navigation_demand(pages),
             presentation,
         }
     }
@@ -46264,13 +46462,15 @@ mod tests {
         presentation: FsNavigationPresentation,
     ) -> FsNavigationTargetPhase {
         FsNavigationTargetPhase::Presenting {
-            pages,
+            demand: navigation_demand(pages),
             presentation,
         }
     }
 
     fn navigation_rendition_failed(pages: Vec<usize>) -> FsNavigationTargetPhase {
-        FsNavigationTargetPhase::RenditionFailed { pages }
+        FsNavigationTargetPhase::RenditionFailed {
+            demand: navigation_demand(pages),
+        }
     }
 
     fn cache_fullscreen_keyboard_owner_for_test(ctx: &egui::Context) {
@@ -47626,7 +47826,7 @@ mod tests {
     #[test]
     fn a_burst_takes_the_stand_in_even_when_the_real_page_is_also_ready() {
         assert_eq!(
-            navigation_target_next_phase(&[7], true, true, false, false),
+            navigation_target_next_phase(&navigation_demand(vec![7]), true, true, false, false),
             Some(navigation_ready(
                 vec![7],
                 FsNavigationPresentation::Rendition
@@ -47641,7 +47841,7 @@ mod tests {
     #[test]
     fn a_single_press_still_shows_the_real_page() {
         assert_eq!(
-            navigation_target_next_phase(&[7], true, false, false, false),
+            navigation_target_next_phase(&navigation_demand(vec![7]), true, false, false, false),
             Some(navigation_ready(
                 vec![7],
                 FsNavigationPresentation::Materialized
@@ -47652,7 +47852,7 @@ mod tests {
     #[test]
     fn the_stand_in_carries_the_turn_when_the_real_page_is_not_ready() {
         assert_eq!(
-            navigation_target_next_phase(&[7], false, true, false, false),
+            navigation_target_next_phase(&navigation_demand(vec![7]), false, true, false, false),
             Some(navigation_ready(
                 vec![7],
                 FsNavigationPresentation::Rendition
@@ -47665,14 +47865,14 @@ mod tests {
     #[test]
     fn anything_showable_outranks_a_failure() {
         assert_eq!(
-            navigation_target_next_phase(&[7], false, true, true, true),
+            navigation_target_next_phase(&navigation_demand(vec![7]), false, true, true, true),
             Some(navigation_ready(
                 vec![7],
                 FsNavigationPresentation::Rendition
             ))
         );
         assert_eq!(
-            navigation_target_next_phase(&[7], true, false, true, true),
+            navigation_target_next_phase(&navigation_demand(vec![7]), true, false, true, true),
             Some(navigation_ready(
                 vec![7],
                 FsNavigationPresentation::Materialized
@@ -47683,7 +47883,7 @@ mod tests {
     #[test]
     fn nothing_ready_and_nothing_failed_keeps_waiting() {
         assert_eq!(
-            navigation_target_next_phase(&[7], false, false, false, false),
+            navigation_target_next_phase(&navigation_demand(vec![7]), false, false, false, false),
             None,
             "settling early is what leaves a turn showing the page before it"
         );
@@ -47692,11 +47892,11 @@ mod tests {
     #[test]
     fn a_failed_decode_settles_rather_than_waiting_forever() {
         assert_eq!(
-            navigation_target_next_phase(&[7], false, false, true, false),
+            navigation_target_next_phase(&navigation_demand(vec![7]), false, false, true, false),
             Some(navigation_ready(vec![7], FsNavigationPresentation::Failure))
         );
         assert_eq!(
-            navigation_target_next_phase(&[7], false, false, false, true),
+            navigation_target_next_phase(&navigation_demand(vec![7]), false, false, false, true),
             Some(navigation_rendition_failed(vec![7]))
         );
     }
@@ -49914,7 +50114,7 @@ mod tests {
                 anchor_idx: 2,
                 accept_rendition: true,
                 phase: FsNavigationTargetPhase::Presenting {
-                    pages: vec![1, 2],
+                    demand: crate::app::FsNavigationDisplayDemand::navigation_only(2, vec![1, 2]),
                     presentation: FsNavigationPresentation::Rendition,
                 },
             }),
@@ -50328,9 +50528,9 @@ mod tests {
         assert!(matches!(
             target,
             Some(FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
-                phase: FsNavigationTargetPhase::Awaiting { pages },
+                phase: FsNavigationTargetPhase::Awaiting { demand },
                 ..
-            })) if pages == vec![3]
+            })) if demand.navigation_pages() == [3]
         ));
     }
 
@@ -50359,8 +50559,8 @@ mod tests {
                 items_generation: 12,
                 anchor_idx: 1,
                 accept_rendition: true,
-                phase: FsNavigationTargetPhase::Awaiting { pages },
-            })) if pages == vec![1]
+                phase: FsNavigationTargetPhase::Awaiting { demand },
+            })) if demand.navigation_pages() == [1]
         ));
     }
 
@@ -62357,6 +62557,303 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 2]
         );
+    }
+
+    #[test]
+    fn role_composition_preserves_existing_spread_pairs_when_supplement_is_disabled() {
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![0, 1],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![2],
+            },
+        ];
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::Rtl,
+            SpreadMode::LtrCover,
+            SpreadMode::RtlCover,
+        ] {
+            for (unit_pos, unit) in units.iter().enumerate() {
+                let composition =
+                    resolve_spread_display_composition(&units, unit_pos, mode, false, true)
+                        .unwrap();
+                assert_eq!(composition.navigation_anchor_idx(), unit.anchor_idx());
+                assert_eq!(composition.navigation_pages(), unit.pages);
+                assert_eq!(
+                    composition
+                        .pages_in_screen_order(mode)
+                        .into_iter()
+                        .map(|page| page.idx)
+                        .collect::<Vec<_>>(),
+                    unit.screen_pages(mode)
+                );
+                assert!(
+                    composition
+                        .pages_in_reading_order()
+                        .iter()
+                        .all(|page| page.role == SpreadPageRole::Navigation)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_cover_composition_adds_a_non_navigation_occurrence_only_to_the_last_unit() {
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![0],
+            },
+            SpreadDisplayUnit {
+                nav_start: 1,
+                pages: vec![1, 2],
+            },
+            SpreadDisplayUnit {
+                nav_start: 3,
+                pages: vec![3],
+            },
+        ];
+
+        let leading =
+            resolve_spread_display_composition(&units, 0, SpreadMode::LtrCover, true, true)
+                .unwrap();
+        assert_eq!(leading.navigation_pages(), vec![0]);
+        assert_eq!(leading.pages_in_reading_order().len(), 1);
+
+        let ltr = resolve_spread_display_composition(&units, 2, SpreadMode::LtrCover, true, true)
+            .unwrap();
+        assert_eq!(ltr.navigation_anchor_idx(), 3);
+        assert_eq!(ltr.navigation_pages(), vec![3]);
+        assert_eq!(
+            ltr.pages_in_reading_order(),
+            &[
+                SpreadPageOccurrence {
+                    idx: 3,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: 3,
+                },
+                SpreadPageOccurrence {
+                    idx: 0,
+                    role: SpreadPageRole::FrontCoverSupplement,
+                    navigation_anchor_idx: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            ltr.pages_in_screen_order(SpreadMode::LtrCover)
+                .into_iter()
+                .map(|page| page.idx)
+                .collect::<Vec<_>>(),
+            vec![3, 0]
+        );
+        assert_eq!(
+            ltr.pages_in_screen_order(SpreadMode::RtlCover)
+                .into_iter()
+                .map(|page| page.idx)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+    }
+
+    #[test]
+    fn final_cover_composition_requires_cover_mode_complete_book_and_singleton_endpoints() {
+        let singleton_endpoints = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![0],
+            },
+            SpreadDisplayUnit {
+                nav_start: 1,
+                pages: vec![1],
+            },
+        ];
+        for (mode, enabled, eligible) in [
+            (SpreadMode::Ltr, true, true),
+            (SpreadMode::LtrCover, false, true),
+            (SpreadMode::LtrCover, true, false),
+        ] {
+            let composition = resolve_spread_display_composition(
+                &singleton_endpoints,
+                1,
+                mode,
+                enabled,
+                eligible,
+            )
+            .unwrap();
+            assert_eq!(composition.pages_in_reading_order().len(), 1);
+        }
+
+        let paired_last = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![0],
+            },
+            SpreadDisplayUnit {
+                nav_start: 1,
+                pages: vec![1, 2],
+            },
+        ];
+        let composition =
+            resolve_spread_display_composition(&paired_last, 1, SpreadMode::LtrCover, true, true)
+                .unwrap();
+        assert_eq!(composition.navigation_pages(), vec![1, 2]);
+        assert!(
+            composition
+                .pages_in_reading_order()
+                .iter()
+                .all(|page| page.role == SpreadPageRole::Navigation)
+        );
+    }
+
+    #[test]
+    fn final_cover_display_demand_owns_navigation_and_presentation_as_one_value() {
+        let demand = crate::app::FsNavigationDisplayDemand::from_presentation(
+            3,
+            vec![
+                SpreadPageOccurrence {
+                    idx: 3,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: 3,
+                },
+                SpreadPageOccurrence {
+                    idx: 0,
+                    role: SpreadPageRole::FrontCoverSupplement,
+                    navigation_anchor_idx: 3,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(demand.navigation_pages(), &[3]);
+        assert_eq!(demand.presentation_pages().len(), 2);
+
+        assert!(
+            crate::app::FsNavigationDisplayDemand::from_presentation(
+                3,
+                vec![SpreadPageOccurrence {
+                    idx: 0,
+                    role: SpreadPageRole::FrontCoverSupplement,
+                    navigation_anchor_idx: 3,
+                }],
+            )
+            .is_none()
+        );
+        assert!(
+            crate::app::FsNavigationDisplayDemand::from_presentation(
+                3,
+                vec![
+                    SpreadPageOccurrence {
+                        idx: 3,
+                        role: SpreadPageRole::Navigation,
+                        navigation_anchor_idx: 3,
+                    },
+                    SpreadPageOccurrence {
+                        idx: 3,
+                        role: SpreadPageRole::FrontCoverSupplement,
+                        navigation_anchor_idx: 3,
+                    },
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn final_cover_rebind_compares_the_complete_display_demand() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..4)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/book/{idx}.png"))))
+            .collect();
+        app.items_generation = 9;
+        app.fs_holdover_tex = Some(page_wait_navigation_sequence(
+            std::time::Instant::now(),
+            9,
+            vec![3],
+            navigation_awaiting(vec![3]),
+        ));
+        let demand = crate::app::FsNavigationDisplayDemand::from_presentation(
+            3,
+            vec![
+                SpreadPageOccurrence {
+                    idx: 3,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: 3,
+                },
+                SpreadPageOccurrence {
+                    idx: 0,
+                    role: SpreadPageRole::FrontCoverSupplement,
+                    navigation_anchor_idx: 3,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(app.rebind_fs_navigation_sequence_to_demand(3, demand.clone()));
+        let target = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target) => Some(target),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target.pages(), &[3]);
+        assert_eq!(target.presentation_pages(), demand.presentation_pages());
+        assert!(!app.rebind_fs_navigation_sequence_to_demand(3, demand));
+    }
+
+    #[test]
+    fn remote_final_cover_group_keeps_navigation_indices_and_emits_only_delta_presentation() {
+        let items = (0..4)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/book/{idx}.png"))))
+            .collect::<Vec<_>>();
+        let groups = build_remote_spread_page_groups_with_composition(
+            &items,
+            SpreadMode::LtrCover,
+            &[false; 4],
+            true,
+            true,
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![1, 2], vec![3]]
+        );
+        assert!(groups[0].presentation.is_none());
+        assert!(groups[1].presentation.is_none());
+        assert_eq!(
+            groups[2].presentation.as_deref(),
+            Some(
+                [
+                    SpreadPageOccurrence {
+                        idx: 3,
+                        role: SpreadPageRole::Navigation,
+                        navigation_anchor_idx: 3,
+                    },
+                    SpreadPageOccurrence {
+                        idx: 0,
+                        role: SpreadPageRole::FrontCoverSupplement,
+                        navigation_anchor_idx: 3,
+                    },
+                ]
+                .as_slice()
+            )
+        );
+
+        let incomplete = build_remote_spread_page_groups_with_composition(
+            &items,
+            SpreadMode::LtrCover,
+            &[false; 4],
+            true,
+            false,
+        );
+        assert!(incomplete.iter().all(|group| group.presentation.is_none()));
     }
 
     #[test]

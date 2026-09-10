@@ -30533,7 +30533,7 @@ mod favorite_adjustment_defaults_tests {
                 items_generation: app.items_generation,
                 anchor_idx: 0,
                 accept_rendition: false,
-                phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
+                phase: FsNavigationTargetPhase::awaiting_navigation(0, vec![0]),
             }),
         }));
         // erase_base_cache に dummy ピクセルを入れる必要は無い: マスクが空なので
@@ -30591,7 +30591,7 @@ mod favorite_adjustment_defaults_tests {
                 items_generation: app.items_generation,
                 anchor_idx: 0,
                 accept_rendition: false,
-                phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
+                phase: FsNavigationTargetPhase::awaiting_navigation(0, vec![0]),
             }),
         }));
 
@@ -36351,9 +36351,7 @@ mod pipeline_cache_refactor_tests {
                 items_generation: app.items_generation,
                 anchor_idx: target_idx,
                 accept_rendition: true,
-                phase: FsNavigationTargetPhase::Awaiting {
-                    pages: vec![target_idx],
-                },
+                phase: FsNavigationTargetPhase::awaiting_navigation(target_idx, vec![target_idx]),
             }),
         }));
 
@@ -36417,10 +36415,11 @@ mod pipeline_cache_refactor_tests {
                 items_generation: 30,
                 anchor_idx: 1,
                 accept_rendition: false,
-                phase: FsNavigationTargetPhase::Presenting {
-                    pages: vec![1, 2],
-                    presentation: FsNavigationPresentation::Materialized,
-                },
+                phase: FsNavigationTargetPhase::presenting_navigation(
+                    1,
+                    vec![1, 2],
+                    FsNavigationPresentation::Materialized,
+                ),
             }),
         }));
 
@@ -36445,10 +36444,11 @@ mod pipeline_cache_refactor_tests {
                     items_generation: 40,
                     anchor_idx: 1,
                     accept_rendition: false,
-                    phase: FsNavigationTargetPhase::Ready {
-                        pages: vec![1, 2],
-                        presentation: FsNavigationPresentation::Materialized,
-                    },
+                    phase: FsNavigationTargetPhase::ready_navigation(
+                        1,
+                        vec![1, 2],
+                        FsNavigationPresentation::Materialized,
+                    ),
                 }),
             }));
         });
@@ -36500,10 +36500,11 @@ mod pipeline_cache_refactor_tests {
                     items_generation,
                     anchor_idx,
                     accept_rendition: false,
-                    phase: FsNavigationTargetPhase::Ready {
-                        pages: vec![anchor_idx],
-                        presentation: FsNavigationPresentation::Materialized,
-                    },
+                    phase: FsNavigationTargetPhase::ready_navigation(
+                        anchor_idx,
+                        vec![anchor_idx],
+                        FsNavigationPresentation::Materialized,
+                    ),
                 }),
             })
         };
@@ -36582,9 +36583,7 @@ mod pipeline_cache_refactor_tests {
                 items_generation: generation,
                 anchor_idx: target,
                 accept_rendition: false,
-                phase: FsNavigationTargetPhase::Awaiting {
-                    pages: vec![target],
-                },
+                phase: FsNavigationTargetPhase::awaiting_navigation(target, vec![target]),
             }),
         }));
 
@@ -36640,9 +36639,10 @@ mod pipeline_cache_refactor_tests {
                     items_generation: sibling_generation,
                     anchor_idx: sibling_idx,
                     accept_rendition: false,
-                    phase: FsNavigationTargetPhase::Awaiting {
-                        pages: vec![sibling_idx],
-                    },
+                    phase: FsNavigationTargetPhase::awaiting_navigation(
+                        sibling_idx,
+                        vec![sibling_idx],
+                    ),
                 }),
             }));
         });

@@ -479,6 +479,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::DriveStripped,
     ),
     store(
+        "spread.db",
+        "final_cover_spreads",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    store(
         "view_trim.db",
         "view_trim_books",
         "book_key",
@@ -2525,6 +2532,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mode, 2, "drive 除去キーの見開き設定も移る");
+    }
+
+    #[test]
+    fn final_cover_spread_override_migrates_without_a_legacy_spread_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\Old.zip");
+        let new = PathBuf::from(r"D:\Books\New.zip");
+        let old_key = crate::path_key::normalize(&old);
+        let new_key = crate::path_key::normalize(&new);
+        let conn = open(dir.path(), "spread.db");
+        conn.execute_batch(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE final_cover_spreads (
+                 path TEXT PRIMARY KEY,
+                 preference INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2)",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = open(dir.path(), "spread.db");
+        assert_eq!(
+            conn.query_row(
+                "SELECT preference FROM final_cover_spreads WHERE path = ?1",
+                [&new_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM spreads", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     /// ZIP コンテナ改名: `::` 合成キー (アーカイブ内ページの★等) が prefix 書換され、

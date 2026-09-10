@@ -8820,35 +8820,137 @@ pub(crate) struct FsNavigationDisplayTarget {
 
 impl FsNavigationDisplayTarget {
     pub(crate) fn pages(&self) -> &[usize] {
-        self.phase.pages()
+        self.phase.demand().navigation_pages()
+    }
+
+    pub(crate) fn presentation_pages(&self) -> &[crate::ui_fullscreen::SpreadPageOccurrence] {
+        self.phase.demand().presentation_pages()
+    }
+}
+
+/// One navigation target owns both its stable navigation identity and every
+/// page occurrence required for an atomic presentation. The projections are
+/// private so phase transitions cannot update only one side of the contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsNavigationDisplayDemand {
+    navigation_pages: Vec<usize>,
+    presentation_pages: Vec<crate::ui_fullscreen::SpreadPageOccurrence>,
+}
+
+impl FsNavigationDisplayDemand {
+    pub(crate) fn navigation_only(anchor_idx: usize, pages: Vec<usize>) -> Self {
+        let presentation_pages = pages
+            .iter()
+            .copied()
+            .map(|idx| crate::ui_fullscreen::SpreadPageOccurrence {
+                idx,
+                role: crate::ui_fullscreen::SpreadPageRole::Navigation,
+                navigation_anchor_idx: anchor_idx,
+            })
+            .collect();
+        Self::from_presentation(anchor_idx, presentation_pages)
+            .expect("navigation display demand must contain its anchor")
+    }
+
+    pub(crate) fn from_presentation(
+        anchor_idx: usize,
+        presentation_pages: Vec<crate::ui_fullscreen::SpreadPageOccurrence>,
+    ) -> Option<Self> {
+        if presentation_pages.is_empty()
+            || presentation_pages
+                .iter()
+                .any(|page| page.navigation_anchor_idx != anchor_idx)
+        {
+            return None;
+        }
+        let mut seen_occurrences = std::collections::HashSet::new();
+        let mut seen_indices = std::collections::HashSet::new();
+        if presentation_pages
+            .iter()
+            .any(|page| !seen_occurrences.insert(*page) || !seen_indices.insert(page.idx))
+        {
+            return None;
+        }
+        let navigation_pages = presentation_pages
+            .iter()
+            .filter_map(|page| {
+                (page.role == crate::ui_fullscreen::SpreadPageRole::Navigation).then_some(page.idx)
+            })
+            .collect::<Vec<_>>();
+        if navigation_pages.is_empty()
+            || !navigation_pages.contains(&anchor_idx)
+            || navigation_pages.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return None;
+        }
+        Some(Self {
+            navigation_pages,
+            presentation_pages,
+        })
+    }
+
+    pub(crate) fn navigation_pages(&self) -> &[usize] {
+        &self.navigation_pages
+    }
+
+    pub(crate) fn presentation_pages(&self) -> &[crate::ui_fullscreen::SpreadPageOccurrence] {
+        &self.presentation_pages
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationTargetPhase {
     /// Canonical pages are bound to the stable anchor, but none has been accepted for painting.
-    Awaiting { pages: Vec<usize> },
+    Awaiting { demand: FsNavigationDisplayDemand },
     Ready {
-        pages: Vec<usize>,
+        demand: FsNavigationDisplayDemand,
         presentation: FsNavigationPresentation,
     },
     Presenting {
-        pages: Vec<usize>,
+        demand: FsNavigationDisplayDemand,
         presentation: FsNavigationPresentation,
     },
     /// PDFium/catalog production reached a terminal failure. This does not block
     /// another repeat; on release, full materialization is admitted while the
     /// previous complete unit remains visible.
-    RenditionFailed { pages: Vec<usize> },
+    RenditionFailed { demand: FsNavigationDisplayDemand },
 }
 
 impl FsNavigationTargetPhase {
-    pub(crate) fn pages(&self) -> &[usize] {
+    pub(crate) fn awaiting_navigation(anchor_idx: usize, pages: Vec<usize>) -> Self {
+        Self::Awaiting {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+        }
+    }
+
+    pub(crate) fn ready_navigation(
+        anchor_idx: usize,
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
+    ) -> Self {
+        Self::Ready {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+            presentation,
+        }
+    }
+
+    pub(crate) fn presenting_navigation(
+        anchor_idx: usize,
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
+    ) -> Self {
+        Self::Presenting {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+            presentation,
+        }
+    }
+
+    pub(crate) fn demand(&self) -> &FsNavigationDisplayDemand {
         match self {
-            Self::Awaiting { pages }
-            | Self::Ready { pages, .. }
-            | Self::Presenting { pages, .. }
-            | Self::RenditionFailed { pages } => pages,
+            Self::Awaiting { demand }
+            | Self::Ready { demand, .. }
+            | Self::Presenting { demand, .. }
+            | Self::RenditionFailed { demand } => demand,
         }
     }
 }
@@ -12941,6 +13043,7 @@ pub struct App {
     /// 現在のフォルダの基本ページ構成。表紙あり/なし・LTR/RTL は `spread_db` で
     /// フォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
+    pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
     /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
     pub(crate) spread_shift_anchor_idx: Option<usize>,
@@ -15930,6 +16033,7 @@ impl App {
             reading_history_return_from: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
+            final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -20044,14 +20148,31 @@ impl App {
     /// (ZIP 自身のキー `C:\x.zip` とも衝突しない)。通常フォルダ / 単純 ZIP は従来どおり
     /// `current_folder`。
     pub(crate) fn spread_container_key(&self) -> Option<PathBuf> {
+        self.spread_container_key_with_fallback()
+            .map(|key| key.exact)
+    }
+
+    pub(crate) fn spread_container_key_with_fallback(
+        &self,
+    ) -> Option<crate::spread_db::SpreadContainerKey> {
         if let Some(nav) = self.zip_nav.as_ref() {
-            Some(
-                crate::spread_db::container_key_with_fallback(&nav.tree.zip_path, nav.current())
-                    .exact,
-            )
+            Some(crate::spread_db::container_key_with_fallback(
+                &nav.tree.zip_path,
+                nav.current(),
+            ))
         } else {
-            self.current_folder.clone()
+            self.current_folder
+                .clone()
+                .map(|exact| crate::spread_db::SpreadContainerKey {
+                    exact,
+                    fallback: None,
+                })
         }
+    }
+
+    pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
+        self.final_cover_spread_preference
+            .effective(self.settings.final_cover_spread_enabled)
     }
 
     /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
@@ -20118,6 +20239,9 @@ impl App {
         let db = self.spread_db.as_ref();
         let stored = db
             .map(|db| db.get_state_with_fallback(key, fallback))
+            .unwrap_or_default();
+        self.final_cover_spread_preference = db
+            .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
             .unwrap_or_default();
         let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
@@ -29820,10 +29944,13 @@ impl App {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
             context_id: ViewerContextId,
-            spread_container_path: Option<PathBuf>,
+            spread_container_key: Option<crate::spread_db::SpreadContainerKey>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
+            let (spread_container_path, spread_container_fallback) = spread_container_key
+                .map(|key| (Some(key.exact), key.fallback))
+                .unwrap_or_default();
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
                 context_id,
                 items_generation: index.items_generation,
@@ -29831,6 +29958,7 @@ impl App {
                 legacy_seed_paths: index.legacy_seed_paths,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
+                spread_container_fallback,
                 old_folder_pin_keys,
                 folder_pin_paths: index.folder_pin_paths,
                 folder_pin_aliases: index.folder_pin_aliases,
@@ -29845,12 +29973,12 @@ impl App {
             context_ids.sort_by_key(|id| (*id != main_id, id.serial()));
             for context_id in context_ids {
                 if let Err(error) = self.with_viewer_context(context_id, |app| {
-                    let spread_path = app.spread_container_key();
+                    let spread_key = app.spread_container_key_with_fallback();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
                         context_id,
-                        spread_path,
+                        spread_key,
                         old_folder_pin_keys,
                     ) {
                         requests.push(request);
@@ -29865,12 +29993,12 @@ impl App {
         #[cfg(not(windows))]
         {
             let context_id = ViewerContextId::single_context();
-            let spread_path = self.spread_container_key();
+            let spread_key = self.spread_container_key_with_fallback();
             let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
             if let Some(request) = take_current(
                 &mut self.metadata_import_refresh_index,
                 context_id,
-                spread_path,
+                spread_key,
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
@@ -30318,6 +30446,7 @@ impl App {
             // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
             self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
+            self.final_cover_spread_preference = container.final_cover_spread_preference;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
                 crate::view_trim::ViewTrimApplyMode::Page => {

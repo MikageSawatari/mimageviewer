@@ -2858,6 +2858,46 @@ impl SpreadMode {
 }
 
 // -----------------------------------------------------------------------
+/// Whether the final-cover supplement follows the environment default or is
+/// overridden for the current book container.
+///
+/// This is kept separate from [`SpreadMode`]: changing the supplement must not
+/// materialize or otherwise change a book's inherited spread/flow/direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FinalCoverSpreadPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl FinalCoverSpreadPreference {
+    pub(crate) fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    pub(crate) fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    pub(crate) fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::On),
+            2 => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 // ReadingFlow (フルスクリーン連結方式)
 // -----------------------------------------------------------------------
 
@@ -4255,6 +4295,9 @@ pub struct Settings {
     /// デフォルトの横連結方向
     #[serde(default)]
     pub default_reading_direction: ReadingDirection,
+    /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
+    #[serde(default = "default_true")]
+    pub final_cover_spread_enabled: bool,
     /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
     #[serde(default = "default_spread_page_gap_px")]
     pub spread_page_gap_px: u32,
@@ -6435,6 +6478,7 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
+            final_cover_spread_enabled: true,
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
@@ -12435,6 +12479,27 @@ mod tests {
             SpreadMode::Vertical.next_in_spread_cycle(),
             SpreadMode::Single
         );
+    }
+
+    #[test]
+    fn final_cover_spread_defaults_on_and_book_preference_resolves_explicitly() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.final_cover_spread_enabled);
+        assert!(FinalCoverSpreadPreference::FollowGlobal.effective(true));
+        assert!(!FinalCoverSpreadPreference::FollowGlobal.effective(false));
+        assert!(FinalCoverSpreadPreference::On.effective(false));
+        assert!(!FinalCoverSpreadPreference::Off.effective(true));
+        for preference in [
+            FinalCoverSpreadPreference::FollowGlobal,
+            FinalCoverSpreadPreference::On,
+            FinalCoverSpreadPreference::Off,
+        ] {
+            assert_eq!(
+                FinalCoverSpreadPreference::from_int(preference.to_int()),
+                Some(preference)
+            );
+        }
+        assert_eq!(FinalCoverSpreadPreference::from_int(3), None);
     }
 
     #[test]

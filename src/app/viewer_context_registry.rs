@@ -967,6 +967,7 @@ pub(in crate::app) struct ViewerContextBundle {
     analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
     analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
     spread_mode: crate::settings::SpreadMode,
+    final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     spread_shift_anchor_idx: Option<usize>,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
@@ -1521,6 +1522,7 @@ impl ViewerContextBundle {
             analysis_hist_cache: None,
             analysis_sv_cache: None,
             spread_mode: crate::settings::SpreadMode::default(),
+            final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -1866,6 +1868,7 @@ impl App {
             analysis_hist_cache,
             analysis_sv_cache,
             spread_mode,
+            final_cover_spread_preference,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2120,6 +2123,7 @@ impl App {
         swap_field!(analysis_hist_cache);
         swap_field!(analysis_sv_cache);
         swap_field!(spread_mode);
+        swap_field!(final_cover_spread_preference);
         swap_field!(spread_shift_anchor_idx);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
@@ -2410,6 +2414,7 @@ impl App {
             analysis_hist_cache,
             analysis_sv_cache,
             spread_mode,
+            final_cover_spread_preference,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2703,6 +2708,7 @@ impl App {
             view_trim_dirty_page_overrides,
             view_trim_save_pending,
             spread_mode,
+            final_cover_spread_preference,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2772,6 +2778,7 @@ impl App {
         detached.view_trim_book_settings = self.view_trim_book_settings.clone();
         detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
         detached.spread_mode = self.spread_mode;
+        detached.final_cover_spread_preference = self.final_cover_spread_preference;
         detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
@@ -3656,6 +3663,37 @@ mod tests {
             .unwrap();
             app.with_viewer_context(b, |app| {
                 assert_eq!(app.video_zoom_state, Some(state_b));
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_final_cover_preference_survives_exchange_and_return() {
+        use crate::settings::FinalCoverSpreadPreference;
+
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(715, |app| {
+            app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
+        });
+        let b = app.build_window_context_for_test(716, |app| {
+            app.final_cover_spread_preference = FinalCoverSpreadPreference::Off;
+        });
+
+        for _ in 0..2 {
+            app.with_viewer_context(a, |app| {
+                assert_eq!(
+                    app.final_cover_spread_preference,
+                    FinalCoverSpreadPreference::On
+                );
+            })
+            .unwrap();
+            app.with_viewer_context(b, |app| {
+                assert_eq!(
+                    app.final_cover_spread_preference,
+                    FinalCoverSpreadPreference::Off
+                );
             })
             .unwrap();
         }
