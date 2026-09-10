@@ -1746,7 +1746,7 @@ stillだけがfitted rectを渡し、描画clip・hit・touch correlationを一�
 lifecycle は変更しない。詳細と回帰要件は [実装計画](v3.7.0-input-and-still-seek-plan.md)。
 実アプリ検証は明示了承後のリリース前の枠に残す。
 
-**2026-09-10 §1.197 S3b: native上部ボタンの実描画観測（hover-only実装済み・live未実施）:**
+**2026-09-10 §1.197 S3b: native上部ボタンの実描画観測（hover-only実装済み・live確認済み）:**
 
 利用者指定の親Astraと独立Astraで、既存render ownerに属する診断観測として合意した。
 Solは実装前に入口と前提を再確認する。対象は上部hover入口と実際の
@@ -1772,7 +1772,8 @@ Canvasのgeometry/version照合を上部chrome inventory版から分離した。
 含む前面blocker中はnamed targetを公開しない。
 `NativeTopPanoramaHover`は上端36ptへ実MouseMoveを1件送り、pump/renderのexact receipt後に
 同owner/source/hostのenabled Responseを待つ。診断repaint、click/wheel/key/pan送信は追加しない。
-非対話回帰とportable artifact準備を完了しても、明示了承後の実hover確認までは未実施として残し、
+2026-09-10 10:18の明示了承済みportable実機確認で、このhover-only scenarioはPASSした。
+実行条件・証跡は[自動化設計の検証記録](ui-smoke-automation-plan.md#検証記録)を参照。
 症状修正やzoom/button/panの実機成功の代用にはしない。
 
 **2026-09-08 §1.197 S3b: native zoom wheelの消費所有（実装前の構造合意）:**
