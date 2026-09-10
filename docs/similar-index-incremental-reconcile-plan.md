@@ -2,7 +2,7 @@
 
 ## 範囲と状態（2026-09-11）
 
-第一段階の実装・独立差分レビュー・関連狭域検証は完了し、`98dc41f4b` に保存した。第二段階の DB 読み取り削減も実装・独立差分レビュー・狭域 11 件の検証を終えた。測定用 r4r1 の release build と合成 DB 4,627,166 行・キー長 80/120 UTF-8 bytes の AB/BA は成功した。新方式の sampled peak Private Bytes は約 921/1,137 MiB。親は旧方式の peak より小さいことと「1 GB くらい」という目安を踏まえ、実アプリ全体の未測定という限界を残して現 inventory 表現の採用を承認した。追加 memory redesign/benchmark は行わず、進捗 UI snapshot・全体 gate・確認 build を進める。機能の再有効化や master 統合、リリース完了ではない。
+第一段階は `98dc41f4b`、第二段階の DB 読み取り削減は `aea120cf6`、進捗 UI の検証整備は `efa6f7ba2` に保存した。各独立レビュー、狭域回帰、合成 DB 4,627,166 行・キー長 80/120 UTF-8 bytes の AB/BA、進捗 snapshot、共有全体 gate、normal 確認 build は成功した。新方式の sampled peak Private Bytes は約 921/1,137 MiB。親は旧方式の peak より小さいことと「1 GB くらい」という目安を踏まえ、実アプリ全体の未測定という限界を残して現 inventory 表現の採用を承認した。追加 memory redesign/benchmark は行わない。アプリ起動・実機確認は未実施で、機能の再有効化や master 統合、リリース完了ではない。
 作業は `codex/similar-index-incremental-reconcile`、基点は `77a6f270e`。
 master の休止版 `3f5481c14` は取り込まない。統合・再有効化・リリースは別判断とし、後の統合では `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
 
@@ -292,3 +292,22 @@ Phase 2 を `aea120cf6` に保存してから開始。`favorites_editor` は pri
 全 variant/stage・3 Degraded reason・disabled を確認する純粋テスト 2 件、snapshot 生成 1 件と通常比較 1 件が成功。glyph 0、fmt/diff check 0。root は `tests/snapshots/favorites_similar_index_progress_dark.png` を目視し、8 行の無効/Scanning/Pruning/待機 2 種/未完了 3 理由が読め、欠け・tofu・意図外の折返しがないことを確認した。証跡は `target/similar-index-incremental-ui-20260911/freeze-r2/` と同親 directory の各 log/exit 記録。全体 gate と normal 確認 build は独立最終検収後に実施する。
 
 独立 Sol / xhigh の最終差分検収も P1/P2 なしで承認。`freeze-r2/review-approval.md` SHA256 は `F8AF863C36ABCB3A3BFCC37AB99F1A99746C0AD059D8711C47D45C0085194DCE`。既存表示契約・pure mapper・実描画経路・検証ログと目視結果を照合済み。
+
+### 共有全体 gate
+
+UI 検証を `efa6f7ba2` に保存し clean を確認後、`scripts/test-full.ps1 -SuppressCrashDialogs` を jobs=1 で実行した。2026-09-11 07:18:32–07:32:58 JST、native exit 0 / `[test-full] PASS`。本体 lib は 8,120 passed / 0 failed / 44 ignored（手動測定等）、UI integration snapshot は 48 passed。workspace・統合・doc・補助 bin と vendor egui/egui-wgpu/eframe まで全成功。process-local error mode も元の `0x00008001` に復元された。
+
+root もログを確認。証跡は `target/similar-index-incremental-final-gate-20260911/test-full.log`、SHA256 `90C5213BD21C15992D65CB91E76866FE1B39EA536D24BD7615E29CC5234BF721` と `test-full.exit.txt`。source は固定、アプリ起動・本番データ操作は行っていない。gate 後に staged core/remote resident と cargo/rustc/link が 0 と確認し、07:33:42 JST から通常 feature の `scripts/build-dev.ps1` を実行中。
+
+### 確認 build と最終引渡し
+
+`scripts/build-dev.ps1` は 07:33:42–07:45:17 JST、native exit 0 で完了。jobs=1、通常 feature（portable/test-script なし）で core と Remote を同じ source `efa6f7ba2` から構築した。以後の変更は本書の検証記録のみ。root は DONE ログと成果物の size/mtime を照合した。
+
+| 成果物 | bytes | 更新時刻 UTC | SHA256 |
+| --- | --- | --- | --- |
+| `target/dev-runtime/mimageviewer-core.exe` | 309,817,856 | 2026-09-10 22:44:06.7532279 | `F5DD19766E6264AAA1C52E08D9FA88E8B6E8DFCFBC8CB30B05A2662B0C83F2BD` |
+| `target/dev-runtime/mimageviewer-remote.exe` | 12,197,376 | 2026-09-10 22:45:16.8048088 | `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA` |
+
+同 final-gate artifact の `build-dev.preflight.txt` / `.stdout.log` / `.stderr.log` / `.exit.txt` / `.result.json` に実行条件と結果を保存した。終了後 staged core/remote resident と cargo/rustc/link は 0。エージェントはアプリを起動せず、本番 DB/APPDATA を操作していない。
+
+残件は実機での進捗・監視収束・取消・操作応答確認、実アプリ全体 peak の未測定という限界、および親での休止版との統合・再有効化判断。全体 gate と確認 build は完了しており、再有効化や実機確認の成功とは扱わない。利用者が通常 profile で確認する場合のコマンドは、repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため、installed/tray 常駐版を先に終了する。今回このコマンドをエージェントは実行していない。
