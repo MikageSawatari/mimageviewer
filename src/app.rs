@@ -12077,9 +12077,9 @@ pub struct App {
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
-    // auto_index_similar=true のお気に入りだけを対象にし、既存 favorite watcher の
-    // 通知を共有してバックグラウンドで差分を照合する。
-    pub(crate) similar_index: crate::similar_index::SimilarIndexManager,
+    // 別バージョン索引 service の runtime owner。`None` は UI と全 producer に共通の
+    // Paused capability を表し、保存済み auto_index_similar の値やデータは変更しない。
+    pub(crate) similar_index: Option<crate::similar_index::SimilarIndexManager>,
 
     /// 名前索引 Supervisor のアクティブ handle (favorite_id → handle)。
     ///
@@ -15472,6 +15472,12 @@ impl App {
         keymap.install_global_native_video_shortcuts();
         let creative_lut_library =
             crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
+        let similar_feature_capability = crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY;
+        let similar_index = crate::similar_index::SimilarIndexManager::new_if_enabled(
+            similar_feature_capability,
+            crate::data_dir::get(),
+            notify_book_query_change,
+        );
 
         let mut app = Self {
             address: String::new(),
@@ -15697,10 +15703,7 @@ impl App {
             fav_add_auto_index_thumbs: false,
             fav_add_auto_index_similar: false,
             indexer_manager,
-            similar_index: crate::similar_index::SimilarIndexManager::new_with_book_query_notifier(
-                crate::data_dir::get(),
-                notify_book_query_change,
-            ),
+            similar_index,
             name_index_supervisors: std::collections::HashMap::new(),
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
@@ -21516,35 +21519,73 @@ impl App {
         favorite_path: &std::path::Path,
         new_on: bool,
     ) {
-        self.similar_index.configure(
-            &self.settings.favorites,
-            self.pdf_passwords.clone(),
-            Some(Arc::clone(&self.activity_gate)),
-        );
-        if !new_on {
-            self.similar_index.purge_disabled_favorite(favorite_path);
+        if self.similar_feature_capability().is_enabled()
+            && let Some(similar_index) = self.similar_index.as_ref()
+        {
+            similar_index.configure(
+                &self.settings.favorites,
+                self.pdf_passwords.clone(),
+                Some(Arc::clone(&self.activity_gate)),
+            );
+            if !new_on {
+                similar_index.purge_disabled_favorite(favorite_path);
+            }
         }
+        self.sync_shared_favorite_indexers();
+    }
+
+    /// Reflect favorite changes into the ordinary metadata watcher even when the optional
+    /// alternate-version service is paused.
+    pub(crate) fn sync_shared_favorite_indexers(&mut self) {
         if let Some(manager) = self.indexer_manager.as_mut() {
             manager.sync_with_favorites(&self.settings.favorites);
         }
     }
 
     pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
-        self.similar_index.progress()
+        self.similar_index
+            .as_ref()
+            .map_or(crate::similar_index::IndexProgress::Idle, |index| {
+                index.progress()
+            })
+    }
+
+    pub(crate) fn similar_feature_capability(
+        &self,
+    ) -> crate::similar_index::SimilarFeatureCapability {
+        if self.similar_index.is_some() {
+            crate::similar_index::SimilarFeatureCapability::Enabled
+        } else {
+            crate::similar_index::SimilarFeatureCapability::Paused
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_similar_feature_for_test(&mut self) {
+        if self.similar_index.is_none() {
+            self.similar_index = Some(crate::similar_index::SimilarIndexManager::new(
+                crate::data_dir::get(),
+            ));
+        }
     }
 
     pub(crate) fn query_similar_item(
         &self,
         item: &GridItem,
     ) -> Arc<crate::similar_index::ItemQuery> {
+        let Some(similar_index) = self.similar_index.as_ref() else {
+            return Arc::new(crate::similar_index::ItemQuery::NotIndexed);
+        };
         let Some(key) = similar_index_item_key(item) else {
             return Arc::new(crate::similar_index::ItemQuery::NotIndexed);
         };
-        self.similar_index.query_item(&key)
+        similar_index.query_item(&key)
     }
 
     pub(crate) fn similar_query_results_are_stale(&self) -> bool {
-        self.similar_index.query_results_are_stale()
+        self.similar_index
+            .as_ref()
+            .is_some_and(|index| index.query_results_are_stale())
     }
 
     pub(crate) fn query_similar_book(
@@ -21552,11 +21593,15 @@ impl App {
         item: &GridItem,
     ) -> std::sync::Arc<crate::similar_index::BookQuery> {
         let client = self.similar_panel.book_query_client();
-        let Some(key) = similar_index_container_key(item) else {
-            self.similar_index.withdraw_book_query(client);
+        let Some(similar_index) = self.similar_index.as_ref() else {
+            client.withdraw();
             return std::sync::Arc::new(crate::similar_index::BookQuery::NotBook);
         };
-        self.similar_index.query_book(client, &key)
+        let Some(key) = similar_index_container_key(item) else {
+            similar_index.withdraw_book_query(client);
+            return std::sync::Arc::new(crate::similar_index::BookQuery::NotBook);
+        };
+        similar_index.query_book(client, &key)
     }
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
@@ -21568,12 +21613,17 @@ impl App {
         #[cfg(windows)]
         self.kick_off_vst3_startup_load();
         let favorites = self.settings.favorites.clone();
-        self.similar_index.configure(
-            &favorites,
-            self.pdf_passwords.clone(),
-            Some(Arc::clone(&self.activity_gate)),
-        );
-        let similar_notifier = self.similar_index.notifier();
+        if let Some(similar_index) = self.similar_index.as_ref() {
+            similar_index.configure(
+                &favorites,
+                self.pdf_passwords.clone(),
+                Some(Arc::clone(&self.activity_gate)),
+            );
+        }
+        let similar_notifier = self
+            .similar_index
+            .as_ref()
+            .map(crate::similar_index::SimilarIndexManager::notifier);
         let speed = self.settings.indexer_speed_profile;
         let excluded_roots = vec![self.settings.books_root_path()];
         let activity_gate = Arc::clone(&self.activity_gate);
@@ -21610,7 +21660,9 @@ impl App {
                 self.settings.indexer_speed_profile,
                 Arc::clone(&self.activity_gate),
                 vec![self.settings.books_root_path()],
-                self.similar_index.notifier(),
+                self.similar_index
+                    .as_ref()
+                    .map(crate::similar_index::SimilarIndexManager::notifier),
                 Some(hook),
             );
             self.startup_done = true;
@@ -22328,10 +22380,12 @@ impl App {
                 }
             }
         }
-        if matches!(
-            self.similar_index.progress(),
-            crate::similar_index::IndexProgress::Running(_)
-        ) {
+        if self.similar_index.as_ref().is_some_and(|index| {
+            matches!(
+                index.progress(),
+                crate::similar_index::IndexProgress::Running(_)
+            )
+        }) {
             return true;
         }
         false

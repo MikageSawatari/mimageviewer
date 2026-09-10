@@ -13741,10 +13741,13 @@ mod tests {
         e.auto_index_metadata = true;
         e.auto_index_thumbs = false;
         e.auto_index_similar = true;
+        // Editing an unrelated visible field while the similar toggle is hidden must preserve
+        // the saved value for a future release that re-enables the capability.
+        e.name = "renamed".to_owned();
         let json = serde_json::to_string(&e).unwrap();
         let back: FavoriteEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, e.id);
-        assert_eq!(back.name, "x");
+        assert_eq!(back.name, "renamed");
         assert!(back.auto_index_structure);
         assert!(back.auto_index_metadata);
         assert!(!back.auto_index_thumbs);

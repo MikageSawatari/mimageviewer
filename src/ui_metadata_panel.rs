@@ -2170,7 +2170,13 @@ impl App {
         ) else {
             return false;
         };
-        self.similar_panel.retain_book_query();
+        let similar_feature_capability = self.similar_feature_capability();
+        project_metadata_panel_tab(similar_feature_capability, &mut self.similar_panel.tab);
+        if similar_feature_capability.is_enabled() {
+            self.similar_panel.retain_book_query();
+        } else {
+            self.similar_panel.withdraw_book_query();
+        }
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
@@ -2181,10 +2187,16 @@ impl App {
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
                 ui.set_width(metadata_scroll_content_width(ui, inner_rect.width()));
-                draw_metadata_panel_tabs(ui, &mut self.similar_panel.tab);
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(12.0);
+                if similar_feature_capability.is_enabled() {
+                    draw_metadata_panel_tabs(
+                        ui,
+                        &mut self.similar_panel.tab,
+                        similar_feature_capability,
+                    );
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                }
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
@@ -2224,6 +2236,8 @@ impl App {
         let tweet_info = self.get_current_tweet_info();
         let sidecar_info = self.get_current_sidecar();
         let current_palette = self.current_fullscreen_color_palette();
+        let similar_feature_capability = self.similar_feature_capability();
+        project_metadata_panel_tab(similar_feature_capability, &mut self.similar_panel.tab);
         // Collect CPU completions before drawing. Which of them may upload, and which queued jobs
         // may start, is decided after the frame has produced its visible-card demand set.
         self.similar_panel.begin_thumbnail_frame();
@@ -2320,20 +2334,33 @@ impl App {
             .show(&mut child_ui, |ui| {
                 ui.set_width(metadata_scroll_content_width(ui, inner_rect.width()));
 
-                draw_metadata_panel_tabs(ui, &mut self.similar_panel.tab);
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(8.0);
+                if similar_feature_capability.is_enabled() {
+                    draw_metadata_panel_tabs(
+                        ui,
+                        &mut self.similar_panel.tab,
+                        similar_feature_capability,
+                    );
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                }
 
                 // The close button above changes the live panel state but this draw closure still
                 // runs for the current pass. Recheck demand before accepting a fresh book query.
-                let book_query_demanded = self.similar_panel.tab == MetadataPanelTab::Similar
-                    && self.fs_info_panel.visible(
+                let book_query_demanded = metadata_panel_similar_demanded(
+                    similar_feature_capability,
+                    self.similar_panel.tab,
+                    self.fs_info_panel.visible(
                         self.settings.fullscreen_side_panel_mode,
                         self.fullscreen_tag_picker_open,
-                    );
+                    ),
+                );
                 if !book_query_demanded {
-                    self.similar_panel.retain_book_query();
+                    if similar_feature_capability.is_enabled() {
+                        self.similar_panel.retain_book_query();
+                    } else {
+                        self.similar_panel.withdraw_book_query();
+                    }
                 }
 
                 if book_query_demanded {
@@ -2386,11 +2413,12 @@ impl App {
                             Some(self.query_similar_book(item))
                         },
                     );
-                    let mut results_are_stale = self.similar_query_results_are_stale();
+                    let results_are_stale = self.similar_query_results_are_stale();
                     #[cfg(test)]
-                    if let Some(override_value) = self.similar_panel.results_are_stale_override {
-                        results_are_stale = override_value;
-                    }
+                    let results_are_stale = self
+                        .similar_panel
+                        .results_are_stale_override
+                        .unwrap_or(results_are_stale);
                     // Fresh Ready results are the only indexed freshness signal for a preview.
                     // Preparing falls back to last_ready below, and a missing hit is not proof that
                     // the underlying resource was deleted.
@@ -3495,7 +3523,69 @@ fn tag_picker_tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui
     )
 }
 
-fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
+fn project_metadata_panel_tab(
+    capability: crate::similar_index::SimilarFeatureCapability,
+    tab: &mut MetadataPanelTab,
+) {
+    if !capability.is_enabled() {
+        *tab = MetadataPanelTab::Info;
+    }
+}
+
+fn metadata_panel_similar_demanded(
+    capability: crate::similar_index::SimilarFeatureCapability,
+    tab: MetadataPanelTab,
+    panel_visible: bool,
+) -> bool {
+    capability.is_enabled() && tab == MetadataPanelTab::Similar && panel_visible
+}
+
+#[cfg(test)]
+mod paused_metadata_panel_tests {
+    use super::{MetadataPanelTab, metadata_panel_similar_demanded, project_metadata_panel_tab};
+    use crate::similar_index::SimilarFeatureCapability;
+
+    #[test]
+    fn paused_capability_projects_stale_similar_selection_to_info_without_query_demand() {
+        let mut tab = MetadataPanelTab::Similar;
+        project_metadata_panel_tab(SimilarFeatureCapability::Paused, &mut tab);
+
+        assert_eq!(tab, MetadataPanelTab::Info);
+        assert!(!metadata_panel_similar_demanded(
+            SimilarFeatureCapability::Paused,
+            MetadataPanelTab::Similar,
+            true,
+        ));
+        assert!(!metadata_panel_similar_demanded(
+            SimilarFeatureCapability::Paused,
+            tab,
+            true,
+        ));
+    }
+
+    #[test]
+    fn enabled_capability_retains_the_existing_similar_content_path() {
+        let mut tab = MetadataPanelTab::Similar;
+        project_metadata_panel_tab(SimilarFeatureCapability::Enabled, &mut tab);
+
+        assert_eq!(tab, MetadataPanelTab::Similar);
+        assert!(metadata_panel_similar_demanded(
+            SimilarFeatureCapability::Enabled,
+            tab,
+            true,
+        ));
+    }
+}
+
+fn draw_metadata_panel_tabs(
+    ui: &mut egui::Ui,
+    tab: &mut MetadataPanelTab,
+    capability: crate::similar_index::SimilarFeatureCapability,
+) {
+    project_metadata_panel_tab(capability, tab);
+    if !capability.is_enabled() {
+        return;
+    }
     const TAB_HEIGHT: f32 = 24.0;
     const TAB_GAP: f32 = 4.0;
     let width = ui.available_width().max(1.0);
@@ -4765,6 +4855,26 @@ pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
 }
 
 pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {
+    draw_metadata_panel_snapshot_fixture_with_capability(
+        ui,
+        similar_selected,
+        crate::similar_index::SimilarFeatureCapability::Enabled,
+    );
+}
+
+pub fn draw_paused_metadata_panel_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_metadata_panel_snapshot_fixture_with_capability(
+        ui,
+        true,
+        crate::similar_index::SimilarFeatureCapability::Paused,
+    );
+}
+
+fn draw_metadata_panel_snapshot_fixture_with_capability(
+    ui: &mut egui::Ui,
+    similar_selected: bool,
+    capability: crate::similar_index::SimilarFeatureCapability,
+) {
     ui.set_width(360.0);
     apply_metadata_panel_dark_widget_style(ui);
     // 本番と同じ scroll 構成で描く。ここを省くと、**溝の有無で幅が動く**という当の症状が
@@ -4785,11 +4895,14 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     } else {
                         MetadataPanelTab::Info
                     };
-                    draw_metadata_panel_tabs(ui, &mut tab);
-                    ui.add_space(4.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    if !similar_selected {
+                    project_metadata_panel_tab(capability, &mut tab);
+                    if capability.is_enabled() {
+                        draw_metadata_panel_tabs(ui, &mut tab, capability);
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                    if tab == MetadataPanelTab::Info {
                         ui.label(
                             egui::RichText::new("画像情報")
                                 .color(egui::Color32::WHITE)

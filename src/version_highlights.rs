@@ -192,6 +192,36 @@ fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     });
 }
 
+const V3_8_HIGHLIGHTS_WITH_SIMILAR: &[HighlightItem] = &[
+    HighlightItem {
+        title: "同じ絵の別バージョンを探せます",
+        body: "お気に入りごとに「別バージョン索引」を ON にすると (既定は OFF)、フルスクリーン右パネルの「類似」で、いま見ている画像と同じ絵を別の大きさ・形式から探せます。画像単位と本単位の両方で探せ、本単位ではどのページが一致しているかも表示します。",
+    },
+    HighlightItem {
+        title: "画像・動画の余白色を選べます",
+        body: "静止画・本の画像の外側、静止画サムネイル列の空欄、動画の映像の外側に使う色を、黒 / 灰 / 白と任意の色から選べます (既定は黒のままです)。環境設定 → 表示 → 閲覧表示 にあります。",
+    },
+    HighlightItem {
+        title: "動画のマウスボタンへシークを割り当てられます",
+        body: "戻る / 進むボタンとホイールクリックへ、小・中・大のシークを割り当てられます。押し続けると繰り返します。操作カスタマイズから設定します。",
+    },
+];
+
+const V3_8_HIGHLIGHTS_WITHOUT_SIMILAR: &[HighlightItem] = &[
+    V3_8_HIGHLIGHTS_WITH_SIMILAR[1],
+    V3_8_HIGHLIGHTS_WITH_SIMILAR[2],
+];
+
+const fn v3_8_highlights(
+    capability: crate::similar_index::SimilarFeatureCapability,
+) -> &'static [HighlightItem] {
+    if capability.is_enabled() {
+        V3_8_HIGHLIGHTS_WITH_SIMILAR
+    } else {
+        V3_8_HIGHLIGHTS_WITHOUT_SIMILAR
+    }
+}
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -807,20 +837,7 @@ const TABLE: &[VersionHighlights] = &[
             title: "見開きの最後に表紙を添えるようになりました",
             body: "「表紙あり」の見開きで先頭と末尾がどちらも単独ページになる本では、最後のページの隣へ先頭の表紙を並べます。表示だけの追加で、ページ数・ページ送り・シークバー・読書位置は変わりません。既定は ON です。環境設定 → 表示 → 閲覧表示 で全体を切り替えられ、本ごとにはフルスクリーンの表示モードメニューから選べます。",
         }],
-        highlights: &[
-            HighlightItem {
-                title: "同じ絵の別バージョンを探せます",
-                body: "お気に入りごとに「別バージョン索引」を ON にすると (既定は OFF)、フルスクリーン右パネルの「類似」で、いま見ている画像と同じ絵を別の大きさ・形式から探せます。画像単位と本単位の両方で探せ、本単位ではどのページが一致しているかも表示します。",
-            },
-            HighlightItem {
-                title: "画像・動画の余白色を選べます",
-                body: "静止画・本の画像の外側、静止画サムネイル列の空欄、動画の映像の外側に使う色を、黒 / 灰 / 白と任意の色から選べます (既定は黒のままです)。環境設定 → 表示 → 閲覧表示 にあります。",
-            },
-            HighlightItem {
-                title: "動画のマウスボタンへシークを割り当てられます",
-                body: "戻る / 進むボタンとホイールクリックへ、小・中・大のシークを割り当てられます。押し続けると繰り返します。操作カスタマイズから設定します。",
-            },
-        ],
+        highlights: v3_8_highlights(crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY),
     },
 ];
 
@@ -1001,6 +1018,38 @@ mod tests {
         assert!(notice.body.contains("前方 3・後方 2"));
         assert!(notice.body.contains("旧既定の前方 2"));
         assert!(notice.body.contains("保存済みの後方値は変更しません"));
+    }
+
+    #[test]
+    fn v3_8_highlights_follow_the_shared_similar_feature_capability() {
+        let paused = v3_8_highlights(crate::similar_index::SimilarFeatureCapability::Paused);
+        assert_eq!(paused.len(), 2);
+        assert!(
+            paused
+                .iter()
+                .all(|item| !item.title.contains("別バージョン"))
+        );
+        assert!(paused.iter().any(|item| item.title.contains("余白色")));
+        assert!(
+            paused
+                .iter()
+                .any(|item| item.title.contains("マウスボタン"))
+        );
+
+        let enabled = v3_8_highlights(crate::similar_index::SimilarFeatureCapability::Enabled);
+        assert_eq!(enabled.len(), 3);
+        assert!(
+            enabled
+                .iter()
+                .any(|item| item.title.contains("別バージョン"))
+        );
+        let shipped = table().last().unwrap().highlights;
+        assert_eq!(shipped.len(), paused.len());
+        assert!(
+            shipped
+                .iter()
+                .all(|item| !item.title.contains("別バージョン"))
+        );
     }
 
     #[test]

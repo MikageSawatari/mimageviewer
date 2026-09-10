@@ -24,6 +24,26 @@ use crate::similar_image::{
 use crate::similar_search_array::{self, SearchRecord, SearchSnapshot};
 use image::GenericImageView;
 
+/// Whether the alternate-version index is exposed and allowed to start.
+///
+/// The product constant is the single release switch.  Tests that exercise the
+/// retained implementation pass `Enabled` explicitly instead of changing the
+/// shipped policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SimilarFeatureCapability {
+    Enabled,
+    Paused,
+}
+
+impl SimilarFeatureCapability {
+    pub(crate) const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+pub(crate) const PRODUCT_SIMILAR_FEATURE_CAPABILITY: SimilarFeatureCapability =
+    SimilarFeatureCapability::Paused;
+
 /// §9.5 の単体画像帯。いずれも実測済みで、索引ジョブの採否には使わない。
 pub const NEARLY_IDENTICAL_MAX_DISTANCE: u32 = 8;
 pub const OTHER_VERSION_MAX_DISTANCE: u32 = 48;
@@ -440,6 +460,16 @@ struct ItemQueryTestHook {
 }
 
 impl SimilarIndexManager {
+    pub(crate) fn new_if_enabled(
+        capability: SimilarFeatureCapability,
+        data_dir: PathBuf,
+        notify_book_query_change: impl Fn() + Send + Sync + 'static,
+    ) -> Option<Self> {
+        capability
+            .is_enabled()
+            .then(|| Self::new_with_book_query_notifier(data_dir, notify_book_query_change))
+    }
+
     /// DB を開かない軽量 constructor。起動時 I/O を増やさない。
     pub fn new(data_dir: PathBuf) -> Self {
         Self::new_with_book_query_notifier(data_dir, || {})
@@ -4114,7 +4144,61 @@ pub(crate) fn offer_thumbnail_raster(
     image: &image::DynamicImage,
     source_dims: (u32, u32),
 ) {
-    let Some((db, enabled_roots)) = prefill_target() else {
+    offer_thumbnail_raster_with_capability(
+        PRODUCT_SIMILAR_FEATURE_CAPABILITY,
+        path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        image,
+        source_dims,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn offer_thumbnail_raster_with_capability(
+    capability: SimilarFeatureCapability,
+    path: &Path,
+    zip_entry: Option<&str>,
+    pdf_page: Option<u32>,
+    mtime: i64,
+    file_size: i64,
+    image: &image::DynamicImage,
+    source_dims: (u32, u32),
+) {
+    offer_thumbnail_raster_with_target_resolver(
+        capability,
+        path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        image,
+        source_dims,
+        prefill_target,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn offer_thumbnail_raster_with_target_resolver(
+    capability: SimilarFeatureCapability,
+    path: &Path,
+    zip_entry: Option<&str>,
+    pdf_page: Option<u32>,
+    mtime: i64,
+    file_size: i64,
+    image: &image::DynamicImage,
+    source_dims: (u32, u32),
+    resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)>,
+) {
+    // This direct product gate is intentional.  A stale process-global test registration (or a
+    // future accidental manager construction) must not turn ordinary thumbnail decoding into
+    // similar-index signature work or DB writes while the feature is paused.
+    if !capability.is_enabled() {
+        return;
+    }
+    let Some((db, enabled_roots)) = resolve_target() else {
         return;
     };
     let prepared = match prepare_thumbnail_prefill(
@@ -4906,6 +4990,21 @@ mod tests {
     }
 
     #[test]
+    fn paused_capability_does_not_construct_the_optional_service_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("product-data");
+
+        let manager = SimilarIndexManager::new_if_enabled(
+            SimilarFeatureCapability::Paused,
+            data_dir.clone(),
+            || {},
+        );
+
+        assert!(manager.is_none());
+        assert!(!data_dir.exists());
+    }
+
+    #[test]
     fn thumbnail_prefill_accepts_only_an_already_canonical_sized_raster() {
         assert!(!raster_is_large_enough_for_canonical_proxy(
             SimilarImageFormat::Jpeg,
@@ -4932,6 +5031,31 @@ mod tests {
             (1024, 768),
             (1024, 768),
         ));
+    }
+
+    #[test]
+    fn paused_product_prefill_rejects_before_resolving_or_touching_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("already-decoded.png");
+        let image = image::DynamicImage::new_rgba8(1024, 1024);
+        let resolver_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        offer_thumbnail_raster_with_target_resolver(
+            SimilarFeatureCapability::Paused,
+            &path,
+            None,
+            None,
+            10,
+            20,
+            &image,
+            (1024, 1024),
+            || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                panic!("paused product prefill must not resolve a stale process-global target")
+            },
+        );
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

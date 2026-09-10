@@ -6548,15 +6548,45 @@ pub(crate) mod phase_c_support {
     }
 
     pub(crate) fn setup_app() -> AppTestEnv {
+        setup_app_with_similar_feature(true)
+    }
+
+    pub(crate) fn setup_paused_similar_app() -> AppTestEnv {
+        setup_app_with_similar_feature(false)
+    }
+
+    pub(crate) fn setup_paused_similar_app_with_fixture(
+        settings: crate::settings::Settings,
+        prepare_data_dir: impl FnOnce(&std::path::Path),
+    ) -> AppTestEnv {
+        setup_app_with_options(false, Some(settings), prepare_data_dir)
+    }
+
+    fn setup_app_with_similar_feature(enable_similar: bool) -> AppTestEnv {
+        setup_app_with_options(enable_similar, None, |_| {})
+    }
+
+    fn setup_app_with_options(
+        enable_similar: bool,
+        settings: Option<crate::settings::Settings>,
+        prepare_data_dir: impl FnOnce(&std::path::Path),
+    ) -> AppTestEnv {
         let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
+        prepare_data_dir(tmp.path());
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
         let guard = OverrideGuard;
         let config = AppTestConfig {
             data_dir: tmp.path().to_path_buf(),
-            settings: None,
+            settings,
         };
         let mut app = App::new_for_test(config);
+        if enable_similar {
+            // Product v3.8 keeps the optional similar service paused.  The long-standing behavior
+            // tests below opt into the retained implementation explicitly so they continue to
+            // cover its ownership and lifecycle for a future re-enable.
+            app.enable_similar_feature_for_test();
+        }
         app.settings.first_setup_completed = true;
         // `data_dir` の差し替えだけでは製本ルートは隔離されない。`book_root` が None のままだと
         // `settings_books_root` が既定 (= 利用者の実ピクチャフォルダ) を返し、そこへ本フォルダを
@@ -6569,6 +6599,111 @@ pub(crate) mod phase_c_support {
             tmp,
             _lock: lock,
         }
+    }
+}
+
+#[cfg(test)]
+mod paused_similar_feature_tests {
+    use super::phase_c_support::{setup_paused_similar_app, setup_paused_similar_app_with_fixture};
+    use super::*;
+
+    #[test]
+    fn product_app_owns_no_similar_service_and_returns_terminal_neutral_results() {
+        let app = setup_paused_similar_app();
+        let item = GridItem::Image(PathBuf::from(r"C:\Pictures\paused.png"));
+
+        assert_eq!(
+            app.similar_feature_capability(),
+            crate::similar_index::SimilarFeatureCapability::Paused
+        );
+        assert!(app.similar_index.is_none());
+        assert_eq!(
+            app.similar_index_progress(),
+            crate::similar_index::IndexProgress::Idle
+        );
+        assert!(!app.similar_query_results_are_stale());
+        assert_eq!(
+            app.query_similar_item(&item).as_ref(),
+            &crate::similar_index::ItemQuery::NotIndexed
+        );
+        assert_eq!(
+            app.query_similar_book(&item).as_ref(),
+            &crate::similar_index::BookQuery::NotBook
+        );
+        assert_eq!(
+            app.similar_panel.book_query_demand_for_test(),
+            crate::similar_book_query::BookQueryDemandSnapshot::Unbound,
+            "paused queries never bind a client to the absent executor"
+        );
+    }
+
+    #[test]
+    fn paused_app_preserves_saved_true_and_existing_similar_store_across_all_public_entries() {
+        let favorite_root = PathBuf::from(r"C:\Pictures\paused-favorite");
+        let mut favorite = crate::settings::FavoriteEntry::new(
+            "saved similar favorite".to_owned(),
+            favorite_root.clone(),
+        );
+        favorite.auto_index_similar = true;
+        let favorite_id = favorite.id;
+        let mut settings = crate::settings::Settings::default();
+        settings.favorites.push(favorite);
+
+        const DB_SENTINEL: &[u8] = b"paused-invalid-existing-similar-db";
+        const BASE_SENTINEL: &[u8] = b"paused-invalid-existing-similar-base";
+        let mut app = setup_paused_similar_app_with_fixture(settings, |data_dir| {
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(
+                crate::similar_db::SimilarDb::db_path_at(data_dir),
+                DB_SENTINEL,
+            )
+            .unwrap();
+            std::fs::write(
+                crate::similar_search_array::base_path(data_dir),
+                BASE_SENTINEL,
+            )
+            .unwrap();
+        });
+        let db_path = crate::similar_db::SimilarDb::db_path_at(app.tmp.path());
+        let base_path = crate::similar_search_array::base_path(app.tmp.path());
+        let item = GridItem::Image(favorite_root.join("sample.png"));
+
+        assert!(app.similar_index.is_none());
+        assert!(app.settings.favorites[0].auto_index_similar);
+        app.sync_shared_favorite_indexers();
+        app.apply_favorite_similar_index_change(&favorite_root, false);
+        assert_eq!(
+            app.query_similar_item(&item).as_ref(),
+            &crate::similar_index::ItemQuery::NotIndexed
+        );
+        assert_eq!(
+            app.query_similar_book(&item).as_ref(),
+            &crate::similar_index::BookQuery::NotBook
+        );
+        crate::similar_index::offer_thumbnail_raster(
+            &favorite_root.join("sample.png"),
+            None,
+            None,
+            7,
+            9,
+            &image::DynamicImage::new_rgba8(1, 1),
+            (1, 1),
+        );
+
+        app.settings.favorites[0].name = "ordinary edit".to_owned();
+        assert!(app.settings.favorites[0].auto_index_similar);
+        assert!(app.settings.save_checked());
+        let reloaded = crate::settings::Settings::load();
+        let reloaded_favorite = reloaded
+            .favorites
+            .iter()
+            .find(|favorite| favorite.id == favorite_id)
+            .expect("the favorite remains saved");
+        assert_eq!(reloaded_favorite.name, "ordinary edit");
+        assert!(reloaded_favorite.auto_index_similar);
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), DB_SENTINEL);
+        assert_eq!(std::fs::read(&base_path).unwrap(), BASE_SENTINEL);
     }
 }
 

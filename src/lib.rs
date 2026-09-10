@@ -275,7 +275,8 @@ mod ui_main;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
-    draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
+    draw_paused_metadata_panel_snapshot_fixture, draw_similar_panel_snapshot_fixture,
+    draw_similar_states_snapshot_fixture,
 };
 pub mod ui_music_panels;
 pub mod ui_music_spectrum;
