@@ -451,3 +451,25 @@ S3b hover-only実装を完了。独立Solの最終検収は重要指摘なし。
 診断portable SHA256 `2837643A6E8F3913BECCA0F3413664F5969531EAB19BAE45346D5B46853A86EE`、fingerprint `00a73a21d188762799add761b04f08bca452a69d0dcb271b14dd8021efb4f2fa` を準備済み。通常統合build `4087876E...` は保持。アプリ/UI/SendInputは実行していない。NativeTopPanoramaHoverはlive pendingであり、クリック・zoom・panやthumbnail pixel出力の検証済みとは扱わない。
 
 コミットはS3b candidate10pathと親台帳を対象にする。ui-smoke.ps1は既存idle198差分を残し、`target/next-version-work/logs/s3b-ui-smoke-isolation/ui-smoke-s3b-only-index-ready.patch`（SHA E5EDBDEEF71A726DA4508179A02667CD85C325C89E88E67E28DC114346B4849B）だけをindexへ適用する。既存dirtyを全addしない。実機suiteの具体了承は引き続き回答待ち。
+
+## 利用者確認と通常版の索引作成中の並行検証
+
+利用者が統合確認buildの動画stripの色は大丈夫と確認。類似本検索は通常APPDATA版で索引作成中。通常版を動かしたまま別data-dirで実機検証可能かとの問い合わせを受け、single_instanceのdata-dir別mutex/activation/pipe分離とdiagnostic portable経路をコード確認した。使用するのは既定のtarget/portable-smoke/mimageviewer.exeと専用dataであり、通常版をエージェントが起動/停止したり通常profileを試験へ転用しない。build-portable -SmokeTestScriptは通常processの停止blockを通らず、runnerの終了処理は自身が起動したProcessだけを対象とする。機能テストの並行実行は可能だがCPU/GPU/diskは共有するため索引作成時間と試験時間に影響し得る。性能/idle計測の合否は索引作成の並行負荷と区別する（できれば索引完了後に実施）。実機suiteの実行了承は引き続き別途確認中。
+
+## 索引作成中の類似パネルに前の画像が残る報告（2026-09-10）
+
+通常APPDATA版で索引作成中、test表紙/00表紙.jpgへ移動した後も右パネルの「表示中（更新中）」と候補が前のChatGPT Image PNGのまま残ると利用者から報告。アプリを操作・停止せず、ログをtarget/next-version-work/similar-stale-panel-20260910へ読み取りコピーして保全した。mimageviewer.logでは新画像のDisplayReadyとitems_generation更新を確認。perf_eventsの新画像へのsimilar_item照会seq260はactive=true/stale=false、terminal=not_indexed、wall_ms=0.7877で完了しており、重い照会が未完了のままという説明ではない。索引snapshot未反映と別originの結果保持を分けて調査する。
+
+調査担当similar_stale_investigation（Sol/xhigh）はread-onlyの原因・影響範囲・回帰案を担当。製品コード変更・Cargo・実アプリ入力は未実施。正常な索引作成は継続させる。設計§20.7のorigin key + memory epochによる再利用とComplete snapshot利用は、別画像を現在表示中として残す仕様ではない。
+
+原因をsourceと照合した。src/ui_metadata_panel.rsのSimilarPanelState.last_readyはslotごとの旧Readyを保持し、shown_queries生成でPreparingならorigin identity照合なしに旧Readyへ置換する。src/similar_index.rsのquery_itemは索引Running中のNotIndexedをPreparingとしてUIへ返す。この組合せにより、新画像の未索引応答が返っていても前画像の「表示中」と候補が残る。修正すべき境界はUIの結果保持であり、同じ画像の索引更新待ちだけ旧結果を使い、別画像への切替では旧originと候補を退役させる。見開きの右頁だけ変更にも対応するため、先頭origin変更時の一括clearではなく各ページidentityとの対応が必要。コード修正・回帰・確認buildは未実施。
+
+利用者は類似パネルの修正を依頼し、その後9:30頃から実機テストを進めるよう指定した。実装・非対話検証をsimilar_stale_investigation、独立設計/実装検収をnext_independent_review、実機準備をsmoke_next_planへ委任した。修正はUI結果保持のorigin ownershipへ限定。通常版索引作成は継続し、build-devの自動停止は禁止。
+
+実機予約更新は自動承認審査が「開始時刻の了承のみではexact suite/時間/再試行/隔離scopeの了承不足」として拒否。利用者へ理由を説明し、既提示5scenario（30〜60分、9:30〜18:30、初回+原因確認後再試行1回、生成素材とportable-smoke/data、通常版保持、並行負荷時idle延期）の明示確認をasyncで再送した。返答までは実機操作を行わず、非対話準備を続ける。既存heartbeatは更新されていない。
+
+独立reviewerと親が設計合意。Ready限定のorigin-key所有へ変更し、全current page_keysでkey lookup/reconcileする。Ready内部originと保持key一致、非Ready保持禁止、現在表示にないkey退役、各頁terminalはそのkeyのみ退役、同一origin Refreshingは従来Preparing相当100ms pollを維持。古いカード/候補/操作は描画投影から消すがthumbnail/preview cacheやbook clientの一括resetは行わない。manager/DB/detached runtimeへの変更は不要。
+
+利用者が具体suite再確認後に「この後進めてもらって大丈夫です。記載の実機検証・テスト、進めてください」と明示了承。承認範囲は上述の5scenario/時間枠/所要時間/再試行/隔離data/通常版保持。heartbeat v3-8-0更新も自動審査を通過した。実装のreview/gate→最新portable準備→09:30以降の実機、という順序で専任担当へ引き渡す。承認の阻害は解消。
+
+修正の実装と独立最終検収を完了（重要指摘なし）。source ui_metadata_panel.rs SHA256 E5FDEB11B1D367642A581906494EB0F15117031AA4E4D743A19E198D45F15800、feedback doc SHA256 292154BA7A9E79CBEEBE22B4E11119E594B8B5A4A34DDC6B240B6FFEB1EF5540 を親も照合。focused36 pass/1 ignored、normal core check/fmt/glyph/diff成功、test-full -SuppressCrashDialogs exit0/PASS（本体8034 pass/43 ignored、既存similar snapshotとvendor25/9/15等成功）。初回repaint fixture失敗は初期settling frameを消費していない観測不備で、製品コード不変のまま実frame順へ修正して再検証、独立検収で妥当と確認。証拠target/next-version-work/similar-stale-panel-20260910/verification-summary.txt。通常版と索引は操作せず、使用中のdev-runtimeを上書きするbuild-devは保留。最新sourceから隔離portableを専任担当がbuildし、承認済み実機へ進める。

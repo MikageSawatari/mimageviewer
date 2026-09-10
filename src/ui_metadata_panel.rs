@@ -117,6 +117,67 @@ struct SimilarThumbJob {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A completed item query retained only for refreshing the same displayed image.
+///
+/// The origin key comes from the `Ready` payload itself. Keeping it beside the result makes it
+/// impossible for positional fullscreen slots to redefine which image the result describes.
+#[derive(Clone)]
+struct RetainedItemReady {
+    origin_item_key: String,
+    query: std::sync::Arc<crate::similar_index::ItemQuery>,
+}
+
+impl RetainedItemReady {
+    fn from_current_query(
+        current_item_key: Option<&str>,
+        query: std::sync::Arc<crate::similar_index::ItemQuery>,
+    ) -> Option<Self> {
+        let crate::similar_index::ItemQuery::Ready(matches) = query.as_ref() else {
+            return None;
+        };
+        if current_item_key != Some(matches.origin.item_key.as_str()) {
+            return None;
+        }
+        let origin_item_key = matches.origin.item_key.clone();
+        Some(Self {
+            origin_item_key,
+            query,
+        })
+    }
+}
+
+#[derive(Clone)]
+enum SimilarItemQueryPresentation {
+    Current(std::sync::Arc<crate::similar_index::ItemQuery>),
+    RefreshingSameOrigin(std::sync::Arc<crate::similar_index::ItemQuery>),
+}
+
+impl SimilarItemQueryPresentation {
+    fn query(&self) -> &crate::similar_index::ItemQuery {
+        match self {
+            Self::Current(query) | Self::RefreshingSameOrigin(query) => query.as_ref(),
+        }
+    }
+
+    fn is_refreshing(&self) -> bool {
+        matches!(self, Self::RefreshingSameOrigin(_))
+    }
+}
+
+fn maintain_similar_item_query_progress(
+    ctx: &egui::Context,
+    presentations: &[SimilarItemQueryPresentation],
+) {
+    if presentations
+        .iter()
+        .any(SimilarItemQueryPresentation::is_refreshing)
+    {
+        // Refreshing draws the retained Ready model instead of the Preparing spinner, so it must
+        // preserve the spinner's polling cadence explicitly.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
 pub(crate) struct SimilarPanelState {
     tab: MetadataPanelTab,
     origin_key: Option<String>,
@@ -141,13 +202,14 @@ pub(crate) struct SimilarPanelState {
     thumb_running: usize,
     thumb_next_request_id: u64,
     thumb_last_upload_frame: Option<u64>,
-    /// 直前に出せた結果。次の照会が返るまでこれを出し続ける。**表示している面ごとに 1 つ**
-    /// (見開きなら左右で 2 つ)。
+    /// 現在表示している画像について直前に出せた結果。次の照会が返るまで、**同じ画像の
+    /// 更新中だけ**出し続ける。見開きの左右が入れ替わっても slot 位置ではなく origin key で
+    /// 対応させる。
     ///
     /// 本を読み進めると起点はページごとに変わり、そのたびに照会が走る。返るまでの数フレーム
-    /// を spinner に差し替えると、ページを送るたびに内容が消えて戻る。**古い内容を出したまま
-    /// 差し替える方が読める。** 出している間は「更新中」と明記する。
-    last_ready: Vec<Option<std::sync::Arc<crate::similar_index::ItemQuery>>>,
+    /// を spinner に差し替えると内容が明滅するため、同一 origin の再照会では前の結果を
+    /// 「更新中」と明記して保持する。別ページの結果は現在画像として表示しない。
+    retained_item_ready: Vec<RetainedItemReady>,
     pub(crate) preview: crate::similar_preview::SimilarPreviewState,
     thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
     thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
@@ -175,7 +237,7 @@ impl Default for SimilarPanelState {
             thumb_running: 0,
             thumb_next_request_id: 1,
             thumb_last_upload_frame: None,
-            last_ready: Vec::new(),
+            retained_item_ready: Vec::new(),
             preview: crate::similar_preview::SimilarPreviewState::default(),
             thumb_tx,
             thumb_rx,
@@ -317,6 +379,78 @@ impl SimilarPanelState {
         }
         self.finish_pressed_move_trace("origin_changed");
         self.origin_key = origin_key;
+    }
+
+    fn project_item_queries(
+        &mut self,
+        page_keys: &[Option<String>],
+        queries: &[std::sync::Arc<crate::similar_index::ItemQuery>],
+    ) -> Vec<SimilarItemQueryPresentation> {
+        debug_assert_eq!(page_keys.len(), queries.len());
+
+        // A retained answer belongs to a displayed source, not to a left/right slot. Retire
+        // sources that left the current display unit before resolving any Preparing query.
+        self.retained_item_ready.retain(|retained| {
+            page_keys
+                .iter()
+                .any(|key| key.as_deref() == Some(retained.origin_item_key.as_str()))
+        });
+
+        let mut presentations = Vec::with_capacity(queries.len());
+        for (page_key, query) in page_keys.iter().zip(queries) {
+            let current_key = page_key.as_deref();
+            match query.as_ref() {
+                crate::similar_index::ItemQuery::Preparing => {
+                    let retained = current_key.and_then(|key| {
+                        self.retained_item_ready
+                            .iter()
+                            .find(|ready| ready.origin_item_key == key)
+                    });
+                    if let Some(retained) = retained {
+                        presentations.push(SimilarItemQueryPresentation::RefreshingSameOrigin(
+                            std::sync::Arc::clone(&retained.query),
+                        ));
+                    } else {
+                        presentations.push(SimilarItemQueryPresentation::Current(
+                            std::sync::Arc::clone(query),
+                        ));
+                    }
+                }
+                crate::similar_index::ItemQuery::Ready(_) => {
+                    if let Some(ready) = RetainedItemReady::from_current_query(
+                        current_key,
+                        std::sync::Arc::clone(query),
+                    ) {
+                        if let Some(existing) = self
+                            .retained_item_ready
+                            .iter_mut()
+                            .find(|existing| existing.origin_item_key == ready.origin_item_key)
+                        {
+                            *existing = ready;
+                        } else {
+                            self.retained_item_ready.push(ready);
+                        }
+                    } else if let Some(current_key) = current_key {
+                        self.retained_item_ready
+                            .retain(|ready| ready.origin_item_key != current_key);
+                    }
+                    presentations.push(SimilarItemQueryPresentation::Current(
+                        std::sync::Arc::clone(query),
+                    ));
+                }
+                _ => {
+                    if let Some(current_key) = current_key {
+                        self.retained_item_ready
+                            .retain(|ready| ready.origin_item_key != current_key);
+                    }
+                    presentations.push(SimilarItemQueryPresentation::Current(
+                        std::sync::Arc::clone(query),
+                    ));
+                }
+            }
+        }
+        debug_assert!(self.retained_item_ready.len() <= page_keys.len().min(2));
+        presentations
     }
 
     fn finish_pressed_move_trace(&self, reason: &'static str) {
@@ -657,20 +791,32 @@ impl SimilarPanelState {
     pub(crate) fn set_context_marker_for_test(&mut self, marker: &str) {
         self.tab = MetadataPanelTab::Similar;
         self.origin_key = Some(marker.to_owned());
-        self.last_ready = vec![Some(std::sync::Arc::new(
-            crate::similar_index::ItemQuery::Failed(format!("ready:{marker}")),
-        ))];
+        let query = std::sync::Arc::new(crate::similar_index::ItemQuery::Ready(
+            crate::similar_index::ItemMatches {
+                origin: crate::similar_index::OriginItem {
+                    item_key: marker.to_owned(),
+                    kind: crate::similar_db::ItemKind::Image,
+                    mtime: 0,
+                    file_size: 0,
+                    width: 1,
+                    height: 1,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    target: None,
+                },
+                hits: Vec::new(),
+            },
+        ));
+        self.retained_item_ready = vec![
+            RetainedItemReady::from_current_query(Some(marker), query)
+                .expect("test marker is a matching Ready result"),
+        ];
     }
 
     pub(crate) fn context_marker_for_test(&self) -> (bool, Option<String>, Option<String>) {
         let last_ready = self
-            .last_ready
+            .retained_item_ready
             .first()
-            .and_then(Option::as_ref)
-            .and_then(|query| match query.as_ref() {
-                crate::similar_index::ItemQuery::Failed(marker) => Some(marker.clone()),
-                _ => None,
-            });
+            .map(|ready| format!("ready:{}", ready.origin_item_key));
         (
             self.tab == MetadataPanelTab::Similar,
             self.origin_key.clone(),
@@ -2258,32 +2404,15 @@ impl App {
                             preview_pdf_viewport,
                         );
                     }
-                    // 照会が返るまでの数フレームだけ、直前の結果を出し続ける。面ごとに覚える
-                    // ので、見開きでも左右それぞれが空白にならない。
-                    self.similar_panel.last_ready.resize(queries.len(), None);
-                    let shown_queries: Vec<(
-                        std::sync::Arc<crate::similar_index::ItemQuery>,
-                        bool,
-                    )> = queries
-                        .iter()
-                        .enumerate()
-                        .map(|(slot, query)| {
-                            if matches!(query.as_ref(), crate::similar_index::ItemQuery::Preparing)
-                                && let Some(previous) = self.similar_panel.last_ready[slot].clone()
-                            {
-                                return (previous, true);
-                            }
-                            self.similar_panel.last_ready[slot] =
-                                matches!(query.as_ref(), crate::similar_index::ItemQuery::Ready(_))
-                                    .then(|| std::sync::Arc::clone(query));
-                            (std::sync::Arc::clone(query), false)
-                        })
-                        .collect();
+                    let shown_queries = self
+                        .similar_panel
+                        .project_item_queries(&page_keys, &queries);
+                    maintain_similar_item_query_progress(ctx, &shown_queries);
                     let spread_headings = shown_queries.len() > 1;
                     let views: Vec<SimilarPageView<'_>> = shown_queries
                         .iter()
                         .enumerate()
-                        .map(|(slot, (shown, showing_previous))| SimilarPageView {
+                        .map(|(slot, shown)| SimilarPageView {
                             heading: spread_headings.then(|| {
                                 if slot == 0 {
                                     "左ページ"
@@ -2292,8 +2421,8 @@ impl App {
                                 }
                             }),
                             item_key: page_keys.get(slot).and_then(Option::as_deref),
-                            model: similar_panel_model(shown.as_ref()),
-                            showing_previous: *showing_previous,
+                            model: similar_panel_model(shown.query()),
+                            showing_previous: shown.is_refreshing(),
                         })
                         .collect();
                     draw_similar_panel(
@@ -5642,9 +5771,10 @@ mod similar_panel_tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        SIMILAR_THUMB_CACHE_LIMIT, SIMILAR_THUMB_WORKER_LIMIT, SimilarMoveFrameInput,
-        SimilarMovePointerEvent, SimilarPanelModel, SimilarPanelState, SimilarThumbResult,
-        SimilarThumbState, TracedSimilarAction, finish_similar_move_frame,
+        RetainedItemReady, SIMILAR_THUMB_CACHE_LIMIT, SIMILAR_THUMB_WORKER_LIMIT,
+        SimilarItemQueryPresentation, SimilarMoveFrameInput, SimilarMovePointerEvent,
+        SimilarPanelModel, SimilarPanelState, SimilarThumbResult, SimilarThumbState,
+        TracedSimilarAction, finish_similar_move_frame, maintain_similar_item_query_progress,
         observe_similar_move_response, replace_traced_similar_action, similar_copy_path_text,
         similar_difference_line, similar_location_line, similar_panel_model, summarize_page_strip,
     };
@@ -5656,6 +5786,162 @@ mod similar_panel_tests {
         crate::app::SimilarBookLocation {
             container_key: container.to_string(),
             page: crate::snapshot::SnapshotTarget::Fs(PathBuf::from(page)),
+        }
+    }
+
+    fn ready_item_query(item_key: &str) -> std::sync::Arc<ItemQuery> {
+        std::sync::Arc::new(ItemQuery::Ready(crate::similar_index::ItemMatches {
+            origin: crate::similar_index::OriginItem {
+                item_key: item_key.to_owned(),
+                kind: ItemKind::Image,
+                mtime: 1,
+                file_size: 2,
+                width: 3,
+                height: 4,
+                format: SimilarImageFormat::Png,
+                target: None,
+            },
+            hits: Vec::new(),
+        }))
+    }
+
+    fn page_keys(keys: &[&str]) -> Vec<Option<String>> {
+        keys.iter().map(|key| Some((*key).to_owned())).collect()
+    }
+
+    fn ready_origin(presentation: &SimilarItemQueryPresentation) -> Option<&str> {
+        match presentation.query() {
+            ItemQuery::Ready(matches) => Some(matches.origin.item_key.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn retained_ready_rejects_a_different_current_origin() {
+        assert!(RetainedItemReady::from_current_query(Some("b"), ready_item_query("a")).is_none());
+        assert!(RetainedItemReady::from_current_query(Some("a"), ready_item_query("a")).is_some());
+        assert!(
+            RetainedItemReady::from_current_query(
+                Some("a"),
+                std::sync::Arc::new(ItemQuery::Preparing),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn different_origin_preparing_never_projects_the_previous_ready_result() {
+        let mut state = SimilarPanelState::default();
+        state.project_item_queries(&page_keys(&["a"]), &[ready_item_query("a")]);
+
+        let preparing = std::sync::Arc::new(ItemQuery::Preparing);
+        let projected = state.project_item_queries(&page_keys(&["b"]), &[preparing]);
+
+        assert!(!projected[0].is_refreshing());
+        assert!(matches!(projected[0].query(), ItemQuery::Preparing));
+        assert!(state.retained_item_ready.is_empty());
+    }
+
+    #[test]
+    fn same_origin_preparing_projects_ready_and_requests_the_poll_repaint() {
+        let mut state = SimilarPanelState::default();
+        state.project_item_queries(&page_keys(&["a"]), &[ready_item_query("a")]);
+
+        let projected = state.project_item_queries(
+            &page_keys(&["a"]),
+            &[std::sync::Arc::new(ItemQuery::Preparing)],
+        );
+        assert!(projected[0].is_refreshing());
+        assert_eq!(ready_origin(&projected[0]), Some("a"));
+
+        let ctx = egui::Context::default();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_cb = std::sync::Arc::clone(&requests);
+        ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
+        // Consume egui's initial settling repaint so the delayed request becomes the earliest one.
+        let _ = ctx.run(Default::default(), |_| {});
+        requests.lock().unwrap().clear();
+        let _ = ctx.run(Default::default(), |ctx| {
+            maintain_similar_item_query_progress(ctx, &projected);
+        });
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| {
+                request.viewport_id == egui::ViewportId::ROOT
+                    && request.delay <= std::time::Duration::from_millis(100)
+                    && !request.delay.is_zero()
+            }),
+            "missing 100 ms refresh poll in {requests:?}"
+        );
+    }
+
+    #[test]
+    fn spread_retention_follows_origin_across_membership_and_slot_changes() {
+        let mut state = SimilarPanelState::default();
+        state.project_item_queries(
+            &page_keys(&["a", "b"]),
+            &[ready_item_query("a"), ready_item_query("b")],
+        );
+
+        let changed = state.project_item_queries(
+            &page_keys(&["a", "c"]),
+            &[
+                std::sync::Arc::new(ItemQuery::Preparing),
+                std::sync::Arc::new(ItemQuery::Preparing),
+            ],
+        );
+        assert!(changed[0].is_refreshing());
+        assert_eq!(ready_origin(&changed[0]), Some("a"));
+        assert!(!changed[1].is_refreshing());
+        assert!(matches!(changed[1].query(), ItemQuery::Preparing));
+        assert_eq!(state.retained_item_ready.len(), 1);
+
+        state.project_item_queries(
+            &page_keys(&["a", "b"]),
+            &[ready_item_query("a"), ready_item_query("b")],
+        );
+        let swapped = state.project_item_queries(
+            &page_keys(&["b", "a"]),
+            &[
+                std::sync::Arc::new(ItemQuery::Preparing),
+                std::sync::Arc::new(ItemQuery::Preparing),
+            ],
+        );
+        assert_eq!(ready_origin(&swapped[0]), Some("b"));
+        assert_eq!(ready_origin(&swapped[1]), Some("a"));
+        assert!(swapped.iter().all(|query| query.is_refreshing()));
+    }
+
+    #[test]
+    fn terminal_query_retires_only_its_current_origin() {
+        let terminals = [
+            ItemQuery::NoIndex,
+            ItemQuery::NotIndexed,
+            ItemQuery::Featureless,
+            ItemQuery::Failed("query failed".to_owned()),
+        ];
+
+        for terminal in terminals {
+            let mut state = SimilarPanelState::default();
+            state.project_item_queries(
+                &page_keys(&["a", "b"]),
+                &[ready_item_query("a"), ready_item_query("b")],
+            );
+            let projected = state.project_item_queries(
+                &page_keys(&["a", "b"]),
+                &[
+                    std::sync::Arc::new(terminal.clone()),
+                    std::sync::Arc::new(ItemQuery::Preparing),
+                ],
+            );
+
+            assert!(!projected[0].is_refreshing());
+            assert_eq!(projected[0].query(), &terminal);
+            assert!(projected[1].is_refreshing());
+            assert_eq!(ready_origin(&projected[1]), Some("b"));
+            assert_eq!(state.retained_item_ready.len(), 1);
+            assert_eq!(state.retained_item_ready[0].origin_item_key, "b");
         }
     }
 

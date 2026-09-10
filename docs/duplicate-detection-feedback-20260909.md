@@ -220,3 +220,13 @@ build-portable.ps1 -KeepRunningはexit 0 / DONE（core18分57秒）、update-por
 ## v3.8.0へのリリース方針（2026-09-10 利用者指定）
 
 §9.2横断一覧は保留。現状の右パネルによる比較を今回の提供範囲とする。別系統でv3.7.1向けの最終バグ修正が進行中で、その完了後、v3.7.1としての公開はスキップし、本機能を含むv3.8.0としてリリースする方針。完了連絡までは他系統の修正・version・release作業へ介入しない。統合時は最終バグ修正とdupe側の未コミット変更を保持して変更を整理し、共通機構への影響と競合を独立レビュー、統合後の全体gate・release向けビルド・必要な実機検証・マニュアル/リリース記述を確認する。既存の成功検証を無条件に繰り返さず、統合差分と正式版の条件に応じた検証を行う。音声途切れは未解決の観測事項として維持し、この方針を解消確認とは扱わない。公開やpushは今回行っていない。
+
+## 索引更新中に別画像の旧結果が残る問題（2026-09-10）
+
+通常版で類似索引を更新中、中央画像を `00表紙.jpg` へ切り替えても、固定した右パネルの「表示中（更新中）」に前の ChatGPT PNG とその候補が残る実機報告を受けた。保存済みログでは新しい `00表紙.jpg` の単体照会が `terminal=not_indexed / active=true / stale=false` として短時間で繰り返し完了しており、重い照会や古い worker の未完了が原因ではなかった。
+
+原因は UI の完成結果保持が表示 slot の `Vec<Option<Ready>>` だったこと。現在の照会が `Preparing` なら、その slot に残る直前の `Ready` を origin の一致確認なしで「更新中」として投影していた。索引走査中に manager が現在 origin の cached `NotIndexed` を意図どおり `Preparing` として返す経路と組み合わさり、別画像の旧カード・候補・操作が現在画像の結果として残った。索引走査中の旧 Complete snapshot 利用と manager の `Running + NotIndexed -> Preparing` 投影は変更しない。
+
+UI の保持所有者を `Ready` 内部の `origin.item_key` で識別する型へ置き換えた。現在の `page_key` と `Ready.origin` が一致した結果だけを保持し、毎 frame の現在 page key 全体で退役させてから key 検索で投影する。同じ origin の `Preparing` だけが「表示中（更新中）」を再利用し、別 origin は直ちに `Preparing` 表示へ移る。単体/見開きの切替、左右 slot の入替、見開き片側だけの変更にも同じ規則を使い、terminal は該当 origin だけを退役させる。同一 origin の結果を保持中も、`Preparing` 表示と同じ 100 ms の再描画を要求する。thumbnail/preview/book client の所有・cache は変更しない。
+
+製品 helper の回帰として、A Ready -> B Preparing で A 非表示、A Ready -> A Preparing で同一 origin 更新表示、`[A,B] -> [A,C]` で右だけ退役、`[A,B] -> [B,A]` で key に追従、全 terminal で同 key だけ退役、更新中の repaint 要求、Ready 所有者の origin 不一致拒否を追加した。focused `similar_panel_tests` は 36 passed / 0 failed / 1 ignored。初回は egui の初期 settling repaint を消費しない test fixture の観測だけが失敗し、実 frame と同じ順で初期 pass 後の delayed repaint を観測するよう訂正した。製品 helper はこの訂正で変更していない。`cargo check`、fmt、glyph、既存の類似パネル states/results snapshot を含む `test-full.ps1 -SuppressCrashDialogs` は成功し、本体最大 suite は 8034 passed / 0 failed / 43 ignored、vendor egui / egui-wgpu / eframe も成功した。証跡は `target/next-version-work/similar-stale-panel-20260910/` に保存する。
