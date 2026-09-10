@@ -561,6 +561,19 @@ cleanupで元の失敗を成功へ変換せず、AppのZoomPanを診断コード
 正常完了は実Up配送・pump側のcapture解放・UI handler後のZoomPan解放を揃える。
 workerのGetCapture/ReleaseCaptureは別threadのcapture確認/解放の代用にならない。
 
+2026-09-10に、上記ignored草案から外部button owner/pipe/hostを
+`scripts/ui-smoke/button-helper/`へ追跡可能なcheckpointとして移した。host草案はこの時点まで
+実行・独立検収されていなかったため、current-SIDの自process pipeで正常完了、App death、EOF、
+reader/protocol fault、second Begin、blocked/faulted reply、固定join期限、未解決releaseを追加確認した。
+terminal replyのtransport失敗をSucceededに残さず、runnerが先に観測したApp timeout/非0終了も
+helper成功で上書きせず、後続runner接続では先行失敗の理由文字列も正本として保持する。
+cleanup Upは古いtarget/foreground/cursorを要求せず、helper threadと
+開いたinput desktopが現在の入力desktopであることだけを送信区間中に再検証する。PS5.1/7で
+reducer 16件とhelper 54件が成功した。manifestは
+`target/next-version-work/logs/button-helper-host-checkpoint-20260910/manifest.json`。
+このcheckpointはnative inserterを構築せず、実SendInput、Rust/App receipt、
+`scripts/ui-smoke.ps1`へのscenario接続を完了したとは扱わない。
+
 通常操作の現在target検証と、既に挿入したDownのcleanup解放証明は型で分ける。
 cleanupの権限は保存済みのtagged/validated Downとown Up挿入から取り、元HWND消失後も
 別windowへtargetを付け替えない。現在のhelper-thread input desktop/accessとphysical Upを
