@@ -10,10 +10,10 @@
 
 | 段階 | 成果物 | 現在の状態 |
 | --- | --- | --- |
-| A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 全gate指摘のcanonical navigation投影・旧schema互換を修正、focusedと独立delta検収完了 |
-| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r6でprevious capture・layout寿命・target identity修正、focusedと独立delta検収完了 |
+| A 共通基盤 | role/occurrence/composition、phase所有demand、global既定ON、本override別table、context・metadata・rename境界 | 修正・独立検収・再fullgate完了 |
+| B 本体表示 | paged/連結読みの描画・需要・保持・失敗終端、編集復帰、HUD・各操作のidentity接続、設定UI | B2r6でprevious capture・layout寿命・target identity修正、独立検収・再fullgate完了 |
 | C Remote | sparse presentation wire、live設定snapshot、typed設定書込、Webのnavと描画分離、protocol互換 | source凍結・独立レビュー・Node388件・IPC55件・Rust狭域とRemote check完了 |
-| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 追加snapshot3枚完了。初回fullgateは本体8061成功/7失敗/43除外、原因確認中。vendor・build・実機は未完了 |
+| D 最終検証 | 各段階の回帰・snapshot、shared full gate、利用者確認用build、実機確認 | 再fullgate・snapshot・core/Remote確認build完了。利用者の実機確認は未実施 |
 
 Aの成功だけでは機能完成・利用者検証可能とは扱わない。各段階のsource変更は実装担当、凍結差分レビューは別担当とし、既存検証を重複実行しない。Cargo枠はAのcheckと狭い回帰に限定して借用し、結果とログを共有して返却する。次段階の重い検証はあらためて所有調整する。
 
@@ -186,6 +186,19 @@ B2r4-r1のfocusedはrestore件数・rename suite・設定検索suite・post-poll
 B2r5は中央lifecycleのlayout退役とcanonical Navigation投影を加えて6sourceを凍結し、7exactすべて1/1 PASS（shift、補助painted capture、RTL navigation/presentation、generation、true close、context隔離、post-poll）。既存preferences snapshotも完全修飾exactで更新・通常比較ともrunning1 / PASS、fmt全体check exit0。golden差はscrollbar内22px、bbox `(544,76)-(551,79)` のみで本文pixel不変。親も新PNGを確認した。source/goldenを保存した最終freezeはtarget/final-cover-spread-phase-b2r6-20260910、MANIFEST SHA256 8acb48578b3a3596d586c9b18d5d2e6ff2716eb4ceaf601ce69b3499fd07f6b2、patch SHA256 30e6a3ec3750377d8177f629196360b7f908828975fb66b2f91cd4cf0c61286d。cargo/rustc停止確認後に枠返却、独立delta検収待ち。初回B2r4-r0のartifactはin-place更新され原本を保存できていなかったため、HISTORYにその制約・当時patch SHA・残存compile-red logを明記し、後から保存済みと扱わない。
 
 B2r6の最終独立reviewはP1/P2なしで承認。中央setterはitems世代が変わる場合だけ自owner layoutを退役し、registry swapでcontext ownershipを保持する。真closeはmounted ownerだけ、park/mountやsource不変のcancel/errorへclearを追加しないことを確認した。Navigationのcanonical sortと全presentationのscreen exact照合、7exact・snapshot・fmt・6source/golden hashの一致も独立照合済み。限定commit後に未実施vendorを含む全gateを再実行する。
+
+## 最終自動検証と確認用成果物（2026-09-10）
+
+修正commitは`bc8aa8c210f3bc7b0b83a5bb1a17688e4216419d`。再fullgateは同commitのclean treeで`test-full.ps1 -SuppressCrashDialogs`を実行しexit0。本体8074 passed / 0 failed / 43 ignored、UI snapshot48、IPC55、Remote Web Rust118（1 ignored）、vendor egui25・egui-wgpu9・eframe15はいずれも失敗0。workspace残りtarget/doctestも成功し、末尾`[test-full] PASS`とerror mode復元を親が実ログで照合した。記録はtarget/final-cover-spread-full-gate-r2-20260910/MANIFEST.txt（SHA256 e87f6e79758c2dcd0a37c6c819461236ab7e0c34002a5831bea6ce8b8b2b8253）。先のNode388件・独立レビュー・focused・追加3snapshotの結果も有効で、コードを変更せず再利用した。
+
+確認buildは同commitで`build-dev.ps1`、jobs1、通常feature（portable/test-scriptなし）、exit0。core10分41秒、Remote1分6秒。直前・直後ともdupeの出力pathにresident0を確認し、master側9processと通常APPDATA側4processの同identityを保持、成果物は起動していない。記録はtarget/final-cover-spread-build-dev-20260910/MANIFEST.txt（SHA256 81a42fac65f8f9c3e37131656da098132fa0aa7d9b6f77a6ef90281644083fc8）。
+
+| 成果物 | bytes | SHA256 |
+| --- | ---: | --- |
+| target/dev-runtime/mimageviewer-core.exe | 309761024 | 299002ffc3e5f32c60115b7975a28f4954f0cccc45ff6c7f7f7d843bde2a0636 |
+| target/dev-runtime/mimageviewer-remote.exe | 12197888 | 03ddde6fd4faee48f24d16ac24b9c9c9ef632114f71041e0aa780cf82ece7918 |
+
+利用者が既存mIV（トレイ常駐含む）を終了してから、C:/home/mimageviewer-dupeで`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`を実行する。single-instance mutexを共有し、通常`%APPDATA%\mimageviewer`profileを使うため、実設定・データを更新し得る。agentは起動しない。実機確認は、両端が単ページになる表紙あり見開きの末尾でLTR/RTL・N/N、全体/本別設定、連結読み・F12・Remote、見開きずらしと本切替/close-reopenを確認する。masterへの統合・公開・version変更は行っておらず、実機結果と統合は後続判断である。
 
 ## 後続の受入確認
 
