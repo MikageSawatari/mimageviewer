@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 52;
+pub const PROTOCOL_VERSION: u32 = 53;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -578,6 +578,10 @@ pub enum RemoteWriteRequest {
         spread_mode: RemoteSpreadMode,
         reading_direction: RemoteReadingDirection,
     },
+    SetFinalCoverSpreadPreference {
+        address: RemoteAddress,
+        preference: RemoteFinalCoverSpreadPreference,
+    },
     /// 表示完了済みのページ位置。page fields と record_history は remote-web の
     /// 観測値として受けるが、本体 write worker がローカルと同じ列挙規則で検証・
     /// 正規化してから UI thread へ渡す。
@@ -662,6 +666,7 @@ impl RemoteWriteRequest {
     pub fn address(&self) -> Option<&RemoteAddress> {
         match self {
             Self::SetSpread { address, .. }
+            | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -680,6 +685,7 @@ impl RemoteWriteRequest {
     pub fn address_mut(&mut self) -> Option<&mut RemoteAddress> {
         match self {
             Self::SetSpread { address, .. }
+            | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -722,6 +728,7 @@ impl RemoteWriteRequest {
                 context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
+            | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -756,6 +763,7 @@ impl RemoteWriteRequest {
                 context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
+            | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -766,6 +774,7 @@ impl RemoteWriteRequest {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::SetSpread { .. } => "set_spread",
+            Self::SetFinalCoverSpreadPreference { .. } => "set_final_cover_spread_preference",
             Self::RecordReadingProgress { .. } => "record_reading_progress",
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
@@ -952,9 +961,38 @@ pub struct PageGroup {
     /// 特定できない。位置の照合は `(anchor, slice)` の組で行うこと。
     pub anchor: RemoteAddress,
     pub pages: Vec<RemoteAddress>,
+    /// Full screen-order presentation when it differs from `pages`.
+    ///
+    /// Ordinary groups omit this field. A client that does not receive it must
+    /// synthesize one `Navigation` slot per entry in `pages`; this keeps old
+    /// browser assets safe while avoiding another address copy for every group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<Vec<RemotePagePresentationSlot>>,
     /// 分割中にこの表示単位が元ページのどちら側か。分割していなければ `Full`。
     #[serde(default)]
     pub slice: RemotePageSlice,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePagePresentationRole {
+    Navigation,
+    FrontCoverSupplement,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePagePresentationSlot {
+    pub address: RemoteAddress,
+    pub role: RemotePagePresentationRole,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFinalCoverSpreadPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -979,6 +1017,10 @@ pub struct ContainerPayload {
     pub effective_spread_mode: RemoteSpreadMode,
     /// Single を含む物理的なページ送り方向。spread.db の reading direction を反映する。
     pub reading_direction: RemoteReadingDirection,
+    /// 本の保存値。`FollowGlobal` も nested ZIP の fallback を遮る明示値になり得る。
+    pub final_cover_spread_preference: RemoteFinalCoverSpreadPreference,
+    /// 全体設定と本の保存値を解決した結果。実際の適用可否は各 group の構成が表す。
+    pub final_cover_spread_enabled: bool,
     /// 本体 seek overlay と同じ nav item 分類による件数内訳。
     pub image_count: usize,
     pub video_count: usize,
@@ -2787,8 +2829,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v52_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 52);
+    fn protocol_v53_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 53);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2963,8 +3005,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v52_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 52);
+    fn protocol_v53_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 53);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3111,13 +3153,25 @@ mod tests {
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
                 effective_spread_mode: RemoteSpreadMode::RtlCover,
                 reading_direction: RemoteReadingDirection::Rtl,
+                final_cover_spread_preference: RemoteFinalCoverSpreadPreference::On,
+                final_cover_spread_enabled: true,
                 image_count: 2,
                 video_count: 0,
                 other_count: 0,
                 spread_page_gap_px: 8,
                 page_groups: vec![PageGroup {
-                    anchor: page(0),
-                    pages: vec![page(1), page(0)],
+                    anchor: page(1),
+                    pages: vec![page(1)],
+                    presentation: Some(vec![
+                        RemotePagePresentationSlot {
+                            address: page(0),
+                            role: RemotePagePresentationRole::FrontCoverSupplement,
+                        },
+                        RemotePagePresentationSlot {
+                            address: page(1),
+                            role: RemotePagePresentationRole::Navigation,
+                        },
+                    ]),
                     slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,
@@ -3130,6 +3184,9 @@ mod tests {
             read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
 
+        let encoded = serde_json::to_string(&expected).unwrap();
+        assert!(encoded.contains("\"front_cover_supplement\""));
+
         let request = ContainerRequest {
             address: RemoteAddress::file("C:/Books/book.pdf"),
             spread_mode: Some(RemoteSpreadMode::Ltr),
@@ -3140,6 +3197,23 @@ mod tests {
         assert!(encoded.contains("\"spread_mode\":\"ltr\""));
         assert!(encoded.contains("\"reading_direction\":\"ltr\""));
         assert!(encoded.contains("\"force_single_page\":true"));
+    }
+
+    #[test]
+    fn ordinary_page_group_omits_presentation_and_legacy_shape_restores_navigation_fallback() {
+        let address = RemoteAddress::file("C:/Books/page.jpg");
+        let group = PageGroup {
+            anchor: address.clone(),
+            pages: vec![address],
+            presentation: None,
+            slice: RemotePageSlice::Full,
+        };
+        let encoded = serde_json::to_string(&group).unwrap();
+        assert!(!encoded.contains("presentation"));
+
+        let decoded: PageGroup = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.presentation, None);
+        assert_eq!(decoded.pages, group.pages);
     }
 
     #[test]
@@ -3162,6 +3236,24 @@ mod tests {
             unreachable!();
         };
         assert_eq!(request.kind_name(), "set_spread");
+
+        let preference = ClientMessage::Write {
+            id: 46,
+            owner: test_owner("test-client"),
+            request: RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: RemoteAddress::file("C:/Books/book.pdf"),
+                preference: RemoteFinalCoverSpreadPreference::Off,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &preference).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, preference);
+        let ClientMessage::Write { request, .. } = actual else {
+            unreachable!();
+        };
+        assert_eq!(request.kind_name(), "set_final_cover_spread_preference");
     }
 
     #[test]
@@ -3172,6 +3264,10 @@ mod tests {
             subresource: RemoteSubresource::PdfPage { page_number: 2 },
         };
         let requests = [
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: container.clone(),
+                preference: RemoteFinalCoverSpreadPreference::FollowGlobal,
+            },
             RemoteWriteRequest::RecordReadingProgress {
                 address: page.clone(),
                 context_address: container.clone(),
@@ -3448,6 +3544,7 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page.clone(),
                     pages: vec![page],
+                    presentation: None,
                     slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,

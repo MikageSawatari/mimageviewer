@@ -298,6 +298,32 @@ pub(crate) struct RemoteListingSettings {
     thumb_aspect_auto: bool,
 }
 
+/// Small live snapshot used to resolve one Remote book presentation.
+///
+/// The long-lived Remote container engine keeps a startup `Settings` value for
+/// unrelated rendering defaults. These fields are user-editable while the
+/// engine is alive, so one container response reads them together from
+/// `settings_kv` rather than mixing a current final-cover switch with stale
+/// spread defaults or page gap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RemoteReadingSettings {
+    pub(crate) default_spread_mode: crate::settings::SpreadMode,
+    pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) final_cover_spread_enabled: bool,
+    pub(crate) spread_page_gap_px: u32,
+}
+
+impl RemoteReadingSettings {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            default_spread_mode: settings.default_spread_mode,
+            default_reading_direction: settings.default_reading_direction,
+            final_cover_spread_enabled: settings.final_cover_spread_enabled,
+            spread_page_gap_px: settings.spread_page_gap_px,
+        }
+    }
+}
+
 impl RemoteListingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
@@ -758,6 +784,38 @@ impl SettingsDb {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
         Ok(settings)
+    }
+
+    /// Read only the scalar settings that determine one Remote book layout.
+    ///
+    /// Missing keys in an older DB use the startup snapshot, matching the
+    /// serde/default compatibility of a full settings load. The shared DB lock
+    /// is held once so the four values form one request snapshot.
+    pub(crate) fn load_remote_reading_settings(
+        &self,
+        fallback: &Settings,
+    ) -> Result<RemoteReadingSettings, SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        Ok(RemoteReadingSettings {
+            default_spread_mode: read_settings_kv_typed(
+                &inner.conn,
+                "default_spread_mode",
+                || fallback.default_spread_mode,
+            )?,
+            default_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "default_reading_direction",
+                || fallback.default_reading_direction,
+            )?,
+            final_cover_spread_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "final_cover_spread_enabled",
+                || fallback.final_cover_spread_enabled,
+            )?,
+            spread_page_gap_px: read_settings_kv_typed(&inner.conn, "spread_page_gap_px", || {
+                fallback.spread_page_gap_px
+            })?,
+        })
     }
 
     /// Remote の集約系 worker が現在の共有並び順だけを読む。
@@ -4862,6 +4920,45 @@ mod tests {
             .apply_to(&mut startup_snapshot);
 
         assert!(!startup_snapshot.video_thumb_use_sidecar_image);
+    }
+
+    #[test]
+    fn remote_reading_settings_are_live_and_keep_missing_old_key_defaults() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut live = Settings::default();
+        live.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        live.final_cover_spread_enabled = false;
+        live.spread_page_gap_px = 19;
+        db.save_full(&live).unwrap();
+
+        let mut fallback = Settings::default();
+        fallback.default_spread_mode = crate::settings::SpreadMode::Ltr;
+        fallback.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        fallback.final_cover_spread_enabled = true;
+        fallback.spread_page_gap_px = 3;
+        assert_eq!(
+            db.load_remote_reading_settings(&fallback).unwrap(),
+            RemoteReadingSettings::from_settings(&live)
+        );
+
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'final_cover_spread_enabled'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_remote_reading_settings(&fallback).unwrap();
+        assert!(loaded.final_cover_spread_enabled);
+        assert_eq!(loaded.default_spread_mode, live.default_spread_mode);
+        assert_eq!(
+            loaded.default_reading_direction,
+            live.default_reading_direction
+        );
+        assert_eq!(loaded.spread_page_gap_px, live.spread_page_gap_px);
     }
 
     #[test]

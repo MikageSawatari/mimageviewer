@@ -62,7 +62,7 @@ fn navigation_sequence(items_generation: u64, pages: Vec<usize>) -> FsHoldover {
             items_generation,
             anchor_idx,
             accept_rendition: true,
-            phase: FsNavigationTargetPhase::Awaiting { pages },
+            phase: FsNavigationTargetPhase::awaiting_navigation(anchor_idx, pages),
         }),
     })
 }

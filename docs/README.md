@@ -10,6 +10,7 @@
 | --- | --- |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
+| [final-cover-spread-plan.md](final-cover-spread-plan.md) | **独立ブランチで開発中**。末尾に表紙を添える見開き。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定、段階別の検証記録 |
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |

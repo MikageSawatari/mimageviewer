@@ -2342,14 +2342,19 @@ impl App {
                     // 編集が一度に 1 ページだからで、閲覧側にその制約はない。
                     let spread = self
                         .fullscreen_idx
-                        .map(|idx| self.resolve_spread_pair(idx))
+                        .map(|idx| self.resolve_visible_spread_pair(idx))
                         .unwrap_or(crate::ui_fullscreen::SpreadPair::Single);
                     let shown_indices = similar_shown_indices(self.fullscreen_idx, spread);
                     let shown_items: Vec<crate::grid_item::GridItem> = shown_indices
                         .iter()
                         .filter_map(|index| self.items.get(*index).cloned())
                         .collect();
-                    let current_item = shown_items.first().cloned();
+                    // Keep the canonical navigation page as the Similar origin/history owner.
+                    // The presentation list remains in screen order so the cover supplement is
+                    // still queried and rendered on its physical side (including RTL `[0,last]`).
+                    let current_item = self
+                        .fullscreen_idx
+                        .and_then(|index| self.items.get(index).cloned());
                     let origin_key = current_item
                         .as_ref()
                         .and_then(crate::app::similar_index_item_key);

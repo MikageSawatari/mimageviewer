@@ -709,15 +709,43 @@ pub(crate) fn paint_source_region_texture(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DisplayedPage {
     pub(crate) transform: DisplayedImageTransform,
+    occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
 }
 
 impl DisplayedPage {
     pub(crate) fn new(transform: DisplayedImageTransform) -> Self {
-        Self { transform }
+        let page_idx = transform.page_idx;
+        Self {
+            transform,
+            occurrence: crate::ui_fullscreen::SpreadPageOccurrence {
+                idx: page_idx,
+                role: crate::ui_fullscreen::SpreadPageRole::Navigation,
+                navigation_anchor_idx: page_idx,
+            },
+        }
+    }
+
+    pub(crate) fn with_occurrence(
+        transform: DisplayedImageTransform,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) -> Self {
+        debug_assert_eq!(transform.page_idx, occurrence.idx);
+        Self {
+            transform,
+            occurrence,
+        }
     }
 
     pub(crate) fn page_idx(self) -> usize {
         self.transform.page_idx
+    }
+
+    pub(crate) fn occurrence(self) -> crate::ui_fullscreen::SpreadPageOccurrence {
+        self.occurrence
+    }
+
+    pub(crate) fn navigation_anchor_idx(self) -> usize {
+        self.occurrence.navigation_anchor_idx
     }
 }
 
@@ -752,6 +780,36 @@ impl FullscreenPageLayout {
 
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
         self.pages.push(DisplayedPage::new(transform));
+    }
+
+    pub(crate) fn push_occurrence(
+        &mut self,
+        transform: DisplayedImageTransform,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) {
+        self.pages
+            .push(DisplayedPage::with_occurrence(transform, occurrence));
+    }
+
+    /// Rebind a paged layout to the role-aware composition that produced it.
+    /// Index and screen order must already match; this method never changes geometry.
+    pub(crate) fn rebind_occurrences(
+        &mut self,
+        occurrences: &[crate::ui_fullscreen::SpreadPageOccurrence],
+    ) -> bool {
+        if self.pages.len() != occurrences.len()
+            || self
+                .pages
+                .iter()
+                .zip(occurrences)
+                .any(|(page, occurrence)| page.page_idx() != occurrence.idx)
+        {
+            return false;
+        }
+        for (page, occurrence) in self.pages.iter_mut().zip(occurrences) {
+            page.occurrence = *occurrence;
+        }
+        true
     }
 
     pub(crate) fn hit_test(&self, pos: egui::Pos2) -> Option<&DisplayedPage> {
@@ -798,8 +856,36 @@ impl FullscreenPageLayout {
         self.pages.iter().map(|page| page.transform.page_idx)
     }
 
+    pub(crate) fn navigation_page_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pages.iter().filter_map(|page| {
+            (page.occurrence.role == crate::ui_fullscreen::SpreadPageRole::Navigation)
+                .then_some(page.transform.page_idx)
+        })
+    }
+
     pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
         self.pages.iter().find(|page| page.page_idx() == page_idx)
+    }
+
+    pub(crate) fn page_by_occurrence(
+        &self,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) -> Option<&DisplayedPage> {
+        self.pages.iter().find(|page| page.occurrence == occurrence)
+    }
+
+    /// Find a displayed source within one navigation unit. Continuous final-cover display can
+    /// show source index 0 twice at once (the first unit and the last unit's supplement), so the
+    /// source index alone is not enough to select the geometry that belongs to the current unit.
+    pub(crate) fn page_by_idx_for_navigation_anchor(
+        &self,
+        page_idx: usize,
+        navigation_anchor_idx: usize,
+    ) -> Option<&DisplayedPage> {
+        self.pages.iter().find(|page| {
+            page.page_idx() == page_idx
+                && page.occurrence.navigation_anchor_idx == navigation_anchor_idx
+        })
     }
 
     pub(crate) fn kind(&self) -> FullscreenPageLayoutKind {
@@ -818,6 +904,23 @@ impl FullscreenPageLayout {
             return None;
         }
         Some((self.pages[0].page_idx(), self.pages[1].page_idx()))
+    }
+
+    pub(crate) fn spread_occurrences(
+        &self,
+    ) -> Option<[crate::ui_fullscreen::SpreadPageOccurrence; 2]> {
+        if self.kind != FullscreenPageLayoutKind::Spread || self.pages.len() != 2 {
+            return None;
+        }
+        Some([self.pages[0].occurrence(), self.pages[1].occurrence()])
+    }
+
+    pub(crate) fn navigation_spread_pair(&self) -> Option<(usize, usize)> {
+        if self.kind != FullscreenPageLayoutKind::Spread {
+            return None;
+        }
+        let pages = self.navigation_page_indices().collect::<Vec<_>>();
+        (pages.len() == 2).then(|| (pages[0], pages[1]))
     }
 }
 
@@ -1763,6 +1866,41 @@ mod tests {
                 .hit_test(egui::pos2(155.0, 40.0))
                 .map(|p| p.page_idx()),
             Some(21)
+        );
+    }
+
+    #[test]
+    fn repeated_cover_source_is_addressed_by_navigation_occurrence() {
+        let first_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(80.0, 100.0));
+        let final_rect = egui::Rect::from_min_max(egui::pos2(0.0, 220.0), egui::pos2(80.0, 320.0));
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Continuous);
+        layout.push_occurrence(
+            page_transform(0, first_rect),
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
+        );
+        layout.push_occurrence(
+            page_transform(0, final_rect),
+            crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 3),
+        );
+
+        assert_eq!(
+            layout
+                .page_by_idx_for_navigation_anchor(0, 0)
+                .map(|page| page.transform.paint_rect),
+            Some(first_rect)
+        );
+        assert_eq!(
+            layout
+                .page_by_idx_for_navigation_anchor(0, 3)
+                .map(|page| page.transform.paint_rect),
+            Some(final_rect)
+        );
+        assert_eq!(
+            layout
+                .hit_test(final_rect.center())
+                .map(|page| page.occurrence()),
+            Some(crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 3))
         );
     }
 

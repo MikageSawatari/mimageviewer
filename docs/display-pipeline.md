@@ -419,15 +419,28 @@ frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し�
 各 cache が保持する寸法は回転前なので、見開きの横長判定は nav 分の保存済み回転を
 `rotation_db.get_many` で一括取得し、共通の `landscape_after_rotation` へ寸法とともに渡す。
 90° / 270° は幅と高さを入れ替え、0° / 180° は元の寸法比を使う。`rotation_cache` は item
-差し替え時に失効し、個別回転時は更新値を直接 memoize する。`SpreadDisplayUnit` は固定 cache を
-持たず表示・ナビゲーションの各解決時に組み直すため、回転変更後の次の解決から単独境界と後続ペアが変わる。
+差し替え時に失効し、個別回転時は更新値を直接 memoize する。`SpreadDisplayUnitsCache` は
+items 世代・読書順・見開き mode・ずらし位置・横長判定 epoch に対応する unit 列を保持する。
+回転変更による横長判定の更新を次の解決へ反映し、単独境界と後続ペアを再計算する。
 Remote の通常コンテナとコレクションも catalog の回転前寸法と同じ回転キーを一括で読み、同じ純関数を
-通す。寸法未確定を縦長扱いにする契約と、address-based `PageGroup` の通信形式は変更しない。
+通す。寸法未確定を縦長扱いにする契約は維持する。
+
+末尾に表紙を添える場合も `SpreadDisplayUnit` の navigation 列は変えない。
+`SpreadDisplayComposition` の slot は source idx・Navigation / FrontCoverSupplement role・読書 anchor
+を持ち、phase 所有の `FsNavigationDisplayDemand` が navigation と全 presentation の投影を一体で扱う。
+読書位置・シーク・履歴・ページ番号は navigation、読み込み・全 slot の ready/failure・描画・保持は
+presentation を参照する。末尾だけを先に確定して後から表紙を足す表示にはしない。
+連結読みは既存 still-image unit owner を使い、同じ source が先頭と末尾に現れる occurrence を
+unit anchor と role で区別する。保持対象は残存 unit の source の和集合から求める。
+全画像からなる単本の完全読書順の検証は items / nav identity ごとに保持し、回転だけで再走査しない。
+検索・stack・合成一覧などの一時条件は別に評価する。
+Remote は navigation の `PageGroup.anchor/pages/slice` を維持し、補助のある group だけに
+role 付き `presentation` を付加する。仕様・検証状況は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。
 
 paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
 表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
 GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
-`SpreadDisplayUnit` resolver が返す全ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
+共通 composition が返す補助を含む全 presentation ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
 欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。ただし、その display unit の
 全ページについて `current_final_composite_texture` が既に返せる場合は、未消費 edge があっても
 `Materialize` を維持し、完成表示からサムネイルへ降格しない。この在住確認は cache lookup だけで、

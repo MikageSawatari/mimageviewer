@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   ViewerGroupLoadOutcome,
+  remoteAddressIdentity,
 } from "./command-core.mjs";
 
 class FakeElement {
@@ -127,10 +128,12 @@ const {
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
+  applyContainerData,
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   collectionImageHash,
+  containerRuntimeStateForTest,
   containerInitialImageIndex,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
@@ -140,6 +143,7 @@ const {
   favoriteSearchEmptyMessage,
   favoriteSearchHash,
   favoriteSearchResultTitle,
+  finalCoverSpreadWriteRequest,
   gridReturnItemIdentity,
   imageRequest,
   invalidateViewerPendingLoad,
@@ -148,10 +152,20 @@ const {
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
+  normalizeContainerPageGroups,
   normalizeRemoteGridSortState,
   normalizeRemotePostFilterState,
   normalizeRemoteViewTrimState,
+  normalizePagePresentationSlots,
+  openViewerPagePositionForTest,
+  pageGroupNavigationEntries,
+  pageGroupPresentationIdentity,
+  pageGroupPresentationSlots,
   pageGroupIndexIn,
+  pagePrefetchRequestKeys,
+  pagePrefetchResourceLimit,
+  pagePrefetchTargetGroups,
+  pageRenderContextForSlot,
   parentContainerAddress,
   parseRoute,
   reloadApplication,
@@ -3601,4 +3615,298 @@ test("asking for a half that no longer exists lands on the page itself", () => {
   // 分割をやめた直後。右半分はもう無いので、そのページの表示単位へ戻す。
   assert.equal(pageGroupIndexIn(groups, page, "right"), 1);
   assert.equal(pageGroupIndexIn(groups, { path: "C:/book/p9.jpg" }, "left"), -1);
+});
+
+test("a real container exposes the tri-state final-cover setting without adding it to collections", () => {
+  const container = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: true,
+    finalCoverPreference: "off",
+    finalCoverEnabled: false,
+  });
+  const finalCoverActions = container.spread.actions.filter(([name]) =>
+    name.startsWith("final_cover_")
+  );
+  assert.deepEqual(
+    finalCoverActions.map(([name]) => name),
+    ["final_cover_follow_global", "final_cover_on", "final_cover_off"]
+  );
+  assert.equal(finalCoverActions[0][2], "全体設定");
+  assert.match(finalCoverActions[2][1], /^✓ /);
+  assert.ok(container.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+
+  const collection = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: false,
+  });
+  assert.equal(
+    collection.spread.actions.some(([name]) => name.startsWith("final_cover_")),
+    false
+  );
+});
+
+test("final-cover writes keep the effective container address and typed preference", () => {
+  const address = {
+    path: "C:/book/book.zip",
+    subresource: { kind: "zip_directory", prefix: "chapter/" },
+  };
+  assert.deepEqual(finalCoverSpreadWriteRequest(address, "follow_global"), {
+    kind: "set_final_cover_spread_preference",
+    address,
+    preference: "follow_global",
+  });
+  assert.equal(finalCoverSpreadWriteRequest(address, "unknown"), null);
+});
+
+test("supplemental cover presentation stays outside navigation and has explicit slot context", () => {
+  const fileAddress = (name) => ({
+    path: `C:/book/${name}`,
+    subresource: { kind: "file" },
+  });
+  const cover = { name: "cover.jpg", address: fileAddress("cover.jpg") };
+  const last = { name: "last.jpg", address: fileAddress("last.jpg") };
+  const byAddress = new Map([
+    [remoteAddressIdentity(cover.address), cover],
+    [remoteAddressIdentity(last.address), last],
+  ]);
+  const lastGroup = {
+    anchor: last,
+    navigationEntries: [last],
+    presentationSlots: normalizePagePresentationSlots(
+      [
+        { address: last.address, role: "navigation" },
+        { address: cover.address, role: "front_cover_supplement" },
+      ],
+      [last],
+      byAddress
+    ),
+    slice: "full",
+  };
+  const firstGroup = {
+    anchor: cover,
+    navigationEntries: [cover],
+    presentationSlots: [{ entry: cover, role: "navigation" }],
+    slice: "full",
+  };
+
+  assert.deepEqual(pageGroupNavigationEntries(lastGroup), [last]);
+  assert.deepEqual(
+    pageGroupPresentationSlots(lastGroup).map(({ entry, role }) => [entry.name, role]),
+    [
+      ["last.jpg", "navigation"],
+      ["cover.jpg", "front_cover_supplement"],
+    ]
+  );
+  assert.equal(pageGroupIndexIn([firstGroup, lastGroup], cover), 0);
+  assert.notEqual(
+    pageGroupPresentationIdentity(firstGroup),
+    pageGroupPresentationIdentity(lastGroup)
+  );
+  const contextAddress = fileAddress("book");
+  assert.deepEqual(pageRenderContextForSlot(lastGroup, 0, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_left",
+    spread_partner: cover.address,
+  });
+  assert.deepEqual(pageRenderContextForSlot(lastGroup, 1, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_right",
+    spread_partner: last.address,
+  });
+});
+
+test("prefetch plans each Double group once and reserves its supplemental resources", () => {
+  const image = (name) => ({
+    kind: "image",
+    name,
+    address: {
+      path: `C:/book/${name}`,
+      subresource: { kind: "file" },
+    },
+  });
+  const images = [image("0.jpg"), image("1.jpg"), image("2.jpg"), image("3.jpg")];
+  const firstDouble = {
+    anchor: images[0],
+    navigationEntries: [images[0], images[1]],
+    presentationSlots: [
+      { entry: images[0], role: "navigation" },
+      { entry: images[1], role: "navigation" },
+    ],
+    slice: "full",
+  };
+  const secondDouble = {
+    anchor: images[2],
+    navigationEntries: [images[2], images[3]],
+    presentationSlots: [
+      { entry: images[2], role: "navigation" },
+      { entry: images[3], role: "navigation" },
+    ],
+    slice: "full",
+  };
+  const doubleTargets = pagePrefetchTargetGroups(
+    [2, 3],
+    images,
+    [firstDouble, secondDouble]
+  );
+  assert.equal(doubleTargets.length, 1);
+  assert.deepEqual(doubleTargets[0].navigationIndexes, [2, 3]);
+  assert.equal(pageGroupPresentationSlots(doubleTargets[0].targetGroup).length, 2);
+
+  const doublePlan = [{
+    ...doubleTargets[0],
+    requests: [{ cacheKey: "page-2" }, { cacheKey: "page-3" }],
+  }];
+  assert.deepEqual(pagePrefetchRequestKeys([2, 3], doublePlan), ["page-2", "page-3"]);
+  assert.deepEqual(pagePrefetchRequestKeys([2], doublePlan), ["page-2", "page-3"]);
+  assert.equal(
+    pagePrefetchResourceLimit(firstDouble, doublePlan, { ahead: 1, behind: 0 }),
+    4
+  );
+
+  const finalGroup = {
+    anchor: images[3],
+    navigationEntries: [images[3]],
+    presentationSlots: [
+      { entry: images[3], role: "navigation" },
+      { entry: images[0], role: "front_cover_supplement" },
+    ],
+    slice: "full",
+  };
+  const finalTargets = pagePrefetchTargetGroups([3], images, [firstDouble, finalGroup]);
+  assert.equal(finalTargets.length, 1);
+  assert.equal(pageGroupPresentationSlots(finalTargets[0].targetGroup).length, 2);
+  const finalPlan = [{
+    ...finalTargets[0],
+    requests: [{ cacheKey: "last-spread" }, { cacheKey: "cover-spread" }],
+  }];
+  assert.equal(
+    pagePrefetchResourceLimit(firstDouble, finalPlan, { ahead: 1, behind: 0 }),
+    4
+  );
+});
+
+test("missing presentation wire falls back while explicit invalid presentation is rejected", () => {
+  const entry = {
+    name: "page.jpg",
+    address: {
+      path: "C:/book/page.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const byAddress = new Map([[remoteAddressIdentity(entry.address), entry]]);
+  assert.deepEqual(normalizePagePresentationSlots(undefined, [entry], byAddress), [
+    { entry, role: "navigation" },
+  ]);
+  assert.equal(
+    normalizePagePresentationSlots(
+      [{ address: entry.address, role: "future_role" }],
+      [entry],
+      byAddress
+    ),
+    null
+  );
+  assert.equal(
+    normalizePagePresentationSlots(
+      [{ address: entry.address, role: "front_cover_supplement" }],
+      [],
+      byAddress,
+      entry
+    ),
+    null
+  );
+  assert.equal(
+    normalizePagePresentationSlots(
+      [
+        { address: entry.address, role: "navigation" },
+        { address: entry.address, role: "front_cover_supplement" },
+      ],
+      [entry],
+      byAddress,
+      entry
+    ),
+    null
+  );
+
+  const cover = {
+    kind: "image",
+    name: "cover.jpg",
+    address: {
+      path: "C:/book/cover.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const last = {
+    kind: "image",
+    name: "last.jpg",
+    address: {
+      path: "C:/book/last.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const containerAddress = {
+    path: "C:/book",
+    subresource: { kind: "file" },
+  };
+  const validData = {
+    kind: "folder",
+    title: "previous",
+    effective_address: containerAddress,
+    entries: [cover, last],
+    page_groups: [
+      { anchor: cover.address, pages: [cover.address], slice: "full" },
+      { anchor: last.address, pages: [last.address], slice: "full" },
+    ],
+    image_count: 2,
+  };
+  assert.throws(
+    () => normalizeContainerPageGroups(
+      [{
+        anchor: cover.address,
+        pages: [last.address],
+        presentation: [
+          { address: last.address, role: "navigation" },
+          { address: cover.address, role: "front_cover_supplement" },
+        ],
+        slice: "full",
+      }],
+      [cover, last]
+    ),
+    /表示構成/
+  );
+  const previousHistory = globalThis.history;
+  const historyCalls = [];
+  globalThis.history = {
+    state: { mivRoute: true, viewerDepth: 4 },
+    pushState(...args) { historyCalls.push(["push", ...args]); },
+    replaceState(...args) { historyCalls.push(["replace", ...args]); },
+  };
+  try {
+    applyContainerData(containerAddress, validData, false);
+    assert.equal(openViewerPagePositionForTest({}, 1), true);
+    const snapshot = containerRuntimeStateForTest();
+    assert.throws(
+      () =>
+        applyContainerData(containerAddress, {
+          ...validData,
+          title: "invalid replacement",
+          entries: [cover, last],
+          page_groups: [{
+            anchor: last.address,
+            pages: [last.address],
+            presentation: [
+              { address: last.address, role: "navigation" },
+              { address: last.address, role: "front_cover_supplement" },
+            ],
+            slice: "full",
+          }],
+        }, false),
+      /表示構成/
+    );
+    assert.deepEqual(containerRuntimeStateForTest(), snapshot);
+    assert.deepEqual(historyCalls, []);
+  } finally {
+    globalThis.history = previousHistory;
+  }
 });

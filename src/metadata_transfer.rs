@@ -443,6 +443,8 @@ struct PortableContainerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spread: Option<PortableSpreadState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_cover_spread: Option<crate::settings::FinalCoverSpreadPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     view_trim: Option<crate::view_trim::ViewTrimBookState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     folder_thumb_pin: Option<PortableFolderThumbPin>,
@@ -450,11 +452,14 @@ struct PortableContainerState {
 
 impl PortableContainerState {
     fn is_empty(&self) -> bool {
-        self.spread.is_none() && self.view_trim.is_none() && self.folder_thumb_pin.is_none()
+        self.spread.is_none()
+            && self.final_cover_spread.is_none()
+            && self.view_trim.is_none()
+            && self.folder_thumb_pin.is_none()
     }
 
     fn has_view_state(&self) -> bool {
-        self.spread.is_some() || self.view_trim.is_some()
+        self.spread.is_some() || self.final_cover_spread.is_some() || self.view_trim.is_some()
     }
 }
 
@@ -2396,6 +2401,61 @@ where
                 }
             }
         }
+        let has_final_cover_table = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'final_cover_spreads'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if has_final_cover_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.preference
+                       FROM metadata_transfer_container_scope AS s
+                       CROSS JOIN final_cover_spreads AS p
+                      WHERE p.path = s.item_key
+                         OR (s.include_nested != 0
+                             AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let value = row.get::<_, i32>(1)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        crate::settings::FinalCoverSpreadPreference::from_int(value),
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, preference) = row.map_err(db_error)?;
+                let Some(preference) = preference else {
+                    continue;
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .final_cover_spread = Some(preference);
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .final_cover_spread = Some(preference);
+                    }
+                }
+            }
+        }
     }
 
     let view_trim_path = data_dir.join("view_trim.db");
@@ -4310,6 +4370,14 @@ fn apply_entry(
         )?;
         delete_container_key_family(
             tx,
+            "spread.final_cover_spreads",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
             "view_trim.view_trim_books",
             "book_key",
             &container_source_key,
@@ -4574,6 +4642,14 @@ fn insert_container_state(
             spread.flow,
             spread.direction
         ])
+        .map_err(db_error)?;
+    }
+    if let Some(preference) = state.final_cover_spread {
+        tx.prepare_cached(
+            "INSERT INTO spread.final_cover_spreads (path, preference) VALUES (?1, ?2)",
+        )
+        .map_err(db_error)?
+        .execute(params![stripped_key, preference.to_int()])
         .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
@@ -6836,6 +6912,85 @@ mod tests {
                 )
                 .unwrap(),
             trim_json
+        );
+    }
+
+    #[test]
+    fn final_cover_only_container_state_round_trips_without_materializing_spread_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_book = source.join("book.zip");
+        let destination_book = destination.join("book.zip");
+        fs::write(&source_book, b"same-book").unwrap();
+        fs::write(&destination_book, b"same-book").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_key = crate::path_key::normalize(&source_book);
+        let source_nested = join_container_key(&source_key, "nested");
+        let source_spread = Connection::open(source_data.join("spread.db")).unwrap();
+        source_spread
+            .execute(
+                "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2), (?2, 0)",
+                params![source_key, source_nested],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.container_states, 2);
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.zip")
+            .unwrap();
+        assert!(entry.container_state.spread.is_none());
+        assert_eq!(
+            entry.container_state.final_cover_spread,
+            Some(crate::settings::FinalCoverSpreadPreference::Off)
+        );
+        assert_eq!(
+            entry.nested_containers[0].state.final_cover_spread,
+            Some(crate::settings::FinalCoverSpreadPreference::FollowGlobal)
+        );
+
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        let destination_key = crate::path_key::normalize(&destination_book);
+        let destination_nested = PathBuf::from(join_container_key(&destination_key, "nested"));
+        let destination_absent = PathBuf::from(join_container_key(&destination_key, "absent"));
+        let spread =
+            crate::spread_db::SpreadDb::open_at(&destination_data.join("spread.db")).unwrap();
+        assert_eq!(spread.count(), 2);
+        assert!(spread.get(&destination_book).is_none());
+        assert_eq!(
+            Connection::open(destination_data.join("spread.db"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM spreads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            spread.get_final_cover_spread_preference_with_fallback(
+                &destination_nested,
+                Some(&destination_book),
+            ),
+            crate::settings::FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(
+            spread.get_final_cover_spread_preference_with_fallback(
+                &destination_absent,
+                Some(&destination_book),
+            ),
+            crate::settings::FinalCoverSpreadPreference::Off
         );
     }
 

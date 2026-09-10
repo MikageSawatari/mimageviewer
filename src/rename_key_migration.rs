@@ -286,6 +286,14 @@ pub(crate) enum StoreKeyNormalization {
     DriveStripped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreTableAvailability {
+    Required,
+    /// The database can predate this table. A missing table is an empty store, while an
+    /// existing table with the wrong schema remains an error.
+    OptionalInLegacySchema,
+}
+
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
 /// `unique` は rename の衝突処理と content-identity v1 copy の可否に使う。
@@ -301,6 +309,7 @@ pub(crate) struct StoreDescriptor {
     pub(crate) unique: bool,
     pub(crate) normalization: StoreKeyNormalization,
     pub(crate) rename_generic: bool,
+    table_availability: StoreTableAvailability,
 }
 
 impl StoreDescriptor {
@@ -328,6 +337,25 @@ const fn store(
         unique,
         normalization,
         rename_generic: true,
+        table_availability: StoreTableAvailability::Required,
+    }
+}
+
+const fn optional_legacy_store(
+    file: &'static str,
+    table: &'static str,
+    column: &'static str,
+    unique: bool,
+    normalization: StoreKeyNormalization,
+) -> StoreDescriptor {
+    StoreDescriptor {
+        file,
+        table,
+        column,
+        unique,
+        normalization,
+        rename_generic: true,
+        table_availability: StoreTableAvailability::OptionalInLegacySchema,
     }
 }
 
@@ -478,6 +506,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         true,
         StoreKeyNormalization::DriveStripped,
     ),
+    optional_legacy_store(
+        "spread.db",
+        "final_cover_spreads",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
     store(
         "view_trim.db",
         "view_trim_books",
@@ -492,6 +527,7 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         unique: true,
         normalization: StoreKeyNormalization::KeepDrive,
         rename_generic: false,
+        table_availability: StoreTableAvailability::Required,
     },
 ];
 
@@ -657,6 +693,11 @@ fn store_keys_with_rows(
         .map_err(|error| error.to_string())?;
     let conn = conn.transaction().map_err(|error| error.to_string())?;
     let columns = table_columns(&conn, descriptor.table).map_err(|error| error.to_string())?;
+    if columns.is_empty()
+        && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+    {
+        return Ok(Vec::new());
+    }
     if !columns.iter().any(|column| column == descriptor.column) {
         return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string());
     }
@@ -977,6 +1018,17 @@ fn migrate_store(
         let mut conn = rusqlite::Connection::open(db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction()?;
+        let columns = table_columns(&tx, descriptor.table)?;
+        if columns.is_empty()
+            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+        {
+            return Ok(0);
+        }
+        if !columns.iter().any(|column| column == descriptor.column) {
+            return Err(rusqlite::Error::InvalidColumnName(
+                descriptor.column.to_string(),
+            ));
+        }
         let mut changed = 0usize;
         changed += move_exact(
             &tx,
@@ -1134,6 +1186,11 @@ fn copy_store_transaction(
             .map_err(|error| error.to_string())?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
+        if columns.is_empty()
+            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+        {
+            return Ok(0);
+        }
         if !columns.iter().any(|column| column == descriptor.column) {
             return Err(
                 rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string(),
@@ -1579,8 +1636,8 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
-        assert_eq!(STORES.len(), 22, "A1 ledger を含む現行 descriptor 数");
-        assert_eq!(covered, 21);
+        assert_eq!(STORES.len(), 23, "A1 ledger を含む現行 descriptor 数");
+        assert_eq!(covered, 22);
         assert_eq!(report.rows, covered * 2);
 
         for descriptor in STORES {
@@ -1849,6 +1906,7 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
         purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
@@ -1912,6 +1970,7 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            table_availability: StoreTableAvailability::Required,
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
@@ -2527,6 +2586,82 @@ mod tests {
         assert_eq!(mode, 2, "drive 除去キーの見開き設定も移る");
     }
 
+    #[test]
+    fn final_cover_spread_override_migrates_without_a_legacy_spread_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\Old.zip");
+        let new = PathBuf::from(r"D:\Books\New.zip");
+        let old_key = crate::path_key::normalize(&old);
+        let new_key = crate::path_key::normalize(&new);
+        let conn = open(dir.path(), "spread.db");
+        conn.execute_batch(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE final_cover_spreads (
+                 path TEXT PRIMARY KEY,
+                 preference INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2)",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = open(dir.path(), "spread.db");
+        assert_eq!(
+            conn.query_row(
+                "SELECT preference FROM final_cover_spreads WHERE path = ?1",
+                [&new_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM spreads", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_spread_schema_copies_the_existing_store_without_requiring_the_new_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\Old.zip");
+        let new = PathBuf::from(r"D:\Books\New.zip");
+        let old_key = crate::path_key::normalize(&old);
+        let new_key = crate::path_key::normalize(&new);
+        let conn = open(dir.path(), "spread.db");
+        conn.execute_batch(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spreads (path, mode) VALUES (?1, 2)",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = open(dir.path(), "spread.db");
+        assert_eq!(
+            conn.query_row(
+                "SELECT mode FROM spreads WHERE path = ?1",
+                [&new_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
     /// ZIP コンテナ改名: `::` 合成キー (アーカイブ内ページの★等) が prefix 書換され、
     /// 新キー側の既存行が優先される。path 中の `%` / `_` も誤爆しない。
     #[test]
@@ -2766,7 +2901,17 @@ mod tests {
         let untouched = "c:/pictures/untouched.png".to_string();
         let keys = vec![edited.clone(), untouched.clone()];
 
-        // store が 1 つも無ければ、運ぶ行も無い。
+        // An upgraded data directory can have the legacy spread table without the optional
+        // final-cover table. Its absence is an empty store, not an unreadable-store signal.
+        let spread = open(data_dir, "spread.db");
+        spread
+            .execute_batch(
+                "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+            )
+            .unwrap();
+        drop(spread);
+
+        // store に対象行が 1 つも無ければ、運ぶ行も無い。
         assert!(ledger_keys_with_restorable_rows_at(data_dir, &keys).is_empty());
 
         let rating = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();

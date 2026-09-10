@@ -689,8 +689,13 @@ materializer worker が source を再デコードして共通合成する。
 - 効くのは**フルスクリーンで見えているページを渡すときだけ**。対象が `fullscreen_idx` と
   一致しなければ従来どおり 1 件で渡す (一覧から選んだ 1 件がたまたま同じページでも展開しない)。
 - 見えている組の解決は <kbd>Ctrl+S</kbd> / <kbd>Ctrl+E</kbd> と同じ `resolve_visible_spread_pair()`。
-- `BothPages` は**画面の左右ではなく読み順** (ページ番号の昇順) で渡す
-  (`spread_reading_order`)。右綴じでも左綴じでも「先のページが先」になる。
+- `BothPages` は**画面の左右ではなくrole付き構成の読書順**（通常の連続ページでは昇順）で渡す。
+  `resolve_visible_spread_presentation_in_reading_order` から `spread_both_pages_order` へ渡し、
+  右綴じでも左綴じでも「先のページが先」になる。
+  末尾表紙の機能branchでは、通常ページのこの順序を保持しつつ、補助付き構成を `[末尾, 表紙]`
+  とする。source index の数値sortでは表紙が先になってしまうため、role付き構成から読み順を
+  導出する。`Merged` は画面の左右順、`MainPageOnly` は読書anchorの末尾を使う。
+  開発・検証状態は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。
 - `Merged` は `MaterializeSource::MergedSpread` に左右の source、
   `MaterializePageEdits::Spread` に左右の編集 context を載せる。decode・選択段までの合成・
   見開き結合・encode はすべて実体化 worker が行い、UI 入力ハンドラは画素を作らない。

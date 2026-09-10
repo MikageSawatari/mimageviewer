@@ -145,7 +145,9 @@ fn install_rendition_failed_sequence(
             items_generation,
             anchor_idx,
             accept_rendition: true,
-            phase: FsNavigationTargetPhase::RenditionFailed { pages },
+            phase: FsNavigationTargetPhase::RenditionFailed {
+                demand: crate::app::FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+            },
         }),
         purpose,
     );
@@ -213,7 +215,7 @@ fn similar_move_p2_trace_terminals_when_materialized_navigation_fails() {
             anchor_idx: 0,
             accept_rendition: true,
             phase: FsNavigationTargetPhase::Ready {
-                pages: vec![0],
+                demand: crate::app::FsNavigationDisplayDemand::navigation_only(0, vec![0]),
                 presentation: FsNavigationPresentation::Failure,
             },
         }),
@@ -501,7 +503,9 @@ fn book_relation_move_button_reaches_the_exact_physical_target() {
             items_generation: accepted_generation,
             anchor_idx: 0,
             accept_rendition: true,
-            phase: FsNavigationTargetPhase::Awaiting { pages: vec![0] },
+            phase: FsNavigationTargetPhase::Awaiting {
+                demand: crate::app::FsNavigationDisplayDemand::navigation_only(0, vec![0]),
+            },
         }),
         FsNavigationPurpose::Ordinary,
     );
@@ -939,9 +943,10 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
         let FsNavigationSequenceTarget::Display(target) = &mut sequence.target else {
             panic!("required target must bind to a display sequence");
         };
-        let pages = target.pages().to_vec();
+        let demand = target.phase.demand().clone();
+        let pages = demand.navigation_pages().to_vec();
         target.phase = FsNavigationTargetPhase::Presenting {
-            pages: pages.clone(),
+            demand,
             presentation: crate::app::FsNavigationPresentation::Rendition,
         };
         pages

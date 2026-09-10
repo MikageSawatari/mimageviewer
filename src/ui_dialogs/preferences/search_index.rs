@@ -586,6 +586,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/final-cover",
+        SpreadMode,
+        "末尾に表紙を添える",
+        ["表紙", "末尾", "見開き", "本ごとの設定"]
+    ),
+    entry!(
         "spread/reading-flow",
         SpreadMode,
         "デフォルトの連結方式",

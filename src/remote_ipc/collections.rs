@@ -798,6 +798,7 @@ fn collection_spread_payload(
             Some(PageGroup {
                 anchor,
                 pages,
+                presentation: None,
                 slice: crate::ui_fullscreen::remote_page_slice(group.slice),
             })
         })

@@ -2308,6 +2308,7 @@ impl App {
                 let old_keymap_settings = self.settings.keymap.clone();
                 let old_fullscreen_side_panel_mode =
                     self.settings.fullscreen_side_panel_mode.normalized();
+                let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
                 let old_ui_font = self.settings.ui_font.clone();
                 let old_creative_luts = self.settings.creative_luts.clone();
                 let mut creative_lut_transaction =
@@ -2371,6 +2372,15 @@ impl App {
                 // Settings に追加した場合はここにも追記が必要。
                 prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
                 self.settings = state.settings;
+                if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
+                    #[cfg(windows)]
+                    self.invalidate_final_cover_spread_display_in_parked_contexts();
+                    if self.final_cover_spread_preference
+                        == crate::settings::FinalCoverSpreadPreference::FollowGlobal
+                    {
+                        self.invalidate_final_cover_spread_display(ctx);
+                    }
+                }
                 #[cfg(windows)]
                 if old_video_seek_strip_min_interval_secs.to_bits()
                     != self.settings.video_seek_strip_min_interval_secs.to_bits()
@@ -3915,6 +3925,31 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_viewer_notice_visibility");
+    }
+
+    #[test]
+    fn spread_page_supplement_setting_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut enabled = true;
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(540.0, 100.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    draw_final_cover_spread_setting(ui, &mut enabled);
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_final_cover_spread_setting");
     }
 
     fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {

@@ -8408,10 +8408,10 @@ pub(crate) struct FsDisplayUnitHoldover {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
-    /// Capture-time index retained for tracing and `fullscreen_page_layout` identity only.
+    /// Capture-time occurrence retained for tracing and `fullscreen_page_layout` identity only.
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
-    pub(crate) idx: usize,
+    pub(crate) occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
     pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) rotation: crate::rotation_db::Rotation,
     /// Capture-time canonical dimensions used only for page layout. PDF pages retain their
@@ -8427,6 +8427,12 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     pub(crate) trace_load_seq: u64,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
+}
+
+impl FsDisplayUnitHoldoverPage {
+    pub(crate) fn idx(&self) -> usize {
+        self.occurrence.idx
+    }
 }
 
 /// One accepted manual-browsing target and the complete display unit held while
@@ -8774,16 +8780,23 @@ impl FsNavigationSequence {
         }
     }
 
-    pub(crate) fn target_pages_for_generation(&self, items_generation: u64) -> &[usize] {
+    pub(crate) fn target_presentation_page_indices_for_generation(
+        &self,
+        items_generation: u64,
+    ) -> Vec<usize> {
         match &self.target {
             FsNavigationSequenceTarget::Display(target)
                 if target.items_generation == items_generation =>
             {
-                target.pages()
+                target
+                    .presentation_pages()
+                    .iter()
+                    .map(|page| page.idx)
+                    .collect()
             }
             FsNavigationSequenceTarget::FolderItems { .. }
             | FsNavigationSequenceTarget::AwaitingPassword { .. }
-            | FsNavigationSequenceTarget::Display(_) => &[],
+            | FsNavigationSequenceTarget::Display(_) => Vec::new(),
         }
     }
 }
@@ -8820,35 +8833,140 @@ pub(crate) struct FsNavigationDisplayTarget {
 
 impl FsNavigationDisplayTarget {
     pub(crate) fn pages(&self) -> &[usize] {
-        self.phase.pages()
+        self.phase.demand().navigation_pages()
+    }
+
+    pub(crate) fn presentation_pages(&self) -> &[crate::ui_fullscreen::SpreadPageOccurrence] {
+        self.phase.demand().presentation_pages()
+    }
+}
+
+/// One navigation target owns both its stable navigation identity and every
+/// page occurrence required for an atomic presentation. The projections are
+/// private so phase transitions cannot update only one side of the contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsNavigationDisplayDemand {
+    navigation_pages: Vec<usize>,
+    presentation_pages: Vec<crate::ui_fullscreen::SpreadPageOccurrence>,
+}
+
+impl FsNavigationDisplayDemand {
+    pub(crate) fn navigation_only(anchor_idx: usize, pages: Vec<usize>) -> Self {
+        let presentation_pages = pages
+            .iter()
+            .copied()
+            .map(|idx| crate::ui_fullscreen::SpreadPageOccurrence {
+                idx,
+                role: crate::ui_fullscreen::SpreadPageRole::Navigation,
+                navigation_anchor_idx: anchor_idx,
+            })
+            .collect();
+        Self::from_presentation(anchor_idx, presentation_pages)
+            .expect("navigation display demand must contain its anchor")
+    }
+
+    pub(crate) fn from_presentation(
+        anchor_idx: usize,
+        presentation_pages: Vec<crate::ui_fullscreen::SpreadPageOccurrence>,
+    ) -> Option<Self> {
+        if presentation_pages.is_empty()
+            || presentation_pages
+                .iter()
+                .any(|page| page.navigation_anchor_idx != anchor_idx)
+        {
+            return None;
+        }
+        let mut seen_occurrences = std::collections::HashSet::new();
+        let mut seen_indices = std::collections::HashSet::new();
+        if presentation_pages
+            .iter()
+            .any(|page| !seen_occurrences.insert(*page) || !seen_indices.insert(page.idx))
+        {
+            return None;
+        }
+        let mut navigation_pages = presentation_pages
+            .iter()
+            .filter_map(|page| {
+                (page.role == crate::ui_fullscreen::SpreadPageRole::Navigation).then_some(page.idx)
+            })
+            .collect::<Vec<_>>();
+        if navigation_pages.is_empty()
+            || !navigation_pages.contains(&anchor_idx)
+            || navigation_pages.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return None;
+        }
+        // Navigation identity has always been direction-independent. Keep that canonical
+        // projection sorted while presentation retains its exact screen order and roles.
+        navigation_pages.sort_unstable();
+        Some(Self {
+            navigation_pages,
+            presentation_pages,
+        })
+    }
+
+    pub(crate) fn navigation_pages(&self) -> &[usize] {
+        &self.navigation_pages
+    }
+
+    pub(crate) fn presentation_pages(&self) -> &[crate::ui_fullscreen::SpreadPageOccurrence] {
+        &self.presentation_pages
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationTargetPhase {
     /// Canonical pages are bound to the stable anchor, but none has been accepted for painting.
-    Awaiting { pages: Vec<usize> },
+    Awaiting { demand: FsNavigationDisplayDemand },
     Ready {
-        pages: Vec<usize>,
+        demand: FsNavigationDisplayDemand,
         presentation: FsNavigationPresentation,
     },
     Presenting {
-        pages: Vec<usize>,
+        demand: FsNavigationDisplayDemand,
         presentation: FsNavigationPresentation,
     },
     /// PDFium/catalog production reached a terminal failure. This does not block
     /// another repeat; on release, full materialization is admitted while the
     /// previous complete unit remains visible.
-    RenditionFailed { pages: Vec<usize> },
+    RenditionFailed { demand: FsNavigationDisplayDemand },
 }
 
 impl FsNavigationTargetPhase {
-    pub(crate) fn pages(&self) -> &[usize] {
+    pub(crate) fn awaiting_navigation(anchor_idx: usize, pages: Vec<usize>) -> Self {
+        Self::Awaiting {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+        }
+    }
+
+    pub(crate) fn ready_navigation(
+        anchor_idx: usize,
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
+    ) -> Self {
+        Self::Ready {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+            presentation,
+        }
+    }
+
+    pub(crate) fn presenting_navigation(
+        anchor_idx: usize,
+        pages: Vec<usize>,
+        presentation: FsNavigationPresentation,
+    ) -> Self {
+        Self::Presenting {
+            demand: FsNavigationDisplayDemand::navigation_only(anchor_idx, pages),
+            presentation,
+        }
+    }
+
+    pub(crate) fn demand(&self) -> &FsNavigationDisplayDemand {
         match self {
-            Self::Awaiting { pages }
-            | Self::Ready { pages, .. }
-            | Self::Presenting { pages, .. }
-            | Self::RenditionFailed { pages } => pages,
+            Self::Awaiting { demand }
+            | Self::Ready { demand, .. }
+            | Self::Presenting { demand, .. }
+            | Self::RenditionFailed { demand } => demand,
         }
     }
 }
@@ -8941,6 +9059,9 @@ pub(crate) struct PageEditSpreadPivot {
     pub saved_mode: crate::settings::SpreadMode,
     /// (left_idx, right_idx)。LTR / RTL のいずれでも「画面上の左/右」の意味で固定。
     pub pair: (usize, usize),
+    /// Canonical reader position. A presentation-only cover may be either physical side, but
+    /// leaving the tool must restore the navigation target rather than that source occurrence.
+    pub navigation_anchor_idx: usize,
 }
 
 impl App {
@@ -8953,12 +9074,13 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> (usize, Option<PageEditSpreadPivot>) {
-        match self.resolve_spread_pair(fs_idx) {
+        match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => (
                 left,
                 Some(PageEditSpreadPivot {
                     saved_mode: self.spread_mode,
                     pair: (left, right),
+                    navigation_anchor_idx: fs_idx,
                 }),
             ),
             // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
@@ -9012,17 +9134,27 @@ impl App {
             .map(|pivot| pivot.pair)
     }
 
+    fn page_edit_navigation_anchor_idx(&self) -> Option<usize> {
+        self.erase_spread_ctx
+            .or(self.conceal_spread_ctx)
+            .or(self.text_spread_ctx)
+            .or(self.export_crop_spread_ctx)
+            .or(self.sns_split_spread_ctx)
+            .or(self.local_adjust_spread_ctx)
+            .map(|pivot| pivot.navigation_anchor_idx)
+    }
+
     /// 退避しておいた見開きへ戻す。
     ///
-    /// ページ位置は左ページに揃える (`resolve_spread_pair` が同じペアを返すので、
-    /// 元と同じ見開きが再構築される)。
+    /// ページ位置は退避した navigation anchor に揃える。通常見開きでは従来の anchor、
+    /// 末尾表紙 supplement では末尾ページへ戻るので、画面上の左ページから推測しない。
     pub(crate) fn leave_page_edit_single_view(&mut self, pivot: Option<PageEditSpreadPivot>) {
         let Some(pivot) = pivot else {
             return;
         };
-        self.cancel_superseded_fs_navigation_display_target(pivot.pair.0);
+        self.cancel_superseded_fs_navigation_display_target(pivot.navigation_anchor_idx);
         self.spread_mode = pivot.saved_mode;
-        self.fullscreen_idx = Some(pivot.pair.0);
+        self.fullscreen_idx = Some(pivot.navigation_anchor_idx);
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
     }
@@ -12941,6 +13073,7 @@ pub struct App {
     /// 現在のフォルダの基本ページ構成。表紙あり/なし・LTR/RTL は `spread_db` で
     /// フォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
+    pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
     /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
     pub(crate) spread_shift_anchor_idx: Option<usize>,
@@ -14169,7 +14302,7 @@ pub struct App {
     pub(crate) erase_preview_cache:
         std::collections::HashMap<usize, crate::app::ErasePreviewCacheEntry>,
     /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
-    /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
+    /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を保存済み navigation anchor に
     /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
     /// (表紙・末尾奇数・横長画像) から入った場合は `None`。
     /// 2 値を 1 構造体にまとめてあるのは「mode と pair は常に同時に set / take される」
@@ -15930,6 +16063,7 @@ impl App {
             reading_history_return_from: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
+            final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -20044,14 +20178,31 @@ impl App {
     /// (ZIP 自身のキー `C:\x.zip` とも衝突しない)。通常フォルダ / 単純 ZIP は従来どおり
     /// `current_folder`。
     pub(crate) fn spread_container_key(&self) -> Option<PathBuf> {
+        self.spread_container_key_with_fallback()
+            .map(|key| key.exact)
+    }
+
+    pub(crate) fn spread_container_key_with_fallback(
+        &self,
+    ) -> Option<crate::spread_db::SpreadContainerKey> {
         if let Some(nav) = self.zip_nav.as_ref() {
-            Some(
-                crate::spread_db::container_key_with_fallback(&nav.tree.zip_path, nav.current())
-                    .exact,
-            )
+            Some(crate::spread_db::container_key_with_fallback(
+                &nav.tree.zip_path,
+                nav.current(),
+            ))
         } else {
-            self.current_folder.clone()
+            self.current_folder
+                .clone()
+                .map(|exact| crate::spread_db::SpreadContainerKey {
+                    exact,
+                    fallback: None,
+                })
         }
+    }
+
+    pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
+        self.final_cover_spread_preference
+            .effective(self.settings.final_cover_spread_enabled)
     }
 
     /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
@@ -20118,6 +20269,9 @@ impl App {
         let db = self.spread_db.as_ref();
         let stored = db
             .map(|db| db.get_state_with_fallback(key, fallback))
+            .unwrap_or_default();
+        self.final_cover_spread_preference = db
+            .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
             .unwrap_or_default();
         let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
@@ -26630,6 +26784,10 @@ impl App {
         if self.items_generation != items_generation {
             // Exact seek indices belong to the items identity, not the current page.
             self.clear_still_seek_thumbnail_requests();
+            // The page layout describes the last frame painted from this exact items identity.
+            // Reused numeric indices in the next generation must not capture its pairing or
+            // occurrence roles as a navigation holdover.
+            self.fullscreen_page_layout.clear();
             // A Display target names pages in the old items identity and cannot be remapped
             // after this owner changes generation. FolderItems is different: it deliberately
             // spans the folder install and binds to the new generation after the items arrive.
@@ -29820,10 +29978,13 @@ impl App {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
             context_id: ViewerContextId,
-            spread_container_path: Option<PathBuf>,
+            spread_container_key: Option<crate::spread_db::SpreadContainerKey>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
+            let (spread_container_path, spread_container_fallback) = spread_container_key
+                .map(|key| (Some(key.exact), key.fallback))
+                .unwrap_or_default();
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
                 context_id,
                 items_generation: index.items_generation,
@@ -29831,6 +29992,7 @@ impl App {
                 legacy_seed_paths: index.legacy_seed_paths,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
+                spread_container_fallback,
                 old_folder_pin_keys,
                 folder_pin_paths: index.folder_pin_paths,
                 folder_pin_aliases: index.folder_pin_aliases,
@@ -29845,12 +30007,12 @@ impl App {
             context_ids.sort_by_key(|id| (*id != main_id, id.serial()));
             for context_id in context_ids {
                 if let Err(error) = self.with_viewer_context(context_id, |app| {
-                    let spread_path = app.spread_container_key();
+                    let spread_key = app.spread_container_key_with_fallback();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
                         context_id,
-                        spread_path,
+                        spread_key,
                         old_folder_pin_keys,
                     ) {
                         requests.push(request);
@@ -29865,12 +30027,12 @@ impl App {
         #[cfg(not(windows))]
         {
             let context_id = ViewerContextId::single_context();
-            let spread_path = self.spread_container_key();
+            let spread_key = self.spread_container_key_with_fallback();
             let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
             if let Some(request) = take_current(
                 &mut self.metadata_import_refresh_index,
                 context_id,
-                spread_path,
+                spread_key,
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
@@ -30318,6 +30480,7 @@ impl App {
             // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
             self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
+            self.final_cover_spread_preference = container.final_cover_spread_preference;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
                 crate::view_trim::ViewTrimApplyMode::Page => {
@@ -32161,7 +32324,7 @@ impl App {
         };
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let is_spread_double = matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
         if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double)
@@ -34791,9 +34954,7 @@ impl App {
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
             .map(|sequence| {
-                sequence
-                    .target_pages_for_generation(self.items_generation)
-                    .to_vec()
+                sequence.target_presentation_page_indices_for_generation(self.items_generation)
             })
             .unwrap_or_default()
     }
@@ -39908,7 +40069,7 @@ impl App {
             return None;
         }
         let fs_idx = self.fullscreen_idx?;
-        match self.resolve_visible_spread_pair(fs_idx) {
+        match self.resolve_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } if fs_idx == left => {
                 Some(right)
             }
@@ -43608,12 +43769,7 @@ impl App {
                     } else {
                         None
                     };
-                    let spread_other: Option<usize> = match app.resolve_spread_pair(fs_idx) {
-                        crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                            Some(if left == fs_idx { right } else { left })
-                        }
-                        _ => None,
-                    };
+                    let spread_other: Option<usize> = app.displayed_spread_partner(fs_idx);
                     let mut targets: Vec<usize> = Vec::with_capacity(2);
                     targets.push(fs_idx);
                     if let Some(other) = spread_other {
@@ -54486,10 +54642,16 @@ impl App {
         let keep_back = pf_back + 1;
         let keep_forward = pf_forward + 1;
 
-        let keep_set: std::collections::HashSet<usize> = (pos.saturating_sub(keep_back)
+        let mut keep_set: std::collections::HashSet<usize> = (pos.saturating_sub(keep_back)
             ..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
             .collect();
+
+        // The final-cover supplement intentionally reuses page 0 far outside the last page's
+        // positional prefetch window. Treat the actual presentation partner as display-critical
+        // before trimming any source/GPU caches; navigation and page count remain unchanged.
+        let displayed_partner = self.displayed_spread_partner(current_idx);
+        keep_set.extend(displayed_partner);
 
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
@@ -54518,7 +54680,6 @@ impl App {
         // 昇格は**表示中のページ**に属する。見開きでは相方も表示中なので止めない。
         // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
         // decode 済み backlog も捨てる。
-        let displayed_partner = self.displayed_spread_partner(current_idx);
         self.discard_animation_expansion_confirmation_outside_display(
             current_idx,
             displayed_partner,
@@ -55089,6 +55250,9 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        // A true viewer close ends ownership of the last painted page layout. Temporary context
+        // parking does not enter this teardown and therefore keeps its context-local layout.
+        self.fullscreen_page_layout.clear();
         self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
         self.fs_pdf_display_target = None;
         // `close_fullscreen` is also used as a generic teardown from
@@ -55393,7 +55557,10 @@ impl App {
     /// `fullscreen_idx` は別々に進むことがある。終了時に同期しておくと、動画を右クリックで
     /// 閉じた場合も画像と同じく「今見ていた場所」へスクロールして戻れる。
     fn restore_grid_cursor_to_fullscreen_item(&mut self) {
-        let Some(idx) = self.fullscreen_idx else {
+        let Some(idx) = self
+            .page_edit_navigation_anchor_idx()
+            .or(self.fullscreen_idx)
+        else {
             return;
         };
         #[cfg(windows)]
@@ -56393,14 +56560,19 @@ impl App {
             // visible_indices から外れても、表示中ページの派生キャッシュは守る。
             let mut keep = std::collections::HashSet::new();
             keep.insert(current_idx);
+            keep.extend(self.displayed_spread_partner(current_idx));
             return keep;
         };
         let n = image_indices.len();
         let keep_back = self.settings.prefetch_back + 1;
         let keep_forward = self.settings.prefetch_forward + 1;
-        (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
+        let mut keep = (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
-            .collect()
+            .collect::<std::collections::HashSet<_>>();
+        // Presentation-only roles consume the same source/edit/AI pipeline as navigation pages.
+        // Keep the distant front-cover source while it is attached to the final singleton.
+        keep.extend(self.displayed_spread_partner(current_idx));
+        keep
     }
 
     /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
@@ -59375,7 +59547,7 @@ impl App {
 
             if self.reading_flow.is_paged()
                 && let Some(fs_idx) = self.fullscreen_idx
-                && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
+                && (idx == fs_idx || self.displayed_spread_partner(fs_idx) == Some(idx))
                 && let Some(previous) = self.capture_fs_display_unit(fs_idx)
             {
                 self.fs_holdover_tex = Some(FsHoldover::FinalEffectSourceReload(
@@ -60631,7 +60803,7 @@ impl App {
 
     /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
     pub(crate) fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
-        match self.resolve_spread_pair(current) {
+        match self.resolve_visible_spread_pair(current) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => {
                 Some(if left == current { right } else { left })
             }
@@ -60768,10 +60940,8 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return (HashSet::new(), HashSet::new());
         };
-        let page_indices = match self.resolve_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
-        };
+        let mut page_indices = vec![fs_idx];
+        page_indices.extend(self.displayed_spread_partner(fs_idx));
         let mut display_keys = HashSet::with_capacity(page_indices.len());
         let mut pending_keys = HashSet::with_capacity(page_indices.len());
         for idx in page_indices {
@@ -65488,7 +65658,7 @@ impl App {
     /// に応じた左/右ページの idx。フルスクリーンを開いていなければ None。
     pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
         let fs_idx = self.fullscreen_idx?;
-        Some(match self.resolve_spread_pair(fs_idx) {
+        Some(match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => {
                 match self.adjust_spread_target {
                     AdjustSpreadTarget::Left => left,
@@ -66918,7 +67088,7 @@ impl App {
             return;
         }
         let is_spread_double = matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
         if !self.panorama_entry_allowed(fs_idx, is_spread_double) {
@@ -71307,12 +71477,7 @@ impl App {
                     None
                 };
                 // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
-                let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
-                    crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                        Some(if left == fs_idx { right } else { left })
-                    }
-                    _ => None,
-                };
+                let spread_other = self.displayed_spread_partner(fs_idx);
                 // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
                 // 解像度へ再レンダして AI を起動する。
                 // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
