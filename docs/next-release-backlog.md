@@ -24,6 +24,85 @@
 ---
 
 ## 1. 優先候補
+### 1.210 右クリックメニューが、閉じた後の左クリックで出直して抜けられない — 再現条件確定 (2026-09-11)
+
+**P1。操作不能になる。** 出典: 利用者報告 (2026-09-11) と開発機での再現確認。
+
+#### 再現条件 (確定)
+
+**操作カスタマイズ → 設定 > 右ドラッグ・右クリック** で、画像フルスクリーンが
+
+- 右クリック短押し = **右クリックメニューを表示**
+- 右ドラッグ = **未使用**
+
+の組み合わせのときだけ起きる。**右ドラッグをリングショートカットにすると回避できる** (利用者へ暫定回避として案内済み)。
+
+#### 症状
+
+メニューを出した後、**メニュー外を左クリックすると同じ場所にメニューが出直す**。
+繰り返すため、メニューをやめられない。フルスクリーンを閉じると解除される。
+
+#### 原因 (コードから確定した部分)
+
+**この経路は `RightDragMode::Disabled | Unknown(_)` の arm だけが持つ**
+([ui_fullscreen.rs:31688](../src/ui_fullscreen.rs:31688))。`RingShortcut` / `MouseGesture` の
+arm は `MouseFlickOutcome` の recognizer を通し、**`fs_secondary_press_start` に触らない**。
+リングにすると回避できる理由がこれで、**同じ「短押し / 長押し」の判定が 2 通りに実装されている**。
+
+`Disabled` arm は **level から event を作っている** ([:31695](../src/ui_fullscreen.rs:31695)):
+
+```rust
+} else if secondary_down && self.fs_secondary_press_start.is_none() {
+    // 押下開始を記録
+    self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
+}
+```
+
+press / release の **edge ではなく、`secondary_down` が真であるフレーム**で武装する。
+そして `secondary_down` は egui の pointer 状態
+([:31491](../src/ui_fullscreen.rs:31491) の `ctx.input(|i| i.pointer.secondary_down())`) で、
+OS 直読みではない。
+
+メニュー表示中はステートマシンごと止まる
+([:31611](../src/ui_fullscreen.rs:31611) の `fs_context_menu_idx.is_none()` ガード) ので、
+**閉じた直後のフレームで再武装する**。400ms 後に `current_pos` でメニューを開く
+([:31701](../src/ui_fullscreen.rs:31701)〜) ため、**位置がクリック地点になる**。
+フルスクリーンを閉じると `fs_secondary_press_start` がクリアされる
+([app.rs:55419](../src/app.rs:55419)) ので、そこで抜けられる。症状の 3 点すべてと一致する。
+
+メニューは Win32 `TrackPopupMenuEx` ([native_context_menu.rs:558](../src/native_context_menu.rs:558))。
+**「TrackPopupMenuEx を閉じたクリックは presenter の queue に遅れて届く」**という既知の
+コメントが動画側にある ([native_video.rs:13944](../src/app/native_video.rs:13944))。
+**静止画側には対応する扱いが無い。**
+
+#### 未確認
+
+`secondary_down` が真のままになる理由。Win32 メニューの modal loop 中に egui が release を
+取りこぼしているのが最有力だが、**測っていない**。`MIV_DETACHED_WINDOW_DEBUG=1` で起動すると
+`[detached-window-debug] right_drag_probe` 行に `secondary_down / secondary_pressed /
+secondary_released / context_menu` が出るので、**press に対応する release が来ているか**で判る。
+直す前に 1 回見ておくと、level → edge の修正が本当に効く経路か確定できる。
+
+#### 対応
+
+- **level ではなく edge で武装する。** `secondary_pressed` を起点にし、`secondary_down` は
+  継続判定にだけ使う。stale な level から新しい押下を捏造しない
+- できれば **3 つの arm を同じ recognizer へ寄せる**。「短押し / 長押し / ドラッグ」という
+  同じ問いに 2 つの実装がある状態そのものが原因なので、片方だけ直すと次も同じ形で出る
+- **症状パッチを入れない。** 「メニューを閉じた後 N ミリ秒は武装しない」のような時間任せの
+  抑止は、原因 (level から event を作っている) に対応していない
+
+#### 回帰確認
+
+- 右ドラッグ = 未使用 の設定で、メニュー → メニュー外を左クリック → **閉じるだけ**
+- 同設定で、長押しメニューと短押しアクションが**両方とも従来どおり**動く
+- 右ドラッグ = リングショートカット / マウスジェスチャの既存挙動が変わらない
+- 動画フルスクリーン側のメニュー経路 ([native_video.rs:13818](../src/app/native_video.rs:13818) /
+  [:14111](../src/app/native_video.rs:14111)) に影響しない
+- 編集モード中 (`RightDragContext::EditMode`) の早期 return が生きている
+
+- 規模 / 優先度: Small / **P1**。
+
 ### 1.209 サイドカーの取り込みが UI スレッドを数十秒止める (2026-09-11)
 
 **P1。v3.8.0 のポータブル smoke で発見。出荷済みの既存不具合で、v3.8.0 の退行ではない。**
