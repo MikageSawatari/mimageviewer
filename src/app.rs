@@ -12461,6 +12461,7 @@ pub struct App {
     pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// Raw XButton seek holds owned by the currently projected viewer context.
     /// Normal AtRest deposits preserve this state via `ViewerContextBundle`.
+    #[cfg(windows)]
     pub(crate) native_video_mouse_seek_holds: native_video::NativeVideoMouseSeekHolds,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
@@ -15862,6 +15863,7 @@ impl App {
             sidecar_display_cache: std::collections::HashMap::new(),
             panorama_state: None,
             video_zoom_state: None,
+            #[cfg(windows)]
             native_video_mouse_seek_holds: native_video::NativeVideoMouseSeekHolds::default(),
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             pano_uploaded: None,
@@ -73352,7 +73354,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
+        #[cfg(windows)]
         self.poll_similar_preview_workers_in_all_contexts(ctx);
+        #[cfg(not(windows))]
+        {
+            // Non-Windows builds have one mounted viewer context and therefore no
+            // ViewerContextRegistry. Keep polling that context's draining preview
+            // worker so cancellation/late completion retains the Windows lifecycle.
+            let passwords = self.pdf_passwords.clone();
+            self.similar_panel.preview.poll_background(ctx, &passwords);
+        }
         self.update_frame(ctx, frame);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::finish_action_pass(ctx);
