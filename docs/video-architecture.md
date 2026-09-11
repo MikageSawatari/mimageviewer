@@ -882,22 +882,29 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 (場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した
 まま、中身を止めて赤線だけを動かせる。場面の軸は `StripAxis::whole` (尺を帯のセル数で等分した
 `TimeGrid`) で、セル数は presenter が実寸から報告する。
+この実寸feedbackは独立eventにせず、成功presentの`Visible { window }` latest snapshotへ内包する。
+Appはsession/source/placementを照合してVisibleへ遷移し、同じhandlerでlayout revisionを照合して
+`visible_count`とwhole axisを更新してからworkerへ要求する。HUD Hidden中のfeedback拒否と別slotの
+Visible遅着が組み合わさり、初期9セルだけが中央に残る§1.211の順序欠陥をこの境界で防ぐ。
 
 **セッションを畳む境界と、記憶している選択は別物である** (§1.146、2026-08-31)。
 `Settings.video_seek_strip_state` を消すのは `SeekStripCloseCause::is_user_dismissal`
 (`Toggle` / `DownwardDrag` / `Escape`) と、もう一方の面を明示的に開いた `TileModeOpened`
-だけ。**HUD が自動で隠れただけの `HudHidden` と、素材都合の `Unavailable` は消さない。**
-以前は固定していない限りこの 2 つでも消しており、シークバーが自動で隠れて出し直すたびに
-ストリップが「なし」に戻っていた。素材の無い動画 1 本が、そのあとの動画すべてから選択を
-奪ってもいた。
+だけ。素材都合の `Unavailable` でも消さない。HUD の自動 hide/show は close cause ではなく、
+同じ resource session を `Visible` / `Suspended` の間で移す一時的な presentation transition とする。
+hidden 中は選択・worker・decoder・セルを保持し、波形の background 解析だけを pause する。
+以前は固定していない限り HUD hide や `Unavailable` でも選択を消しており、シークバーを
+出し直すたびにストリップが「なし」に戻っていた。素材の無い動画 1 本が、そのあとの動画
+すべてから選択を奪ってもいた。
 
 波形の粗トラック (全尺解析) はセッションより長く生きる。`SeekStripWaveWorker` は
-`SeekStripCloseCause::keeps_viewing_the_same_video` が真の境界では `cancel` せず、
-App の `video_seek_strip_wave_holdover` へ動画パスと一緒に預ける。次のセッションは
-`take_or_spawn_seek_strip_wave_worker` でパスを照合して拾い、**新しく spawn したものと
+`SeekStripCloseCause::keeps_viewing_the_same_video` が真の境界では `cancel` せず、App の
+`video_seek_strip_wave_holdover` へ owner fs index、動画パス、source epoch、items generation と
+一緒に預ける。次のセッションは`take_or_spawn_seek_strip_wave_worker` でこの4 identityをexactに
+照合して拾い、**新しく spawn したものと
 見分けが付かない状態** (背景段は再開済み) で受け取る。預けている間は背景の全尺解析だけを
 止める。手放すのは動画が変わる / フルスクリーンを出るときで、`sync_native_video_seek_strip`
-が毎フレーム現在のパスと照合して取りこぼしを拾う。保持は 1 本ぶん
+が毎フレーム4 identityを照合してsource replacementの取りこぼしを拾う。保持は 1 本ぶん
 (`MAX_COARSE_WAVEFORM_BYTES` = 64 MiB が上限、通常の 1〜2 時間なら 250〜500 KB)。
 `cancel` は不可逆でスレッドが終わるため、預ける経路では絶対に呼ばない。サムネイルモードの
 `SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
@@ -994,10 +1001,11 @@ terminal state はセルごとに
 繰り返さず、列全体を 1 個の案内へ置き換える。この判定は `KeyframeIndex / TimeGrid` を区別しない。
 軸解決そのものの失敗、worker thread spawn failure、cancel は既存の open / close lifecycle が扱い、
 presenter payload の案内状態にはしない。
-波形 span の設定変更時は、旧 worker を cancel/drop して保持 raster と LRU を request coverage から
-外す一方、現在の raster の Arc とその旧可視 span を display-only holdover として session に残す。
-新 first paint が publish された frame で raster と可視 span を一緒に交換するため、再構築中に blank
-や一時的な誤スケールを挟まない。
+波形 span や mode の設定変更では resource session と worker/decoder を保持し、layout revision と
+request signature を更新する。現在の raster の Arc と旧可視 span は新しい first paint が publish
+されるまで display-only holdover として session に残すため、再構築中に blank や一時的な誤スケールを
+挟まない。HUD hidden 中の設定変更は正本だけを更新し、新 request と未生成 worker の生成は visible
+へ戻るまで延期する。
 strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする typed command に変換する。
 **保存は 1 ノッチごとには行わない。** `Settings::save` は全設定の JSON 化 + SQLite transaction
 なので (実測 1.3ms、VST3 プラグイン状態 1MB を持つ環境で 17ms)、ホイール中はメモリ上の

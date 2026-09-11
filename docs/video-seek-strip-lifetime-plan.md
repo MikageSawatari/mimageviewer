@@ -4,8 +4,8 @@
 対象: 次版 backlog §1.211、および 2026-09-11 の動画メモリ急増調査
 
 この文書は、動画 HUD の一時非表示によってシークストリップの thumbnail worker と
-decoder が短時間に再生成される問題について、確定した根因と構造修正の受入条件を固定する。
-実装前の設計記録であり、この時点では製品コードを変更していない。
+decoder が短時間に再生成される問題について、確定した根因、実装した構造修正、受入条件を
+固定する実装記録である。
 
 ## 1. 観測した失敗と守るべき不変条件
 
@@ -26,15 +26,15 @@ decoder が短時間に再生成される問題について、確定した根因
 - worker、decoder、cell cache、wave worker は viewer context に属し、別 context の同じ
   `fs_idx` や同じ path へ流用しない。
 
-根拠となる現在の経路は次のとおり。
+根拠となった修正前の経路は次のとおり。
 
-- `src/app.rs`: fullscreen 動画の各 update で `sync_native_video_seek_strip` を呼ぶ。
+- `src/app.rs`: fullscreen 動画の各 update で `sync_native_video_seek_strip` を呼んでいた。
 - `src/video/native_presenter/render_core.rs`: strip payload があり、bottom HUD が隠れていると
-  `CloseSeekStrip(HudHidden)` を生成する。
-- `src/video/mod.rs`: native overlay command を source epoch 付きの通常 output busへ送る。
-- `src/app/native_video.rs`: close 時に thumbnail worker を cancel/drop する。wave worker だけは
+  `CloseSeekStrip(HudHidden)` を生成していた。
+- `src/video/mod.rs`: native overlay command を source epoch 付きの通常 output busへ送っていた。
+- `src/app/native_video.rs`: close 時に thumbnail worker を cancel/dropしていた。wave worker だけは
   同一動画向け holdover へ移す場合がある。
-- `src/video/seek_strip_thumbs.rs`: 一つの安定した worker 内では decoder を lazy-open して保持する。
+- `src/video/seek_strip_thumbs.rs`: 一つの安定した worker 内では decoder を lazy-open して保持していた。
 
 したがって多数の decoder open はセルごとの通常動作ではなく、session/worker が再生成された
 ことを表す。
@@ -62,10 +62,11 @@ JSON/logを参照する。
 - WDDM `process_dedicated_bytes` は physical VRAM 使用量ではない。DirectComposition/DWMを含む
   PID attributionとして物理容量を超えることがあるため、今回の根因や計測バグの直接証拠には
   使わない。
-- §1.211 の「whole strip が中央約60%に8〜9セルだけ出て、HUD hide/show後に直る」症状は、
-  session再生成で`visible_count`が初期値9へ戻り、presenterの実幅feedback
-  `RequestSeekStripWindow`が定着しない説明と整合する。ただし当該frameのcell-count eventを
-  記録していないため、同じ寿命不整合が直接原因だとはまだ証明できていない。
+- §1.211 は2026-09-11のED動画再現ログで原因を確定した。HUD Hidden中のsessionは初期
+  `visible_count=9`でrequest 1を送った。最初のVisible成功presentでは、rendererが実幅feedbackを
+  先に別latest slotへ送り、Visibleを次loopで送ったため、AppはSuspended中のfeedbackを拒否した。
+  renderer側dedupは既に進んでおり、終了時も`last_sent_request=1`、center 4.5のままだった。workerは
+  cache 5 + decode publish 4 = 要求された9セルを全件返しており、切詰め原因ではない。
 - 既存のpure layout計算は全幅を埋める。追加証拠なしに別のlayout math bugと断定しない。
 
 ## 3. 正本となる typed state
@@ -89,6 +90,14 @@ enum SeekStripPresentedInventory {
     Absent,
     Hidden { session_id: SeekStripSessionId },
     Visible { session_id: SeekStripSessionId },
+}
+
+enum SeekStripPresentationEvent {
+    Hidden { session_stamp },
+    Visible {
+        session_stamp,
+        window: Option<ExactLayoutWindow>,
+    },
 }
 ```
 
@@ -117,19 +126,22 @@ runtimeまで欠落なく運ぶ。Appは現在Open中のexact idとowner identit
 - session生成前の操作: `OpenSeekStrip`。active sessionがないためsession idは持たないが、producerの
   window/placement generationは持つ。
 - session-bound: `CloseSeekStrip`、`MoveSeekStrip`、`CommitSeekStrip`、
-  `RequestSeekStripWindow`、`StepSeekStripRange`、`ToggleSeekStripLock`。すべてexact session idと
+  `StepSeekStripRange`。すべてexact session idと
   producerのwindow/placement generationを持つ。
-- menu configuration: `SetSeekStripView`と`SetSeekStripHeight`はstripがClosedでも表示され得る。
-  `expected_session_id: Option<_>`とproducer generationを持たせ、`Some(id)`はexact Open session、
-  `None`は現在もClosedである場合だけ受理する。古いrendererの`None`をOpen中sessionへ適用しない。
+- menu configuration: `SetSeekStripView`、`SetSeekStripHeight`、`ToggleSeekStripLock`はstripが
+  Closedでも表示され得る。
+  `expected: Option<session/layout stamp>`とproducer generationを持たせ、`Some`はexact Open sessionと
+  layout、`None`は現在もClosedである場合だけ受理する。古いrendererの`None`をOpen中sessionへ
+  適用しない。
 - strip非依存: 通常のseek、hover thumbnail、動画navigationなど。strip session stampを足さない。
 
-特にlatest/coalesce対象の`RequestSeekStripWindow`、およびlayout上の座標を運ぶ`MoveSeekStrip`と
-`CommitSeekStrip`はlayout revisionも持つ。mode/span/height変更ではrevisionを進めて旧layout由来の
-feedback/gestureを拒否するが、同じworker handleを新しいmutable configへ移して保持する。resizeは
-同sessionのlayout feedback更新として扱い、worker/decoderを再生成しない。`StepSeekStripRange`等の
-連続した利用者commandはlosslessな順序を維持し、一つ目の適用だけで同じ入力batchの後続stepを
-誤って捨てるrevision運用にはしない。
+renderer内部のfinal-pass `RequestSeekStripWindow` observation、layout上の座標を運ぶ`MoveSeekStrip`と
+`CommitSeekStrip`、現在layoutのmode/rangeへ相対変更する`StepSeekStripRange`はlayout revisionも
+持つ。mode/span/height変更ではrevisionを進めて旧layout由来のfeedback/gesture/configを拒否するが、
+同じworker handleを新しいmutable configへ移して保持する。resizeは同sessionのlayout feedback更新
+として扱い、worker/decoderを再生成しない。同じnative input batchの連続stepはordered `Vec`を持つ
+1 typed commandへまとめ、exact layout stampを1回だけ検証して全段を順に適用した後、revisionと
+requestを1回だけ更新する。別batchで遅着した旧layout stepは拒否する。
 
 ## 4. rendererからAppへのpresent済みedge
 
@@ -141,25 +153,27 @@ native rendererは、logical outputに`SeekStripPresentedInventory`相当を含�
    上書きする。unionや全passのedge列にはしない。
 3. `surface_texture.present()`だけでなく、その後の`set_visual_attached(true)?`など当該batchの
    fallible処理がすべて成功し、`present_logical_batch`が`Ok`を返す直前に、前回committed
-   inventoryとの差をrender core内のlatest pending snapshotとして記録する。
+   inventoryとの差と、最終Visible passのexact window observationをrender core内の一つのlatest
+   pending snapshotとして記録する。presentation stateかwindow request keyのどちらかが変われば更新する。
 4. pending snapshotを`NativeOverlayInputOutcome.commands`だけへ入れない。通常frame、resize、grade、
    zoom、show refresh、placement candidate primeなど、成功outcomeのcommandsを呼び出し側が使わない
    既存経路がある。そこでnative output loopは各iterationの末尾にcurrent presenterのpending
    snapshotを読み、latest-value eventとして必ず送る。
-5. 同じ値のframeではpendingを繰り返さない。present/acquire/render/visual attach失敗時はcommitted
+5. `Visible` snapshotはsession/generationのlifecycle stampと、任意のexact layout windowを同じeventに
+   持つ。`Hidden`はwindowを持たない。別latest slotへ分けないため、App drain前に後続Hiddenが来ても
+   visibilityだけを上書きしてdedup済みrequestを取り残すことがない。同じ値のframeではpendingを
+   繰り返さない。present/acquire/render/visual attach失敗時はcommitted
    stateもpendingも進めない。output loopはpendingをpeek/cloneし、専用latest publisherが受理した
    後にだけackしてclearする。現在の`send() -> ()`へ「成功したはず」と委ねない。publisherは
    `Result`等でtyped accepted/faultを返し、Mutex poisonなど受理不能ならpendingを保持したまま
    native outputをfatal terminalへ移す。
 6. placement candidateがprime中に作ったpendingは、candidateがcommitされcurrent presenterへ
    replaceされた場合だけ送る。candidateがabortした場合はcandidateと一緒に破棄する。
-7. candidateの最初のvisible passはpresentation inventoryだけでなく、実寸の
-   `RequestSeekStripWindow`を生成してrenderer内のrequest dedup正本も進める。現行のplacement primeは
-   `overlay_outcome.commands`を利用しないため、このrequestをその場で捨てるとcommit後にも再送されず、
-   Appの初期`visible_count=9`が残る。candidate outcomeの全semantic commandを再生するのではなく、最終
-   `Visible` inventoryとsession/layout stampが一致するlatest passive `RequestSeekStripWindow`だけを
-   candidateと一緒に保留する。placement commit後にcandidate generation付きで一度publishし、abort時は
-   破棄する。dedupは、このcommit/abort所有者から確実に配送されるrequestだけ進んだ状態として扱う。
+7. candidateの最初のvisible passも、実寸windowを内包した同じcompound `Visible` snapshotをcandidateと
+   一緒に保留する。`PlacementCommitted`をAppへ送り、Appがgenerationを適用して返すexact `Retire`
+   controlを受けた直後に一度publishする。commit前後のAbortではcandidateと一緒に破棄する。
+   candidate outcomeのsemantic commandは再生しない。`PlacementReady.requires_retire`はtrue固定であり、
+   このack境界を通らないcandidateは無い。
 8. `SetSeekStrip(None)`、overlay source session reset、`SwitchSource`、render core replacementでは
    renderer側のcommitted baselineとpendingを`Absent`へclearする。
 
@@ -176,30 +190,25 @@ bundleによって決まる。
 eventにはしない。Appのterminalは利用者command、source/context lifecycle、availabilityから決める。
 遅延した`Absent`に意味を持たせない。
 
-通常のoverlay commandsはpresent成功outcomeから先にoutput busへ送られ、presentation pending snapshotは
-output-loop iteration末尾にpublishされる。この順序では、最初の成功visible passが生成した
-`RequestSeekStripWindow`等が、対応するVisible edgeより先にAppへ届く。Appのsession-bound command
-gateは`AwaitingFirstPresent`を失敗扱いにせず、exact session id、placement generation、必要なlayout
-revisionが一致するcommandを受理する。`Suspended`だけが新しいlayout requestやgestureを拒否する。
+Appはcompound snapshotのsession/source/placement generationを先に照合し、`Visible`へ遷移してから
+内包windowのlayout revisionを照合する。exact windowならvisible count/raster/whole axis/centerを適用し、
+その値でworker requestを一度だけ出す。session/source/generation不一致はsnapshot全体を拒否する。
+layoutだけが古い場合はVisible lifecycleだけを適用し、windowを拒否する。次のcurrent-layout成功presentが
+compound snapshotを再生成して回復する。独立したnative `RequestSeekStripWindow` event/slotは持たない。
 
 新event handlerから`mark_native_video_hud_activity`を呼ばない。現在のClose handlerと同じ副作用を
 残すと、表示観測がHUD visibilityを変え、再び自己励起する。
 
-このpresentation eventはParkedLive maintenanceだけでなく、sidecar restore modal中にも許可する。
-semantic inputではなくpresenter lifecycle resultなので、modal中に捨てるとrendererだけがHiddenへ
-commitしてAppがActiveのままになる。どちらの経路でもactivationやHUD activityを起こさず、exact
-ownerへ適用する。
-
-sidecar restore modal中は、同じpresentで先に届くexact `RequestSeekStripWindow`もpassive feedbackとして
-許可する。これを捨てるとrendererの`last_window_request` dedupによってmodal解除後に再送されず、
-初期9セルが残り得る。対象sessionがSuspendedなら拒否する。Move/Commit等のsemantic inputは従来の
-modal blockを維持し、modal中のpassive例外へ広げない。
+compound presentation eventはParkedLive maintenanceとして受理する。activationやHUD activityを
+起こさず、stamp reducerがstale owner/layoutを拒否する。§1.209後は
+sidecar restore用のnative output allow/block classifierを持たず、target native sessionはrestore開始前の
+既存close契約で終端し、独立sibling native eventは通常配送される。本修正でsidecar専用gateは追加しない。
 
 ## 5. transientとterminalの遷移
 
 | 契機 | 分類 | session/worker | 保存された表示状態 |
 | --- | --- | --- | --- |
-| 初回成功present中のexact layout feedback | Awaitingで受理 | 同じsessionへ一度適用 | 変更しない |
+| 初回/再表示成功presentのcompound Visible + exact layout feedback | lifecycle後にlayout照合して受理 | 同じsessionへ一度適用 | 変更しない |
 | present済みHUD Hidden | transient suspend | 同じsessionを保持 | 変更しない |
 | 同じidのpresent済みHUD Visible | transient resume | 同じsessionを再開 | 変更しない |
 | 利用者Toggle/下drag/Escape | session/thumbnail terminal | thumbnailをcancel/drop。waveは同動画holdover可 | Closedへ保存 |
@@ -256,8 +265,8 @@ terminal条件が無ければ、次を行わない。
 command受理はactivityごとに次を守る。
 
 - `AwaitingFirstPresent`: 同じsuccessful visible passから返ったexact owner stampの通常commandを受理
-  する。RequestWindow、Move/Commit、StepRange、ToggleLock、user Close、
-  `expected_session_id=Some`のSetView/SetHeightを、Visible edgeより先という理由だけで失わない。
+  する。RequestWindow、Move/Commit、StepRange、user Close、
+  `expected=Some`のSetView/SetHeight/ToggleLockを、Visible edgeより先という理由だけで失わない。
 - `Visible`: exact stampを持つ通常のstrip feedback/gesture/config commandを受理する。
 - `Suspended`: 新しいRequestWindow/Move/Commit/StepRange等を拒否する。利用者closeやsource/contextの
   terminalは別のlifecycle経路で引き続き処理する。
@@ -286,7 +295,10 @@ visible stall時間へ算入しないようpending timingをresetする。その
   移してstrip workerを元contextへ残さない。
 - 新規fork/open siblingは空のruntimeと独立したnext idを持つ。worker/cellをcloneしない。
 - `items_generation` replacement、index-space replacement、context retire/dropではそのbundleの
-  sessionだけをcancel/dropする。
+  sessionだけをcancel/dropする。ただしsnapshotがexact `SnapshotKey` survivorを同じpath/source epochの
+  playerへ写す場合だけ、LiveMedia transferと同じidentity-preserving remapとしてopen sessionとclosed
+  wave holdoverのowner index/items generationを一緒に更新する。missing key、別path/epoch、siblingへは
+  移さずterminalにする。
 - mount/depositそのものをterminal扱いしない。F12 viewportは毎frame bundleを交換するため、ここで
   cancelすると一時非表示修正後もworkerが継続できない。
 - raw HWNDをAppのsession identityへ追加する必要はない。HWNDはnative eventのhost/placement経路で
@@ -359,40 +371,45 @@ Hidden後に行う初回openは許容する。cell populateもその受理済み
 - 通常frame/resize/grade/zoom/show refreshでoutcome commandsを無視しても、iteration末尾のpending回収で
   edgeを一度送る。
 - latest publisherが受理した後だけpendingをackする。受理不能はsuccess扱いせずoutput fatalとなる。
-- placement candidate primeのedgeはcommit後だけ送り、abort時は送らない。
+- placement candidate primeのcompound VisibleはAppからexact Retire ackを受けた後だけ送り、
+  commit前後のAbortでは送らない。
 - source reset/SwitchSource/core replacement後に古いinventoryを再利用しない。
-- placement candidateの最初のvisible passが生成したlatest exact `RequestSeekStripWindow`は、candidate
-  commit後に新generationで一度だけpublishする。abortでは破棄し、renderer dedupだけを進めてrequestを
-  失う状態を作らない。candidateのsemantic commandはこのpassive配送へ混ぜない。
+- placement candidateの最初のvisible passが生成したexact window付きcompound `Visible`は、candidate
+  commit後に新generationで一度だけpublishする。abortでは破棄し、candidateのsemantic commandは
+  このpassive配送へ混ぜない。
 - Hidden event handlerがHUD activityを生成しない。
-- presentation eventをParkedLive maintenance allowlistへ含め、activationや利用者入力として扱わない。
-- sidecar restore modal中もpresentation eventをexact ownerへ適用し、modal解除後のedge再送へ依存しない。
-- sidecar restore modal中もAwaiting/Visibleのexact RequestWindowだけはpassive feedbackとして受理し、
-  semantic inputはblockする。SuspendedのRequestWindowは拒否する。
+- compound presentation eventをParkedLive maintenance allowlistへ含め、activationや利用者入力として扱わない。
+- ParkedLive中もcompound presentation/windowをpassive maintenanceとして受理し、
+  semantic inputやactivationへ昇格しない。§1.209 sidecar専用native gateは追加しない。
 - `Absent`はApp eventを作らず、runtimeを変更しない。
 
 ### session identity
 
 - 同source epochのclose→reopen後、旧session idのHidden/Visibleと全session-bound strip commandを拒否する。
 - 同じpath、同じ`fs_idx`でも別viewer contextのeventを拒否する。
-- `items_generation`またはsource epochが変われば旧sessionをterminalにする。
+- `items_generation`またはsource epochが変われば旧sessionをterminalにする。exact SnapshotKey/path/source
+  epochのsnapshot remapだけはopen sessionとclosed holdoverを同じworker identityのまま移し、それ以外は
+  terminalにする。
 - window/placement generationが変われば旧eventを拒否するが、F12 placement switchでは同じsessionと
   workerを保持する。
-- Close/Move/Commit/RequestWindow/StepRange/ToggleLockのsession stamp欠落をcompile/pure分類で検出する。
-- Openはgenerationだけ、SetView/SetHeightは`expected_session_id`のSome/None preconditionを持ち、
+- Close/Move/Commit/StepRange/ToggleLockとcompound windowのsession stamp欠落をcompile/pure分類で検出する。
+- Openはgenerationだけ、SetView/SetHeightはfull layout `expected`のSome/None preconditionを持ち、
   Closed由来の遅延commandをOpen sessionへ適用しない。
-- mode/span/height変更でlayout revisionを進め、旧RequestWindow/Move/Commitを拒否しつつ、同じ
+- mode/span/height変更でlayout revisionを進め、旧compound window/Move/Commitを拒否しつつ、同じ
   thumbnail/wave workerとdecoder identityを保持する。
-- 同じsuccessful first-present batchの`RequestWindow -> Visible`順でRequestWindowを一度適用し、
-  `AwaitingFirstPresent`を理由に拒否しない。
+- successful presentの`Visible { window }`を一つのreducerでlifecycle→exact layout→requestの順に一度適用し、
+  初回fallback値やSuspended stateを理由にwindowを失わない。App drain前のVisible→HiddenはHiddenだけ、
+  Hidden→Visibleはwindow付きVisibleだけへatomicにcoalesceする。
 - Awaitingのclassifier/reducerは、同じsuccessful visible passから返るsession-bound commandと
-  `expected_session_id=Some`のconfiguration commandを網羅する。代表RequestWindowの順序testに加え、
+  `expected=Some`のconfiguration commandを網羅する。compound window testに加え、
   許可集合の分類testでMove/Commit/StepRange/ToggleLock/user Close/SetView/SetHeightの欠落を防ぐ。
 - Suspendedでは新規feedback/gesture/config commandを拒否する。exact user Closeはterminalとして扱う。
   stamp mismatchはactivityにかかわらずすべて拒否する。
 - Suspended中のApp正規設定更新はmutable config/layout revisionへ適用・保存し、既存worker/decoder
   identityを保つ。同じ変更を旧native presentation由来の遅延config commandとして受けた場合だけ拒否する。
   mode変更で必要なworkerが未生成ならHidden中はspawn/requestせず、Visible後の一度syncで生成する。
+- source swapは旧playerがnative outputを渡せることを確認した後、takeの直前にVideoChanged terminalを
+  線形化する。output unavailableならswapを始めず、open session/worker/holdoverを一切変更しない。
 
 ### Suspended work
 

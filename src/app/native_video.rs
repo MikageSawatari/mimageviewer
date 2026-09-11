@@ -287,6 +287,11 @@ pub(super) enum VideoSeekStripAxisState {
 
 #[cfg(windows)]
 pub(super) struct VideoSeekStripSession {
+    session_id: crate::video::seek_strip::SeekStripSessionId,
+    layout_revision: crate::video::seek_strip::SeekStripLayoutRevision,
+    items_generation: u64,
+    source_epoch: u64,
+    presentation: VideoSeekStripPresentationState,
     owner_fs_idx: usize,
     video_path: std::path::PathBuf,
     duration_secs: f64,
@@ -326,7 +331,8 @@ pub(super) struct VideoSeekStripSession {
     /// ホイールでレンジ設定を変えた時点の [`crate::settings::save_generation`]。
     /// 変えていなければ `None`。
     ///
-    /// ホイールは 1 ノッチ = 1 コマンドなので、その都度 `Settings::save` を呼ぶと
+    /// ホイールは同じnative input batchのノッチ列を1 typed commandとして順に適用する。そのたびに
+    /// `Settings::save` を呼ぶと
     /// 全設定の JSON 化 + SQLite transaction が UI スレッドで連続する。実測は既定設定で
     /// 1.3ms、VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)、さらに
     /// プロセス最初の保存には世代ローテ 7ms が付く。操作中はメモリ上の `settings` だけを
@@ -338,6 +344,14 @@ pub(super) struct VideoSeekStripSession {
     range_edited_at_save_generation: Option<u64>,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSeekStripPresentationState {
+    AwaitingFirstPresent,
+    Visible,
+    Suspended,
+}
+
 #[cfg(all(test, windows))]
 impl VideoSeekStripSession {
     /// 持ち越しの検証に要る 2 つ (動画と波形ワーカー) だけを持つセッション。
@@ -347,6 +361,11 @@ impl VideoSeekStripSession {
         worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
     ) -> Self {
         Self {
+            session_id: crate::video::seek_strip::SeekStripSessionId(1),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(1),
+            items_generation: 0,
+            source_epoch: 0,
+            presentation: VideoSeekStripPresentationState::Visible,
             owner_fs_idx: 0,
             video_path,
             duration_secs: 600.0,
@@ -378,8 +397,71 @@ impl VideoSeekStripSession {
     }
 }
 
+#[cfg(all(test, windows))]
+impl App {
+    pub(in crate::app) fn seed_video_seek_strip_context_for_test(
+        &mut self,
+        video_path: std::path::PathBuf,
+        worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
+        session_id: u64,
+        visible_count: usize,
+        next_session_id: u64,
+    ) {
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(video_path, worker);
+        session.session_id = crate::video::seek_strip::SeekStripSessionId(session_id);
+        session.owner_fs_idx = self.fullscreen_idx.unwrap_or(0);
+        session.items_generation = self.items_generation;
+        session.visible_count = visible_count;
+        self.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+        self.video_seek_strip_next_session_id = next_session_id;
+    }
+
+    pub(in crate::app) fn video_seek_strip_context_owner_for_test(
+        &self,
+    ) -> Option<(crate::video::seek_strip::SeekStripSessionId, usize, usize)> {
+        self.video_seek_strip_runtime.context_owner_for_test()
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VideoSeekStripRuntime {
+    pub(super) fn context_owner_for_test(
+        &self,
+    ) -> Option<(crate::video::seek_strip::SeekStripSessionId, usize, usize)> {
+        let VideoSeekStripRuntime::Open(session) = self else {
+            return None;
+        };
+        Some((
+            session.session_id,
+            session.visible_count,
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test())
+                .unwrap_or_default(),
+        ))
+    }
+}
+
 #[cfg(windows)]
 impl VideoSeekStripSession {
+    fn render_stamp(&self) -> crate::video::seek_strip::SeekStripRenderStamp {
+        crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: self.session_id,
+            layout_revision: self.layout_revision,
+        }
+    }
+
+    fn advance_layout_revision(&mut self) {
+        self.layout_revision = crate::video::seek_strip::SeekStripLayoutRevision(
+            self.layout_revision.0.saturating_add(1),
+        );
+        // Presentation activity is independent from layout. In particular, a canonical settings
+        // edit while Suspended must not reopen polling/requests, and an edit while Visible does
+        // not make already-presented pixels disappear. AwaitingFirstPresent is assigned only when
+        // a resource session itself is created.
+    }
+
     /// 全体表示の軸を、帯が報告したセル数へ合わせる。
     ///
     /// セル数は帯の幅と高さで決まるので、ウィンドウのリサイズや高さの変更で変わる。
@@ -467,7 +549,10 @@ pub(super) enum VideoSeekStripRuntime {
 /// close cause は「同じ動画を見続けているか」しか答えられないので、拾う側で必ず照合する。
 #[cfg(windows)]
 pub(crate) struct HeldSeekStripWaveWorker {
+    pub(super) owner_fs_idx: usize,
     pub(super) path: std::path::PathBuf,
+    pub(super) source_epoch: u64,
+    pub(super) items_generation: u64,
     pub(super) worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
 }
 
@@ -481,11 +566,18 @@ pub(crate) struct HeldSeekStripWaveWorker {
 #[cfg(windows)]
 fn take_or_spawn_seek_strip_wave_worker(
     holdover: &mut Option<HeldSeekStripWaveWorker>,
+    owner_fs_idx: usize,
     path: &std::path::Path,
+    source_epoch: u64,
+    items_generation: u64,
     cache: Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 ) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
     if let Some(held) = holdover.take() {
-        if crate::path_key::eq_keep_drive(&held.path, path) {
+        if held.owner_fs_idx == owner_fs_idx
+            && held.source_epoch == source_epoch
+            && held.items_generation == items_generation
+            && crate::path_key::eq_keep_drive(&held.path, path)
+        {
             held.worker.set_background_paused(false);
             crate::logger::log(format!(
                 "[video-seek-strip] reused the held wave worker: {}",
@@ -495,6 +587,20 @@ fn take_or_spawn_seek_strip_wave_worker(
         }
     }
     crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf(), cache)
+}
+
+#[cfg(windows)]
+fn held_seek_strip_wave_worker_matches_current(
+    held: &HeldSeekStripWaveWorker,
+    current_fs_idx: usize,
+    current_path: Option<&std::path::Path>,
+    current_source_epoch: Option<u64>,
+    current_items_generation: u64,
+) -> bool {
+    held.owner_fs_idx == current_fs_idx
+        && held.items_generation == current_items_generation
+        && current_source_epoch == Some(held.source_epoch)
+        && current_path.is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
 }
 
 /// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
@@ -2786,6 +2892,27 @@ impl App {
         }
 
         self.save_all_video_resume_positions();
+        // Source replacement is a terminal boundary for the strip resource session.  Confirm
+        // that this player still owns a presenter before retiring the session, so a failed swap
+        // attempt cannot tear down an otherwise reusable same-source strip.  The App thread is
+        // the sole owner of `native_output`, so this availability check and the take below are a
+        // single ordered transition.  Retiring while the output is still attached also lets
+        // `stop_video_seek_strip_session` enqueue SetSeekStrip(None) ahead of any late output.
+        let source_output_available =
+            self.fs_cache
+                .get(&from_idx)
+                .is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_committed_generation().is_some()
+                    }
+                    _ => false,
+                });
+        if !source_output_available {
+            return false;
+        }
+        self.stop_video_seek_strip_session(
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+        );
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
@@ -4697,7 +4824,8 @@ impl App {
             | Ev::PlacementCommitted { .. }
             | Ev::PlacementRetired { .. }
             | Ev::PlacementAborted { .. }
-            | Ev::PlacementSwitchFailed { .. } => true,
+            | Ev::PlacementSwitchFailed { .. }
+            | Ev::SeekStripPresentation(_) => true,
             // Baseline maintenance excludes user input. The narrow owner-scoped right-drag
             // exception is applied by native_video_output_event_allowed_while_parked_live below.
             Ev::Window(
@@ -4779,9 +4907,10 @@ impl App {
     /// The match is exhaustive on purpose. It used to end in `_ => true`, which made "an event we
     /// have not classified" mean "the user clicked a HUD button", so every event added anywhere in
     /// the video subsystem became an activation stealer by default. The seek strip added ten and
-    /// three were classified; `RequestSeekStripWindow`, which the renderer emits whenever the strip
-    /// layout changes, then pulled the video window in front of whatever the user had just
-    /// activated (backlog §1.131). Adding a variant must now cost a decision here.
+    /// three were classified; passive seek-strip layout feedback once pulled the video window in
+    /// front of whatever the user had just activated (backlog §1.131). It is now carried inside
+    /// `SeekStripPresentation`, which remains maintenance. Adding a variant must cost a decision
+    /// here.
     pub(crate) fn native_video_output_event_is_parked_live_hud_click_activation(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
@@ -4803,7 +4932,7 @@ impl App {
             | Ev::PlacementSwitchFailed { .. }
             | Ev::RequestSeekThumbnail { .. }
             | Ev::ClearSeekThumbnail
-            | Ev::RequestSeekStripWindow { .. }
+            | Ev::SeekStripPresentation(_)
             | Ev::VideoScaleSettingsCommitted { .. }
             | Ev::PanoramaWheel { .. }
             | Ev::VideoZoomWheel { .. } => false,
@@ -4818,10 +4947,10 @@ impl App {
             // in the payload, which is a change this fix does not need; see backlog §1.131.
             Ev::TileColumnsDelta { .. } | Ev::NormalWheel { .. } => false,
             // Events that carry their own cause: ask the cause, not the variant. The presenter
-            // converts a plain wheel into `NavigateItem`, and closes the strip with `HudHidden`
-            // from the draw path whenever the HUD is not visible.
+            // converts a plain wheel into `NavigateItem`; an explicit strip close carries its
+            // own dismissal cause, while transient HUD visibility is classified above.
             Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
-            Ev::CloseSeekStrip { cause } => cause.is_user_dismissal(),
+            Ev::CloseSeekStrip { cause, .. } => cause.is_user_dismissal(),
             // Native HUD commands the user issued. While ParkedLive the button function stays
             // inert; the click itself requests activation.
             Ev::Seek { .. }
@@ -4835,7 +4964,7 @@ impl App {
             | Ev::ResetPanorama
             | Ev::ResetVideoZoom
             | Ev::TileSeek { .. }
-            | Ev::OpenSeekStrip
+            | Ev::OpenSeekStrip { .. }
             | Ev::MoveSeekStrip { .. }
             | Ev::CommitSeekStrip { .. }
             | Ev::SetSeekStripView { .. }
@@ -4845,7 +4974,7 @@ impl App {
             | Ev::TogglePerfOverlay
             | Ev::ToggleSidePanelMode
             | Ev::ToggleBarLock { .. }
-            | Ev::ToggleSeekStripLock
+            | Ev::ToggleSeekStripLock { .. }
             | Ev::ToggleClickInfoOpen
             | Ev::ToggleInfoPanelLock
             | Ev::OpenTouchInfoPanel
@@ -4942,6 +5071,79 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn seek_strip_session_stamp_is_current(
+        &self,
+        fs_idx: usize,
+        stamp: crate::video::seek_strip::SeekStripSessionEventStamp,
+        allow_suspended: bool,
+    ) -> bool {
+        let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.owner_fs_idx != fs_idx
+            || session.items_generation != self.items_generation
+            || session.session_id != stamp.session_id
+            || (!allow_suspended
+                && session.presentation == VideoSeekStripPresentationState::Suspended)
+        {
+            return false;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return false;
+        };
+        let current_generation = player.native_committed_generation().unwrap_or(0).max(1);
+        player.native_source_epoch() == Some(session.source_epoch)
+            && current_generation == stamp.generation
+            && crate::path_key::eq_keep_drive(player.path(), &session.video_path)
+    }
+
+    fn seek_strip_event_stamp_is_current(
+        &self,
+        fs_idx: usize,
+        stamp: crate::video::seek_strip::SeekStripEventStamp,
+        allow_suspended: bool,
+    ) -> bool {
+        self.seek_strip_session_stamp_is_current(
+            fs_idx,
+            crate::video::seek_strip::SeekStripSessionEventStamp {
+                session_id: stamp.session_id,
+                generation: stamp.generation,
+            },
+            allow_suspended,
+        ) && matches!(
+            &self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.layout_revision == stamp.layout_revision
+        )
+    }
+
+    fn native_video_generation_is_exact_current(&self, fs_idx: usize, generation: u64) -> bool {
+        self.fs_cache.get(&fs_idx).is_some_and(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => {
+                player.native_committed_generation().unwrap_or(0).max(1) == generation
+            }
+            _ => false,
+        })
+    }
+
+    fn seek_strip_expected_session_is_current(
+        &self,
+        fs_idx: usize,
+        generation: u64,
+        expected: Option<crate::video::seek_strip::SeekStripEventStamp>,
+    ) -> bool {
+        match expected {
+            Some(stamp) => {
+                stamp.generation == generation
+                    && self.seek_strip_event_stamp_is_current(fs_idx, stamp, false)
+            }
+            None => {
+                matches!(self.video_seek_strip_runtime, VideoSeekStripRuntime::Closed)
+                    && self.native_video_generation_is_exact_current(fs_idx, generation)
+            }
+        }
+    }
+
     pub(super) fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -5186,7 +5388,6 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleBarLock { .. }
-                    | crate::video::NativeVideoOutputEvent::ToggleSeekStripLock
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
                     | crate::video::NativeVideoOutputEvent::ToggleInfoPanelLock
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
@@ -5449,17 +5650,26 @@ impl App {
                     player.clear_native_hover_thumbnail();
                 }
             }
-            crate::video::NativeVideoOutputEvent::OpenSeekStrip => {
+            crate::video::NativeVideoOutputEvent::OpenSeekStrip { generation } => {
+                if !self.native_video_generation_is_exact_current(fs_idx, generation) {
+                    return;
+                }
                 if self.open_video_seek_strip(fs_idx) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::CloseSeekStrip { cause } => {
+            crate::video::NativeVideoOutputEvent::CloseSeekStrip { cause, stamp } => {
+                if !self.seek_strip_session_stamp_is_current(fs_idx, stamp, true) {
+                    return;
+                }
                 self.close_video_seek_strip(cause);
                 self.mark_native_video_hud_activity(ctx);
             }
-            crate::video::NativeVideoOutputEvent::MoveSeekStrip { center } => {
+            crate::video::NativeVideoOutputEvent::MoveSeekStrip { center, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
                 // 全体表示の帯は動かない。表示範囲を切り替えた直後に届く 1 つ前の帯からの
                 // 移動を当てると、固定しているはずの中身が 1 フレームだけ流れる。
                 if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
@@ -5483,7 +5693,10 @@ impl App {
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::CommitSeekStrip { center } => {
+            crate::video::NativeVideoOutputEvent::CommitSeekStrip { center, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
                 let target_secs = match &mut self.video_seek_strip_runtime {
                     VideoSeekStripRuntime::Open(session)
                         if center.mode() == session.center.mode() =>
@@ -5520,50 +5733,148 @@ impl App {
                 }
                 self.sync_native_video_seek_strip(ctx, fs_idx);
             }
-            crate::video::NativeVideoOutputEvent::RequestSeekStripWindow {
-                center,
-                visible_count,
-                pixel_width,
-                pixel_height,
+            crate::video::NativeVideoOutputEvent::SetSeekStripView {
+                view,
+                generation,
+                expected,
             } => {
-                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
-                    if center.mode() == session.center.mode() {
-                        session.center = center;
-                    }
-                    session.visible_count = visible_count.max(1);
-                    let raster_size = (pixel_width.max(1), pixel_height.max(1));
-                    if session.wave_raster_size != Some(raster_size) {
-                        session.wave_raster_size = Some(raster_size);
-                        session.last_wave_request = None;
-                        session.pending_wave_span = None;
-                    }
-                    // 全体表示のセル数は帯が決める。届いた枚数で軸を作り直してから要求する。
-                    if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
-                        session.rebuild_whole_axis_if_needed();
-                        session.pin_whole_center();
-                    }
-                    Self::request_video_seek_strip_window(
-                        session,
-                        StripThumbnailRequestTrigger::WindowRecalculated,
-                    );
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
                 }
-            }
-            crate::video::NativeVideoOutputEvent::SetSeekStripView { view } => {
                 if self.set_video_seek_strip_view(fs_idx, view) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::SetSeekStripHeight { height } => {
+            crate::video::NativeVideoOutputEvent::SetSeekStripHeight {
+                height,
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
                 if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::StepSeekStripRange { step } => {
-                if self.step_video_seek_strip_range(fs_idx, step) {
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
+                if self.step_video_seek_strip_ranges(fs_idx, &steps) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(presentation) => {
+                let (stamp, visible, window) = match presentation {
+                    crate::video::seek_strip::SeekStripPresentationEvent::Hidden(stamp) => {
+                        (stamp, false, None)
+                    }
+                    crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                        stamp,
+                        window,
+                    } => (stamp, true, window),
+                };
+                if !self.seek_strip_session_stamp_is_current(fs_idx, stamp, true) {
+                    crate::logger::log(format!(
+                        "[video-seek-strip] reject presented update: idx={fs_idx} session={} generation={} visible={visible}",
+                        stamp.session_id.0, stamp.generation
+                    ));
+                    return;
+                }
+                let mut window_applied = false;
+                let mut old_visible_count = 0;
+                let mut old_axis_count = None;
+                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
+                    old_visible_count = session.visible_count;
+                    old_axis_count = match &session.axis {
+                        VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+                        VideoSeekStripAxisState::Resolving { .. } => None,
+                    };
+                    session.presentation = if visible {
+                        VideoSeekStripPresentationState::Visible
+                    } else {
+                        VideoSeekStripPresentationState::Suspended
+                    };
+                    session.drag_state = VideoSeekStripDragState::Idle;
+                    session.visible_pending_since = None;
+                    session.visible_pending_reported = false;
+                    if let Some(worker) = session.wave_worker.as_ref() {
+                        worker.set_background_paused(
+                            !visible || wave_background_paused_for_mode(session.center.mode()),
+                        );
+                    }
+                    if visible
+                        && let Some(window) = window
+                        && window.stamp.session_id == stamp.session_id
+                        && window.stamp.generation == stamp.generation
+                        && window.stamp.layout_revision == session.layout_revision
+                    {
+                        if window.center.mode() == session.center.mode() {
+                            session.center = window.center;
+                        }
+                        session.visible_count = window.visible_count.max(1);
+                        let raster_size = (window.pixel_width.max(1), window.pixel_height.max(1));
+                        if session.wave_raster_size != Some(raster_size) {
+                            session.wave_raster_size = Some(raster_size);
+                            session.last_wave_request = None;
+                            session.pending_wave_span = None;
+                        }
+                        // Whole-span geometry is committed by the same successful present as
+                        // Visible, so rebuild its axis before any redisplay request can use the
+                        // fallback count.
+                        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
+                            session.rebuild_whole_axis_if_needed();
+                            session.pin_whole_center();
+                        }
+                        window_applied = true;
+                    }
+                }
+                if visible
+                    && let Some(window) = window
+                    && !window_applied
+                    && let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
+                {
+                    crate::logger::log(format!(
+                        "[video-seek-strip] reject presented window: idx={fs_idx} session={} generation={} expected_revision={} reported_revision={} reported_count={}",
+                        stamp.session_id.0,
+                        stamp.generation,
+                        session.layout_revision.0,
+                        window.stamp.layout_revision.0,
+                        window.visible_count
+                    ));
+                }
+                if visible {
+                    self.ensure_visible_video_seek_strip_workers(fs_idx);
+                    if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+                    {
+                        Self::request_video_seek_strip_window(
+                            session,
+                            if window_applied {
+                                StripThumbnailRequestTrigger::WindowRecalculated
+                            } else {
+                                StripThumbnailRequestTrigger::StripRedisplayed
+                            },
+                        );
+                    }
+                    self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+                if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime {
+                    let new_axis_count = match &session.axis {
+                        VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+                        VideoSeekStripAxisState::Resolving { .. } => None,
+                    };
+                    crate::logger::log(format!(
+                        "[video-seek-strip] apply presented update: idx={fs_idx} session={} generation={} revision={} visible={visible} window_applied={window_applied} visible_count={old_visible_count}->{} axis={old_axis_count:?}->{new_axis_count:?} request_id={:?}",
+                        stamp.session_id.0,
+                        stamp.generation,
+                        session.layout_revision.0,
+                        session.visible_count,
+                        session.last_sent_thumbnail_request_id
+                    ));
                 }
             }
             crate::video::NativeVideoOutputEvent::ToggleTileMode => {
@@ -5597,7 +5908,13 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
                 ctx.request_repaint();
             }
-            crate::video::NativeVideoOutputEvent::ToggleSeekStripLock => {
+            crate::video::NativeVideoOutputEvent::ToggleSeekStripLock {
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
                 let locked = toggle_native_video_seek_strip_lock_setting(&mut self.settings);
                 self.settings.save();
                 self.sync_native_video_metadata(fs_idx);
@@ -8779,21 +9096,6 @@ impl App {
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
         let mode = showing.mode;
-        if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
-            && session.owner_fs_idx == fs_idx
-            && session.center.mode() == mode
-            && session.span == showing.span
-        {
-            return true;
-        }
-        if matches!(
-            self.video_seek_strip_runtime,
-            VideoSeekStripRuntime::Open(_)
-        ) {
-            self.stop_video_seek_strip_session(
-                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
-            );
-        }
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return false;
         };
@@ -8825,6 +9127,25 @@ impl App {
         let path = player.path().clone();
         let initial_time_secs = player.position();
         let duration_secs = info.duration_secs;
+        let Some(source_epoch) = player.native_source_epoch() else {
+            return false;
+        };
+        if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
+            && session.owner_fs_idx == fs_idx
+            && session.items_generation == self.items_generation
+            && session.source_epoch == source_epoch
+            && crate::path_key::eq_keep_drive(&session.video_path, &path)
+        {
+            return true;
+        }
+        if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        ) {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+        }
         let min_interval_secs = self.settings.video_seek_strip_min_interval_secs;
         let meta = self.image_metas.get(fs_idx).copied().flatten();
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
@@ -8868,8 +9189,17 @@ impl App {
                 None,
             ),
         };
+        let session_id =
+            crate::video::seek_strip::SeekStripSessionId(self.video_seek_strip_next_session_id);
+        self.video_seek_strip_next_session_id =
+            self.video_seek_strip_next_session_id.saturating_add(1);
         self.video_seek_strip_runtime =
             VideoSeekStripRuntime::Open(Box::new(VideoSeekStripSession {
+                session_id,
+                layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(1),
+                items_generation: self.items_generation,
+                source_epoch,
+                presentation: VideoSeekStripPresentationState::AwaitingFirstPresent,
                 owner_fs_idx: fs_idx,
                 video_path: path,
                 duration_secs,
@@ -8948,9 +9278,10 @@ impl App {
             return false;
         };
         // ホイールで動かしたレンジはここで 1 回だけ書く
-        // (`range_edited_at_save_generation` 参照)。セッションが死ぬ経路はこの関数だけ
-        // なので、開き直し・モード切替・動画切替・利用者の閉じるのどれでも同じ 1 箇所を
-        // 通る。世代が動いていれば別経路の save が既に書いている。
+        // (`range_edited_at_save_generation` 参照)。resource session が終端する動画切替・
+        // fullscreen 終了・利用者の close はこの 1 箇所を通る。mode/span 変更は同じ
+        // worker/decoder を保持して layout revision だけを進めるため、この close には入らない。
+        // 世代が動いていれば別経路の save が既に書いている。
         if session.range_edited_at_save_generation == Some(crate::settings::save_generation()) {
             self.settings.save();
         }
@@ -8963,7 +9294,10 @@ impl App {
                 // 見えていないあいだ背景の全尺解析だけ止め、解析済みの粗い波形は残す。
                 worker.set_background_paused(true);
                 self.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+                    owner_fs_idx: session.owner_fs_idx,
                     path: session.video_path.clone(),
+                    source_epoch: session.source_epoch,
+                    items_generation: session.items_generation,
                     worker,
                 });
             } else {
@@ -9089,11 +9423,14 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn step_video_seek_strip_range(
+    fn step_video_seek_strip_ranges(
         &mut self,
         fs_idx: usize,
-        step: crate::video::seek_strip::SeekStripRangeStep,
+        steps: &[crate::video::seek_strip::SeekStripRangeStep],
     ) -> bool {
+        if steps.is_empty() {
+            return false;
+        }
         let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime else {
             return false;
         };
@@ -9112,10 +9449,9 @@ impl App {
                 self.settings.video_seek_strip_waveform_span_secs
             }
         };
-        let Some(next) = crate::video::seek_strip::step_seek_strip_range(mode, current, step)
-        else {
-            return false;
-        };
+        let next = steps.iter().copied().fold(current, |value, step| {
+            crate::video::seek_strip::step_seek_strip_range(mode, value, step).unwrap_or(value)
+        });
         if next.to_bits() == current.to_bits() {
             return false;
         }
@@ -9180,12 +9516,16 @@ impl App {
             return false;
         };
         let path = session.video_path.clone();
+        let source_epoch = session.source_epoch;
+        let items_generation = session.items_generation;
         let duration_secs = session.duration_secs;
         let need_thumbnail_worker = mode == crate::settings::VideoSeekStripMode::Thumbnails
-            && session.thumbnail_worker.is_none();
+            && session.thumbnail_worker.is_none()
+            && session.presentation != VideoSeekStripPresentationState::Suspended;
         let need_wave_worker = mode == crate::settings::VideoSeekStripMode::Waveform
             && session.wave_worker.is_none()
-            && matches!(session.axis, VideoSeekStripAxisState::Ready(_));
+            && matches!(session.axis, VideoSeekStripAxisState::Ready(_))
+            && session.presentation != VideoSeekStripPresentationState::Suspended;
 
         let new_thumbnail_worker = need_thumbnail_worker.then(|| {
             let fallback_interval_secs =
@@ -9202,7 +9542,10 @@ impl App {
         let new_wave_worker = if need_wave_worker {
             Some(take_or_spawn_seek_strip_wave_worker(
                 &mut self.video_seek_strip_wave_holdover,
+                fs_idx,
                 &path,
+                source_epoch,
+                items_generation,
                 wave_cache,
             ))
         } else {
@@ -9235,7 +9578,10 @@ impl App {
         // 作り直させない。サムネイル側は要求駆動で、要求が止まれば自分で寝るため
         // 対になる操作は要らない (両方の worker loop を読んで確認した)。
         if let Some(worker) = session.wave_worker.as_ref() {
-            worker.set_background_paused(wave_background_paused_for_mode(mode));
+            worker.set_background_paused(
+                session.presentation == VideoSeekStripPresentationState::Suspended
+                    || wave_background_paused_for_mode(mode),
+            );
         }
         match mode {
             crate::settings::VideoSeekStripMode::Thumbnails => match &mut session.axis {
@@ -9267,6 +9613,7 @@ impl App {
         session.last_wave_request = None;
         session.pending_wave_span = None;
         session.wave_holdover = None;
+        session.advance_layout_revision();
         Self::request_video_seek_strip_window(
             session,
             StripThumbnailRequestTrigger::StripRedisplayed,
@@ -9306,6 +9653,7 @@ impl App {
         }
         .unwrap_or(0.0);
         session.span = span;
+        session.advance_layout_revision();
         session.drag_state = VideoSeekStripDragState::Idle;
         match span {
             SeekStripSpan::Whole => {
@@ -9358,6 +9706,11 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_bar_lock_state(bar_lock);
         }
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+            && session.owner_fs_idx == fs_idx
+        {
+            session.advance_layout_revision();
+        }
         true
     }
 
@@ -9387,6 +9740,67 @@ impl App {
             self.video_seek_strip_runtime,
             VideoSeekStripRuntime::Open(_)
         )
+    }
+
+    #[cfg(windows)]
+    pub(super) fn remap_video_seek_strip_for_snapshot(
+        &mut self,
+        old_to_new: &std::collections::HashMap<usize, usize>,
+        opened_media_path: Option<&std::path::Path>,
+    ) {
+        let exact_remap = |old_idx: usize, path: &std::path::Path, source_epoch: u64| {
+            old_to_new.get(&old_idx).copied().filter(|&new_idx| {
+                opened_media_path.is_some_and(|opened| {
+                    crate::path_key::eq_keep_drive(opened, path)
+                        && self
+                            .fs_cache
+                            .get(&new_idx)
+                            .is_some_and(|entry| match entry {
+                                FsCacheEntry::Video { player, .. } => {
+                                    player.native_source_epoch() == Some(source_epoch)
+                                        && crate::path_key::eq_keep_drive(player.path(), path)
+                                }
+                                _ => false,
+                            })
+                })
+            })
+        };
+
+        let session_survivor = match &self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Open(session) => exact_remap(
+                session.owner_fs_idx,
+                &session.video_path,
+                session.source_epoch,
+            ),
+            VideoSeekStripRuntime::Closed => None,
+        };
+        let holdover_survivor = self
+            .video_seek_strip_wave_holdover
+            .as_ref()
+            .and_then(|held| exact_remap(held.owner_fs_idx, &held.path, held.source_epoch));
+
+        if let Some(new_idx) = session_survivor {
+            if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
+                session.owner_fs_idx = new_idx;
+                session.items_generation = self.items_generation;
+            }
+        } else if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        ) {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+        }
+
+        if let Some(new_idx) = holdover_survivor {
+            if let Some(held) = self.video_seek_strip_wave_holdover.as_mut() {
+                held.owner_fs_idx = new_idx;
+                held.items_generation = self.items_generation;
+            }
+        } else {
+            self.video_seek_strip_wave_holdover = None;
+        }
     }
 
     #[cfg(windows)]
@@ -9440,6 +9854,9 @@ impl App {
         session: &mut VideoSeekStripSession,
         request_trigger: crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger,
     ) {
+        if session.presentation == VideoSeekStripPresentationState::Suspended {
+            return;
+        }
         match session.center {
             crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                 let VideoSeekStripAxisState::Ready(axis) = &session.axis else {
@@ -9617,6 +10034,7 @@ impl App {
             session.center = crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index };
         }
         session.axis = VideoSeekStripAxisState::Ready(rebuilt);
+        session.advance_layout_revision();
         session.last_requested_center = None;
         session.last_sent_thumbnail_request_id = None;
         if matches!(
@@ -9632,7 +10050,6 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn rebuild_video_seek_strip_waveform_span(&mut self) {
-        let wave_cache = self.video_tile_cache.clone();
         let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
@@ -9645,6 +10062,7 @@ impl App {
             return;
         }
         session.waveform_span_secs = new_span_secs;
+        session.advance_layout_revision();
         session.last_wave_request = None;
         session.pending_wave_span = None;
         if !matches!(
@@ -9654,21 +10072,10 @@ impl App {
             return;
         }
 
-        let previous_raster = session
-            .wave_worker
-            .as_ref()
-            .and_then(|worker| worker.snapshot().raster)
-            .or_else(|| session.wave_holdover.take());
-        if let Some(worker) = session.wave_worker.as_ref() {
-            worker.cancel();
-        }
-        // A fresh worker drops both the old retained raster and its in-memory LRU. The Arc copied
-        // above is display-only and cannot satisfy coverage for the new preference.
-        session.wave_worker = Some(crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
-            session.video_path.clone(),
-            wave_cache,
-        ));
-        session.wave_holdover = previous_raster;
+        // The worker owns the decoder and its coarse-analysis cache. A range preference changes
+        // only the request signature; replacing the worker here recreated the decoder on every
+        // wheel step. The old raster remains a display holdover until this worker publishes the
+        // first raster for the new signature.
         Self::request_video_seek_strip_window(
             session,
             StripThumbnailRequestTrigger::UserInteraction,
@@ -9809,6 +10216,99 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn ensure_visible_video_seek_strip_workers(&mut self, fs_idx: usize) {
+        const FALLBACK_MAX_CELLS: usize = 240;
+        let Some((
+            session_id,
+            mode,
+            path,
+            source_epoch,
+            items_generation,
+            duration_secs,
+            min_interval_secs,
+            need_thumbnail,
+            need_wave,
+        )) = (match &self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Open(session)
+                if session.owner_fs_idx == fs_idx
+                    && session.presentation != VideoSeekStripPresentationState::Suspended =>
+            {
+                Some((
+                    session.session_id,
+                    session.center.mode(),
+                    session.video_path.clone(),
+                    session.source_epoch,
+                    session.items_generation,
+                    session.duration_secs,
+                    session.min_interval_secs,
+                    session.thumbnail_worker.is_none(),
+                    session.wave_worker.is_none()
+                        && matches!(session.axis, VideoSeekStripAxisState::Ready(_))
+                        && session.center.mode() == crate::settings::VideoSeekStripMode::Waveform,
+                ))
+            }
+            _ => None,
+        })
+        else {
+            return;
+        };
+        let new_thumbnail = need_thumbnail.then(|| {
+            crate::video::seek_strip_thumbs::SeekStripThumbnailWorker::spawn(
+                path.clone(),
+                self.settings.video_hw_decode,
+                self.video_tile_cache.clone(),
+                duration_secs,
+                min_interval_secs,
+                crate::ui_video_tile::pick_interval(duration_secs, FALLBACK_MAX_CELLS),
+            )
+        });
+        let new_wave = if need_wave {
+            Some(take_or_spawn_seek_strip_wave_worker(
+                &mut self.video_seek_strip_wave_holdover,
+                fs_idx,
+                &path,
+                source_epoch,
+                items_generation,
+                self.video_tile_cache.clone(),
+            ))
+        } else {
+            None
+        };
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+            && session.session_id == session_id
+            && session.presentation != VideoSeekStripPresentationState::Suspended
+        {
+            if let Some(worker) = new_thumbnail {
+                session.thumbnail_worker = Some(worker);
+            }
+            if let Some(worker) = new_wave {
+                worker.set_background_paused(wave_background_paused_for_mode(mode));
+                session.wave_worker = Some(worker);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn discard_stale_video_seek_strip_wave_holdover(
+        &mut self,
+        current_fs_idx: usize,
+        current_path: Option<&std::path::Path>,
+        current_source_epoch: Option<u64>,
+    ) {
+        if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
+            && !held_seek_strip_wave_worker_matches_current(
+                held,
+                current_fs_idx,
+                current_path,
+                current_source_epoch,
+                self.items_generation,
+            )
+        {
+            self.video_seek_strip_wave_holdover = None;
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn sync_native_video_seek_strip(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let wave_cache = self.video_tile_cache.clone();
         let current_path = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -9817,15 +10317,17 @@ impl App {
             }
             _ => None,
         });
+        let current_source_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+            _ => None,
+        });
         // 見ている動画が変わった / 動画を見ていない。close だけに任せると、ストリップを
         // 閉じたまま次の動画へ移った経路で持ち越しが残る。
-        if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
-            && !current_path
-                .as_ref()
-                .is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
-        {
-            self.video_seek_strip_wave_holdover = None;
-        }
+        self.discard_stale_video_seek_strip_wave_holdover(
+            fs_idx,
+            current_path.as_deref(),
+            current_source_epoch,
+        );
         if self.video_tile_mode_active {
             self.close_video_seek_strip(
                 crate::video::seek_strip::SeekStripCloseCause::TileModeOpened,
@@ -9849,13 +10351,28 @@ impl App {
         let session_matches = matches!(
             (&self.video_seek_strip_runtime, current_path.as_ref()),
             (VideoSeekStripRuntime::Open(session), Some(path))
-                if &session.video_path == path
-                    && session.center.mode() == showing.mode
-                    && session.span == showing.span
+                if session.owner_fs_idx == fs_idx
+                    && session.items_generation == self.items_generation
+                    && session.source_epoch == current_source_epoch.unwrap_or(u64::MAX)
+                    && crate::path_key::eq_keep_drive(&session.video_path, path)
         );
         if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, showing) {
             return;
         }
+        self.set_video_seek_strip_runtime_mode(fs_idx, showing.mode);
+        self.set_video_seek_strip_runtime_span(fs_idx, showing.span);
+
+        if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(ref session)
+                if session.presentation == VideoSeekStripPresentationState::Suspended
+        ) {
+            // Canonical settings above still update the retained resource, but hidden chrome does
+            // not advance requests, poll workers, clone snapshots or schedule repaint work.
+            return;
+        }
+
+        self.ensure_visible_video_seek_strip_workers(fs_idx);
 
         self.follow_video_seek_strip_playhead(fs_idx);
         self.rebuild_video_seek_strip_adopted_list();
@@ -9926,7 +10443,10 @@ impl App {
                             {
                                 session.wave_worker = Some(take_or_spawn_seek_strip_wave_worker(
                                     &mut self.video_seek_strip_wave_holdover,
+                                    session.owner_fs_idx,
                                     &session.video_path,
+                                    session.source_epoch,
+                                    session.items_generation,
                                     wave_cache.clone(),
                                 ));
                             }
@@ -10110,6 +10630,7 @@ impl App {
                         .map_or(0, |snapshot| snapshot.cells.len()),
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
+                    stamp: session.render_stamp(),
                     center: session.center,
                     span: session.span,
                     cell_aspect: video_cell_aspect,
@@ -13594,6 +14115,24 @@ impl App {
             target_path.display()
         ));
         self.save_all_video_resume_positions();
+        // See the deferred-swap path above: retire the source-bound strip only after proving
+        // that this player can actually yield the presenter, and while the old output is still
+        // attached so its payload is cleared before ownership moves.
+        let source_output_available =
+            self.fs_cache
+                .get(&from_idx)
+                .is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_committed_generation().is_some()
+                    }
+                    _ => false,
+                });
+        if !source_output_available {
+            return None;
+        }
+        self.stop_video_seek_strip_session(
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+        );
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
@@ -15703,10 +16242,6 @@ mod native_video_key_observation_tests {
     #[test]
     fn folding_a_session_hands_the_wave_worker_over_instead_of_killing_it() {
         for (cause, handed_over) in [
-            (
-                crate::video::seek_strip::SeekStripCloseCause::HudHidden,
-                true,
-            ),
             (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
             (
                 crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
@@ -15767,11 +16302,14 @@ mod native_video_key_observation_tests {
         // 預けるときと同じ状態にしてから拾わせる。
         worker.set_background_paused(true);
         let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
             path: one.clone(),
+            source_epoch: 7,
+            items_generation: 11,
             worker,
         });
 
-        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one, None);
+        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &one, 7, 11, None);
         assert_eq!(
             reused.identity_for_test(),
             held_identity,
@@ -15786,16 +16324,822 @@ mod native_video_key_observation_tests {
         let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
         let stale_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
             path: one.clone(),
+            source_epoch: 7,
+            items_generation: 11,
             worker,
         });
-        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other, None);
+        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &other, 7, 11, None);
         assert_ne!(
             fresh.identity_for_test(),
             stale_identity,
             "別の動画に前のワーカーを使い回している"
         );
         assert!(holdover.is_none(), "別の動画のものを抱えたままになっている");
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let stale_epoch_identity = worker.identity_for_test();
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: one.clone(),
+            source_epoch: 7,
+            items_generation: 11,
+            worker,
+        });
+        let fresh_epoch = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &one, 8, 11, None);
+        assert_ne!(
+            fresh_epoch.identity_for_test(),
+            stale_epoch_identity,
+            "同じ path でも新しい source epoch に旧 worker を再利用している"
+        );
+    }
+
+    #[test]
+    fn closed_runtime_drops_a_held_worker_when_the_source_identity_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let generation = app.items_generation;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: path.clone(),
+            source_epoch: 7,
+            items_generation: generation,
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None),
+        });
+
+        assert!(held_seek_strip_wave_worker_matches_current(
+            app.video_seek_strip_wave_holdover.as_ref().unwrap(),
+            0,
+            Some(&path),
+            Some(7),
+            generation,
+        ));
+        assert!(!held_seek_strip_wave_worker_matches_current(
+            app.video_seek_strip_wave_holdover.as_ref().unwrap(),
+            0,
+            Some(&path),
+            Some(8),
+            generation,
+        ));
+
+        // The production sync calls this before inspecting whether a strip session is open.
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(7));
+        assert!(
+            app.video_seek_strip_wave_holdover.is_some(),
+            "the exact source keeps the reusable worker"
+        );
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(8));
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+    }
+
+    #[test]
+    fn exact_snapshot_remap_moves_open_and_closed_strip_resources_without_cross_owner_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items_generation = 12;
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            4,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
+                ),
+                load_seq,
+            },
+        );
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path.clone(), worker);
+        session.owner_fs_idx = 2;
+        session.items_generation = 11;
+        session.source_epoch = 0;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("the exact snapshot survivor lost its strip session");
+        };
+        assert_eq!(session.owner_fs_idx, 4);
+        assert_eq!(session.items_generation, 12);
+        assert_eq!(
+            session.wave_worker.as_ref().unwrap().identity_for_test(),
+            worker_id
+        );
+
+        let held_worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let held_id = held_worker.identity_for_test();
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 2,
+            path: path.clone(),
+            source_epoch: 0,
+            items_generation: 11,
+            worker: held_worker,
+        });
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        let held = app.video_seek_strip_wave_holdover.as_ref().unwrap();
+        assert_eq!(held.owner_fs_idx, 4);
+        assert_eq!(held.items_generation, 12);
+        assert_eq!(held.worker.identity_for_test(), held_id);
+
+        app.video_seek_strip_wave_holdover
+            .as_mut()
+            .unwrap()
+            .owner_fs_idx = 8;
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        assert!(
+            app.video_seek_strip_wave_holdover.is_none(),
+            "a sibling or missing SnapshotKey is terminal"
+        );
+    }
+
+    #[test]
+    fn unavailable_source_swap_output_preserves_the_open_strip_resource() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from_path = dir.path().join("from.mp4");
+        let target_path = dir.path().join("target.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.extend([
+            crate::app::GridItem::Video(from_path.clone()),
+            crate::app::GridItem::Video(target_path),
+        ]);
+        app.thumbnails.extend([
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ]);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        from_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        let detached_output = match app.fs_cache.get_mut(&0) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
+                .take_native_output()
+                .expect("fixture starts with an owned native output"),
+            _ => unreachable!(),
+        };
+        let worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(from_path.clone(), None);
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let ctx = egui::Context::default();
+        assert!(
+            !app.defer_native_video_source_swap_until_decoder_free(
+                &ctx,
+                1,
+                None,
+                false,
+                false,
+                "test-unavailable",
+                crate::app::HistoryTrigger::UserChosen,
+            ),
+            "a swap that cannot take the source output must not begin"
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("failed swap must preserve the open strip session");
+        };
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_cancelled_for_test())
+        );
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+        assert!(app.native_video_source_swap_pending.is_none());
+        drop(detached_output);
+    }
+
+    #[test]
+    fn deferred_source_swap_retires_the_old_strip_only_after_output_is_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from_path = dir.path().join("from.mp4");
+        let target_path = dir.path().join("target.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.extend([
+            crate::app::GridItem::Video(from_path.clone()),
+            crate::app::GridItem::Video(target_path),
+        ]);
+        app.thumbnails.extend([
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ]);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        from_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        let worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(from_path.clone(), None);
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        let old_event_stamp = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let ctx = egui::Context::default();
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "test",
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(matches!(
+            app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Closed
+        ));
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+        assert!(app.native_video_source_swap_pending.is_some());
+        assert!(
+            !app.seek_strip_event_stamp_is_current(0, old_event_stamp, true),
+            "late RequestWindow from the terminal source must be rejected"
+        );
+        assert!(
+            !app.seek_strip_session_stamp_is_current(
+                0,
+                crate::video::seek_strip::SeekStripSessionEventStamp {
+                    session_id: old_event_stamp.session_id,
+                    generation: 1,
+                },
+                true,
+            ),
+            "late Visible from the terminal source must be rejected"
+        );
+
+        // Updating an already pending replacement cannot recreate an old-source strip.
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "test-update",
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(matches!(
+            app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Closed
+        ));
+
+        // Model deferred completion with a fresh player/resource session. The successor accepts
+        // its own first layout but cannot be confused with the old session even when a test
+        // output uses the same synthetic source epoch.
+        app.native_video_source_swap_pending = None;
+        let target_path = match app.items[1].clone() {
+            crate::app::GridItem::Video(path) => path,
+            _ => unreachable!(),
+        };
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            1,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        target_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        app.fullscreen_idx = Some(1);
+        let worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(target_path.clone(), None);
+        let mut successor = VideoSeekStripSession::for_wave_holdover_test(target_path, worker);
+        successor.session_id = crate::video::seek_strip::SeekStripSessionId(2);
+        successor.owner_fs_idx = 1;
+        successor.items_generation = app.items_generation;
+        successor.source_epoch = 0;
+        successor.presentation = VideoSeekStripPresentationState::AwaitingFirstPresent;
+        let successor_stamp = successor.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(successor));
+        assert!(app.seek_strip_event_stamp_is_current(1, successor_stamp, false));
+        assert!(!app.seek_strip_event_stamp_is_current(1, old_event_stamp, false));
+    }
+
+    #[test]
+    fn layout_revision_does_not_change_visible_or_suspended_activity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        session.advance_layout_revision();
+        assert_eq!(
+            session.layout_revision,
+            crate::video::seek_strip::SeekStripLayoutRevision(2)
+        );
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        session.advance_layout_revision();
+        assert_eq!(
+            session.layout_revision,
+            crate::video::seek_strip::SeekStripLayoutRevision(3)
+        );
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Suspended
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_cancelled_for_test()),
+            "canonical layout changes keep the resource worker"
+        );
+    }
+
+    #[test]
+    fn hidden_presentation_retains_the_resource_and_first_layout_then_resumes_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
+                ),
+                load_seq,
+            },
+        );
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.items_generation = app.items_generation;
+        session.visible_count = 17;
+        session.axis = VideoSeekStripAxisState::Ready(std::sync::Arc::new(
+            crate::video::seek_strip::StripAxis::whole(session.duration_secs, 17)
+                .expect("seeded visible axis"),
+        ));
+        let first_render_stamp = session.render_stamp();
+        let first_event_stamp = first_render_stamp.at_generation(1);
+        let presentation_stamp = first_render_stamp.session_at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+        let ctx = egui::Context::default();
+
+        // Start from an already-presented waveform resource whose thumbnail worker has never been
+        // needed. Hiding the HUD retains that exact resource and canonical 17-cell geometry without
+        // spawning the missing worker.
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Hidden(presentation_stamp),
+            ),
+        );
+
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("HUD hiding must not close the resource session");
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(session.visible_count, 17);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| worker.background_is_paused())
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_state,
+            crate::settings::VideoSeekStripState::Waveform
+        );
+
+        assert!(app.set_video_seek_strip_view(
+            0,
+            crate::video::seek_strip_layout::SeekStripView::showing(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                crate::video::seek_strip_layout::SeekStripSpan::Whole,
+            ),
+        ));
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Suspended
+        );
+        assert!(session.thumbnail_worker.is_none());
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+
+        // Presentation visibility is session-scoped, so the old-layout payload may reveal the
+        // same resource after canonical settings advanced its revision while hidden.
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Waveform {
+                            center_time_secs: 0.0,
+                        },
+                        visible_count: 99,
+                        pixel_width: 9_900,
+                        pixel_height: 999,
+                        stamp: first_event_stamp,
+                    }),
+                },
+            ),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        assert!(session.thumbnail_worker.is_some());
+        assert_eq!(session.visible_count, 17);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+
+        // The lifecycle stamp deliberately ignores layout revisions, but the embedded geometry
+        // does not. A current-layout present repairs the skipped stale geometry without reopening
+        // the session or replacing either worker.
+        let current_render_stamp = session.render_stamp();
+        let current_presentation_stamp = current_render_stamp.session_at_generation(1);
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: current_presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                            center_index: 8.5,
+                        },
+                        visible_count: 19,
+                        pixel_width: 1_900,
+                        pixel_height: 100,
+                        stamp: current_render_stamp.at_generation(1),
+                    }),
+                },
+            ),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(session.visible_count, 19);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 19
+        ));
+    }
+
+    #[test]
+    fn suspended_whole_strip_applies_compound_visible_geometry_before_requesting_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("whole.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Thumbnails;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Whole;
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
+                ),
+                load_seq,
+            },
+        );
+
+        let disposable_wave =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let mut session =
+            VideoSeekStripSession::for_wave_holdover_test(path.clone(), disposable_wave);
+        session.wave_worker = None;
+        session.items_generation = app.items_generation;
+        session.span = crate::video::seek_strip_layout::SeekStripSpan::Whole;
+        session.center =
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 4.5 };
+        session.axis = VideoSeekStripAxisState::Ready(std::sync::Arc::new(
+            crate::video::seek_strip::StripAxis::whole(session.duration_secs, 9)
+                .expect("nine-cell fallback axis"),
+        ));
+        session.thumbnail_worker = Some(
+            crate::video::seek_strip_thumbs::SeekStripThumbnailWorker::spawn(
+                path,
+                false,
+                None,
+                session.duration_secs,
+                session.min_interval_secs,
+                crate::ui_video_tile::pick_interval(session.duration_secs, 240),
+            ),
+        );
+        App::request_video_seek_strip_window(
+            &mut session,
+            StripThumbnailRequestTrigger::WindowRecalculated,
+        );
+        assert_eq!(session.last_sent_thumbnail_request_id, Some(1));
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        let render_stamp = session.render_stamp();
+        let presentation_stamp = render_stamp.session_at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let wrong_session = crate::video::seek_strip::SeekStripSessionEventStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(
+                presentation_stamp.session_id.0 + 1,
+            ),
+            generation: presentation_stamp.generation,
+        };
+        app.handle_native_video_output_event(
+            &egui::Context::default(),
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: wrong_session,
+                    window: None,
+                },
+            ),
+        );
+        assert!(matches!(
+            &app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.presentation == VideoSeekStripPresentationState::Suspended
+                    && session.visible_count == 9
+                    && session.last_sent_thumbnail_request_id == Some(1)
+        ));
+
+        app.handle_native_video_output_event(
+            &egui::Context::default(),
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                            center_index: 4.5,
+                        },
+                        visible_count: 17,
+                        pixel_width: 1_700,
+                        pixel_height: 100,
+                        stamp: render_stamp.at_generation(1),
+                    }),
+                },
+            ),
+        );
+
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("compound Visible must keep the resource session open");
+        };
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        assert_eq!(session.visible_count, 17);
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+        assert!(matches!(
+            session.center,
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index }
+                if center_index.to_bits() == 8.5f64.to_bits()
+        ));
+        assert_eq!(session.last_sent_thumbnail_request_id, Some(2));
+    }
+
+    #[test]
+    fn native_config_events_require_the_current_layout_or_an_exact_closed_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let fs_idx = 0;
+        app.fullscreen_idx = Some(fs_idx);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            fs_idx,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
+                ),
+                load_seq,
+            },
+        );
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.owner_fs_idx = fs_idx;
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        let old = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, Some(old)));
+        let VideoSeekStripRuntime::Open(session) = &mut app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        session.advance_layout_revision();
+        let current = session.render_stamp().at_generation(1);
+        assert!(
+            !app.seek_strip_expected_session_is_current(fs_idx, 1, Some(old)),
+            "a menu/config command from the old native layout cannot overwrite canonical App settings"
+        );
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)));
+        assert!(
+            !app.seek_strip_event_stamp_is_current(fs_idx, old, false),
+            "a range step from the old native layout cannot modify the new mode/range"
+        );
+        assert!(app.seek_strip_event_stamp_is_current(fs_idx, current, false));
+
+        let VideoSeekStripRuntime::Open(session) = &mut app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        assert!(
+            !app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)),
+            "hidden native chrome cannot mutate canonical settings"
+        );
+
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, None));
+        assert!(!app.seek_strip_expected_session_is_current(fs_idx, 2, None));
+        assert!(!app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)));
+    }
+
+    #[test]
+    fn same_native_batch_applies_every_range_step_after_one_exact_layout_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let fs_idx = 0;
+        app.fullscreen_idx = Some(fs_idx);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            fs_idx,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
+                ),
+                load_seq,
+            },
+        );
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
+        app.settings.video_seek_strip_waveform_span_secs = 30.0;
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.owner_fs_idx = fs_idx;
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        session.waveform_span_secs = 30.0;
+        let initial_revision = session.layout_revision;
+        let stamp = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let steps = vec![
+            crate::video::seek_strip::SeekStripRangeStep::Narrower,
+            crate::video::seek_strip::SeekStripRangeStep::Narrower,
+        ];
+        let expected = steps.iter().copied().fold(30.0, |value, step| {
+            crate::video::seek_strip::step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                value,
+                step,
+            )
+            .unwrap_or(value)
+        });
+        let ctx = egui::Context::default();
+        app.handle_native_video_output_event(
+            &ctx,
+            fs_idx,
+            0,
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange {
+                steps: steps.clone(),
+                stamp,
+            },
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_waveform_span_secs.to_bits(),
+            expected.to_bits(),
+            "both ordered wheel edges must be applied"
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("session closed");
+        };
+        assert_eq!(session.layout_revision.0, initial_revision.0 + 1);
+
+        app.handle_native_video_output_event(
+            &ctx,
+            fs_idx,
+            0,
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp },
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_waveform_span_secs.to_bits(),
+            expected.to_bits(),
+            "the old-layout batch must not be replayed after revision advance"
+        );
     }
 
     /// 一時停止は worker loop が読むのと**同じ場所**へ書く。
@@ -15953,7 +17297,7 @@ mod native_video_key_observation_tests {
 mod seek_strip_range_persist_audit {
     /// ホイールでレンジを変える関数は保存しない。書くのはセッションを閉じる 1 箇所だけ。
     ///
-    /// 欠陥は「1 ノッチ = 1 コマンド」なのに毎回 `Settings::save` を呼んでいたことで、
+    /// 欠陥はwheel batchの各ノッチ適用時に毎回 `Settings::save` を呼んでいたことで、
     /// 実測は既定設定 1.3ms / VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)。
     /// 保存 1 回分のコストを測るテストは環境で揺れるので、**どの関数の中で保存するか**を
     /// 見る (2026-08-29 レビュー R-06)。
@@ -15990,7 +17334,7 @@ mod seek_strip_range_persist_audit {
                 continue;
             }
             match current_fn {
-                "step_video_seek_strip_range" => {
+                "step_video_seek_strip_ranges" => {
                     if line.contains(save_call) {
                         wheel_saves.push(lineno + 1);
                     }

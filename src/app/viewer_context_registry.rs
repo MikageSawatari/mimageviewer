@@ -858,6 +858,9 @@ pub(in crate::app) struct ViewerContextBundle {
     video_audio_mode: Option<usize>,
     video_audio_vst: Option<VideoAudioVstState>,
     video_audio_mode_runtime: Option<VideoAudioModeRuntime>,
+    video_seek_strip_runtime: crate::app::native_video::VideoSeekStripRuntime,
+    video_seek_strip_wave_holdover: Option<crate::app::native_video::HeldSeekStripWaveWorker>,
+    video_seek_strip_next_session_id: u64,
     panorama_state: Option<crate::panorama::PanoramaState>,
     /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
     /// context を mount した間だけ App field へ投影する。
@@ -1447,6 +1450,9 @@ impl ViewerContextBundle {
             video_audio_mode: None,
             video_audio_vst: None,
             video_audio_mode_runtime: None,
+            video_seek_strip_runtime: crate::app::native_video::VideoSeekStripRuntime::Closed,
+            video_seek_strip_wave_holdover: None,
+            video_seek_strip_next_session_id: 1,
             panorama_state: None,
             video_zoom_state: None,
             native_video_mouse_seek_holds:
@@ -1796,6 +1802,9 @@ impl App {
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_runtime,
+            video_seek_strip_runtime,
+            video_seek_strip_wave_holdover,
+            video_seek_strip_next_session_id,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -2050,6 +2059,9 @@ impl App {
         swap_field!(video_audio_mode);
         swap_field!(video_audio_vst);
         swap_field!(video_audio_mode_runtime);
+        swap_field!(video_seek_strip_runtime);
+        swap_field!(video_seek_strip_wave_holdover);
+        swap_field!(video_seek_strip_next_session_id);
         swap_field!(panorama_state);
         swap_field!(video_zoom_state);
         swap_field!(native_video_mouse_seek_holds);
@@ -2345,6 +2357,9 @@ impl App {
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_runtime,
+            video_seek_strip_runtime,
+            video_seek_strip_wave_holdover,
+            video_seek_strip_next_session_id,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -2566,6 +2581,9 @@ impl App {
             video_audio_mode,
             video_audio_vst,
             video_audio_mode_runtime,
+            video_seek_strip_runtime,
+            video_seek_strip_wave_holdover,
+            video_seek_strip_next_session_id,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -3910,6 +3928,79 @@ mod tests {
         assert_eq!(app.video_zoom_state, Some(state_main));
         app.swap_viewer_context_bundle(&mut fork);
         assert_eq!(app.video_zoom_state, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_seek_strip_resources_survive_owner_roundtrip_and_move_only_to_live_fork() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("context-a.mp4");
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(4);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker_id = worker.identity_for_test();
+        app.seed_video_seek_strip_context_for_test(path, worker, 41, 17, 42);
+        let owner = app.video_seek_strip_context_owner_for_test().unwrap();
+
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.video_seek_strip_next_session_id = 901;
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(app.video_seek_strip_context_owner_for_test(), None);
+        assert_eq!(app.video_seek_strip_next_session_id, 901);
+        assert_eq!(
+            sibling.video_seek_strip_next_session_id, 42,
+            "the next id belongs to the same resource-session owner"
+        );
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(app.video_seek_strip_context_owner_for_test(), Some(owner));
+        assert_eq!(owner.1, 17);
+        assert_eq!(owner.2, worker_id);
+        assert_eq!(app.video_seek_strip_next_session_id, 42);
+        assert!(matches!(
+            sibling.video_seek_strip_runtime,
+            crate::app::native_video::VideoSeekStripRuntime::Closed
+        ));
+        assert_eq!(sibling.video_seek_strip_next_session_id, 901);
+
+        let parked = app.split_current_context_preserving_main_grid();
+        assert_eq!(app.video_seek_strip_context_owner_for_test(), None);
+        assert_eq!(app.video_seek_strip_next_session_id, 1);
+        assert_eq!(
+            parked.video_seek_strip_runtime.context_owner_for_test(),
+            Some(owner),
+            "the live-media fork receives the player-scoped strip resource"
+        );
+        assert_eq!(parked.video_seek_strip_next_session_id, 42);
+        drop(parked);
+        drop(app);
+
+        // The Closed-session wave holdover and its identity move through the same transaction.
+        let mut held_app = crate::app::setup_app_for_test();
+        held_app.fullscreen_idx = Some(6);
+        held_app.video_seek_strip_next_session_id = 72;
+        let held_path = dir.path().join("held.mp4");
+        let held_worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(held_path.clone(), None);
+        let held_id = held_worker.identity_for_test();
+        held_app.video_seek_strip_wave_holdover =
+            Some(crate::app::native_video::HeldSeekStripWaveWorker {
+                owner_fs_idx: 6,
+                path: held_path,
+                source_epoch: 8,
+                items_generation: held_app.items_generation,
+                worker: held_worker,
+            });
+        let held_parked = held_app.split_current_context_preserving_main_grid();
+        assert!(held_app.video_seek_strip_wave_holdover.is_none());
+        assert_eq!(held_app.video_seek_strip_next_session_id, 1);
+        assert_eq!(held_parked.video_seek_strip_next_session_id, 72);
+        assert_eq!(
+            held_parked
+                .video_seek_strip_wave_holdover
+                .as_ref()
+                .map(|held| held.worker.identity_for_test()),
+            Some(held_id)
+        );
     }
 
     #[cfg(windows)]

@@ -734,30 +734,34 @@ pub enum NativeVideoOutputEvent {
     },
     /// hover が外れて hover thumbnail 要求がもう不要 (T35)。
     ClearSeekThumbnail,
-    OpenSeekStrip,
+    OpenSeekStrip {
+        generation: u64,
+    },
     CloseSeekStrip {
         cause: seek_strip::SeekStripCloseCause,
+        stamp: seek_strip::SeekStripSessionEventStamp,
     },
     MoveSeekStrip {
         center: seek_strip::SeekStripCenter,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     CommitSeekStrip {
         center: seek_strip::SeekStripCenter,
-    },
-    RequestSeekStripWindow {
-        center: seek_strip::SeekStripCenter,
-        visible_count: usize,
-        pixel_width: usize,
-        pixel_height: usize,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     SetSeekStripView {
         view: seek_strip_layout::SeekStripView,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
     },
     SetSeekStripHeight {
         height: seek_strip_layout::SeekStripHeight,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
     },
     StepSeekStripRange {
-        step: seek_strip::SeekStripRangeStep,
+        steps: Vec<seek_strip::SeekStripRangeStep>,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -765,7 +769,11 @@ pub enum NativeVideoOutputEvent {
     ToggleBarLock {
         bar: NativeVideoBar,
     },
-    ToggleSeekStripLock,
+    ToggleSeekStripLock {
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
+    },
+    SeekStripPresentation(seek_strip::SeekStripPresentationEvent),
     ToggleClickInfoOpen,
     ToggleInfoPanelLock,
     OpenTouchInfoPanel,
@@ -945,7 +953,7 @@ const OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING: usize = 3;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE: usize = 4;
 #[cfg(windows)]
-const OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW: usize = 5;
+const OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION: usize = 5;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_SLOTS: usize = 6;
 
@@ -963,8 +971,8 @@ fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usi
             Some(OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING)
         }
         NativeVideoOutputEvent::MoveSeekStrip { .. } => Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE),
-        NativeVideoOutputEvent::RequestSeekStripWindow { .. } => {
-            Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW)
+        NativeVideoOutputEvent::SeekStripPresentation(_) => {
+            Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION)
         }
         _ => None,
     }
@@ -1091,6 +1099,33 @@ impl NativeOutputEventSender {
 
     pub(crate) fn wake_ui(&self) {
         self.shared.ui_wake.wake();
+    }
+
+    fn publish_seek_strip_presentation(
+        &self,
+        source_epoch: u64,
+        event: seek_strip::SeekStripPresentationEvent,
+    ) -> Result<(), ()> {
+        let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let queued = SequencedNativeOutputEvent {
+            sequence,
+            source_epoch,
+            event: NativeVideoOutputEvent::SeekStripPresentation(event),
+            #[cfg(feature = "test-script")]
+            ui_smoke_button_dispatch: None,
+        };
+        match self.shared.latest.lock() {
+            Ok(mut latest) => {
+                latest[OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION] = Some(queued);
+                self.shared.ui_wake.wake();
+                Ok(())
+            }
+            Err(_) => {
+                self.shared.overflow_fault.store(true, Ordering::Release);
+                self.shared.ui_wake.wake();
+                Err(())
+            }
+        }
     }
 }
 
@@ -1792,6 +1827,13 @@ enum PlacementTransitionControl {
     Commit,
     Retire,
     Abort,
+}
+
+#[cfg(windows)]
+fn placement_control_releases_candidate_seek_strip_passive(
+    control: &PlacementTransitionControl,
+) -> bool {
+    matches!(control, PlacementTransitionControl::Retire)
 }
 
 #[cfg(windows)]
@@ -4102,6 +4144,50 @@ fn publish_native_overlay_input_routing(
 }
 
 #[cfg(windows)]
+fn publish_pending_seek_strip_presentation(
+    presenter: &mut native_presenter::NativeRenderCore,
+    tx: &NativeOutputEventSender,
+    source_epoch: u64,
+    generation: u64,
+) {
+    let Some(update) = presenter.pending_seek_strip_presentation() else {
+        return;
+    };
+    let event = match update {
+        seek_strip::SeekStripPresentedUpdate::Hidden(stamp) => {
+            seek_strip::SeekStripPresentationEvent::Hidden(stamp.session_at_generation(generation))
+        }
+        seek_strip::SeekStripPresentedUpdate::Visible { stamp, window } => {
+            seek_strip::SeekStripPresentationEvent::Visible {
+                stamp: stamp.session_at_generation(generation),
+                window: window.map(|window| window.at_generation(generation)),
+            }
+        }
+    };
+    if tx
+        .publish_seek_strip_presentation(source_epoch, event)
+        .is_ok()
+    {
+        match event {
+            seek_strip::SeekStripPresentationEvent::Hidden(stamp) => crate::logger::log(format!(
+                "[native-video] seek-strip presented update published: source_epoch={source_epoch} session={} generation={} visible=false",
+                stamp.session_id.0, stamp.generation
+            )),
+            seek_strip::SeekStripPresentationEvent::Visible { stamp, window } => {
+                crate::logger::log(format!(
+                    "[native-video] seek-strip presented update published: source_epoch={source_epoch} session={} generation={} visible=true revision={:?} reported_count={:?}",
+                    stamp.session_id.0,
+                    stamp.generation,
+                    window.map(|window| window.stamp.layout_revision.0),
+                    window.map(|window| window.visible_count)
+                ));
+            }
+        }
+        presenter.acknowledge_seek_strip_presentation(update);
+    }
+}
+
+#[cfg(windows)]
 fn native_window_event_should_forward_to_app(
     event: &native_window::NativeVideoWindowEvent,
     overlay_forwards: bool,
@@ -4160,31 +4246,52 @@ fn send_native_overlay_command(
             pixels_per_point,
         },
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
-        Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip,
-        Command::CloseSeekStrip { cause } => NativeVideoOutputEvent::CloseSeekStrip { cause },
-        Command::MoveSeekStrip { center } => NativeVideoOutputEvent::MoveSeekStrip { center },
-        Command::CommitSeekStrip { center } => NativeVideoOutputEvent::CommitSeekStrip { center },
-        Command::RequestSeekStripWindow {
-            center,
-            visible_count,
-            pixel_width,
-            pixel_height,
-        } => NativeVideoOutputEvent::RequestSeekStripWindow {
-            center,
-            visible_count,
-            pixel_width,
-            pixel_height,
+        Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip { generation },
+        Command::CloseSeekStrip { cause, stamp } => NativeVideoOutputEvent::CloseSeekStrip {
+            cause,
+            stamp: stamp.session_at_generation(generation),
         },
-        Command::SetSeekStripView { view } => NativeVideoOutputEvent::SetSeekStripView { view },
-        Command::SetSeekStripHeight { height } => {
-            NativeVideoOutputEvent::SetSeekStripHeight { height }
+        Command::MoveSeekStrip { center, stamp } => NativeVideoOutputEvent::MoveSeekStrip {
+            center,
+            stamp: stamp.at_generation(generation),
+        },
+        Command::CommitSeekStrip { center, stamp } => NativeVideoOutputEvent::CommitSeekStrip {
+            center,
+            stamp: stamp.at_generation(generation),
+        },
+        Command::RequestSeekStripWindow { .. } => {
+            debug_assert!(
+                false,
+                "RequestSeekStripWindow must be attached to the presented snapshot"
+            );
+            return;
         }
-        Command::StepSeekStripRange { step } => NativeVideoOutputEvent::StepSeekStripRange { step },
+        Command::SetSeekStripView { view, expected } => NativeVideoOutputEvent::SetSeekStripView {
+            view,
+            generation,
+            expected: expected.map(|stamp| stamp.at_generation(generation)),
+        },
+        Command::SetSeekStripHeight { height, expected } => {
+            NativeVideoOutputEvent::SetSeekStripHeight {
+                height,
+                generation,
+                expected: expected.map(|stamp| stamp.at_generation(generation)),
+            }
+        }
+        Command::StepSeekStripRange { steps, stamp } => {
+            NativeVideoOutputEvent::StepSeekStripRange {
+                steps,
+                stamp: stamp.at_generation(generation),
+            }
+        }
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
         Command::ToggleBarLock { bar } => NativeVideoOutputEvent::ToggleBarLock { bar },
-        Command::ToggleSeekStripLock => NativeVideoOutputEvent::ToggleSeekStripLock,
+        Command::ToggleSeekStripLock { expected } => NativeVideoOutputEvent::ToggleSeekStripLock {
+            generation,
+            expected: expected.map(|stamp| stamp.at_generation(generation)),
+        },
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
         Command::ToggleInfoPanelLock => NativeVideoOutputEvent::ToggleInfoPanelLock,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
@@ -4627,6 +4734,9 @@ fn run_native_video_output(
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
     let mut cur_anime4k_status = crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting;
+    let mut cur_seek_strip: Option<native_presenter::NativeOverlaySeekStrip> = None;
+    let mut cur_seek_strip_material_availability =
+        seek_strip::SeekStripMaterialAvailability::Unknown;
     fn sync_hud_regions(
         window_pump: &native_window_pump::NativeWindowPumpRenderClient,
         epoch: u64,
@@ -4845,6 +4955,12 @@ fn run_native_video_output(
         }
     }
     while !cancel.load(Ordering::Acquire) {
+        publish_pending_seek_strip_presentation(
+            &mut presenter,
+            &ui_event_tx,
+            source.source_epoch,
+            cur_generation,
+        );
         let mut measurement_finished = false;
         if let Some(measurement) = anime4k_measurement.as_ref() {
             loop {
@@ -5409,21 +5525,25 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetSeekStrip {
                     seek_strip,
                     material_availability,
-                } => match presenter.set_overlay_seek_strip(seek_strip, material_availability) {
-                    Ok(true) => {
-                        if source
-                            .video_scale_state
-                            .invalidate_preparation_and_keep_desired()
-                        {
-                            presenter.discard_prepared_video_scale_settings();
-                            desired_scale_apply_due = true;
+                } => {
+                    cur_seek_strip = seek_strip.clone();
+                    cur_seek_strip_material_availability = material_availability;
+                    match presenter.set_overlay_seek_strip(seek_strip, material_availability) {
+                        Ok(true) => {
+                            if source
+                                .video_scale_state
+                                .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
                         }
+                        Ok(false) => {}
+                        Err(err) => crate::logger::log(format!(
+                            "[native-video] set seek-strip transform failed: {err}"
+                        )),
                     }
-                    Ok(false) => {}
-                    Err(err) => crate::logger::log(format!(
-                        "[native-video] set seek-strip transform failed: {err}"
-                    )),
-                },
+                }
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
                 }
@@ -5621,6 +5741,9 @@ fn run_native_video_output(
                             "[native-video] reset seek-strip transform failed: {err}"
                         ));
                     }
+                    cur_seek_strip = None;
+                    cur_seek_strip_material_availability =
+                        seek_strip::SeekStripMaterialAvailability::Unknown;
                     // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
                     // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
                     // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
@@ -5956,6 +6079,10 @@ fn run_native_video_output(
                                 file_size: 0,
                             },
                         );
+                        new_presenter.set_overlay_seek_strip(
+                            cur_seek_strip.clone(),
+                            cur_seek_strip_material_availability,
+                        )?;
                         let overlay_outcome = new_presenter.tick_overlay_video_state(
                             source.clock.now_secs(),
                             f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
@@ -6006,6 +6133,9 @@ fn run_native_video_output(
                         &new_presenter,
                         &overlay_outcome,
                     );
+                    // Candidate semantic commands are not delivered: the candidate may still be
+                    // aborted. Its passive presentation snapshot already owns the exact final
+                    // RequestWindow and is released only after the commit/Retire acknowledgement.
                     let hud_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
                     let retire_t0 = std::time::Instant::now();
                     frame_output.retire_completed(presenter.copy_fence_completed_value());
@@ -6122,6 +6252,19 @@ fn run_native_video_output(
                         true,
                         &cancel,
                     )?;
+                    if placement_control_releases_candidate_seek_strip_passive(&retire_control) {
+                        // App has accepted PlacementCommitted, applied the transition effect,
+                        // and advanced the player's committed generation before it can issue
+                        // this Retire. Publish the candidate's passive strip state only past that
+                        // acknowledgement boundary; publishing it in the same drain as
+                        // PlacementCommitted makes App validate it against the old generation.
+                        publish_pending_seek_strip_presentation(
+                            &mut presenter,
+                            &ui_event_tx,
+                            source.source_epoch,
+                            cur_generation,
+                        );
+                    }
                     match retire_control {
                         PlacementTransitionControl::Retire => {
                             window_pump.target_retire(
@@ -6390,6 +6533,8 @@ fn run_native_video_output(
                         .into_iter()
                         .enumerate()
                     {
+                        #[cfg(not(feature = "test-script"))]
+                        let _ = command_index;
                         let event_epoch = source.source_epoch;
                         match command {
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
@@ -6571,61 +6716,74 @@ fn run_native_video_output(
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::OpenSeekStrip,
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::CloseSeekStrip { cause } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::CloseSeekStrip { cause },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::MoveSeekStrip { center },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::CommitSeekStrip { center },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { center, visible_count, pixel_width, pixel_height } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::RequestSeekStripWindow {
-                                        center,
-                                        visible_count,
-                                        pixel_width,
-                                        pixel_height,
+                                    NativeVideoOutputEvent::OpenSeekStrip {
+                                        generation: cur_generation,
                                     },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view } => {
+                            crate::video::native_presenter::NativeOverlayCommand::CloseSeekStrip { cause, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::SetSeekStripView { view },
+                                    NativeVideoOutputEvent::CloseSeekStrip {
+                                        cause,
+                                        stamp: stamp.session_at_generation(cur_generation),
+                                    },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height } => {
+                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::SetSeekStripHeight { height },
+                                    NativeVideoOutputEvent::MoveSeekStrip {
+                                        center,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { step } => {
+                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::StepSeekStripRange { step },
+                                    NativeVideoOutputEvent::CommitSeekStrip {
+                                        center,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { .. } => {
+                                debug_assert!(false, "RequestSeekStripWindow must be attached to the presented snapshot");
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripView {
+                                        view,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripHeight {
+                                        height,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { steps, stamp } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::StepSeekStripRange {
+                                        steps,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
@@ -6656,11 +6814,14 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::ToggleBarLock { bar },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock => {
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock { expected } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::ToggleSeekStripLock,
+                                    NativeVideoOutputEvent::ToggleSeekStripLock {
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleClickInfoOpen => {
@@ -12478,6 +12639,195 @@ mod tests {
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::KeyDown(_)
             )
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn seek_strip_presented_snapshot_coalesces_visibility_and_window_atomically() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let render_stamp = crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(5),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(2),
+        };
+        let visible =
+            |visible_count| crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                stamp: render_stamp.session_at_generation(3),
+                window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                    center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                        center_index: (visible_count as f64 - 1.0) / 2.0,
+                    },
+                    visible_count,
+                    pixel_width: 1280,
+                    pixel_height: 104,
+                    stamp: render_stamp.at_generation(3),
+                }),
+            };
+        let hidden = crate::video::seek_strip::SeekStripPresentationEvent::Hidden(
+            render_stamp.session_at_generation(3),
+        );
+
+        // If App has not drained yet, a later successful Hidden present replaces both Visible and
+        // its RequestWindow. The renderer clears its dedup baseline on Hidden, so the next Visible
+        // can publish the geometry again.
+        tx.publish_seek_strip_presentation(13, visible(17)).unwrap();
+        tx.publish_seek_strip_presentation(13, hidden).unwrap();
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Hidden(_)
+            )
+        ));
+
+        // Conversely, Hidden followed by a successful Visible present delivers one compound
+        // snapshot. There is no interval in which App can observe Visible without its final width.
+        tx.publish_seek_strip_presentation(13, hidden).unwrap();
+        tx.publish_seek_strip_presentation(13, visible(17)).unwrap();
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        visible_count: 17,
+                        ..
+                    }),
+                    ..
+                }
+            )
+        ));
+
+        // PlacementCommitted remains lossless and drains independently before a candidate's
+        // compound snapshot is released at its exact Retire acknowledgement.
+        tx.send(
+            13,
+            super::NativeVideoOutputEvent::PlacementCommitted {
+                request_id: 9,
+                placement: super::NativeVideoPlacement::FullscreenBorderless,
+                generation: 3,
+            },
+        );
+        let committed = rx.drain();
+        assert_eq!(committed.len(), 1);
+        assert!(matches!(
+            committed[0].event,
+            super::NativeVideoOutputEvent::PlacementCommitted { generation: 3, .. }
+        ));
+
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_strip_passive_output_is_released_only_by_the_exact_retire_ack() {
+        assert!(
+            !super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Commit,
+            )
+        );
+        assert!(
+            !super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Abort,
+            )
+        );
+        assert!(
+            super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Retire,
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_strip_config_commands_preserve_the_full_expected_layout_stamp() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let render_stamp = crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(17),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(23),
+        };
+        let expected = render_stamp.at_generation(31);
+
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView {
+                view: crate::video::seek_strip_layout::SeekStripView::Hidden,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight {
+                height: crate::video::seek_strip_layout::SeekStripHeight::Large,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange {
+                steps: vec![crate::video::seek_strip::SeekStripRangeStep::Narrower],
+                stamp: render_stamp,
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock {
+                expected: Some(render_stamp),
+            },
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SetSeekStripView {
+                generation: 31,
+                expected: Some(actual),
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[1].event,
+            super::NativeVideoOutputEvent::SetSeekStripHeight {
+                generation: 31,
+                expected: Some(actual),
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[2].event,
+            super::NativeVideoOutputEvent::StepSeekStripRange {
+                stamp: actual,
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[3].event,
+            super::NativeVideoOutputEvent::ToggleSeekStripLock {
+                generation: 31,
+                expected: Some(actual),
+            } if actual == expected
         ));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
     }

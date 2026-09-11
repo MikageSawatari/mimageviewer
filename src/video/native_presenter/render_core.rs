@@ -767,6 +767,7 @@ fn draw_native_seek_strip_lock_button(
     painter: &egui::Painter,
     lock_rect: egui::Rect,
     strip_locked: bool,
+    stamp: crate::video::seek_strip::SeekStripRenderStamp,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let response = ui
@@ -788,7 +789,9 @@ fn draw_native_seek_strip_lock_button(
         "ストリップを固定表示"
     });
     if response.clicked() {
-        commands.push(NativeOverlayCommand::ToggleSeekStripLock);
+        commands.push(NativeOverlayCommand::ToggleSeekStripLock {
+            expected: Some(stamp),
+        });
     }
 }
 
@@ -962,7 +965,6 @@ fn draw_native_seek_strip(
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
     drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
-    last_window_request: &mut Option<(u8, u64, u64, usize, usize, usize)>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> NativeSeekStripPreviewHover {
     use crate::video::seek_strip_layout::SeekStripSpan;
@@ -973,9 +975,8 @@ fn draw_native_seek_strip(
         || strip_rect.width() <= 0.0
         || strip_rect.height() <= 0.0
     {
-        // 0 領域で max(1) の画像・波形要求を作らない。再び正領域になったフレームでは
-        // request key を必ず作り直す。
-        *last_window_request = None;
+        // 0 領域で max(1) の画像・波形要求を作らない。commit 済み request key は
+        // successful present の owner だけが更新する。
         if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
             && let Some(origin) = drag_origin.take()
             && let Some(pointer) = ctx
@@ -989,6 +990,7 @@ fn draw_native_seek_strip(
             ) {
                 commands.push(NativeOverlayCommand::CloseSeekStrip {
                     cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                    stamp: strip.stamp,
                 });
             } else {
                 let center = match layout.span {
@@ -1002,7 +1004,10 @@ fn draw_native_seek_strip(
                     }
                 };
                 if let Some(center) = center {
-                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                    commands.push(NativeOverlayCommand::CommitSeekStrip {
+                        center,
+                        stamp: strip.stamp,
+                    });
                 }
             }
         }
@@ -1018,33 +1023,16 @@ fn draw_native_seek_strip(
     let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 4.0);
     let pixel_width = layout.wave_pixel_width(pixels_per_point);
     let pixel_height = layout.wave_pixel_height(pixels_per_point);
-    let (mode_key, center_bits, waveform_span_bits) = match strip.center {
-        crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
-            (0, center_index.to_bits(), 0)
-        }
-        crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => (
-            1,
-            center_time_secs.to_bits(),
-            strip.waveform_span_secs.to_bits(),
-        ),
-    };
-    let request_key = (
-        mode_key,
-        center_bits,
-        waveform_span_bits,
+    // This is an observation of the final pixels, not a logical-pass side effect. Every visible
+    // pass reports it; the successful-present owner below compares and commits only the final
+    // pass. Advancing a dedup key here loses feedback when egui runs a second identical pass.
+    commands.push(NativeOverlayCommand::RequestSeekStripWindow {
+        center: strip.center,
         visible_count,
         pixel_width,
         pixel_height,
-    );
-    if *last_window_request != Some(request_key) {
-        *last_window_request = Some(request_key);
-        commands.push(NativeOverlayCommand::RequestSeekStripWindow {
-            center: strip.center,
-            visible_count,
-            pixel_width,
-            pixel_height,
-        });
-    }
+        stamp: strip.stamp,
+    });
 
     egui::Area::new(egui::Id::new("native_video_seek_strip"))
         .order(egui::Order::Foreground)
@@ -1317,7 +1305,14 @@ fn draw_native_seek_strip(
             // `interact` より後に登録する。先に登録すると body がポインタを取り、鍵は
             // 一度も `clicked()` にならない。body 側は下の `seek_strip_body_accepts_pointer`
             // で鍵の矩形を除外するので、どちらか一方だけが反応する。
-            draw_native_seek_strip_lock_button(ui, &painter, lock_rect, strip_locked, commands);
+            draw_native_seek_strip_lock_button(
+                ui,
+                &painter,
+                lock_rect,
+                strip_locked,
+                strip.stamp,
+                commands,
+            );
             // `Response` の hover と egui の `pointer_hover_pos` は、HUD / presenter
             // HWND 間の input handoff 中に一時的に失われ得る。HUD 可視性と同じ
             // presenter-owned native hover snapshot をストリップの矩形へ当て、可視性と
@@ -1326,11 +1321,15 @@ fn draw_native_seek_strip(
                 cursor_hover_pos.is_some_and(|pointer| strip_rect.contains(pointer));
             let pointer_over_lock =
                 cursor_hover_pos.is_some_and(|pointer| lock_rect.contains(pointer));
-            for step in consume_seek_strip_wheel(
+            let steps = consume_seek_strip_wheel(
                 ui.ctx(),
                 pointer_inside && wheel_enabled && layout.span.has_range_setting(),
-            ) {
-                commands.push(NativeOverlayCommand::StepSeekStripRange { step });
+            );
+            if !steps.is_empty() {
+                commands.push(NativeOverlayCommand::StepSeekStripRange {
+                    steps,
+                    stamp: strip.stamp,
+                });
             }
             if (pointer_inside && !pointer_over_lock)
                 || (response.dragged() && drag_origin.is_some())
@@ -1401,12 +1400,16 @@ fn draw_native_seek_strip(
                     *drag_origin = None;
                     commands.push(NativeOverlayCommand::CloseSeekStrip {
                         cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                        stamp: strip.stamp,
                     });
                 } else if layout.span == SeekStripSpan::Window
                     && let Some(center) = dragged_center(origin, pointer)
                 {
                     // 全体表示では中身を動かさないので、ドラッグ中に送るものが無い。
-                    commands.push(NativeOverlayCommand::MoveSeekStrip { center });
+                    commands.push(NativeOverlayCommand::MoveSeekStrip {
+                        center,
+                        stamp: strip.stamp,
+                    });
                 }
             }
             if response.drag_stopped()
@@ -1414,7 +1417,10 @@ fn draw_native_seek_strip(
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 if let Some(center) = dragged_center(origin, pointer) {
-                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                    commands.push(NativeOverlayCommand::CommitSeekStrip {
+                        center,
+                        stamp: strip.stamp,
+                    });
                 }
             } else if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -1441,7 +1447,10 @@ fn draw_native_seek_strip(
                     _ => center_at_pointer(pointer),
                 };
                 if let Some(center) = center {
-                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                    commands.push(NativeOverlayCommand::CommitSeekStrip {
+                        center,
+                        stamp: strip.stamp,
+                    });
                 }
             }
             let drag_claims_pointer = response.dragged() && drag_origin.is_some();
@@ -1546,6 +1555,7 @@ fn draw_native_seek_strip_menu(
     button_rect: egui::Rect,
     view: crate::video::seek_strip_layout::SeekStripView,
     height: crate::video::seek_strip_layout::SeekStripHeight,
+    expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     menu_open: &mut bool,
     menu_rect_out: &mut Option<egui::Rect>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -1564,6 +1574,7 @@ fn draw_native_seek_strip_menu(
         !view.is_visible(),
         NativeOverlayCommand::SetSeekStripView {
             view: SeekStripView::Hidden,
+            expected,
         },
     ))
     .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
@@ -1572,6 +1583,7 @@ fn draw_native_seek_strip_menu(
             view == SeekStripView::Showing(*showing),
             NativeOverlayCommand::SetSeekStripView {
                 view: SeekStripView::Showing(*showing),
+                expected,
             },
         )
     }))
@@ -1579,7 +1591,10 @@ fn draw_native_seek_strip_menu(
         (
             format!("高さ: {}", preset.label()),
             height == *preset,
-            NativeOverlayCommand::SetSeekStripHeight { height: *preset },
+            NativeOverlayCommand::SetSeekStripHeight {
+                height: *preset,
+                expected,
+            },
         )
     }))
     .collect();
@@ -2359,7 +2374,9 @@ struct NativeEguiOverlay {
     seek_strip_wave_texture: Option<(u64, egui::TextureHandle)>,
     seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
     seek_strip_drag_origin: Option<crate::video::seek_strip::SeekStripDragOrigin>,
-    last_seek_strip_window_request: Option<(u8, u64, u64, usize, usize, usize)>,
+    last_seek_strip_window_request: Option<SeekStripWindowRequestKey>,
+    seek_strip_committed_inventory: crate::video::seek_strip::SeekStripPresentedInventory,
+    seek_strip_pending_inventory: Option<crate::video::seek_strip::SeekStripPresentedUpdate>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     /// 直前の render_once で実際に描画した上部バーの可視状態。
     /// top_bar_visible は hover ヒステリシス用に残し、region はこの snapshot を参照する。
@@ -2875,6 +2892,7 @@ const NATIVE_SEEK_STRIP_OUT_OF_TRACK_EDGE: egui::Color32 = egui::Color32::from_g
 
 #[derive(Clone)]
 pub struct NativeOverlaySeekStrip {
+    pub stamp: crate::video::seek_strip::SeekStripRenderStamp,
     pub center: crate::video::seek_strip::SeekStripCenter,
     /// 帯が動画のどこを写しているか。全体表示では中身が動かず赤線が動く。
     pub span: crate::video::seek_strip_layout::SeekStripSpan,
@@ -3175,12 +3193,14 @@ impl NativeOverlayInputOutcome {
 struct NativeOverlayLogicalOutput {
     full_output: egui::FullOutput,
     commands: Vec<NativeOverlayCommand>,
+    seek_strip_window_request: Option<NativeOverlayCommand>,
     window_intents: Vec<NativeWindowIntent>,
     pending_event_count: usize,
     egui_run_ms: f64,
     overlay_visible: bool,
     hud_visible: bool,
     perf_visible: bool,
+    seek_strip_inventory: crate::video::seek_strip::SeekStripPresentedInventory,
     #[cfg(feature = "test-script")]
     ui_smoke_inventory: crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory,
     #[cfg(feature = "test-script")]
@@ -3191,12 +3211,14 @@ struct NativeOverlayLogicalOutput {
 struct NativeOverlayLogicalBatch {
     full_output: Option<egui::FullOutput>,
     commands: Vec<NativeOverlayCommand>,
+    seek_strip_window_request: Option<NativeOverlayCommand>,
     window_intents: Vec<NativeWindowIntent>,
     pending_event_count: usize,
     egui_run_ms: f64,
     overlay_visible: bool,
     hud_visible: bool,
     perf_visible: bool,
+    seek_strip_inventory: Option<crate::video::seek_strip::SeekStripPresentedInventory>,
     #[cfg(feature = "test-script")]
     ui_smoke_inventory: Option<crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory>,
     #[cfg(feature = "test-script")]
@@ -3205,17 +3227,44 @@ struct NativeOverlayLogicalBatch {
 
 impl NativeOverlayLogicalBatch {
     fn append(&mut self, output: NativeOverlayLogicalOutput) {
-        #[cfg(feature = "test-script")]
-        let command_offset = self.commands.len();
         if let Some(full_output) = self.full_output.as_mut() {
             full_output.append(output.full_output);
         } else {
             self.full_output = Some(output.full_output);
         }
-        self.commands.extend(output.commands);
         #[cfg(feature = "test-script")]
-        if let Some(mut attribution) = output.ui_smoke_command_attribution {
-            attribution.command_index = attribution.command_index.saturating_add(command_offset);
+        let mut mapped_attribution = output.ui_smoke_command_attribution;
+        for (_local_index, command) in output.commands.into_iter().enumerate() {
+            let previous_len = self.commands.len();
+            let _command_index = match (self.commands.last_mut(), command) {
+                (
+                    Some(NativeOverlayCommand::StepSeekStripRange {
+                        steps: existing,
+                        stamp: existing_stamp,
+                    }),
+                    NativeOverlayCommand::StepSeekStripRange { steps, stamp },
+                ) if *existing_stamp == stamp => {
+                    existing.extend(steps);
+                    previous_len.saturating_sub(1)
+                }
+                (_, command) => {
+                    self.commands.push(command);
+                    self.commands.len().saturating_sub(1)
+                }
+            };
+            #[cfg(feature = "test-script")]
+            if let Some(attribution) = mapped_attribution.as_mut()
+                && attribution.command_index == _local_index
+            {
+                attribution.command_index = _command_index;
+            }
+        }
+        // RequestWindow is renderer feedback for the pixels from this logical pass. Unlike
+        // semantic input commands it must not accumulate across passes: only the final pass can
+        // describe the image which is presented below.
+        self.seek_strip_window_request = output.seek_strip_window_request;
+        #[cfg(feature = "test-script")]
+        if let Some(attribution) = mapped_attribution {
             self.ui_smoke_command_attributions.push(attribution);
         }
         self.window_intents.extend(output.window_intents);
@@ -3226,6 +3275,9 @@ impl NativeOverlayLogicalBatch {
         self.overlay_visible = output.overlay_visible;
         self.hud_visible = output.hud_visible;
         self.perf_visible = output.perf_visible;
+        // Multiple logical passes may precede one present. Only the final pass describes the
+        // pixels whose presentation state may be committed.
+        self.seek_strip_inventory = Some(output.seek_strip_inventory);
         #[cfg(feature = "test-script")]
         {
             // A native input batch can run multiple logical passes before one present.
@@ -3233,6 +3285,141 @@ impl NativeOverlayLogicalBatch {
             self.ui_smoke_inventory = Some(output.ui_smoke_inventory);
         }
     }
+}
+
+fn seek_strip_window_request_for_presented_inventory(
+    inventory: crate::video::seek_strip::SeekStripPresentedInventory,
+    request: Option<NativeOverlayCommand>,
+) -> Option<NativeOverlayCommand> {
+    match (inventory, request) {
+        (
+            crate::video::seek_strip::SeekStripPresentedInventory::Visible(inventory_stamp),
+            Some(request @ NativeOverlayCommand::RequestSeekStripWindow { stamp, .. }),
+        ) if stamp == inventory_stamp => Some(request),
+        _ => None,
+    }
+}
+
+type SeekStripWindowRequestKey = (
+    crate::video::seek_strip::SeekStripRenderStamp,
+    u8,
+    u64,
+    usize,
+    usize,
+    usize,
+);
+
+fn seek_strip_window_request_key(
+    request: &NativeOverlayCommand,
+) -> Option<SeekStripWindowRequestKey> {
+    let NativeOverlayCommand::RequestSeekStripWindow {
+        center,
+        visible_count,
+        pixel_width,
+        pixel_height,
+        stamp,
+    } = request
+    else {
+        return None;
+    };
+    let (mode_key, center_bits) = match center {
+        crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+            (0, center_index.to_bits())
+        }
+        crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+            (1, center_time_secs.to_bits())
+        }
+    };
+    Some((
+        *stamp,
+        mode_key,
+        center_bits,
+        *visible_count,
+        *pixel_width,
+        *pixel_height,
+    ))
+}
+
+/// Commit final-pass feedback only after the entire present tail succeeded.
+fn commit_seek_strip_window_request(
+    committed: &mut Option<SeekStripWindowRequestKey>,
+    inventory: crate::video::seek_strip::SeekStripPresentedInventory,
+    observation: Option<NativeOverlayCommand>,
+) -> Option<crate::video::seek_strip::SeekStripPresentedWindow> {
+    let Some(request) = seek_strip_window_request_for_presented_inventory(inventory, observation)
+    else {
+        *committed = None;
+        return None;
+    };
+    let key = seek_strip_window_request_key(&request)
+        .expect("presented seek-strip request must have a request key");
+    if *committed == Some(key) {
+        None
+    } else {
+        *committed = Some(key);
+        let NativeOverlayCommand::RequestSeekStripWindow {
+            center,
+            visible_count,
+            pixel_width,
+            pixel_height,
+            stamp,
+        } = request
+        else {
+            unreachable!("presented seek-strip request was validated above")
+        };
+        Some(crate::video::seek_strip::SeekStripPresentedWindow {
+            center,
+            visible_count,
+            pixel_width,
+            pixel_height,
+            stamp,
+        })
+    }
+}
+
+fn commit_seek_strip_presented_inventory(
+    committed: &mut crate::video::seek_strip::SeekStripPresentedInventory,
+    pending: &mut Option<crate::video::seek_strip::SeekStripPresentedUpdate>,
+    next: crate::video::seek_strip::SeekStripPresentedInventory,
+    window: Option<crate::video::seek_strip::SeekStripPresentedWindow>,
+) {
+    let state_changed = !committed.same_presentation_state(next);
+    *committed = next;
+    match next {
+        crate::video::seek_strip::SeekStripPresentedInventory::Absent => {
+            *pending = None;
+        }
+        crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp) => {
+            if state_changed {
+                *pending = Some(crate::video::seek_strip::SeekStripPresentedUpdate::Hidden(
+                    stamp,
+                ));
+            }
+        }
+        crate::video::seek_strip::SeekStripPresentedInventory::Visible(stamp) => {
+            if state_changed || window.is_some() {
+                // The exact final geometry is part of the same latest snapshot as Visible. A
+                // following Hidden may replace both before App drains, but can never strand a
+                // separately-deduplicated RequestWindow behind it.
+                *pending = Some(
+                    crate::video::seek_strip::SeekStripPresentedUpdate::Visible { stamp, window },
+                );
+            }
+        }
+    }
+}
+
+fn acknowledge_seek_strip_presented_inventory(
+    pending: &mut Option<crate::video::seek_strip::SeekStripPresentedUpdate>,
+    accepted: crate::video::seek_strip::SeekStripPresentedUpdate,
+) {
+    if *pending == Some(accepted) {
+        *pending = None;
+    }
+}
+
+fn seek_strip_requires_periodic_tick(has_payload: bool, bottom_hud_visible: bool) -> bool {
+    has_payload && bottom_hud_visible
 }
 
 struct NativeOverlayEventBatchRun {
@@ -3844,28 +4031,35 @@ pub enum NativeOverlayCommand {
     OpenSeekStrip,
     CloseSeekStrip {
         cause: crate::video::seek_strip::SeekStripCloseCause,
+        stamp: crate::video::seek_strip::SeekStripRenderStamp,
     },
     MoveSeekStrip {
         center: crate::video::seek_strip::SeekStripCenter,
+        stamp: crate::video::seek_strip::SeekStripRenderStamp,
     },
     CommitSeekStrip {
         center: crate::video::seek_strip::SeekStripCenter,
+        stamp: crate::video::seek_strip::SeekStripRenderStamp,
     },
     RequestSeekStripWindow {
         center: crate::video::seek_strip::SeekStripCenter,
         visible_count: usize,
         pixel_width: usize,
         pixel_height: usize,
+        stamp: crate::video::seek_strip::SeekStripRenderStamp,
     },
     /// 右下のメニューから表示を直接選ぶ。巡回から外したモードにもここから届く。
     SetSeekStripView {
         view: crate::video::seek_strip_layout::SeekStripView,
+        expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     },
     SetSeekStripHeight {
         height: crate::video::seek_strip_layout::SeekStripHeight,
+        expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     },
     StepSeekStripRange {
-        step: crate::video::seek_strip::SeekStripRangeStep,
+        steps: Vec<crate::video::seek_strip::SeekStripRangeStep>,
+        stamp: crate::video::seek_strip::SeekStripRenderStamp,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -3873,7 +4067,9 @@ pub enum NativeOverlayCommand {
     ToggleBarLock {
         bar: crate::video::NativeVideoBar,
     },
-    ToggleSeekStripLock,
+    ToggleSeekStripLock {
+        expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
+    },
     ToggleClickInfoOpen,
     /// 右情報パネルの固定を切り替える (静止画の鍵ボタンと同じ状態を触る)。
     ToggleInfoPanelLock,
@@ -7084,7 +7280,7 @@ impl NativeRenderCore {
         self.egui_overlay.as_ref().is_some_and(|overlay| {
             overlay.navigation_preview.is_some()
                 || overlay.tile_overlay.is_some()
-                || overlay.seek_strip.is_some()
+                || (overlay.bottom_hud_visible && overlay.seek_strip.is_some())
                 || overlay.native_touch.first_run_help_visible()
         })
     }
@@ -7362,6 +7558,26 @@ impl NativeRenderCore {
             self.update_video_visual_transform(self.width, self.height)?;
         }
         Ok(layout_changed)
+    }
+
+    pub(crate) fn pending_seek_strip_presentation(
+        &self,
+    ) -> Option<crate::video::seek_strip::SeekStripPresentedUpdate> {
+        self.egui_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.seek_strip_pending_inventory)
+    }
+
+    pub(crate) fn acknowledge_seek_strip_presentation(
+        &mut self,
+        accepted: crate::video::seek_strip::SeekStripPresentedUpdate,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            acknowledge_seek_strip_presented_inventory(
+                &mut overlay.seek_strip_pending_inventory,
+                accepted,
+            );
+        }
     }
 
     pub fn set_overlay_ring_picker(&mut self, picker: Option<NativeOverlayRingPicker>) {
@@ -8433,6 +8649,9 @@ impl NativeEguiOverlay {
             seek_row_gesture: None,
             seek_strip_drag_origin: None,
             last_seek_strip_window_request: None,
+            seek_strip_committed_inventory:
+                crate::video::seek_strip::SeekStripPresentedInventory::Absent,
+            seek_strip_pending_inventory: None,
             jump_textures: HashMap::new(),
             top_bar_drawn_visible: false,
             bottom_hud_visible: false,
@@ -8927,11 +9146,13 @@ impl NativeEguiOverlay {
                     && !key.repeat
                     && key.virtual_key == 0x1B
                     && !self.text_input_active()
+                    && self.bottom_hud_visible
                     && self.seek_strip.is_some()
                 {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::CloseSeekStrip {
                             cause: crate::video::seek_strip::SeekStripCloseCause::Escape,
+                            stamp: self.seek_strip.as_ref().expect("checked above").stamp,
                         });
                     self.side_panel_escape_consumed = true;
                     self.dirty = true;
@@ -9853,6 +10074,9 @@ impl NativeEguiOverlay {
             self.seek_strip_wave_texture = None;
             self.seek_strip_drag_origin = None;
             self.last_seek_strip_window_request = None;
+            self.seek_strip_committed_inventory =
+                crate::video::seek_strip::SeekStripPresentedInventory::Absent;
+            self.seek_strip_pending_inventory = None;
         }
         self.seek_strip = seek_strip;
         self.seek_strip_material_availability = material_availability;
@@ -10143,7 +10367,9 @@ impl NativeEguiOverlay {
     }
 
     fn wants_periodic_tick(&self) -> bool {
-        self.hud_visible()
+        let hud_visible = self.hud_visible();
+        hud_visible
+            || seek_strip_requires_periodic_tick(self.seek_strip.is_some(), hud_visible)
             || self.jump_panel_visible()
             || self.top_bar_visible()
             || self.right_panel_visible()
@@ -10151,7 +10377,6 @@ impl NativeEguiOverlay {
             || self.perf_visible
             || self.navigation_preview.is_some()
             || self.tile_overlay.is_some()
-            || self.seek_strip.is_some()
             || self.hover_preview_target_secs.is_some()
             || self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
@@ -10886,7 +11111,8 @@ impl NativeEguiOverlay {
             .normal_bar_height;
         // ホバー帯は「いま帯が描かれているか」で決まる。映像の予約 (ピン) とは別の問い
         // なので述語は分けたまま、高さだけを同じ 1 か所から取る。
-        let seek_strip_drawn = self.seek_strip.is_some()
+        let seek_strip_drawn = self.bottom_hud_visible
+            && self.seek_strip.is_some()
             && self.tile_overlay.is_none()
             && self.navigation_preview.is_none();
         let strip_points = if seek_strip_drawn {
@@ -11005,7 +11231,7 @@ impl NativeEguiOverlay {
                     || self.video_speed_popup_open
                     || self.hover_preview_target_secs.is_some()
                     || self.tile_overlay.is_some()
-                    || self.seek_strip.is_some()
+                    || (self.bottom_hud_visible && self.seek_strip.is_some())
                     || self.navigation_preview.is_some(),
                 left_panel_open: self.left_panel_open.is_open(),
                 right_panel_open: self.info_panel_open.is_open(),
@@ -11024,7 +11250,7 @@ impl NativeEguiOverlay {
             || self.video_speed_popup_open
             || self.hover_preview_target_secs.is_some()
             || self.tile_overlay.is_some()
-            || self.seek_strip.is_some()
+            || (self.bottom_hud_visible && self.seek_strip.is_some())
             || self.navigation_preview.is_some()
         {
             return (false, false);
@@ -11292,7 +11518,6 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
-        let seek_strip_visible = seek_strip.is_some() && !tile_overlay_visible;
         let thumbnail_strip_visible_for_preview_policy =
             seek_geometry.thumbnail_strip_visible_for_preview_policy;
         let normal_seek_bar_visible = seek_geometry.normal_seek_bar_visible;
@@ -11327,6 +11552,18 @@ impl NativeEguiOverlay {
         let seek_status_visible = raw_seek_status_visible;
         let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
         let bottom_hud_visible = bar_visibility.bottom_hud_visible;
+        let seek_strip_visible =
+            seek_strip.is_some() && !tile_overlay_visible && bottom_hud_visible;
+        let seek_strip_inventory = seek_strip.as_ref().map_or(
+            crate::video::seek_strip::SeekStripPresentedInventory::Absent,
+            |strip| {
+                if bottom_hud_visible {
+                    crate::video::seek_strip::SeekStripPresentedInventory::Visible(strip.stamp)
+                } else {
+                    crate::video::seek_strip::SeekStripPresentedInventory::Hidden(strip.stamp)
+                }
+            },
+        );
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
         // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
@@ -11456,7 +11693,6 @@ impl NativeEguiOverlay {
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
-        let mut last_seek_strip_window_request = self.last_seek_strip_window_request;
         // 実機修正 (2026-05-12 P1 #2): 実描画した preview_rect を記録して
         // `compute_hud_regions` に渡す (= region を draw rect と完全同期させる)。
         let mut last_drawn_preview_rect: Option<egui::Rect> = None;
@@ -11979,13 +12215,8 @@ impl NativeEguiOverlay {
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
                         &mut seek_strip_drag_origin,
-                        &mut last_seek_strip_window_request,
                         &mut commands,
                     );
-                } else {
-                    commands.push(NativeOverlayCommand::CloseSeekStrip {
-                        cause: crate::video::seek_strip::SeekStripCloseCause::HudHidden,
-                    });
                 }
             }
 
@@ -13282,6 +13513,7 @@ impl NativeEguiOverlay {
                         button_rect,
                         seek_strip_view,
                         seek_strip_height,
+                        seek_strip.as_ref().map(|strip| strip.stamp),
                         &mut seek_strip_menu_open,
                         &mut seek_strip_menu_rect,
                         &mut commands,
@@ -13407,6 +13639,11 @@ impl NativeEguiOverlay {
         if !bottom_hud_visible {
             seek_strip_menu_open = false;
             seek_strip_menu_rect = None;
+            // A release can occur while the strip is hidden and therefore never reach its
+            // widgets. Do not carry a pre-hide drag/gesture into a later visible presentation.
+            // The accepted RequestWindow dedup and decoded cells remain session resources.
+            seek_row_gesture = None;
+            seek_strip_drag_origin = None;
         }
         self.seek_strip_menu_open = seek_strip_menu_open;
         self.last_drawn_seek_strip_menu_rect = seek_strip_menu_rect;
@@ -13414,7 +13651,6 @@ impl NativeEguiOverlay {
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
         self.seek_strip_drag_origin = seek_strip_drag_origin;
-        self.last_seek_strip_window_request = last_seek_strip_window_request;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
         self.video_left_panel_tab = video_left_panel_tab;
@@ -13454,15 +13690,42 @@ impl NativeEguiOverlay {
             || self.shortcut_help_open
             || left_panel_open_changed;
 
+        let mut seek_strip_window_request = None;
+        let mut retained_commands = Vec::with_capacity(commands.len());
+        #[cfg(feature = "test-script")]
+        let mut removed_before_attribution = 0usize;
+        for (_index, command) in commands.into_iter().enumerate() {
+            if matches!(command, NativeOverlayCommand::RequestSeekStripWindow { .. }) {
+                seek_strip_window_request = Some(command);
+                #[cfg(feature = "test-script")]
+                if ui_smoke_command_attribution
+                    .as_ref()
+                    .is_some_and(|attribution| _index < attribution.command_index)
+                {
+                    removed_before_attribution = removed_before_attribution.saturating_add(1);
+                }
+            } else {
+                retained_commands.push(command);
+            }
+        }
+        #[cfg(feature = "test-script")]
+        if let Some(attribution) = ui_smoke_command_attribution.as_mut() {
+            attribution.command_index = attribution
+                .command_index
+                .saturating_sub(removed_before_attribution);
+        }
+
         Ok(NativeOverlayLogicalOutput {
             full_output,
-            commands,
+            commands: retained_commands,
+            seek_strip_window_request,
             window_intents,
             pending_event_count,
             egui_run_ms,
             overlay_visible,
             hud_visible,
             perf_visible,
+            seek_strip_inventory,
             #[cfg(feature = "test-script")]
             ui_smoke_inventory: crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory::new(
                 &self.ui_smoke_owner,
@@ -13489,12 +13752,14 @@ impl NativeEguiOverlay {
         let NativeOverlayLogicalBatch {
             full_output,
             commands,
+            seek_strip_window_request,
             window_intents,
             pending_event_count,
             egui_run_ms,
             overlay_visible,
             hud_visible,
             perf_visible,
+            seek_strip_inventory,
             #[cfg(feature = "test-script")]
             ui_smoke_inventory,
             #[cfg(feature = "test-script")]
@@ -13646,6 +13911,20 @@ impl NativeEguiOverlay {
         if overlay_visible {
             self.set_visual_attached(true)?;
         }
+        let seek_strip_inventory = seek_strip_inventory.ok_or_else(|| {
+            "native overlay logical batch produced no seek-strip inventory".to_string()
+        })?;
+        let seek_strip_window = commit_seek_strip_window_request(
+            &mut self.last_seek_strip_window_request,
+            seek_strip_inventory,
+            seek_strip_window_request,
+        );
+        commit_seek_strip_presented_inventory(
+            &mut self.seek_strip_committed_inventory,
+            &mut self.seek_strip_pending_inventory,
+            seek_strip_inventory,
+            seek_strip_window,
+        );
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
@@ -14489,6 +14768,13 @@ mod tests {
     /// 既定プリセットの帯の高さ。テストも実装と同じ解決経路を通す。
     const STRIP_HEIGHT: f32 = SeekStripHeight::Large.points();
 
+    fn test_seek_strip_stamp() -> crate::video::seek_strip::SeekStripRenderStamp {
+        crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(41),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(3),
+        }
+    }
+
     #[test]
     fn video_canvas_clear_color_preserves_rgb_code_value_order() {
         assert_eq!(
@@ -14517,7 +14803,6 @@ mod tests {
         let overlay_size = egui::vec2(960.0, 540.0);
         let layout = test_strip_layout(overlay_size);
         let mut drag_origin = None;
-        let mut last_window_request = None;
         let mut commands = Vec::new();
         let mut time_secs = 0.0;
         let mut run = || {
@@ -14541,7 +14826,6 @@ mod tests {
                         texture_ids,
                         wave_texture_id,
                         &mut drag_origin,
-                        &mut last_window_request,
                         &mut commands,
                     );
                 },
@@ -14850,6 +15134,7 @@ mod tests {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let pointer = egui::pos2(640.0, 600.0);
         let strip = NativeOverlaySeekStrip {
+            stamp: test_seek_strip_stamp(),
             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             cell_aspect: None,
             center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
@@ -14870,7 +15155,6 @@ mod tests {
             duration_secs: 600.0,
         };
         let mut drag_origin = None;
-        let mut last_window_request = None;
 
         let presenter_hover_positions = [Some(pointer), Some(pointer), Some(pointer), None];
         let mut egui_hover_positions = Vec::new();
@@ -14900,7 +15184,6 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
-                        &mut last_window_request,
                         &mut commands,
                     );
                     egui::Area::new(egui::Id::new("native_video_seek_hud"))
@@ -15255,6 +15538,7 @@ mod tests {
     fn seek_strip_thumbnail_preview_uses_fractional_axis_time() {
         let rect = test_strip_layout(egui::vec2(1280.0, 720.0)).rect;
         let strip = NativeOverlaySeekStrip {
+            stamp: test_seek_strip_stamp(),
             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             cell_aspect: None,
             center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 1.0 },
@@ -15305,6 +15589,7 @@ mod tests {
     fn seek_strip_wave_preview_uses_pointer_time_but_lock_suppresses_it() {
         let rect = test_strip_layout(egui::vec2(1280.0, 720.0)).rect;
         let strip = NativeOverlaySeekStrip {
+            stamp: test_seek_strip_stamp(),
             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             cell_aspect: None,
             center: crate::video::seek_strip::SeekStripCenter::Waveform {
@@ -15406,6 +15691,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             let strip = NativeOverlaySeekStrip {
+                stamp: test_seek_strip_stamp(),
                 span: crate::video::seek_strip_layout::SeekStripSpan::Window,
                 cell_aspect: None,
                 center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
@@ -15426,7 +15712,6 @@ mod tests {
                 duration_secs: 600.0,
             };
             let mut drag_origin = None;
-            let mut last_window_request = None;
             let mut commands = Vec::new();
             let mut wheel_remaining = true;
             assert!(
@@ -15455,7 +15740,6 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
-                        &mut last_window_request,
                         &mut commands,
                     );
                     wheel_remaining = ctx.input(|input| {
@@ -15473,8 +15757,9 @@ mod tests {
             assert!(commands.iter().any(|command| matches!(
                 command,
                 super::NativeOverlayCommand::StepSeekStripRange {
-                    step: crate::video::seek_strip::SeekStripRangeStep::Narrower
-                }
+                    steps,
+                    ..
+                } if steps == &[crate::video::seek_strip::SeekStripRangeStep::Narrower]
             )));
             assert!(!commands.iter().any(|command| matches!(
                 command,
@@ -15492,6 +15777,7 @@ mod tests {
         let axis = crate::video::seek_strip::StripAxis::whole(duration_secs, cells).expect("axis");
         let cell_count = axis.cell_count();
         NativeOverlaySeekStrip {
+            stamp: test_seek_strip_stamp(),
             span: SeekStripSpan::Whole,
             cell_aspect: Some(16.0 / 9.0),
             center: match mode {
@@ -15540,7 +15826,6 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let mut drag_origin = None;
-        let mut last_window_request = None;
         let mut commands = Vec::new();
         for chunk in std::iter::once(Vec::new()).chain(frames) {
             let _ = ctx.run(
@@ -15565,7 +15850,6 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
-                        &mut last_window_request,
                         &mut commands,
                     );
                 },
@@ -15586,7 +15870,6 @@ mod tests {
         );
         let ctx = egui::Context::default();
         let mut drag_origin = None;
-        let mut last_request = Some((1, 2, 3, 4, 5, 6));
         let mut commands = Vec::new();
         assert_eq!(
             draw_native_seek_strip(
@@ -15600,12 +15883,10 @@ mod tests {
                 &std::collections::HashMap::new(),
                 None,
                 &mut drag_origin,
-                &mut last_request,
                 &mut commands,
             ),
             super::NativeSeekStripPreviewHover::Outside
         );
-        assert!(last_request.is_none());
         assert!(commands.is_empty());
 
         drag_origin = crate::video::seek_strip::SeekStripDragOrigin::new(
@@ -15646,7 +15927,6 @@ mod tests {
                     &std::collections::HashMap::new(),
                     None,
                     &mut drag_origin,
-                    &mut last_request,
                     &mut commands,
                 );
             },
@@ -15683,7 +15963,6 @@ mod tests {
                     &std::collections::HashMap::new(),
                     None,
                     &mut drag_origin,
-                    &mut last_request,
                     &mut commands,
                 );
             },
@@ -15694,7 +15973,8 @@ mod tests {
             super::NativeOverlayCommand::CommitSeekStrip {
                 center: crate::video::seek_strip::SeekStripCenter::Waveform {
                     center_time_secs
-                }
+                },
+                ..
             } if (*center_time_secs - 450.0).abs() < 1.0e-6
         )));
     }
@@ -15792,7 +16072,7 @@ mod tests {
         let committed = commands
             .iter()
             .find_map(|command| match command {
-                super::NativeOverlayCommand::CommitSeekStrip { center } => Some(*center),
+                super::NativeOverlayCommand::CommitSeekStrip { center, .. } => Some(*center),
                 _ => None,
             })
             .expect("クリックはその位置へ移る");
@@ -15881,17 +16161,20 @@ mod tests {
         let wanted: Vec<super::NativeOverlayCommand> =
             std::iter::once(super::NativeOverlayCommand::SetSeekStripView {
                 view: SeekStripView::Hidden,
+                expected: None,
             })
             .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
                 super::NativeOverlayCommand::SetSeekStripView {
                     view: SeekStripView::Showing(*showing),
+                    expected: None,
                 }
             }))
-            .chain(
-                SeekStripHeight::ALL.iter().map(|height| {
-                    super::NativeOverlayCommand::SetSeekStripHeight { height: *height }
-                }),
-            )
+            .chain(SeekStripHeight::ALL.iter().map(|height| {
+                super::NativeOverlayCommand::SetSeekStripHeight {
+                    height: *height,
+                    expected: None,
+                }
+            }))
             .collect();
 
         for (row_index, expected) in wanted.iter().enumerate() {
@@ -15933,6 +16216,7 @@ mod tests {
                             button,
                             SeekStripView::Hidden,
                             SeekStripHeight::Large,
+                            None,
                             &mut menu_open,
                             &mut menu_rect,
                             &mut commands,
@@ -15954,12 +16238,12 @@ mod tests {
             assert!(
                 commands.iter().any(|command| match (command, expected) {
                     (
-                        super::NativeOverlayCommand::SetSeekStripView { view },
-                        super::NativeOverlayCommand::SetSeekStripView { view: wanted },
+                        super::NativeOverlayCommand::SetSeekStripView { view, .. },
+                        super::NativeOverlayCommand::SetSeekStripView { view: wanted, .. },
                     ) => view == wanted,
                     (
-                        super::NativeOverlayCommand::SetSeekStripHeight { height },
-                        super::NativeOverlayCommand::SetSeekStripHeight { height: wanted },
+                        super::NativeOverlayCommand::SetSeekStripHeight { height, .. },
+                        super::NativeOverlayCommand::SetSeekStripHeight { height: wanted, .. },
                     ) => height == wanted,
                     _ => false,
                 }),
@@ -16005,6 +16289,7 @@ mod tests {
                         &painter,
                         egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(28.0, 28.0)),
                         false,
+                        test_seek_strip_stamp(),
                         &mut commands,
                     );
                     captured_for_ui.lock().unwrap().extend(commands);
@@ -16024,11 +16309,10 @@ mod tests {
         harness.run();
 
         let commands = captured.lock().unwrap();
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, super::NativeOverlayCommand::ToggleSeekStripLock))
-        );
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            super::NativeOverlayCommand::ToggleSeekStripLock { .. }
+        )));
         assert_eq!(commands.len(), 1);
     }
 
@@ -16049,7 +16333,6 @@ mod tests {
             let captured = Arc::new(Mutex::new(Vec::new()));
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
-            let last_window_request = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(overlay_size)
@@ -16061,6 +16344,7 @@ mod tests {
                         return;
                     }
                     let strip = NativeOverlaySeekStrip {
+                        stamp: test_seek_strip_stamp(),
                         span: crate::video::seek_strip_layout::SeekStripSpan::Window,
                         cell_aspect: None,
                         center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
@@ -16096,7 +16380,6 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin.lock().unwrap(),
-                        &mut last_window_request.lock().unwrap(),
                         &mut commands,
                     );
                     captured_for_ui.lock().unwrap().extend(commands);
@@ -16114,9 +16397,12 @@ mod tests {
             harness.run();
 
             let commands = captured.lock().unwrap();
-            let locked = commands
-                .iter()
-                .any(|command| matches!(command, super::NativeOverlayCommand::ToggleSeekStripLock));
+            let locked = commands.iter().any(|command| {
+                matches!(
+                    command,
+                    super::NativeOverlayCommand::ToggleSeekStripLock { .. }
+                )
+            });
             let seeked = commands.iter().any(|command| {
                 matches!(command, super::NativeOverlayCommand::CommitSeekStrip { .. })
             });
@@ -16158,7 +16444,6 @@ mod tests {
                 Arc::new(Mutex::new(Vec::new()));
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
-            let last_window_request = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(overlay_size)
@@ -16173,6 +16458,7 @@ mod tests {
                     let mut commands = Vec::new();
                     if with_strip {
                         let strip = NativeOverlaySeekStrip {
+                            stamp: test_seek_strip_stamp(),
                             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
                             cell_aspect: None,
                             center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
@@ -16207,7 +16493,6 @@ mod tests {
                             &std::collections::HashMap::new(),
                             None,
                             &mut drag_origin.lock().unwrap(),
-                            &mut last_window_request.lock().unwrap(),
                             &mut commands,
                         );
                     }
@@ -16842,9 +17127,12 @@ mod tests {
             if let Some(delta) = panel_raw_delta {
                 self.panel_raw_deltas.push(delta);
             }
-            for step in strip_steps {
+            if !strip_steps.is_empty() {
                 self.pending_commands
-                    .push(NativeOverlayCommand::StepSeekStripRange { step });
+                    .push(NativeOverlayCommand::StepSeekStripRange {
+                        steps: strip_steps,
+                        stamp: test_seek_strip_stamp(),
+                    });
             }
             full_output
                 .platform_output
@@ -16862,12 +17150,14 @@ mod tests {
             Ok(NativeOverlayLogicalOutput {
                 full_output,
                 commands: std::mem::take(&mut self.pending_commands),
+                seek_strip_window_request: None,
                 window_intents: Vec::new(),
                 pending_event_count: 0,
                 egui_run_ms: 0.0,
                 overlay_visible: true,
                 hud_visible: true,
                 perf_visible: false,
+                seek_strip_inventory: crate::video::seek_strip::SeekStripPresentedInventory::Absent,
                 #[cfg(feature = "test-script")]
                 ui_smoke_inventory:
                     crate::video::native_ui_smoke::NativeUiSmokeLogicalInventory::new(
@@ -17138,8 +17428,8 @@ mod tests {
                     .iter()
                     .filter(|command| matches!(
                         command,
-                        NativeOverlayCommand::StepSeekStripRange { step }
-                            if *step == expected_strip_step
+                        NativeOverlayCommand::StepSeekStripRange { steps, .. }
+                            if steps == &[expected_strip_step]
                     ))
                     .count(),
                 1
@@ -17364,6 +17654,309 @@ mod tests {
     }
 
     #[test]
+    fn seek_strip_request_comes_only_from_the_final_visible_logical_pass() {
+        fn request(
+            stamp: crate::video::seek_strip::SeekStripRenderStamp,
+            visible_count: usize,
+        ) -> NativeOverlayCommand {
+            NativeOverlayCommand::RequestSeekStripWindow {
+                center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 4.0 },
+                visible_count,
+                pixel_width: 960,
+                pixel_height: 104,
+                stamp,
+            }
+        }
+
+        let stamp = test_seek_strip_stamp();
+        let mut target = HeadlessNativeBatchTarget::default();
+        target.batch_prepare().unwrap();
+        let mut visible = target.batch_render_logical_once(false).unwrap();
+        visible.seek_strip_inventory =
+            crate::video::seek_strip::SeekStripPresentedInventory::Visible(stamp);
+        visible.seek_strip_window_request = Some(request(stamp, 9));
+        let mut hidden = target.batch_render_logical_once(false).unwrap();
+        hidden.seek_strip_inventory =
+            crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp);
+        hidden.seek_strip_window_request = None;
+
+        let mut hidden_final = NativeOverlayLogicalBatch::default();
+        hidden_final.append(visible);
+        hidden_final.append(hidden);
+        assert!(hidden_final.seek_strip_window_request.is_none());
+        assert!(
+            super::seek_strip_window_request_for_presented_inventory(
+                hidden_final.seek_strip_inventory.unwrap(),
+                hidden_final.seek_strip_window_request,
+            )
+            .is_none()
+        );
+
+        let mut intermediate = target.batch_render_logical_once(false).unwrap();
+        intermediate.seek_strip_inventory =
+            crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp);
+        intermediate.seek_strip_window_request = Some(request(stamp, 7));
+        let mut final_visible = target.batch_render_logical_once(false).unwrap();
+        final_visible.seek_strip_inventory =
+            crate::video::seek_strip::SeekStripPresentedInventory::Visible(stamp);
+        final_visible.seek_strip_window_request = Some(request(stamp, 11));
+        let mut visible_final = NativeOverlayLogicalBatch::default();
+        visible_final.append(intermediate);
+        visible_final.append(final_visible);
+        assert!(matches!(
+            super::seek_strip_window_request_for_presented_inventory(
+                visible_final.seek_strip_inventory.unwrap(),
+                visible_final.seek_strip_window_request,
+            ),
+            Some(NativeOverlayCommand::RequestSeekStripWindow {
+                visible_count: 11,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn identical_visible_logical_passes_commit_one_request_only_after_present_success() {
+        let stamp = test_seek_strip_stamp();
+        let strip = whole_span_strip(crate::settings::VideoSeekStripMode::Thumbnails, 600.0, 17);
+        let layout = SeekStripLayout::resolve(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 160.0)),
+            SeekStripHeight::Large,
+            SeekStripHeightValues::default(),
+            SeekStripSpan::Whole,
+            strip.cell_aspect,
+        );
+        let ctx = egui::Context::default();
+        let mut drag_origin = None;
+        let mut observations = Vec::new();
+        for frame in 0..4 {
+            let mut commands = Vec::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 160.0),
+                    )),
+                    time: Some(frame as f64),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = draw_native_seek_strip(
+                        ctx,
+                        layout,
+                        crate::video::seek_strip_layout::SeekStripMarker::Center,
+                        None,
+                        true,
+                        &strip,
+                        false,
+                        &std::collections::HashMap::new(),
+                        None,
+                        &mut drag_origin,
+                        &mut commands,
+                    );
+                },
+            );
+            observations.push(
+                commands
+                    .into_iter()
+                    .find(|command| {
+                        matches!(command, NativeOverlayCommand::RequestSeekStripWindow { .. })
+                    })
+                    .expect("every visible logical pass reports its current request"),
+            );
+        }
+
+        let inventory = crate::video::seek_strip::SeekStripPresentedInventory::Visible(stamp);
+        let mut target = HeadlessNativeBatchTarget::default();
+        target.batch_prepare().unwrap();
+        let mut first_pass = target.batch_render_logical_once(false).unwrap();
+        first_pass.seek_strip_inventory = inventory;
+        first_pass.seek_strip_window_request = Some(observations.remove(0));
+        let mut final_pass = target.batch_render_logical_once(true).unwrap();
+        final_pass.seek_strip_inventory = inventory;
+        let expected_final_request = observations.remove(0);
+        final_pass.seek_strip_window_request = Some(expected_final_request.clone());
+        let mut two_pass_batch = NativeOverlayLogicalBatch::default();
+        two_pass_batch.append(first_pass);
+        two_pass_batch.append(final_pass);
+        assert_eq!(
+            two_pass_batch
+                .seek_strip_window_request
+                .as_ref()
+                .and_then(super::seek_strip_window_request_key),
+            super::seek_strip_window_request_key(&expected_final_request),
+            "only the final actual logical-pass observation may survive"
+        );
+
+        let mut committed = None;
+        // A failed present never calls the commit helper. Even though both logical passes
+        // observed the same layout, their speculative observations cannot mutate the dedup
+        // baseline.
+        assert_eq!(committed, None);
+        let first = super::commit_seek_strip_window_request(
+            &mut committed,
+            inventory,
+            two_pass_batch.seek_strip_window_request.clone(),
+        )
+        .expect("successful final visible pass commits its exact window");
+        let mut committed_inventory = crate::video::seek_strip::SeekStripPresentedInventory::Absent;
+        let mut pending_update = None;
+        super::commit_seek_strip_presented_inventory(
+            &mut committed_inventory,
+            &mut pending_update,
+            inventory,
+            Some(first),
+        );
+        assert!(matches!(
+            pending_update,
+            Some(crate::video::seek_strip::SeekStripPresentedUpdate::Visible {
+                stamp: pending_stamp,
+                window: Some(window),
+            }) if pending_stamp == stamp && window == first
+        ));
+        let committed_after_success = committed;
+
+        // A later failed present likewise cannot advance or clear the request baseline. The
+        // next identical successful pass is deduplicated.
+        assert_eq!(committed, committed_after_success);
+        assert!(
+            super::commit_seek_strip_window_request(
+                &mut committed,
+                inventory,
+                Some(observations.remove(0)),
+            )
+            .is_none()
+        );
+
+        assert!(
+            super::commit_seek_strip_window_request(
+                &mut committed,
+                crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp),
+                None,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            committed, None,
+            "successful Hidden clears the request baseline"
+        );
+
+        assert!(
+            super::commit_seek_strip_window_request(
+                &mut committed,
+                inventory,
+                Some(observations.remove(0)),
+            )
+            .is_some(),
+            "a later successful Visible pass must re-emit after Hidden cleared the baseline"
+        );
+    }
+
+    #[test]
+    fn seek_strip_presented_updates_replace_window_atomically_and_wait_for_exact_ack() {
+        use crate::video::seek_strip::{
+            SeekStripLayoutRevision, SeekStripPresentedInventory, SeekStripRenderStamp,
+            SeekStripSessionId,
+        };
+
+        let visible_one = SeekStripPresentedInventory::Visible(SeekStripRenderStamp {
+            session_id: SeekStripSessionId(8),
+            layout_revision: SeekStripLayoutRevision(1),
+        });
+        let visible_two = SeekStripPresentedInventory::Visible(SeekStripRenderStamp {
+            session_id: SeekStripSessionId(8),
+            layout_revision: SeekStripLayoutRevision(2),
+        });
+        let hidden_two = SeekStripPresentedInventory::Hidden(SeekStripRenderStamp {
+            session_id: SeekStripSessionId(8),
+            layout_revision: SeekStripLayoutRevision(2),
+        });
+        let mut committed = SeekStripPresentedInventory::Absent;
+        let mut pending = None;
+        let window_for =
+            |stamp, visible_count| crate::video::seek_strip::SeekStripPresentedWindow {
+                center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                    center_index: visible_count as f64 * 0.5,
+                },
+                visible_count,
+                pixel_width: visible_count * 100,
+                pixel_height: 100,
+                stamp,
+            };
+        let stamp_one = match visible_one {
+            SeekStripPresentedInventory::Visible(stamp) => stamp,
+            _ => unreachable!(),
+        };
+        let stamp_two = match visible_two {
+            SeekStripPresentedInventory::Visible(stamp) => stamp,
+            _ => unreachable!(),
+        };
+        let window_one = window_for(stamp_one, 9);
+        let window_two = window_for(stamp_two, 17);
+
+        super::commit_seek_strip_presented_inventory(
+            &mut committed,
+            &mut pending,
+            visible_one,
+            Some(window_one),
+        );
+        assert_eq!(committed, visible_one);
+        let pending_visible_one = crate::video::seek_strip::SeekStripPresentedUpdate::Visible {
+            stamp: stamp_one,
+            window: Some(window_one),
+        };
+        assert_eq!(pending, Some(pending_visible_one));
+
+        // A successful visible resize is one newer compound snapshot. It replaces the old
+        // lifecycle+window value before App drains rather than leaving the geometry in another
+        // latest slot.
+        super::commit_seek_strip_presented_inventory(
+            &mut committed,
+            &mut pending,
+            visible_two,
+            Some(window_two),
+        );
+        assert_eq!(committed, visible_two);
+        let pending_visible_two = crate::video::seek_strip::SeekStripPresentedUpdate::Visible {
+            stamp: stamp_two,
+            window: Some(window_two),
+        };
+        assert_eq!(pending, Some(pending_visible_two));
+        super::acknowledge_seek_strip_presented_inventory(&mut pending, pending_visible_one);
+        assert_eq!(
+            pending,
+            Some(pending_visible_two),
+            "an ack for the overwritten compound value must not clear the current one"
+        );
+        super::acknowledge_seek_strip_presented_inventory(&mut pending, pending_visible_two);
+        assert_eq!(pending, None);
+
+        super::commit_seek_strip_presented_inventory(
+            &mut committed,
+            &mut pending,
+            hidden_two,
+            None,
+        );
+        assert_eq!(
+            pending,
+            Some(crate::video::seek_strip::SeekStripPresentedUpdate::Hidden(
+                match hidden_two {
+                    SeekStripPresentedInventory::Hidden(stamp) => stamp,
+                    _ => unreachable!(),
+                }
+            )),
+            "Visible -> Hidden is a real edge"
+        );
+    }
+
+    #[test]
+    fn retained_hidden_seek_strip_does_not_request_periodic_ticks() {
+        assert!(!super::seek_strip_requires_periodic_tick(true, false));
+        assert!(super::seek_strip_requires_periodic_tick(true, true));
+        assert!(!super::seek_strip_requires_periodic_tick(false, true));
+    }
+
+    #[test]
     fn native_batch_driver_delivers_each_region_wheel_once_and_keeps_priority() {
         let mut strips = HeadlessNativeBatchTarget::default();
         strips.tile_overlay_visible = true;
@@ -17375,13 +17968,15 @@ mod tests {
         ];
         let strip_run = run_native_event_batch(&mut strips, &strip_events).unwrap();
         assert_eq!(strips.strip_steps.len(), 2);
-        assert_eq!(strip_run.commands.len(), 2);
-        assert!(
-            strip_run
-                .commands
-                .iter()
-                .all(|command| matches!(command, NativeOverlayCommand::StepSeekStripRange { .. }))
-        );
+        assert_eq!(strip_run.commands.len(), 1);
+        assert!(matches!(
+            &strip_run.commands[0],
+            NativeOverlayCommand::StepSeekStripRange { steps, .. }
+                if steps == &[
+                    crate::video::seek_strip::SeekStripRangeStep::Narrower,
+                    crate::video::seek_strip::SeekStripRangeStep::Wider,
+                ]
+        ));
         assert!(
             strip_run
                 .event_dispositions

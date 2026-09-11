@@ -57273,24 +57273,45 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn parked_live_renderer_emitted_events_do_not_request_activation() {
         use crate::video::NativeVideoOutputEvent as Ev;
-        use crate::video::seek_strip::{SeekStripCenter, SeekStripCloseCause};
+        use crate::video::seek_strip::{
+            SeekStripCenter, SeekStripCloseCause, SeekStripEventStamp, SeekStripLayoutRevision,
+            SeekStripPresentationEvent, SeekStripSessionEventStamp, SeekStripSessionId,
+            SeekStripWindowEvent,
+        };
+        let session_stamp = SeekStripSessionEventStamp {
+            session_id: SeekStripSessionId(7),
+            generation: 3,
+        };
+        let layout_stamp = SeekStripEventStamp {
+            session_id: session_stamp.session_id,
+            layout_revision: SeekStripLayoutRevision(2),
+            generation: session_stamp.generation,
+        };
 
         // The event the user hit: emitted whenever the strip layout key changes, with no click.
         assert!(
             !App::native_video_output_event_is_parked_live_hud_click_activation(
-                &Ev::RequestSeekStripWindow {
-                    center: SeekStripCenter::Thumbnails { center_index: 0.0 },
-                    visible_count: 10,
-                    pixel_width: 1752,
-                    pixel_height: 141,
-                }
+                &Ev::SeekStripPresentation(SeekStripPresentationEvent::Visible {
+                    stamp: session_stamp,
+                    window: Some(SeekStripWindowEvent {
+                        center: SeekStripCenter::Thumbnails { center_index: 0.0 },
+                        visible_count: 10,
+                        pixel_width: 1752,
+                        pixel_height: 141,
+                        stamp: layout_stamp,
+                    }),
+                })
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SeekStripPresentation(SeekStripPresentationEvent::Hidden(session_stamp))
             )
         );
 
-        // The strip closes itself from the draw path whenever the HUD is not visible. Only the
-        // three causes the user actually asks for count as a dismissal.
+        // HUD Hidden is a presentation state, not a close. None of these four lifecycle causes is
+        // a user dismissal/activation request.
         for cause in [
-            SeekStripCloseCause::HudHidden,
             SeekStripCloseCause::VideoChanged,
             SeekStripCloseCause::FullscreenExit,
             SeekStripCloseCause::TileModeOpened,
@@ -57298,7 +57319,10 @@ mod still_window_mode_key_tests {
         ] {
             assert!(
                 !App::native_video_output_event_is_parked_live_hud_click_activation(
-                    &Ev::CloseSeekStrip { cause }
+                    &Ev::CloseSeekStrip {
+                        cause,
+                        stamp: session_stamp,
+                    }
                 ),
                 "{cause:?} is not a user dismissal"
             );
@@ -57310,7 +57334,10 @@ mod still_window_mode_key_tests {
         ] {
             assert!(
                 App::native_video_output_event_is_parked_live_hud_click_activation(
-                    &Ev::CloseSeekStrip { cause }
+                    &Ev::CloseSeekStrip {
+                        cause,
+                        stamp: session_stamp,
+                    }
                 ),
                 "{cause:?} is a user dismissal"
             );
@@ -57354,12 +57381,15 @@ mod still_window_mode_key_tests {
         );
         // So is every deliberate strip operation.
         assert!(
-            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::OpenSeekStrip)
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::OpenSeekStrip { generation: 3 }
+            )
         );
         assert!(
             App::native_video_output_event_is_parked_live_hud_click_activation(
                 &Ev::CommitSeekStrip {
                     center: SeekStripCenter::Thumbnails { center_index: 4.0 },
+                    stamp: layout_stamp,
                 }
             )
         );
@@ -71814,16 +71844,12 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
 ///
 /// フルスクリーン退出は**無条件に** `close_video_seek_strip` を呼ぶ。ストリップを閉じた
 /// まま退出した経路にはセッションが無いので、早期 return より前に手放さないと、動画を
-/// 見ていないあいだワーカーが残る。HUD が隠れただけなら、逆に手放してはいけない
-/// (§1.146 の直す対象そのもの)。
+/// 見ていないあいだワーカーが残る。一時的な HUD 非表示はこの close 経路へ入らず、
+/// 開いているセッション自体を保持する。
 #[test]
 #[cfg(windows)]
 fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
     for (cause, still_held) in [
-        (
-            crate::video::seek_strip::SeekStripCloseCause::HudHidden,
-            true,
-        ),
         (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
         (
             crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
@@ -71839,7 +71865,10 @@ fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
         // 開けないパスでよい。ここで見たいのは持ち越しの所在であって解析結果ではない。
         let path = dir.path().join("clip.mp4");
         app.video_seek_strip_wave_holdover = Some(native_video::HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
             path: path.clone(),
+            source_epoch: 1,
+            items_generation: app.items_generation,
             worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path, None),
         });
 

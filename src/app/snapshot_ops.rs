@@ -257,6 +257,10 @@ impl App {
                     })
                 });
         self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(&remap);
+        self.remap_video_seek_strip_for_snapshot(
+            &swap.old_to_new,
+            swap.opened_media_path.as_deref(),
+        );
 
         if swap.current_owns_global_media_indices {
             if let Some(shell) = self.music_vst_shell.as_mut()

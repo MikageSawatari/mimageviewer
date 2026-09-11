@@ -13074,6 +13074,8 @@ pub struct App {
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
     video_seek_strip_runtime: native_video::VideoSeekStripRuntime,
+    #[cfg(windows)]
+    video_seek_strip_next_session_id: u64,
     /// 直前のストリップセッションが使っていた波形ワーカー。**同じ動画のあいだだけ持つ。**
     ///
     /// HUD が自動で隠れるたびに捨てていたので、出し直すたびに全尺の粗い解析をやり直して
@@ -16245,6 +16247,8 @@ impl App {
             video_tile_state: None,
             #[cfg(windows)]
             video_seek_strip_runtime: native_video::VideoSeekStripRuntime::Closed,
+            #[cfg(windows)]
+            video_seek_strip_next_session_id: 1,
             #[cfg(windows)]
             video_seek_strip_wave_holdover: None,
             #[cfg(windows)]
