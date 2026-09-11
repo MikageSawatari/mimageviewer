@@ -850,16 +850,14 @@ pub(in crate::app) struct ViewerContextBundle {
     /// 置くと、context を切り替えたときに前の viewer の左右が次の viewer へ残る。
     /// 永続化はしない (開き直しは分割方向の最初の半分へ着地する)。
     fullscreen_page_slice: crate::page_split::PageSlice,
+    /// 右ボタンの物理 press sequence。通常の AtRest 往復では同じ viewer と一緒に保持し、
+    /// fork / close / index-space replacement では明示的に終端する。
+    fs_secondary_press: crate::ui_fullscreen::FullscreenSecondaryPress,
     viewer_session: ViewerSession,
     native_video_in_window_active: bool,
     video_audio_mode: Option<usize>,
     video_audio_vst: Option<VideoAudioVstState>,
-    video_audio_mode_entry_target: Option<(
-        crate::video::NativeVideoPlacement,
-        windows::Win32::Foundation::RECT,
-        u64,
-    )>,
-    video_audio_exit_pending: Option<VideoAudioExitPending>,
+    video_audio_mode_runtime: Option<VideoAudioModeRuntime>,
     panorama_state: Option<crate::panorama::PanoramaState>,
     /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
     /// context を mount した間だけ App field へ投影する。
@@ -1443,12 +1441,12 @@ impl ViewerContextBundle {
             vst3_deferred_media_open: None,
             fullscreen_idx: None,
             fullscreen_page_slice: crate::page_split::PageSlice::Full,
+            fs_secondary_press: crate::ui_fullscreen::FullscreenSecondaryPress::Idle,
             viewer_session: ViewerSession::default(),
             native_video_in_window_active: false,
             video_audio_mode: None,
             video_audio_vst: None,
-            video_audio_mode_entry_target: None,
-            video_audio_exit_pending: None,
+            video_audio_mode_runtime: None,
             panorama_state: None,
             video_zoom_state: None,
             native_video_mouse_seek_holds:
@@ -1792,12 +1790,12 @@ impl App {
             vst3_deferred_media_open,
             fullscreen_idx,
             fullscreen_page_slice,
+            fs_secondary_press,
             viewer_session,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
+            video_audio_mode_runtime,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -2041,6 +2039,7 @@ impl App {
         swap_field!(fullscreen_idx);
         // 左右は元ページと同じ所有。片方だけ残すと別 viewer の半分が見える。
         swap_field!(fullscreen_page_slice);
+        swap_field!(fs_secondary_press);
         viewer_session.swap_with_mounted(
             &mut self.viewer_presentation,
             &mut self.last_viewer_sync_stamp,
@@ -2050,8 +2049,7 @@ impl App {
         swap_field!(native_video_in_window_active);
         swap_field!(video_audio_mode);
         swap_field!(video_audio_vst);
-        swap_field!(video_audio_mode_entry_target);
-        swap_field!(video_audio_exit_pending);
+        swap_field!(video_audio_mode_runtime);
         swap_field!(panorama_state);
         swap_field!(video_zoom_state);
         swap_field!(native_video_mouse_seek_holds);
@@ -2224,6 +2222,9 @@ impl App {
     pub(in crate::app) fn split_current_context_preserving_main_grid(
         &mut self,
     ) -> Box<ViewerContextBundle> {
+        // Forking changes the exact viewer owner even when the new payload retains the same
+        // fullscreen index. Never carry a physical right-button sequence across that boundary.
+        self.fs_secondary_press.cancel();
         macro_rules! duplicate_for_parked {
             ($($field:ident),+ $(,)?) => {
                 $(*$field = self.$field.clone();)+
@@ -2338,12 +2339,12 @@ impl App {
             vst3_deferred_media_open,
             fullscreen_idx,
             fullscreen_page_slice,
+            fs_secondary_press,
             viewer_session,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
+            video_audio_mode_runtime,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -2560,11 +2561,11 @@ impl App {
             vst3_deferred_media_open,
             fullscreen_idx,
             fullscreen_page_slice,
+            fs_secondary_press,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
+            video_audio_mode_runtime,
             panorama_state,
             video_zoom_state,
             native_video_mouse_seek_holds,
@@ -3297,6 +3298,18 @@ impl App {
             ForkPolicy::LiveMediaPark { window_id },
             ProductionForkSpec::LiveMedia,
         );
+        let presenter_owner_transferred = self
+            .with_viewer_context(parked, |app| {
+                app.video_audio_mode_runtime
+                    .as_mut()
+                    .is_none_or(|runtime| runtime.transfer_context_owner(source, parked))
+            })
+            .expect("freshly forked live-media context must be mountable");
+        if !presenter_owner_transferred {
+            crate::logger::log(format!(
+                "[video-audio] live-media context transfer cancelled stale presenter owner from={source:?} to={parked:?}"
+            ));
+        }
         crate::logger::log(format!(
             "[active-detached-session] t_us={} kind=binding action=transfer_live window_id={} from={source:?} to={parked:?} session={:?} transition={}",
             crate::logger::elapsed_micros(),
@@ -3897,6 +3910,123 @@ mod tests {
         assert_eq!(app.video_zoom_state, Some(state_main));
         app.swap_viewer_context_bundle(&mut fork);
         assert_eq!(app.video_zoom_state, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_secondary_press_survives_ordinary_deposit_but_not_sibling_mount() {
+        let mut app = crate::app::setup_app_for_test();
+        let started = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        let mut expected = None;
+        let a = app.build_window_context_for_test(801, |mounted| {
+            mounted.fullscreen_idx = Some(3);
+            mounted.fs_secondary_press =
+                crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+                    mounted.projected_viewer_context_id(),
+                    mounted.items_generation,
+                    3,
+                    crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                    started,
+                    pos,
+                );
+            expected = Some(mounted.fs_secondary_press);
+        });
+        let b = app.build_window_context_for_test(802, |mounted| {
+            mounted.fullscreen_idx = Some(3);
+            assert_eq!(
+                mounted.fs_secondary_press,
+                crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+            );
+        });
+        let expected = expected.unwrap();
+
+        app.with_viewer_context(a, |mounted| {
+            assert_eq!(mounted.fs_secondary_press, expected);
+            let context_id = mounted.projected_viewer_context_id();
+            let items_generation = mounted.items_generation;
+            assert_eq!(
+                mounted.fs_secondary_press.finish_for_test(
+                    context_id,
+                    items_generation,
+                    3,
+                    crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                    started + std::time::Duration::from_millis(100),
+                    pos,
+                    false,
+                    true,
+                ),
+                Some(false),
+                "the owning viewer must complete its short release after remount"
+            );
+            let long_started = started + std::time::Duration::from_secs(1);
+            mounted.fs_secondary_press =
+                crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+                    context_id,
+                    items_generation,
+                    3,
+                    crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                    long_started,
+                    pos,
+                );
+        })
+        .unwrap();
+        app.with_viewer_context(b, |mounted| {
+            assert_eq!(
+                mounted.fs_secondary_press,
+                crate::ui_fullscreen::FullscreenSecondaryPress::Idle,
+                "a sibling with the same fullscreen index must not receive the press"
+            );
+        })
+        .unwrap();
+        app.with_viewer_context(a, |mounted| {
+            let context_id = mounted.projected_viewer_context_id();
+            let items_generation = mounted.items_generation;
+            assert_eq!(
+                mounted.fs_secondary_press.finish_for_test(
+                    context_id,
+                    items_generation,
+                    3,
+                    crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                    started
+                        + std::time::Duration::from_secs(1)
+                        + crate::ring_shortcut::mouse_flick_menu_delay(),
+                    pos,
+                    true,
+                    false,
+                ),
+                Some(true),
+                "ordinary deposit/remount must preserve the owning long-press sequence"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_secondary_press_is_terminal_at_live_media_fork() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(3);
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            app.projected_viewer_context_id(),
+            app.items_generation,
+            3,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(100.0, 120.0),
+        );
+
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+        );
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle,
+            "a fork cannot revive a physical press after the ownership boundary"
+        );
     }
 
     #[cfg(windows)]

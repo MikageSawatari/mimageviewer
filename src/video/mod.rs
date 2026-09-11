@@ -9846,6 +9846,20 @@ impl VideoPlayer {
             .unwrap_or(false)
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_native_presenter_hidden_for_test(&self, hidden: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.presenter_visibility.publish_hidden(hidden);
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_presenter_visibility_requested_for_test(&self) -> Option<bool> {
+        self.native_output
+            .as_ref()
+            .map(|output| output.visibility_gate.base_visible.load(Ordering::Acquire))
+    }
+
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
     /// CP4 で presenter thread が `HudOverlayWindow::create` 成功時に store する。
     /// store されていなければ 0。

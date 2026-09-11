@@ -2841,14 +2841,14 @@ pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 fn should_close_fullscreen_from_main_focus(
     fs_focus_grace_elapsed: bool,
     main_viewport_focused: bool,
-    native_video_presenter_active: bool,
+    fullscreen_input_owner_blocks_main_focus: bool,
     embedded_still: bool,
     keep_fullscreen_on_app_switch: bool,
     fullscreen_root_key_handled: bool,
 ) -> bool {
     fs_focus_grace_elapsed
         && main_viewport_focused
-        && !native_video_presenter_active
+        && !fullscreen_input_owner_blocks_main_focus
         && !embedded_still
         && !keep_fullscreen_on_app_switch
         && !fullscreen_root_key_handled
@@ -2866,6 +2866,35 @@ fn should_restore_fullscreen_focus_from_main_focus(
         && !embedded_still
         && keep_fullscreen_on_app_switch
         && !fullscreen_root_key_handled
+}
+
+#[cfg(windows)]
+fn should_cancel_video_audio_handoff_for_main_input(
+    main_viewport_focused: bool,
+    main_viewport_explicit_input: bool,
+    fullscreen_root_key_handled: bool,
+) -> bool {
+    main_viewport_focused && main_viewport_explicit_input && !fullscreen_root_key_handled
+}
+
+fn main_viewport_event_is_explicit_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { pressed: true, .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::PointerButton { pressed: true, .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Touch { .. }
+    )
+}
+
+#[cfg(windows)]
+fn should_cancel_video_audio_handoff_for_external_foreground(
+    foreground_hwnd: u64,
+    foreground_belongs_to_current_process: bool,
+) -> bool {
+    foreground_hwnd != 0 && !foreground_belongs_to_current_process
 }
 
 fn should_render_main_fullscreen_viewport_after_detached_context(
@@ -10251,13 +10280,132 @@ fn run_fullscreen_video_marker_thumb_decode(
     result
 }
 
-/// Inc 7 hidden presenter: exit (音声モード→動画) の非同期完了待ち 1 件。
-/// `exit_video_audio_mode` が show / SwitchPlacement を要求したときに生成し、
-/// `poll_video_audio_exit_pending` が presenter の再表示 (`!native_presenter_hidden()`) を
-/// 検知したら `video_audio_mode` を None に落として消す。`deadline` は presenter 無応答時の
-/// 保険 (超過で detach+attach+seek フォールバック)。
+/// Inc 7 hidden presenter: 音声モードが所有する native presenter の物理ターゲット。
+///
+/// placement だけでなく rect / owner HWND も含める。音声モード中の F11 や host 変更後に
+/// 元の presenter をそのまま show できるかを判定する identity であり、表示中の viewport
+/// identity とは別物。
 #[cfg(windows)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoAudioPhysicalTarget {
+    pub(crate) placement: crate::video::NativeVideoPlacement,
+    pub(crate) rect: windows::Win32::Foundation::RECT,
+    pub(crate) owner_hwnd: u64,
+}
+
+#[cfg(windows)]
+impl VideoAudioPhysicalTarget {
+    pub(crate) fn from_tuple(
+        (placement, rect, owner_hwnd): (
+            crate::video::NativeVideoPlacement,
+            windows::Win32::Foundation::RECT,
+            u64,
+        ),
+    ) -> Self {
+        Self {
+            placement,
+            rect,
+            owner_hwnd,
+        }
+    }
+
+    pub(crate) fn same_target(self, other: Self) -> bool {
+        self.placement == other.placement
+            && self.owner_hwnd == other.owner_hwnd
+            && self.rect.left == other.rect.left
+            && self.rect.top == other.rect.top
+            && self.rect.right == other.rect.right
+            && self.rect.bottom == other.rect.bottom
+    }
+}
+
+/// App が presenter の可視性を変更してよい exact owner。`committed_generation_floor` は
+/// native active generation ではない。初回 presenter は active=1 / committed floor=0 が正常なので、
+/// handoff 中に stale floor が変わっていないことだけを確認する。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoAudioPresenterOwner {
+    pub(crate) context_id: ViewerContextId,
+    pub(crate) fs_idx: usize,
+    pub(crate) source_epoch: u64,
+    pub(crate) presenter_hwnd: u64,
+    pub(crate) committed_generation_floor: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAudioViewportHandoffStage {
+    /// native backdrop/VST host を退役させ、音楽 viewport の初回 paint を待つ。
+    AwaitingPresentation,
+    /// 初回 paint 後の既存 Visible+Focus command を一度だけ発行済み。`Some(true)` の
+    /// viewport focus acknowledgement を待つ。`Some(false)` / `None` は負 ack ではない。
+    AwaitingFocus,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAudioAfterHidden {
+    ContinueAudio,
+    ExitToVideo { deadline: std::time::Instant },
+}
+
+/// presenter hide の非同期段階。可視 HWND の存在と入力 owner の handoff を同じ bool にしない。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAudioPresenterPhase {
+    ViewportHandoff {
+        stage: VideoAudioViewportHandoffStage,
+        viewport_generation: u64,
+    },
+    HideRequested {
+        after_hidden: VideoAudioAfterHidden,
+    },
+    SettledHidden,
+    /// 外部 app への foreground 移動、明示 main/root 入力、または owner/lifecycle 失効で
+    /// handoff を終端した。この状態名は可視性を推定せず、exit 時に pump の実状態を再読する。
+    HandoffCancelled,
+    Exiting(VideoAudioExitPending),
+}
+
+/// `video_audio_mode` に付随する Windows native resource owner。旧 entry target と exit pending、
+/// および fullscreen viewport への入力 handoff を 1 つの mutually-exclusive runtime に束ねる。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoAudioModeRuntime {
+    pub(crate) fs_idx: usize,
+    pub(crate) entry_target: Option<VideoAudioPhysicalTarget>,
+    pub(crate) presenter_owner: VideoAudioPresenterOwner,
+    pub(crate) presenter_phase: VideoAudioPresenterPhase,
+}
+
+#[cfg(windows)]
+impl VideoAudioModeRuntime {
+    pub(crate) fn remap_fs_idx(&mut self, new_idx: usize) {
+        self.fs_idx = new_idx;
+        self.presenter_owner.fs_idx = new_idx;
+        if let VideoAudioPresenterPhase::Exiting(mut pending) = self.presenter_phase {
+            pending.fs_idx = new_idx;
+            self.presenter_phase = VideoAudioPresenterPhase::Exiting(pending);
+        }
+    }
+
+    pub(crate) fn transfer_context_owner(
+        &mut self,
+        from: ViewerContextId,
+        to: ViewerContextId,
+    ) -> bool {
+        if self.presenter_owner.context_id != from {
+            self.presenter_phase = VideoAudioPresenterPhase::HandoffCancelled;
+            return false;
+        }
+        self.presenter_owner.context_id = to;
+        true
+    }
+}
+
+/// 音声モード→動画の非同期完了待ち。`VideoAudioPresenterPhase::Exiting` だけが所有する。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VideoAudioExitPending {
     /// 音声モードから戻る対象の fullscreen アイテム。
     pub fs_idx: usize,
@@ -12226,9 +12374,10 @@ pub struct App {
     pub(crate) show_context_shortcuts_help: bool,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
-    /// フルスクリーン右クリック判定用: 押下開始時刻と座標。
-    /// 短い移動なし release は close、長押しはコンテキストメニュー / リングへ分岐する。
-    pub(crate) fs_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
+    /// フルスクリーン右クリック判定用の edge-owned 押下状態。
+    /// viewer context / item 世代 / index / 操作 context を押下時に焼き付け、modal menu 後に
+    /// 残った button level や別 viewer の同じ index から押下を再生成しない。
+    pub(crate) fs_secondary_press: crate::ui_fullscreen::FullscreenSecondaryPress,
     /// フルスクリーン用コンテキストメニューの対象アイテムインデックス
     pub(crate) fs_context_menu_idx: Option<usize>,
     /// フルスクリーン用コンテキストメニューの表示座標
@@ -14109,25 +14258,11 @@ pub struct App {
     /// (app/native_video.rs)。`video_audio_mode == Some(idx)` を **音楽ビュー表示中**の意味で
     /// 読む箇所は `&& video_audio_vst_active_for(idx) == false` で分ける (Codex 設計レビュー)。
     pub(crate) video_audio_vst: Option<VideoAudioVstState>,
-    /// Inc 7 hidden presenter: enter 時点の presenter 物理ターゲット
-    /// `(placement, rect, owner_hwnd)`。exit で現在の presentation の物理ターゲットと比較し、
-    /// 一致すれば hidden の高速 show (シームレス)、不一致 (音声モード中に全画面⇔ウィンドウを
-    /// 切り替えた) なら SwitchPlacement で正しい placement へ作り直して復帰する (それも source を
-    /// 保持するので音声無中断、Codex 案D)。`viewer_presentation` だけでなく物理 tuple で比較する
-    /// のは、同一モードでの host/rect 変化を取りこぼさないため (Codex)。
+    /// Inc 7 hidden presenter の native resource owner。enter 時点の物理ターゲット、exact
+    /// source/HWND/context、fullscreen music viewport への focus handoff、hide commit、exit wait を
+    /// 1 つの typed state で所有する。可視 HWND の存在を input owner と読み替えない。
     #[cfg(windows)]
-    pub(crate) video_audio_mode_entry_target: Option<(
-        crate::video::NativeVideoPlacement,
-        windows::Win32::Foundation::RECT,
-        u64,
-    )>,
-    /// Inc 7 hidden presenter: exit の非同期完了待ち。show / SwitchPlacement を要求したあと、
-    /// presenter が実際に再表示 (`!native_presenter_hidden()`) するまで `video_audio_mode` を
-    /// Some に保って音楽ビューを描き続け、確認後に None へ落とす (逆順だと 1 フレーム映像が
-    /// 出ない穴が空く、Codex Q4)。deadline 超過は presenter 無応答時の保険で detach+attach+seek
-    /// フォールバックへ回す。
-    #[cfg(windows)]
-    pub(crate) video_audio_exit_pending: Option<VideoAudioExitPending>,
+    pub(crate) video_audio_mode_runtime: Option<VideoAudioModeRuntime>,
     /// Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られるときに立てる one-shot。
     /// `handle_video_audio_mode_continuous_eof` が `try_start_native_video_fast_swap` を呼ぶ
     /// 直前に true にし、`defer_native_video_source_swap_until_decoder_free` が pending の
@@ -15760,7 +15895,7 @@ impl App {
             whats_new_entries,
             network_data_dir_notice,
             show_context_shortcuts_help: false,
-            fs_secondary_press_start: None,
+            fs_secondary_press: Default::default(),
             fs_middle_zoom_drag: None,
             mouse_middle_click_start: None,
             fs_context_menu_idx: None,
@@ -16422,9 +16557,7 @@ impl App {
             video_audio_mode: None,
             video_audio_vst: None,
             #[cfg(windows)]
-            video_audio_mode_entry_target: None,
-            #[cfg(windows)]
-            video_audio_exit_pending: None,
+            video_audio_mode_runtime: None,
             #[cfg(windows)]
             source_swap_keep_audio_mode: false,
             pdf_worker_notice: None,
@@ -29279,15 +29412,17 @@ impl App {
         });
         #[cfg(windows)]
         {
-            self.video_audio_exit_pending =
-                self.video_audio_exit_pending.take().and_then(|mut p| {
-                    shift(p.fs_idx).map(|ni| {
-                        p.fs_idx = ni;
-                        p
-                    })
-                });
+            self.video_audio_mode_runtime =
+                self.video_audio_mode_runtime
+                    .take()
+                    .and_then(|mut runtime| {
+                        shift(runtime.fs_idx).map(|ni| {
+                            runtime.remap_fs_idx(ni);
+                            runtime
+                        })
+                    });
             if self.video_audio_mode.is_none() {
-                self.video_audio_mode_entry_target = None;
+                self.video_audio_mode_runtime = None;
             }
         }
         #[cfg(windows)]
@@ -39978,6 +40113,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         main_viewport_focused: bool,
+        main_viewport_explicit_input: bool,
         fullscreen_root_key_handled: bool,
     ) {
         if self.remote_session_blocks_local_control() {
@@ -39995,9 +40131,21 @@ impl App {
                 .unwrap_or(true);
         }
         #[cfg(windows)]
-        let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
+        {
+            self.cancel_video_audio_viewport_handoff_for_external_foreground();
+            if should_cancel_video_audio_handoff_for_main_input(
+                main_viewport_focused,
+                main_viewport_explicit_input,
+                fullscreen_root_key_handled,
+            ) {
+                self.cancel_video_audio_viewport_handoff("explicit_main_input");
+            }
+        }
+        #[cfg(windows)]
+        let fullscreen_input_owner_blocks_main_focus =
+            self.native_video_input_owner_blocks_main_focus();
         #[cfg(not(windows))]
-        let native_video_presenter_active = false;
+        let fullscreen_input_owner_blocks_main_focus = false;
         #[cfg(windows)]
         let embedded_still = self.fullscreen_embedded_still_active();
         #[cfg(not(windows))]
@@ -40005,7 +40153,7 @@ impl App {
         if should_close_fullscreen_from_main_focus(
             self.fs_focus_grace_elapsed,
             main_viewport_focused,
-            native_video_presenter_active,
+            fullscreen_input_owner_blocks_main_focus,
             embedded_still,
             self.settings.fullscreen_keep_on_app_switch,
             fullscreen_root_key_handled,
@@ -40744,6 +40892,7 @@ impl App {
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         self.cancel_mouse_ring_flick();
+        self.fs_secondary_press.cancel();
         self.capture_region_selection = None;
         self.invalidate_similar_preview();
         self.fullscreen_navigator_interaction
@@ -46706,6 +46855,10 @@ impl App {
         }
         self.cancel_superseded_fs_navigation_display_target(idx);
 
+        if self.fullscreen_idx != Some(idx) {
+            self.fs_secondary_press.cancel();
+        }
+
         #[cfg(windows)]
         if self.fullscreen_idx != Some(idx) {
             self.clear_native_video_mouse_seek_holds("fullscreen_item_change");
@@ -46757,8 +46910,7 @@ impl App {
         self.video_audio_vst = None;
         #[cfg(windows)]
         {
-            self.video_audio_mode_entry_target = None;
-            self.video_audio_exit_pending = None;
+            self.video_audio_mode_runtime = None;
         }
         // viewer 内の手動ナビ (grid からの新規 open ではない = `fs_open_intent_from_grid` が false、
         // かつ既にフルスクリーン中) で **メディア (動画/音声)** を開くときは、現在の presentation を維持する
@@ -55141,8 +55293,7 @@ impl App {
         self.video_audio_vst = None;
         #[cfg(windows)]
         {
-            self.video_audio_mode_entry_target = None;
-            self.video_audio_exit_pending = None;
+            self.video_audio_mode_runtime = None;
         }
         // 音声 VST シェル (Inc 6 ②-3): フルスクリーンを完全に閉じるならシェル状態も落とす。
         // VST GUI の hide/re-owner は下の VST cleanup (show_vst3_manager 経路) が、native 出力の
@@ -55418,7 +55569,7 @@ impl App {
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
         self.fs_primary_suppression = Default::default();
-        self.fs_secondary_press_start = None;
+        self.fs_secondary_press.cancel();
         #[cfg(windows)]
         {
             self.native_video_secondary_press_start = None;
@@ -69321,7 +69472,7 @@ impl App {
                     && self.native_video_source_swap_pending.is_none()
                     && self.native_video_fast_swap_pending.is_none()
                     && self.video_tile_swap_pending.is_none()
-                    && self.video_audio_exit_pending.is_none()
+                    && !self.video_audio_exit_pending_active()
             }
             MediaNavigationAction::Manual { fs_idx, .. } => self.fullscreen_idx == Some(*fs_idx),
         }
@@ -69855,10 +70006,10 @@ impl App {
         // 進行中の swap / placement 切替中は多重起動しない (enter_video_audio_mode と同じ保護、
         // stale pending の混線を避ける)。
         //
-        // exit 進行中 (`video_audio_exit_pending`) も弾く。exit は presenter 再表示確認まで
+        // exit 進行中 (`VideoAudioPresenterPhase::Exiting`) も弾く。exit は presenter 再表示確認まで
         // `video_audio_mode = Some` を維持する設計なので、その窓で EOF が来るとここが
         // keep-audio swap を開始して `video_audio_mode` を next へ進め、
-        // `poll_video_audio_exit_pending` が mode 不一致で pending を黙って破棄する
+        // `poll_video_audio_mode_runtime` が mode 不一致で pending を黙って破棄する
         // (= ユーザーの「動画へ戻る」が消失 + show 済み presenter に旧動画 hold フレームが
         // 露出)。exit 完了後の EOF は mode=None で Video 分類に落ち、通常の連続再生として
         // 次動画が映像表示で開く (review-v2.3.0 P2-1)。
@@ -69866,7 +70017,7 @@ impl App {
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
-            || self.video_audio_exit_pending.is_some()
+            || self.video_audio_exit_pending_active()
         {
             return;
         }
@@ -69911,7 +70062,7 @@ impl App {
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
-            || self.video_audio_exit_pending.is_some()
+            || self.video_audio_exit_pending_active()
         {
             return;
         }
@@ -70255,8 +70406,7 @@ impl App {
         self.video_zoom_state = None;
         self.video_audio_mode = None;
         self.video_audio_vst = None;
-        self.video_audio_mode_entry_target = None;
-        self.video_audio_exit_pending = None;
+        self.video_audio_mode_runtime = None;
         self.video_continuous_last_eof = None;
         self.fs_open_intent_from_grid = false;
         self.fs_video_open_autoplay_override = None;
@@ -70656,9 +70806,10 @@ impl App {
         }
         #[cfg(windows)]
         self.poll_native_video_source_swap_pending(ctx);
-        // Inc 7 hidden presenter: 音声モード exit の非同期完了 (presenter 再表示待ち) をポーリング。
+        // Inc 7 hidden presenter: viewport focus handoff / hide commit / exit の native runtime を
+        // ポーリングする。
         #[cfg(windows)]
-        self.poll_video_audio_exit_pending(ctx);
+        self.poll_video_audio_mode_runtime(ctx);
         #[cfg(windows)]
         self.poll_video_presentation_transition(ctx);
         // detached host HWND が変わったら presenter child を現 host へ再親付けする
@@ -71625,6 +71776,12 @@ impl App {
         // フルスクリーンのキーが main/root 側に届いた場合は、main focus guard より先に
         // 処理する。F11 の window/fullscreen 切替など、main が focused になること自体が
         // 操作の副作用であるキーを、一覧へ戻りたい意図と誤認しないため。
+        let main_viewport_explicit_input = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(main_viewport_event_is_explicit_input)
+        });
         let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
 
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
@@ -71643,6 +71800,7 @@ impl App {
         self.reconcile_fullscreen_after_main_focus(
             ctx,
             main_viewport_focused,
+            main_viewport_explicit_input,
             fullscreen_root_key_handled,
         );
 

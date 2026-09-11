@@ -187,3 +187,21 @@ Enabledテスト経路の差分通知・watch bootstrap・password更新・進�
 実装と別担当の独立レビュー、統合影響の焦点テスト・全体gate・確認buildを行う。
 masterの未コミット差分、実データ、実アプリには触れず、再有効化とmasterへのmergeは
 後続判断とする。既に有効な大規模性能測定は繰り返さない。
+
+## 利用者の確認追記
+
+2026-09-11、利用者から§1.210の右クリックメニューが再出現しなくなり、F12も動作するとの
+報告を受けた。別窓でのメニューを閉じた後の非再出現と長押しの確認範囲を案内した。
+§1.208は通常profileにVSTが設定されているため、未設定のportable確認版を別途準備する。
+この時点では§1.208を実機確認済みとは扱わない。
+
+続いて利用者がVST未設定portableで「♪はうまく動くようになりました。OK」と確認した。
+確認exe SHA256は `8823E8AC36BA8CEF248123349708D6B9EDC0E37CF3013C79B5794F92CDEAE776`。
+§1.208の報告再現経路と§1.210のメニュー再出現は利用者確認済みとして記録し、
+成功済み自動gateと同一sourceの製品差分をコミットする。F12長押しやVSTありの全経路まで
+実機確認したとは扱わない。
+
+このportable準備では内部build-portable.ps1の既定Stop-Process -Forceが開発版core 8件と
+Remote 1件を停止する事故があった。利用者へ報告済み、再起動なし、未保存状態への影響未確認。
+今後は `build-portable.ps1 -PreserveRuntime` → `prepare-portable-smoke.ps1 -SkipBuild` とし、
+稼働アプリを停止しない。記録は同checkpoint directoryの `manual-portable-vst-unset-build.json`。

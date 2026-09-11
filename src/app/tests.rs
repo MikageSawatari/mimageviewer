@@ -41203,6 +41203,13 @@ mod fullscreen_main_focus_guard_tests {
     }
 
     #[test]
+    fn main_focus_guard_skips_close_while_fullscreen_input_handoff_is_active() {
+        assert!(!should_close_fullscreen_from_main_focus(
+            true, true, true, false, false, false,
+        ));
+    }
+
+    #[test]
     fn main_focus_guard_skips_close_when_keep_on_app_switch_enabled() {
         assert!(!should_close_fullscreen_from_main_focus(
             true, true, false, false, true, false,
@@ -41239,6 +41246,50 @@ mod fullscreen_main_focus_guard_tests {
         ));
         assert!(!should_close_fullscreen_from_main_focus(
             true, true, false, true, false, false,
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn explicit_main_input_cancels_handoff_unless_root_consumed_it() {
+        assert!(should_cancel_video_audio_handoff_for_main_input(
+            true, true, false,
+        ));
+        assert!(!should_cancel_video_audio_handoff_for_main_input(
+            true, true, true,
+        ));
+        assert!(!should_cancel_video_audio_handoff_for_main_input(
+            true, false, false,
+        ));
+        assert!(!should_cancel_video_audio_handoff_for_main_input(
+            false, true, false,
+        ));
+    }
+
+    #[test]
+    fn main_pointer_press_is_explicit_input_but_release_is_not() {
+        let event = |pressed| egui::Event::PointerButton {
+            pos: egui::pos2(24.0, 36.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert!(main_viewport_event_is_explicit_input(&event(true)));
+        assert!(!main_viewport_event_is_explicit_input(&event(false)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn only_a_known_external_foreground_cancels_the_handoff() {
+        assert!(should_cancel_video_audio_handoff_for_external_foreground(
+            0x1234, false,
+        ));
+        assert!(!should_cancel_video_audio_handoff_for_external_foreground(
+            0x1234, true,
+        ));
+        assert!(!should_cancel_video_audio_handoff_for_external_foreground(
+            0, false,
         ));
     }
 }
@@ -41394,9 +41445,9 @@ mod still_window_mode_key_tests {
         let GridItem::Video(path) = app.items[idx].clone() else {
             unreachable!()
         };
-        let mut player = crate::video::VideoPlayer::disconnected_for_test(path, 0.0);
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.configure_native_timing_for_test(0.0, 30.0, true, false);
         player.set_media_visual_mode(music_core::MediaVisualMode::Music);
-        player.attach_native_output(crate::video::NativeVideoOutput::disconnected_for_test());
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Video {
@@ -41404,6 +41455,49 @@ mod still_window_mode_key_tests {
                 load_seq: app.input_seq,
             },
         );
+    }
+
+    #[cfg(windows)]
+    fn set_video_audio_runtime_for_test(
+        app: &mut App,
+        idx: usize,
+        presenter_phase: VideoAudioPresenterPhase,
+    ) {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&idx).unwrap() else {
+            unreachable!()
+        };
+        app.video_audio_mode_runtime = Some(VideoAudioModeRuntime {
+            fs_idx: idx,
+            entry_target: None,
+            presenter_owner: VideoAudioPresenterOwner {
+                context_id: app.projected_viewer_context_id(),
+                fs_idx: idx,
+                source_epoch: player.native_source_epoch().unwrap(),
+                presenter_hwnd: player.native_presenter_hwnd(),
+                committed_generation_floor: player.native_committed_generation().unwrap(),
+            },
+            presenter_phase,
+        });
+    }
+
+    #[cfg(windows)]
+    fn set_synthetic_video_audio_runtime_for_test(
+        app: &mut App,
+        idx: usize,
+        presenter_phase: VideoAudioPresenterPhase,
+    ) {
+        app.video_audio_mode_runtime = Some(VideoAudioModeRuntime {
+            fs_idx: idx,
+            entry_target: None,
+            presenter_owner: VideoAudioPresenterOwner {
+                context_id: app.projected_viewer_context_id(),
+                fs_idx: idx,
+                source_epoch: 7,
+                presenter_hwnd: 0x1234,
+                committed_generation_floor: 0,
+            },
+            presenter_phase,
+        });
     }
 
     fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
@@ -44620,10 +44714,10 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn continuous_eof_is_blocked_while_video_audio_exit_pending() {
+    fn continuous_eof_is_blocked_while_video_audio_runtime_is_exiting() {
         // review-v2.3.0 P2-1: exit (「動画へ戻る」) 進行中に連続再生 EOF が重なっても
         // keep-audio swap を開始しない。開始すると video_audio_mode が next へ進み、
-        // poll_video_audio_exit_pending が mode 不一致で exit pending を黙って捨てる
+        // poll_video_audio_mode_runtime が mode 不一致で exit pending を黙って捨てる
         // (= ユーザーの exit 操作の消失 + show 済み presenter への旧動画フレーム露出)。
         let mut app = setup_app();
         let a = push_video(&mut app, r"C:\clips\a.mp4");
@@ -44632,11 +44726,15 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
         app.video_audio_mode = Some(a);
-        app.video_audio_exit_pending = Some(VideoAudioExitPending {
-            fs_idx: a,
-            deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
-            saw_hidden: false,
-        });
+        set_synthetic_video_audio_runtime_for_test(
+            &mut app,
+            a,
+            VideoAudioPresenterPhase::Exiting(VideoAudioExitPending {
+                fs_idx: a,
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
+                saw_hidden: false,
+            }),
+        );
         let ctx = egui::Context::default();
 
         app.handle_video_audio_mode_continuous_eof(&ctx, a, 1);
@@ -44647,7 +44745,7 @@ mod still_window_mode_key_tests {
             "exit pending 中の EOF は音声モードを next へ進めない"
         );
         assert!(
-            app.video_audio_exit_pending.is_some(),
+            app.video_audio_exit_pending_active(),
             "exit pending は EOF 継続に破棄されない"
         );
         assert_eq!(
@@ -44877,6 +44975,312 @@ mod still_window_mode_key_tests {
         );
     }
 
+    #[cfg(windows)]
+    fn setup_fullscreen_video_audio_handoff(path: &str) -> (AppTestEnv, usize, egui::Context) {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, path);
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.video_in_window_mode = false;
+        app.native_video_in_window_active = false;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+        install_video_audio_player_with_native_output(&mut app, video);
+        (app, video, ctx)
+    }
+
+    #[cfg(windows)]
+    fn video_audio_presenter_phase(app: &App) -> VideoAudioPresenterPhase {
+        app.video_audio_mode_runtime
+            .expect("video audio runtime")
+            .presenter_phase
+    }
+
+    #[cfg(windows)]
+    fn video_audio_presenter_visibility_requested(app: &App, fs_idx: usize) -> bool {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&fs_idx).unwrap() else {
+            unreachable!()
+        };
+        player
+            .native_presenter_visibility_requested_for_test()
+            .expect("native output visibility request")
+    }
+
+    #[cfg(windows)]
+    fn publish_video_audio_presenter_hidden(app: &App, fs_idx: usize, hidden: bool) {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&fs_idx).unwrap() else {
+            unreachable!()
+        };
+        player.set_native_presenter_hidden_for_test(hidden);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullscreen_video_audio_enter_waits_for_exact_viewport_focus_before_hiding_presenter() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\focus-handoff.mp4");
+        let viewport_id = app.fullscreen_viewport_id();
+
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::EguiKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+        let runtime = app.video_audio_mode_runtime.expect("handoff runtime");
+        assert_eq!(runtime.presenter_owner.committed_generation_floor, 0);
+        assert!(matches!(
+            runtime.presenter_phase,
+            VideoAudioPresenterPhase::ViewportHandoff {
+                stage: VideoAudioViewportHandoffStage::AwaitingPresentation,
+                ..
+            }
+        ));
+        assert!(
+            video_audio_presenter_visibility_requested(&app, video),
+            "enter must keep the old presenter visible until the new viewport owns focus"
+        );
+        assert!(
+            !app.fs_viewport_shown,
+            "the old native backdrop must retire so the music viewport uses the one-shot show path"
+        );
+        assert!(app.native_video_input_owner_blocks_main_focus());
+
+        app.mark_video_audio_music_viewport_focus_requested(viewport_id);
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::ViewportHandoff {
+                stage: VideoAudioViewportHandoffStage::AwaitingFocus,
+                ..
+            }
+        ));
+        app.mark_video_audio_music_viewport_focus_requested(viewport_id);
+        app.observe_video_audio_music_viewport_focus(viewport_id, None);
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(false));
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::ViewportHandoff {
+                stage: VideoAudioViewportHandoffStage::AwaitingFocus,
+                ..
+            }
+        ));
+        assert!(video_audio_presenter_visibility_requested(&app, video));
+
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(true));
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HideRequested {
+                after_hidden: VideoAudioAfterHidden::ContinueAudio
+            }
+        ));
+        assert!(!video_audio_presenter_visibility_requested(&app, video));
+        assert!(
+            !app.native_video_input_owner_blocks_main_focus(),
+            "the exact focus acknowledgement completes input handoff; only visibility commit remains"
+        );
+
+        app.poll_video_audio_mode_runtime(&ctx);
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HideRequested { .. }
+        ));
+        publish_video_audio_presenter_hidden(&app, video, true);
+        app.poll_video_audio_mode_runtime(&ctx);
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::SettledHidden
+        ));
+        assert!(
+            !app.native_video_input_owner_blocks_main_focus(),
+            "the pump visibility commit must not recreate the completed input-owner guard"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullscreen_video_audio_handoff_rejects_stale_presenter_owner_before_hide() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\stale-handoff.mp4");
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::NativeKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+        let viewport_id = app.fullscreen_viewport_id();
+        app.mark_video_audio_music_viewport_focus_requested(viewport_id);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&video).unwrap() else {
+            unreachable!()
+        };
+        player.bump_native_committed_generation(1);
+
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(true));
+
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HandoffCancelled
+        ));
+        assert!(video_audio_presenter_visibility_requested(&app, video));
+        assert!(!app.native_video_input_owner_blocks_main_focus());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullscreen_video_audio_enter_with_already_hidden_presenter_is_terminal() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\already-hidden.mp4");
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&video).unwrap() else {
+            unreachable!()
+        };
+        player.set_native_window_visible(false);
+        player.set_native_presenter_hidden_for_test(true);
+
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::NativeOutputEvent,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::SettledHidden
+        ));
+        assert!(!video_audio_presenter_visibility_requested(&app, video));
+        assert!(
+            app.fs_viewport_shown,
+            "an already-focused existing viewport does not need a new one-shot Focus request"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_exit_before_focus_ack_never_queues_a_false_show() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\early-exit.mp4");
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::EguiKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+
+        app.exit_video_audio_mode(&ctx, video);
+
+        assert_eq!(app.video_audio_mode, None);
+        assert!(app.video_audio_mode_runtime.is_none());
+        assert!(
+            video_audio_presenter_visibility_requested(&app, video),
+            "no hide was issued, so exit must not manufacture a hide/show receipt"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cancelled_fullscreen_handoff_keeps_presenter_visible_and_ends_focus_guard() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\cancelled-handoff.mp4");
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::EguiKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+
+        app.cancel_video_audio_viewport_handoff("test_external_foreground");
+
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HandoffCancelled
+        ));
+        assert!(video_audio_presenter_visibility_requested(&app, video));
+        assert!(!app.native_video_input_owner_blocks_main_focus());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_exit_after_hide_request_waits_for_hidden_commit() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\hide-race-exit.mp4");
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::EguiKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+        let viewport_id = app.fullscreen_viewport_id();
+        app.mark_video_audio_music_viewport_focus_requested(viewport_id);
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(true));
+
+        app.exit_video_audio_mode(&ctx, video);
+
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HideRequested {
+                after_hidden: VideoAudioAfterHidden::ExitToVideo { .. }
+            }
+        ));
+        assert!(
+            !video_audio_presenter_visibility_requested(&app, video),
+            "show must not overtake the queued hide"
+        );
+
+        publish_video_audio_presenter_hidden(&app, video, true);
+        app.poll_video_audio_mode_runtime(&ctx);
+        assert_eq!(
+            app.video_audio_mode, None,
+            "the target-less fixture may take fallback, but only after hidden was observed"
+        );
+        assert!(app.video_audio_mode_runtime.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_vst_exit_restarts_the_fullscreen_focus_handoff_before_hide() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\vst-exit-handoff.mp4");
+        app.video_audio_mode = Some(video);
+        set_video_audio_runtime_for_test(&mut app, video, VideoAudioPresenterPhase::SettledHidden);
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx: video,
+            phase: VideoAudioVstPhase::Active,
+        });
+
+        app.exit_video_audio_vst(&ctx, video);
+
+        assert!(app.video_audio_vst.is_none());
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::ViewportHandoff {
+                stage: VideoAudioViewportHandoffStage::AwaitingPresentation,
+                ..
+            }
+        ));
+        assert!(video_audio_presenter_visibility_requested(&app, video));
+        assert!(!app.fs_viewport_shown);
+
+        let viewport_id = app.fullscreen_viewport_id();
+        app.mark_video_audio_music_viewport_focus_requested(viewport_id);
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(false));
+        assert!(video_audio_presenter_visibility_requested(&app, video));
+        app.observe_video_audio_music_viewport_focus(viewport_id, Some(true));
+        assert!(!video_audio_presenter_visibility_requested(&app, video));
+    }
+
     #[test]
     #[cfg(windows)]
     fn video_audio_mode_f11_keeps_audio_mode_and_avoids_native_switch() {
@@ -44912,6 +45316,55 @@ mod still_window_mode_key_tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
         assert!(!app.settings.video_in_window_mode);
         assert!(!app.video_presentation_transition.is_transitioning());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_f11_to_main_retires_presenter_without_waiting_for_viewport_focus() {
+        let (mut app, video, ctx) =
+            setup_fullscreen_video_audio_handoff(r"C:\clips\f11-handoff.mp4");
+        assert_eq!(
+            app.enter_video_audio_mode(
+                &ctx,
+                video,
+                crate::app::native_video::VideoAudioEnterSource::EguiKey,
+            ),
+            crate::app::native_video::VideoAudioEnterOutcome::Entered
+        );
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::HideRequested {
+                after_hidden: VideoAudioAfterHidden::ContinueAudio
+            }
+        ));
+        assert!(!video_audio_presenter_visibility_requested(&app, video));
+        assert!(
+            !app.native_video_input_owner_blocks_main_focus(),
+            "the embedded main music view is already the input owner"
+        );
+
+        publish_video_audio_presenter_hidden(&app, video, true);
+        app.poll_video_audio_mode_runtime(&ctx);
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::SettledHidden
+        ));
+
+        app.toggle_video_window_mode_for_input(&ctx);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+        assert!(matches!(
+            video_audio_presenter_phase(&app),
+            VideoAudioPresenterPhase::SettledHidden
+        ));
+        assert!(
+            !video_audio_presenter_visibility_requested(&app, video),
+            "an already-hidden presenter stays retired while the ordinary egui viewport opens"
+        );
     }
 
     #[test]
@@ -49112,7 +49565,7 @@ mod still_window_mode_key_tests {
             assert_eq!(app.prepare_media_session_for_tray_residency(), 1);
             app.window_visible = false;
             app.sync_after_restore(&ctx);
-            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
             assert_eq!(
                 app.fullscreen_idx,
@@ -49172,7 +49625,7 @@ mod still_window_mode_key_tests {
         assert!(app.viewer_session_is_detached_or_switching());
         app.sync_after_restore(&ctx);
         crate::app::tests::phase_c_support::wait_for_external_rescan(&mut app);
-        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
         assert!(app.window_visible);
         assert!(
@@ -49221,7 +49674,7 @@ mod still_window_mode_key_tests {
         app.window_visible = false;
 
         app.sync_after_restore(&ctx);
-        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
         assert!(app.window_visible);
         assert_eq!(app.fullscreen_idx, Some(video));
@@ -49266,7 +49719,7 @@ mod still_window_mode_key_tests {
         app.window_visible = false;
 
         app.sync_after_restore(&ctx);
-        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
         assert_eq!(app.fullscreen_idx, Some(video));
         assert_eq!(app.video_audio_mode, Some(video));
@@ -49284,7 +49737,7 @@ mod still_window_mode_key_tests {
         app.window_visible = false;
 
         app.sync_after_restore(&ctx);
-        app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+        app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
         assert!(app.window_visible);
         assert!(app.fullscreen_idx.is_none());
@@ -49329,7 +49782,7 @@ mod still_window_mode_key_tests {
             app.viewer_presentation = presentation;
             app.fs_focus_grace_elapsed = true;
 
-            app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
+            app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
 
             assert_eq!(
                 app.fullscreen_idx, None,
@@ -49462,6 +49915,64 @@ mod still_window_mode_key_tests {
             assert!(std::sync::Arc::ptr_eq(&mounted.cancel_token, &main_cancel));
         })
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_runtime_moves_with_context_bundle_and_retires_with_it() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\bundled-audio.mp4");
+        app.fullscreen_idx = Some(video);
+        app.video_audio_mode = Some(video);
+        set_synthetic_video_audio_runtime_for_test(
+            &mut app,
+            video,
+            VideoAudioPresenterPhase::ViewportHandoff {
+                stage: VideoAudioViewportHandoffStage::AwaitingFocus,
+                viewport_generation: 17,
+            },
+        );
+        let owner = app
+            .video_audio_mode_runtime
+            .as_ref()
+            .expect("runtime before bundle move")
+            .presenter_owner;
+
+        let context_id = app.stash_mounted_as_active_for_test(94);
+        assert!(
+            app.video_audio_mode_runtime.is_none(),
+            "the fresh mounted side must not borrow the stashed viewer's presenter owner"
+        );
+        app.with_viewer_context(context_id, |mounted| {
+            let runtime = mounted
+                .video_audio_mode_runtime
+                .as_ref()
+                .expect("stashed bundle keeps the complete runtime");
+            assert_eq!(runtime.fs_idx, video);
+            assert_eq!(runtime.presenter_owner, owner);
+            assert!(matches!(
+                runtime.presenter_phase,
+                VideoAudioPresenterPhase::ViewportHandoff {
+                    stage: VideoAudioViewportHandoffStage::AwaitingFocus,
+                    viewport_generation: 17,
+                }
+            ));
+        })
+        .unwrap();
+        assert!(
+            app.video_audio_mode_runtime.is_none(),
+            "restoring the mounted side must return the runtime to its owning bundle"
+        );
+
+        app.remove_active_context_for_test();
+        assert_eq!(
+            app.viewer_context_residence(context_id),
+            ContextResidence::Retired
+        );
+        assert!(
+            app.video_audio_mode_runtime.is_none(),
+            "retiring the owner bundle must not resurrect its presenter runtime"
+        );
     }
 
     #[test]
@@ -49732,6 +50243,15 @@ mod still_window_mode_key_tests {
             fs_idx: video,
             phase: VideoAudioVstPhase::Active,
         });
+        set_synthetic_video_audio_runtime_for_test(
+            &mut app,
+            video,
+            VideoAudioPresenterPhase::Exiting(VideoAudioExitPending {
+                fs_idx: video,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                saw_hidden: true,
+            }),
+        );
         // 音量ノーマライズ / ループ位置の idx-keyed 状態も shift 対象 (Codex fix-review P2)。
         app.normalize_ui_states.insert(
             video,
@@ -49770,6 +50290,20 @@ mod still_window_mode_key_tests {
             app.video_audio_vst.as_ref().map(|s| s.fs_idx),
             Some(video - 1)
         );
+        let runtime = app
+            .video_audio_mode_runtime
+            .as_ref()
+            .expect("runtime follows the retained video");
+        assert_eq!(runtime.fs_idx, video - 1);
+        assert_eq!(runtime.presenter_owner.fs_idx, video - 1);
+        assert!(matches!(
+            runtime.presenter_phase,
+            VideoAudioPresenterPhase::Exiting(VideoAudioExitPending {
+                fs_idx,
+                saw_hidden: true,
+                ..
+            }) if fs_idx == video - 1
+        ));
         assert!(matches!(app.items.get(video - 1), Some(GridItem::Video(_))));
         assert!(
             matches!(
@@ -49799,6 +50333,10 @@ mod still_window_mode_key_tests {
         assert!(matches!(app.items.get(0), Some(GridItem::Image(_))));
         assert_eq!(app.video_audio_mode, None);
         assert!(app.video_audio_vst.is_none());
+        assert!(
+            app.video_audio_mode_runtime.is_none(),
+            "deleting the owned video must retire its complete presenter runtime"
+        );
         assert!(app.normalize_state.is_none(), "対象削除でスキャンは畳む");
         assert!(
             scan_cancel.load(std::sync::atomic::Ordering::Relaxed),
@@ -55588,6 +56126,12 @@ mod still_window_mode_key_tests {
         app.video_audio_mode = Some(video);
         app.video_audio_vst = None;
         app.begin_active_detached_session(window_id, DetachedSource::Video);
+        let source_context_id = app.projected_viewer_context_id();
+        set_synthetic_video_audio_runtime_for_test(
+            &mut app,
+            video,
+            VideoAudioPresenterPhase::SettledHidden,
+        );
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_video_audio_park"));
         assert_eq!(
@@ -55605,12 +56149,27 @@ mod still_window_mode_key_tests {
             .find(|window| window.id == window_id)
             .expect("parked media snapshot must remain");
         let parked_id = parked.id;
+        let (parked_context_id, residence) = app
+            .locate_window_context(parked_id)
+            .expect("parked live window keeps its context binding");
+        assert_ne!(parked_context_id, source_context_id);
+        assert_eq!(residence, ContextResidence::AtRest);
         app.with_window_viewer_context(parked_id, |bundle| {
             assert_eq!(
                 bundle.video_audio_mode,
                 Some(video),
                 "video_audio_mode must move with the parked media bundle"
             );
+            let runtime = bundle
+                .video_audio_mode_runtime
+                .as_ref()
+                .expect("the complete presenter runtime moves with the parked bundle");
+            assert_eq!(runtime.fs_idx, video);
+            assert_eq!(runtime.presenter_owner.context_id, parked_context_id);
+            assert!(matches!(
+                runtime.presenter_phase,
+                VideoAudioPresenterPhase::SettledHidden
+            ));
         })
         .expect("parked media snapshot owns its context bundle");
 
@@ -55620,6 +56179,14 @@ mod still_window_mode_key_tests {
                 active.video_audio_mode,
                 Some(video),
                 "reactivation must keep video audio mode for the active detached context"
+            );
+            assert_eq!(
+                active
+                    .video_audio_mode_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.presenter_owner.context_id),
+                Some(parked_context_id),
+                "reactivation must preserve the transferred exact presenter owner"
             );
         })
         .expect("reactivated ParkedLive media owns an active context");
@@ -57989,11 +58556,15 @@ mod still_window_mode_key_tests {
             fs_idx: video,
             phase: VideoAudioVstPhase::Active,
         });
-        app.video_audio_exit_pending = Some(VideoAudioExitPending {
-            fs_idx: video,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            saw_hidden: true,
-        });
+        set_synthetic_video_audio_runtime_for_test(
+            &mut app,
+            video,
+            VideoAudioPresenterPhase::Exiting(VideoAudioExitPending {
+                fs_idx: video,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                saw_hidden: true,
+            }),
+        );
         app.music_vst_shell = Some(MusicVstShell {
             fs_idx: video,
             activated: true,
@@ -58046,9 +58617,20 @@ mod still_window_mode_key_tests {
             Some(new_idx)
         );
         assert_eq!(
-            app.video_audio_exit_pending.as_ref().map(|s| s.fs_idx),
+            app.video_audio_mode_runtime.as_ref().and_then(|runtime| {
+                match runtime.presenter_phase {
+                    VideoAudioPresenterPhase::Exiting(pending) => Some(pending.fs_idx),
+                    _ => None,
+                }
+            }),
             Some(new_idx)
         );
+        let runtime = app
+            .video_audio_mode_runtime
+            .as_ref()
+            .expect("snapshot remap retains the presenter runtime");
+        assert_eq!(runtime.fs_idx, new_idx);
+        assert_eq!(runtime.presenter_owner.fs_idx, new_idx);
         assert_eq!(
             app.music_vst_shell.as_ref().map(|s| s.fs_idx),
             Some(new_idx)

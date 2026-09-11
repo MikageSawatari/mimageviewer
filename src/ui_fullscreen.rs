@@ -62,6 +62,227 @@ use crate::settings::{
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
+const FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX: f32 =
+    crate::ring_shortcut::MOUSE_FLICK_MOVE_THRESHOLD_PX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullscreenSecondaryPressOwner {
+    viewer_context: crate::app::ViewerContextId,
+    items_generation: u64,
+    fs_idx: usize,
+    context: crate::ring_shortcut::RightDragContext,
+}
+
+impl FullscreenSecondaryPressOwner {
+    fn new(
+        viewer_context: crate::app::ViewerContextId,
+        items_generation: u64,
+        fs_idx: usize,
+        context: crate::ring_shortcut::RightDragContext,
+    ) -> Self {
+        Self {
+            viewer_context,
+            items_generation,
+            fs_idx,
+            context,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FullscreenSecondaryPress {
+    Idle,
+    Armed {
+        owner: FullscreenSecondaryPressOwner,
+        started_at: std::time::Instant,
+        start_pos: egui::Pos2,
+    },
+}
+
+impl Default for FullscreenSecondaryPress {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FullscreenSecondaryPressOutcome {
+    None,
+    ShortTap(egui::Pos2),
+    LongPress(egui::Pos2),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FullscreenSecondaryPressSample {
+    pressed: bool,
+    down: bool,
+    released: bool,
+    pos: egui::Pos2,
+    now: std::time::Instant,
+}
+
+impl FullscreenSecondaryPress {
+    pub(crate) fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
+
+    fn start_pos(self) -> Option<egui::Pos2> {
+        match self {
+            Self::Idle => None,
+            Self::Armed { start_pos, .. } => Some(start_pos),
+        }
+    }
+
+    fn advance(
+        &mut self,
+        owner: Option<FullscreenSecondaryPressOwner>,
+        sample: FullscreenSecondaryPressSample,
+    ) -> FullscreenSecondaryPressOutcome {
+        let Some(owner) = owner else {
+            return if matches!(std::mem::take(self), Self::Armed { .. }) {
+                FullscreenSecondaryPressOutcome::Cancelled
+            } else {
+                FullscreenSecondaryPressOutcome::None
+            };
+        };
+
+        // A press edge is the only event that may create or replace ownership. A stale
+        // `secondary_down` level left behind by a modal native menu therefore cannot invent a
+        // second click after the menu closes.
+        if sample.pressed {
+            *self = Self::Armed {
+                owner,
+                started_at: sample.now,
+                start_pos: sample.pos,
+            };
+        } else if matches!(self, Self::Armed { owner: armed, .. } if *armed != owner) {
+            self.cancel();
+            return FullscreenSecondaryPressOutcome::Cancelled;
+        }
+
+        let Self::Armed {
+            started_at,
+            start_pos,
+            ..
+        } = *self
+        else {
+            return FullscreenSecondaryPressOutcome::None;
+        };
+        let elapsed = sample.now.saturating_duration_since(started_at);
+        let moved = sample.pos.distance(start_pos);
+
+        if sample.released {
+            self.cancel();
+            if moved >= FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX {
+                return FullscreenSecondaryPressOutcome::Cancelled;
+            }
+            return if elapsed >= crate::ring_shortcut::mouse_flick_menu_delay() {
+                FullscreenSecondaryPressOutcome::LongPress(sample.pos)
+            } else {
+                FullscreenSecondaryPressOutcome::ShortTap(sample.pos)
+            };
+        }
+
+        // A missing release edge is possible around modal native menus. Physical button liveness
+        // is authoritative for an already-armed sequence, but never creates a new one.
+        if !sample.down || moved >= FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX {
+            self.cancel();
+            return FullscreenSecondaryPressOutcome::Cancelled;
+        }
+        if elapsed >= crate::ring_shortcut::mouse_flick_menu_delay() {
+            self.cancel();
+            return FullscreenSecondaryPressOutcome::LongPress(sample.pos);
+        }
+        FullscreenSecondaryPressOutcome::None
+    }
+
+    fn remaining_until_long_press(self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let Self::Armed { started_at, .. } = self else {
+            return None;
+        };
+        Some(
+            crate::ring_shortcut::mouse_flick_menu_delay()
+                .saturating_sub(now.saturating_duration_since(started_at)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn armed_for_test(
+        viewer_context: crate::app::ViewerContextId,
+        items_generation: u64,
+        fs_idx: usize,
+        context: crate::ring_shortcut::RightDragContext,
+        started_at: std::time::Instant,
+        start_pos: egui::Pos2,
+    ) -> Self {
+        Self::Armed {
+            owner: FullscreenSecondaryPressOwner::new(
+                viewer_context,
+                items_generation,
+                fs_idx,
+                context,
+            ),
+            started_at,
+            start_pos,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(
+        &mut self,
+        viewer_context: crate::app::ViewerContextId,
+        items_generation: u64,
+        fs_idx: usize,
+        context: crate::ring_shortcut::RightDragContext,
+        now: std::time::Instant,
+        pos: egui::Pos2,
+        down: bool,
+        released: bool,
+    ) -> Option<bool> {
+        match self.advance(
+            Some(FullscreenSecondaryPressOwner::new(
+                viewer_context,
+                items_generation,
+                fs_idx,
+                context,
+            )),
+            FullscreenSecondaryPressSample {
+                pressed: false,
+                down,
+                released,
+                pos,
+                now,
+            },
+        ) {
+            FullscreenSecondaryPressOutcome::ShortTap(_) => Some(false),
+            FullscreenSecondaryPressOutcome::LongPress(_) => Some(true),
+            FullscreenSecondaryPressOutcome::None | FullscreenSecondaryPressOutcome::Cancelled => {
+                None
+            }
+        }
+    }
+}
+
+fn fullscreen_secondary_press_owner_for_frame(
+    candidate: Option<FullscreenSecondaryPressOwner>,
+    mode: &crate::ring_shortcut::RightDragMode,
+    context: crate::ring_shortcut::RightDragContext,
+    blocked: bool,
+    in_overlay_chrome: bool,
+) -> Option<FullscreenSecondaryPressOwner> {
+    candidate.filter(|_| {
+        !blocked
+            && !in_overlay_chrome
+            && context != crate::ring_shortcut::RightDragContext::EditMode
+            && matches!(
+                mode,
+                crate::ring_shortcut::RightDragMode::Disabled
+                    | crate::ring_shortcut::RightDragMode::Unknown(_)
+            )
+    })
+}
+
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
 const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
@@ -21155,7 +21376,13 @@ impl App {
                 // 他アプリからフォーカスが戻ってきた瞬間を記録。
                 // この直後のクリックはナビ目的ではなく「フォーカスを戻すだけのクリック」
                 // とみなし、アプリ側の処理を抑制する（ページ送り・パン開始など）。
-                let focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+                let focused_observation = ctx.input(|i| i.viewport().focused);
+                #[cfg(windows)]
+                self.observe_video_audio_music_viewport_focus(
+                    ctx.viewport_id(),
+                    focused_observation,
+                );
+                let focused_now = focused_observation.unwrap_or(true);
                 if focused_now && !self.fs_prev_focused {
                     self.fs_focus_regained_at = Some(std::time::Instant::now());
                 }
@@ -22904,6 +23131,7 @@ impl App {
                                 "ui_fullscreen::initial_visibility_release",
                                 "viewport_command=Focus",
                             );
+                            self.mark_video_audio_music_viewport_focus_requested(ctx.viewport_id());
                         }
                     } else {
                         ctx.request_repaint();
@@ -30908,7 +31136,7 @@ impl App {
         if modal_input_blocked {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
-            self.fs_secondary_press_start = None;
+            self.fs_secondary_press.cancel();
             self.fs_pan_drag_start = None;
             self.fs_rotation_drag_start = None;
             return (FsPageNav::None, false);
@@ -31477,7 +31705,7 @@ impl App {
         if dialog_open_for_right_drag {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
-            self.fs_secondary_press_start = None;
+            self.fs_secondary_press.cancel();
         }
         let video_in_audio_mode = state.is_video
             && self
@@ -31492,6 +31720,13 @@ impl App {
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let secondary_released = ctx.input(|i| i.pointer.secondary_released());
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
+        let passive_secondary_pos = fullscreen_pointer_pos_or(
+            ctx,
+            full_rect,
+            self.fs_secondary_press
+                .start_pos()
+                .unwrap_or(full_rect.center()),
+        );
         let secondary_in_overlay_chrome = fullscreen_secondary_in_overlay_chrome(
             secondary_pos,
             full_rect,
@@ -31520,6 +31755,32 @@ impl App {
         } else {
             None
         };
+        let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
+            self.fullscreen_idx.map(|fs_idx| {
+                FullscreenSecondaryPressOwner::new(
+                    // This existing helper is the cross-platform current projection owner;
+                    // edit requests and physical pointer sequences need the same exact scope.
+                    self.edit_request_owner_context(),
+                    self.items_generation,
+                    fs_idx,
+                    right_drag_context,
+                )
+            }),
+            &right_drag_mode,
+            right_drag_context,
+            right_drag_gate_reject.is_some(),
+            secondary_in_overlay_chrome,
+        );
+        let passive_press_outcome = self.fs_secondary_press.advance(
+            passive_press_owner,
+            FullscreenSecondaryPressSample {
+                pressed: secondary_pressed,
+                down: secondary_down,
+                released: secondary_released,
+                pos: passive_secondary_pos,
+                now: std::time::Instant::now(),
+            },
+        );
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
             && Self::detached_image_window_debug_enabled()
@@ -31690,45 +31951,20 @@ impl App {
                     if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
                         return (page_nav, close);
                     }
-                    if secondary_in_overlay_chrome {
-                        self.fs_secondary_press_start = None;
-                    } else if secondary_down && self.fs_secondary_press_start.is_none() {
-                        // 押下開始を記録
-                        self.fs_secondary_press_start =
-                            Some((std::time::Instant::now(), secondary_pos));
-                    }
-
-                    if let Some((start_time, start_pos)) = self.fs_secondary_press_start {
-                        let elapsed = start_time.elapsed();
-                        let current_pos = fullscreen_pointer_pos_or(ctx, full_rect, start_pos);
-                        let moved = current_pos.distance(start_pos);
-
-                        if !secondary_released
-                            && elapsed >= std::time::Duration::from_millis(400)
-                            && moved < 20.0
-                        {
-                            // 長押ししきい値超過 → 押下中にコンテキストメニューを即表示
-                            self.fs_context_menu_idx = self.fullscreen_idx;
-                            self.fs_context_menu_pos = current_pos;
-                            self.fs_secondary_press_start = None;
-                        } else if secondary_released {
-                            if moved < 20.0 {
-                                if elapsed >= std::time::Duration::from_millis(400) {
-                                    self.fs_context_menu_idx = self.fullscreen_idx;
-                                    self.fs_context_menu_pos = current_pos;
-                                } else {
-                                    close |= self.apply_viewer_short_right_click_action(
-                                        right_drag_context,
-                                        self.fullscreen_idx,
-                                        current_pos,
-                                    );
-                                }
-                            }
-                            self.fs_secondary_press_start = None;
-                        } else if moved >= 20.0 {
-                            // マウスが動きすぎた → キャンセル
-                            self.fs_secondary_press_start = None;
+                    match passive_press_outcome {
+                        FullscreenSecondaryPressOutcome::ShortTap(pos) => {
+                            close |= self.apply_viewer_short_right_click_action(
+                                right_drag_context,
+                                self.fullscreen_idx,
+                                pos,
+                            );
                         }
+                        FullscreenSecondaryPressOutcome::LongPress(pos) => {
+                            self.fs_context_menu_idx = self.fullscreen_idx;
+                            self.fs_context_menu_pos = pos;
+                        }
+                        FullscreenSecondaryPressOutcome::Cancelled
+                        | FullscreenSecondaryPressOutcome::None => {}
                     }
                 }
             }
@@ -33271,9 +33507,10 @@ impl App {
         }
 
         // 右クリック長押し検出中: しきい値チェックのため再描画をリクエスト
-        if let Some((start_time, _)) = self.fs_secondary_press_start {
-            let remaining =
-                std::time::Duration::from_millis(400).saturating_sub(start_time.elapsed());
+        if let Some(remaining) = self
+            .fs_secondary_press
+            .remaining_until_long_press(std::time::Instant::now())
+        {
             if remaining.is_zero() {
                 ctx.request_repaint();
             } else {
@@ -45170,6 +45407,324 @@ mod tests {
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;
+
+    fn secondary_press_owner(context_id: u64, fs_idx: usize) -> FullscreenSecondaryPressOwner {
+        FullscreenSecondaryPressOwner::new(
+            crate::app::ViewerContextId::for_test(context_id),
+            41,
+            fs_idx,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+        )
+    }
+
+    fn secondary_press_sample(
+        now: std::time::Instant,
+        pressed: bool,
+        down: bool,
+        released: bool,
+        pos: egui::Pos2,
+    ) -> FullscreenSecondaryPressSample {
+        FullscreenSecondaryPressSample {
+            pressed,
+            down,
+            released,
+            pos,
+            now,
+        }
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_does_not_rearm_from_stale_level_after_menu() {
+        let owner = secondary_press_owner(1, 7);
+        let pos = egui::pos2(120.0, 180.0);
+        let started = std::time::Instant::now();
+        let mut state = FullscreenSecondaryPress::Idle;
+
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(started, true, true, false, pos)
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                None,
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(20),
+                    false,
+                    true,
+                    false,
+                    pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::Cancelled,
+            "opening a modal menu retires the sequence that opened it"
+        );
+        assert_eq!(state, FullscreenSecondaryPress::Idle);
+
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(600),
+                    false,
+                    true,
+                    false,
+                    egui::pos2(300.0, 240.0),
+                )
+            ),
+            FullscreenSecondaryPressOutcome::None,
+            "a retained down level after menu dismissal is not a new press"
+        );
+        assert_eq!(state, FullscreenSecondaryPress::Idle);
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_lost_release_cannot_fire_long_press() {
+        let owner = secondary_press_owner(1, 7);
+        let pos = egui::pos2(120.0, 180.0);
+        let started = std::time::Instant::now();
+        let mut state = FullscreenSecondaryPress::Idle;
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(started, true, true, false, pos)
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + crate::ring_shortcut::mouse_flick_menu_delay(),
+                    false,
+                    false,
+                    false,
+                    pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::Cancelled
+        );
+        assert_eq!(state, FullscreenSecondaryPress::Idle);
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_preserves_short_and_long_actions() {
+        let owner = secondary_press_owner(1, 7);
+        let started = std::time::Instant::now();
+        let start_pos = egui::pos2(120.0, 180.0);
+        let release_pos = egui::pos2(124.0, 184.0);
+        let mut state = FullscreenSecondaryPress::Idle;
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(started, true, false, true, release_pos)
+            ),
+            FullscreenSecondaryPressOutcome::ShortTap(release_pos),
+            "a complete press/release pair in one egui input frame remains a short tap"
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(10),
+                    true,
+                    true,
+                    false,
+                    start_pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(110),
+                    false,
+                    false,
+                    true,
+                    release_pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::ShortTap(release_pos)
+        );
+
+        let long_started = started + std::time::Duration::from_secs(1);
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(long_started, true, true, false, start_pos)
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    long_started + crate::ring_shortcut::mouse_flick_menu_delay(),
+                    false,
+                    true,
+                    false,
+                    release_pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::LongPress(release_pos)
+        );
+        assert_eq!(state, FullscreenSecondaryPress::Idle);
+
+        let released_long_started = started + std::time::Duration::from_secs(2);
+        let _ = state.advance(
+            Some(owner),
+            secondary_press_sample(released_long_started, true, true, false, start_pos),
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    released_long_started + crate::ring_shortcut::mouse_flick_menu_delay(),
+                    false,
+                    false,
+                    true,
+                    release_pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::LongPress(release_pos),
+            "a release frame at the existing threshold keeps the previous long-press action"
+        );
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_rejects_other_viewer_with_same_index_and_context() {
+        let owner = secondary_press_owner(1, 7);
+        let other_viewer = secondary_press_owner(2, 7);
+        let started = std::time::Instant::now();
+        let pos = egui::pos2(120.0, 180.0);
+        let mut state = FullscreenSecondaryPress::Idle;
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(started, true, true, false, pos)
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                Some(other_viewer),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(100),
+                    false,
+                    false,
+                    true,
+                    pos,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::Cancelled
+        );
+        assert_eq!(state, FullscreenSecondaryPress::Idle);
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_eligibility_retires_mode_edit_chrome_and_modal_owners() {
+        let candidate = Some(secondary_press_owner(1, 7));
+        let disabled = crate::ring_shortcut::RightDragMode::Disabled;
+        assert_eq!(
+            fullscreen_secondary_press_owner_for_frame(
+                candidate,
+                &disabled,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                false,
+                false,
+            ),
+            candidate
+        );
+        for owner in [
+            fullscreen_secondary_press_owner_for_frame(
+                candidate,
+                &crate::ring_shortcut::RightDragMode::RingShortcut,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                false,
+                false,
+            ),
+            fullscreen_secondary_press_owner_for_frame(
+                candidate,
+                &disabled,
+                crate::ring_shortcut::RightDragContext::EditMode,
+                false,
+                false,
+            ),
+            fullscreen_secondary_press_owner_for_frame(
+                candidate,
+                &disabled,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                true,
+                false,
+            ),
+            fullscreen_secondary_press_owner_for_frame(
+                candidate,
+                &disabled,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                false,
+                true,
+            ),
+        ] {
+            assert_eq!(owner, None);
+        }
+    }
+
+    #[test]
+    fn fullscreen_secondary_press_motion_cancels_until_a_fresh_edge() {
+        let owner = secondary_press_owner(1, 7);
+        let started = std::time::Instant::now();
+        let pos = egui::pos2(120.0, 180.0);
+        let moved = pos + egui::vec2(FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX, 0.0);
+        let mut state = FullscreenSecondaryPress::Idle;
+        let _ = state.advance(
+            Some(owner),
+            secondary_press_sample(started, true, true, false, pos),
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(20),
+                    false,
+                    true,
+                    false,
+                    moved,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::Cancelled
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(500),
+                    false,
+                    true,
+                    false,
+                    moved,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert_eq!(
+            state.advance(
+                Some(owner),
+                secondary_press_sample(
+                    started + std::time::Duration::from_millis(600),
+                    true,
+                    true,
+                    false,
+                    moved,
+                )
+            ),
+            FullscreenSecondaryPressOutcome::None
+        );
+        assert!(matches!(state, FullscreenSecondaryPress::Armed { .. }));
+    }
 
     #[test]
     fn transparent_underlay_default_and_missing_checker_are_explicit_black() {

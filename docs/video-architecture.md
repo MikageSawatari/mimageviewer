@@ -2651,7 +2651,10 @@ context menu / keyboard focus / modal / normalize scan の所有権 guard を co
 
 **presenter を drop せず hide する (consume-and-hold)**。動画→音声モードへ入るとき native
 D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{visible:false}` で
-`SW_HIDE` して生かしたままにする。理由:
+`SW_HIDE` して生かしたままにする。Fullscreen では、先に同じ世代の music viewport を描画し、
+初回の既存 `Visible(true)` + `Focus` command を一度だけ発行して、viewport が exact
+`focused=Some(true)` を返した後に presenter の hide を要求する。MainWindow / DetachedWindow
+では表示中の egui surface が既に入力 owner なので直ちに hide を要求する。理由:
 
 - **映像を止めない**。demux / decode は通常どおり回り、hidden presenter は届いたフレームを
   consume して `last_displayed_pts_bits` / `displayed_frame_seq` / FirstFrameReady などの
@@ -2665,8 +2668,11 @@ D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{vi
   timeout は持たず、通常動画の遷移条件は変えない。
 - **音切れを作らない**。presenter を drop して作り直すと音声パイプラインも一度畳む必要があり
   数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
-- **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の
-  再取得を決定的に扱える。
+- **focus / exit race を避ける**。可視 presenter HWND と入力 owner を同じ判定にせず、
+  `AwaitingPresentation → AwaitingFocus → HideRequested → SettledHidden` の typed runtime で
+  handoff を所有する。`Some(false)` / `None` は Focus command の負 acknowledgement ではない。
+  presenter pump が実際の hidden を publish する前に exit された場合は hide commit を待ってから
+  show し、hide 自体をまだ要求していない場合は同期的に video mode へ戻る。
 
 hide 中の最新映像は native output context の `FramePresentationState::Hidden` が 1 枚だけ
 所有する。新フレームを選択すると旧 `Hidden` を producer-side recovery へ返し、show 時は同じ
@@ -2674,9 +2680,16 @@ frame を最新 grade で present して `Visible` へ移してから HWND を�
 中に再提示しない。
 
 hide 中は HUD overlay HWND も明示 hide し、overlay tick / cursor polling / HUD raise burst を
-抑止する。音声モードの owner 同期・focus guard・`ensure_native_video_front` は
-`video_audio_mode == Some(idx)` を「presenter 非アクティブ扱い」の gate にして、現行 detach
-(hwnd=0) と同じ挙動を再現する。
+抑止する。音声モードの owner 同期と `ensure_native_video_front` は
+`video_audio_mode == Some(idx)` を「presenter 非アクティブ扱い」の gate にする。一方 main-focus
+close guard は HWND の可視性から入力 owner を推定しない。Fullscreen handoff が exact
+context / item / source epoch / presenter HWND / committed generation floor を所有し、まだ
+`AwaitingPresentation` / `AwaitingFocus` の間だけ close を抑止する。`Some(true)` を受けた
+`HideRequested` は入力 handoff 完了後の可視性 commit 待ちなので guard へ含めない。owner 失効、外部
+foreground、fullscreen root で消費されていない明示 main 入力も handoff を終端する。runtime は
+viewer bundle と一緒に mount / park / restore / retire され、LiveMedia park で新しい
+`ViewerContextId` へ fork されるときだけ exact presenter owner も同じ transaction で移送する。通常の
+外部 focus loss と MainWindow / DetachedWindow の close 規則は維持する。
 
 **ファイル移動は音声モードを維持する**。音声モード中に前後ファイルへ移動すると、hidden
 presenter の source だけを差し替える keep-audio-mode の source-swap を使い、遷移先が映像を持つ
@@ -2687,8 +2700,10 @@ presenter を一時的に un-hide して VST ホスト化する (音効果自体
 この source-swap では pump-owned の `WindowHostState` と、その output-lifetime projection
 `NativePresenterVisibility` は交換しない。新 source の `video_rx` も最初の source と同じ hidden
 drain policy を直ちに使うため、seek 直後を含め `video_tx` の back-pressure で demux EOF を塞がない。
-swap 完了後の音声モード再確立は hide を再要求するが、Hidden→Hidden でも pump が completion を返す。
-音声モード終了時だけ typed show transition が projection を visible に戻す。
+swap 完了後の音声モード再確立は新 source / HWND の runtime owner を作り直す。既に Hidden なら
+`SettledHidden`、Fullscreen で visible なら同じ viewport focus handoff、MainWindow / DetachedWindow
+なら直ちに hide 要求へ進む。音声モード終了時だけ typed show transition が projection を visible
+に戻す。
 
 実装の詳細な段階計画 (10 ステップ)・Codex 設計レビュー履歴は
 [music-integration-plan.md](music-integration-plan.md) § 5.7 を参照。

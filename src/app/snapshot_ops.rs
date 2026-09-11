@@ -157,6 +157,7 @@ impl App {
         self.analysis_hist_cache = None;
         self.analysis_sv_cache = None;
         self.fs_context_menu_idx = None;
+        self.fs_secondary_press.cancel();
         self.adjust_scope_selection_idx = None;
         self.cancel_mouse_ring_flick();
         self.mouse_ring_grid_target_idx = None;
@@ -246,13 +247,15 @@ impl App {
     #[cfg(windows)]
     fn finish_snapshot_windows_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
-        self.video_audio_exit_pending =
-            self.video_audio_exit_pending.take().and_then(|mut state| {
-                remap(state.fs_idx).map(|new_idx| {
-                    state.fs_idx = new_idx;
-                    state
-                })
-            });
+        self.video_audio_mode_runtime =
+            self.video_audio_mode_runtime
+                .take()
+                .and_then(|mut runtime| {
+                    remap(runtime.fs_idx).map(|new_idx| {
+                        runtime.remap_fs_idx(new_idx);
+                        runtime
+                    })
+                });
         self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(&remap);
 
         if swap.current_owns_global_media_indices {
@@ -2168,6 +2171,27 @@ mod tests {
         assert!(!app.is_snapshot_active());
         assert_eq!(app.snapshot_count(), None);
         assert!(app.snapshot_origin().is_none());
+    }
+
+    #[test]
+    fn snapshot_index_space_change_retires_secondary_press_owner() {
+        let mut app = setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            app.edit_request_owner_context(),
+            app.items_generation,
+            0,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(100.0, 120.0),
+        );
+
+        app.clear_snapshot_index_space_derived_state();
+
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+        );
     }
 
     /// ネスト ZIP の本の中で ★固定 → zip_nav は必ず退避 (take) され、at_origin の解除で
