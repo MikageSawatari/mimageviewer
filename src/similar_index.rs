@@ -1098,6 +1098,7 @@ enum FullReason {
     Reconfigure,
     Overflow,
     WatchRecovery,
+    SummaryRepair,
     Manual,
 }
 
@@ -1108,6 +1109,7 @@ impl FullReason {
             Self::Reconfigure => "reconfigure",
             Self::Overflow => "overflow",
             Self::WatchRecovery => "watch_recovery",
+            Self::SummaryRepair => "summary_repair",
             Self::Manual => "manual",
         }
     }
@@ -1318,6 +1320,50 @@ struct ReconcileWorkCounters {
     image_book_pages: AtomicU64,
     zip_pages: AtomicU64,
     pdf_pages: AtomicU64,
+    directory_time: ReconcileDurationCounter,
+    loose_time: ReconcileDurationCounter,
+    image_book_time: ReconcileDurationCounter,
+    zip_time: ReconcileDurationCounter,
+    pdf_time: ReconcileDurationCounter,
+}
+
+#[derive(Default)]
+struct ReconcileDurationCounter {
+    operations: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReconcileDurationSnapshot {
+    operations: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+impl ReconcileDurationCounter {
+    fn observe(&self, elapsed: std::time::Duration) {
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let _ = self
+            .operations
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            });
+        let _ = self
+            .total_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(elapsed_us))
+            });
+        self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ReconcileDurationSnapshot {
+        ReconcileDurationSnapshot {
+            operations: self.operations.load(Ordering::Relaxed),
+            total_us: self.total_us.load(Ordering::Relaxed),
+            max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1331,6 +1377,11 @@ struct ReconcileWorkSnapshot {
     image_book_pages: u64,
     zip_pages: u64,
     pdf_pages: u64,
+    directory_time: ReconcileDurationSnapshot,
+    loose_time: ReconcileDurationSnapshot,
+    image_book_time: ReconcileDurationSnapshot,
+    zip_time: ReconcileDurationSnapshot,
+    pdf_time: ReconcileDurationSnapshot,
 }
 
 impl ReconcileWorkCounters {
@@ -1345,6 +1396,11 @@ impl ReconcileWorkCounters {
             image_book_pages: self.image_book_pages.load(Ordering::Relaxed),
             zip_pages: self.zip_pages.load(Ordering::Relaxed),
             pdf_pages: self.pdf_pages.load(Ordering::Relaxed),
+            directory_time: self.directory_time.snapshot(),
+            loose_time: self.loose_time.snapshot(),
+            image_book_time: self.image_book_time.snapshot(),
+            zip_time: self.zip_time.snapshot(),
+            pdf_time: self.pdf_time.snapshot(),
         }
     }
 }
@@ -1511,6 +1567,28 @@ impl ReconcileRunTelemetry {
             work.zip_pages,
             work.pdf_containers,
             work.pdf_pages,
+        ));
+        // total_ms is accumulated worker time and may exceed job wall time; max_ms is the
+        // slowest completed operation in that category.
+        crate::logger::log(format!(
+            "similar reconcile work timing: {} terminal={} directory_ops={} directory_total_ms={} directory_max_ms={} loose_ops={} loose_total_ms={} loose_max_ms={} image_book_ops={} image_book_total_ms={} image_book_max_ms={} zip_ops={} zip_total_ms={} zip_max_ms={} pdf_ops={} pdf_total_ms={} pdf_max_ms={}",
+            self.prefix(),
+            terminal,
+            work.directory_time.operations,
+            work.directory_time.total_us / 1_000,
+            work.directory_time.max_us / 1_000,
+            work.loose_time.operations,
+            work.loose_time.total_us / 1_000,
+            work.loose_time.max_us / 1_000,
+            work.image_book_time.operations,
+            work.image_book_time.total_us / 1_000,
+            work.image_book_time.max_us / 1_000,
+            work.zip_time.operations,
+            work.zip_time.total_us / 1_000,
+            work.zip_time.max_us / 1_000,
+            work.pdf_time.operations,
+            work.pdf_time.total_us / 1_000,
+            work.pdf_time.max_us / 1_000,
         ));
     }
 }
@@ -1750,6 +1828,16 @@ impl SchedulerState {
             }
             ReconcileJobKind::Purge => {}
         }
+    }
+
+    fn request_summary_repair_after(&mut self, plan: &ReconcileJobPlan, purge_committed: bool) {
+        self.restore_unfinished_job(plan, purge_committed);
+        self.merge_full_intent(FullIntent {
+            config_epoch: self.config_epoch,
+            required_gap_epoch: self.next_gap_epoch,
+            reason: FullReason::SummaryRepair,
+        });
+        self.phase = SchedulerPhase::Idle;
     }
 
     fn finish_successful_job(&mut self, plan: &ReconcileJobPlan) -> SuccessfulJobDisposition {
@@ -2710,6 +2798,8 @@ impl SimilarIndexScheduler {
                         return Ok(ScanJobOutcome {
                             report: IndexReport::default(),
                             prune_safe: false,
+                            requires_full: false,
+                            watermark: None,
                         });
                     }
                 };
@@ -2747,6 +2837,8 @@ impl SimilarIndexScheduler {
                     ReconcileJobKind::Purge => Ok(ScanJobOutcome {
                         report: IndexReport::default(),
                         prune_safe: true,
+                        requires_full: false,
+                        watermark: None,
                     }),
                 }?;
                 let mut report = scan.report;
@@ -2754,6 +2846,8 @@ impl SimilarIndexScheduler {
                 Ok(ScanJobOutcome {
                     report,
                     prune_safe: scan.prune_safe,
+                    requires_full: scan.requires_full,
+                    watermark: scan.watermark,
                 })
             });
 
@@ -2805,7 +2899,34 @@ impl SimilarIndexScheduler {
                 }
             };
 
-            let watermark = match db.change_watermark() {
+            if outcome.requires_full {
+                telemetry.log_terminal("summary_repair_required", &outcome.report);
+                let restart = {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.request_summary_repair_after(&plan, purge_committed);
+                    state.reserve_worker_if_runnable()
+                };
+                *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = if restart {
+                    IndexProgress::Running(RunningProgress {
+                        stage: IndexStage::Opening,
+                        current_path: None,
+                        report: outcome.report,
+                    })
+                } else {
+                    IndexProgress::AwaitingWatch(outcome.report)
+                };
+                if restart {
+                    continue;
+                }
+                self.book_query.soft_refresh();
+                return;
+            }
+
+            let watermark = match outcome
+                .watermark
+                .map(Ok)
+                .unwrap_or_else(|| db.change_watermark())
+            {
                 Ok(watermark) => watermark,
                 Err(error) => {
                     telemetry.log_terminal("failed", &outcome.report);
@@ -4407,8 +4528,6 @@ impl<T> Drop for WorkLease<'_, T> {
 #[derive(Default)]
 struct ScanAggregateState {
     report: IndexReport,
-    seen_items: HashSet<String>,
-    seen_containers: HashSet<String>,
     visited_dirs: HashSet<String>,
     prune_safe: bool,
 }
@@ -4446,7 +4565,7 @@ impl<'a> ScanAggregate<'a> {
             .insert(directory_key)
     }
 
-    fn merge(&self, report: &mut IndexReport, local_seen: &mut ScanLocalSeen, prune_safe: bool) {
+    fn merge(&self, report: &mut IndexReport, prune_safe: bool) {
         let published = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.report.discovered = state.report.discovered.saturating_add(report.discovered);
@@ -4487,10 +4606,6 @@ impl<'a> ScanAggregate<'a> {
                 .saturating_add(report.decode_failures);
             state.report.io_failures = state.report.io_failures.saturating_add(report.io_failures);
             state.report.errors.append(&mut report.errors);
-            if let ScanLocalSeen::Delta { items, containers } = local_seen {
-                state.seen_items.extend(items.drain());
-                state.seen_containers.extend(containers.drain());
-            }
             state.prune_safe &= prune_safe;
             report.discovered = 0;
             report.processed = 0;
@@ -4519,8 +4634,6 @@ impl<'a> ScanAggregate<'a> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         ScanAggregateState {
             report: state.report.clone(),
-            seen_items: state.seen_items.clone(),
-            seen_containers: state.seen_containers.clone(),
             visited_dirs: HashSet::new(),
             prune_safe: state.prune_safe,
         }
@@ -4541,6 +4654,15 @@ enum ScanWork {
     },
     Zip(FileCandidate),
     Pdf(FileCandidate),
+}
+
+#[derive(Clone, Copy)]
+enum ReconcileWorkKind {
+    Directory,
+    Loose,
+    ImageBook,
+    Zip,
+    Pdf,
 }
 
 impl ScanWork {
@@ -4583,6 +4705,16 @@ impl ReconcileRunTelemetry {
         }
     }
 
+    fn observe_work_elapsed(&self, kind: ReconcileWorkKind, elapsed: std::time::Duration) {
+        match kind {
+            ReconcileWorkKind::Directory => self.work.directory_time.observe(elapsed),
+            ReconcileWorkKind::Loose => self.work.loose_time.observe(elapsed),
+            ReconcileWorkKind::ImageBook => self.work.image_book_time.observe(elapsed),
+            ReconcileWorkKind::Zip => self.work.zip_time.observe(elapsed),
+            ReconcileWorkKind::Pdf => self.work.pdf_time.observe(elapsed),
+        }
+    }
+
     fn observe_directory_entries(&self, count: u64) {
         self.work
             .directory_entries
@@ -4605,6 +4737,8 @@ impl ReconcileRunTelemetry {
 struct ScanJobOutcome {
     report: IndexReport,
     prune_safe: bool,
+    requires_full: bool,
+    watermark: Option<crate::similar_db::StoreWatermark>,
 }
 
 #[derive(Default)]
@@ -4616,15 +4750,15 @@ struct DeltaPublication {
 #[derive(Clone, Copy)]
 enum ScanPass<'a> {
     Full(&'a FullReconcileInventory),
-    Delta(&'a DeltaPublication),
+    Delta {
+        inventory: &'a crate::similar_db::DeltaScopedInventory,
+        publication: &'a DeltaPublication,
+    },
 }
 
 enum ScanLocalSeen {
     Full,
-    Delta {
-        items: HashSet<String>,
-        containers: HashSet<String>,
-    },
+    Delta,
 }
 
 impl DeltaPublication {
@@ -4669,6 +4803,8 @@ fn run_index_job(
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
             prune_safe: false,
+            requires_full: false,
+            watermark: None,
         });
     }
     db.cleanup_incomplete()
@@ -4681,6 +4817,8 @@ fn run_index_job(
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
             prune_safe: false,
+            requires_full: false,
+            watermark: None,
         });
     };
     if let Some(telemetry) = telemetry {
@@ -4736,6 +4874,8 @@ fn run_index_job(
         return Ok(ScanJobOutcome {
             report: aggregate.report,
             prune_safe: false,
+            requires_full: false,
+            watermark: None,
         });
     }
     set_stage(progress, IndexStage::Pruning, None);
@@ -4776,6 +4916,8 @@ fn run_index_job(
     Ok(ScanJobOutcome {
         report: aggregate.report,
         prune_safe: aggregate.prune_safe,
+        requires_full: false,
+        watermark: None,
     })
 }
 
@@ -4788,6 +4930,14 @@ fn run_delta_index_job(
     _array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
+    if !wait_for_full_inventory_start(config.activity_gate.as_deref(), cancel) {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+            requires_full: false,
+            watermark: None,
+        });
+    }
     db.cleanup_incomplete()
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
     set_stage(progress, IndexStage::Scanning, None);
@@ -4844,6 +4994,8 @@ fn run_delta_index_job(
                 let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
+                    requires_full: false,
+                    watermark: None,
                 };
                 if let Some(telemetry) = telemetry {
                     telemetry.log_phase("scan_incomplete", Some(&outcome.report));
@@ -4868,6 +5020,8 @@ fn run_delta_index_job(
                 let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
+                    requires_full: false,
+                    watermark: None,
                 };
                 if let Some(telemetry) = telemetry {
                     telemetry.log_phase("scan_incomplete", Some(&outcome.report));
@@ -4882,6 +5036,8 @@ fn run_delta_index_job(
                 let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
+                    requires_full: false,
+                    watermark: None,
                 };
                 if let Some(telemetry) = telemetry {
                     telemetry.log_phase("scan_incomplete", Some(&outcome.report));
@@ -4893,6 +5049,8 @@ fn run_delta_index_job(
                 let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
+                    requires_full: false,
+                    watermark: None,
                 };
                 if let Some(telemetry) = telemetry {
                     telemetry.log_phase("scan_incomplete", Some(&outcome.report));
@@ -4906,6 +5064,31 @@ fn run_delta_index_job(
             }
         }
     }
+
+    let mut scope_plan = crate::similar_db::DeltaScopePlan::default();
+    for scope in &active_scopes {
+        let (target, path) = match scope {
+            DirtyScope::DirectoryContents(path) => (&mut scope_plan.directory_contents, path),
+            DirtyScope::Subtree(path) | DirtyScope::RootRepair(path) => {
+                (&mut scope_plan.subtrees, path)
+            }
+            DirtyScope::RemovedPrefix(path) => (&mut scope_plan.removed_prefixes, path),
+        };
+        target.push(crate::search_index_db::normalize_path(path));
+    }
+    let Some(inventory) = db
+        .load_delta_scoped_inventory(scope_plan, current_hash_version(), || {
+            !cancel.load(Ordering::Acquire)
+        })
+        .map_err(|error| format!("delta scoped inventory load failed: {error}"))?
+    else {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+            requires_full: false,
+            watermark: None,
+        });
+    };
 
     let aggregate = ScanAggregate::with_telemetry(progress, telemetry);
     let publication = DeltaPublication::default();
@@ -4927,7 +5110,10 @@ fn run_delta_index_job(
                     cancel,
                     progress,
                     &deferred_refresh,
-                    ScanPass::Delta(&publication),
+                    ScanPass::Delta {
+                        inventory: &inventory,
+                        publication: &publication,
+                    },
                     telemetry,
                 )
             }));
@@ -4951,49 +5137,56 @@ fn run_delta_index_job(
         return Ok(ScanJobOutcome {
             report: aggregate.report,
             prune_safe: false,
+            requires_full: false,
+            watermark: None,
         });
     }
     set_stage(progress, IndexStage::Pruning, None);
     if let Some(telemetry) = telemetry {
         telemetry.log_phase("pruning", Some(&aggregate.report));
     }
+    let mut published_watermark = None;
     if aggregate.prune_safe {
-        let mut directory_contents = Vec::new();
-        let mut subtrees = Vec::new();
-        let mut removed_prefixes = Vec::new();
-        for scope in &active_scopes {
-            let (target, path) = match scope {
-                DirtyScope::DirectoryContents(path) => (&mut directory_contents, path),
-                DirtyScope::Subtree(path) | DirtyScope::RootRepair(path) => (&mut subtrees, path),
-                DirtyScope::RemovedPrefix(path) => (&mut removed_prefixes, path),
-            };
-            target.push(crate::search_index_db::normalize_path(path));
-        }
         let completed_at_unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         let (loose_items, completed_containers) = publication.into_parts();
-        aggregate.report.removed = match db.publish_delta_reconcile_if(
+        match db.publish_delta_scoped_reconcile_if(
+            inventory,
             &loose_items,
             &completed_containers,
-            &directory_contents,
-            &subtrees,
-            &removed_prefixes,
-            &aggregate.seen_items,
-            &aggregate.seen_containers,
             current_hash_version(),
             completed_at_unix_secs,
             || !cancel.load(Ordering::Acquire),
         ) {
-            Ok(removed) => removed as u64,
+            Ok(crate::similar_db::DeltaPublishResult::Committed { removed, watermark }) => {
+                aggregate.report.removed = removed as u64;
+                published_watermark = Some(watermark);
+            }
+            Ok(crate::similar_db::DeltaPublishResult::RequiresFull) => {
+                return Ok(ScanJobOutcome {
+                    report: aggregate.report,
+                    prune_safe: true,
+                    requires_full: true,
+                    watermark: None,
+                });
+            }
+            Ok(crate::similar_db::DeltaPublishResult::Skipped) => {
+                return Ok(ScanJobOutcome {
+                    report: aggregate.report,
+                    prune_safe: false,
+                    requires_full: false,
+                    watermark: None,
+                });
+            }
             Err(error) => {
                 db.cleanup_incomplete().map_err(|cleanup| {
                     format!("delta publish failed: {error}; generation cleanup failed: {cleanup}")
                 })?;
                 return Err(format!("delta publish failed: {error}"));
             }
-        };
+        }
         if let Some(telemetry) = telemetry {
             telemetry.log_phase("database_published", Some(&aggregate.report));
         }
@@ -5008,6 +5201,8 @@ fn run_delta_index_job(
     Ok(ScanJobOutcome {
         report: aggregate.report,
         prune_safe: aggregate.prune_safe,
+        requires_full: false,
+        watermark: published_watermark,
     })
 }
 
@@ -5047,9 +5242,17 @@ fn scan_worker_loop(
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
+        let work_kind = match &work {
+            ScanWork::Directory(_) | ScanWork::DirectoryContents(_) => ReconcileWorkKind::Directory,
+            ScanWork::LooseImage { .. } => ReconcileWorkKind::Loose,
+            ScanWork::ImageBook { .. } => ReconcileWorkKind::ImageBook,
+            ScanWork::Zip(_) => ReconcileWorkKind::Zip,
+            ScanWork::Pdf(_) => ReconcileWorkKind::Pdf,
+        };
         if let Some(telemetry) = telemetry {
             telemetry.observe_work(&work);
         }
+        let work_started = std::time::Instant::now();
         let path = work.path().to_path_buf();
         set_stage(progress, IndexStage::Scanning, Some(path.clone()));
         let mut context = ScanContext {
@@ -5061,10 +5264,7 @@ fn scan_worker_loop(
             report: IndexReport::default(),
             local_seen: match pass {
                 ScanPass::Full(_) => ScanLocalSeen::Full,
-                ScanPass::Delta(_) => ScanLocalSeen::Delta {
-                    items: HashSet::new(),
-                    containers: HashSet::new(),
-                },
+                ScanPass::Delta { .. } => ScanLocalSeen::Delta,
             },
             prune_safe: true,
             array_refresh,
@@ -5102,6 +5302,9 @@ fn scan_worker_loop(
                 Vec::new()
             }
         };
+        if let Some(telemetry) = telemetry {
+            telemetry.observe_work_elapsed(work_kind, work_started.elapsed());
+        }
         context.publish();
         lease.finish(children.into_iter().map(ScanWork::tagged).collect());
     }
@@ -5113,8 +5316,7 @@ impl ScanContext<'_> {
     }
 
     fn publish(&mut self) {
-        self.aggregate
-            .merge(&mut self.report, &mut self.local_seen, self.prune_safe);
+        self.aggregate.merge(&mut self.report, self.prune_safe);
     }
 
     fn mark_item_seen(&mut self, item_key: &str) {
@@ -5122,8 +5324,8 @@ impl ScanContext<'_> {
             (ScanPass::Full(inventory), ScanLocalSeen::Full) => {
                 inventory.mark_item(item_key);
             }
-            (ScanPass::Delta(_), ScanLocalSeen::Delta { items, .. }) => {
-                items.insert(item_key.to_owned());
+            (ScanPass::Delta { inventory, .. }, ScanLocalSeen::Delta) => {
+                inventory.mark_item(item_key);
             }
             _ => unreachable!("scan pass and local seen owner must match"),
         }
@@ -5134,8 +5336,8 @@ impl ScanContext<'_> {
             (ScanPass::Full(inventory), ScanLocalSeen::Full) => {
                 inventory.observe_container(container_key);
             }
-            (ScanPass::Delta(_), ScanLocalSeen::Delta { containers, .. }) => {
-                containers.insert(container_key.to_owned());
+            (ScanPass::Delta { inventory, .. }, ScanLocalSeen::Delta) => {
+                inventory.observe_container(container_key);
             }
             _ => unreachable!("scan pass and local seen owner must match"),
         }
@@ -5158,18 +5360,15 @@ impl ScanContext<'_> {
                     candidate.file_size,
                 )
                 .exact_current),
-            ScanPass::Delta(_) => {
-                self.mark_item_seen(item_key);
-                Ok(self
-                    .db
-                    .load_item(item_key, current_hash_version())
-                    .map_err(db_error)?
-                    .is_some_and(|existing| {
-                        existing.item.container_key.as_deref() == owner
-                            && existing.item.page_index == page_index
-                            && item_metadata_matches(&existing.item, candidate)
-                    }))
-            }
+            ScanPass::Delta { inventory, .. } => Ok(inventory
+                .observe_item(
+                    item_key,
+                    owner,
+                    page_index,
+                    candidate.mtime,
+                    candidate.file_size,
+                )
+                .exact_current),
         }
     }
 
@@ -5180,25 +5379,31 @@ impl ScanContext<'_> {
         page_index: Option<u32>,
         candidate: &FileCandidate,
     ) -> Result<Option<StoredItem>, String> {
-        if let ScanPass::Full(inventory) = self.pass
-            && !inventory
-                .observe_item(
-                    item_key,
-                    owner,
-                    page_index,
-                    candidate.mtime,
-                    candidate.file_size,
-                )
-                .reusable_current_row
-        {
-            return Ok(None);
+        match self.pass {
+            ScanPass::Full(inventory) => {
+                if !inventory
+                    .observe_item(
+                        item_key,
+                        owner,
+                        page_index,
+                        candidate.mtime,
+                        candidate.file_size,
+                    )
+                    .reusable_current_row
+                {
+                    return Ok(None);
+                }
+                Ok(self
+                    .db
+                    .load_item(item_key, current_hash_version())
+                    .map_err(db_error)?
+                    .filter(|existing| item_metadata_matches(&existing.item, candidate))
+                    .map(|existing| existing.item))
+            }
+            ScanPass::Delta { inventory, .. } => {
+                Ok(inventory.reusable_item(item_key, candidate.mtime, candidate.file_size))
+            }
         }
-        Ok(self
-            .db
-            .load_item(item_key, current_hash_version())
-            .map_err(db_error)?
-            .filter(|existing| item_metadata_matches(&existing.item, candidate))
-            .map(|existing| existing.item))
     }
 
     fn container_observation(
@@ -5216,22 +5421,13 @@ impl ScanContext<'_> {
                 page_count,
                 current_hash_version(),
             )),
-            ScanPass::Delta(_) => {
-                let freshness = self
-                    .db
-                    .container_freshness(
-                        container_key,
-                        mtime,
-                        file_size,
-                        page_count,
-                        current_hash_version(),
-                    )
-                    .map_err(db_error)?;
-                Ok(crate::similar_db::FullContainerObservation {
-                    freshness,
-                    member_count: 0,
-                })
-            }
+            ScanPass::Delta { inventory, .. } => Ok(inventory.container_observation(
+                container_key,
+                mtime,
+                file_size,
+                page_count,
+                current_hash_version(),
+            )),
         }
     }
 
@@ -5240,24 +5436,15 @@ impl ScanContext<'_> {
             ScanPass::Full(inventory) => {
                 Ok(u64::from(inventory.container_member_count(container_key)))
             }
-            ScanPass::Delta(_) => {
-                let keys = self
-                    .db
-                    .item_keys_for_container(container_key)
-                    .map_err(db_error)?;
-                let count = keys.len() as u64;
-                let ScanLocalSeen::Delta { items, .. } = &mut self.local_seen else {
-                    unreachable!("delta pass must own local seen sets")
-                };
-                items.extend(keys);
-                Ok(count)
+            ScanPass::Delta { inventory, .. } => {
+                Ok(u64::from(inventory.container_member_count(container_key)))
             }
         }
     }
 
     fn publish_loose_item(&self, item: StoredItem) -> Result<(), String> {
         match self.pass {
-            ScanPass::Delta(publication) => {
+            ScanPass::Delta { publication, .. } => {
                 publication.stage_loose(item);
                 Ok(())
             }
@@ -5276,7 +5463,7 @@ impl ScanContext<'_> {
 
     fn finish_container(&self, container_key: &str, generation: u64) -> Result<(), String> {
         match self.pass {
-            ScanPass::Delta(publication) => {
+            ScanPass::Delta { publication, .. } => {
                 publication.stage_container(container_key.to_owned(), generation);
                 Ok(())
             }
@@ -6449,6 +6636,7 @@ mod tests {
         assert_eq!(FullReason::Initial.label(), "initial");
         assert_eq!(FullReason::Reconfigure.label(), "reconfigure");
         assert_eq!(FullReason::Overflow.label(), "overflow");
+        assert_eq!(FullReason::SummaryRepair.label(), "summary_repair");
         assert_eq!(FullReason::Manual.label(), "manual");
         assert!(!telemetry.claim_progress_log(4_999));
         assert!(telemetry.claim_progress_log(5_000));
@@ -6456,6 +6644,24 @@ mod tests {
         assert!(telemetry.claim_progress_log(10_000));
         assert!(telemetry.claim_terminal_log());
         assert!(!telemetry.claim_terminal_log());
+    }
+
+    #[test]
+    fn reconcile_telemetry_category_time_is_saturating_worker_time() {
+        let counter = ReconcileDurationCounter::default();
+        counter.observe(Duration::from_micros(1_250));
+        counter.observe(Duration::from_micros(3_750));
+        let snapshot = counter.snapshot();
+        assert_eq!(snapshot.operations, 2);
+        assert_eq!(snapshot.total_us, 5_000);
+        assert_eq!(snapshot.max_us, 3_750);
+
+        counter.operations.store(u64::MAX, Ordering::Relaxed);
+        counter.total_us.store(u64::MAX - 10, Ordering::Relaxed);
+        counter.observe(Duration::from_micros(20));
+        let saturated = counter.snapshot();
+        assert_eq!(saturated.operations, u64::MAX);
+        assert_eq!(saturated.total_us, u64::MAX);
     }
 
     #[test]
@@ -6526,8 +6732,16 @@ mod tests {
             password_revision: 0,
             activity_gate: None,
         };
+        let delta_db = SimilarDb::open_in_memory().unwrap();
+        delta_db
+            .record_completed_index(
+                current_hash_version(),
+                1,
+                crate::similar_db::CompletedIndexStats::default(),
+            )
+            .unwrap();
         let outcome = run_delta_index_job(
-            &SimilarDb::open_in_memory().unwrap(),
+            &delta_db,
             &DirtyScopeSet::default(),
             &empty_config,
             &Arc::new(AtomicBool::new(false)),
@@ -7174,6 +7388,93 @@ mod tests {
             0,
             "cancellation while paused must not enter the inventory loader"
         );
+    }
+
+    #[test]
+    fn incremental_delta_obeys_pause_before_cleanup_inventory_and_cancel() {
+        let run = |db: &SimilarDb,
+                   gate: &Arc<crate::activity_gate::ActivityGate>,
+                   cancel: &Arc<AtomicBool>| {
+            run_delta_index_job(
+                db,
+                &DirtyScopeSet::default(),
+                &SchedulerConfig {
+                    roots: Vec::new(),
+                    excluded_roots: Vec::new(),
+                    excluded_root_keys: Vec::new(),
+                    pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+                    password_revision: 0,
+                    activity_gate: Some(Arc::clone(gate)),
+                },
+                cancel,
+                &Arc::new(Mutex::new(IndexProgress::Idle)),
+                &ArrayRefreshNotifier {
+                    scheduler: Weak::new(),
+                },
+                None,
+            )
+            .unwrap()
+        };
+
+        let paused_db = SimilarDb::open_in_memory().unwrap();
+        paused_db
+            .record_completed_index(
+                current_hash_version(),
+                1,
+                crate::similar_db::CompletedIndexStats::default(),
+            )
+            .unwrap();
+        let paused_gate = Arc::new(crate::activity_gate::ActivityGate::new(10_000));
+        paused_gate.set_paused(true);
+        let paused_cancel = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let db = &paused_db;
+            let gate = &paused_gate;
+            let cancel = &paused_cancel;
+            let run = &run;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                run(db, gate, cancel)
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(INDEX_LIMIT_RECHECK * 3);
+            assert_eq!(paused_db.cleanup_incomplete_call_count(), 0);
+            assert_eq!(paused_db.delta_inventory_load_count(), 0);
+            paused_gate.set_paused(false);
+            assert!(worker.join().unwrap().prune_safe);
+        });
+        assert_eq!(paused_db.cleanup_incomplete_call_count(), 1);
+        assert_eq!(paused_db.delta_inventory_load_count(), 1);
+
+        let cancelled_db = SimilarDb::open_in_memory().unwrap();
+        cancelled_db
+            .record_completed_index(
+                current_hash_version(),
+                1,
+                crate::similar_db::CompletedIndexStats::default(),
+            )
+            .unwrap();
+        let cancelled_gate = Arc::new(crate::activity_gate::ActivityGate::new(10_000));
+        cancelled_gate.set_paused(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let db = &cancelled_db;
+            let gate = &cancelled_gate;
+            let cancel = &cancelled;
+            let run = &run;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                run(db, gate, cancel)
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(INDEX_LIMIT_RECHECK * 2);
+            cancelled.store(true, Ordering::Release);
+            assert!(!worker.join().unwrap().prune_safe);
+        });
+        assert_eq!(cancelled_db.cleanup_incomplete_call_count(), 0);
+        assert_eq!(cancelled_db.delta_inventory_load_count(), 0);
     }
 
     #[test]
@@ -8179,22 +8480,33 @@ mod tests {
         let aggregate = ScanAggregate::new(&progress);
         let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let publication = DeltaPublication::default();
+        let inventory = db
+            .load_delta_scoped_inventory(
+                crate::similar_db::DeltaScopePlan {
+                    directory_contents: vec![String::new()],
+                    ..crate::similar_db::DeltaScopePlan::default()
+                },
+                current_hash_version(),
+                || true,
+            )
+            .unwrap()
+            .unwrap();
         let context = ScanContext {
             db: &db,
             pdf_passwords: &passwords,
             cancel: &cancel,
             aggregate: &aggregate,
             report: IndexReport::default(),
-            local_seen: ScanLocalSeen::Delta {
-                items: HashSet::new(),
-                containers: HashSet::new(),
-            },
+            local_seen: ScanLocalSeen::Delta,
             excluded_root_keys: &[],
             prune_safe: true,
             array_refresh: &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
-            pass: ScanPass::Delta(&publication),
+            pass: ScanPass::Delta {
+                inventory: &inventory,
+                publication: &publication,
+            },
         };
         let unchanged = FileCandidate {
             path: PathBuf::from("this-file-does-not-exist.png"),
@@ -9422,6 +9734,39 @@ mod tests {
     }
 
     #[test]
+    fn incremental_reconcile_invalid_summary_restores_delta_and_selects_full_repair() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let dirty_scope = DirtyScope::DirectoryContents(root.join("changed"));
+        state.next_event_seq = 5;
+        state.dirty.insert(dirty_scope.clone(), 5);
+        let plan = state.take_next_job().expect("dirty scope starts Delta");
+        assert!(matches!(plan.running.kind, ReconcileJobKind::Delta));
+
+        state.request_summary_repair_after(&plan, false);
+        assert_eq!(state.dirty.latest_by_scope.get(&dirty_scope), Some(&5));
+        assert_eq!(
+            state.pending_full,
+            Some(FullIntent {
+                config_epoch: 7,
+                required_gap_epoch: 0,
+                reason: FullReason::SummaryRepair,
+            })
+        );
+        let repair = state
+            .take_next_job()
+            .expect("summary repair Full is runnable");
+        assert!(matches!(
+            repair.running.kind,
+            ReconcileJobKind::Full(FullIntent {
+                reason: FullReason::SummaryRepair,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn incremental_reconcile_cancelled_full_keeps_the_newer_overflow_repair() {
         let favorite_id = Uuid::new_v4();
         let root = PathBuf::from("c:/library");
@@ -9687,6 +10032,12 @@ mod tests {
         let stale_key = crate::search_index_db::normalize_path(&stale_path);
         let stale = row(1, &stale_key, [7; 32], 10).item;
         db.upsert_loose_item(&stale).unwrap();
+        db.record_completed_index(
+            current_hash_version(),
+            1,
+            crate::similar_db::CompletedIndexStats::default(),
+        )
+        .unwrap();
         let mut dirty = DirtyScopeSet::default();
         dirty.insert(DirtyScope::Subtree(missing), 1);
 
@@ -9715,6 +10066,54 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "confirmed Subtree disappearance must prune every nested stale row"
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_parent_directory_scope_preserves_child_image_book() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let child_book = root.join("child-book");
+        std::fs::create_dir_all(&child_book).unwrap();
+        let favorite_id = Uuid::new_v4();
+        let state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        let config = state.desired_config.unwrap();
+        let db = crate::similar_db::SimilarDb::open_at(&temp.path().join("similar.db")).unwrap();
+        let container_key = crate::search_index_db::normalize_path(&child_book);
+        let page = book_page(&container_key, 0, 7);
+        publish_book(&db, &container_key, &[page.clone()]);
+        db.record_completed_index(
+            current_hash_version(),
+            1,
+            crate::similar_db::CompletedIndexStats::default(),
+        )
+        .unwrap();
+        let mut dirty = DirtyScopeSet::default();
+        dirty.insert(DirtyScope::DirectoryContents(root), 1);
+
+        let outcome = run_delta_index_job(
+            &db,
+            &dirty,
+            &config,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.prune_safe);
+        assert_eq!(outcome.report.removed, 0);
+        assert_eq!(
+            db.load_book_pages(&container_key, current_hash_version())
+                .unwrap()
+                .into_iter()
+                .map(|row| row.item)
+                .collect::<Vec<_>>(),
+            vec![page],
+            "a parent DirectoryContents observation must not retire a child image book"
         );
     }
 

@@ -1,6 +1,6 @@
 # 類似索引：起動確認と変更時DB整理の次段階
 
-2026-09-11。設計検討のみ。実装・性能検証は未実施。
+2026-09-11。設計レビュー完了後、利用者の依頼により実装を開始。実装・性能検証は進行中で、完了扱いにしない。
 前段の実装と検証は [incremental reconcile計画](similar-index-incremental-reconcile-plan.md) を参照。
 
 ## 要求と実測
@@ -82,8 +82,85 @@ scope matrix、snapshot後追加/owner変更、failed保護、book↔loose、ren
 
 既知の旧scope欠陥は旧方式との同値を正解にせず、期待する保持・削除を独立したfixtureで定義する。summary旧baseline移行、commit/rollback、Complete/Failed遷移、purge、store置換、seqとwatermark不一致も検証する。parent index migrationはrollback・中断後旧schemaからの再開・WAL/空き容量・正規化version変更を含める。
 
-共通変更箇所は主にsimilar_dbの候補取得・summary更新とsimilar_indexのscope受渡し・計測。全writerへの影響を設計確定し、親タスクのapp.rs等と重複編集しない。実装後は限定テスト→独立レビュー→全体gate→利用者用build。実機起動は利用者が行い、本番DBの直接変更・索引削除による検証はしない。本変更は設計文書のみのため今回buildは不要。
+共通変更箇所は主にsimilar_dbの候補取得・summary更新とsimilar_indexのscope受渡し・計測。全writerへの影響を設計確定し、親タスクのapp.rs等と重複編集しない。実装後は限定テスト→独立レビュー→全体gate→利用者用build。実機起動は利用者が行い、本番DBの直接変更・索引削除による検証はしない。設計文書だけの段階ではbuild不要だったが、実装後は確認buildを用意する。
 
 ## 設計レビュー記録
 
 2026-09-11、実装調査 `implement_resume` と別担当 `review_resume`（双方GPT-5.6 Sol / xhigh）。独立レビューのP1 2件（child画像本の未観測prune、summary baseline）とP2 1件（RootRepair・長時間TX・migration検収）を上記へ反映し、限定再確認でP1/P2残件なし、設計draft承認。実装や性能結果の承認ではない。source変更・Cargo・アプリ操作・本番DB操作なし。
+
+## 実装の区切りと進捗
+
+利用者の実装依頼を受領。実装・テストは `implement_resume`、独立レビューは別担当 `review_resume`、rootは設計判断・文書・統合調整を所有する。両担当のモデル指定は引き続きSol/xhigh。親タスクのsidecar等とはsource所有を分離する。
+
+| 区切り | 完了条件 | 状態 |
+| --- | --- | --- |
+| DB基盤 | 既知schemaの保持移行、scope候補取得、identity保護、summary baselineと小fixture | 実装・焦点回帰済み、レビュー中 |
+| 索引接続・計測 | production Delta経路への接続、child scope回帰、種類別時間 | 接続・焦点回帰済み、最終確認待ち |
+| 性能・独立レビュー | 小K/大Nの候補数・query plan・時間・移行容量、独立指摘解消 | 検証・レビュー中 |
+| 全体gate・確認build | 最終sourceで全体テスト、実行中アプリを保持した確認build | 未実施 |
+
+前提確認では既存schema 3の明示的保持migrationを追加する方針。schema番号だけを変更して既存再作成分岐へ流さない。既知の古いschema移行も回帰対象。実アプリ起動・停止・通常DBの操作は行わない。
+
+初回core checkではDelta取消分岐の `ScanJobOutcome.watermark` 追随漏れ（E0063 1件）を補正し、再checkはexit0、33.04秒との実装担当報告。両回の出力原本はこの時点で未保存のため、原本付き最終検証とは分けて扱う。Directory/Loose/ImageBook/ZIP/PDFの累積worker wall/max計測は接続済み、migration・scope・summary回帰の追加中であり、source freeze・独立実装レビュー・最終gateはまだ。
+
+最初の焦点回帰は `target/similar-index-startup-delta-optimization-20260911/validation-r1` に記録。rootも原本末尾を照合し、`delta-scoped.log` 6 passed（0.02秒）、`schema-v4.log` 2 passed（0.06秒）を確認した。scope候補件数、child保護、identity変更保護、cancel rollback、invalid summary、v2/v3保持移行と移行失敗後の再openを含む。既存テスト全体・大規模性能・実機改善まで確認できたという意味ではない。
+
+### Production freeze r1
+
+静的確認でドライブ直下のparent keyが `c:` と `c:/` で不一致になる境界を発見し、rootを保持する親key計算と回帰を追加。実行出力未保存の7件成功は参考記録にとどめ、最終ログ付き集合で再確認する。実 `run_delta` のparent-child画像本保護は `validation-r2/parent-child-book.log` で1 passed / 0 failed、0.02秒（compile1分32秒）をrootも確認した。
+
+13:47 JSTの `freeze-production-r1` を独立レビューへ渡した。manifest SHA256 `1AA46689FEFBEC91E7D64CB873F76ED762144A2056F552BDC1407F33A21A5FA0`、patch SHA256 `6B158DCA5E959FE2FF3AD4C22E22F682CD0F131B9BC45DDFEA91F22EC338B297`。sourceはsimilar_db `8FBD978B36F1347AEE3380F80A992E1238F8F616D2D934636392A0EE444B6082`、similar_index `E0EDA60566D81692CCDDD8A5E20BB3CA01BAE53AD51FE9CE0D12AA678B4D09D9`。rootも実file hash一致を確認。性能harnessだけ別test子fileで追加できるよう分離し、production変更時はfreezeを更新する。
+
+既存焦点回帰 `validation-r2` はsimilar-db-module 51 passed / 1 ignored、incremental-reconcile 32 passed、schema-v1 6 passed / 1 ignored、missing-subtree 1 passed、telemetry-safe-unsafe 1 passed、全exit0をrootも照合した。これらは一部集合が重なるため合算の独立件数とはしない。
+
+### r1独立レビュー指摘への対応中
+
+独立レビューでP1 2件：DeltaのcleanupがActivityGateより先でpause/cancel中もDB writeを始める点、scoped loaderの全行collectが巨大scopeで取消pollなしの長いread TXと一時memory増を作る点。r1を解除し、gateをcleanup/metadata/DB取得前へ移す実経路回帰、stream取得と定期取消確認・fallible growth・DB解放回帰を実装担当へ依頼した。P2としてprefix scope各種のquery plan/固定K増Nの証拠が未完で、性能harnessの検収へ追加する。その他のchild保護、identity/failed保護、summary CAS→Full修復、watermark/array ackはレビューで成立を確認。再確認は修正差分と性能証拠に限定する。
+
+### r2静的freezeと検証開始
+
+ActivityGateをDelta入口へ移し、scoped loaderをstream取得・4,096行ごとの取消確認・fallible growthへ変更。性能fixtureを固定K/2段階Nとparent/prefix loose/container/orphanの5 query plan、v3/v4容量・移行時間、旧新最終fingerprint比較へ拡張した。`freeze-r2/MANIFEST.txt` SHA256 `D4023752464DA20CF4B82EA54F967B7EB4305E9BC8719B0C7BD665AEF6D16629`、complete patch `0B418A7BD246A17DB7072B0BEEBBBE896017A43A850725ACA8F5500D162E8E50`。freeze時はrustfmt/diff-checkのみ成功、未compileとして記録。独立レビューへr1との差分を渡し、209からCargo枠返却後に限定テスト・性能検証を開始する。r1成功をr2の成功と読み替えない。
+
+r2再レビューではActivityGate/stream処理を確認したが、production SQLのORDER BY/DISTINCTがrow返却前にscan/sortを行う余地と、EXPLAIN fixtureがその句を省いている不一致をP1とした。順序に意味がないinventory取得の不要な並べ替えを除去し、row step前poll、productionと共通のSQL定義によるquery plan検証へ修正する。P2としてmigrationのWALをcheckpoint後だけ測る問題を指摘し、checkpoint前DB/WALと後DBを分離する。r2は未承認。`validation-r2fix/activity-gate.log` のE0373は追加テストclosureの所有権に関するcompile失敗であり、原本を保持して修正する。
+
+### r3と小性能測定で残る全体件数依存
+
+`freeze-r3/MANIFEST.txt` SHA256 `A70B43D7A689309C2B1071DC6EF8166CA74A5F7D744F082AAA6C0565A85FCF23`、complete patch `08E284C50F277D5920376F50E6D804D598CA7C28E842905E58B69966910BF952`。r2との差分レビューを依頼。`validation-r3` のActivityGate実経路1 passed、delta-scoped 9 passed / 1 ignoredをrootも確認した。
+
+`performance-small-r3/result.json` はK=8、N=4,096/32,768でcandidate両8・最終fingerprint一致。旧publish56.44/470.79msに対し、新load0.524/0.303ms・publish2.61/16.36ms。しかし新publishもNに追随する傾向があり、性能検収完了とはしない。rootはsubtree_looseのplanが `item_container_idx(container_key=?)` のみでprefix範囲を絞らない点と、publish/summaryのtemp joinが全itemを外側にし得る点を指摘し、大規模run前のquery plan/処理量確認を依頼した。SEARCH表記や返却候補数だけでは、内部の全件処理を排除した証拠にはならない。
+
+### r4小測定で全体件数依存を除去
+
+loose key用partial indexでexact/rangeを別々に引き、finalizerの集計/journal/deleteはtempのK行を外側に固定してitemをkey/rowid検索する方式へ変更。最初の小測定はquery plan等の検収で失敗した原本を保持し、条件を緩めず修正した。`performance-small-r4r2/result.json` はK8・N4,096/32,768、候補両8、旧新最終state一致。新load0.535/0.310ms、publish0.486/0.336ms、旧publish55.90/458.66ms。rootもJSON原本を照合した。
+
+本番SQLのVM stepsはN両点でcount160・journal465・delete358と同一。fullscan_steps=7はtemp8行の走査で、item全体の走査ではない。sorts=0。query planもtemp外側→item key/rowid検索を示す。migrationの直接観測WAL704,552/5,397,232 bytesと報告peakを一致させ、checkpoint後0を別記録とした。小fixture結果であり、実機26.7秒がこの時間になると約束するものではない。大N測定・r4独立レビュー・最終gateはまだ。
+
+r4の独立限定レビューは承認、blocking P1/P2なし。`freeze-r4/review-approval.md` SHA256 `B89DA9630C67FA58711207D2F58405690F9CB659BEEDFE730605F7E504D726B1`。partial index追加をschema v5とし、v4も保持移行する。source hashはDB `8B558E01683F4FA165E6AD3457AA0A25BE73D140CB0573721AD1DB13D906546D`、index `A12320D01277FFD7783C402CB3FC2FBA5DFBC8D3221D9C22D68AA1A3625B834A`、benchmark `80178D55CBCA9815DD557F531678DBAD26766D8F9CFB94EF7185B6E9F731A847`、complete patch `BE1497E16743C4F289EDB620C379BD208815616B512A7A86926AC7E0059AB57B`。
+
+同freezeのdebug test exeでK8・N32,768/4,627,166の大N測定を `performance-full-r4` のfresh fixtureで開始。専用TEMP/TMP、APPDATA不使用。大規模migration・性能証拠と全体gate・実機は引き続き未確認として扱う。
+
+### 大N証拠確認とr5移行補正
+
+`performance-full-r4/result.json` SHA256 `BBA0C314CB906D629C5DF701A3FAF2D0FDD48C1042576DC6CA079B522F4182C9` をrootと独立reviewerが照合。K8/N32,768→4,627,166でcandidate両8、VM steps160/465/358、temp由来fullscan7、sort0が不変、最終state一致。load0.5487→0.3121ms、publish0.4308→0.3808ms、旧publish0.452→66.518秒。同host cacheのdebug合成比較であり、実機26.7秒への倍率外挿はしない。全行looseで、ZIP/PDF/画像本が混じる利用者の分布の代表ではない。
+
+v3→v5移行は369.273秒、DB656,338,944→988,246,016 bytes、checkpoint前WAL778,399,872 bytes、temp観測peak167,258,400 bytes。移行中process sampled peak WS36,638,720 / Private57,978,880 bytesはこの検証processの値で、実アプリ総peakではない。初回移行が約6分を要したことと一時disk増を、通常Deltaの短縮と必ず分けて伝える。各fileのpeakは同時刻と限らず、単純合算を実測同時peakとはしない。
+
+実装担当の追加確認で、v4→v5も既充填parent keyを再計算・UPDATEしていた点を発見。NULL行だけのbackfillとv4 UPDATE禁止trigger回帰へ最小補正するr5を承認し、r4を解除した。v3 fixtureは全parent未設定のため上記初回移行証拠は保持し、v4を別測定する。r5差分確認前は全体gateを開始しない。他の性能SQLや取消契約のレビューを最初からやり直さない。
+
+### r5最終限定承認・全体gateへ
+
+NULL行限定の補正後、v4 fixtureはitem/container/container_buildのparent列UPDATEを禁止するtriggerがあっても移行・再openが成功。`validation-r5` の移行2、DB module53（1 ignored）、index module77（5 ignored）が成功、core checkもexit0（12.39秒）。rootも原本を照合した。
+
+`performance-full-r5-v4/result.json` SHA256 `9EF65E46C99FFF9585DE3A82F9706B918607556D6CB684221FB8F09DBDF79544` はN4,627,166/K8でv4→v5 open3.359秒＋checkpoint0.021秒、load0.392ms＋publish0.319ms、candidate8・最終state一致・VM steps不変。v3の全parent未設定条件で測った369秒とは別条件。v4追加index移行もWAL168,849,992 bytes / temp観測peak165,483,100 bytesを要しており、ゼロ負荷とはしない。
+
+`freeze-r5/MANIFEST.txt` SHA256 `2EEB917852CD17AA3B7F275328BB0240918DE4CC00996858C15169FE0FB98AE1`。sourceはDB `168CA99B2BA1406F9BC6B364256273F29A19ED081AF5CB5ABC77845768BFB8DE`、index `A12320D01277FFD7783C402CB3FC2FBA5DFBC8D3221D9C22D68AA1A3625B834A`、benchmark `52A14711DF3E6A6A5B8A060F6ECE7C056DBC19927D89E41C9DD36582182AAD91`。complete patch `7FB527AD9D5602D1A97A1EBB3709187078FC8F6C922AB597565A0927D2845634`。
+
+独立レビューはr4との差分と大N証拠を承認し、blocking P1/P2なし、全体gate開始可。`freeze-r5/review-approval.md` SHA256 `C0FA7E9EAD2F907A214794B12EE42A3E996F0E3DC6238A4ED004D526867A9549`。親209とCargo枠を調整し、同sourceの全体gateを指示した。実機の初回移行・更新速度、起動FS分類実測は引き続き未確認。
+
+### r5全体gate成功と残る入口cleanup
+
+全体gateは14:56:48.905–15:09:27.807 JST、exit0 / timeoutなし。本体8,191 passed / 45 ignored（353.55秒）、UI48（4.21秒）、vendor egui25 / egui-wgpu9 / eframe15を含む全段階成功。証跡 `fullgate-r5`、stdout SHA256 `4B75C65AA532E6943B51FD92116360BCDF7AC7DCACFF500F8EE8B9B19DD52E82`、stderr `39E9314416F7B7203AB177474E8B7467D87EB0109D8B672770A8047DE25C2357`。rootも原本とsource固定を確認。Cargo枠を209へ返却し、buildは未開始。
+
+最終説明の監査で、毎Delta入口の既存 `cleanup_incomplete` → `load_items_for_container_state(Building)` が全itemを外側にするSQLだった点を確認。rootと独立reviewerが既存合成DBへPython SQLite3.49.1でread-only EXPLAINし、container0でも `SCAN i → SEARCH c` となる計画を確認した。bundled SQLiteの計測は追加回帰で確認する。この時点で成立した性能説明はscope inventory/publish/finalizer部分のN比例排除であり、通常Deltaの準備全体のN比例排除ではない。
+
+r5を承認・全gate成功のまとまりとして保存し、追加chunkで共通cleanupのmember選択をBuilding container外側→member index取得へ直す。Complete/loose保持、delete+journal順、staging掃除と単一TXを維持する。Full/Delta入口は取消確認付き経路、失敗・取消後の後始末は既存の無条件経路として所有を区別する。新schema追加は不要とし、container側の走査が残る点を明記する。追加差分は限定レビュー・焦点回帰・再gate後に確認buildへ進める。

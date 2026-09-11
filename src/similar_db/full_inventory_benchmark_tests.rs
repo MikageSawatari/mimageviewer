@@ -10,6 +10,7 @@
 
 use super::*;
 
+use rusqlite::StatementStatus;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::error::Error;
@@ -1076,6 +1077,18 @@ impl ResourceSampler {
         }
     }
 
+    /// Records a synchronous storage observation at a semantic boundary that can be shorter than
+    /// the sampler's 50 ms interval (for example, immediately before a WAL checkpoint).
+    fn observe_storage(&self) -> Result<(), String> {
+        self.peak_db
+            .fetch_max(file_len(&self.db_path), AtomicOrdering::Relaxed);
+        self.peak_wal
+            .fetch_max(file_len(&wal_path(&self.db_path)), AtomicOrdering::Relaxed);
+        self.peak_temp
+            .fetch_max(directory_bytes(&self.temp_dir)?, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
     fn finish(mut self) -> Result<ResourceMetrics, String> {
         self.stop.store(true, AtomicOrdering::Release);
         if let Some(worker) = self.worker.take() {
@@ -1549,10 +1562,13 @@ fn setup(config: &BenchConfig) -> Result<(), Box<dyn Error>> {
     )?;
     transaction.execute(
         "INSERT INTO index_run
-           (singleton, hash_version, completed_at_unix_secs, registered_items,
+           (singleton, store_id, through_change_seq, hash_version,
+            completed_at_unix_secs, registered_items,
             password_required_pdfs, corrupt_containers, zero_page_containers,
             decode_failures, io_failures)
-         VALUES (1, ?1, 1, ?2, 0, 0, 0, 0, 0)",
+         VALUES (1,
+                 (SELECT store_id FROM search_content_state WHERE singleton = 1),
+                 0, ?1, 1, ?2, 0, 0, 0, 0, 0)",
         params![current_hash_version(), i64::try_from(config.rows)?],
     )?;
     transaction.commit()?;
@@ -1819,6 +1835,557 @@ fn verify(config: &BenchConfig) -> Result<(), Box<dyn Error>> {
         result_path.display()
     );
     Ok(())
+}
+
+const ENV_DELTA_SCOPE_BENCH_DIR: &str = "MIV_DELTA_SCOPE_BENCH_DIR";
+const ENV_DELTA_SCOPE_BENCH_ROWS: &str = "MIV_DELTA_SCOPE_BENCH_ROWS";
+const ENV_DELTA_SCOPE_BENCH_CANDIDATES: &str = "MIV_DELTA_SCOPE_BENCH_CANDIDATES";
+
+#[derive(Serialize)]
+struct DeltaScopeBenchResult {
+    scoped_candidates: u64,
+    points: Vec<DeltaScopeBenchPoint>,
+    note: &'static str,
+}
+
+#[derive(Serialize)]
+struct DeltaScopeBenchPoint {
+    total_rows: u64,
+    schema_v4_db_bytes: u64,
+    schema_v4_wal_bytes: u64,
+    schema_v5_precheckpoint_db_bytes: u64,
+    schema_v5_precheckpoint_wal_bytes: u64,
+    schema_v5_postcheckpoint_db_bytes: u64,
+    schema_v5_postcheckpoint_wal_bytes: u64,
+    migration_open_ms: f64,
+    migration_checkpoint_ms: f64,
+    migration_resources: ResourceMetrics,
+    scoped_load_ms: f64,
+    scoped_publish_ms: f64,
+    legacy_publish_ms: f64,
+    candidate_count: usize,
+    query_plans: DeltaScopeQueryPlans,
+    finalizer_evidence: DeltaFinalizerEvidence,
+    final_state_equal: bool,
+}
+
+#[derive(Serialize)]
+struct DeltaScopeQueryPlans {
+    directory_loose: String,
+    directory_file_containers: String,
+    subtree_loose: String,
+    subtree_containers: String,
+    subtree_orphans: String,
+    container_members: String,
+}
+
+#[derive(Serialize)]
+struct DeltaFinalizerEvidence {
+    count_visible: StatementEvidence,
+    insert_journal: StatementEvidence,
+    delete_items: StatementEvidence,
+}
+
+#[derive(Serialize)]
+struct StatementEvidence {
+    plan: String,
+    vm_steps: i32,
+    fullscan_steps: i32,
+    sorts: i32,
+}
+
+fn delta_scope_bench_directory() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let requested = PathBuf::from(
+        std::env::var_os(ENV_DELTA_SCOPE_BENCH_DIR)
+            .ok_or_else(|| format!("{ENV_DELTA_SCOPE_BENCH_DIR} is required"))?,
+    );
+    if !requested.is_absolute() {
+        return Err(format!("{ENV_DELTA_SCOPE_BENCH_DIR} must be absolute").into());
+    }
+    let target_requested = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    reject_absolute_reparse_chain(&target_requested)?;
+    reject_absolute_reparse_chain(&requested)?;
+    let target = target_requested.canonicalize()?;
+    let run = requested.canonicalize()?;
+    if run == target || !run.starts_with(&target) {
+        return Err(format!(
+            "benchmark run must be a dedicated child of {}",
+            target.display()
+        )
+        .into());
+    }
+    reject_reparse_chain(&target, &run)?;
+    let temp = run.join("temp").canonicalize()?;
+    if temp.parent() != Some(run.as_path()) {
+        return Err("benchmark temp directory escaped its run directory".into());
+    }
+    reject_reparse_path(&temp)?;
+    require_empty_directory(&temp)?;
+    let entries = std::fs::read_dir(&run)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || entries[0].path() != temp {
+        return Err("fresh benchmark run must contain only its empty temp directory".into());
+    }
+    for name in ["TEMP", "TMP"] {
+        let configured =
+            PathBuf::from(std::env::var_os(name).ok_or_else(|| format!("{name} must be set"))?);
+        reject_absolute_reparse_chain(&configured)?;
+        if configured.canonicalize()? != temp {
+            return Err(format!("{name} must point to the benchmark temp directory").into());
+        }
+    }
+    Ok((run, temp))
+}
+
+fn downgrade_delta_scope_bench_to_v4(path: &Path) -> rusqlite::Result<()> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "DROP INDEX item_loose_key_idx;
+         PRAGMA user_version = 4;
+         PRAGMA wal_checkpoint(TRUNCATE);
+         VACUUM;",
+    )
+}
+
+fn populate_delta_scope_bench(
+    db: &SimilarDb,
+    total_rows: u64,
+    scoped_candidates: u64,
+) -> rusqlite::Result<Vec<String>> {
+    let outside_rows = total_rows.saturating_sub(scoped_candidates);
+    let mut connection = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+    let transaction = write_transaction(&mut connection)?;
+    if outside_rows > 0 {
+        transaction.execute(
+            "WITH RECURSIVE ids(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+             )
+             INSERT INTO item
+               (revision, item_key, kind, container_key, source_parent_key, page_index,
+                mtime, file_size, hash_version, pdq256, quality, width, height, format)
+             SELECT 1, printf('c:/outside/%012d.jpg', value), 0, NULL, 'c:/outside', NULL,
+                    1, 1, ?2, zeroblob(32), 1, 1, 1, 1 FROM ids",
+            params![i64::try_from(outside_rows).unwrap(), current_hash_version()],
+        )?;
+    }
+    let mut keys = Vec::with_capacity(usize::try_from(scoped_candidates).unwrap());
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO item
+               (revision, item_key, kind, container_key, source_parent_key, page_index,
+                mtime, file_size, hash_version, pdq256, quality, width, height, format)
+             VALUES (1, ?1, 0, NULL, 'c:/target', NULL, 1, 1, ?2,
+                     zeroblob(32), 1, 1, 1, 1)",
+        )?;
+        for index in 0..scoped_candidates {
+            let key = format!("c:/target/{index:012}.jpg");
+            insert.execute(params![key, current_hash_version()])?;
+            keys.push(key);
+        }
+    }
+    transaction.commit()?;
+    drop(connection);
+    db.record_completed_index(
+        current_hash_version(),
+        FIXED_COMPLETED_AT - 1,
+        CompletedIndexStats::default(),
+    )?;
+    Ok(keys)
+}
+
+fn fingerprint_path(path: &Path) -> Result<StateFingerprint, Box<dyn Error>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(state_fingerprint(&connection)?)
+}
+
+fn explain_query_plan(
+    connection: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+) -> rusqlite::Result<String> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement
+        .query_map(parameters, |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.join(" | "))
+}
+
+fn delta_scope_query_plans(connection: &Connection) -> rusqlite::Result<DeltaScopeQueryPlans> {
+    Ok(DeltaScopeQueryPlans {
+        directory_loose: explain_query_plan(
+            connection,
+            &delta_loose_parent_sql(true),
+            ["c:/target"],
+        )?,
+        directory_file_containers: explain_query_plan(
+            connection,
+            &delta_child_file_container_sql(true),
+            params![
+                "c:/target",
+                ContainerKind::Zip as i64,
+                ContainerKind::Pdf as i64
+            ],
+        )?,
+        subtree_loose: explain_query_plan(
+            connection,
+            &delta_loose_prefix_sql(true),
+            params!["c:/target", "c:/target/", "c:/target0"],
+        )?,
+        subtree_containers: explain_query_plan(
+            connection,
+            &delta_container_prefix_sql(true),
+            params!["c:/target", "c:/target/", "c:/target0"],
+        )?,
+        subtree_orphans: explain_query_plan(
+            connection,
+            &delta_orphan_container_sql(true),
+            params!["c:/target", "c:/target/", "c:/target0"],
+        )?,
+        container_members: explain_query_plan(
+            connection,
+            &delta_container_members_sql(true),
+            ["c:/target/book.zip"],
+        )?,
+    })
+}
+
+fn statement_status(statement: &rusqlite::Statement<'_>, plan: String) -> StatementEvidence {
+    StatementEvidence {
+        plan,
+        vm_steps: statement.get_status(StatementStatus::VmStep),
+        fullscan_steps: statement.get_status(StatementStatus::FullscanStep),
+        sorts: statement.get_status(StatementStatus::Sort),
+    }
+}
+
+fn delta_finalizer_evidence(
+    connection: &mut Connection,
+    keys: &[String],
+) -> rusqlite::Result<DeltaFinalizerEvidence> {
+    prepare_delta_touched_table(connection)?;
+    prepare_delta_delete_table(connection)?;
+    for key in keys {
+        insert_delta_touched_key(connection, key)?;
+        connection.execute(
+            "INSERT INTO temp.delta_delete_candidate
+             (item_id, revision, item_key, container_key)
+             SELECT item_id, revision, item_key, container_key FROM item WHERE item_key = ?1",
+            [key],
+        )?;
+    }
+
+    let count_sql = delta_count_visible_touched_sql(false);
+    let count_plan = explain_query_plan(
+        connection,
+        &delta_count_visible_touched_sql(true),
+        params![current_hash_version(), ScanState::Complete as i64],
+    )?;
+    let mut count_statement = connection.prepare(&count_sql)?;
+    let count = count_statement.query_row(
+        params![current_hash_version(), ScanState::Complete as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if count != i64::try_from(keys.len()).unwrap_or(i64::MAX) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let count_visible = statement_status(&count_statement, count_plan);
+    drop(count_statement);
+
+    connection.execute_batch("SAVEPOINT delta_evidence_insert;")?;
+    let insert_plan = explain_query_plan(connection, &delta_insert_deleted_changes_sql(true), [])?;
+    let insert_sql = delta_insert_deleted_changes_sql(false);
+    let mut insert_statement = connection.prepare(&insert_sql)?;
+    let inserted = insert_statement.execute([])?;
+    if inserted != keys.len() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let insert_journal = statement_status(&insert_statement, insert_plan);
+    drop(insert_statement);
+    connection
+        .execute_batch("ROLLBACK TO delta_evidence_insert; RELEASE delta_evidence_insert;")?;
+
+    connection.execute_batch("SAVEPOINT delta_evidence_delete;")?;
+    let delete_plan = explain_query_plan(connection, &delta_delete_items_sql(true), [])?;
+    let delete_sql = delta_delete_items_sql(false);
+    let mut delete_statement = connection.prepare(&delete_sql)?;
+    let deleted = delete_statement.execute([])?;
+    if deleted != keys.len() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let delete_items = statement_status(&delete_statement, delete_plan);
+    drop(delete_statement);
+    connection
+        .execute_batch("ROLLBACK TO delta_evidence_delete; RELEASE delta_evidence_delete;")?;
+
+    Ok(DeltaFinalizerEvidence {
+        count_visible,
+        insert_journal,
+        delete_items,
+    })
+}
+
+fn run_delta_scope_bench_point(
+    run: &Path,
+    temp: &Path,
+    label: &str,
+    total_rows: u64,
+    scoped_candidates: u64,
+) -> Result<DeltaScopeBenchPoint, Box<dyn Error>> {
+    let base = run.join(format!("{label}-base-v4.db"));
+    let scoped = run.join(format!("{label}-scoped.db"));
+    let legacy = run.join(format!("{label}-legacy.db"));
+    let keys = {
+        let db = SimilarDb::open_at(&base)?;
+        configure_benchmark_connection(&db)?;
+        let keys = populate_delta_scope_bench(&db, total_rows, scoped_candidates)?;
+        checkpoint(&db)?;
+        keys
+    };
+    downgrade_delta_scope_bench_to_v4(&base)?;
+    let schema_v4_db_bytes = file_len(&base);
+    let schema_v4_wal_bytes = file_len(&wal_path(&base));
+
+    let migration_sampler = ResourceSampler::start(&base, temp)?;
+    let migration_started = Instant::now();
+    let db = SimilarDb::open_at(&base)?;
+    let migration_open_ms = migration_started.elapsed().as_secs_f64() * 1_000.0;
+    configure_benchmark_connection(&db)?;
+    let schema_v5_precheckpoint_db_bytes = file_len(&base);
+    let schema_v5_precheckpoint_wal_bytes = file_len(&wal_path(&base));
+    migration_sampler.observe_storage()?;
+    let checkpoint_started = Instant::now();
+    checkpoint(&db)?;
+    let migration_checkpoint_ms = checkpoint_started.elapsed().as_secs_f64() * 1_000.0;
+    drop(db);
+    let migration_resources = migration_sampler.finish()?;
+    let schema_v5_postcheckpoint_db_bytes = file_len(&base);
+    let schema_v5_postcheckpoint_wal_bytes = file_len(&wal_path(&base));
+    copy_create_new(&base, &scoped)?;
+    copy_create_new(&base, &legacy)?;
+
+    let scoped_db = SimilarDb::open_at(&scoped)?;
+    configure_benchmark_connection(&scoped_db)?;
+    let load_started = Instant::now();
+    let inventory = scoped_db
+        .load_delta_scoped_inventory(
+            DeltaScopePlan {
+                directory_contents: vec!["c:/target".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+            current_hash_version(),
+            || true,
+        )?
+        .ok_or("scoped inventory load was cancelled")?;
+    let scoped_load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
+    let candidate_count = inventory.items.len();
+    for key in &keys {
+        inventory.mark_item(key);
+    }
+    let (query_plans, finalizer_evidence) = {
+        let mut connection = scoped_db
+            .conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            delta_scope_query_plans(&connection)?,
+            delta_finalizer_evidence(&mut connection, &keys)?,
+        )
+    };
+    let publish_started = Instant::now();
+    let scoped_result = scoped_db.publish_delta_scoped_reconcile_if(
+        inventory,
+        &[],
+        &[],
+        current_hash_version(),
+        FIXED_COMPLETED_AT,
+        || true,
+    )?;
+    let scoped_publish_ms = publish_started.elapsed().as_secs_f64() * 1_000.0;
+    if !matches!(
+        scoped_result,
+        DeltaPublishResult::Committed { removed: 0, .. }
+    ) {
+        return Err("scoped no-change publication did not commit cleanly".into());
+    }
+    checkpoint(&scoped_db)?;
+    drop(scoped_db);
+
+    let legacy_db = SimilarDb::open_at(&legacy)?;
+    configure_benchmark_connection(&legacy_db)?;
+    let seen = keys.into_iter().collect::<HashSet<_>>();
+    let legacy_started = Instant::now();
+    let legacy_removed = legacy_db.publish_delta_reconcile(
+        &[],
+        &[],
+        &["c:/target".to_owned()],
+        &[],
+        &[],
+        &seen,
+        &HashSet::new(),
+        current_hash_version(),
+        FIXED_COMPLETED_AT,
+    )?;
+    let legacy_publish_ms = legacy_started.elapsed().as_secs_f64() * 1_000.0;
+    if legacy_removed != 0 {
+        return Err("legacy no-change publication unexpectedly removed rows".into());
+    }
+    checkpoint(&legacy_db)?;
+    drop(legacy_db);
+
+    let final_state_equal = fingerprint_path(&scoped)? == fingerprint_path(&legacy)?;
+    let point = DeltaScopeBenchPoint {
+        total_rows,
+        schema_v4_db_bytes,
+        schema_v4_wal_bytes,
+        schema_v5_precheckpoint_db_bytes,
+        schema_v5_precheckpoint_wal_bytes,
+        schema_v5_postcheckpoint_db_bytes,
+        schema_v5_postcheckpoint_wal_bytes,
+        migration_open_ms,
+        migration_checkpoint_ms,
+        migration_resources,
+        scoped_load_ms,
+        scoped_publish_ms,
+        legacy_publish_ms,
+        candidate_count,
+        query_plans,
+        finalizer_evidence,
+        final_state_equal,
+    };
+    write_json_create_new(&run.join(format!("{label}-diagnostic.json")), &point)?;
+    let plans = [
+        &point.query_plans.directory_loose,
+        &point.query_plans.directory_file_containers,
+        &point.query_plans.subtree_loose,
+        &point.query_plans.subtree_containers,
+        &point.query_plans.subtree_orphans,
+        &point.query_plans.container_members,
+    ];
+    if point.candidate_count != usize::try_from(scoped_candidates).unwrap()
+        || !point
+            .query_plans
+            .directory_loose
+            .contains("item_source_parent_idx")
+        || !point
+            .query_plans
+            .directory_file_containers
+            .contains("container_source_parent_idx")
+        || !point
+            .query_plans
+            .subtree_loose
+            .contains("item_loose_key_idx")
+        || !point.query_plans.subtree_loose.contains("item_key>?")
+        || plans.iter().any(|plan| plan.contains("SCAN "))
+        || !point
+            .finalizer_evidence
+            .count_visible
+            .plan
+            .contains("SCAN t")
+        || !point
+            .finalizer_evidence
+            .count_visible
+            .plan
+            .contains("item_key=?)")
+        || !point
+            .finalizer_evidence
+            .insert_journal
+            .plan
+            .contains("SCAN d")
+        || !point
+            .finalizer_evidence
+            .insert_journal
+            .plan
+            .contains("INTEGER PRIMARY KEY")
+        || !point
+            .finalizer_evidence
+            .delete_items
+            .plan
+            .contains("SCAN d")
+        || !point
+            .finalizer_evidence
+            .delete_items
+            .plan
+            .contains("INTEGER PRIMARY KEY")
+        || [
+            &point.finalizer_evidence.count_visible,
+            &point.finalizer_evidence.insert_journal,
+            &point.finalizer_evidence.delete_items,
+        ]
+        .iter()
+        .any(|evidence| evidence.sorts != 0)
+        || !point.final_state_equal
+    {
+        return Err("scoped candidate count, query plan, or final state was invalid".into());
+    }
+    Ok(point)
+}
+
+#[test]
+#[ignore = "manual target-only v4 migration and K-fixed/N-scaled Delta comparison"]
+fn measure_delta_scoped_reconcile_candidate_scaling() {
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let (run, temp) = delta_scope_bench_directory()?;
+        let row_counts = std::env::var(ENV_DELTA_SCOPE_BENCH_ROWS)
+            .unwrap_or_else(|_| "10000,100000".to_owned())
+            .split(',')
+            .map(|value| value.trim().parse::<u64>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let scoped_candidates = std::env::var(ENV_DELTA_SCOPE_BENCH_CANDIDATES)
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(16);
+        if row_counts.len() != 2
+            || row_counts[0] == 0
+            || row_counts[0] >= row_counts[1]
+            || scoped_candidates == 0
+            || row_counts.iter().any(|&rows| scoped_candidates > rows)
+        {
+            return Err(
+                "rows must contain two ascending positive N values and K must fit both".into(),
+            );
+        }
+        let points = ["small", "large"]
+            .into_iter()
+            .zip(row_counts)
+            .map(|(label, rows)| {
+                run_delta_scope_bench_point(&run, &temp, label, rows, scoped_candidates)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let small = &points[0].finalizer_evidence;
+        let large = &points[1].finalizer_evidence;
+        let fixed_k_limit = i32::try_from(scoped_candidates).unwrap_or(i32::MAX);
+        for evidence in [
+            &small.count_visible,
+            &small.insert_journal,
+            &small.delete_items,
+            &large.count_visible,
+            &large.insert_journal,
+            &large.delete_items,
+        ] {
+            if evidence.vm_steps <= 0 || evidence.fullscan_steps > fixed_k_limit {
+                return Err("finalizer statement work exceeded the fixed candidate scope".into());
+            }
+        }
+        for (small, large) in [
+            (&small.count_visible, &large.count_visible),
+            (&small.insert_journal, &large.insert_journal),
+            (&small.delete_items, &large.delete_items),
+        ] {
+            if large.vm_steps > small.vm_steps.saturating_add(32) {
+                return Err("finalizer VM work grew with unrelated store rows".into());
+            }
+        }
+        write_json_create_new(
+            &run.join("result.json"),
+            &DeltaScopeBenchResult {
+                scoped_candidates,
+                points,
+                note: "Two synthetic N points keep K fixed. Migration, legacy, and scoped wall times share the host cache and are not a production latency claim. The dataset intentionally excludes the legacy child-directory prune defect, which has its own expected-behavior regressions.",
+            },
+        )?;
+        Ok(())
+    })();
+    result.unwrap_or_else(|error| panic!("delta scoped benchmark failed: {error}"));
 }
 
 #[test]
