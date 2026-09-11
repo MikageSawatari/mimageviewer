@@ -3296,10 +3296,10 @@ mod tests {
             .split_once("self.update_frame(ctx, frame);")
             .expect("`eframe::App::update` は本体を update_frame へ委譲すること")
             .1;
-        let tail: String = wrapper.lines().take(20).collect::<Vec<_>>().join(
-            "
-",
-        );
+        let tail = wrapper
+            .split_once("fn on_exit(")
+            .expect("update の terminal tail は on_exit より前にあること")
+            .0;
         assert!(
             tail.contains("self.show_external_tool_modals(ctx);"),
             "早期 return を飛び越える tail で modal を描いていない"

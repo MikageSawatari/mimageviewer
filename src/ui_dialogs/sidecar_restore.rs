@@ -21,6 +21,13 @@ impl App {
         let Some(state) = self.sidecar_restore.as_ref() else {
             return;
         };
+        let remaining = state.modal_delay_remaining(std::time::Instant::now());
+        if !remaining.is_zero() {
+            // Fast Missing/already-synchronized checks should not flash a one-frame dialog.
+            // The restore state and its input gate are already active; only drawing waits.
+            ctx.request_repaint_after(remaining);
+            return;
+        }
         draw_sidecar_restore_modal(ctx, state.label());
     }
 }

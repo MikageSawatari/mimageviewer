@@ -320,6 +320,11 @@ write permit と lossless deferred intent を実装する必要はない。§4.1
 操作を止めても、sidecar/DB I/O、writer の待機、preview cache の ACK 待ちは UI thread へ
 移さない。モーダルは競合する操作を新しく発生させないための仕様であり、UI thread を block する
 仕組みではない。worker の進捗待ちは毎 frame の poll と repaint deadline で進める。
+state と target の入力 gate は旧同期 import 点で直ちに確立するが、モーダルの描画だけは開始から
+100 ms の猶予を置く。猶予中も state machine は遅延せず、deadline までの repaint を予約する。
+Missing かつ marker 無し、または同期済みの短い確認が猶予内に terminal へ達した場合は表示を
+flash させず、猶予を超えて active な場合だけ進捗を表示する。これは安全な probe を省略する
+fast path ではなく、quiescence、flush、strict probe、tail の一回所有を一切変えない表示方針である。
 
 ### 5.1 state owner と pause 位置
 
@@ -692,6 +697,11 @@ consumer と、結果を install する最後の terminal の両方で照合す�
   既存 queue/fallback を所有し、App cache の dirty owner が変更されず import/marker が始まらないこと
 - synchronized/Missing/disabled probe より前に local-adjust/edit-bundle/favorite completion が残る race で
   全 completion/mirror 反映と flush 後の strict probe を通ること
+- 製品 `Settings` の sidecar backup default は有効のまま維持すること。Missing/marker無しまたは同期済みの
+  短い terminal は100 ms未満ならモーダルを描かずtailを一度だけ実行し、100 msを超えてactiveなら
+  target gateを維持したままモーダルを描くこと。marker clear/import/dirty outgoingは同じbarrierを通ること
+- sidecar復元と無関係な共有navigation fixtureは edit/tag backupを両方OFFにした明示的な `NoSidecar`
+  profileとする。復元/default契約testは明示的にONにしてstateをpollし、production cfgをtest都合で変えないこと
 - local-adjust worker を queue/document の pop 後、`process_write` 内で停止して
   `has_unfinished_work == false` となる窓でも、fence ACK、completion 適用、pending map の解消前には
   Resume/flush/import しないこと
@@ -766,3 +776,21 @@ UI 停止を解決しない。TempDir の焦点検証では lib sidecar-import 2
 queue/idle 2 件、owner resolution 2 件、Missing revalidation 1 件、既存 integration 14 件が成功した。
 430 mixed integration の再計測は load 13.282 ms、prepare 6.104 ms、transaction 13.858 ms、commit
 19.391 ms、engine 25.495 ms、end-to-end 38.777 ms であり、UI 配線後の応答性を保証する値ではない。
+
+### 5.10 統合 gate で判明した test 契約
+
+2026-09-11 の最初の統合 `test-full` は main lib が 8124 success / 134 failure / 45 ignored、
+後続 integration/workspace target は sidecar integration 14 件を含めて成功した。独立 failure は次の三群に
+分類した。
+
+- 共有 `phase_c_support::setup_app` の production default（edit sidecar backup ON）により、sidecar復元と
+  無関係な navigation test まで新しい continuation を開始し、`load_folder` 直後の同期tailを仮定した
+  assertion が pre-continuation state を観測したもの
+- 全context edit-preview clearが AtRest main contextも処理する新しい正規owner契約に対し、旧testが
+  mounted/active/siblingの三つだけを期待したもの、およびexternal-tool source auditがupdate wrapperの
+  固定20行だけを調べ、新しいrestore pollで正規tailが行窓外へ出たもの
+- 先行navigation failureが共有key-input mutexをpoisonした後の派生failure
+
+前者は製品defaultや安全なprobeを変えず、共有fixtureだけを明示 `NoSidecar` profileにした。後二者は
+所有context全列挙とupdate terminal tailという製品構造を直接検査する期待へ直した。sidecar復元を検査する
+testはbackupを明示ONにして非同期stateをpollする。

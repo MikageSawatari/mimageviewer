@@ -8,6 +8,7 @@ use super::*;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 const SIDECAR_WRITER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(super) struct SidecarLoadContinuation {
     pub(super) source_path: PathBuf,
@@ -38,6 +39,9 @@ enum RequiredAction {
 
 struct Common {
     request_id: u64,
+    /// Presentation grace starts with the typed restore owner.  It never delays the
+    /// quiescence/probe state machine or relaxes its input gate.
+    started_at: std::time::Instant,
     target_context: ViewerContextId,
     items_generation: u64,
     folder: PathBuf,
@@ -348,6 +352,11 @@ impl SidecarRestoreState {
             Phase::Resuming => "復元した設定を反映中",
         }
     }
+
+    pub(crate) fn modal_delay_remaining(&self, now: std::time::Instant) -> std::time::Duration {
+        SIDECAR_RESTORE_MODAL_GRACE
+            .saturating_sub(now.saturating_duration_since(self.common.started_at))
+    }
 }
 
 impl App {
@@ -384,6 +393,7 @@ impl App {
         self.sidecar_restore = Some(SidecarRestoreState {
             common: Common {
                 request_id: 1,
+                started_at: std::time::Instant::now(),
                 target_context,
                 items_generation: self.items_generation,
                 folder: folder.clone(),
@@ -622,9 +632,11 @@ impl App {
             .frame_counter
             .wrapping_add(self.input_seq)
             .wrapping_add(1);
+        let started_at = continuation.restore_started_at;
         self.sidecar_restore = Some(SidecarRestoreState {
             common: Common {
                 request_id,
+                started_at,
                 target_context,
                 items_generation,
                 folder,
@@ -1975,6 +1987,7 @@ mod tests {
         SidecarRestoreState {
             common: Common {
                 request_id: 1,
+                started_at: std::time::Instant::now(),
                 target_context: ViewerContextId::for_test(1),
                 items_generation: 1,
                 folder: folder.clone(),
@@ -2011,6 +2024,113 @@ mod tests {
             prepare_elapsed: std::time::Duration::ZERO,
             probe_elapsed: std::time::Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn product_settings_keep_sidecar_restore_enabled_by_default() {
+        let settings = crate::settings::Settings::default();
+
+        assert!(settings.sidecar_backup_enabled);
+        assert!(!settings.tag_sidecar_backup_enabled);
+    }
+
+    #[test]
+    fn modal_grace_delays_only_presentation_while_the_target_gate_is_active() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("book");
+        app.activate_sidecar_restore_modal_for_test(folder);
+        let started_at = app.sidecar_restore.as_ref().unwrap().common.started_at;
+
+        assert!(app.sidecar_restore_blocks_projected_context());
+        assert_eq!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .modal_delay_remaining(started_at),
+            SIDECAR_RESTORE_MODAL_GRACE
+        );
+        assert_eq!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .modal_delay_remaining(started_at + SIDECAR_RESTORE_MODAL_GRACE),
+            std::time::Duration::ZERO
+        );
+
+        app.sidecar_restore.as_mut().unwrap().common.started_at =
+            std::time::Instant::now() + SIDECAR_RESTORE_MODAL_GRACE;
+        let early = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog(ctx);
+        });
+        assert!(
+            early.shapes.is_empty(),
+            "presentation alone must stay hidden during the grace"
+        );
+
+        app.sidecar_restore.as_mut().unwrap().common.started_at =
+            std::time::Instant::now() - SIDECAR_RESTORE_MODAL_GRACE;
+        let visible = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog(ctx);
+        });
+        assert!(
+            !visible.shapes.is_empty(),
+            "an active restore must draw its progress modal after the grace"
+        );
+        assert!(app.sidecar_restore_blocks_projected_context());
+    }
+
+    #[test]
+    fn fast_current_terminal_finishes_inside_the_modal_grace_and_runs_the_tail_once() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let folder = app.tmp.path().join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        let (thumb_tx, _thumb_rx) = mpsc::channel::<ThumbMsg>();
+        let started_at = std::time::Instant::now();
+        let continuation = SidecarLoadContinuation {
+            source_path: folder.clone(),
+            source_is_directory: true,
+            prepared_subfolder: None,
+            prepared_aggregate: None,
+            catalog_existing_keys: HashSet::new(),
+            video_items: Vec::new(),
+            sli_seq: 0,
+            sli_t0: started_at,
+            items_len: 0,
+            detached_physical: false,
+            tx: thumb_tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            restore_started_at: started_at,
+        };
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert!(app.sidecar_restore_blocks_projected_context());
+        assert_eq!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .modal_delay_remaining(started_at + std::time::Duration::from_millis(99)),
+            std::time::Duration::from_millis(1),
+            "a fast Missing/no-marker or synchronized Current terminal must not flash the modal"
+        );
+
+        // Current is the terminal used by both Missing/no-marker and synchronized probes.
+        // Put that completed probe at the Resuming boundary without bypassing begin's typed owner.
+        app.sidecar_restore.as_mut().unwrap().phase = Phase::Resuming;
+        let ctx = egui::Context::default();
+        app.poll_sidecar_restore(&ctx);
+        assert!(app.sidecar_restore.is_none());
+        assert_eq!(
+            app.settings.last_folder.as_ref(),
+            Some(&folder),
+            "the owned load tail must run at the fast Current terminal"
+        );
+
+        let sentinel = app.tmp.path().join("second-poll-sentinel");
+        app.settings.last_folder = Some(sentinel.clone());
+        app.poll_sidecar_restore(&ctx);
+        assert_eq!(app.settings.last_folder.as_ref(), Some(&sentinel));
     }
 
     #[test]

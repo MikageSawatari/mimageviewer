@@ -2676,10 +2676,11 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
         take_current_edit_preview_clear_trace(),
         vec![
             Some(mounted_folder),
+            None,
             Some(active_folder),
             Some(sibling_folder)
         ],
-        "the mounted, active, and remaining paused contexts must each be processed exactly once"
+        "the mounted context, AtRest main context, active context, and remaining paused context must each be processed exactly once"
     );
 
     assert_eq!(
@@ -6564,6 +6565,15 @@ pub(crate) mod phase_c_support {
         setup_app_with_similar_capability(crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY)
     }
 
+    #[test]
+    fn shared_navigation_fixture_uses_an_explicit_no_sidecar_profile() {
+        let app = setup_app();
+
+        assert!(!app.settings.sidecar_backup_enabled);
+        assert!(!app.settings.tag_sidecar_backup_enabled);
+        assert!(crate::settings::Settings::default().sidecar_backup_enabled);
+    }
+
     pub(crate) fn setup_paused_similar_app_with_fixture(
         settings: crate::settings::Settings,
         prepare_data_dir: impl FnOnce(&std::path::Path),
@@ -6598,6 +6608,12 @@ pub(crate) mod phase_c_support {
         };
         let mut app = App::new_for_test(config);
         app.settings.first_setup_completed = true;
+        // This shared fixture exercises navigation, context, and input behavior. Give it an
+        // explicit NoSidecar profile so those tests retain their synchronous load contract;
+        // recovery-specific tests opt back in and poll the typed async owner to completion.
+        // Production defaults remain covered separately and are not changed by this fixture.
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
         // `data_dir` の差し替えだけでは製本ルートは隔離されない。`book_root` が None のままだと
         // `settings_books_root` が既定 (= 利用者の実ピクチャフォルダ) を返し、そこへ本フォルダを
         // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
