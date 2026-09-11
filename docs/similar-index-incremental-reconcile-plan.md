@@ -501,3 +501,11 @@ source不変 `51caf188e` の再確認は11:58:23–12:05:30 JST、426.868秒、n
 rootも実成果物hashを照合。証跡は `target/similar-startup-full-hotpath-20260911/build-dev-cef1e68d9/MANIFEST.txt`、build log SHA256 `C18678C0EFD1A5D4DA9C3FE6CC3C8350763521EC637EFE747046740C205BBAD5`。この後は本書の記録のみ。
 
 利用者用コマンドはrepository rootで `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るためinstalled/tray版を先に終了する。起動後の索引確認件数と段階ログを採り、実機総時間が短縮したか、残る律速がどこかを確認する。A+Bの実装・独立レビュー・全体gate・buildは完了したが、起動時Fullそのものは残り、実機の時間問題全体の解決は未確認である。
+
+### 利用者実機：起動 Full が約3分で完了
+
+修正版起動後、利用者が約241万件の画面を提示し、その後完了を報告した。rootは通常logをread-onlyで確認し、startup経過180.158秒でjob `1:0 kind=full reason=initial` の `terminal=complete` を確認。job経過179.266秒、inventory load4.901秒、scanning約172.387秒、終端prune/DB公開約1.975秒、array待ち約0.003秒。processed4,654,263 / discovered4,666,609 / unchanged4,646,102 / indexed0 / removed0 / io_failures0 / decode_failures142。既存464万件は再利用され、再登録はない。decode失敗142は前回画面にも出ていた件数と同数だが、同一対象の照合まではしていない。
+
+初回の約12分で163万件という画面より短い時間で全体が完了したことは今回の実機観測。OS cacheやアクセス順の条件を固定したAB比較ではないため、この差のすべてをbuffer修正の効果と断定しない。今回の観測では支配的な時間はFS scanningで、inventory/DB終端/array公開ではない。起動Fullそのものは残るが、今回の実機で約3分の収束と利用者の完了確認を得た。
+
+抽出証跡は `target/similar-startup-full-hotpath-20260911/live-20260911-1225/similar-events.txt`、SHA256 `FDC39659DFA3B6A59417C4CC452D58C68D8CC9523EEB5FA797CADE885E7AB40A`。エージェントは起動・停止・本番DB操作・追加FS走査を行っていない。
