@@ -205,3 +205,15 @@ masterの未コミット差分、実データ、実アプリには触れず、�
 Remote 1件を停止する事故があった。利用者へ報告済み、再起動なし、未保存状態への影響未確認。
 今後は `build-portable.ps1 -PreserveRuntime` → `prepare-portable-smoke.ps1 -SkipBuild` とし、
 稼働アプリを停止しない。記録は同checkpoint directoryの `manual-portable-vst-unset-build.json`。
+
+## 2026-09-11 統合後の完了状況
+
+§1.209 は `9c9df532c` と `06a256a24` で実装。復元はworkerで行い、短時間ならmodalを描かず、100msを超える場合に復元中表示を出す。別窓native動画の通常操作は維持。全窓native入力排他の追加案は利用者合意で撤回。原本・未保存owner保護は維持する。
+統合gateはmain 8266成功/0失敗/45 ignored、他workspace/integration/doc/vendorも成功。実アプリでの新しい復元確認は未実施。
+
+§1.217 サムネイル画質dialog自己拡張、§1.214 件数overlay半透明化、§1.215 同一ピンタグ再クリックで閉じる、は `108931b9d` で実装・独立承認済み。28frame寸法安定、明暗theme可読性、通常/スマートフォルダ復帰等の重点回帰に成功。完了3節はbacklogから除去し本記録へ移した。
+同commitの全gateはmain 8272成功/0失敗/45 ignored、全integration/doc/vendor成功、fmt成功、glyph0。`build-dev.ps1 -PreserveRuntime`成功。core SHA256 `3C568D002FFA375DAA9AED462787A75F44B14C57B79DD875239ECD11943ED6C3`。アプリ起動・停止は行っておらず、UI3件の利用者実機確認は未実施。
+
+類似検索・コンテナ索引の製品変更は `12e9b8008`、`2b03c73b6` までmasterへ統合済み。実機測定の最新記録はdupeのdoc-only `54c36d6b6` / `a691aee59` を参照。類似差分27〜61ms、コンテナ同件数108秒→15.4秒/56秒→9.9秒。前後のキャッシュ条件は統制していない。
+
+残る今回の製品実装は動画メモリ消費の§1.190と列幅§1.211。自動余白カット§1.216は利用者指定で後続版へ延期し、設計を保持する。実機自動検証は次回以降リリース前に約20分の枠を想定、診断版を事前準備し具体suiteの了承後に実行する。
