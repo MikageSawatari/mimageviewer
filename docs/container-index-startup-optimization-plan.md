@@ -54,3 +54,25 @@ r2は `strip_suffix('/').expect(...).to_owned()` で通常文として上限を�
 証跡 `target/container-index-startup-optimization/validation-r2/RESULTS.txt` SHA256 `184C68B44AC45B55E65348570A18C22F23EBF9107B791B5D3441A8D2DBBD0936`。全体gateと確認buildはまだ。親master統合gateの§209経路による失敗は本ブランチに含まない別source条件であり、このSQL修正の失敗として扱わない。最終gate/buildの統合可否を親担当と調整する。
 
 独立reviewerは実行証拠も確認しP1/P2なしで承認。`freeze-r2/review-approval.md` SHA256 `DD4406CA2553787EFF5337F71E4D29B85C2339FD7D2B4E5462EAD12CD3B35517`。親担当と合意し、§209修正を混ぜず、本ブランチの検証済み基盤で今回SQL修正の全体gate/buildを独立実行する。
+
+## 全体gate
+
+実装commit `2b03c73b6`。17:18–17:29 JSTの `test-full.ps1 -SuppressCrashDialogs` はexit0/PASS、timeoutなし。本体8,198 passed / 45 ignored（360.38秒）、UI48（5.66秒）、vendor egui25 / egui-wgpu9 / eframe15を含め全段階成功。開始時12e9b8008＋差分とcommit後のsource bytesは同じ。rootも原本を照合した。
+
+証跡 `target/container-index-startup-optimization/fullgate-r2/`。stdout SHA256 `200A053E1AB903D1A14B2985C285864A10155D7D8DED6CDAA40F49110A0FEECE`、stderr `DF97C616B43C6EA18F7584C8C15F77411B0EDFFCA59D96F71BFDDC3F6B5E4696`。利用者がmIV終了を連絡し、担当が対象dev-runtime core/remote0を確認後にbuild-dev -PreserveRuntimeへ進む。実機のコンテナ索引時間は引き続き未測定。
+
+## 確認build
+
+`build-dev.ps1 -PreserveRuntime` normal featureは17:32:44 JSTにexit0で完了。前後の対象core/remote0、終了時Cargo/rustc/link0。通常app起動停止・実DB変更は行っていない。sourceは2b03c73b6/freezeと一致する。
+
+`target/dev-runtime/mimageviewer-core.exe` は310,145,536 bytes、17:32:42 JST、SHA256 `1C6BB8F01CCECF8B391F71241A72F15B847B60791B1EE66953D2447A2DD802ED`。Remoteは変更なし、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。rootが実file hashを照合。証跡 `target/container-index-startup-optimization/build-r2/RESULTS.txt` SHA256 `9718D05D832647B64A5BB7D4C34FE61A5DCFD0F5A2FE35187671FB03E9208D0E`。
+
+利用者には常駐版を終了して同coreを手動起動し、通常の `%APPDATA%/mimageviewer` を使用・更新することを伝える。コンテナ索引の起動完了時間を前回E:107.865秒/D:55.828秒と比較し、watch変更後の検索反映も確認する。二重列挙・アイテム索引・並列度・DB形式は変更していない。CPU/IOの削減根拠は合成SQLで確認済みだが、実機秒数の改善は利用者の次回起動ログ待ち。
+
+## 実機起動確認
+
+17:37起動sessionで利用者が「かなり速くなっている」と報告。rootがログを読み取り、E:/share/18は107.865→15.415秒、D:/home/18は55.828→9.941秒を確認。folder/entry数はそれぞれ29,177/33,692、12,219/13,244で前回と同じ。全name scanはcancelled=false、対象ログにname_bulkのerrorなし。
+
+アイテム索引の最長jobは24.197→23.077秒、類似は42.157→43.052秒（indexed=0、removed=0、containers_completed=0）。類似のdecode failures142は前回同数、同一対象とは未照合。通常索引のinitial_scan_settledは起動t24.071、類似完了はt44.047。並列のため各索引時間を足さない。
+
+キャッシュを統制したA/Bではないが、対象件数の一致と合成SQLのN比例排除の証拠があり、今回小修正の実機改善を支持する。watch変更後の検索反映はこのsessionでは未検証。証跡 `target/container-index-startup-optimization/live-verification/events.txt` SHA256 `9B5C31C6C0CAD37F8D798312F2E178EA226B0A2256F03B2048A4742F81FB0E71`。アプリ起動停止、DB操作、Cargoなし。
