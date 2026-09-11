@@ -413,3 +413,20 @@ freeze は `target/similar-index-enabled-20260911/freeze-r1/MANIFEST.txt`（SHA2
 freeze は `target/similar-enabled-master-8e5e7-integration-20260911/freeze-r1`。両 parent は `6f7bcd29c` / `8e5e7ca7e`、source freeze 時の index tree は `2d85469033179e2a58d79367a0a0ba6302d4f73b`（本書の追加記録は未stage）。独立 Sol は交差する app.rs/tests.rs を両 parent と照合し、Enabled private constructor / Option / bootstrap / password / FullDelta と、typed VideoAudioModeRuntime / explicit-input handoff / FullscreenSecondaryPress / context lifecycle の共存を承認、P1/P2 なし。`review-approval.md` SHA256 `5A200B129331A54DC854DF6BF941BD509E11AEF24EBB404758EBE321C75378B2`。
 
 統合 source は freeze と一致し、次に merge commit と結合 full gate / 確認 build を行う。既知 master 修正の再設計や既知性能試験の再実行はない。
+
+### master 208/210 結合 full gate
+
+統合を `cf712806f8c85234f72dfa192c2c1fea0741d1ab`（parents `6f7bcd29c` / `8e5e7ca7e`）に保存し、この clean HEAD を対象に全体 gate を実行した。10:15:55–10:28:10 JST、`test-full.ps1 -SuppressCrashDialogs`、jobs=1、exit 0 / PASS。本体 8,171 passed / 44 ignored、UI snapshot 48、workspace/integration/doc、vendor 25/9/15 件も成功した。
+
+証跡は `target/similar-enabled-master-8e5e7-integration-20260911/fullgate-cf712806f/`。stdout SHA256 `95141EDC431D59CE8B3628FEB6B379D8B1A97E3FF8D5A3C053BF81FFA4B78B29`、stderr SHA256 `FB81A3592096D24E24E222D7C697911A3BDD88974B653C04C873489C5175A169`。root も PASS、件数、exit を照合した。source は固定し、続いて `build-dev.ps1 -PreserveRuntime` の通常確認 build を行う。
+
+### master 208/210 結合 build 完了・引渡し
+
+`cf712806f` の通常確認 build は 10:29:17–10:35:52 JST、`build-dev.ps1 -PreserveRuntime`、jobs=1、exit 0。root は実ファイルの hash を再計算して一致を確認した。
+
+- core: 309,925,888 bytes、mtime 10:35:47 JST、SHA256 `EF9E3F341ED00F063BCBBBA9E5B437583FC0D261CE41DFC8CB4E5D384B6A1135`
+- Remote: 12,197,376 bytes、mtime 07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。変更のない成果物を Cargo が再利用した。
+
+集約証跡は `target/similar-enabled-master-8e5e7-integration-20260911/FINAL-VALIDATION.txt`、SHA256 `5AD50576905A489B0691BD2CF1F0C704BA271A716F54055194990A7AA67B1AB8`。終了時 exact staged resident / cargo / rustc はすべて 0。以後の変更は本書の記録だけで、アプリ起動・停止・本番データ操作なし。結合に追加製品修正はなく、独立 review・焦点 gate・full gate・確認 build が完了した。master への取り込みは親に引き渡す。
+
+手動確認用は repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。再有効化後の索引進捗と通知収束、類似タブの移動・比較・履歴、動画再生との併用は統合版での利用者確認に残る。208/210 単体の利用者実機確認済みという証拠を、結合版の実機成功に読み替えない。
