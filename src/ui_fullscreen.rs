@@ -54150,6 +54150,284 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn fullscreen_book_query_for_strip_preview(
+        origin_paths: &[PathBuf],
+        target: &std::path::Path,
+        target_origin_slot: usize,
+    ) -> crate::similar_index::BookQuery {
+        use crate::similar_index::{
+            BookOrigin, BookOriginPage, BookPageBaseline, BookPageMatch, BookPageMatchState,
+            BookRelationHit, BookRelations, SimilarItemTarget,
+        };
+
+        let origin = Arc::new(BookOrigin {
+            pages: origin_paths
+                .iter()
+                .map(|path| BookOriginPage {
+                    item_key: crate::similar_index::item_key_for_file(path),
+                    baseline: BookPageBaseline::Unmatched,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+        let target_item_key = crate::similar_index::item_key_for_file(target);
+        let target_page = 7;
+        let hit = BookRelationHit::new(
+            crate::search_index_db::normalize_path(target.parent().unwrap()),
+            10,
+            crate::dupe::book::BookPair {
+                a: 1,
+                b: 2,
+                matched: 1,
+                distinctive_a: 1,
+                distinctive_b: 1,
+                coverage_a: 1.0,
+                coverage_b: 1.0,
+                relation: crate::dupe::book::Relation::Same,
+                alignment: vec![(target_origin_slot as u32, target_page)],
+            },
+            vec![BookPageMatch {
+                origin_slot: target_origin_slot,
+                state: BookPageMatchState::Strong,
+                other_page_index: target_page,
+                other_target: Some(SimilarItemTarget::File(target.to_path_buf())),
+                other_item_key: target_item_key,
+                other_mtime: 17,
+                other_file_size: 23,
+            }],
+            origin.pages.len(),
+        )
+        .unwrap();
+        crate::similar_index::BookQuery::Ready(BookRelations {
+            origin,
+            hits: vec![hit],
+        })
+    }
+
+    #[cfg(windows)]
+    fn run_real_book_strip_preview_spread_case(
+        case: &str,
+        spread_mode: crate::settings::SpreadMode,
+        origin_page_count: usize,
+    ) {
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        configure_similar_preview_layout_mode(
+            &mut app,
+            fs_idx,
+            crate::similar_preview::SimilarPreviewLayoutMode::Spread,
+        );
+        app.spread_mode = spread_mode;
+        app.native_video_in_window_active = true;
+        app.fs_info_panel.locked = true;
+        app.similar_panel.select_similar_tab_for_test();
+
+        let origin_paths = (0..origin_page_count)
+            .map(|page| PathBuf::from(format!(r"C:\preview\origin\{page:04}.png")))
+            .collect::<Vec<_>>();
+        let target_origin_slot = origin_page_count * 2 / 3;
+        let target_path = PathBuf::from(r"D:\preview\candidate\0007.png");
+        app.items[fs_idx] = GridItem::Image(origin_paths[0].clone());
+        app.items[fs_idx + 1] = GridItem::Image(origin_paths[1].clone());
+        app.similar_panel.set_book_query_override_for_test(
+            fullscreen_book_query_for_strip_preview(
+                &origin_paths,
+                &target_path,
+                target_origin_slot,
+            ),
+        );
+        app.similar_panel.set_item_query_override_for_test(
+            crate::similar_index::ItemQuery::Ready(crate::similar_index::ItemMatches {
+                origin: crate::similar_index::OriginItem {
+                    item_key: crate::similar_index::item_key_for_file(&origin_paths[0]),
+                    kind: crate::similar_db::ItemKind::Image,
+                    mtime: 11,
+                    file_size: 13,
+                    width: 1200,
+                    height: 1600,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(
+                        origin_paths[0].clone(),
+                    )),
+                },
+                hits: Vec::new(),
+            }),
+            true,
+        );
+
+        let original_ids = [
+            insert_similar_preview_dispatcher_static_page(
+                &mut app,
+                &ctx,
+                fs_idx,
+                &format!("{case}_left"),
+                egui::Color32::DARK_RED,
+            ),
+            insert_similar_preview_dispatcher_static_page(
+                &mut app,
+                &ctx,
+                fs_idx + 1,
+                &format!("{case}_right"),
+                egui::Color32::DARK_GREEN,
+            ),
+        ];
+        let expected_idx = app.fullscreen_idx;
+        let expected_generation = app.items_generation;
+        let expected_reading_flow = app.reading_flow;
+        let expected_page_slice = app.fullscreen_page_slice;
+
+        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
+            app.render_fullscreen_viewport(ctx);
+        });
+        let strip_rect =
+            crate::ui_metadata_panel::take_book_strip_rect_for_test().unwrap_or_else(|| {
+                panic!("{case}: real locked Similar panel must draw the book strip")
+            });
+        let target_key = crate::similar_index::item_key_for_file(&target_path);
+        let target_rects = crate::ui_metadata_panel::take_book_strip_target_rects_for_test()
+            .into_iter()
+            .filter_map(|(item_key, rect)| (item_key == target_key).then_some(rect))
+            .collect::<Vec<_>>();
+        let press_pos = target_rects
+            .get(target_rects.len() / 2)
+            .unwrap_or_else(|| panic!("{case}: target must own an actually painted strip column"))
+            .center();
+        let _ = ctx.run(
+            navigator_ordered_input(vec![egui::Event::PointerMoved(press_pos)], 0.05),
+            |ctx| app.render_fullscreen_viewport(ctx),
+        );
+        let hover_rect = crate::ui_metadata_panel::take_book_strip_rect_for_test()
+            .unwrap_or_else(|| panic!("{case}: hovered locked panel must retain the book strip"));
+        let _ = crate::ui_metadata_panel::take_book_strip_target_rects_for_test();
+        let completion = app
+            .similar_panel
+            .preview
+            .queue_test_completion_for_next_press();
+        let _ = ctx.run(
+            navigator_ordered_input(
+                vec![
+                    egui::Event::PointerMoved(press_pos),
+                    navigator_button_event(press_pos, egui::PointerButton::Primary, true),
+                ],
+                0.1,
+            ),
+            |ctx| app.render_fullscreen_viewport(ctx),
+        );
+        let pressed_rect = crate::ui_metadata_panel::take_book_strip_rect_for_test();
+        let _ = crate::ui_metadata_panel::take_book_strip_target_rects_for_test();
+        let (candidate, session) = app
+            .similar_panel
+            .preview
+            .active_candidate_for_test()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{case}: strip press must reach the production preview owner; initial={strip_rect:?}, hover={hover_rect:?}, pressed={pressed_rect:?}, press={press_pos:?}"
+                )
+            });
+        assert_eq!(candidate.item_key, target_key);
+        assert_eq!(
+            candidate.target,
+            crate::similar_index::SimilarItemTarget::File(target_path.clone())
+        );
+        assert_eq!(candidate.indexed_mtime, 17);
+        assert_eq!(candidate.indexed_file_size, 23);
+        assert_eq!(session.viewport, egui::ViewportId::ROOT);
+        assert_eq!(session.items_generation, expected_generation);
+        assert_eq!(session.page_idx, fs_idx);
+        assert_eq!(
+            session.layout_mode,
+            crate::similar_preview::SimilarPreviewLayoutMode::Spread
+        );
+
+        completion
+            .send_prepared(
+                Arc::new(egui::ColorImage::filled(
+                    [24, 16],
+                    egui::Color32::LIGHT_BLUE,
+                )),
+                [2400, 1600],
+                None,
+                29,
+            )
+            .expect("production strip press must own the queued deterministic receiver");
+        let preview_output = ctx.run(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
+            app.render_fullscreen_viewport(ctx);
+        });
+        let candidate_id = app
+            .similar_panel
+            .preview
+            .cached_texture()
+            .expect("held strip completion must install the candidate texture")
+            .id();
+        let preview_primitives =
+            ctx.tessellate(preview_output.shapes, preview_output.pixels_per_point);
+        assert!(
+            similar_preview_mesh_count(&preview_primitives, candidate_id) >= 2,
+            "{case}: candidate must replace the spread in both body and navigator"
+        );
+        for original_id in original_ids {
+            assert_eq!(
+                similar_preview_mesh_count(&preview_primitives, original_id),
+                0,
+                "{case}: held preview must not leave either spread page visible"
+            );
+        }
+
+        let release_output = ctx.run(
+            navigator_ordered_input(
+                vec![navigator_button_event(
+                    press_pos,
+                    egui::PointerButton::Primary,
+                    false,
+                )],
+                0.3,
+            ),
+            |ctx| app.render_fullscreen_viewport(ctx),
+        );
+        let release_primitives =
+            ctx.tessellate(release_output.shapes, release_output.pixels_per_point);
+        assert_eq!(
+            similar_preview_mesh_count(&release_primitives, candidate_id),
+            0,
+            "{case}: release must retire the temporary candidate in the same frame"
+        );
+        let resolved_ids = [fs_idx, fs_idx + 1].map(|idx| {
+            app.resolve_fs_display_tex(idx, false)
+                .unwrap_or_else(|| {
+                    panic!("{case}: release must retain page {idx} display resource")
+                })
+                .id()
+        });
+        let release_counts =
+            resolved_ids.map(|id| similar_preview_mesh_count(&release_primitives, id));
+        assert!(
+            release_counts.into_iter().all(|paints| paints >= 1),
+            "{case}: release must restore both original spread pages; paints={release_counts:?}, resolved={resolved_ids:?}, left_layout={}, right_layout={}",
+            app.fullscreen_page_layout.page_by_idx(fs_idx).is_some(),
+            app.fullscreen_page_layout.page_by_idx(fs_idx + 1).is_some()
+        );
+        assert_eq!(app.fullscreen_idx, expected_idx);
+        assert_eq!(app.items_generation, expected_generation);
+        assert_eq!(app.reading_flow, expected_reading_flow);
+        assert_eq!(app.fullscreen_page_slice, expected_page_slice);
+        assert_eq!(app.spread_mode, spread_mode);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_book_strip_press_previews_one_page_over_wide_and_compressed_spreads() {
+        for (case, spread_mode, origin_page_count) in [
+            ("ltr_wide", crate::settings::SpreadMode::Ltr, 4),
+            ("rtl_wide", crate::settings::SpreadMode::Rtl, 4),
+            ("ltr_compressed", crate::settings::SpreadMode::Ltr, 600),
+            ("rtl_compressed", crate::settings::SpreadMode::Rtl, 600),
+        ] {
+            run_real_book_strip_preview_spread_case(case, spread_mode, origin_page_count);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn locked_fullscreen_similar_panel_move_button_admits_the_physical_scan() {
         let (mut app, _, fs_idx) = setup_flat_navigator_input_test();

@@ -511,6 +511,37 @@ impl SimilarPreviewState {
         )
     }
 
+    /// Queue a deterministic completion receiver for the next production press path.
+    ///
+    /// Unlike [`Self::begin_test_press`], this does not create a gesture. Integration tests must
+    /// first drive the real widget/dispatcher, verify the resulting active candidate, and only
+    /// then send the returned completion. That keeps a missing press from being hidden by the
+    /// test seam while leaving filesystem decoding to the dedicated worker tests below.
+    #[cfg(test)]
+    pub(crate) fn queue_test_completion_for_next_press(&mut self) -> SimilarPreviewTestCompletion {
+        let (tx, rx) = mpsc::channel();
+        self.test_receivers.push_back(rx);
+        SimilarPreviewTestCompletion { tx }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_candidate_for_test(
+        &self,
+    ) -> Option<(SimilarPreviewCandidate, SimilarPreviewSession)> {
+        let SimilarPreviewGesture::Holding { stamp, session, .. } = &self.gesture else {
+            return None;
+        };
+        Some((
+            SimilarPreviewCandidate {
+                item_key: stamp.item_key.clone(),
+                target: stamp.target.clone(),
+                indexed_mtime: stamp.indexed_mtime,
+                indexed_file_size: stamp.indexed_file_size,
+            },
+            *session,
+        ))
+    }
+
     fn observe_session(&mut self, session: SimilarPreviewSession) {
         if self.session == Some(session) {
             return;

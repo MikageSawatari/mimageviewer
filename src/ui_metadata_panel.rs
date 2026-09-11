@@ -4305,6 +4305,14 @@ struct StripColumnRange {
     end: usize,
 }
 
+#[derive(Clone, Copy)]
+struct StripTargetHit {
+    column: usize,
+    page: usize,
+    range: StripColumnRange,
+    rect: egui::Rect,
+}
+
 /// Origin-only column projection shared by every visible relation row in one draw pass.
 struct OriginStripColumns {
     pages: usize,
@@ -4419,11 +4427,94 @@ fn summarize_page_strip(
 #[cfg(test)]
 thread_local! {
     static LAST_BOOK_STRIP_RECT: std::cell::Cell<Option<egui::Rect>> = const { std::cell::Cell::new(None) };
+    static LAST_BOOK_STRIP_TARGET_RECTS: std::cell::RefCell<Vec<(String, egui::Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn strip_column_outline_rect(
+    rect: egui::Rect,
+    pages: usize,
+    columns: usize,
+    column: usize,
+) -> (StripColumnRange, egui::Rect) {
+    let range = strip_column_page_range(pages, columns, column);
+    let left = strip_page_left(rect.width(), pages, range.start);
+    let right = strip_page_left(rect.width(), pages, range.end).max(left + STRIP_MIN_CELL);
+    (
+        range,
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + left, rect.top()),
+            egui::vec2(right - left, rect.height()),
+        ),
+    )
+}
+
+fn strip_column_raw_rect(
+    rect: egui::Rect,
+    pages: usize,
+    columns: usize,
+    column: usize,
+) -> (StripColumnRange, egui::Rect) {
+    let range = strip_column_page_range(pages, columns, column);
+    let left = strip_page_left(rect.width(), pages, range.start);
+    let right = strip_page_left(rect.width(), pages, range.end);
+    (
+        range,
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + left, rect.top()),
+            egui::pos2(rect.left() + right, rect.bottom()),
+        ),
+    )
+}
+
+/// Resolve the same minimum-width target that the strip presents as a hover outline.
+///
+/// A compressed book can paint one logical column while the visible outline is deliberately at
+/// least [`STRIP_MIN_CELL`] points wide. Input must belong to that visible owner too; otherwise
+/// most of the shown square says "no corresponding page" when pressed. An exact raw column keeps
+/// priority. Overlapping expanded targets choose the nearest painted one-point column, then the
+/// lower column for a deterministic tie.
+fn resolve_strip_target_hit(
+    first_target: &[Option<usize>],
+    rect: egui::Rect,
+    pages: usize,
+    raw_column: usize,
+    pointer: egui::Pos2,
+) -> Option<StripTargetHit> {
+    let make = |column: usize, page: usize| {
+        let (range, rect) = strip_column_outline_rect(rect, pages, first_target.len(), column);
+        StripTargetHit {
+            column,
+            page,
+            range,
+            rect,
+        }
+    };
+    if let Some(page) = first_target.get(raw_column).copied().flatten() {
+        return Some(make(raw_column, page));
+    }
+    first_target
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(column, page)| page.map(|page| make(column, page)))
+        .filter(|hit| hit.rect.contains(pointer))
+        .min_by(|left, right| {
+            let left_distance = (pointer.x - (rect.left() + left.column as f32 + 0.5)).abs();
+            let right_distance = (pointer.x - (rect.left() + right.column as f32 + 0.5)).abs();
+            left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| left.column.cmp(&right.column))
+        })
 }
 
 #[cfg(test)]
-fn take_book_strip_rect_for_test() -> Option<egui::Rect> {
+pub(crate) fn take_book_strip_rect_for_test() -> Option<egui::Rect> {
     LAST_BOOK_STRIP_RECT.with(|rect| rect.take())
+}
+
+#[cfg(test)]
+pub(crate) fn take_book_strip_target_rects_for_test() -> Vec<(String, egui::Rect)> {
+    LAST_BOOK_STRIP_TARGET_RECTS.with(|rects| std::mem::take(&mut *rects.borrow_mut()))
 }
 
 /// 1 冊分のページを 1 行の帯にする。
@@ -4474,6 +4565,21 @@ fn draw_page_strip(
         strongest,
         first_target,
     } = summarize_page_strip(strip, columns, origin_columns);
+    #[cfg(test)]
+    LAST_BOOK_STRIP_TARGET_RECTS.with(|target_rects| {
+        let mut target_rects = target_rects.borrow_mut();
+        target_rects.clear();
+        for (column, page) in first_target.iter().copied().enumerate() {
+            let Some(entry) = page.and_then(|page| strip.get(page)) else {
+                continue;
+            };
+            let Some(entry) = entry.match_override() else {
+                continue;
+            };
+            let (_, target_rect) = strip_column_outline_rect(rect, strip.len(), columns, column);
+            target_rects.push((entry.other_item_key.clone(), target_rect));
+        }
+    });
     // 1 ページが 3 px 以上取れるなら、ページごとの区画として描く。ページ数を数えられ、
     // ▼ がどの区画を指しているのかが分かる。取れないときだけ 1 px のコマへ畳む。
     let per_page = width / strip.len() as f32;
@@ -4525,26 +4631,25 @@ fn draw_page_strip(
     let Some(pos) = response.hover_pos() else {
         return;
     };
-    let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+    let raw_column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+    let target_hit = resolve_strip_target_hit(&first_target, rect, strip.len(), raw_column, pos);
     // 押したときに対象になるページ範囲を、そのまま囲う。カーソル中心の固定幅にすると、
     // 1 ページが十数 px ある帯で枠だけが細く残り、どのページを指しているのか分からない。
     let pages = strip.len();
-    let StripColumnRange {
-        start: first,
-        end: last,
-    } = strip_column_page_range(pages, columns, column);
-    let left = strip_page_left(width, pages, first);
-    let right = strip_page_left(width, pages, last).max(left + STRIP_MIN_CELL);
+    let (_, hover_rect) = target_hit.map_or_else(
+        // An unmatched raw column keeps its unexpanded page-range width. Expanding it would paint
+        // a white outline over a neighbouring target even though this pointer does not resolve to
+        // that target.
+        || strip_column_raw_rect(rect, pages, columns, raw_column),
+        |hit| (hit.range, hit.rect),
+    );
     painter.rect_stroke(
-        egui::Rect::from_min_size(
-            egui::pos2(rect.left() + left, rect.top()),
-            egui::vec2(right - left, STRIP_HEIGHT),
-        ),
+        hover_rect,
         0.0,
         egui::Stroke::new(1.0, egui::Color32::WHITE),
         egui::StrokeKind::Inside,
     );
-    let Some(page) = first_target[column] else {
+    let Some(page) = target_hit.map(|hit| hit.page) else {
         response.on_hover_text("ここに対応するページはありません");
         return;
     };
@@ -7489,6 +7594,62 @@ mod similar_panel_tests {
                 (2, 3),
                 (2, 3),
             ]
+        );
+    }
+
+    #[test]
+    fn compressed_strip_visible_target_rect_and_press_share_one_owner() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 20.0), egui::vec2(10.0, 8.0));
+        let mut first_target = vec![None; 10];
+        first_target[2] = Some(20);
+
+        let (_, visible) = super::strip_column_outline_rect(rect, 100, 10, 2);
+        assert_eq!(visible.width(), super::STRIP_MIN_CELL);
+        let pointer = egui::pos2(visible.right() - 0.25, visible.center().y);
+        let raw_column = ((pointer.x - rect.left()).floor() as usize).min(9);
+        assert_ne!(
+            raw_column, 2,
+            "the regression point is outside the raw target column"
+        );
+
+        let hit = super::resolve_strip_target_hit(&first_target, rect, 100, raw_column, pointer)
+            .expect("the whole visible three-point target must admit the press");
+        assert_eq!(hit.column, 2);
+        assert_eq!(hit.page, 20);
+        assert_eq!(hit.rect, visible);
+    }
+
+    #[test]
+    fn compressed_strip_target_resolution_is_exact_then_nearest_and_bounded() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 5.0), egui::vec2(10.0, 8.0));
+        let mut first_target = vec![None; 10];
+        first_target[2] = Some(20);
+        first_target[4] = Some(40);
+
+        let exact_pointer = egui::pos2(rect.left() + 4.25, rect.center().y);
+        let exact = super::resolve_strip_target_hit(&first_target, rect, 100, 4, exact_pointer)
+            .expect("an exact raw target column must resolve");
+        assert_eq!((exact.column, exact.page), (4, 40));
+
+        let tie_pointer = egui::pos2(rect.left() + 3.5, rect.center().y);
+        let tie = super::resolve_strip_target_hit(&first_target, rect, 100, 3, tie_pointer)
+            .expect("overlapping visible targets must resolve deterministically");
+        assert_eq!(
+            (tie.column, tie.page),
+            (2, 20),
+            "equal distance chooses the lower painted column"
+        );
+
+        let outside_pointer = egui::pos2(rect.left() + 7.25, rect.center().y);
+        assert!(
+            super::resolve_strip_target_hit(&first_target, rect, 100, 7, outside_pointer).is_none(),
+            "a pointer outside every three-point target remains unmatched"
+        );
+        let (_, unmatched_outline) = super::strip_column_raw_rect(rect, 100, 10, 7);
+        assert_eq!(unmatched_outline.width(), 1.0);
+        assert!(
+            unmatched_outline.left() >= exact.rect.right(),
+            "an unmatched hover outline must not cover a neighbouring target owner"
         );
     }
 
