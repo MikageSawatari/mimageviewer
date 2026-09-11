@@ -25,6 +25,8 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -97,6 +99,143 @@ enum ReaderCloneCancel {
 
 type ReaderCloneControl = Arc<Mutex<Option<ReaderCloneCancel>>>;
 
+/// zip 2.4.2 constructs each central-directory record through `central_header_to_zip_file`, whose
+/// `find_data_start` reads the matching local header and then restores the central-directory
+/// position. Two tiny windows combine adjacent reads on both sides of that alternating access
+/// without changing which headers or entries zip validates.
+// 2,048-entry disposable ZIP comparison (2026-09-11): two 256-byte windows removed 58% of OS
+// read calls while limiting read amplification to 3.38x; the second window removed 37.5% of the
+// calls and bytes remaining with one window. Larger windows saved only another 8 percentage
+// points of calls but raised amplification to 6.1x/11.5x/43.8x, a poor trade on UNC.
+const POSITIONED_READ_WINDOW_BYTES: usize = 256;
+const POSITIONED_READ_WINDOW_COUNT: usize = 2;
+
+#[derive(Debug, Default)]
+struct PositionedReadWindow {
+    start: u64,
+    bytes: Vec<u8>,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct PositionedReadCache {
+    window_bytes: usize,
+    window_count: usize,
+    windows: [PositionedReadWindow; POSITIONED_READ_WINDOW_COUNT],
+    use_serial: u64,
+    #[cfg(test)]
+    buffer_allocations: u64,
+}
+
+impl PositionedReadCache {
+    fn new(window_bytes: usize, window_count: usize) -> Self {
+        Self {
+            window_bytes,
+            window_count: if window_bytes == 0 {
+                0
+            } else {
+                window_count.clamp(1, POSITIONED_READ_WINDOW_COUNT)
+            },
+            windows: std::array::from_fn(|_| PositionedReadWindow::default()),
+            use_serial: 0,
+            #[cfg(test)]
+            buffer_allocations: 0,
+        }
+    }
+
+    fn copy_at(&mut self, position: u64, target: &mut [u8]) -> Option<usize> {
+        let index = self.windows[..self.window_count]
+            .iter()
+            .position(|window| {
+                position >= window.start
+                    && !window.bytes.is_empty()
+                    && position.saturating_sub(window.start) < window.bytes.len() as u64
+            })?;
+        let window = &mut self.windows[index];
+        let offset = usize::try_from(position.saturating_sub(window.start)).ok()?;
+        let count = target.len().min(window.bytes.len().saturating_sub(offset));
+        target[..count].copy_from_slice(&window.bytes[offset..offset + count]);
+        self.use_serial = self.use_serial.wrapping_add(1).max(1);
+        window.last_used = self.use_serial;
+        Some(count)
+    }
+
+    fn take_fill_buffer(&mut self) -> (usize, Vec<u8>) {
+        let index = self.windows[..self.window_count]
+            .iter()
+            .position(|window| window.bytes.is_empty())
+            .or_else(|| {
+                self.windows[..self.window_count]
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, window)| window.last_used)
+                    .map(|(index, _)| index)
+            })
+            .expect("a non-zero read window count has a fill slot");
+        let window = &mut self.windows[index];
+        window.start = 0;
+        window.last_used = 0;
+        let mut bytes = std::mem::take(&mut window.bytes);
+        bytes.clear();
+        if bytes.capacity() < self.window_bytes {
+            #[cfg(test)]
+            {
+                self.buffer_allocations = self.buffer_allocations.saturating_add(1);
+            }
+            bytes.reserve_exact(self.window_bytes);
+        }
+        bytes.resize(self.window_bytes, 0);
+        (index, bytes)
+    }
+
+    fn recycle_failed_fill(&mut self, index: usize, mut bytes: Vec<u8>) {
+        bytes.clear();
+        self.windows[index] = PositionedReadWindow {
+            bytes,
+            ..PositionedReadWindow::default()
+        };
+    }
+
+    fn finish_fill(&mut self, index: usize, start: u64, bytes: Vec<u8>) {
+        self.use_serial = self.use_serial.wrapping_add(1).max(1);
+        self.windows[index] = PositionedReadWindow {
+            start,
+            bytes,
+            last_used: self.use_serial,
+        };
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PositionedIoProbe {
+    requested_bytes: AtomicU64,
+    os_read_calls: AtomicU64,
+    os_read_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct PositionedIoSnapshot {
+    requested_bytes: u64,
+    os_read_calls: u64,
+    os_read_bytes: u64,
+    cache_hits: u64,
+}
+
+#[cfg(test)]
+impl PositionedIoProbe {
+    fn snapshot(&self) -> PositionedIoSnapshot {
+        PositionedIoSnapshot {
+            requested_bytes: self.requested_bytes.load(Ordering::Relaxed),
+            os_read_calls: self.os_read_calls.load(Ordering::Relaxed),
+            os_read_bytes: self.os_read_bytes.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// 1 つの `File` を共有しつつ、clone ごとに論理位置を持つ位置指定 reader。
 #[derive(Debug)]
 pub struct PositionedFileReader {
@@ -104,6 +243,9 @@ pub struct PositionedFileReader {
     position: u64,
     cancel: Option<Arc<AtomicBool>>,
     clone_control: ReaderCloneControl,
+    read_cache: PositionedReadCache,
+    #[cfg(test)]
+    io_probe: Option<Arc<PositionedIoProbe>>,
 }
 
 impl PositionedFileReader {
@@ -115,9 +257,29 @@ impl PositionedFileReader {
                 position: 0,
                 cancel,
                 clone_control: Arc::clone(&clone_control),
+                read_cache: PositionedReadCache::new(
+                    POSITIONED_READ_WINDOW_BYTES,
+                    POSITIONED_READ_WINDOW_COUNT,
+                ),
+                #[cfg(test)]
+                io_probe: None,
             },
             clone_control,
         )
+    }
+
+    #[cfg(test)]
+    fn new_with_read_window(
+        file: Arc<File>,
+        cancel: Option<Arc<AtomicBool>>,
+        window_bytes: usize,
+        window_count: usize,
+        io_probe: Arc<PositionedIoProbe>,
+    ) -> (Self, ReaderCloneControl) {
+        let (mut reader, clone_control) = Self::new(file, cancel);
+        reader.read_cache = PositionedReadCache::new(window_bytes, window_count);
+        reader.io_probe = Some(io_probe);
+        (reader, clone_control)
     }
 
     /// `Read` / `Seek` から返るので `cancelled_read_error` を使う (retry 契約を踏まない)。
@@ -131,6 +293,34 @@ impl PositionedFileReader {
         } else {
             Ok(())
         }
+    }
+
+    fn advance_position(&mut self, read: usize) -> std::io::Result<()> {
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ZIP reader position overflow",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn read_from_file(&self, buffer: &mut [u8], position: u64) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(probe) = &self.io_probe {
+            probe.os_read_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(self.file.as_ref(), buffer, position)?;
+        #[cfg(not(windows))]
+        let read = std::os::unix::fs::FileExt::read_at(self.file.as_ref(), buffer, position)?;
+        #[cfg(test)]
+        if let Some(probe) = &self.io_probe {
+            probe
+                .os_read_bytes
+                .fetch_add(read as u64, Ordering::Relaxed);
+        }
+        Ok(read)
     }
 }
 
@@ -147,6 +337,14 @@ impl Clone for PositionedFileReader {
             position: self.position,
             cancel,
             clone_control: Arc::clone(&self.clone_control),
+            // A clone is a new request owner. It shares the immutable zip directory through
+            // `ZipArchive`, but never shares mutable read-ahead state or cached bytes.
+            read_cache: PositionedReadCache::new(
+                self.read_cache.window_bytes,
+                self.read_cache.window_count,
+            ),
+            #[cfg(test)]
+            io_probe: self.io_probe.clone(),
         }
     }
 }
@@ -157,18 +355,46 @@ impl Read for PositionedFileReader {
         if buffer.is_empty() {
             return Ok(0);
         }
-        #[cfg(windows)]
-        let read =
-            std::os::windows::fs::FileExt::seek_read(self.file.as_ref(), buffer, self.position)?;
-        #[cfg(not(windows))]
-        let read = std::os::unix::fs::FileExt::read_at(self.file.as_ref(), buffer, self.position)?;
-        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ZIP reader position overflow",
-            )
-        })?;
-        Ok(read)
+        #[cfg(test)]
+        if let Some(probe) = &self.io_probe {
+            probe
+                .requested_bytes
+                .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+        }
+        if let Some(read) = self.read_cache.copy_at(self.position, buffer) {
+            // Cancellation was checked before consulting cached bytes. A cancelled request can
+            // therefore never observe data merely because another read populated a window.
+            #[cfg(test)]
+            if let Some(probe) = &self.io_probe {
+                probe.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            self.advance_position(read)?;
+            return Ok(read);
+        }
+        let window_bytes = self.read_cache.window_bytes;
+        if window_bytes == 0 || buffer.len() >= window_bytes {
+            let read = self.read_from_file(buffer, self.position)?;
+            self.advance_position(read)?;
+            return Ok(read);
+        }
+
+        let start = self.position;
+        let (slot, mut window) = self.read_cache.take_fill_buffer();
+        let read = match self.read_from_file(&mut window, start) {
+            Ok(read) => read,
+            Err(error) => {
+                // Keep the reusable allocation, but invalidate the selected slot: a failed fill
+                // must not leave unrelated bytes addressable under its previous range.
+                self.read_cache.recycle_failed_fill(slot, window);
+                return Err(error);
+            }
+        };
+        window.truncate(read);
+        let copied = buffer.len().min(window.len());
+        buffer[..copied].copy_from_slice(&window[..copied]);
+        self.read_cache.finish_fill(slot, start, window);
+        self.advance_position(copied)?;
+        Ok(copied)
     }
 }
 
@@ -1606,6 +1832,252 @@ mod tests {
             zw.write_all(data).unwrap();
         }
         zw.finish().unwrap();
+    }
+
+    fn measure_zip_directory_reads(
+        path: &Path,
+        window_bytes: usize,
+        window_count: usize,
+    ) -> (
+        Vec<(String, bool, u64)>,
+        PositionedIoSnapshot,
+        PositionedIoSnapshot,
+        Duration,
+    ) {
+        let probe = Arc::new(PositionedIoProbe::default());
+        let (reader, _) = PositionedFileReader::new_with_read_window(
+            Arc::new(File::open(path).unwrap()),
+            None,
+            window_bytes,
+            window_count,
+            Arc::clone(&probe),
+        );
+        let started = Instant::now();
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+        let after_open = probe.snapshot();
+        let entries = (0..archive.len())
+            .map(|index| {
+                let entry = archive.by_index(index).unwrap();
+                (entry.name().to_owned(), entry.is_file(), entry.size())
+            })
+            .collect();
+        (entries, after_open, probe.snapshot(), started.elapsed())
+    }
+
+    /// Drive zip 2.4's real central-directory parser against a disposable on-disk archive.
+    /// The timing is diagnostic only; deterministic assertions use calls, bytes, and metadata.
+    #[test]
+    fn positioned_read_windows_reduce_zip_parser_reads_without_changing_entries() {
+        const ENTRIES: usize = 2_048;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("directory-read-count.zip");
+        let file = File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let payload = vec![0x5a_u8; 4 * 1024];
+        for index in 0..ENTRIES {
+            use std::io::Write as _;
+            writer
+                .start_file(format!("chapter/{index:06}.jpg"), options)
+                .unwrap();
+            writer.write_all(&payload).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let (baseline_entries, baseline_open, baseline, baseline_elapsed) =
+            measure_zip_directory_reads(&path, 0, 0);
+        assert_eq!(baseline_entries.len(), ENTRIES);
+        let mut selected = None;
+        let mut one_window = None;
+        for (window_bytes, window_count) in [(256, 1), (256, 2), (512, 2), (1_024, 2), (4_096, 2)] {
+            let (entries, after_open, measured, elapsed) =
+                measure_zip_directory_reads(&path, window_bytes, window_count);
+            assert_eq!(entries, baseline_entries);
+            eprintln!(
+                "zip_positioned_reader entries={ENTRIES} window_bytes={window_bytes} window_count={window_count} elapsed_ms={:.3} requested_bytes={} open_calls={} open_bytes={} entry_calls={} entry_bytes={} os_read_calls={} os_read_bytes={} cache_hits={} baseline_elapsed_ms={:.3} baseline_open_calls={} baseline_open_bytes={} baseline_calls={} baseline_bytes={}",
+                elapsed.as_secs_f64() * 1000.0,
+                measured.requested_bytes,
+                after_open.os_read_calls,
+                after_open.os_read_bytes,
+                measured
+                    .os_read_calls
+                    .saturating_sub(after_open.os_read_calls),
+                measured
+                    .os_read_bytes
+                    .saturating_sub(after_open.os_read_bytes),
+                measured.os_read_calls,
+                measured.os_read_bytes,
+                measured.cache_hits,
+                baseline_elapsed.as_secs_f64() * 1000.0,
+                baseline_open.os_read_calls,
+                baseline_open.os_read_bytes,
+                baseline.os_read_calls,
+                baseline.os_read_bytes,
+            );
+            if window_bytes == POSITIONED_READ_WINDOW_BYTES && window_count == 1 {
+                one_window = Some(measured);
+            }
+            if window_bytes == POSITIONED_READ_WINDOW_BYTES
+                && window_count == POSITIONED_READ_WINDOW_COUNT
+            {
+                selected = Some(measured);
+            }
+        }
+        let selected = selected.expect("production read window must be one measured candidate");
+        let one_window = one_window.expect("one-window comparison must be measured");
+        assert!(
+            selected.os_read_calls * 2 < baseline.os_read_calls,
+            "the bounded production window must remove most tiny parser reads: baseline={} selected={}",
+            baseline.os_read_calls,
+            selected.os_read_calls,
+        );
+        assert!(
+            selected.os_read_bytes <= baseline.os_read_bytes.saturating_mul(4),
+            "read-ahead must remain bounded on network and rotating media: baseline={} selected={}",
+            baseline.os_read_bytes,
+            selected.os_read_bytes,
+        );
+        assert!(
+            selected.os_read_calls.saturating_mul(4) <= one_window.os_read_calls.saturating_mul(3),
+            "a second window must remove a material share of OS calls: one={} two={}",
+            one_window.os_read_calls,
+            selected.os_read_calls,
+        );
+    }
+
+    #[test]
+    fn positioned_read_window_keeps_seek_eof_large_read_and_clone_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader-window.bin");
+        let expected = (0..2_500).map(|value| value as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &expected).unwrap();
+        let probe = Arc::new(PositionedIoProbe::default());
+        let (mut reader, _) = PositionedFileReader::new_with_read_window(
+            Arc::new(File::open(&path).unwrap()),
+            None,
+            512,
+            2,
+            Arc::clone(&probe),
+        );
+
+        let mut prefix = [0_u8; 40];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix.as_slice(), &expected[..40]);
+        let calls_after_fill = probe.snapshot().os_read_calls;
+        reader.seek(SeekFrom::Start(16)).unwrap();
+        let mut cached = [0_u8; 32];
+        reader.read_exact(&mut cached).unwrap();
+        assert_eq!(cached.as_slice(), &expected[16..48]);
+        assert_eq!(probe.snapshot().os_read_calls, calls_after_fill);
+
+        let mut clone = reader.clone();
+        assert!(
+            clone
+                .read_cache
+                .windows
+                .iter()
+                .all(|window| window.bytes.capacity() == 0),
+            "cloning a reader must not allocate or copy window storage"
+        );
+        clone.seek(SeekFrom::Start(16)).unwrap();
+        clone.read_exact(&mut cached).unwrap();
+        assert_eq!(cached.as_slice(), &expected[16..48]);
+        assert_eq!(
+            probe.snapshot().os_read_calls,
+            calls_after_fill + 1,
+            "a request clone must start with an empty mutable cache"
+        );
+
+        reader.seek(SeekFrom::Start(2_400)).unwrap();
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, expected[2_400..]);
+        let mut eof = [0_u8; 1];
+        assert_eq!(reader.read(&mut eof).unwrap(), 0);
+
+        let direct_probe = Arc::new(PositionedIoProbe::default());
+        let (mut direct_reader, _) = PositionedFileReader::new_with_read_window(
+            Arc::new(File::open(&path).unwrap()),
+            None,
+            512,
+            2,
+            Arc::clone(&direct_probe),
+        );
+        let mut large = [0_u8; 1_024];
+        direct_reader.read_exact(&mut large).unwrap();
+        assert_eq!(large.as_slice(), &expected[..1_024]);
+        assert_eq!(
+            direct_probe.snapshot().os_read_calls,
+            1,
+            "large reads bypass the read-ahead copy"
+        );
+        assert_eq!(direct_reader.read_cache.buffer_allocations, 0);
+    }
+
+    #[test]
+    fn positioned_read_window_handles_partial_hits_and_two_window_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader-window-eviction.bin");
+        let expected = (0..256).map(|value| value as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &expected).unwrap();
+        let probe = Arc::new(PositionedIoProbe::default());
+        let (mut reader, _) = PositionedFileReader::new_with_read_window(
+            Arc::new(File::open(path).unwrap()),
+            None,
+            16,
+            2,
+            Arc::clone(&probe),
+        );
+
+        let mut first = [0_u8; 4];
+        reader.read_exact(&mut first).unwrap();
+        reader.seek(SeekFrom::Start(64)).unwrap();
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(probe.snapshot().os_read_calls, 2);
+
+        // Refresh the first window, then a third fill must evict the older second window.
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut first).unwrap();
+        reader.seek(SeekFrom::Start(128)).unwrap();
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(probe.snapshot().os_read_calls, 3);
+        reader.seek(SeekFrom::Start(64)).unwrap();
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(probe.snapshot().os_read_calls, 4);
+
+        // A read crossing a cached window boundary may return the cached prefix first; ReadExact
+        // must then continue at the exact logical position without a duplicate or missing byte.
+        reader.seek(SeekFrom::Start(76)).unwrap();
+        let mut crossing = [0_u8; 12];
+        reader.read_exact(&mut crossing).unwrap();
+        assert_eq!(crossing.as_slice(), &expected[76..88]);
+        assert_eq!(
+            reader.read_cache.buffer_allocations, 2,
+            "repeated misses must reuse the two fixed slot buffers"
+        );
+    }
+
+    #[test]
+    fn positioned_read_window_checks_cancel_before_returning_cached_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader-window-cancel.bin");
+        std::fs::write(&path, b"cached bytes must stay behind cancellation").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(PositionedIoProbe::default());
+        let (mut reader, _) = PositionedFileReader::new_with_read_window(
+            Arc::new(File::open(path).unwrap()),
+            Some(Arc::clone(&cancel)),
+            512,
+            2,
+            probe,
+        );
+        let mut first = [0_u8; 6];
+        reader.read_exact(&mut first).unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        cancel.store(true, Ordering::Release);
+        let error = reader.read(&mut first).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 
     fn read_with_directory_cache(

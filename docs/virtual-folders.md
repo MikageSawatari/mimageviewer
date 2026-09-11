@@ -741,3 +741,11 @@ ZIP/PDF 用の相対キーは **ZIP/PDF ファイルの親フォルダ** に置�
 片側だけ足すとインポートで復元されない。
 
 詳細は [preset-and-adjustment.md §9](preset-and-adjustment.md) を参照。
+
+## ZIP の小読み取りバッファ
+
+`zip_loader::PositionedFileReader` は位置をreaderごとに持つ既存の共有file handle方式に加え、256 bytes×2領域のsmall-read bufferをreader単位で持つ。依存zipの中央ディレクトリ解析は各local headerの検証と交互にseekするため、片方の領域を使っている間ももう片方を再利用できる。これは類似索引だけでなく通常ZIP閲覧・サムネイル・アーカイブcache経由の読み取りに共通する。
+
+bufferは初回small readでのみ確保し、miss時は領域を再利用する。request/templateのcloneは空のbufferで開始し、可変bufferや取消tokenを兄弟request間で共有しない。cache hit前にも取消を確認し、大きなreadは直接読み、EOF/short read/seekの位置契約を維持する。書庫のfreshness判定、entry列挙、CP932/UTF-8正規化、legacy rename、入れ子ZIP、復号や失敗の扱いを省略しない。
+
+局所比較と検証結果は [類似索引の増分照合と収束](similar-index-incremental-reconcile-plan.md) の起動Full短縮節に記録する。small readのOS呼出しは減るがread-aheadによる読み取りbytesは増え得るため、局所fixtureの速度を実機全体の起動時間に読み替えない。

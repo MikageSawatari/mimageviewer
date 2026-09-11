@@ -1101,6 +1101,18 @@ enum FullReason {
     Manual,
 }
 
+impl FullReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Reconfigure => "reconfigure",
+            Self::Overflow => "overflow",
+            Self::WatchRecovery => "watch_recovery",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FullIntent {
     config_epoch: u64,
@@ -1273,6 +1285,234 @@ enum ReconcileJobKind {
     Full(FullIntent),
     Delta,
     Purge,
+}
+
+impl ReconcileJobKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full(_) => "full",
+            Self::Delta => "delta",
+            Self::Purge => "purge",
+        }
+    }
+
+    fn reason_label(self) -> &'static str {
+        match self {
+            Self::Full(intent) => intent.reason.label(),
+            Self::Delta => "watch_change",
+            Self::Purge => "root_removed",
+        }
+    }
+}
+
+const RECONCILE_PROGRESS_LOG_INTERVAL_MS: u64 = 5_000;
+
+#[derive(Default)]
+struct ReconcileWorkCounters {
+    directories: AtomicU64,
+    loose_images: AtomicU64,
+    image_books: AtomicU64,
+    zip_containers: AtomicU64,
+    pdf_containers: AtomicU64,
+    directory_entries: AtomicU64,
+    image_book_pages: AtomicU64,
+    zip_pages: AtomicU64,
+    pdf_pages: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct ReconcileWorkSnapshot {
+    directories: u64,
+    loose_images: u64,
+    image_books: u64,
+    zip_containers: u64,
+    pdf_containers: u64,
+    directory_entries: u64,
+    image_book_pages: u64,
+    zip_pages: u64,
+    pdf_pages: u64,
+}
+
+impl ReconcileWorkCounters {
+    fn snapshot(&self) -> ReconcileWorkSnapshot {
+        ReconcileWorkSnapshot {
+            directories: self.directories.load(Ordering::Relaxed),
+            loose_images: self.loose_images.load(Ordering::Relaxed),
+            image_books: self.image_books.load(Ordering::Relaxed),
+            zip_containers: self.zip_containers.load(Ordering::Relaxed),
+            pdf_containers: self.pdf_containers.load(Ordering::Relaxed),
+            directory_entries: self.directory_entries.load(Ordering::Relaxed),
+            image_book_pages: self.image_book_pages.load(Ordering::Relaxed),
+            zip_pages: self.zip_pages.load(Ordering::Relaxed),
+            pdf_pages: self.pdf_pages.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Read-only diagnostics for one scheduler-owned reconcile job. It does not participate in job
+/// state transitions: the scheduler remains the sole owner of cancellation and completion.
+struct ReconcileRunTelemetry {
+    kind: &'static str,
+    reason: &'static str,
+    config_epoch: u64,
+    start_event_seq: u64,
+    started: std::time::Instant,
+    next_progress_log_ms: AtomicU64,
+    terminal_logged: AtomicBool,
+    work: ReconcileWorkCounters,
+    #[cfg(test)]
+    phase_trace: Mutex<Vec<&'static str>>,
+}
+
+impl ReconcileRunTelemetry {
+    fn new(job: &RunningReconcileJob) -> Self {
+        Self {
+            kind: job.kind.label(),
+            reason: job.kind.reason_label(),
+            config_epoch: job.config_epoch,
+            start_event_seq: job.start_event_seq,
+            started: std::time::Instant::now(),
+            next_progress_log_ms: AtomicU64::new(RECONCILE_PROGRESS_LOG_INTERVAL_MS),
+            terminal_logged: AtomicBool::new(false),
+            work: ReconcileWorkCounters::default(),
+            #[cfg(test)]
+            phase_trace: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn prefix(&self) -> String {
+        format!(
+            "job={}:{} kind={} reason={}",
+            self.config_epoch, self.start_event_seq, self.kind, self.reason
+        )
+    }
+
+    fn log_start(&self, roots: usize, dirty_scopes: usize, purge_roots: usize) {
+        crate::logger::log(format!(
+            "similar reconcile start: {} roots={} dirty_scopes={} purge_roots={}",
+            self.prefix(),
+            roots,
+            dirty_scopes,
+            purge_roots,
+        ));
+    }
+
+    fn log_phase(&self, phase: &'static str, report: Option<&IndexReport>) {
+        #[cfg(test)]
+        self.phase_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(phase);
+        let empty_report = IndexReport::default();
+        let report = report.unwrap_or(&empty_report);
+        crate::logger::log(format!(
+            "similar reconcile phase: {} phase={} elapsed_ms={} processed={} discovered={} unchanged={} indexed={} removed={}",
+            self.prefix(),
+            phase,
+            self.elapsed_ms(),
+            report.processed,
+            report.discovered,
+            report.unchanged,
+            report.indexed,
+            report.removed,
+        ));
+    }
+
+    fn claim_progress_log(&self, elapsed_ms: u64) -> bool {
+        let mut next = self.next_progress_log_ms.load(Ordering::Relaxed);
+        loop {
+            if elapsed_ms < next {
+                return false;
+            }
+            let following = elapsed_ms
+                .saturating_div(RECONCILE_PROGRESS_LOG_INTERVAL_MS)
+                .saturating_add(1)
+                .saturating_mul(RECONCILE_PROGRESS_LOG_INTERVAL_MS);
+            match self.next_progress_log_ms.compare_exchange_weak(
+                next,
+                following,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => next = actual,
+            }
+        }
+    }
+
+    fn maybe_log_progress(&self, report: &IndexReport) {
+        let elapsed_ms = self.elapsed_ms();
+        if !self.claim_progress_log(elapsed_ms) {
+            return;
+        }
+        let work = self.work.snapshot();
+        crate::logger::log(format!(
+            "similar reconcile progress: {} phase=scanning elapsed_ms={} processed={} discovered={} unchanged={} indexed={} work_dirs={} dir_entries={} loose={} image_books={} image_book_pages={} zips={} zip_pages={} pdfs={} pdf_pages={}",
+            self.prefix(),
+            elapsed_ms,
+            report.processed,
+            report.discovered,
+            report.unchanged,
+            report.indexed,
+            work.directories,
+            work.directory_entries,
+            work.loose_images,
+            work.image_books,
+            work.image_book_pages,
+            work.zip_containers,
+            work.zip_pages,
+            work.pdf_containers,
+            work.pdf_pages,
+        ));
+    }
+
+    #[cfg(test)]
+    fn phase_trace(&self) -> Vec<&'static str> {
+        self.phase_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn claim_terminal_log(&self) -> bool {
+        self.terminal_logged
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn log_terminal(&self, terminal: &'static str, report: &IndexReport) {
+        if !self.claim_terminal_log() {
+            return;
+        }
+        let work = self.work.snapshot();
+        crate::logger::log(format!(
+            "similar reconcile terminal: {} terminal={} elapsed_ms={} processed={} discovered={} unchanged={} indexed={} removed={} containers_completed={} io_failures={} decode_failures={} work_dirs={} dir_entries={} loose={} image_books={} image_book_pages={} zips={} zip_pages={} pdfs={} pdf_pages={}",
+            self.prefix(),
+            terminal,
+            self.elapsed_ms(),
+            report.processed,
+            report.discovered,
+            report.unchanged,
+            report.indexed,
+            report.removed,
+            report.containers_completed,
+            report.io_failures,
+            report.decode_failures,
+            work.directories,
+            work.directory_entries,
+            work.loose_images,
+            work.image_books,
+            work.image_book_pages,
+            work.zip_containers,
+            work.zip_pages,
+            work.pdf_containers,
+            work.pdf_pages,
+        ));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2435,12 +2675,19 @@ impl SimilarIndexScheduler {
                 }
                 ReconcileJobKind::Purge => {}
             }
+            let telemetry = ReconcileRunTelemetry::new(&plan.running);
+            telemetry.log_start(
+                plan.config.roots.len(),
+                plan.dirty.len(),
+                plan.purge_roots.len(),
+            );
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::Running(RunningProgress {
                     stage: IndexStage::Opening,
                     current_path: None,
                     report: IndexReport::default(),
                 });
+            telemetry.log_phase("opening", None);
             let keep_roots = plan.config.normalized_roots();
             let purge_roots = plan
                 .purge_roots
@@ -2466,6 +2713,13 @@ impl SimilarIndexScheduler {
                         });
                     }
                 };
+                if matches!(plan.running.kind, ReconcileJobKind::Purge) {
+                    let report = IndexReport {
+                        removed: purged as u64,
+                        ..IndexReport::default()
+                    };
+                    telemetry.log_phase("database_published", Some(&report));
+                }
                 let array_refresh = ArrayRefreshNotifier {
                     scheduler: Arc::downgrade(&self),
                 };
@@ -2479,6 +2733,7 @@ impl SimilarIndexScheduler {
                         &plan.running.cancel,
                         &self.progress,
                         &array_refresh,
+                        Some(&telemetry),
                     ),
                     ReconcileJobKind::Delta => run_delta_index_job(
                         &db,
@@ -2487,6 +2742,7 @@ impl SimilarIndexScheduler {
                         &plan.running.cancel,
                         &self.progress,
                         &array_refresh,
+                        Some(&telemetry),
                     ),
                     ReconcileJobKind::Purge => Ok(ScanJobOutcome {
                         report: IndexReport::default(),
@@ -2513,6 +2769,7 @@ impl SimilarIndexScheduler {
                     .as_ref()
                     .map(|outcome| outcome.report.clone())
                     .unwrap_or_default();
+                telemetry.log_terminal(if stale { "stale" } else { "cancelled" }, &report);
                 match self.settle_interrupted_plan(&plan, purge_committed, report) {
                     InterruptedJobDisposition::RestartWorker => continue,
                     InterruptedJobDisposition::AwaitingWatch
@@ -2526,6 +2783,7 @@ impl SimilarIndexScheduler {
             let outcome = match outcome {
                 Ok(outcome) if outcome.prune_safe => outcome,
                 Ok(outcome) => {
+                    telemetry.log_terminal("filesystem_incomplete", &outcome.report);
                     self.restore_unfinished_plan(&plan, purge_committed);
                     *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                         IndexProgress::Degraded {
@@ -2537,6 +2795,7 @@ impl SimilarIndexScheduler {
                     return;
                 }
                 Err(error) => {
+                    telemetry.log_terminal("failed", &IndexReport::default());
                     self.restore_unfinished_plan(&plan, purge_committed);
                     *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                         IndexProgress::Failed(error);
@@ -2549,6 +2808,7 @@ impl SimilarIndexScheduler {
             let watermark = match db.change_watermark() {
                 Ok(watermark) => watermark,
                 Err(error) => {
+                    telemetry.log_terminal("failed", &outcome.report);
                     self.restore_unfinished_plan(&plan, purge_committed);
                     *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                         IndexProgress::Failed(format!(
@@ -2558,19 +2818,27 @@ impl SimilarIndexScheduler {
                     return;
                 }
             };
-            {
+            let shutdown = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.shutdown {
-                    return;
+                    true
+                } else {
+                    state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+                    false
                 }
-                state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+            };
+            if shutdown {
+                telemetry.log_terminal("shutdown", &outcome.report);
+                return;
             }
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::AwaitingArray(outcome.report.clone());
+            telemetry.log_phase("awaiting_array", Some(&outcome.report));
             self.request_array_refresh_through(watermark);
             if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
                 match error {
                     ArrayAckWaitError::Cancelled => {
+                        telemetry.log_terminal("cancelled", &outcome.report);
                         match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
                             InterruptedJobDisposition::RestartWorker => continue,
                             InterruptedJobDisposition::AwaitingWatch
@@ -2581,6 +2849,7 @@ impl SimilarIndexScheduler {
                         }
                     }
                     ArrayAckWaitError::Failed(error) => {
+                        telemetry.log_terminal("array_publication_failed", &outcome.report);
                         self.restore_unfinished_plan(&plan, purge_committed);
                         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                             IndexProgress::Degraded {
@@ -2595,6 +2864,7 @@ impl SimilarIndexScheduler {
             }
 
             if !self.job_is_current(&plan.running) {
+                telemetry.log_terminal("stale", &outcome.report);
                 match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
                     InterruptedJobDisposition::RestartWorker => continue,
                     InterruptedJobDisposition::AwaitingWatch
@@ -2606,6 +2876,15 @@ impl SimilarIndexScheduler {
             }
 
             let disposition = self.finish_successful_plan(&plan);
+            telemetry.log_terminal(
+                match disposition {
+                    SuccessfulJobDisposition::Complete => "complete",
+                    SuccessfulJobDisposition::MoreWork => "complete_more_work",
+                    SuccessfulJobDisposition::AwaitingWatch => "awaiting_watch",
+                    SuccessfulJobDisposition::DegradedWatch => "watch_unavailable",
+                },
+                &outcome.report,
+            );
             *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = match disposition {
                 SuccessfulJobDisposition::DegradedWatch => IndexProgress::Degraded {
@@ -4137,16 +4416,25 @@ struct ScanAggregateState {
 struct ScanAggregate<'a> {
     state: Mutex<ScanAggregateState>,
     progress: &'a Arc<Mutex<IndexProgress>>,
+    telemetry: Option<&'a ReconcileRunTelemetry>,
 }
 
 impl<'a> ScanAggregate<'a> {
     fn new(progress: &'a Arc<Mutex<IndexProgress>>) -> Self {
+        Self::with_telemetry(progress, None)
+    }
+
+    fn with_telemetry(
+        progress: &'a Arc<Mutex<IndexProgress>>,
+        telemetry: Option<&'a ReconcileRunTelemetry>,
+    ) -> Self {
         Self {
             state: Mutex::new(ScanAggregateState {
                 prune_safe: true,
                 ..ScanAggregateState::default()
             }),
             progress,
+            telemetry,
         }
     }
 
@@ -4218,6 +4506,13 @@ impl<'a> ScanAggregate<'a> {
             state.report.clone()
         };
         publish_report(self.progress, &published);
+        if let Some(telemetry) = self.telemetry {
+            // Both aggregate and public-progress locks have been released before logger I/O.
+            // The CAS elects at most one completed-work publisher per interval. This is
+            // intentionally opportunistic: a single ZIP/PDF enumeration that takes longer than
+            // the interval emits its next snapshot only after that operation publishes work.
+            telemetry.maybe_log_progress(&published);
+        }
     }
 
     fn snapshot(&self) -> ScanAggregateState {
@@ -4261,6 +4556,49 @@ impl ScanWork {
 
     fn tagged(self) -> TaggedWork<Self> {
         TaggedWork::new(volume_key(self.path()), self)
+    }
+}
+
+impl ReconcileRunTelemetry {
+    fn observe_work(&self, work: &ScanWork) {
+        match work {
+            ScanWork::Directory(_) | ScanWork::DirectoryContents(_) => {
+                self.work.directories.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanWork::LooseImage { .. } => {
+                self.work.loose_images.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanWork::ImageBook { images, .. } => {
+                self.work.image_books.fetch_add(1, Ordering::Relaxed);
+                self.work
+                    .image_book_pages
+                    .fetch_add(images.len() as u64, Ordering::Relaxed);
+            }
+            ScanWork::Zip(_) => {
+                self.work.zip_containers.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanWork::Pdf(_) => {
+                self.work.pdf_containers.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn observe_directory_entries(&self, count: u64) {
+        self.work
+            .directory_entries
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn observe_zip_pages(&self, count: usize) {
+        self.work
+            .zip_pages
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    fn observe_pdf_pages(&self, count: usize) {
+        self.work
+            .pdf_pages
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 }
 
@@ -4325,6 +4663,7 @@ fn run_index_job(
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
+    telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
     if !wait_for_full_inventory_start(activity_gate, cancel) {
         return Ok(ScanJobOutcome {
@@ -4344,8 +4683,14 @@ fn run_index_job(
             prune_safe: false,
         });
     };
+    if let Some(telemetry) = telemetry {
+        telemetry.log_phase("inventory_loaded", None);
+    }
     set_stage(progress, IndexStage::Scanning, None);
-    let aggregate = ScanAggregate::new(progress);
+    if let Some(telemetry) = telemetry {
+        telemetry.log_phase("scanning", None);
+    }
+    let aggregate = ScanAggregate::with_telemetry(progress, telemetry);
     let initial = roots
         .iter()
         .cloned()
@@ -4368,6 +4713,7 @@ fn run_index_job(
                     progress,
                     array_refresh,
                     ScanPass::Full(&inventory),
+                    telemetry,
                 )
             }));
         }
@@ -4393,6 +4739,9 @@ fn run_index_job(
         });
     }
     set_stage(progress, IndexStage::Pruning, None);
+    if let Some(telemetry) = telemetry {
+        telemetry.log_phase("pruning", Some(&aggregate.report));
+    }
     if aggregate.prune_safe {
         let completed_at_unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4417,6 +4766,11 @@ fn run_index_job(
         if aggregate.report.removed > 0 {
             array_refresh.request();
         }
+        if let Some(telemetry) = telemetry {
+            telemetry.log_phase("database_published", Some(&aggregate.report));
+        }
+    } else if let Some(telemetry) = telemetry {
+        telemetry.log_phase("scan_incomplete", Some(&aggregate.report));
     }
     publish_report(progress, &aggregate.report);
     Ok(ScanJobOutcome {
@@ -4432,10 +4786,14 @@ fn run_delta_index_job(
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
     _array_refresh: &ArrayRefreshNotifier,
+    telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
     db.cleanup_incomplete()
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
     set_stage(progress, IndexStage::Scanning, None);
+    if let Some(telemetry) = telemetry {
+        telemetry.log_phase("scanning", None);
+    }
     let root_keys = config.normalized_roots();
     let mut active_scopes = Vec::new();
     let mut initial = Vec::new();
@@ -4483,10 +4841,14 @@ fn run_delta_index_job(
                     "similar delta observation incomplete: repair root is not a directory: {}",
                     path.display()
                 ));
-                return Ok(ScanJobOutcome {
+                let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
-                });
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.log_phase("scan_incomplete", Some(&outcome.report));
+                }
+                return Ok(outcome);
             }
             (DirtyScope::RemovedPrefix(_), Err(error))
                 if error.kind() == std::io::ErrorKind::NotFound =>
@@ -4503,27 +4865,39 @@ fn run_delta_index_job(
                     "similar delta observation incomplete for {}: {error}",
                     path.display()
                 ));
-                return Ok(ScanJobOutcome {
+                let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
-                });
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.log_phase("scan_incomplete", Some(&outcome.report));
+                }
+                return Ok(outcome);
             }
             (DirtyScope::RemovedPrefix(_), Err(error)) => {
                 crate::logger::log(format!(
                     "similar delta removal observation incomplete for {}: {error}",
                     path.display()
                 ));
-                return Ok(ScanJobOutcome {
+                let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
-                });
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.log_phase("scan_incomplete", Some(&outcome.report));
+                }
+                return Ok(outcome);
             }
             (DirtyScope::RootRepair(_), Err(error)) => {
                 debug_assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
-                return Ok(ScanJobOutcome {
+                let outcome = ScanJobOutcome {
                     report: IndexReport::default(),
                     prune_safe: false,
-                });
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.log_phase("scan_incomplete", Some(&outcome.report));
+                }
+                return Ok(outcome);
             }
             (DirtyScope::DirectoryContents(_) | DirtyScope::Subtree(_), _)
             | (DirtyScope::RemovedPrefix(_), Ok(_)) => {
@@ -4533,7 +4907,7 @@ fn run_delta_index_job(
         }
     }
 
-    let aggregate = ScanAggregate::new(progress);
+    let aggregate = ScanAggregate::with_telemetry(progress, telemetry);
     let publication = DeltaPublication::default();
     let queue = BoundedWorkQueue::new(initial);
     let deferred_refresh = ArrayRefreshNotifier {
@@ -4554,6 +4928,7 @@ fn run_delta_index_job(
                     progress,
                     &deferred_refresh,
                     ScanPass::Delta(&publication),
+                    telemetry,
                 )
             }));
         }
@@ -4579,6 +4954,9 @@ fn run_delta_index_job(
         });
     }
     set_stage(progress, IndexStage::Pruning, None);
+    if let Some(telemetry) = telemetry {
+        telemetry.log_phase("pruning", Some(&aggregate.report));
+    }
     if aggregate.prune_safe {
         let mut directory_contents = Vec::new();
         let mut subtrees = Vec::new();
@@ -4616,9 +4994,15 @@ fn run_delta_index_job(
                 return Err(format!("delta publish failed: {error}"));
             }
         };
+        if let Some(telemetry) = telemetry {
+            telemetry.log_phase("database_published", Some(&aggregate.report));
+        }
     } else {
         db.cleanup_incomplete()
             .map_err(|error| format!("incomplete delta cleanup failed: {error}"))?;
+        if let Some(telemetry) = telemetry {
+            telemetry.log_phase("scan_incomplete", Some(&aggregate.report));
+        }
     }
     publish_report(progress, &aggregate.report);
     Ok(ScanJobOutcome {
@@ -4659,9 +5043,13 @@ fn scan_worker_loop(
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
     pass: ScanPass<'_>,
+    telemetry: Option<&ReconcileRunTelemetry>,
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
+        if let Some(telemetry) = telemetry {
+            telemetry.observe_work(&work);
+        }
         let path = work.path().to_path_buf();
         set_stage(progress, IndexStage::Scanning, Some(path.clone()));
         let mut context = ScanContext {
@@ -4925,11 +5313,13 @@ impl ScanContext<'_> {
         let mut pdfs = Vec::new();
         let mut all_media = Vec::new();
         let mut has_container = false;
+        let mut observed_entries = 0_u64;
 
         for entry in entries {
             if self.cancelled() {
                 return Ok(Vec::new());
             }
+            observed_entries = observed_entries.saturating_add(1);
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -5017,6 +5407,9 @@ impl ScanContext<'_> {
             } else if is_convertible {
                 has_container = true;
             }
+        }
+        if let Some(telemetry) = self.aggregate.telemetry {
+            telemetry.observe_directory_entries(observed_entries);
         }
 
         images.sort_by(|left, right| {
@@ -5198,6 +5591,9 @@ impl ScanContext<'_> {
         // ここが展開済みフォルダと食い違うと、本単位の対応付けが崩れる。
         let mut entries = entries;
         entries.sort_by(|left, right| compare_book_pages(&left.entry_name, &right.entry_name));
+        if let Some(telemetry) = self.aggregate.telemetry {
+            telemetry.observe_zip_pages(entries.len());
+        }
         self.report.discovered += entries.len() as u64;
         let page_count = u32::try_from(entries.len())
             .map_err(|_| format!("too many ZIP pages: {}", candidate.path.display()))?;
@@ -5318,6 +5714,9 @@ impl ScanContext<'_> {
                 return Ok(());
             }
         };
+        if let Some(telemetry) = self.aggregate.telemetry {
+            telemetry.observe_pdf_pages(pages.len());
+        }
         self.report.discovered += pages.len() as u64;
         let page_count = u32::try_from(pages.len())
             .map_err(|_| format!("too many PDF pages: {}", candidate.path.display()))?;
@@ -6019,6 +6418,162 @@ mod tests {
         0
     }
 
+    fn telemetry_for_test(kind: ReconcileJobKind) -> ReconcileRunTelemetry {
+        ReconcileRunTelemetry::new(&RunningReconcileJob {
+            kind,
+            config_epoch: 7,
+            start_event_seq: 41,
+            repairs_watch_gap: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[test]
+    fn reconcile_telemetry_uses_stable_job_labels_and_one_opportunistic_interval_owner() {
+        let telemetry = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 3,
+            reason: FullReason::WatchRecovery,
+        }));
+
+        assert_eq!(telemetry.kind, "full");
+        assert_eq!(telemetry.reason, "watch_recovery");
+        assert_eq!(
+            telemetry.prefix(),
+            "job=7:41 kind=full reason=watch_recovery"
+        );
+        assert_eq!(ReconcileJobKind::Delta.label(), "delta");
+        assert_eq!(ReconcileJobKind::Delta.reason_label(), "watch_change");
+        assert_eq!(ReconcileJobKind::Purge.label(), "purge");
+        assert_eq!(ReconcileJobKind::Purge.reason_label(), "root_removed");
+        assert_eq!(FullReason::Initial.label(), "initial");
+        assert_eq!(FullReason::Reconfigure.label(), "reconfigure");
+        assert_eq!(FullReason::Overflow.label(), "overflow");
+        assert_eq!(FullReason::Manual.label(), "manual");
+        assert!(!telemetry.claim_progress_log(4_999));
+        assert!(telemetry.claim_progress_log(5_000));
+        assert!(!telemetry.claim_progress_log(9_999));
+        assert!(telemetry.claim_progress_log(10_000));
+        assert!(telemetry.claim_terminal_log());
+        assert!(!telemetry.claim_terminal_log());
+    }
+
+    #[test]
+    fn reconcile_telemetry_only_reports_database_publish_after_safe_full_and_delta() {
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let notifier = ArrayRefreshNotifier {
+            scheduler: Weak::new(),
+        };
+
+        let full_safe = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 0,
+            reason: FullReason::Initial,
+        }));
+        let outcome = run_index_job(
+            &SimilarDb::open_in_memory().unwrap(),
+            &[],
+            &[],
+            &passwords,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &notifier,
+            Some(&full_safe),
+        )
+        .unwrap();
+        assert!(outcome.prune_safe);
+        assert_eq!(
+            full_safe.phase_trace(),
+            [
+                "inventory_loaded",
+                "scanning",
+                "pruning",
+                "database_published"
+            ]
+        );
+
+        let missing = tempfile::tempdir().unwrap().path().join("missing-root");
+        let full_incomplete = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 0,
+            reason: FullReason::Initial,
+        }));
+        let outcome = run_index_job(
+            &SimilarDb::open_in_memory().unwrap(),
+            &[missing],
+            &[],
+            &passwords,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &notifier,
+            Some(&full_incomplete),
+        )
+        .unwrap();
+        assert!(!outcome.prune_safe);
+        assert_eq!(
+            full_incomplete.phase_trace(),
+            ["inventory_loaded", "scanning", "pruning", "scan_incomplete"]
+        );
+
+        let delta_safe = telemetry_for_test(ReconcileJobKind::Delta);
+        let empty_config = SchedulerConfig {
+            roots: Vec::new(),
+            excluded_roots: Vec::new(),
+            excluded_root_keys: Vec::new(),
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            password_revision: 0,
+            activity_gate: None,
+        };
+        let outcome = run_delta_index_job(
+            &SimilarDb::open_in_memory().unwrap(),
+            &DirtyScopeSet::default(),
+            &empty_config,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &notifier,
+            Some(&delta_safe),
+        )
+        .unwrap();
+        assert!(outcome.prune_safe);
+        assert_eq!(
+            delta_safe.phase_trace(),
+            ["scanning", "pruning", "database_published"]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_root = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_root, b"file").unwrap();
+        let configured = ConfiguredRoot {
+            favorite_id: Uuid::new_v4(),
+            path: invalid_root.clone(),
+            key: crate::search_index_db::normalize_path(&invalid_root),
+        };
+        let invalid_config = SchedulerConfig {
+            roots: vec![configured],
+            ..empty_config
+        };
+        let mut dirty = DirtyScopeSet::default();
+        dirty.insert(DirtyScope::RootRepair(invalid_root), 1);
+        let delta_incomplete = telemetry_for_test(ReconcileJobKind::Delta);
+        let outcome = run_delta_index_job(
+            &SimilarDb::open_in_memory().unwrap(),
+            &dirty,
+            &invalid_config,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &notifier,
+            Some(&delta_incomplete),
+        )
+        .unwrap();
+        assert!(!outcome.prune_safe);
+        assert_eq!(
+            delta_incomplete.phase_trace(),
+            ["scanning", "scan_incomplete"]
+        );
+    }
+
     /// 候補側の走査が結果を変えるのかを、多数の本で突き合わせる。
     ///
     /// この走査は照会時間の大半を占める。**変えないなら払う理由がない。** 1 プロセスで
@@ -6541,6 +7096,7 @@ mod tests {
                     &ArrayRefreshNotifier {
                         scheduler: Weak::new(),
                     },
+                    None,
                 )
                 .unwrap()
             });
@@ -6571,6 +7127,7 @@ mod tests {
                 &ArrayRefreshNotifier {
                     scheduler: Weak::new(),
                 },
+                None,
             )
             .unwrap()
             .prune_safe,
@@ -6603,6 +7160,7 @@ mod tests {
                     &ArrayRefreshNotifier {
                         scheduler: Weak::new(),
                     },
+                    None,
                 )
                 .unwrap()
             });
@@ -6646,6 +7204,7 @@ mod tests {
             &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
+            None,
         )
         .unwrap()
         .report;
@@ -9140,6 +9699,7 @@ mod tests {
             &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
+            None,
         )
         .unwrap();
 
@@ -9180,6 +9740,7 @@ mod tests {
             &ArrayRefreshNotifier {
                 scheduler: Weak::new(),
             },
+            None,
         )
         .unwrap();
         assert!(!outcome.prune_safe);
