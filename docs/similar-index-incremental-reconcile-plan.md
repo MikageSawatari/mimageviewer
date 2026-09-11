@@ -378,3 +378,22 @@ freeze は `target/similar-index-enabled-20260911/freeze-r1/MANIFEST.txt`（SHA2
 別 chunk として、親承認の `build-dev.ps1 -PreserveRuntime` を追加した。exact staged core/remote の実行を検出したら Stop-Process より前に throw し、未指定時の既定動作は維持する。production 関数を抽出して Get/Stop-Process を mock した回帰と独立レビューは成功。証跡は `target/build-dev-preserve-runtime-20260911/`、review SHA256 `EBD2AC543ADA4A17FAFAAE5924040107FD0EE37E464DDF317E3270CA6C8E54CE`。今回の確認 build は必ずこの switch を使い、実アプリを停止・起動しない。
 
 親 master の新しい `8e5e7ca7e` は現在の検証対象へ混ぜず、本 chunk 完了後の統合対象として留保する。全体 gate と確認 build はこの時点では未完了。
+
+### 再有効化の全体 gate
+
+ビルド安全性を `5290c47e8`、再有効化を `f79a382449872085f42be5419060610182fb0a56` に別 commit で保存した。r2 独立承認は `freeze-r2/review-approval.md`、SHA256 `6503F93B733F7F959AE2BCCB573296F099DE9FF2383FEF06D17D9F5D0CBAFB4B`。
+
+この HEAD を固定し、09:44:15–09:54:14 JST に `scripts/test-full.ps1 -SuppressCrashDialogs` を jobs=1 で実行して exit 0。本体 8,149 passed / 44 ignored、UI snapshot 48、workspace/integration/doc と vendor 3 件群も成功した。証跡は `target/similar-index-enabled-20260911/fullgate-f79a38244/`。`test-full.log` SHA256 `DC13B8213131E58581D0A71F583B4A7C02DC5DE7DD04341EB208C28BEF7FC740`、root も件数と exit を照合した。
+
+09:54:48 JST に exact dev-runtime core/remote resident 0 を確認して `scripts/build-dev.ps1 -PreserveRuntime` の通常 feature / jobs=1 build を開始した。この段落時点では build 中で、アプリ起動・停止・本番データ操作は行っていない。
+
+### 再有効化の確認 build 完了
+
+上記 build は 09:59:18 JST に成果物を生成し exit 0。`-PreserveRuntime` を使用し、前後とも exact staged core/remote resident 0、終了時 cargo/rustc 0。root も実成果物の SHA256 を再計算して照合した。
+
+- core: 309,949,440 bytes、mtime 09:59:18 JST、SHA256 `7F4ADF8E79EBC475EB1FA1311888CA4DA22CB912385375636E1613B7BB74A50A`
+- Remote: 12,197,376 bytes、mtime 07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。変更がなく Cargo が成果物を再利用した。
+
+集約証跡は `target/similar-index-enabled-20260911/FINAL-VALIDATION.txt`（SHA256 `B2543E9FD3829F2BD8D4EA6F2C017C9F81C35DF9041B28247D4D5E056F902F72`）。本 chunk の再有効化、独立レビュー、焦点・全体 gate、通常確認 build は完了。以後の変更は本書のみ。master `8e5e7ca7e` の取り込みと統合後検証は次 chunk に残す。master への逆方向 merge・公開は行っていない。
+
+実機の未確認項目は再有効化後の類似 UI と移動・比較・履歴、初回索引と変更通知後の収束・進捗、取消、音声再生と併用した応答である。通常確認 build の利用者用コマンドは repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。エージェントは起動・停止・実データ操作をしていない。
