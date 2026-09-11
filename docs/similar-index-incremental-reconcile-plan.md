@@ -397,3 +397,19 @@ freeze は `target/similar-index-enabled-20260911/freeze-r1/MANIFEST.txt`（SHA2
 集約証跡は `target/similar-index-enabled-20260911/FINAL-VALIDATION.txt`（SHA256 `B2543E9FD3829F2BD8D4EA6F2C017C9F81C35DF9041B28247D4D5E056F902F72`）。本 chunk の再有効化、独立レビュー、焦点・全体 gate、通常確認 build は完了。以後の変更は本書のみ。master `8e5e7ca7e` の取り込みと統合後検証は次 chunk に残す。master への逆方向 merge・公開は行っていない。
 
 実機の未確認項目は再有効化後の類似 UI と移動・比較・履歴、初回索引と変更通知後の収束・進捗、取消、音声再生と併用した応答である。通常確認 build の利用者用コマンドは repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。エージェントは起動・停止・実データ操作をしていない。
+
+## master 208/210 修正との結合検証
+
+親の明示依頼で、再有効化完了 `6f7bcd29c` に確定済み master `8e5e7ca7e` を `--no-commit --no-ff` で統合した。`src/app.rs` と `src/app/tests.rs` は自動統合、競合はない。208/210 の実装・独立レビュー・利用者実機確認は親の証拠を引き継ぎ、今回の担当は類似機能との交差と両親の変更保持を検収する。親の未コミット209設計文書は対象外、製品ファイルは dupe が唯一 writer。既知性能測定は繰り返さない。
+
+旧文書 `CLAUDE.md`「Detached viewer リワーク中のルール」と `docs/detached-rework-plan.md` §2/3 の ClaudeCode 検収指定は、利用者が明示した Sol/xhigh 実装・別 Sol/xhigh 独立レビューへ移行する。構造的修正の検収と症状パッチ禁止は維持し、担当名称の変更を品質要件の省略として扱わない。今回新たな detached 仕様変更は予定しない。
+
+統合後の焦点回帰、独立検収、結合 full gate、`build-dev.ps1 -PreserveRuntime` が必要。アプリ停止・起動・本番データ操作と master への逆方向 merge は行わず、完了 commit と検証対象を親へ渡す。
+
+### master 208/210 統合の焦点検収
+
+製品への追加修正なしで、Similar constructor/bootstrap/password 3、video_audio 36、secondary_press 9、Similar panel context ownership 1 の回帰が成功した。最後の項目の初回 short-name exact filter は 0 件だったため証拠に数えず、正しい filter の 1 件成功を採用した。fmt/glyph/diff check も成功。
+
+freeze は `target/similar-enabled-master-8e5e7-integration-20260911/freeze-r1`。両 parent は `6f7bcd29c` / `8e5e7ca7e`、source freeze 時の index tree は `2d85469033179e2a58d79367a0a0ba6302d4f73b`（本書の追加記録は未stage）。独立 Sol は交差する app.rs/tests.rs を両 parent と照合し、Enabled private constructor / Option / bootstrap / password / FullDelta と、typed VideoAudioModeRuntime / explicit-input handoff / FullscreenSecondaryPress / context lifecycle の共存を承認、P1/P2 なし。`review-approval.md` SHA256 `5A200B129331A54DC854DF6BF941BD509E11AEF24EBB404758EBE321C75378B2`。
+
+統合 source は freeze と一致し、次に merge commit と結合 full gate / 確認 build を行う。既知 master 修正の再設計や既知性能試験の再実行はない。

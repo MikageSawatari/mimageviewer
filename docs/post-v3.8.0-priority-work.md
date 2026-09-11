@@ -161,3 +161,47 @@ AGENTS.mdの実機確認条件に従い利用者の確認待ち。対象差分�
 類似検索側は小DB11件の同値・取消等の回帰も成功し、大規模合成DBのA/B測定へ進む。
 実DB・通常APPDATA・アプリは使わず、9/11 09:00 JSTまでに大規模実行を終了する枠を引き渡した。
 masterへのmerge・再有効化は依然未実施。
+
+## 9/11 朝の類似検索検収と統合準備
+
+dupe branch `codex/similar-index-incremental-reconcile` は `b7102a53a` まで完了。
+差分通知化、Full job 限定の照合 inventory、進捗表示を独立検収し、全体 gate と
+確認用 build が成功した。本体 lib は8120成功/44 ignored、UI snapshotは48件成功。
+このビルドはmasterの未コミット§1.208・§1.210を含まない。
+
+合成4,627,166件、UTF-8 key 80/120 bytes、16 workersの同一release実行系で、
+旧照合約67.6〜71.9秒に対しinventory方式約4.48〜5.21秒。AB/BAの順序を変えて
+結果一致を確認した。ファイル走査・decode・アプリ全体の起動時間の測定ではない。
+120 bytesケースの新方式process private peakは約1137 MiBで旧方式約1619 MiBより低いが、
+実アプリ全体の最大メモリと実watcher下の収束は未検証。終了直後の残留量を
+inventoryの常駐やリークの証拠とは扱わない。
+
+性能検収記録はdupe側の
+`target/similar-index-incremental-phase2-benchmark-harness-r4r1-20260911/`、
+最終gate/build記録は `target/similar-index-incremental-final-gate-20260911/`。
+測定とbuildのプロセスは終了済み。
+
+次の区切りとして、dupe側でmaster `aa034d578` の確定済み変更を統合するよう指示した。
+`Paused` capabilityと`Option<SimilarIndexManager>`を維持し、休止中の通常名前索引、
+Enabledテスト経路の差分通知・watch bootstrap・password更新・進捗表示を整合させる。
+実装と別担当の独立レビュー、統合影響の焦点テスト・全体gate・確認buildを行う。
+masterの未コミット差分、実データ、実アプリには触れず、再有効化とmasterへのmergeは
+後続判断とする。既に有効な大規模性能測定は繰り返さない。
+
+## 利用者の確認追記
+
+2026-09-11、利用者から§1.210の右クリックメニューが再出現しなくなり、F12も動作するとの
+報告を受けた。別窓でのメニューを閉じた後の非再出現と長押しの確認範囲を案内した。
+§1.208は通常profileにVSTが設定されているため、未設定のportable確認版を別途準備する。
+この時点では§1.208を実機確認済みとは扱わない。
+
+続いて利用者がVST未設定portableで「♪はうまく動くようになりました。OK」と確認した。
+確認exe SHA256は `8823E8AC36BA8CEF248123349708D6B9EDC0E37CF3013C79B5794F92CDEAE776`。
+§1.208の報告再現経路と§1.210のメニュー再出現は利用者確認済みとして記録し、
+成功済み自動gateと同一sourceの製品差分をコミットする。F12長押しやVSTありの全経路まで
+実機確認したとは扱わない。
+
+このportable準備では内部build-portable.ps1の既定Stop-Process -Forceが開発版core 8件と
+Remote 1件を停止する事故があった。利用者へ報告済み、再起動なし、未保存状態への影響未確認。
+今後は `build-portable.ps1 -PreserveRuntime` → `prepare-portable-smoke.ps1 -SkipBuild` とし、
+稼働アプリを停止しない。記録は同checkpoint directoryの `manual-portable-vst-unset-build.json`。
