@@ -27,9 +27,9 @@ use uuid::Uuid;
 
 /// Whether the alternate-version index is exposed and allowed to start.
 ///
-/// The product constant is the single release switch.  Tests that exercise the
-/// retained implementation pass `Enabled` explicitly instead of changing the
-/// shipped policy.
+/// The product constant is the single release switch.  Tests pass either variant
+/// explicitly when they need to cover the paused fallback or the enabled service
+/// independently of the shipped policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SimilarFeatureCapability {
     Enabled,
@@ -43,7 +43,7 @@ impl SimilarFeatureCapability {
 }
 
 pub(crate) const PRODUCT_SIMILAR_FEATURE_CAPABILITY: SimilarFeatureCapability =
-    SimilarFeatureCapability::Paused;
+    SimilarFeatureCapability::Enabled;
 
 /// §9.5 の単体画像帯。いずれも実測済みで、索引ジョブの採否には使わない。
 pub const NEARLY_IDENTICAL_MAX_DISTANCE: u32 = 8;
@@ -5901,8 +5901,8 @@ fn offer_thumbnail_raster_with_target_resolver(
     source_dims: (u32, u32),
     resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)>,
 ) {
-    // This direct product gate is intentional.  A stale process-global test registration (or a
-    // future accidental manager construction) must not turn ordinary thumbnail decoding into
+    // This direct capability gate is intentional.  A stale process-global test registration (or
+    // a future accidental manager construction) must not turn ordinary thumbnail decoding into
     // similar-index signature work or DB writes while the feature is paused.
     if !capability.is_enabled() {
         return;
@@ -6851,7 +6851,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_product_prefill_rejects_before_resolving_or_touching_the_store() {
+    fn paused_prefill_rejects_before_resolving_or_touching_the_store() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("already-decoded.png");
         let image = image::DynamicImage::new_rgba8(1024, 1024);
@@ -6868,11 +6868,36 @@ mod tests {
             (1024, 1024),
             || {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
-                panic!("paused product prefill must not resolve a stale process-global target")
+                panic!("paused prefill must not resolve a stale process-global target")
             },
         );
 
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn product_enabled_prefill_reaches_the_registered_target_resolver() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("already-decoded.png");
+        let image = image::DynamicImage::new_rgba8(1024, 1024);
+        let resolver_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        offer_thumbnail_raster_with_target_resolver(
+            PRODUCT_SIMILAR_FEATURE_CAPABILITY,
+            &path,
+            None,
+            None,
+            10,
+            20,
+            &image,
+            (1024, 1024),
+            || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        );
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

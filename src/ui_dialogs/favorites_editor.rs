@@ -1149,6 +1149,9 @@ mod similar_control_visibility_tests {
         assert!(favorites_editor_similar_controls_visible(
             SimilarFeatureCapability::Enabled
         ));
+        assert!(favorites_editor_similar_controls_visible(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY
+        ));
     }
 }
 

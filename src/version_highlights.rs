@@ -1044,11 +1044,11 @@ mod tests {
                 .any(|item| item.title.contains("別バージョン"))
         );
         let shipped = table().last().unwrap().highlights;
-        assert_eq!(shipped.len(), paused.len());
+        assert_eq!(shipped.len(), enabled.len());
         assert!(
             shipped
                 .iter()
-                .all(|item| !item.title.contains("別バージョン"))
+                .any(|item| item.title.contains("別バージョン"))
         );
     }
 

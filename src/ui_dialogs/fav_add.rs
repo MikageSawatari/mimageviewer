@@ -226,5 +226,8 @@ mod similar_control_visibility_tests {
         assert!(favorite_add_similar_control_visible(
             SimilarFeatureCapability::Enabled
         ));
+        assert!(favorite_add_similar_control_visible(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY
+        ));
     }
 }

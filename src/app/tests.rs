@@ -4131,9 +4131,12 @@ struct AppTestConfig {
     /// テスト用データディレクトリ。`data_dir::set_test_override(Some(...))` に設定済みの
     /// パスを渡す。(呼び出し側の `TempDir` が App より長生きする必要あり)
     data_dir: std::path::PathBuf,
-    /// 起動時に `settings.json` をこの内容で上書きしてから App::default を呼ぶ。
+    /// 起動時に `settings.json` をこの内容で上書きしてから本番同等の constructor を呼ぶ。
     /// None なら `Settings::load` が空ファイルから default 設定を作る。
     settings: Option<crate::settings::Settings>,
+    /// Product policy is explicit in each fixture so Paused regressions never construct and then
+    /// drop an enabled Similar owner before installing their sentinel store.
+    similar_feature_capability: crate::similar_index::SimilarFeatureCapability,
 }
 
 impl App {
@@ -4163,7 +4166,13 @@ impl App {
             config.data_dir,
             "data_dir::set_test_override(Some(config.data_dir)) を先に呼ぶこと"
         );
-        let mut app = App::default();
+        let mut app =
+            App::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(
+                crate::settings::Settings::load(),
+                crate::settings::SettingsLoadMeta::default(),
+                || {},
+                config.similar_feature_capability,
+            );
         // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
         // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
         // spawn し、プロセスグローバルの data_dir override 経由で別テストの rating.db 等を
@@ -6548,26 +6557,32 @@ pub(crate) mod phase_c_support {
     }
 
     pub(crate) fn setup_app() -> AppTestEnv {
-        setup_app_with_similar_feature(true)
+        setup_app_with_similar_capability(crate::similar_index::SimilarFeatureCapability::Enabled)
     }
 
-    pub(crate) fn setup_paused_similar_app() -> AppTestEnv {
-        setup_app_with_similar_feature(false)
+    pub(crate) fn setup_product_similar_app() -> AppTestEnv {
+        setup_app_with_similar_capability(crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY)
     }
 
     pub(crate) fn setup_paused_similar_app_with_fixture(
         settings: crate::settings::Settings,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
-        setup_app_with_options(false, Some(settings), prepare_data_dir)
+        setup_app_with_options(
+            crate::similar_index::SimilarFeatureCapability::Paused,
+            Some(settings),
+            prepare_data_dir,
+        )
     }
 
-    fn setup_app_with_similar_feature(enable_similar: bool) -> AppTestEnv {
-        setup_app_with_options(enable_similar, None, |_| {})
+    fn setup_app_with_similar_capability(
+        capability: crate::similar_index::SimilarFeatureCapability,
+    ) -> AppTestEnv {
+        setup_app_with_options(capability, None, |_| {})
     }
 
     fn setup_app_with_options(
-        enable_similar: bool,
+        similar_feature_capability: crate::similar_index::SimilarFeatureCapability,
         settings: Option<crate::settings::Settings>,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
@@ -6579,14 +6594,9 @@ pub(crate) mod phase_c_support {
         let config = AppTestConfig {
             data_dir: tmp.path().to_path_buf(),
             settings,
+            similar_feature_capability,
         };
         let mut app = App::new_for_test(config);
-        if enable_similar {
-            // Product v3.8 keeps the optional similar service paused.  The long-standing behavior
-            // tests below opt into the retained implementation explicitly so they continue to
-            // cover its ownership and lifecycle for a future re-enable.
-            app.enable_similar_feature_for_test();
-        }
         app.settings.first_setup_completed = true;
         // `data_dir` の差し替えだけでは製本ルートは隔離されない。`book_root` が None のままだと
         // `settings_books_root` が既定 (= 利用者の実ピクチャフォルダ) を返し、そこへ本フォルダを
@@ -6605,7 +6615,7 @@ pub(crate) mod phase_c_support {
 #[cfg(test)]
 mod paused_similar_feature_tests {
     use super::phase_c_support::{
-        setup_app, setup_paused_similar_app, setup_paused_similar_app_with_fixture,
+        setup_app, setup_paused_similar_app_with_fixture, setup_product_similar_app,
     };
     use super::*;
 
@@ -6618,33 +6628,29 @@ mod paused_similar_feature_tests {
     }
 
     #[test]
-    fn product_app_owns_no_similar_service_and_returns_terminal_neutral_results() {
-        let app = setup_paused_similar_app();
-        let item = GridItem::Image(PathBuf::from(r"C:\Pictures\paused.png"));
+    fn product_app_constructs_the_enabled_similar_service_owner() {
+        let app = setup_product_similar_app();
+        let item = GridItem::Image(PathBuf::from(r"C:\Pictures\enabled\page.png"));
 
         assert_eq!(
-            app.similar_feature_capability(),
-            crate::similar_index::SimilarFeatureCapability::Paused
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY,
+            crate::similar_index::SimilarFeatureCapability::Enabled
         );
-        assert!(app.similar_index.is_none());
+        assert_eq!(
+            app.similar_feature_capability(),
+            crate::similar_index::SimilarFeatureCapability::Enabled
+        );
+        assert!(app.similar_index.is_some());
         assert_eq!(
             app.similar_index_progress(),
             crate::similar_index::IndexProgress::Idle
         );
         assert!(!app.similar_query_results_are_stale());
-        assert_eq!(
-            app.query_similar_item(&item).as_ref(),
-            &crate::similar_index::ItemQuery::NotIndexed
-        );
-        assert_eq!(
-            app.query_similar_book(&item).as_ref(),
-            &crate::similar_index::BookQuery::NotBook
-        );
-        assert_eq!(
+        let _ = app.query_similar_book(&item);
+        assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
-            crate::similar_book_query::BookQueryDemandSnapshot::Unbound,
-            "paused queries never bind a client to the absent executor"
-        );
+            crate::similar_book_query::BookQueryDemandSnapshot::Active(_)
+        ));
     }
 
     #[test]

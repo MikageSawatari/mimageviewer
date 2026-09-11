@@ -6,7 +6,7 @@
 作業は `codex/similar-index-incremental-reconcile`、基点は `77a6f270e`。
 最初の検証までは master の休止版を取り込まず、その後の親の明示指示で確定済み `aa034d578`（休止版 `3f5481c14` を含む）の統合を開始した。master 作業ツリーの未コミット差分は取り込まない。master への逆方向の統合・再有効化・リリースは別判断とし、今回も `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
 
-その後、`aa034d578` との統合を `1c3b5861f` に保存し、この統合 hash を対象とする独立検収・焦点回帰・全体 gate・normal build も完了した。現在の確認バイナリは Paused 維持版。以下の統合前測定・build 記録と区別し、最新結果は末尾の「統合コミットの最終検証」を参照する。
+その後、`aa034d578` との統合を `1c3b5861f` に保存し、この統合 hash を対象とする独立検収・焦点回帰・全体 gate・normal build も完了した。そこまでの確認バイナリは Paused 維持版。続いて利用者が休止解除と動作確認を明示承認したため、`627e53a09` を基点に再有効化を開始した。親の別 build と競合させないため、まず設計・編集・静的検収に限定し、重い Cargo は枠調整後に行う。以前の確認 build を Enabled 検証済みとは扱わない。
 
 設計・進行は親、実装・テストは implement_resume、独立レビューは review_resume。
 実装とレビューは別の Sol / xhigh 担当。ソース・テストは実装担当だけが編集し、本書と README は親が編集する。
@@ -352,3 +352,29 @@ merge commit は `1c3b5861f73dc5760f3a3b673e409bda40628c41`、parents は `b7102
 build 証跡は同統合 artifact の `build-dev-1c3b5861/` にある `run.txt`、stdout/stderr、`artifacts.txt`、`validation-log-hashes.txt`、`final-state.txt`。終了時 clean、cargo/rustc 0、exact dev-runtime resident 0。アプリ起動・本番 DB/APPDATA 操作はなく、既知の大規模測定も再実行していない。
 
 Paused 維持の根拠は製品定数、App Option 単一所有、None での設定/store 保護回帰と入口検収。Enabled 側の根拠は App の初回 Full/password 更新 Full、共有 watcher の Full→Delta と復旧回帰。これらの成功は再有効化の承認とは別である。master への merge と製品再有効化は親へ引き渡す。実機の未確認項目は、類似 UI が非表示のままで通常の名前/metadata 索引と閲覧操作が動くこと。確認用コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため installed/tray 常駐版を先に終了する。エージェントは実行していない。
+
+## 利用者承認による再有効化
+
+利用者の「類似検索も速くなったのであれば休止状態を解除して動作確認したい」という明示承認を親から受領。基点 `627e53a09468c818de6950f08f309d28b9ff37f5` の clean な dupe branch で製品 capability を Enabled へ戻す。実装は Sol / xhigh、独立検収は別の Sol / xhigh。親の §1.208/§1.210 portable build と重い Cargo を重ねない。master 未コミット差分・実データ・稼働アプリに触れず、既知 benchmark は再実行しない。
+
+検索対象と類似判定基準、保存済み設定、DB を維持する。再有効化後も App の Option が実行時の正本であり、別の capability field を増やさない。Paused の明示テストは残し、製品定数への暗黙依存だけを取り除く。Enabled lifecycle は通知の収束、watch bootstrap/復旧、取消、favorite 無効化と purge、PDF password revision、進捗 UI を既有効証拠と変更後の焦点回帰で検収する。
+
+利用者向けの説明では、主に速くしたのは索引照合であり類似検索そのものの応答倍率を実測したわけではないと区別する。通常のファイル変更は全件反復から差分照合へ、必要な Full は job 内 inventory による照合へ変更した。初回照合や監視 gap の修復など必要な Full は残る。未知総数を完了率に見せず、監視準備待ち・配列反映中・未完了理由を区別する。検索精度の間引きやページ数制限は導入しない。
+
+Full の合成試験 process peak 約 921–1,137 MiB は旧方式への追加量ではなく、App 全体 peak は未測定。完了/取消後に inventory の live owner は残さないが、allocator の保持はあり得る。実機での音声途切れや実データでの収束確認は未実施で、再有効化のコード検証と区別する。
+
+### 再有効化の静的検収
+
+製品定数を Enabled にし、既存 App constructor は必ずその定数を渡す private な構築境界へ委譲した。テストだけは同境界へ explicit Enabled/Paused を渡す。Paused fixture では一度 Enabled owner を作ってから破棄する方式を避け、DB/worker 開始前から休止を選ぶ。runtime の正本は引き続き Option だけで、別 field は増やさない。製品 App Some/query demand、prefill resolver 到達、追加/編集/metadata UI、既存 v3.8 highlights の復帰を焦点回帰へ追加し、Paused sentinel/neutral 回帰も維持した。
+
+freeze は `target/similar-index-enabled-20260911/freeze-r1/MANIFEST.txt`（SHA256 `F8458BAE4C5923C470C845D1E1F7AB4E1549FB9CC17F40BD85FC7C2810F8C878`）、source 7 件、本書は除外。fmt/diff check 成功。独立静的検収は同 directory の `review-static.md`（SHA256 `EC65B40F30A6E975FFD7778EEBE7C4FEFC8E9C381B71744A985BA2FEA9AB088C`）、P1/P2 なし。Cargo は親の build 枠待ちで未実施であり、静的承認を実行成功とは扱わない。
+
+焦点実行は product/Paused App、prefill、UI/highlight、shared watcher Full→Delta/復旧、password revision、progress mapper/snapshot とし、取消は `incremental_reconcile_cancelled_full_keeps_the_newer_overflow_repair`、purge は `disabled_favorite_purge_preserves_enabled_overlap_and_prefix_sibling` を代表にする。新しい通知の repair と有効 root overlap/prefix sibling を保護する契約を確認し、未変更 scheduler 全体や既知 benchmark の再調査は行わない。
+
+### 再有効化の焦点検証
+
+親から Cargo 枠を受領後、列挙した焦点回帰はすべて exit 0。未使用の test helper/import だけを除いた r2 の core check、glyph、fmt、diff check も成功した。最終 freeze は `target/similar-index-enabled-20260911/freeze-r2`（manifest SHA256 `8153855A827845AA8001F0F351BCB2F7E099494EF3DCF56C64F60DD3943B85E0`）、検証 summary は `validation-r2/SUMMARY.txt`（SHA256 `B1AC74117F9201598B0135E36DA85E0DFF316A0B493CD5044988F9DAEDEAC542`）。独立担当は test-only 削除の意味変更なしを確認し承認を維持した。r2 test source の全体コンパイルは次の full gate で確認する。
+
+別 chunk として、親承認の `build-dev.ps1 -PreserveRuntime` を追加した。exact staged core/remote の実行を検出したら Stop-Process より前に throw し、未指定時の既定動作は維持する。production 関数を抽出して Get/Stop-Process を mock した回帰と独立レビューは成功。証跡は `target/build-dev-preserve-runtime-20260911/`、review SHA256 `EBD2AC543ADA4A17FAFAAE5924040107FD0EE37E464DDF317E3270CA6C8E54CE`。今回の確認 build は必ずこの switch を使い、実アプリを停止・起動しない。
+
+親 master の新しい `8e5e7ca7e` は現在の検証対象へ混ぜず、本 chunk 完了後の統合対象として留保する。全体 gate と確認 build はこの時点では未完了。

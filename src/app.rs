@@ -15086,9 +15086,23 @@ impl App {
     }
 
     pub(crate) fn new_from_settings_with_load_meta_and_book_query_repaint(
+        settings: crate::settings::Settings,
+        load_meta: crate::settings::SettingsLoadMeta,
+        notify_book_query_change: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(
+            settings,
+            load_meta,
+            notify_book_query_change,
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY,
+        )
+    }
+
+    fn new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(
         mut settings: crate::settings::Settings,
         load_meta: crate::settings::SettingsLoadMeta,
         notify_book_query_change: impl Fn() + Send + Sync + 'static,
+        similar_feature_capability: crate::similar_index::SimilarFeatureCapability,
     ) -> Self {
         // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
         // VST3 を強制 OFF にする。設定 DB に true が残っていても (例: 通常版の設定を流用)
@@ -15473,7 +15487,6 @@ impl App {
         keymap.install_global_native_video_shortcuts();
         let creative_lut_library =
             crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
-        let similar_feature_capability = crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY;
         let similar_index = crate::similar_index::SimilarIndexManager::new_if_enabled(
             similar_feature_capability,
             crate::data_dir::get(),
@@ -21559,15 +21572,6 @@ impl App {
             crate::similar_index::SimilarFeatureCapability::Enabled
         } else {
             crate::similar_index::SimilarFeatureCapability::Paused
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enable_similar_feature_for_test(&mut self) {
-        if self.similar_index.is_none() {
-            self.similar_index = Some(crate::similar_index::SimilarIndexManager::new(
-                crate::data_dir::get(),
-            ));
         }
     }
 

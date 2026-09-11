@@ -3574,6 +3574,11 @@ mod paused_metadata_panel_tests {
             tab,
             true,
         ));
+        assert!(metadata_panel_similar_demanded(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY,
+            tab,
+            true,
+        ));
     }
 }
 
