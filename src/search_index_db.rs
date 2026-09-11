@@ -81,6 +81,30 @@ fn subtree_bounds(root_path: &Path) -> (String, String) {
     (root_norm, prefix)
 }
 
+/// `upsert_children` が更新する直下エントリの BINARY collation 範囲。
+///
+/// `lower` は末尾 `/` をちょうど 1 つ持つ正規化済み親パス、`upper` はその末尾の
+/// ASCII `/` (U+002F) を直後の `0` (U+0030) へ進めた厳密な上限である。これにより
+/// 複合主キー `(favorite_root, path)` の path 部分を範囲検索でき、LIKE の `%` / `_`
+/// を実パス中のワイルドカードとして扱うこともない。
+fn direct_children_path_bounds(parent: &Path) -> (String, String) {
+    let parent_norm = normalize_path(parent);
+    let mut lower = parent_norm.trim_end_matches('/').to_owned();
+    lower.push('/');
+    let mut upper = lower
+        .strip_suffix('/')
+        .expect("direct-child lower bound ends in a separator")
+        .to_owned();
+    upper.push('0');
+    (lower, upper)
+}
+
+const UPSERT_CHILDREN_DELETE_SQL: &str = "DELETE FROM entries \
+     WHERE favorite_root = ?1 \
+     AND path >= ?2 \
+     AND path < ?3 \
+     AND instr(substr(path, length(?2) + 1), '/') = 0";
+
 // -----------------------------------------------------------------------
 // SearchIndexDb
 // -----------------------------------------------------------------------
@@ -165,26 +189,15 @@ impl SearchIndexDb {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        // 親フォルダ直下の既存エントリを一度消してから入れ直す
-        // (LIKE 'parent_norm/%' で直下以外も消えるのを避けるため、パス区切り単位で比較)
-        let parent_norm = normalize_path(parent);
-        // 直下 = path が "parent_norm/{name}" で '/' が parent_norm の直後に 1 回のみ
-        let prefix = if parent_norm.ends_with('/') {
-            parent_norm.clone()
-        } else {
-            format!("{}/", parent_norm)
-        };
+        // 親フォルダ直下の既存エントリを一度消してから入れ直す。
+        // prefix 範囲内の深い子孫を消さないよう、パス区切り単位でも比較する。
+        // 直下 = path が "parent_norm/{name}" で '/' が parent_norm の直後に 1 回のみ。
+        // literal range を複合 PK へ渡し、同じ favorite の範囲外行を走査しない。
+        let (lower, upper) = direct_children_path_bounds(parent);
         let fav_norm = normalize_path(favorite_root);
-        // 直下判定: path LIKE 'prefix%' かつ substr(path, len(prefix)+1) に '/' を含まない
-        // かつ **favorite_root が一致する** 行のみ対象 (nested favorites で他 fav の
-        // 行を巻き込まないように)。
-        tx.execute(
-            "DELETE FROM entries \
-             WHERE favorite_root = ?1 \
-             AND path LIKE ?2 || '%' \
-             AND instr(substr(path, length(?2) + 1), '/') = 0",
-            params![fav_norm, prefix],
-        )?;
+        // 範囲内の suffix に '/' が無い行だけを削除する。深い子孫と、nested
+        // favorite が所有する同一 path の行は保持する。
+        tx.execute(UPSERT_CHILDREN_DELETE_SQL, params![fav_norm, lower, upper])?;
 
         let now = next_write_stamp();
         {
@@ -706,6 +719,7 @@ pub fn is_under(path: &Path, favorite_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
 
     fn open_mem() -> SearchIndexDb {
         let conn = Connection::open_in_memory().unwrap();
@@ -857,6 +871,321 @@ mod tests {
         assert!(names.contains(&"w"));
         assert!(names.contains(&"z"));
         assert!(!names.contains(&"y"));
+    }
+
+    #[test]
+    fn upsert_children_uses_literal_parent_boundary_and_preserves_other_owners() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        let target = PathBuf::from(r"C:\Fav\100%_set");
+        let pattern_sibling = PathBuf::from(r"C:\Fav\100xxset");
+        let nested_fav = target.clone();
+
+        db.upsert_children(
+            &fav,
+            &target,
+            &[
+                entry(r"C:\Fav\100%_set\old.zip", "old.zip", IndexKind::ZipFile),
+                entry(
+                    r"C:\Fav\100%_set\日本語.pdf",
+                    "日本語.pdf",
+                    IndexKind::PdfFile,
+                ),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &target.join("sub"),
+            &[entry(
+                r"C:\Fav\100%_set\sub\deep.zip",
+                "deep.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &pattern_sibling,
+            &[entry(
+                r"C:\Fav\100xxset\victim.zip",
+                "victim.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        db.upsert_children(
+            &nested_fav,
+            &target,
+            &[entry(
+                r"C:\Fav\100%_set\nested.pdf",
+                "nested.pdf",
+                IndexKind::PdfFile,
+            )],
+        )
+        .unwrap();
+
+        db.upsert_children(
+            &fav,
+            &target,
+            &[entry(
+                r"C:\Fav\100%_set\new.zip",
+                "new.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let exists = |favorite_root: &str, path: &str| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE favorite_root = ?1 AND path = ?2)",
+                params![favorite_root, path],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(!exists("c:/fav", "c:/fav/100%_set/old.zip"));
+        assert!(!exists("c:/fav", "c:/fav/100%_set/日本語.pdf"));
+        assert!(exists("c:/fav", "c:/fav/100%_set/new.zip"));
+        assert!(exists("c:/fav", "c:/fav/100%_set/sub/deep.zip"));
+        assert!(exists("c:/fav", "c:/fav/100xxset/victim.zip"));
+        assert!(exists("c:/fav/100%_set", "c:/fav/100%_set/nested.pdf"));
+        drop(conn);
+
+        db.upsert_children(&fav, &target, &[]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries
+                 WHERE favorite_root = 'c:/fav'
+                   AND path = 'c:/fav/100%_set/new.zip'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "empty replacement removes the old direct child"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries
+                 WHERE path IN (
+                   'c:/fav/100%_set/sub/deep.zip',
+                   'c:/fav/100xxset/victim.zip',
+                   'c:/fav/100%_set/nested.pdf'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "deep, pattern-sibling, and nested-favorite rows remain"
+        );
+    }
+
+    #[test]
+    fn direct_children_bounds_normalize_trailing_slashes_and_drive_root() {
+        assert_eq!(
+            direct_children_path_bounds(Path::new(r"C:\")),
+            ("c:/".to_owned(), "c:0".to_owned())
+        );
+        assert_eq!(
+            direct_children_path_bounds(Path::new("C:/Fav///")),
+            ("c:/fav/".to_owned(), "c:/fav0".to_owned())
+        );
+        assert_eq!(
+            direct_children_path_bounds(Path::new(r"C:\お気に入り")),
+            ("c:/お気に入り/".to_owned(), "c:/お気に入り0".to_owned())
+        );
+    }
+
+    #[test]
+    fn upsert_children_insert_failure_rolls_back_delete_and_stamp() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        let parent = PathBuf::from(r"C:\Fav\parent");
+        db.upsert_children(
+            &fav,
+            &parent,
+            &[entry(
+                r"C:\Fav\parent\old.zip",
+                "old.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let old_stamp = {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_upsert_child
+                 BEFORE INSERT ON entries
+                 WHEN NEW.name = 'reject.zip'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'test upsert failure');
+                 END;",
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            db.upsert_children(
+                &fav,
+                &parent,
+                &[entry(
+                    r"C:\Fav\parent\reject.zip",
+                    "reject.zip",
+                    IndexKind::ZipFile,
+                )],
+            )
+            .is_err()
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT path FROM entries WHERE favorite_root = 'c:/fav'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "c:/fav/parent/old.zip"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                old_stamp
+            );
+            conn.execute("DROP TRIGGER reject_upsert_child", [])
+                .unwrap();
+        }
+
+        db.upsert_children(
+            &fav,
+            &parent,
+            &[entry(
+                r"C:\Fav\parent\after.zip",
+                "after.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (path, stamp): (String, i64) = conn
+            .query_row(
+                "SELECT path, updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "c:/fav/parent/after.zip");
+        assert!(stamp > old_stamp);
+    }
+
+    fn upsert_children_delete_query_evidence(
+        unrelated_rows: usize,
+    ) -> (String, i32, i32, i32, usize) {
+        let db = open_mem();
+        let mut conn = db.conn.lock().unwrap();
+        conn.execute(
+            "WITH RECURSIVE ids(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+             )
+             INSERT INTO entries
+               (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+             SELECT printf('c:/fav/outside/%08d.zip', value),
+                    printf('C:/Fav/outside/%08d.zip', value),
+                    printf('%08d.zip', value), printf('%08d.zip', value),
+                    1, 'c:/fav', 1, 1 FROM ids",
+            [i64::try_from(unrelated_rows).unwrap()],
+        )
+        .unwrap();
+        for index in 0..8 {
+            conn.execute(
+                "INSERT INTO entries
+                   (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+                 VALUES (?1, ?1, ?2, ?2, 1, 'c:/fav', 1, 1)",
+                params![
+                    format!("c:/fav/target/{index:02}.zip"),
+                    format!("{index:02}.zip")
+                ],
+            )
+            .unwrap();
+        }
+        for index in 0..4 {
+            conn.execute(
+                "INSERT INTO entries
+                   (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+                 VALUES (?1, ?1, ?2, ?2, 1, 'c:/fav', 1, 1)",
+                params![
+                    format!("c:/fav/target/deep/{index:02}.zip"),
+                    format!("{index:02}.zip")
+                ],
+            )
+            .unwrap();
+        }
+        let (lower, upper) = direct_children_path_bounds(Path::new("C:/Fav/target"));
+        let explain_sql = format!("EXPLAIN QUERY PLAN {UPSERT_CHILDREN_DELETE_SQL}");
+        let plan = conn
+            .prepare(&explain_sql)
+            .unwrap()
+            .query_map(params!["c:/fav", lower, upper], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+
+        let tx = conn.transaction().unwrap();
+        let mut statement = tx.prepare(UPSERT_CHILDREN_DELETE_SQL).unwrap();
+        let deleted = statement.execute(params!["c:/fav", lower, upper]).unwrap();
+        let evidence = (
+            plan,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+            deleted,
+        );
+        drop(statement);
+        tx.rollback().unwrap();
+        evidence
+    }
+
+    #[test]
+    fn upsert_children_delete_query_work_is_independent_of_unrelated_rows() {
+        let small = upsert_children_delete_query_evidence(4_096);
+        let large = upsert_children_delete_query_evidence(32_768);
+        for evidence in [&small, &large] {
+            assert!(
+                evidence.0.contains("sqlite_autoindex_entries_1"),
+                "{}",
+                evidence.0
+            );
+            assert!(
+                evidence.0.contains("favorite_root=? AND path>? AND path<?"),
+                "{}",
+                evidence.0
+            );
+            assert!(!evidence.0.contains("SCAN entries"), "{}", evidence.0);
+            assert_eq!(evidence.2, 0, "unexpected full scan: {evidence:?}");
+            assert_eq!(evidence.3, 0, "unexpected sort: {evidence:?}");
+            assert_eq!(evidence.4, 8, "direct children deleted: {evidence:?}");
+        }
+        assert!(
+            large.1 <= small.1.saturating_add(32),
+            "DELETE work grew with unrelated rows: small={small:?}, large={large:?}"
+        );
     }
 
     #[test]
