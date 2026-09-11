@@ -202,12 +202,26 @@ fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
 
 pub(crate) const CHECKED_SELECTION_OVERLAY_ID: &str = "checked_selection_count_overlay";
 
+// `app/grid_paint.rs::draw_cell` draws the selection mark with a 12 pt radius and
+// places its top 4 pt below the cell. Keep the count card below that 28 pt mark,
+// with the same 8 pt edge gap used on the right side.
+const CHECKED_SELECTION_MARK_TOP_INSET: f32 = 4.0;
+const CHECKED_SELECTION_MARK_RADIUS: f32 = 12.0;
+const CHECKED_SELECTION_OVERLAY_GAP: f32 = 8.0;
+
+fn checked_selection_overlay_top(available_rect: egui::Rect) -> f32 {
+    available_rect.top()
+        + CHECKED_SELECTION_MARK_TOP_INSET
+        + CHECKED_SELECTION_MARK_RADIUS * 2.0
+        + CHECKED_SELECTION_OVERLAY_GAP
+}
+
 /// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
 fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
     let Some(count_label) = checked_selection_overlay_label(checked_count) else {
         return false;
     };
-    let top_offset = ctx.available_rect().top() + 8.0;
+    let top_offset = checked_selection_overlay_top(ctx.available_rect());
     let mut clear_clicked = false;
     egui::Area::new(egui::Id::new(CHECKED_SELECTION_OVERLAY_ID))
         .order(egui::Order::Foreground)
@@ -21441,6 +21455,68 @@ mod checked_selection_overlay_tests {
                 composite(dark, egui::Color32::WHITE),
             ) >= 4.5,
             "dark-theme warning text remains readable over a bright thumbnail"
+        );
+    }
+
+    #[test]
+    fn checked_selection_overlay_stays_below_the_top_row_mark_across_grid_sizes_scroll_and_dpi() {
+        for available_top in [0.0, 42.0] {
+            let available = egui::Rect::from_min_size(
+                egui::pos2(0.0, available_top),
+                egui::vec2(1_280.0, 720.0),
+            );
+            for cell_height in [64.0, 180.0, 360.0] {
+                for first_visible_row in [0usize, 1, 17] {
+                    for scroll_remainder in [0.0, cell_height / 2.0, cell_height - 0.25] {
+                        // Mouse/touch glide can temporarily retain a fractional row offset. The
+                        // first visible row then moves upward, so its mark bottom can only move
+                        // farther away from the viewport-anchored count card.
+                        let scroll_offset =
+                            first_visible_row as f32 * cell_height + scroll_remainder;
+                        let cell_top = available.top() + first_visible_row as f32 * cell_height
+                            - scroll_offset;
+                        let mark_bottom = cell_top
+                            + CHECKED_SELECTION_MARK_TOP_INSET
+                            + CHECKED_SELECTION_MARK_RADIUS * 2.0;
+                        let overlay_top = checked_selection_overlay_top(available);
+
+                        assert!(
+                            overlay_top - mark_bottom >= CHECKED_SELECTION_OVERLAY_GAP,
+                            "scrolling must not move the top-row mark under the count card"
+                        );
+                        for pixels_per_point in [1.0, 1.5, 2.0, 2.5] {
+                            assert!(
+                                (overlay_top - mark_bottom) * pixels_per_point
+                                    >= CHECKED_SELECTION_OVERLAY_GAP * pixels_per_point,
+                                "logical separation must scale to physical pixels"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_selection_overlay_real_area_honors_available_top_and_marker_clearance() {
+        let available_top = Arc::new(std::sync::Mutex::new(None));
+        let available_top_in_ui = Arc::clone(&available_top);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 420.0))
+            .build(move |ctx| {
+                egui::TopBottomPanel::top("checked-overlay-test-toolbar")
+                    .exact_height(48.0)
+                    .show(ctx, |_| {});
+                *available_top_in_ui.lock().unwrap() = Some(ctx.available_rect().top());
+                let _ = show_checked_selection_overlay(ctx, 3);
+            });
+
+        harness.run();
+        let available_top = available_top.lock().unwrap().unwrap();
+        let first_label_top = harness.get_by_label("チェック").rect().top();
+        assert!(
+            first_label_top >= available_top + 36.0,
+            "the real Area content must start below the top-row mark: available_top={available_top}, label_top={first_label_top}"
         );
     }
 
