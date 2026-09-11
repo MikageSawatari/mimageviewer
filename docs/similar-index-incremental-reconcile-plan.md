@@ -477,4 +477,16 @@ telemetryで不完全走査にもdatabase_published phaseを出すP2が見つか
 
 ### A+B 最終焦点検収
 
-r3でFull/Deltaのdatabase_publishedを実publish成功branch内だけにし、不完全観測はscan_incompleteとした。productionのsafe/unsafe 4経路を通る回帰を含むtelemetry2件が成功、fmt/diff成功。ZIPは承認済みr2と同一。freezeは `target/similar-startup-full-hotpath-20260911/freeze-r3`、source patch SHA256 `E65ECBD80B6B1710125516FF5B2A8F8A45E244A2C0C57B7A0020C72502204639`（正確なdigestは同manifestを正本とする）。独立reviewはP1/P2なし、`review-approval.md` SHA256 `B8132A4F5CDF3583F5E5A6427CB4DE4892D3A8A65366F96B1FB2978ABBA85629`。全体gateと確認buildはこれから行い、実機の総時間改善は未検証。
+r3でFull/Deltaのdatabase_publishedを実publish成功branch内だけにし、不完全観測はscan_incompleteとした。productionのsafe/unsafe 4経路を通る回帰を含むtelemetry2件が成功、fmt/diff成功。ZIPは承認済みr2と同一。freezeは `target/similar-startup-full-hotpath-20260911/freeze-r3`、source patch SHA256 `E65ECBD80B6B1710125516FF5B2A8B8A45E244A2C0C57B7A0020C72502204639`。独立reviewはP1/P2なし、`review-approval.md` SHA256 `B8132A4F5CDF3583F5E5A6427CB4DE4892D3A8A65366F96B1FB2978ABBA85629`。全体gateと確認buildはこれから行い、実機の総時間改善は未検証。
+
+### 起動 Full 改善の全体 gate 初回
+
+A+Bを `51caf188ee9f8b4921bd6a4a5d3ccfc0d8a4feff` に保存。11:44:15–11:56:17 JST の全体gateは、本体8,177 passed / 44 ignored、UI48、workspace/doc、vendor egui25・egui-wgpu9成功後、vendor eframeの専用Windows process fixture `synchronous_damage_returns_before_outer_paint_gate` だけ失敗した（14 passed / 1 failed、exit101）。fixture内TCP readの5秒timeout（10060）であり、75分runner上限による中断ではない。初回log SHA256 `87D4B6128EC3A3EF45D209543C6EB52223F0D77F243DD3C6603350A122E369A7`。
+
+source不変・fixture変更なしで当該exact1件を1回再実行し、1 passed / 0 failed、0.81秒、exit0。log SHA256 `7A5A0A0B713FD4E26B437127D0CBD8B0F1D1EFEA8E8C6F157535B0D53D45A39F`。初回原因は未確定で、既知flakyと断定せず失敗記録を保持する。実アプリやDBに接続しない専用非対話fixtureで、mIVの起動・停止なし。最終全体gateを同じsourceで一度再確認する。
+
+### 起動 Full 改善の全体 gate 再確認完了
+
+source不変 `51caf188e` の再確認は11:58:23–12:05:30 JST、426.868秒、native exit0 / PASS。本体8,177 passed / 44 ignored、UI48、vendor eframe15を含む全段階が成功した。初回timeoutは保持し、期待・timeout・製品sourceを変えず再実行した。証跡 `target/similar-startup-full-hotpath-20260911/fullgate-r2-51caf188e`、log SHA256 `35FC1FD19A2ACC798E878C7D84599AA24640BD2387FBE997708EFFBC7ECB28FC`。rootも件数/PASSを照合した。
+
+終了時cargo/rustc0、親へCargo枠を返却。ユーザーのexact dev-runtimeが起動中のため、確認buildはまだ開始していない。実行中exeを上書き・停止せず、利用者の終了後に `build-dev.ps1 -PreserveRuntime` を実行する。実機の総起動時間短縮は未検証で、完了宣言の対象外。
