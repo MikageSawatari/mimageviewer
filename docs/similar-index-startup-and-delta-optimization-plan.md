@@ -97,7 +97,7 @@ scope matrix、snapshot後追加/owner変更、failed保護、book↔loose、ren
 | DB基盤 | 既知schemaの保持移行、scope候補取得、identity保護、summary baselineと小fixture | r5/r6実装・自動検証完了 |
 | 索引接続・計測 | production Delta経路への接続、child scope回帰、種類別時間 | 実装・回帰済み、実機分類時間は未測定 |
 | 性能・独立レビュー | 小K/大Nの候補数・query plan・時間・移行容量、独立指摘解消 | r5/r6承認済み、実機速度は未測定 |
-| 全体gate・確認build | 最終sourceで全体テスト、実行中アプリを保持した確認build | r6全gate成功、build準備中 |
+| 全体gate・確認build | 最終sourceで全体テスト、実行中アプリを保持した確認build | r6全gate・確認build成功、実機確認待ち |
 
 前提確認では既存schema 3の明示的保持migrationを追加する方針。schema番号だけを変更して既存再作成分岐へ流さない。既知の古いschema移行も回帰対象。実アプリ起動・停止・通常DBの操作は行わない。
 
@@ -180,3 +180,11 @@ r5は `e614d6b97` に保存。r6 precompile freezeのmanifest SHA256は `4CC4ED8
 ### r6全体gate成功
 
 15:39:39–15:52:26 JST、exit0、`[test-full] PASS`。本体8,194 passed / 45 ignored（377.67秒）、UI snapshot48（3.99秒）、vendor egui25 / egui-wgpu9 / eframe15を含め全段階成功。rootも原本と最終source hash一致を確認した。証跡 `fullgate-r6`、stdout SHA256 `B4841EBE65FCD0B509DFC3FE13A20ACC952EFEC929CCCD566F9363E563DA5431`、stderr `B919430B887254B136AF3E1E04F2B9893570B45F4B6B8F845ED234F7CCEA33FE`。実機時間はまだ未検証であり、確認buildを作成して利用者へ渡す。
+
+### 確認buildの引き渡し
+
+r6 sourceは `ae0b9f7ee` に保存。`build-dev.ps1 -PreserveRuntime` は15:53:21–16:03:42 JST、jobs1、normal feature、exit0。開始時のe614d6b97＋差分とae0b9f7eeのsource hashは同じ。開始・終了時とも対象dev-runtimeアプリ0、終了時Cargo/rustc/link0、アプリ起動・停止・実DB操作なし。証跡は `build-r6`。
+
+`target/dev-runtime/mimageviewer-core.exe` は310,144,512 bytes、2026-09-11 16:03:40 JST、SHA256 `56803B1F9E01AA1F6FE93F4C36FA0FCBDCBD28087E11B3C5E140424F83095547`。Remoteは変更なしで再利用、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。rootも実file hashを照合した。
+
+利用者の手動確認は、常駐版を終了後、通常profileの上記coreを起動し、初回移行・Full完了を待ってから監視対象へ1件コピーしDeltaの各phaseを測る。既存v3からの初回移行は合成約463万行で約6分を要したため、通常更新の時間と分ける。実機の移行・起動分類時間・Delta短縮は未検証。全件フォルダ確認の共通化は実測後の別設計であり、今回実装済みとはしない。
