@@ -4807,8 +4807,18 @@ fn run_index_job(
             watermark: None,
         });
     }
-    db.cleanup_incomplete()
-        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
+    if db
+        .cleanup_incomplete_if(cancel)
+        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
+        .is_none()
+    {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+            requires_full: false,
+            watermark: None,
+        });
+    }
     set_stage(progress, IndexStage::Opening, None);
     let Some(inventory) = db
         .load_full_reconcile_inventory(current_hash_version(), || !cancel.load(Ordering::Acquire))
@@ -4938,8 +4948,18 @@ fn run_delta_index_job(
             watermark: None,
         });
     }
-    db.cleanup_incomplete()
-        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
+    if db
+        .cleanup_incomplete_if(cancel)
+        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
+        .is_none()
+    {
+        return Ok(ScanJobOutcome {
+            report: IndexReport::default(),
+            prune_safe: false,
+            requires_full: false,
+            watermark: None,
+        });
+    }
     set_stage(progress, IndexStage::Scanning, None);
     if let Some(telemetry) = telemetry {
         telemetry.log_phase("scanning", None);

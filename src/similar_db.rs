@@ -224,6 +224,8 @@ pub struct SimilarDb {
 
 const FULL_INVENTORY_CANCEL_POLL_ROWS: usize = 4096;
 const FULL_INVENTORY_MAX_CAPACITY_HINT: usize = 16 * 1024 * 1024;
+const CLEANUP_PROGRESS_OPS: i32 = 1_000;
+type CleanupCancel = Arc<dyn Fn() -> bool + Send + Sync + std::panic::RefUnwindSafe>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FullItemObservation {
@@ -1177,6 +1179,23 @@ impl Drop for CancellableReadTransaction<'_> {
     }
 }
 
+struct SqlProgressHandlerGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> SqlProgressHandlerGuard<'a> {
+    fn install(conn: &'a Connection, cancel: CleanupCancel) -> Self {
+        conn.progress_handler(CLEANUP_PROGRESS_OPS, Some(move || cancel()));
+        Self { conn }
+    }
+}
+
+impl Drop for SqlProgressHandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
 fn classify_book_read_error(error: rusqlite::Error, cancel: &AtomicBool) -> BookReadError {
     if matches!(
         &error,
@@ -1256,23 +1275,71 @@ impl SimilarDb {
 
     /// 前回停止時に公開されなかった世代だけを掃除する。
     pub fn cleanup_incomplete(&self) -> rusqlite::Result<usize> {
+        self.cleanup_incomplete_inner(None)
+            .map(|removed| removed.expect("unconditional cleanup cannot be cancelled"))
+    }
+
+    /// scan の入口で、取消を尊重しながら前回の非公開世代だけを掃除する。
+    ///
+    /// worker failure 後の後始末は取消済みでも必要なので無条件版を使う。
+    pub(crate) fn cleanup_incomplete_if(
+        &self,
+        cancel: &Arc<AtomicBool>,
+    ) -> rusqlite::Result<Option<usize>> {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let cancel = Arc::clone(cancel);
+        self.cleanup_incomplete_inner(Some(Arc::new(move || cancel.load(Ordering::Acquire))))
+    }
+
+    fn cleanup_incomplete_inner(
+        &self,
+        cancel: Option<CleanupCancel>,
+    ) -> rusqlite::Result<Option<usize>> {
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
+        }
         #[cfg(test)]
         self.cleanup_incomplete_calls
             .fetch_add(1, Ordering::Relaxed);
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = write_transaction(&mut conn)?;
-        let staged = transaction.execute("DELETE FROM item_build", [])?;
-        transaction.execute("DELETE FROM container_build", [])?;
-        let unpublished = load_items_for_container_state(&transaction, ScanState::Building)?;
-        for row in &unpublished {
-            delete_item_with_change(&transaction, row)?;
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
         }
-        let containers = transaction.execute(
-            "DELETE FROM container WHERE scan_state = ?1",
-            [ScanState::Building as i64],
-        )?;
+        let transaction = write_transaction(&mut conn)?;
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
+        }
+        let should_continue = || cancel.as_ref().is_none_or(|cancel| !cancel());
+        let cleanup = if let Some(cancel) = cancel.as_ref() {
+            let _progress = SqlProgressHandlerGuard::install(&transaction, Arc::clone(cancel));
+            cleanup_incomplete_transaction(&transaction, &should_continue)
+        } else {
+            cleanup_incomplete_transaction(&transaction, &should_continue)
+        };
+        let removed = match cleanup {
+            Ok(removed) => removed,
+            Err(error)
+                if cancel.as_ref().is_some_and(|cancel| cancel())
+                    && matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(code, _)
+                            if code.code == rusqlite::ErrorCode::OperationInterrupted
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(removed) = removed else {
+            return Ok(None);
+        };
+        if !should_continue() {
+            return Ok(None);
+        }
         transaction.commit()?;
-        Ok(staged + containers + unpublished.len())
+        Ok(Some(removed))
     }
 
     pub fn item_freshness(
@@ -3952,17 +4019,73 @@ fn load_items_for_container_raw(
         .collect()
 }
 
-fn load_items_for_container_state(
+fn cleanup_incomplete_item_ids_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT i.item_id
+         FROM container c
+         CROSS JOIN item i INDEXED BY item_container_idx
+           ON i.container_key = c.container_key
+         WHERE c.scan_state = ?1
+         ORDER BY i.item_id",
+        if explain { "EXPLAIN QUERY PLAN " } else { "" }
+    )
+}
+
+fn load_item_ids_for_container_state_if(
     conn: &Connection,
     state: ScanState,
-) -> rusqlite::Result<Vec<SearchRow>> {
-    let mut statement = conn.prepare(&format!(
-        "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key=i.container_key
-         WHERE c.scan_state=?1 ORDER BY i.item_id"
-    ))?;
-    statement
-        .query_map([state as i64], row_to_search_row)?
-        .collect()
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<Option<Vec<u64>>> {
+    let mut statement = conn.prepare(&cleanup_incomplete_item_ids_sql(false))?;
+    let mut rows = statement.query([state as i64])?;
+    let mut item_ids = Vec::new();
+    loop {
+        if !should_continue() {
+            return Ok(None);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        item_ids.push(i64_to_u64(row.get(0)?, 0)?);
+    }
+    Ok(Some(item_ids))
+}
+
+fn cleanup_incomplete_transaction(
+    transaction: &Transaction<'_>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<Option<usize>> {
+    if !should_continue() {
+        return Ok(None);
+    }
+    let staged = transaction.execute("DELETE FROM item_build", [])?;
+    transaction.execute("DELETE FROM container_build", [])?;
+    let Some(unpublished) =
+        load_item_ids_for_container_state_if(transaction, ScanState::Building, should_continue)?
+    else {
+        return Ok(None);
+    };
+    for item_id in &unpublished {
+        if !should_continue() {
+            return Ok(None);
+        }
+        insert_item_change(transaction, *item_id, ItemChangeOp::Delete, None, None)?;
+        transaction.execute(
+            "DELETE FROM item WHERE item_id = ?1",
+            [i64::try_from(*item_id).unwrap_or(i64::MAX)],
+        )?;
+    }
+    if !should_continue() {
+        return Ok(None);
+    }
+    let containers = transaction.execute(
+        "DELETE FROM container WHERE scan_state = ?1",
+        [ScanState::Building as i64],
+    )?;
+    if !should_continue() {
+        return Ok(None);
+    }
+    Ok(Some(staged + containers + unpublished.len()))
 }
 
 fn load_staged_items(
@@ -4786,6 +4909,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
 
     fn item(key: &str, container: Option<&str>, page: Option<u32>, marker: u8) -> StoredItem {
         StoredItem {
@@ -5985,6 +6109,233 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn insert_unpublished_container_items(
+        db: &SimilarDb,
+        container_key: &str,
+        item_count: usize,
+    ) -> Vec<u64> {
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        conn.execute(
+            "INSERT INTO container
+             (container_key, source_parent_key, kind, page_count, scan_state, generation,
+              mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 1)",
+            params![
+                container_key,
+                source_parent_key(container_key),
+                ContainerKind::Zip as i64,
+                i64::try_from(item_count).unwrap(),
+                ScanState::Building as i64,
+            ],
+        )
+        .unwrap();
+        let mut item_ids = Vec::with_capacity(item_count);
+        for page_index in 0..item_count {
+            let key = format!("{container_key}\u{1f}{page_index:05}.jpg");
+            let mut page = item(
+                &key,
+                Some(container_key),
+                Some(u32::try_from(page_index).unwrap()),
+                u8::try_from(page_index % 251).unwrap(),
+            );
+            page.kind = ItemKind::ZipPage;
+            item_ids.push(publish_item(&conn, None, &page).unwrap().item_id);
+        }
+        item_ids
+    }
+
+    #[test]
+    fn incomplete_cleanup_removes_only_building_members_and_journals_them_in_item_order() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/loose.jpg", None, None, 1))
+            .unwrap();
+        publish_test_book(
+            &db,
+            "c:/library/complete",
+            &[("c:/library/complete/a.jpg", 2)],
+        );
+        let building_ids = insert_unpublished_container_items(&db, "c:/library/incomplete.zip", 3);
+        let generation = {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "INSERT INTO container_build
+                 (container_key, source_parent_key, kind, page_count, scan_state, generation,
+                  mtime, file_size)
+                 SELECT container_key, source_parent_key, kind, page_count, scan_state,
+                        generation, mtime, file_size
+                 FROM container WHERE container_key = 'c:/library/incomplete.zip'",
+                [],
+            )
+            .unwrap();
+            let generation = 1_u64;
+            conn.execute(
+                "INSERT INTO item_build
+                 (item_key, kind, container_key, page_index, mtime, file_size, hash_version,
+                  pdq256, quality, width, height, format, generation)
+                 VALUES ('staged', ?1, 'c:/library/incomplete.zip', 0, 1, 1, ?2,
+                         zeroblob(32), 1, 1, 1, 1, ?3)",
+                params![
+                    ItemKind::ZipPage as i64,
+                    current_hash_version(),
+                    i64::try_from(generation).unwrap()
+                ],
+            )
+            .unwrap();
+            generation
+        };
+        assert_eq!(generation, 1);
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+
+        assert_eq!(db.cleanup_incomplete().unwrap(), 5);
+
+        assert!(
+            db.load_item("c:/library/loose.jpg", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.load_book_pages("c:/library/complete", current_hash_version())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.count_staged(), 0);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM container WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        let changes = db.load_item_changes_after(before_seq).unwrap().changes;
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.item_id)
+                .collect::<Vec<_>>(),
+            building_ids
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.op == ItemChangeOp::Delete)
+        );
+    }
+
+    #[test]
+    fn incomplete_cleanup_cancel_rolls_back_and_clears_the_progress_handler() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let building_ids = insert_unpublished_container_items(&db, "c:/library/incomplete.zip", 32);
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let cancel_checks = Arc::clone(&checks);
+        let cancelled = db
+            .cleanup_incomplete_inner(Some(Arc::new(move || {
+                cancel_checks.fetch_add(1, Ordering::AcqRel) >= 8
+            })))
+            .unwrap();
+
+        assert_eq!(cancelled, None);
+        assert!(checks.load(Ordering::Acquire) >= 9);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM item WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            i64::try_from(building_ids.len()).unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM container WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        assert_eq!(
+            db.load_item_changes_after(before_seq).unwrap().changes,
+            Vec::new()
+        );
+
+        assert_eq!(db.cleanup_incomplete().unwrap(), building_ids.len() + 1);
+        db.upsert_loose_item(&item("after-cleanup", None, None, 7))
+            .unwrap();
+    }
+
+    fn incomplete_cleanup_query_evidence(unrelated_rows: usize) -> (String, i32, i32, i32) {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, source_parent_key, page_index,
+                    mtime, file_size, hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('c:/outside/%08d.jpg', value), 0, NULL, 'c:/outside', NULL,
+                        1, 1, ?2, zeroblob(32), 1, 1, 1, 1 FROM ids",
+                params![
+                    i64::try_from(unrelated_rows).unwrap(),
+                    current_hash_version()
+                ],
+            )
+            .unwrap();
+        }
+        insert_unpublished_container_items(&db, "c:/target/incomplete.zip", 8);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        let plan = conn
+            .prepare(&cleanup_incomplete_item_ids_sql(true))
+            .unwrap()
+            .query_map([ScanState::Building as i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        let mut statement = conn
+            .prepare(&cleanup_incomplete_item_ids_sql(false))
+            .unwrap();
+        let item_ids = statement
+            .query_map([ScanState::Building as i64], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(item_ids.len(), 8);
+        (
+            plan,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+        )
+    }
+
+    #[test]
+    fn incomplete_cleanup_query_work_is_independent_of_unrelated_item_count() {
+        let small = incomplete_cleanup_query_evidence(4_096);
+        let large = incomplete_cleanup_query_evidence(32_768);
+        println!("cleanup query K=8: N=4096 {small:?}; N=32768 {large:?}");
+        for evidence in [&small, &large] {
+            assert!(evidence.0.contains("SCAN c"), "{}", evidence.0);
+            assert!(evidence.0.contains("item_container_idx"), "{}", evidence.0);
+            assert!(!evidence.0.contains("SCAN i"), "{}", evidence.0);
+        }
+        assert!(
+            large.1 <= small.1.saturating_add(32),
+            "cleanup VM work grew with unrelated items: small={small:?}, large={large:?}"
+        );
+        assert_eq!(large.2, small.2);
+        assert_eq!(large.3, small.3);
     }
 
     #[test]

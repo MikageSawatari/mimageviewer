@@ -94,10 +94,10 @@ scope matrix、snapshot後追加/owner変更、failed保護、book↔loose、ren
 
 | 区切り | 完了条件 | 状態 |
 | --- | --- | --- |
-| DB基盤 | 既知schemaの保持移行、scope候補取得、identity保護、summary baselineと小fixture | 実装・焦点回帰済み、レビュー中 |
-| 索引接続・計測 | production Delta経路への接続、child scope回帰、種類別時間 | 接続・焦点回帰済み、最終確認待ち |
-| 性能・独立レビュー | 小K/大Nの候補数・query plan・時間・移行容量、独立指摘解消 | 検証・レビュー中 |
-| 全体gate・確認build | 最終sourceで全体テスト、実行中アプリを保持した確認build | 未実施 |
+| DB基盤 | 既知schemaの保持移行、scope候補取得、identity保護、summary baselineと小fixture | r5/r6実装・自動検証完了 |
+| 索引接続・計測 | production Delta経路への接続、child scope回帰、種類別時間 | 実装・回帰済み、実機分類時間は未測定 |
+| 性能・独立レビュー | 小K/大Nの候補数・query plan・時間・移行容量、独立指摘解消 | r5/r6承認済み、実機速度は未測定 |
+| 全体gate・確認build | 最終sourceで全体テスト、実行中アプリを保持した確認build | r6全gate成功、build準備中 |
 
 前提確認では既存schema 3の明示的保持migrationを追加する方針。schema番号だけを変更して既存再作成分岐へ流さない。既知の古いschema移行も回帰対象。実アプリ起動・停止・通常DBの操作は行わない。
 
@@ -164,3 +164,19 @@ NULL行限定の補正後、v4 fixtureはitem/container/container_buildのparent
 最終説明の監査で、毎Delta入口の既存 `cleanup_incomplete` → `load_items_for_container_state(Building)` が全itemを外側にするSQLだった点を確認。rootと独立reviewerが既存合成DBへPython SQLite3.49.1でread-only EXPLAINし、container0でも `SCAN i → SEARCH c` となる計画を確認した。bundled SQLiteの計測は追加回帰で確認する。この時点で成立した性能説明はscope inventory/publish/finalizer部分のN比例排除であり、通常Deltaの準備全体のN比例排除ではない。
 
 r5を承認・全gate成功のまとまりとして保存し、追加chunkで共通cleanupのmember選択をBuilding container外側→member index取得へ直す。Complete/loose保持、delete+journal順、staging掃除と単一TXを維持する。Full/Delta入口は取消確認付き経路、失敗・取消後の後始末は既存の無条件経路として所有を区別する。新schema追加は不要とし、container側の走査が残る点を明記する。追加差分は限定レビュー・焦点回帰・再gate後に確認buildへ進める。
+
+### r6入口cleanupの限定レビュー
+
+r5は `e614d6b97` に保存。r6 precompile freezeのmanifest SHA256は `4CC4ED8B88213607BCDA1B834F87EAC79AE8936CCB3FAA34E5AFE26444B73CB4`、DB `1070857F7E8F85454FA7FDAFD5C0576125C06CE03122E71C17FDD6058509319E`、index `7E5F1E71EC0901B3DAA5EFEC458732D8B02C54FA88F204282BE383EFCF2A1F93`。schemaは変更しない。
+
+独立Sol/xhighレビューではblocking P1/P2なし。共通SQLをBuilding container外側→member index検索とし、item_id順の削除journalを維持。入口だけ取消可能とし、失敗後の無条件回収を保持する。SQLite progress handlerはRAIIでcommit/error/rollback前に解除する。静的承認時点では未compileであり、保持・journal順、処理途中取消のrollbackとhandler再利用、固定K/増Nの実SQL plan/VM、新旧Full/Delta取消経路の実行を承認条件とする。性能説明はglobal item scanの除去に限定し、container走査・対象memberの一時保持とsortは残る。
+
+`validation-r6` は新規cleanup3、Full/Delta activity2、DB56（1 ignored）、index77（5 ignored）が成功。core check38.25秒、fmt/diff/glyphもexit0。完全修飾名のexactテスト1件で、bundled SQLiteのproduction SQLはN4,096/32,768・K8とも `SCAN c → SEARCH i USING COVERING INDEX item_container_idx`、VM88・fullscan0・sort1と一致した。sortは対象8件のitem_id順である。誤った短いexact指定による0件ログは非証拠として保持し、1件実行ログと区別した。
+
+最終 `freeze-r6/MANIFEST.txt` SHA256 `6794A97536E9C0D685A40B44752B7E747908A3968D6E4A6852246DD1C995095B`、DB `11F7B5E443C3E209BBD46327D339BA6B170A092828094E13967DDDE3133DBAAC`、index `7E5F1E71EC0901B3DAA5EFEC458732D8B02C54FA88F204282BE383EFCF2A1F93`。precompile後はテストの計画出力とrustfmtのみ。最終bytesを全体gateで再compileする。
+
+独立レビューは最終差分・実行証拠を限定照合し、r6 blocking P1/P2なし、全体gate継続可と承認。`freeze-r6/review-approval.md` SHA256 `9D15C7C939A97A3E8F646CE25537206AD3FABB314E6B8866063E4257E18D12EC`。全体gateは15:39:39 JST開始、jobs1、通常アプリや実DBを操作せず実行する。
+
+### r6全体gate成功
+
+15:39:39–15:52:26 JST、exit0、`[test-full] PASS`。本体8,194 passed / 45 ignored（377.67秒）、UI snapshot48（3.99秒）、vendor egui25 / egui-wgpu9 / eframe15を含め全段階成功。rootも原本と最終source hash一致を確認した。証跡 `fullgate-r6`、stdout SHA256 `B4841EBE65FCD0B509DFC3FE13A20ACC952EFEC929CCCD566F9363E563DA5431`、stderr `B919430B887254B136AF3E1E04F2B9893570B45F4B6B8F845ED234F7CCEA33FE`。実機時間はまだ未検証であり、確認buildを作成して利用者へ渡す。
