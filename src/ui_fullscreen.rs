@@ -6898,6 +6898,35 @@ struct DetachedImageWindowEventBatch {
 }
 
 #[cfg(windows)]
+fn clear_passive_detached_activation_holds<'a>(holds: impl IntoIterator<Item = &'a mut bool>) {
+    for hold in holds {
+        *hold = false;
+    }
+}
+
+#[cfg(windows)]
+fn filter_sidecar_restore_target_from_passive_events(
+    batch: &mut DetachedImageWindowEventBatch,
+    target_window_id: u64,
+) -> Vec<u64> {
+    let mut discarded_right_drag_ids = Vec::new();
+    batch.right_drag_events.retain(|(id, _)| {
+        if *id == target_window_id {
+            discarded_right_drag_ids.push(*id);
+            false
+        } else {
+            true
+        }
+    });
+    batch.close_ids.retain(|id| *id != target_window_id);
+    batch.activate_ids.retain(|id| *id != target_window_id);
+    batch
+        .activation_armed_updates
+        .retain(|(id, _)| *id != target_window_id);
+    discarded_right_drag_ids
+}
+
+#[cfg(windows)]
 fn parked_live_egui_right_drag_event_kind(
     egui_owns_right_drag: bool,
     right_drag_live: bool,
@@ -17827,6 +17856,21 @@ impl App {
         mut batch: DetachedImageWindowEventBatch,
         defer_activations: bool,
     ) {
+        if let Some(target_window_id) = self.sidecar_restore_target_window_id() {
+            // Only the restore target owns the modal. Sibling passive/native windows keep their
+            // ordinary input path, while target geometry/focus bookkeeping remains lifecycle data.
+            clear_passive_detached_activation_holds(
+                self.detached_image_windows
+                    .iter_mut()
+                    .filter(|window| window.id == target_window_id)
+                    .map(|window| &mut window.activation_armed),
+            );
+            for id in
+                filter_sidecar_restore_target_from_passive_events(&mut batch, target_window_id)
+            {
+                self.discard_detached_right_drag_command(id, "sidecar_restore_modal");
+            }
+        }
         batch
             .right_drag_events
             .sort_by_key(|(_, event)| event.sequence);
@@ -18106,8 +18150,11 @@ impl App {
         }
         let mut render_batch = DetachedImageWindowEventBatch::default();
         let mut unconfirmed_deferred_registered = false;
-
         for window in &deferred_windows {
+            let sidecar_restore_detail = self
+                .sidecar_restore_blocks_window(window.id)
+                .then(|| self.sidecar_restore.as_ref().map(|state| state.label()))
+                .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             if !self.deferred_detached_window_registration_allowed(
@@ -18152,6 +18199,9 @@ impl App {
             let shared = self.deferred_detached_image_window_shared(view);
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
+                if sidecar_restore_detail.is_some() {
+                    App::consume_sidecar_restore_viewport_input(vp_ctx);
+                }
                 let Some(view) = shared.view() else {
                     return;
                 };
@@ -18190,8 +18240,12 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
-                let right_drag = shared.capture_right_drag_event(vp_ctx, focused);
+                let viewport_close_requested = sidecar_restore_detail.is_none()
+                    && vp_ctx.input(|i| i.viewport().close_requested());
+                let right_drag = sidecar_restore_detail
+                    .is_none()
+                    .then(|| shared.capture_right_drag_event(vp_ctx, focused))
+                    .flatten();
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(view.margin_color))
@@ -18234,6 +18288,12 @@ impl App {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
                     });
+                if sidecar_restore_detail.is_some() {
+                    bar_close_requested = false;
+                }
+                if let Some(detail) = sidecar_restore_detail {
+                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(vp_ctx, detail);
+                }
                 // Passive deferred still windows carry only pointer samples back to the root;
                 // they contain no text input, so IME state remains owned by the root App pass.
                 shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Frame {
@@ -18260,6 +18320,10 @@ impl App {
         }
 
         for window in parked_live_windows {
+            let sidecar_restore_detail = self
+                .sidecar_restore_blocks_window(window.id)
+                .then(|| self.sidecar_restore.as_ref().map(|state| state.label()))
+                .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
@@ -18327,6 +18391,9 @@ impl App {
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+                if sidecar_restore_detail.is_some() {
+                    Self::consume_sidecar_restore_viewport_input(vp_ctx);
+                }
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
                     vp_ctx.input(|i| {
                         let vp = i.viewport();
@@ -18359,7 +18426,9 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                if vp_ctx.input(|i| i.viewport().close_requested()) {
+                if sidecar_restore_detail.is_none()
+                    && vp_ctx.input(|i| i.viewport().close_requested())
+                {
                     viewport_close_requested = true;
                 }
                 (
@@ -18373,6 +18442,9 @@ impl App {
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
+                    if sidecar_restore_detail.is_some() {
+                        return (false, false, false, false, false, None, false, false, false);
+                    }
                     let primary_pressed = i.pointer.primary_pressed();
                     let primary_released = i.pointer.primary_released();
                     let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
@@ -18439,7 +18511,13 @@ impl App {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
                     });
+                if sidecar_restore_detail.is_some() {
+                    bar_close_requested = false;
+                }
                 self.show_remote_session_dialog(vp_ctx);
+                if let Some(detail) = sidecar_restore_detail {
+                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(vp_ctx, detail);
+                }
             });
             #[cfg(windows)]
             self.register_detached_window_hwnd_after_show(
@@ -20185,11 +20263,15 @@ impl App {
                 )
             });
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+                if self.sidecar_restore_blocks_projected_context() {
+                    Self::consume_sidecar_restore_viewport_input(ctx);
+                }
                 // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
                 // ユーザーが待機 canvas に閉じ込められないよう、Esc とウィンドウ
                 // クローズ要求を受け付けて保留中の遷移をキャンセルする。
-                if ctx.input(|i| i.viewport().close_requested())
-                    || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                if !self.sidecar_restore_blocks_projected_context()
+                    && (ctx.input(|i| i.viewport().close_requested())
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape)))
                 {
                     cancel = true;
                 }
@@ -20203,6 +20285,7 @@ impl App {
                             navigation_chrome,
                         );
                     });
+                self.show_sidecar_restore_dialog(ctx);
             });
             #[cfg(windows)]
             if let Some(window_id) = keep_alive_window_id {
@@ -20494,6 +20577,9 @@ impl App {
         let show_t0 = std::time::Instant::now();
         let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
             let inner_t0 = std::time::Instant::now();
+            if self.sidecar_restore_blocks_projected_context() {
+                Self::consume_sidecar_restore_viewport_input(vp_ctx);
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(canvas_color))
                 .show(vp_ctx, |ui| {
@@ -20540,6 +20626,7 @@ impl App {
                         self.similar_panel.retain_book_query();
                     }
                 });
+            self.show_sidecar_restore_dialog(vp_ctx);
             inner_t0.elapsed().as_secs_f64() * 1000.0
         });
         let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
@@ -20620,8 +20707,10 @@ impl App {
                 );
             }
         }
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        let escape_pressed = !self.ime_input_active(ctx)
+        let close_requested = !self.sidecar_restore_blocks_projected_context()
+            && ctx.input(|i| i.viewport().close_requested());
+        let escape_pressed = !self.sidecar_restore_blocks_projected_context()
+            && !self.ime_input_active(ctx)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let cancel = close_requested || escape_pressed;
 
@@ -20630,6 +20719,7 @@ impl App {
             .show(ctx, |ui| {
                 self.draw_fs_navigation_gap_surface(ui, ctx, holdover.as_ref(), navigation_chrome);
             });
+        self.show_sidecar_restore_dialog(ctx);
 
         if cancel {
             // 保留中の「列挙後にフルスクリーン復帰」意図を破棄してグリッドへ戻す。
@@ -21168,6 +21258,9 @@ impl App {
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
+                if self.sidecar_restore_blocks_projected_context() {
+                    Self::consume_sidecar_restore_viewport_input(ctx);
+                }
                 #[cfg(all(windows, feature = "test-script"))]
                 if !embedded {
                     let directions = resolve_still_seek_directions(
@@ -21423,7 +21516,10 @@ impl App {
                     });
                 }
 
-                if !embedded && ctx.input(|i| i.viewport().close_requested()) {
+                if !self.sidecar_restore_blocks_projected_context()
+                    && !embedded
+                    && ctx.input(|i| i.viewport().close_requested())
+                {
                     // embedded のときの close_requested は main ウィンドウの × =
                     // アプリ終了要求。フルスクリーン解除ではないので拾わない。
                     #[cfg(windows)]
@@ -23195,6 +23291,7 @@ impl App {
                 if !embedded {
                     self.show_remote_session_dialog(ctx);
                 }
+                self.show_sidecar_restore_dialog(ctx);
 
                 // 外部ツールへ渡すファイルの準備進捗も、押された viewport 上に出す。
                 //
@@ -25214,6 +25311,9 @@ impl App {
         let expected_physical_rect = self.fullscreen_backdrop_physical_rect();
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+            if self.sidecar_restore_blocks_projected_context() {
+                Self::consume_sidecar_restore_viewport_input(ctx);
+            }
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
@@ -25256,15 +25356,17 @@ impl App {
             // この呼び出し前後でスキャン状態の変化 (= ESC で cancel された) を検出して
             // close 判定をスキップする。
             let normalize_active_before = self.normalize_state.is_some();
-            if !self.ime_input_active(ctx) {
+            if !self.sidecar_restore_blocks_projected_context() && !self.ime_input_active(ctx) {
                 for key in native_video_key_events_from_ctx(ctx) {
                     self.handle_native_video_key_event(ctx, fs_idx, key);
                 }
             }
             let normalize_cancelled_this_frame =
                 normalize_active_before && self.normalize_state.is_none();
-            let close_requested = ctx.input(|i| i.viewport().close_requested());
-            let escape_pressed = !self.ime_input_active(ctx)
+            let close_requested = !self.sidecar_restore_blocks_projected_context()
+                && ctx.input(|i| i.viewport().close_requested());
+            let escape_pressed = !self.sidecar_restore_blocks_projected_context()
+                && !self.ime_input_active(ctx)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if (close_requested || escape_pressed) && !normalize_cancelled_this_frame {
                 close_fs = true;
@@ -25272,6 +25374,7 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ctx, |_ui| {});
+            self.show_sidecar_restore_dialog(ctx);
         });
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_none()
             && let (Some(main_hwnd), Some(expected)) = (self.main_hwnd, expected_physical_rect)
@@ -68431,5 +68534,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows[0].contains("高速汎用 2560×1920"), "{}", rows[0]);
         assert!(rows[1].contains("漫画 3200×2400"), "{}", rows[1]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_restore_clears_passive_detached_activation_holds() {
+        let mut holds = [true, false, true];
+
+        clear_passive_detached_activation_holds(holds.iter_mut());
+
+        assert_eq!(holds, [false, false, false]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_restore_filters_only_the_target_passive_window_events() {
+        use crate::app::{DetachedRightDragEvent, DetachedRightDragEventKind};
+
+        fn drag(sequence: u64) -> DetachedRightDragEvent {
+            DetachedRightDragEvent {
+                sequence,
+                kind: DetachedRightDragEventKind::Input {
+                    secondary_pressed: true,
+                    secondary_down: true,
+                    secondary_released: false,
+                    pointer_pos: Some(egui::pos2(1.0, 2.0)),
+                },
+            }
+        }
+
+        let mut batch = DetachedImageWindowEventBatch {
+            close_ids: vec![701, 702],
+            activate_ids: vec![701, 702],
+            activation_armed_updates: vec![(701, true), (702, true)],
+            right_drag_events: vec![(701, drag(1)), (702, drag(2))],
+            ..Default::default()
+        };
+
+        let discarded = filter_sidecar_restore_target_from_passive_events(&mut batch, 701);
+
+        assert_eq!(discarded, vec![701]);
+        assert_eq!(batch.close_ids, vec![702]);
+        assert_eq!(batch.activate_ids, vec![702]);
+        assert_eq!(batch.activation_armed_updates, vec![(702, true)]);
+        assert_eq!(batch.right_drag_events, vec![(702, drag(2))]);
     }
 }

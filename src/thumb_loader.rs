@@ -215,15 +215,40 @@ pub enum ThumbLoadOrigin {
     /// 編集 preview、drive-list、再帰 pin 伝播など、WebP 自体を完成ソースとして扱う画像。
     /// `from_cache()` は true を返すが、idle quality-upgrade へ再投入しない。
     FinalCache,
+    /// 永続 edit-preview cache から読んだ完成画像。`epoch` は DB row read の直前に
+    /// snapshot し、whole-cache clear 後に遅着した結果を UI 側で破棄する。
+    EditPreviewCache { epoch: u64 },
 }
 
 impl ThumbLoadOrigin {
     pub fn from_cache(self) -> bool {
-        matches!(self, Self::UpgradeableCache | Self::FinalCache)
+        matches!(
+            self,
+            Self::UpgradeableCache | Self::FinalCache | Self::EditPreviewCache { .. }
+        )
     }
 
     pub fn blocks_idle_upgrade(self) -> bool {
-        matches!(self, Self::SourceIntrinsic | Self::FinalCache)
+        matches!(
+            self,
+            Self::SourceIntrinsic | Self::FinalCache | Self::EditPreviewCache { .. }
+        )
+    }
+
+    /// Whether a thumbnail result may still be installed after an edit-preview whole-cache clear.
+    /// Other origins are independent of that cache generation.
+    pub fn matches_edit_preview_epoch(self, current: Option<u64>) -> bool {
+        match self {
+            Self::EditPreviewCache { epoch } => current == Some(epoch),
+            _ => true,
+        }
+    }
+
+    pub fn edit_preview_epoch(self) -> Option<u64> {
+        match self {
+            Self::EditPreviewCache { epoch } => Some(epoch),
+            _ => None,
+        }
     }
 }
 
@@ -1077,7 +1102,11 @@ pub fn process_load_request(
     let edit_preview = if req.source_policy.bypasses_cache() {
         None
     } else if let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db) {
-        if req.edit_preview_validate_container {
+        // Sample immediately before the DB lookup. `EditPreviewCacheDb::clear` increments this
+        // epoch while holding the same connection mutex after DELETE succeeds, so a successful
+        // pre-clear read is always distinguishable when its message reaches the UI later.
+        let epoch = db.epoch();
+        let preview = if req.edit_preview_validate_container {
             std::fs::metadata(&req.path).ok().and_then(|meta| {
                 db.load_for_container(
                     item_key,
@@ -1088,11 +1117,12 @@ pub fn process_load_request(
             })
         } else {
             db.load(item_key, req.mtime, req.file_size, display_px)
-        }
+        };
+        preview.map(|preview| (preview, epoch))
     } else {
         None
     };
-    if let Some(preview) = edit_preview {
+    if let Some((preview, epoch)) = edit_preview {
         let image = if let Some(params) = pinned_page_adjustment.as_ref() {
             let adjusted =
                 crate::adjustment::apply_adjustments_fast(&preview.adjustment_base, params);
@@ -1106,7 +1136,7 @@ pub fn process_load_request(
         let _ = tx.send(ThumbMsg {
             idx: req.idx,
             image: Some(image),
-            origin: ThumbLoadOrigin::FinalCache,
+            origin: ThumbLoadOrigin::EditPreviewCache { epoch },
             from_edit_preview: true,
             edit_preview_adjustment: Some(ThumbEditPreviewAdjustment {
                 base: preview.adjustment_base,
@@ -3295,6 +3325,17 @@ mod tests {
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn edit_preview_origin_is_cache_final_and_requires_the_exact_epoch() {
+        let origin = ThumbLoadOrigin::EditPreviewCache { epoch: 7 };
+        assert!(origin.from_cache());
+        assert!(origin.blocks_idle_upgrade());
+        assert!(origin.matches_edit_preview_epoch(Some(7)));
+        assert!(!origin.matches_edit_preview_epoch(Some(8)));
+        assert!(!origin.matches_edit_preview_epoch(None));
+        assert!(ThumbLoadOrigin::FinalCache.matches_edit_preview_epoch(None));
+    }
 
     #[test]
     fn foreground_thumbnail_requests_do_not_need_a_widened_worker_bbox() {

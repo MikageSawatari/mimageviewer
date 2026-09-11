@@ -2404,6 +2404,21 @@ impl App {
             saw_input_event,
             session_ended,
         } = batch;
+        // Sidecar restore is an App-global semantic-input barrier. End the physical session and
+        // resolve any live picker without replaying its current row: a picker preview may already
+        // have published a rating write, but calling the ordinary commit path here would submit
+        // that value again (and would apply commit-only rows after the modal began).
+        if self.sidecar_restore_active() {
+            self.finish_gamepad_input_for_sidecar_restore(ctx);
+            self.reset_gamepad_continuous_steps(now);
+            self.gamepad_state.suppress_pending_actions();
+            return GamepadDispatchOutcome {
+                nav: None,
+                dispatched: false,
+                dispatch_allowed: false,
+                saw_input_event,
+            };
+        }
         // **リングの確定は所有 context で。** ここは通常の配送と同じ場所で、別ウィンドウが
         // 活性なら mount 済み。評価行はプレビューの時点で DB へ書いており、開いたときの
         // before から Undo を組むのは確定処理だけなので、捨てると書いた評価が取り消せなく
@@ -2445,6 +2460,31 @@ impl App {
         }
     }
 
+    /// End App-owned gamepad semantics at the sidecar-restore modal boundary.
+    ///
+    /// Rating rows are live previews: successful writes before the modal are authoritative and
+    /// need an Undo record, but must not be written again. Other picker rows are either already
+    /// previewed or commit-only; dropping the picker keeps the former and does not synthesize the
+    /// latter. All physical holds and overlays become terminal, so nothing can replay on resume.
+    pub(crate) fn finish_gamepad_input_for_sidecar_restore(&mut self, ctx: &egui::Context) {
+        let picker = self.ring_picker.take();
+        if let Some(picker) = picker {
+            let (item_changes, container_record) =
+                self.published_live_picker_rating_changes(&picker);
+            self.commit_live_picker_undo(item_changes, container_record);
+            let owner = picker.owner;
+            let context = picker.context;
+            let _ = self.with_owner_viewer_context(owner, |app| {
+                if context == RingShortcutContext::VideoFullscreen {
+                    app.clear_native_video_picker_overlay(ctx);
+                }
+            });
+        }
+        self.release_gamepad_input_holds(ctx);
+        self.gamepad_state.clear();
+        self.gamepad_state.require_directional_neutral();
+    }
+
     /// frame 全体の後始末。activity gate と repaint は App-global なので、配り先に
     /// かかわらずここで 1 回だけ行う。
     pub(crate) fn finish_gamepad_frame(
@@ -2461,7 +2501,7 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
-        if self.remote_session_blocks_local_control() {
+        if self.sidecar_restore_active() || self.remote_session_blocks_local_control() {
             return false;
         }
         // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に
@@ -4631,32 +4671,27 @@ impl App {
         Vec<RatingChange>,
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
-        let mut item_changes = Vec::new();
-        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            let (touched, error) =
+        let item_rating_dirty = picker.dirty_rows.contains(&RingPickerRowId::ItemRating);
+        let mut touched = Vec::new();
+        if item_rating_dirty {
+            let (written, error) =
                 self.apply_picker_item_rating_targets(picker, picker.item_rating);
+            touched = written;
             if let Some(error) = error {
                 self.report_rating_write_error(&error);
             }
+        }
 
-            for target in &picker.original.item_rating_records {
-                let actual = self
-                    .rating_session_writes
-                    .get(&target.path_key)
-                    .filter(|write| write.generation > target.session_generation)
-                    .map(|write| write.stars)
-                    .unwrap_or(target.before);
-                if target.before != actual {
-                    item_changes.push(RatingChange {
-                        path_key: target.path_key.clone(),
-                        source_path: target.source_path.clone(),
-                        meta: target.meta.clone(),
-                        xmp_target: target.xmp_target.clone(),
-                        before: target.before,
-                        after: actual,
-                    });
-                }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+        {
+            if let Err(error) = self.preview_ring_container_rating(picker) {
+                self.report_rating_write_error(&error);
             }
+        }
+        let (item_changes, container_record) = self.published_live_picker_rating_changes(picker);
+        if item_rating_dirty {
             if self.global_search.active {
                 self.refresh_global_search_hit_stars(&touched);
             }
@@ -4675,29 +4710,66 @@ impl App {
                 self.checked.clear();
             }
         }
+        (item_changes, container_record)
+    }
 
-        let mut container_record = None;
-        if picker
+    /// Describe only rating writes already published by live picker previews.
+    ///
+    /// The App-global publication ledger advances strictly after SQLite success. Reading it is
+    /// sufficient both when ordinary commit has just re-applied the final value and when a modal
+    /// preempts the picker and must avoid every new DB/sidecar/XMP submission.
+    fn published_live_picker_rating_changes(
+        &self,
+        picker: &RingPickerState,
+    ) -> (
+        Vec<RatingChange>,
+        Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+    ) {
+        let item_changes = if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            picker
+                .original
+                .item_rating_records
+                .iter()
+                .filter_map(|target| {
+                    let actual = self
+                        .rating_session_writes
+                        .get(&target.path_key)
+                        .filter(|write| write.generation > target.session_generation)
+                        .map(|write| write.stars)
+                        .unwrap_or(target.before);
+                    (target.before != actual).then(|| RatingChange {
+                        path_key: target.path_key.clone(),
+                        source_path: target.source_path.clone(),
+                        meta: target.meta.clone(),
+                        xmp_target: target.xmp_target.clone(),
+                        before: target.before,
+                        after: actual,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let container_record = if picker
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
         {
-            if let Err(error) = self.preview_ring_container_rating(picker) {
-                self.report_rating_write_error(&error);
-            }
-            // **DB を正とする。** 表示キャッシュは「いまその container を見ている投影」しか
-            // 持たないので、リングを開いた窓が前面でなくなっていると読めない (レビュー Q01)。
-            let actual = picker
+            picker
                 .original
                 .container_rating_target
                 .as_ref()
-                .and_then(|target| self.rating_db.as_ref().map(|db| db.get(&target.path_key)))
-                .unwrap_or(picker.original.container_rating);
-            if picker.original.container_rating != actual
-                && let Some(target) = picker.original.container_rating_target.clone()
-            {
-                container_record = Some((target, picker.original.container_rating, actual));
-            }
-        }
+                .and_then(|target| {
+                    let actual = self
+                        .rating_session_writes
+                        .get(&target.path_key)
+                        .map(|write| write.stars)
+                        .unwrap_or(picker.original.container_rating);
+                    (picker.original.container_rating != actual)
+                        .then(|| (target.clone(), picker.original.container_rating, actual))
+                })
+        } else {
+            None
+        };
         (item_changes, container_record)
     }
 
@@ -7959,15 +8031,15 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis,
-        cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
-        gamepad_text_input_active, initial_gamepad_favorite_picker_tab,
-        mouse_button_action_blocked_by_edit_mode, mouse_flick_direction, picker_rows_for_context,
-        post_filter_group_index, post_filter_item_index_in_group, rating_label,
-        right_drag_press_suppresses_context_menu, ring_direction_from_dpad_buttons,
-        ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
-        ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
-        update_mouse_middle_click_state, video_seek_ring_action,
+        GamepadFrameBatch, Instant, MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir,
+        RingPickerRatingTarget, RingPickerRowId, continuous_reading_stick_axis, cycle_rating,
+        cycle_video_playback_speed, gamepad_grid_nav_target_pos, gamepad_text_input_active,
+        initial_gamepad_favorite_picker_tab, mouse_button_action_blocked_by_edit_mode,
+        mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
+        post_filter_item_index_in_group, rating_label, right_drag_press_suppresses_context_menu,
+        ring_direction_from_dpad_buttons, ring_direction_from_stick,
+        ring_direction_from_stick_with_hysteresis, ring_shortcut_context_for_surface_state,
+        set_gamepad_favorite_picker_tab, update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
 
@@ -8063,6 +8135,74 @@ mod tests {
             "閉じる手段が消えた overlay を残さない"
         );
     }
+
+    #[test]
+    fn sidecar_restore_ends_gamepad_picker_without_replaying_its_live_write() {
+        use crate::gamepad::{PadAxis, PadEvent};
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let key = "C:/fixture/page.jpg".to_string();
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.dirty_rows.push(RingPickerRowId::ItemRating);
+        picker
+            .original
+            .item_rating_records
+            .push(RingPickerRatingTarget {
+                path_key: key.clone(),
+                source_path: std::path::PathBuf::from(&key),
+                meta: None,
+                xmp_target: None,
+                before: 1,
+                session_generation: 0,
+            });
+        picker.item_rating = 4;
+        app.record_rating_session_write(key, 4, true);
+        let published_generation = app.rating_session_write_generation;
+        app.ring_picker = Some(picker);
+        app.settings.gamepad_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+        let _ = app.sample_gamepad_input(&ctx);
+        app.activate_sidecar_restore_modal_for_test(std::path::PathBuf::from("sidecar-fixture"));
+
+        let outcome = app.dispatch_gamepad_batch(
+            &ctx,
+            GamepadFrameBatch {
+                now: Instant::now(),
+                actions: Vec::new(),
+                saw_input_event: true,
+                session_ended: true,
+            },
+        );
+
+        assert!(!outcome.dispatch_allowed);
+        assert!(!outcome.dispatched);
+        assert!(app.ring_picker.is_none(), "picker ownership must terminate");
+        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad_state.axis(PadAxis::LeftX), 0.0);
+        assert!(!app.gamepad_state.repeat_active());
+        assert!(
+            app.gamepad_state.directional_neutral_required(),
+            "resume must start behind a fresh-neutral re-arm gate"
+        );
+        assert_eq!(
+            app.rating_session_write_generation, published_generation,
+            "modal termination must not submit the final rating again"
+        );
+        assert!(
+            app.meta_undo.can_undo(),
+            "the already-published live preview remains undoable"
+        );
+
+        app.sidecar_restore = None;
+        let resumed = app.dispatch_gamepad_batch(&ctx, GamepadFrameBatch::empty_for_test());
+        assert!(resumed.nav.is_none());
+        assert!(!resumed.dispatched, "no pre-modal action may replay");
+    }
+
     use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};
     use crate::ring_shortcut::{

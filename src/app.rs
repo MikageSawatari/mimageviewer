@@ -174,6 +174,7 @@ pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
+mod sidecar_restore;
 pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
@@ -4775,6 +4776,124 @@ struct ThumbnailKeepProjection {
     pages: HashSet<usize>,
     bounded_range: (usize, usize),
     interactive_pages: HashSet<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ThumbnailRequests {
+    entries: std::collections::HashMap<usize, ThumbnailRequestOwner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThumbnailRequestOwner {
+    idle_upgrade: bool,
+    edit_preview_epoch: Option<u64>,
+}
+
+impl ThumbnailRequests {
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub(crate) fn contains_key(&self, idx: &usize) -> bool {
+        self.entries.contains_key(idx)
+    }
+
+    pub(crate) fn get(&self, idx: &usize) -> Option<&bool> {
+        self.entries.get(idx).map(|owner| &owner.idle_upgrade)
+    }
+
+    pub(crate) fn insert(&mut self, idx: usize, idle_upgrade: bool) -> Option<bool> {
+        self.insert_with_edit_preview_epoch(idx, idle_upgrade, None)
+    }
+
+    fn insert_with_edit_preview_epoch(
+        &mut self,
+        idx: usize,
+        idle_upgrade: bool,
+        edit_preview_epoch: Option<u64>,
+    ) -> Option<bool> {
+        self.entries
+            .insert(
+                idx,
+                ThumbnailRequestOwner {
+                    idle_upgrade,
+                    edit_preview_epoch,
+                },
+            )
+            .map(|owner| owner.idle_upgrade)
+    }
+
+    fn owner_matches_edit_preview_epoch(&self, idx: usize, epoch: u64) -> bool {
+        self.entries
+            .get(&idx)
+            .is_some_and(|owner| owner.edit_preview_epoch == Some(epoch))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &usize> {
+        self.entries.keys()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&usize, &bool)> {
+        self.entries
+            .iter()
+            .map(|(idx, owner)| (idx, &owner.idle_upgrade))
+    }
+
+    pub(crate) fn remove(&mut self, idx: &usize) -> Option<bool> {
+        self.entries.remove(idx).map(|owner| owner.idle_upgrade)
+    }
+}
+
+impl Extend<(usize, bool)> for ThumbnailRequests {
+    fn extend<T: IntoIterator<Item = (usize, bool)>>(&mut self, iter: T) {
+        for (idx, idle_upgrade) in iter {
+            self.insert(idx, idle_upgrade);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a ThumbnailRequests {
+    type Item = (&'a usize, &'a bool);
+    type IntoIter = std::iter::Map<
+        std::collections::hash_map::Iter<'a, usize, ThumbnailRequestOwner>,
+        fn((&'a usize, &'a ThumbnailRequestOwner)) -> (&'a usize, &'a bool),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        fn project<'a>(
+            (idx, owner): (&'a usize, &'a ThumbnailRequestOwner),
+        ) -> (&'a usize, &'a bool) {
+            (idx, &owner.idle_upgrade)
+        }
+        self.entries.iter().map(project)
+    }
+}
+
+fn cleanup_stale_edit_preview_request(
+    requested: &mut ThumbnailRequests,
+    pending_finalize: &mut HashSet<usize>,
+    thumbnails: &mut [ThumbnailState],
+    idx: usize,
+    result_epoch: u64,
+) {
+    if !requested.owner_matches_edit_preview_epoch(idx, result_epoch) {
+        return;
+    }
+    requested.remove(&idx);
+    pending_finalize.remove(&idx);
+    if let Some(state) = thumbnails.get_mut(idx)
+        && !matches!(state, ThumbnailState::Loaded { .. })
+    {
+        *state = ThumbnailState::Evicted;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -11763,7 +11882,7 @@ pub struct App {
     pub(crate) heavy_io_queue: Option<Arc<NotifyQueue>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
-    pub(crate) requested: std::collections::HashMap<usize, bool>,
+    pub(crate) requested: ThumbnailRequests,
     /// 現在の Loaded サムネイルについて、最終的な `LoadRequest` がキャッシュを迂回
     /// できないと確認済みの idx。動画ピン WebP など完成済み派生物を、repaint ごとに
     /// `make_load_request` で再解決しないための per-context memo。
@@ -13595,6 +13714,9 @@ pub struct App {
     pub(crate) show_subfolder_expansion_dialog: bool,
     /// 直近でログに書いた「入力を止めているダイアログ」。遷移のときだけ記録するための控え。
     pub(crate) modal_block_reason_logged: Option<&'static str>,
+    /// 初回 sidecar 復旧の全ライフサイクルと load continuation を所有する。
+    /// `Some` 自体が全入力を止める共通 modal の根拠になる。
+    pub(crate) sidecar_restore: Option<sidecar_restore::SidecarRestoreState>,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
     /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
@@ -15683,7 +15805,7 @@ impl App {
             image_metas: Vec::new(),
             reload_queue: None,
             heavy_io_queue: None,
-            requested: std::collections::HashMap::new(),
+            requested: ThumbnailRequests::default(),
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
@@ -16352,6 +16474,7 @@ impl App {
             subfolder_expansion_removed_paths: std::collections::HashSet::new(),
             show_subfolder_expansion_dialog: false,
             modal_block_reason_logged: None,
+            sidecar_restore: None,
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
             subfolder_expansion_confirm_pending: None,
@@ -18012,6 +18135,7 @@ impl App {
             };
         }
         first![
+            self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
             self.show_stats_dialog => "stats",
@@ -19999,6 +20123,11 @@ impl App {
 
     /// 走査結果を、**要求を出した viewer context** へ適用する。
     pub(crate) fn poll_external_rescan(&mut self, ctx: &egui::Context) {
+        // A rescan accepted before sidecar restore keeps its exact context/generation owner until
+        // the modal terminal. Applying it now can replace the item generation being recovered.
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.external_rescan_pending.as_ref() else {
             return;
         };
@@ -21971,6 +22100,11 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn poll_vst3_startup_load(&mut self, ctx: &egui::Context) {
+        // Completion may start fullscreen materialization directly. Preserve the accepted owner
+        // until sidecar recovery has installed the first-display state.
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.vst3_startup_load.as_ref() else {
             return;
         };
@@ -22012,6 +22146,11 @@ impl App {
     }
 
     pub(crate) fn poll_play_test(&mut self, ctx: &egui::Context) {
+        // The automated playback owner can load/inject an item without semantic UI input. Hold it
+        // across sidecar recovery just like the normal accepted async navigation producers.
+        if self.sidecar_restore_active() {
+            return;
+        }
         if self.play_test.as_ref().is_none_or(|s| s.close_sent) {
             return;
         }
@@ -22965,6 +23104,9 @@ impl App {
     }
 
     pub(crate) fn poll_tag_view(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.tag_view_pending.as_ref() else {
             return;
         };
@@ -23303,6 +23445,9 @@ impl App {
 
     /// お気に入り検索の結果をポーリングする。
     pub(crate) fn poll_favsearch(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.favsearch_pending.as_ref() else {
             return;
         };
@@ -23704,6 +23849,9 @@ impl App {
     }
 
     pub(crate) fn poll_rating_view(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.rating_view_pending.as_ref() else {
             return;
         };
@@ -24197,6 +24345,9 @@ impl App {
     /// `zip_enumerate_pending` の結果を毎フレーム polling する。
     /// 完了時に group/sort + items 構築を行い `start_loading_items` に流す。
     pub(crate) fn poll_zip_enumerate(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.zip_enumerate_pending.as_ref() else {
             return;
         };
@@ -25260,6 +25411,9 @@ impl App {
     /// PDF ページ列挙の非同期応答をポーリングする。
     /// 毎フレーム `update()` から呼び出す。
     pub(crate) fn poll_pdf_enumerate(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some((ref pdf_path, _, ref handle)) = self.pdf_enumerate_pending else {
             return;
         };
@@ -25979,6 +26133,16 @@ impl App {
         folder_signature: Option<u64>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
     ) {
+        // An earlier accepted load owns the sole restore continuation.  Results from sibling
+        // folder/PDF/ZIP workers that were already in flight must not replace its generation and
+        // then bypass recovery through the ordinary first-display tail.
+        if self.sidecar_restore_active() {
+            crate::logger::log(format!(
+                "sidecar restore discarded concurrent load result path={}",
+                source_path.display()
+            ));
+            return;
+        }
         let detached_physical = self.navigation_scope.is_detached_physical();
         let preserve_smart_folder_session = !detached_physical
             && !smart_folder::is_smart_folder_synthetic_path(&source_path)
@@ -26125,7 +26289,12 @@ impl App {
         // フォルダ切替前に dirty なサイドカーをディスクに書き出す。メモリ上の表現は
         // 破棄して再読み込みに任せる (長時間稼働時のメモリリーク防止)。
         let sidecar_t0 = std::time::Instant::now();
-        if !detached_physical {
+        let sidecar_restore_candidate = prepared_subfolder
+            .as_ref()
+            .is_none_or(|metadata| metadata.aggregate.is_none())
+            && !is_synthetic_view_path(&source_path)
+            && (self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled);
+        if !detached_physical && !sidecar_restore_candidate {
             self.flush_all_sidecars();
             self.sidecars.clear();
         }
@@ -26210,11 +26379,12 @@ impl App {
         }
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
-        self.current_folder_last_mtime = source_path
-            .metadata()
-            .ok()
-            .filter(|m| m.is_dir())
-            .and_then(|m| m.modified().ok());
+        let source_metadata = source_path.metadata().ok();
+        let source_is_directory = source_metadata.as_ref().is_some_and(|meta| meta.is_dir());
+        self.current_folder_last_mtime = source_metadata
+            .as_ref()
+            .filter(|meta| meta.is_dir())
+            .and_then(|meta| meta.modified().ok());
         // mtime が None の経路 (ZIP / PDF / 検索結果) ではシグネチャも持たない:
         // フォーカス復帰の差分判定は `current_folder_last_mtime` の有無でゲートされるため
         // 副次的にシグネチャ比較も無効化される。
@@ -26513,24 +26683,48 @@ impl App {
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
 
-        // ── サイドカー → 中央 DB のインポート ──
-        // フォルダ丸ごと移動された場合など、中央 DB に無いエントリがサイドカーにあれば
-        // 取り込む。DB にあるエントリは authoritative なので上書きしない。
-        // 下の `db.load_page_params` はインポート後に走るので、補填されたエントリも拾える。
-        let sidecar_import_t0 = std::time::Instant::now();
-        if !has_prepared_aggregate
-            && (self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled)
+        // The old synchronous import stopped the UI here. Move the exact first-display tail into
+        // the App-global restore owner before returning to the event loop.
+        let continuation = sidecar_restore::SidecarLoadContinuation {
+            source_path,
+            source_is_directory,
+            prepared_subfolder,
+            prepared_aggregate,
+            catalog_existing_keys,
+            video_items,
+            sli_seq,
+            sli_t0,
+            items_len,
+            detached_physical,
+            tx,
+            cancel,
+            restore_started_at: std::time::Instant::now(),
+        };
+        if let Err(continuation) = self.begin_sidecar_restore(continuation, has_prepared_aggregate)
         {
-            let sidecar_folder = if source_path.is_dir() {
-                source_path.clone()
-            } else {
-                source_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| source_path.clone())
-            };
-            self.import_sidecar_to_dbs(&sidecar_folder);
+            self.resume_loading_items_after_sidecar(continuation);
         }
+    }
+
+    fn resume_loading_items_after_sidecar(
+        &mut self,
+        continuation: sidecar_restore::SidecarLoadContinuation,
+    ) {
+        let sidecar_restore::SidecarLoadContinuation {
+            source_path,
+            source_is_directory: _,
+            mut prepared_subfolder,
+            mut prepared_aggregate,
+            catalog_existing_keys,
+            video_items,
+            sli_seq,
+            sli_t0,
+            items_len,
+            detached_physical,
+            tx,
+            cancel,
+            restore_started_at,
+        } = continuation;
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -26539,11 +26733,10 @@ impl App {
                 sli_seq,
                 &[(
                     "ms",
-                    serde_json::Value::from(sidecar_import_t0.elapsed().as_secs_f64() * 1000.0),
+                    serde_json::Value::from(restore_started_at.elapsed().as_secs_f64() * 1000.0),
                 )],
             );
         }
-
         let adj_t0 = std::time::Instant::now();
         if let Some(metadata) = prepared_aggregate.as_mut() {
             self.adjustment_page_params = std::mem::take(&mut metadata.adjustment_page_params);
@@ -27004,7 +27197,6 @@ impl App {
             self.maybe_start_content_identity_detection();
         }
     }
-
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
             // Exact seek indices belong to the items identity, not the current page.
@@ -28723,6 +28915,9 @@ impl App {
     /// グリッドモードで 📌 を押しても次の fullscreen 開閉までグリッドが古いまま
     /// になる (Codex Phase D P2 指摘)。
     pub(crate) fn consume_folder_thumb_pin_dirty(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         if std::mem::take(&mut self.folder_thumb_pin_dirty) {
             // ネスト ZIP ツリー閲覧中は現在の階層を保ったまま再 materialize する。
             // load_folder(zip_path) で開き直すと ZIP のルートに飛んでしまう
@@ -28749,6 +28944,9 @@ impl App {
     /// フォルダを次に開く load_folder が video_pins.db から WebP を snapshot し直す
     /// (`start_loading_items` の pin_blobs) ので反映漏れにはならない。
     pub(crate) fn consume_video_thumb_overrides_dirty(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         if self.video_thumb_overrides_dirty_paths.is_empty() {
             return;
         }
@@ -28876,6 +29074,9 @@ impl App {
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
     pub(crate) fn consume_folder_refresh_pending(&mut self) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
         // ここを通っても pending を消費せず、後で復帰したときに再読込できるよう
         // 残しておく (Codex review CONFIRMED)。
@@ -33068,6 +33269,17 @@ impl App {
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
+        // Delete is a DB writer accepted before the sidecar modal. It must reach its ordinary
+        // terminal before the restore transaction starts, while build/open results below retain
+        // their exact owners until the modal ends. Keep the normal non-modal ordering (build then
+        // delete) because a stale build result must not reintroduce a row deleted in this frame.
+        if self.sidecar_restore_active() {
+            self.poll_bookmark_delete_pending();
+            if self.bookmark_delete_pending.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        }
         let build_result = self
             .bookmark_browser_pending
             .as_ref()
@@ -33121,6 +33333,19 @@ impl App {
             }
         }
 
+        self.poll_bookmark_delete_pending();
+
+        self.poll_bookmark_media_open(ctx);
+        self.poll_bookmark_book_open(ctx);
+        if self.bookmark_browser_pending.is_some()
+            || self.bookmark_delete_pending.is_some()
+            || self.bookmark_open_pending.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn poll_bookmark_delete_pending(&mut self) {
         let delete_result = self
             .bookmark_delete_pending
             .as_ref()
@@ -33155,15 +33380,6 @@ impl App {
                     self.show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}"))
                 }
             }
-        }
-
-        self.poll_bookmark_media_open(ctx);
-        self.poll_bookmark_book_open(ctx);
-        if self.bookmark_browser_pending.is_some()
-            || self.bookmark_delete_pending.is_some()
-            || self.bookmark_open_pending.is_some()
-        {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
@@ -33221,6 +33437,9 @@ impl App {
     }
 
     fn poll_bookmark_media_open(&mut self, _ctx: &egui::Context) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self
             .bookmark_open_pending
             .as_ref()
@@ -33319,6 +33538,9 @@ impl App {
     }
 
     fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(mut pending) = self
             .bookmark_open_pending
             .as_ref()
@@ -34811,6 +35033,35 @@ impl App {
         });
     }
 
+    fn reject_stale_edit_preview_thumbnail_result(
+        &mut self,
+        idx: usize,
+        origin: crate::thumb_loader::ThumbLoadOrigin,
+    ) -> bool {
+        let Some(result_epoch) = origin.edit_preview_epoch() else {
+            return false;
+        };
+        let current_epoch = self
+            .edit_preview_cache
+            .as_ref()
+            .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
+        if current_epoch == Some(result_epoch) {
+            return false;
+        }
+
+        // A clear can overtake a worker after it read the old preview row. Release only the
+        // request owner that sampled that same epoch. A replacement request enqueued after clear
+        // owns the new epoch and must survive this late message.
+        cleanup_stale_edit_preview_request(
+            &mut self.requested,
+            &mut self.pending_finalize,
+            &mut self.thumbnails,
+            idx,
+            result_epoch,
+        );
+        true
+    }
+
     fn poll_thumbnails(&mut self, ctx: &egui::Context, consumption: ThumbnailConsumptionPolicy) {
         // 1 フレームあたりのテクスチャ生成数を制限する。
         // load_texture は GPU テクスチャアップロードを伴い、1 枚 0.5-2 ms かかる。
@@ -34853,6 +35104,13 @@ impl App {
             // 全エンキュー経路 (通常 / idle upgrade / 動画スレッド) で現世代をスナップ
             // ショットして載せるので、不一致 = 旧経路と判定してよい。
             if msg_items_gen != self.items_generation {
+                continue;
+            }
+            // A preview cache clear can overtake a worker that already read the old DB row. The
+            // clear ACK advances the process-local DB epoch before this poll resumes; reject that
+            // late image without disturbing a newer request for the same index.
+            if self.reject_stale_edit_preview_thumbnail_result(i, origin) {
+                received += 1;
                 continue;
             }
             if i >= self.thumbnails.len() {
@@ -35455,6 +35713,12 @@ impl App {
     }
 
     fn enqueue_priority_thumbnail(&mut self, idx: usize) {
+        // The current items generation has no live thumbnail workers until the sidecar recovery
+        // continuation creates fresh queues.  Enqueuing into the cancelled previous generation
+        // would strand `requested[idx]` and prevent the first-display worker from retrying it.
+        if self.sidecar_restore_active() {
+            return;
+        }
         if self.requested.contains_key(&idx) {
             return;
         }
@@ -35525,7 +35789,12 @@ impl App {
         let Some(queue_arc) = queue else {
             return;
         };
-        self.requested.insert(idx, false);
+        let edit_preview_epoch = self
+            .edit_preview_cache
+            .as_ref()
+            .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
+        self.requested
+            .insert_with_edit_preview_epoch(idx, false, edit_preview_epoch);
         let (ref mtx, ref cvar) = *queue_arc;
         let mut q = mtx.lock().unwrap();
         q.push(req);
@@ -35543,6 +35812,13 @@ impl App {
         ctx: &egui::Context,
         frame_t0: std::time::Instant,
     ) {
+        // `start_loading_items_inner` has installed the new generation but its first-display tail
+        // intentionally waits for sidecar recovery.  The queue fields still refer to the
+        // cancelled previous worker generation in this interval, so no request/prioritization or
+        // idle-upgrade producer may touch them.
+        if self.sidecar_restore_active() {
+            return;
+        }
         // 削除進行中は prefetch / eviction 調整も一時停止する。items にはまだ削除対象の
         // path が残っており、worker が keep_range 内の idx を enqueue するとサムネ再デコードが
         // 走って「Failed」表示が出る (ゴミ箱移動済みなので File::open が失敗する)。
@@ -36028,6 +36304,10 @@ impl App {
         let regular_count = new_regular.len();
         let mut pruned_regular: usize = 0;
         let mut pruned_heavy: usize = 0;
+        let edit_preview_epoch = self
+            .edit_preview_cache
+            .as_ref()
+            .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
         {
             let (ref mtx, ref cvar) = *queue_arc;
             let mut q = mtx.lock().unwrap();
@@ -36065,7 +36345,7 @@ impl App {
             }
             let _q_before = q.len();
             for r in new_regular {
-                requested.insert(r.idx, false);
+                requested.insert_with_edit_preview_epoch(r.idx, false, edit_preview_epoch);
                 q.push(r);
             }
             drop(q);
@@ -36102,7 +36382,7 @@ impl App {
                     || interactive_thumbnail_pages.contains(&r.idx);
             }
             for r in new_heavy {
-                requested.insert(r.idx, false);
+                requested.insert_with_edit_preview_epoch(r.idx, false, edit_preview_epoch);
                 q.push(r);
             }
             drop(q);
@@ -36412,7 +36692,10 @@ impl App {
         /// 占有させないために、`last_input_at` ベースのクールダウンを追加している。
         const INPUT_IDLE_SECS: f64 = 0.5;
 
-        if !self.settings.thumb_idle_upgrade || self.items_are_drive_list {
+        if self.sidecar_restore_active()
+            || !self.settings.thumb_idle_upgrade
+            || self.items_are_drive_list
+        {
             return;
         }
 
@@ -36507,7 +36790,8 @@ impl App {
                             evaluated_display_px,
                         } => undersized && evaluated_display_px < current_display_px,
                         crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
-                        | crate::thumb_loader::ThumbLoadOrigin::FinalCache => false,
+                        | crate::thumb_loader::ThumbLoadOrigin::FinalCache
+                        | crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { .. } => false,
                     };
                     !*from_edit_preview && origin_needs_upgrade
                 }
@@ -36608,8 +36892,13 @@ impl App {
             let count = reqs.len();
             let (ref mtx, ref cvar) = **queue;
             let mut q = mtx.lock().unwrap();
+            let edit_preview_epoch = self
+                .edit_preview_cache
+                .as_ref()
+                .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
             for r in reqs {
-                self.requested.insert(r.idx, true);
+                self.requested
+                    .insert_with_edit_preview_epoch(r.idx, true, edit_preview_epoch);
                 q.push(r);
             }
             drop(q);
@@ -38187,6 +38476,11 @@ impl App {
     /// 完了してもここでは直接 load せず、通常 nav 優先順位の候補として返す。
     /// 採用された場合だけ pre-scan 付きで開くことで、UI スレッドの read_dir を省く。
     fn poll_folder_pane_open(&mut self, ctx: &egui::Context) -> Option<FolderPaneOpenReady> {
+        // Preserve the accepted scan and its caller-owned navigation tail while restore blocks
+        // semantic navigation. The normal poll consumes it after the modal terminal.
+        if self.sidecar_restore_active() {
+            return None;
+        }
         let Some(pending) = self.folder_pane_open_pending.as_ref() else {
             return None;
         };
@@ -38495,6 +38789,9 @@ impl App {
     }
 
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
+        if self.sidecar_restore_active() {
+            return None;
+        }
         let pending = self.folder_nav_pending.as_ref()?;
         match pending.rx.try_recv() {
             Ok(thread_result) => {
@@ -46866,6 +47163,14 @@ impl App {
         load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
     ) {
+        if self.defer_sidecar_restore_fullscreen(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+        ) {
+            return;
+        }
         let total_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
         let route_materialized_perf_t0 = start_fs_open_perf_span(&perf);
@@ -57510,42 +57815,18 @@ impl App {
         self.clear_current_edit_preview_materializations();
         #[cfg(windows)]
         {
-            let mounted = self
-                .mounted_viewer_context_id()
-                .expect("all-context edit-preview clear requires a mounted projection");
-            let mut processed = vec![mounted];
-            if let Some(active) = self.active_viewer_context_id()
-                && active != mounted
-            {
-                if let Err(error) = self.with_viewer_context(active, |app| {
-                    app.clear_current_edit_preview_materializations();
-                }) {
-                    crate::logger::log(format!(
-                        "edit_preview_clear_mount_failed context={active:?} error={error:?}"
-                    ));
-                }
-                processed.push(active);
-            }
-            let window_ids: Vec<u64> = self
-                .detached_image_windows
-                .iter()
-                .map(|window| window.id)
-                .collect();
-            for window_id in window_ids {
-                let Some((id, _)) = self.locate_window_context(window_id) else {
-                    continue;
-                };
-                if processed.contains(&id) {
-                    continue;
-                }
+            // `other_viewer_context_ids` enumerates every retained owner, including the AtRest
+            // main context while a detached context is mounted. Window enumeration alone misses
+            // that owner and can leave a stale preview materialized after the global DB clear.
+            for id in self.other_viewer_context_ids() {
                 if let Err(error) = self.with_viewer_context(id, |app| {
                     app.clear_current_edit_preview_materializations();
                 }) {
                     crate::logger::log(format!(
-                        "edit_preview_clear_mount_failed context={id:?} window_id={window_id} error={error:?}"
+                        "edit_preview_clear_mount_failed context={id:?} residence={:?} error={error:?}",
+                        self.viewer_context_residence(id),
                     ));
                 }
-                processed.push(id);
             }
         }
     }
@@ -63779,194 +64060,6 @@ impl App {
         self.evict_final_pipeline_cache_for_keep_set(&keep_set);
     }
 
-    /// サイドカーからまだ DB に無いエントリを取り込み、中央 DB を更新する。
-    /// フォルダ丸ごと移動で中央 DB のパスキーが無効化された場合の復旧経路。
-    /// サイドカー自体はメモリに残し、以降の書き込みミラーに使う。
-    /// 実際のインポートロジックは [`crate::sidecar::import_to_dbs`] に委譲。
-    ///
-    /// ## Fast-path (2026-04): サイドカー mtime ガード
-    ///
-    /// 通常 DB 側が authoritative で、サイドカー側が新しいのはフォルダ移動・
-    /// リネーム直後のレアケース。全フォルダ切替で `read_to_string` + parse +
-    /// import を走らせると HDD 競合で 100-500ms のヒッチになる (perf-log で
-    /// `sli_sidecar_import max=456ms` を観測)。そこで:
-    ///
-    /// 1. `fs::metadata(sidecar)` で mtime を取得 (1 syscall、通常 <1ms)
-    /// 2. 編集データ用 `adjustment_db.sidecar_sync` とタグ用 `tags.db` sync を
-    ///    それぞれ比較
-    /// 3. 有効な系統がすべて一致するなら読まずに return (common case)
-    /// 4. 不一致 / 未登録 / ファイル削除 のときだけ既存の slow-path に入る
-    fn import_sidecar_to_dbs(&mut self, sidecar_folder: &std::path::Path) {
-        let import_edits = self.settings.sidecar_backup_enabled;
-        let import_tags = self.settings.tag_sidecar_backup_enabled;
-        if !import_edits && !import_tags {
-            return;
-        }
-
-        let sidecar_path = sidecar_folder.join(crate::sidecar::SIDECAR_FILENAME);
-        let folder_key = crate::adjustment_db::normalize_path(sidecar_folder);
-
-        // Step 1: サイドカーの fs 状態を確認
-        let fs_mtime: i64 = match std::fs::metadata(&sidecar_path) {
-            Ok(m) => m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // サイドカー無し: 以前に import 済みの記録があれば消して整合させる
-                // (サイドカーが外部削除されたフォルダに追従)
-                if import_edits && let Some(db) = &self.adjustment_db {
-                    let _ = db.sidecar_sync_clear(&folder_key);
-                }
-                if import_tags && let Some(db) = self.tags_db.as_ref() {
-                    let _ = db.sidecar_sync_clear(&folder_key);
-                }
-                return;
-            }
-            Err(_) => return,
-        };
-
-        // Step 2: DB 側に記録された mtime と比較。タグ用 sync を分けることで、
-        // 補正 sidecar を既に同期済みのフォルダでも、タグバックアップを後から ON に
-        // した時だけ slow-path に入れる。
-        let edits_synced = !import_edits
-            || self.adjustment_db.as_ref().map_or(true, |db| {
-                db.sidecar_sync_get(&folder_key) == Some(fs_mtime)
-            });
-        let tags_synced = !import_tags
-            || self.tags_db.as_ref().map_or(true, |db| {
-                db.sidecar_sync_get(&folder_key) == Some(fs_mtime)
-            });
-        if edits_synced && tags_synced {
-            return;
-        }
-
-        // Step 3: Slow-path (初回 / 外部変更された場合のみ)
-        //
-        // **Codex P1 修正**: mtime が一致しないということは、ディスク上のサイドカーが
-        // 外部変更されている可能性がある。この場合、`self.sidecars` 内のメモリキャッシュは
-        // stale なので、使い続けてはいけない (古い内容を DB に書き戻し、新 mtime を記録すると
-        // 以降 fast-path で永久にスキップされて外部更新が反映されないというデータ取込漏れ
-        // バグになる)。
-        //
-        // 例外として、メモリキャッシュが `is_dirty()` (= アプリ内で未保存の編集がある)
-        // 場合は再ロードで edits を破壊してしまうので、slow-path を抜けて何もせず帰る。
-        // ここで `sidecar_sync_upsert` もスキップするので、次回ナビゲート時 (通常は
-        // `flush_periodic_sidecars` で dirty が解消された後) に改めて判定される。
-        let cached_dirty = self
-            .sidecars
-            .get(sidecar_folder)
-            .map(|s| s.is_dirty())
-            .unwrap_or(false);
-        if cached_dirty {
-            crate::logger::log(format!(
-                "sidecar: slow-path hit but in-memory cache is dirty — skip reload (sync record not updated): {}",
-                sidecar_folder.display()
-            ));
-            return;
-        }
-        // キャッシュを無効化して強制再ロード (外部変更されたサイドカーの新内容を取り込む)
-        self.sidecars.insert(
-            sidecar_folder.to_path_buf(),
-            crate::sidecar::SidecarFile::load(sidecar_folder),
-        );
-        let Some(sidecar) = self.sidecars.remove(sidecar_folder) else {
-            return;
-        };
-        // 空サイドカーでも mtime は記録して次回以降スキップできるようにする
-        if !sidecar.items().is_empty() {
-            let stats = crate::sidecar::import_to_dbs(
-                sidecar_folder,
-                &sidecar,
-                import_edits.then_some(()).and(self.adjustment_db.as_ref()),
-                import_edits.then_some(()).and(self.mask_db.as_ref()),
-                import_edits.then_some(()).and(self.conceal_db.as_ref()),
-                import_edits
-                    .then_some(())
-                    .and(self.local_adjust_db.as_ref()),
-                import_edits.then_some(()).and(self.export_crop_db.as_ref()),
-                import_edits.then_some(()).and(self.comic_db.as_ref()),
-                if import_tags {
-                    self.tags_db.as_mut()
-                } else {
-                    None
-                },
-            );
-            if stats.imported_adjust > 0
-                || stats.imported_mask > 0
-                || stats.imported_conceal > 0
-                || stats.imported_local_adjust > 0
-                || stats.imported_export_crop > 0
-                || stats.imported_comic > 0
-                || stats.imported_tags > 0
-            {
-                crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop + {} comic + {} tag entries from {}",
-                    stats.imported_adjust,
-                    stats.imported_mask,
-                    stats.imported_conceal,
-                    stats.imported_local_adjust,
-                    stats.imported_export_crop,
-                    stats.imported_comic,
-                    stats.imported_tags,
-                    sidecar_folder.display()
-                ));
-            }
-            if stats.imported_adjust > 0
-                || stats.imported_mask > 0
-                || stats.imported_conceal > 0
-                || stats.imported_local_adjust > 0
-                || stats.imported_export_crop > 0
-                || stats.imported_comic > 0
-            {
-                self.schedule_current_smart_folder_metadata_refresh(
-                    smart_folder::SmartFolderMetadataDependency::Edits,
-                );
-            }
-            if stats.imported_tags > 0 {
-                self.schedule_current_smart_folder_metadata_refresh(
-                    smart_folder::SmartFolderMetadataDependency::Tags,
-                );
-            }
-            // import で comic.db に追加した行が、それ以前に空としてキャッシュされた
-            // comic_docs に隠れて再起動まで見えない、という stale read を防ぐ (Codex P3)。
-            // 次の表示で comic.db から再ロードされる (page_path_key 別キャッシュなので安価)。
-            if stats.imported_comic > 0 {
-                self.comic_docs.clear();
-            }
-            if stats.imported_adjust > 0
-                || stats.imported_mask > 0
-                || stats.imported_conceal > 0
-                || stats.imported_local_adjust > 0
-                || stats.imported_export_crop > 0
-                || stats.imported_comic > 0
-            {
-                self.refresh_edit_rollup_keys_from_dbs();
-            }
-            if stats.imported_mask > 0
-                || stats.imported_conceal > 0
-                || stats.imported_local_adjust > 0
-                || stats.imported_export_crop > 0
-            {
-                // 外部更新された sidecar はページごとの旧 preview より新しい可能性がある。
-                // import 対象キーの全列挙を UI スレッドで行わず、派生キャッシュを worker で
-                // 一括失効して次の編集終了時に再生成する。
-                if let Some(service) = &self.edit_preview_cache {
-                    service.clear();
-                }
-            }
-        }
-        self.sidecars.insert(sidecar_folder.to_path_buf(), sidecar);
-        if import_edits && let Some(db) = &self.adjustment_db {
-            let _ = db.sidecar_sync_upsert(&folder_key, fs_mtime);
-        }
-        if import_tags && let Some(db) = self.tags_db.as_ref() {
-            let _ = db.sidecar_sync_upsert(&folder_key, fs_mtime);
-        }
-    }
-
     /// 編集ツールを抜けた瞬間にサイドカーを書き出す。
     ///
     /// 「編集が終わった」の判定を各ツールの終了関数へ配らない。キャンバスの所有が
@@ -63974,6 +64067,13 @@ impl App {
     /// ([`crate::app::App::page_edit_tool_owns_canvas`] が唯一の定義)。
     pub(crate) fn flush_sidecars_when_page_edit_ends(&mut self) {
         let owns_canvas = self.page_edit_tool_owns_canvas();
+        if self.sidecar_restore_active() {
+            // Checking owns the dirty SidecarFile values and flushes them on its worker.  Advance
+            // the edge latch without queueing a second stale snapshot (whose send fallback may
+            // otherwise write synchronously on this UI frame).
+            self.page_edit_tool_had_canvas = owns_canvas;
+            return;
+        }
         if self.page_edit_tool_had_canvas && !owns_canvas {
             self.flush_all_sidecars();
         }
@@ -63987,6 +64087,11 @@ impl App {
     /// なった時刻から測るので、編集を続けている間も一定間隔で確実に書かれる
     /// (最後の変更時刻から測ると、編集し続ける限り一度も書かれない)。
     pub(crate) fn flush_periodic_sidecars(&mut self) {
+        if self.sidecar_restore_active() {
+            // Dirty ownership moves to the Checking worker batch.  Leave the value and dirty age
+            // intact until that transfer instead of entering queue_flush's synchronous fallback.
+            return;
+        }
         let now = std::time::Instant::now();
         for sidecar in self.sidecars.values_mut() {
             if !sidecar.is_dirty() {
@@ -65694,6 +65799,42 @@ impl App {
 
     fn poll_favorite_view_writes(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
+        let deferred = self.favorite_view_writes.take_due_deferred_at(now);
+        if !deferred.is_empty() {
+            let mut unsent = Vec::new();
+            let mut commands = deferred.into_iter();
+            while let Some(command) = commands.next() {
+                let submit = (|| {
+                    if self.adjustment_db.is_none() {
+                        return Err("adjustment.db is unavailable".to_owned());
+                    }
+                    if self.favorite_view_store_writer.is_none() {
+                        self.favorite_view_store_writer = Some(
+                            crate::favorite_view_state::FavoriteViewStoreWriter::spawn(
+                                crate::adjustment_db::AdjustmentDb::db_path(),
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
+                    }
+                    self.favorite_view_store_writer
+                        .as_ref()
+                        .expect("favorite view store writer initialized")
+                        .submit(command.clone())
+                })();
+                if let Err(error) = submit {
+                    crate::logger::log(format!(
+                        "favorite view sidecar-restore retry submit failed: {error}"
+                    ));
+                    unsent.push(command);
+                    unsent.extend(commands);
+                    break;
+                }
+            }
+            if !unsent.is_empty() {
+                self.favorite_view_writes
+                    .restore_deferred_front(unsent, now);
+            }
+        }
         let writes = self.favorite_view_writes.take_due_at(now);
         self.submit_favorite_view_writes(writes, true);
         let results: Vec<_> = self
@@ -65745,6 +65886,13 @@ impl App {
 
     pub(crate) fn flush_favorite_view_writes_for_exit(&mut self) {
         self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        for command in self.favorite_view_writes.take_all_deferred() {
+            if let Err(error) = self.submit_favorite_view_store(command) {
+                crate::logger::log(format!(
+                    "favorite view sidecar-restore retry submit failed during exit: {error}"
+                ));
+            }
+        }
         let writes = self.favorite_view_writes.take_all();
         self.submit_favorite_view_writes(writes, false);
     }
@@ -69683,6 +69831,11 @@ impl App {
     }
 
     fn poll_media_navigation_pending(&mut self, ctx: &egui::Context) {
+        // A resolver result accepted before the modal owns the fullscreen navigation tail. Keep
+        // both pending request and shared response queued until the restore terminal.
+        if self.sidecar_restore_active() {
+            return;
+        }
         let Some(pending) = self.media_navigation_pending.as_ref() else {
             return;
         };
@@ -70951,6 +71104,7 @@ impl App {
         // Before any shortcut path, so a state that swallows every key says so once, in the
         // ordinary log, whether or not the reader happened to be running with --perf-log.
         self.note_modal_block_transition();
+        self.consume_input_during_sidecar_restore(ctx);
         // Select and cache the root viewport owner before any shortcut path.
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.
@@ -71136,7 +71290,11 @@ impl App {
             // viewports are registered below; returning here omits them from egui's frame and
             // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
             // already made each retained viewport explicit Hidden, so normal registration is safe.
-            let _tray_hide_started = self.maybe_intercept_close(ctx);
+            let _tray_hide_started = if self.sidecar_restore_blocks_root_tray_hide() {
+                false
+            } else {
+                self.maybe_intercept_close(ctx)
+            };
         }
         // request_repaint cannot wake a hidden Win32 root window. Publish the current media
         // ownership projection near the top of every pass so the tray thread can continue (or
@@ -71447,10 +71605,16 @@ impl App {
         // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、
         // ドロップが無い通常フレームでは空チェックだけで抜ける (Vec を確保しない)。
         if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            if self.sidecar_restore_active() {
+                let count = ctx.input(|i| i.raw.dropped_files.len());
+                self.internal_drop_pending = false;
+                crate::logger::log(format!(
+                    "file_drop: discarded {count} path(s) during sidecar restore"
+                ));
             // mIV 自身のドラッグが mIV ウィンドウ上へ落ちた跳ね返り (グリッド上での
             // クリックずれ等) なら受け取らない。フラグの消費は dropped_files が来た
             // 時点で必ず行う — パスが空に潰れても stale で残さない (Codex P2)。
-            if std::mem::take(&mut self.internal_drop_pending) {
+            } else if std::mem::take(&mut self.internal_drop_pending) {
                 crate::logger::log("file_drop: ignored (mIV-internal drag bounce-back)");
             } else {
                 let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
@@ -71607,8 +71771,11 @@ impl App {
         }
         self.poll_metadata_load();
         mark_update_perf(&mut update_perf, UpdatePerfStage::SearchAndMetadataPolls);
-        // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
-        self.poll_stack_script(ctx);
+        // スタックスクリプトは items generation を差し替える。復旧中は receiver を保持し、
+        // terminal 後に既存 poll へ一度だけ戻す。
+        if !self.sidecar_restore_active() {
+            self.poll_stack_script(ctx);
+        }
         self.poll_subfolder_expansion(ctx);
         self.poll_smart_folder(ctx);
         self.poll_details_meta_load(ctx);
@@ -72289,7 +72456,7 @@ impl App {
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
-        if !main_viewer_blocked {
+        if !main_viewer_blocked && !self.sidecar_restore_active() {
             self.draw_favorite_default_clear_confirm_dialog(ctx);
         }
         self.show_smart_folder_editor_dialog(ctx);
@@ -72306,6 +72473,7 @@ impl App {
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
         self.show_metadata_transfer_dialog(ctx);
+        self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
@@ -72427,7 +72595,7 @@ impl App {
         // 予期せず閉じてしまう。fullscreen のときは一覧へ戻った次フレームに委ねる。
         // 一覧表示中の監視変更は従来どおり即時に適用し、進行中の Ctrl+E 出力が背後の
         // 一覧へ順次増える挙動も維持する (利用者判断 2026-09-05)。
-        if !main_viewer_blocked {
+        if !main_viewer_blocked && !self.sidecar_restore_active() {
             self.consume_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
             // メディア別ウィンドウ (フル機能モード) の P ピンをメイン窓のグリッドへ
@@ -72774,7 +72942,7 @@ impl App {
         self.handle_delete_key(ctx);
 
         // ── 非同期ファイル操作後のフォルダ再読み込み ──────────────
-        if self.pending_reload {
+        if self.pending_reload && !self.sidecar_restore_active() {
             self.pending_reload = false;
             if self.current_folder.is_some() {
                 ctx.request_repaint();
@@ -73560,11 +73728,18 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
+        // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
+        // outside it so worker completions, writer fences, and the terminal continuation cannot
+        // stall behind a presentation path. Running it after the frame also keeps the modal/input
+        // gate alive through the complete input pass in the terminal frame.
+        self.poll_sidecar_restore(ctx);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::finish_action_pass(ctx);
         // UI の代入箇所を列挙せず、frame 終端で有効値との差分を一括検出する。
-        self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
-        self.poll_favorite_view_writes(ctx);
+        if !self.sidecar_restore_active() {
+            self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+            self.poll_favorite_view_writes(ctx);
+        }
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
         // ACK も落ちるので、**早期 return では飛ばせないここ**で拾う。
@@ -73589,6 +73764,10 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::on_app_exit();
+        // Recovery's Checking phase leaves each live SidecarFile in the App cache while its worker
+        // holds immutable Arc reservations. Join and reconcile those reservations before the
+        // established exit path queues and waits for the final process-global writer snapshots.
+        self.resolve_sidecar_restore_for_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         self.on_exit_inner();

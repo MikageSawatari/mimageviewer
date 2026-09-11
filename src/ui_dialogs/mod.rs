@@ -33,6 +33,7 @@ pub(crate) mod rename_item;
 mod rotation_reset;
 mod settings_incompatible;
 pub(crate) mod settings_restore;
+pub(crate) mod sidecar_restore;
 pub(crate) mod smart_folder_editor;
 mod stats_dialog;
 mod subfolder_expansion;

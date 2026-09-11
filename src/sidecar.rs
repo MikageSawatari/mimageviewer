@@ -34,6 +34,7 @@
 //! - 設定 OFF 時: 読み書き両方スキップ。既存ファイルは削除しない。
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -434,6 +435,22 @@ impl SidecarFile {
             disabled: false,
             dirty_since: None,
         }
+    }
+
+    /// A fail-closed cache value for a source that could not reach a stable
+    /// strict snapshot. It prevents a later UI-side forgiving load from doing
+    /// the same potentially large read while ensuring no future flush can
+    /// overwrite the changing or unreadable file.
+    pub(crate) fn disabled_placeholder(folder: PathBuf) -> Self {
+        let mut sidecar = Self::new(folder);
+        sidecar.disabled = true;
+        sidecar
+    }
+
+    /// Preserve a strict snapshot for display while preventing later edits from
+    /// overwriting a source whose item data failed import validation.
+    pub(crate) fn disable_writes_for_session(&mut self) {
+        self.disabled = true;
     }
 
     /// 書き換え用の可変参照。writer がまだ前の snapshot を持っていれば、ここで
@@ -944,6 +961,15 @@ impl SidecarFile {
         !self.dirty && !writer().is_failed(&self.folder)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_dirty_since_for_test(&mut self, since: std::time::Instant) {
+        assert!(
+            self.dirty,
+            "only a dirty test owner may have its age overridden"
+        );
+        self.dirty_since = Some(since);
+    }
+
     /// 書き出しを積み、writer が捌き終わるまで待って結果を返す。
     /// 削除移行のように「書けたか」を報告する必要がある稀な経路だけが使う。
     /// UI スレッドからは呼ばない。
@@ -977,6 +1003,63 @@ pub(crate) struct SidecarFlushOwners {
     expected_flushes: usize,
 }
 
+/// Immutable snapshots reserved from cache owners that remain available to the UI.
+///
+/// Holding each items `Arc` makes a later mutation use copy-on-write. Resolution can
+/// therefore clear or evict only the exact owner that was written, while a sibling
+/// context may keep using the cache without falling back to a synchronous disk load.
+pub(crate) struct SidecarFlushReservations {
+    identity: Arc<SidecarFlushIdentity>,
+    owners: Vec<SidecarFlushReservation>,
+    expected_flushes: usize,
+}
+
+struct SidecarFlushReservation {
+    folder: PathBuf,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
+    disabled: bool,
+    requested: bool,
+}
+
+impl SidecarFlushReservations {
+    /// Reconcile a worker result with cache owners that stayed in place.
+    ///
+    /// Errors leave every cache owner untouched. A successful request clears dirty
+    /// state only when the folder, item `Arc`, and writable state still match the
+    /// captured owner. Main-view cache eviction uses the same exact identity, so a
+    /// clean cache inserted or replaced while the worker ran is preserved.
+    pub(crate) fn resolve_in_place(
+        self,
+        sidecars: &mut HashMap<PathBuf, SidecarFile>,
+        result: Result<SidecarFlushReport, String>,
+        evict_verified_clean: bool,
+    ) -> Result<SidecarFlushReport, String> {
+        let report = validate_flush_result(&self.identity, self.expected_flushes, result)?;
+        let mut evict = Vec::new();
+        for reservation in self.owners {
+            let Some(current) = sidecars.get_mut(&reservation.folder) else {
+                continue;
+            };
+            let exact = Arc::ptr_eq(&current.items, &reservation.items)
+                && current.disabled == reservation.disabled;
+            if !exact {
+                continue;
+            }
+            if reservation.requested && !current.disabled {
+                current.dirty = false;
+                current.dirty_since = None;
+            }
+            if evict_verified_clean && !current.dirty {
+                evict.push(reservation.folder);
+            }
+        }
+        for folder in evict {
+            sidecars.remove(&folder);
+        }
+        Ok(report)
+    }
+}
+
 impl SidecarFlushOwners {
     pub(crate) fn is_empty(&self) -> bool {
         self.sidecars.is_empty()
@@ -994,34 +1077,19 @@ impl SidecarFlushOwners {
         mut self,
         result: Result<SidecarFlushReport, String>,
     ) -> SidecarFlushCompletion {
-        let expected_flushes = self.expected_flushes;
-        match result {
-            Ok(report)
-                if Arc::ptr_eq(&self.identity, &report.identity)
-                    && report.flushed_folders == expected_flushes =>
-            {
+        match validate_flush_result(&self.identity, self.expected_flushes, result) {
+            Ok(report) => {
                 for sidecar in &mut self.sidecars {
-                    sidecar.dirty = false;
-                    sidecar.dirty_since = None;
+                    if !sidecar.disabled {
+                        sidecar.dirty = false;
+                        sidecar.dirty_since = None;
+                    }
                 }
                 SidecarFlushCompletion::Flushed {
                     sidecars: self.sidecars,
                     report,
                 }
             }
-            Ok(report) if !Arc::ptr_eq(&self.identity, &report.identity) => {
-                SidecarFlushCompletion::Failed {
-                    sidecars: self.sidecars,
-                    error: "sidecar flush result belongs to a different owner batch".to_string(),
-                }
-            }
-            Ok(report) => SidecarFlushCompletion::Failed {
-                sidecars: self.sidecars,
-                error: format!(
-                    "sidecar flush reported {} folders for {} expected flushes",
-                    report.flushed_folders, expected_flushes
-                ),
-            },
             Err(error) => SidecarFlushCompletion::Failed {
                 sidecars: self.sidecars,
                 error,
@@ -1030,11 +1098,28 @@ impl SidecarFlushOwners {
     }
 }
 
+fn validate_flush_result(
+    identity: &Arc<SidecarFlushIdentity>,
+    expected_flushes: usize,
+    result: Result<SidecarFlushReport, String>,
+) -> Result<SidecarFlushReport, String> {
+    let report = result?;
+    if !Arc::ptr_eq(identity, &report.identity) {
+        return Err("sidecar flush result belongs to a different owner batch".to_string());
+    }
+    if report.flushed_folders != expected_flushes {
+        return Err(format!(
+            "sidecar flush reported {} folders for {} expected flushes",
+            report.flushed_folders, expected_flushes
+        ));
+    }
+    Ok(report)
+}
+
 #[derive(Clone)]
 struct SidecarFlushRequest {
     folder: PathBuf,
     request: WriteRequest,
-    disabled: bool,
 }
 
 #[derive(Debug)]
@@ -1069,8 +1154,12 @@ pub(crate) enum SidecarFlushCompletion {
 ///
 /// This function only moves `SidecarFile` values and clones their item `Arc`s;
 /// it does no serialization, filesystem access, channel wait, or SQLite work.
-/// Clean sidecars remain in the retained owner set, so a caller may safely move
-/// its complete cache into this boundary without silently dropping entries.
+/// Clean and write-disabled sidecars remain in the retained owner set, so a
+/// caller may safely move its complete cache into this boundary without
+/// silently dropping entries. A dirty disabled owner is deliberately omitted
+/// from the batch and remains dirty after successful resolution: it represents
+/// an edit that cannot safely replace the preserved source, not pending I/O
+/// that should block recovery for an unrelated folder.
 pub(crate) fn prepare_worker_flush(
     sidecars: impl IntoIterator<Item = SidecarFile>,
 ) -> (SidecarFlushOwners, SidecarFlushBatch) {
@@ -1078,11 +1167,10 @@ pub(crate) fn prepare_worker_flush(
     let mut owners = Vec::new();
     let mut requests = Vec::new();
     for sidecar in sidecars {
-        if sidecar.dirty {
+        if sidecar.dirty && !sidecar.disabled {
             requests.push(SidecarFlushRequest {
                 folder: sidecar.folder.clone(),
                 request: sidecar.write_request(),
-                disabled: sidecar.disabled,
             });
         }
         owners.push(sidecar);
@@ -1098,8 +1186,46 @@ pub(crate) fn prepare_worker_flush(
     )
 }
 
+/// Capture an immutable worker batch without removing cache owners from the App.
+///
+/// The captured item `Arc`s are reservations: any edit after this call receives a
+/// distinct `Arc` through `Arc::make_mut`, and resolution will leave that newer dirty
+/// owner untouched. The batch still excludes dirty write-disabled owners and still
+/// requires the process-global idle fence even when it is empty.
+pub(crate) fn prepare_worker_flush_in_place<'a>(
+    sidecars: impl IntoIterator<Item = &'a SidecarFile>,
+) -> (SidecarFlushReservations, SidecarFlushBatch) {
+    let identity = Arc::new(SidecarFlushIdentity);
+    let mut owners = Vec::new();
+    let mut requests = Vec::new();
+    for sidecar in sidecars {
+        let requested = sidecar.dirty && !sidecar.disabled;
+        if requested {
+            requests.push(SidecarFlushRequest {
+                folder: sidecar.folder.clone(),
+                request: sidecar.write_request(),
+            });
+        }
+        owners.push(SidecarFlushReservation {
+            folder: sidecar.folder.clone(),
+            items: Arc::clone(&sidecar.items),
+            disabled: sidecar.disabled,
+            requested,
+        });
+    }
+    let expected_flushes = requests.len();
+    (
+        SidecarFlushReservations {
+            identity: Arc::clone(&identity),
+            owners,
+            expected_flushes,
+        },
+        SidecarFlushBatch { identity, requests },
+    )
+}
+
 impl SidecarFlushBatch {
-    /// Whether this batch has no new dirty snapshots to queue.
+    /// Whether this batch has no new writable dirty snapshots to queue.
     ///
     /// This says nothing about the process-global writer: an earlier ordinary
     /// `queue_flush` may still be in flight after its cache owner became clean.
@@ -1128,9 +1254,6 @@ impl SidecarFlushBatch {
         timeout: std::time::Duration,
     ) -> Result<SidecarFlushReport, String> {
         let started = Instant::now();
-        if self.requests.iter().any(|request| request.disabled) {
-            return Err("disabled sidecar cannot be flushed for import".to_string());
-        }
         for request in &self.requests {
             if writer.state.is_failed_for_import(&request.folder)? {
                 return Err(format!(
@@ -2020,6 +2143,157 @@ mod tests {
         assert_eq!(report.flushed_folders, 0);
         assert_eq!(sidecars.len(), 1);
         assert!(!sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn dirty_disabled_owner_does_not_block_an_unrelated_valid_worker_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid_folder = root.path().join("invalid");
+        let valid_folder = root.path().join("valid");
+        std::fs::create_dir_all(&invalid_folder).unwrap();
+        std::fs::create_dir_all(&valid_folder).unwrap();
+        let invalid_path = invalid_folder.join(SIDECAR_FILENAME);
+        std::fs::write(&invalid_path, b"preserve-invalid-source").unwrap();
+
+        let mut invalid = SidecarFile::disabled_placeholder(invalid_folder.clone());
+        invalid.set_tags("page.jpg", ["unsaved"]);
+        let mut valid = SidecarFile::new(valid_folder.clone());
+        valid.set_adjust("page.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([invalid, valid]);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(batch.requests.len(), 1);
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("a disabled owner must not fail the valid folder's worker batch");
+        };
+        assert_eq!(report.flushed_folders, 1);
+        let invalid = sidecars
+            .iter()
+            .find(|sidecar| sidecar.folder() == invalid_folder)
+            .unwrap();
+        let valid = sidecars
+            .iter()
+            .find(|sidecar| sidecar.folder() == valid_folder)
+            .unwrap();
+        assert!(invalid.is_dirty());
+        assert!(!valid.is_dirty());
+        assert_eq!(
+            std::fs::read(invalid_path).unwrap(),
+            b"preserve-invalid-source"
+        );
+        assert!(valid_folder.join(SIDECAR_FILENAME).is_file());
+    }
+
+    fn reservation_success(
+        reservations: &SidecarFlushReservations,
+    ) -> Result<SidecarFlushReport, String> {
+        Ok(SidecarFlushReport {
+            identity: Arc::clone(&reservations.identity),
+            flushed_folders: reservations.expected_flushes,
+            elapsed: std::time::Duration::ZERO,
+        })
+    }
+
+    #[test]
+    fn in_place_flush_clears_only_the_exact_writable_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("book");
+        let mut sidecar = SidecarFile::new(folder.clone());
+        sidecar.set_tags("page.jpg", ["before"]);
+        let mut cache = HashMap::from([(folder.clone(), sidecar)]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+
+        cache
+            .get_mut(&folder)
+            .unwrap()
+            .set_tags("page.jpg", ["after"]);
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+
+        let current = cache.get(&folder).expect("newer dirty owner retained");
+        assert!(current.is_dirty());
+        assert_eq!(
+            current
+                .items()
+                .get("page.jpg")
+                .and_then(|entry| entry.tags.as_ref()),
+            Some(&vec!["#after".to_string()])
+        );
+    }
+
+    #[test]
+    fn in_place_flush_success_evicts_only_exact_clean_main_cache_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let old_clean_folder = root.path().join("old-clean");
+        let flushed_folder = root.path().join("flushed");
+        let replaced_folder = root.path().join("replaced-clean");
+        let disabled_folder = root.path().join("disabled-dirty");
+        let mut flushed = SidecarFile::new(flushed_folder.clone());
+        flushed.set_tags("page.jpg", ["saved"]);
+        let mut disabled = SidecarFile::disabled_placeholder(disabled_folder.clone());
+        disabled.set_tags("page.jpg", ["unsaved"]);
+        let mut cache = HashMap::from([
+            (
+                old_clean_folder.clone(),
+                SidecarFile::new(old_clean_folder.clone()),
+            ),
+            (flushed_folder.clone(), flushed),
+            (
+                replaced_folder.clone(),
+                SidecarFile::new(replaced_folder.clone()),
+            ),
+            (disabled_folder.clone(), disabled),
+        ]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        cache.insert(
+            replaced_folder.clone(),
+            SidecarFile::new(replaced_folder.clone()),
+        );
+
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+
+        assert!(!cache.contains_key(&old_clean_folder));
+        assert!(!cache.contains_key(&flushed_folder));
+        assert!(cache.contains_key(&replaced_folder));
+        assert!(cache.get(&disabled_folder).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn in_place_flush_failure_and_write_disable_leave_live_owner_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_folder = root.path().join("failed");
+        let mut failed = SidecarFile::new(failed_folder.clone());
+        failed.set_tags("page.jpg", ["pending"]);
+        let mut cache = HashMap::from([(failed_folder.clone(), failed)]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        assert_eq!(
+            reservations
+                .resolve_in_place(&mut cache, Err("injected".into()), true)
+                .unwrap_err(),
+            "injected"
+        );
+        assert!(cache.get(&failed_folder).unwrap().is_dirty());
+
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        cache
+            .get_mut(&failed_folder)
+            .unwrap()
+            .disable_writes_for_session();
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+        assert!(cache.get(&failed_folder).unwrap().is_dirty());
     }
 
     #[test]

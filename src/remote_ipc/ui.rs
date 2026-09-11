@@ -1473,7 +1473,14 @@ impl crate::app::App {
         for pending in handle.take_pending_ui_requests() {
             match pending {
                 ClaimedRemoteUiRequest::Write(pending) => {
-                    self.apply_pending_remote_write(pending, ctx)
+                    if self.sidecar_restore_active() {
+                        pending.complete(UiWriteOutcome::Write(write_error(
+                            RemoteWriteErrorCode::Busy,
+                            "サイドカーから設定を復元しています",
+                        )));
+                    } else {
+                        self.apply_pending_remote_write(pending, ctx)
+                    }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
                     let latest = self.last_book_resume.as_ref().and_then(|(path, page)| {
@@ -1489,7 +1496,14 @@ impl crate::app::App {
                     pending.complete(page);
                 }
                 ClaimedRemoteUiRequest::VideoStream(pending) => {
-                    self.apply_remote_video_stream_request(pending);
+                    if self.sidecar_restore_active() {
+                        pending.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                            VideoStreamErrorCode::Busy,
+                            "サイドカーから設定を復元しています",
+                        )));
+                    } else {
+                        self.apply_remote_video_stream_request(pending);
+                    }
                 }
             }
         }

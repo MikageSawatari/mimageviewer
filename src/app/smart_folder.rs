@@ -3972,6 +3972,11 @@ impl App {
     }
 
     pub(crate) fn poll_smart_folder(&mut self, ctx: &egui::Context) {
+        // Retain accepted scan/count/prepare results while the App-global sidecar coordinator owns
+        // a load continuation. Normal polling consumes the same payload exactly once afterwards.
+        if self.sidecar_restore_active() {
+            return;
+        }
         // Search/Snapshot may be entered while a scan is running (for example from a keyboard
         // shortcut before the modal is painted).  Definition id + generation alone cannot prove
         // that this worker still owns the top-level grid, so reject the whole generation here.

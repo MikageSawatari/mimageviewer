@@ -1695,6 +1695,12 @@ impl App {
     }
 
     pub(crate) fn poll_subfolder_expansion(&mut self, ctx: &egui::Context) {
+        // The scan/prepare was accepted before the sidecar modal. Keep its receiver, prepared
+        // payload, and install tail intact until restore terminal instead of replacing the owned
+        // item generation underneath the restore coordinator.
+        if self.sidecar_restore_active() {
+            return;
+        }
         if self.poll_subfolder_expansion_install(ctx) {
             return;
         }

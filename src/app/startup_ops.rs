@@ -11,6 +11,15 @@ impl App {
     #[cfg(windows)]
     pub(super) fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
         let paths: Vec<PathBuf> = self.activation_open_path_rx.try_iter().collect();
+        if self.sidecar_restore_active() {
+            if !paths.is_empty() {
+                crate::logger::log(format!(
+                    "single_instance: discarded {} activation open request(s) during sidecar restore",
+                    paths.len()
+                ));
+            }
+            return;
+        }
         let Some(path) = paths.into_iter().last() else {
             return;
         };
@@ -143,6 +152,12 @@ impl App {
     }
 
     pub(super) fn poll_startup_open_path_resolve(&mut self, ctx: &egui::Context) {
+        // This request was accepted before the restore modal started. Keep the receiver and its
+        // owner intact so the ordinary completion tail runs exactly once after restore terminal;
+        // taking it here would let `load_folder` replace the restore target mid-transaction.
+        if self.sidecar_restore_active() {
+            return;
+        }
         let recv = match self.startup_open_path_resolve_pending.as_ref() {
             Some(pending) => pending.rx.try_recv(),
             None => return,

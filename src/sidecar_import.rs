@@ -50,6 +50,9 @@ pub enum SidecarProbeFamilyOutcome {
 pub struct SidecarProbeResult {
     pub edits: SidecarProbeFamilyOutcome,
     pub tags: SidecarProbeFamilyOutcome,
+    /// Present only when the sidecar content itself failed semantic validation.
+    /// The matching `Current` owner is write-disabled for this session.
+    pub source_validation_error: Option<String>,
     pub load_elapsed: Duration,
     pub prepare_elapsed: Duration,
     pub probe_elapsed: Duration,
@@ -157,6 +160,9 @@ pub enum ImportFamilyOutcome<T> {
 pub struct SidecarImportResult {
     pub edits: ImportFamilyOutcome<EditImportReport>,
     pub tags: ImportFamilyOutcome<TagImportReport>,
+    /// Present only when the sidecar content itself failed semantic validation.
+    /// The matching `Current` owner is write-disabled for this session.
+    pub source_validation_error: Option<String>,
     pub prepare_elapsed: Duration,
     pub commit_elapsed: Duration,
 }
@@ -193,7 +199,16 @@ pub struct PreparedSidecarImport {
     source: SidecarImportSource,
     edits: PreparedFamily<Vec<PreparedEditRow>>,
     tags: PreparedFamily<Vec<crate::tags_db::PreparedSidecarTagItem>>,
+    source_validation_error: Option<String>,
     prepare_elapsed: Duration,
+}
+
+pub(crate) enum SidecarCacheValidation {
+    Current(SidecarFile),
+    ValidationFailed { sidecar: SidecarFile, error: String },
+    SourceChanged(String),
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Clone)]
@@ -232,7 +247,7 @@ pub fn prepare(
     cancel: &AtomicBool,
 ) -> Result<PreparedSidecarImport, String> {
     let started = Instant::now();
-    let (sidecar, source) = loaded.into_parts();
+    let (mut sidecar, source) = loaded.into_parts();
     let folder = sidecar.folder().to_path_buf();
     let folder_key = crate::adjustment_db::normalize_path(&folder);
 
@@ -240,6 +255,7 @@ pub fn prepare(
     let mut tag_items = Vec::new();
     let mut edit_error = None;
     let mut tag_error = None;
+    let mut source_validation_error = None;
     let mut cancelled = false;
 
     for (relative_key, entry) in sidecar.items() {
@@ -264,6 +280,9 @@ pub fn prepare(
         let key = match validate_and_reconstruct_key(&folder, relative_key) {
             Ok(key) => key,
             Err(error) => {
+                if source_validation_error.is_none() {
+                    source_validation_error = Some(error.clone());
+                }
                 if families.edits && has_edit && edit_error.is_none() {
                     edit_error = Some(error.clone());
                 }
@@ -274,25 +293,62 @@ pub fn prepare(
             }
         };
 
-        if families.edits && edit_error.is_none() {
+        if has_edit {
             match prepare_edit_row(key.clone(), entry) {
-                Ok(row) if !row.is_empty() => edit_rows.push(row),
+                Ok(row) if families.edits && edit_error.is_none() && !row.is_empty() => {
+                    edit_rows.push(row);
+                }
                 Ok(_) => {}
-                Err(error) => edit_error = Some(format!("{relative_key}: {error}")),
+                Err(error) => {
+                    let error = format!("{relative_key}: {error}");
+                    if source_validation_error.is_none() {
+                        source_validation_error = Some(error.clone());
+                    }
+                    if families.edits && edit_error.is_none() {
+                        edit_error = Some(error);
+                    }
+                }
             }
         }
 
-        if families.tags
-            && tag_error.is_none()
-            && matches!(classify_rel_key(relative_key), RelKeyKind::Image)
-            && let Some(tags) = &entry.tags
-        {
+        if let Some(tags) = entry.tags.as_ref().filter(|tags| !tags.is_empty()) {
             match crate::tags_db::prepare_sidecar_tag_item(key, tags) {
-                Ok(Some(item)) => tag_items.push(item),
+                Ok(Some(item))
+                    if families.tags
+                        && tag_error.is_none()
+                        && matches!(classify_rel_key(relative_key), RelKeyKind::Image) =>
+                {
+                    tag_items.push(item);
+                }
                 Ok(None) => {}
-                Err(error) => tag_error = Some(error),
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    if source_validation_error.is_none() {
+                        source_validation_error = Some(error.clone());
+                    }
+                    if families.tags
+                        && tag_error.is_none()
+                        && matches!(classify_rel_key(relative_key), RelKeyKind::Image)
+                    {
+                        tag_error = Some(error);
+                    }
+                }
             }
         }
+    }
+
+    // A syntactically valid sidecar can still contain an escaping key or an
+    // invalid field value.  Keep that exact snapshot available to the caller,
+    // but never let a later UI edit flush a partial reconstruction over it.
+    // Runtime DB probe/commit errors are handled later and do not disable a
+    // source that itself passed validation.
+    let source_validation_error = source_validation_error.map(|error| {
+        format!(
+            "{error}; sidecar writes are disabled for this session to preserve the invalid source"
+        )
+    });
+    if source_validation_error.is_some() {
+        sidecar.disable_writes_for_session();
     }
 
     Ok(PreparedSidecarImport {
@@ -317,8 +373,47 @@ pub fn prepare(
         } else {
             PreparedFamily::Ready(tag_items)
         },
+        source_validation_error,
         prepare_elapsed: started.elapsed(),
     })
+}
+
+/// Validate a loaded source for later cache ownership without touching a DB.
+///
+/// Unlike a forgiving load, semantic validation failures retain the exact
+/// display snapshot as a write-disabled owner. Source changes and cancellation
+/// never expose the stale snapshot.
+pub(crate) fn validate_cache_snapshot(
+    loaded: LoadedSidecarImport,
+    families: ImportFamilies,
+    cancel: &AtomicBool,
+) -> SidecarCacheValidation {
+    let prepared = match prepare(loaded, families, cancel) {
+        Ok(prepared) => prepared,
+        Err(error) => return SidecarCacheValidation::Failed(error),
+    };
+    let PreparedSidecarImport {
+        sidecar,
+        source,
+        edits,
+        tags,
+        source_validation_error,
+        ..
+    } = prepared;
+    if cancel.load(Ordering::Relaxed)
+        || prepared_family_cancelled(&edits)
+        || prepared_family_cancelled(&tags)
+    {
+        return SidecarCacheValidation::Cancelled;
+    }
+    if let Err(error) = crate::sidecar::revalidate_import_source(&sidecar, &source) {
+        return SidecarCacheValidation::SourceChanged(error);
+    }
+    if let Some(error) = source_validation_error {
+        SidecarCacheValidation::ValidationFailed { sidecar, error }
+    } else {
+        SidecarCacheValidation::Current(sidecar)
+    }
 }
 
 /// Strictly load, validate, and inspect v2 markers without mutating a database.
@@ -372,6 +467,7 @@ pub fn probe(
                 source,
                 edits,
                 tags,
+                source_validation_error,
                 prepare_elapsed,
             } = prepared;
             if cancel.load(Ordering::Relaxed)
@@ -379,12 +475,13 @@ pub fn probe(
                 || prepared_family_cancelled(&tags)
             {
                 return SidecarImportProbe::Cancelled {
-                    result: probe_result(
+                    result: probe_result_with_validation(
                         started,
                         load_elapsed,
                         prepare_elapsed,
                         reject_probe_cancelled(edits),
                         reject_probe_cancelled(tags),
+                        source_validation_error,
                     ),
                 };
             }
@@ -400,12 +497,13 @@ pub fn probe(
                 edit_outcome = reject_probe_outcome_cancelled(edit_outcome);
                 tag_outcome = reject_probe_outcome_cancelled(tag_outcome);
                 return SidecarImportProbe::Cancelled {
-                    result: probe_result(
+                    result: probe_result_with_validation(
                         started,
                         load_elapsed,
                         prepare_elapsed,
                         edit_outcome,
                         tag_outcome,
+                        source_validation_error,
                     ),
                 };
             }
@@ -414,21 +512,23 @@ pub fn probe(
                 tag_outcome = reject_probe_outcome_source_changed(tag_outcome, &error);
                 return SidecarImportProbe::SourceChanged {
                     error,
-                    result: probe_result(
+                    result: probe_result_with_validation(
                         started,
                         load_elapsed,
                         prepare_elapsed,
                         edit_outcome,
                         tag_outcome,
+                        source_validation_error,
                     ),
                 };
             }
-            let result = probe_result(
+            let result = probe_result_with_validation(
                 started,
                 load_elapsed,
                 prepare_elapsed,
                 edit_outcome,
                 tag_outcome,
+                source_validation_error,
             );
             if probe_requires_import(&result) {
                 SidecarImportProbe::ImportRequired { result }
@@ -550,10 +650,24 @@ fn probe_result(
     SidecarProbeResult {
         edits,
         tags,
+        source_validation_error: None,
         load_elapsed,
         prepare_elapsed,
         probe_elapsed: started.elapsed(),
     }
+}
+
+fn probe_result_with_validation(
+    started: Instant,
+    load_elapsed: Duration,
+    prepare_elapsed: Duration,
+    edits: SidecarProbeFamilyOutcome,
+    tags: SidecarProbeFamilyOutcome,
+    source_validation_error: Option<String>,
+) -> SidecarProbeResult {
+    let mut result = probe_result(started, load_elapsed, prepare_elapsed, edits, tags);
+    result.source_validation_error = source_validation_error;
+    result
 }
 
 fn terminal_probe(
@@ -1025,6 +1139,7 @@ fn commit_with_progress(
         source,
         edits,
         tags,
+        source_validation_error,
         prepare_elapsed,
     } = prepared;
 
@@ -1039,6 +1154,7 @@ fn commit_with_progress(
             result: SidecarImportResult {
                 edits: reject_cancelled(edits),
                 tags: reject_cancelled(tags),
+                source_validation_error,
                 prepare_elapsed,
                 commit_elapsed: commit_started.elapsed(),
             },
@@ -1050,6 +1166,7 @@ fn commit_with_progress(
             result: SidecarImportResult {
                 edits: reject_source_changed(edits, &error),
                 tags: reject_source_changed(tags, &error),
+                source_validation_error,
                 prepare_elapsed,
                 commit_elapsed: commit_started.elapsed(),
             },
@@ -1119,6 +1236,7 @@ fn commit_with_progress(
     let result = SidecarImportResult {
         edits,
         tags,
+        source_validation_error,
         prepare_elapsed,
         commit_elapsed: commit_started.elapsed(),
     };
@@ -1898,11 +2016,18 @@ mod tests {
         assert_eq!(mode.to_ascii_lowercase(), "wal");
         drop(mask);
 
-        let result = current_result(commit(data.path(), prepared, &cancel));
+        let SidecarImportCompletion::Current {
+            mut sidecar,
+            result,
+        } = commit(data.path(), prepared, &cancel)
+        else {
+            panic!("a DB policy failure must retain the validated source owner");
+        };
         let ImportFamilyOutcome::Failed(error) = result.edits else {
             panic!("unsafe attached journal mode must reject the edit family");
         };
         assert!(error.contains("unsafe journal mode"));
+        assert!(result.source_validation_error.is_none());
         let adjustment =
             crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
                 .unwrap();
@@ -1911,6 +2036,11 @@ mod tests {
         assert_eq!(
             adjustment.sidecar_sync_get(&crate::adjustment_db::normalize_path(media.path())),
             None
+        );
+        sidecar.set_adjust("after-db-error.jpg", params(2.0));
+        assert!(
+            sidecar.flush_blocking(),
+            "a DB-only failure must not disable a validated sidecar source"
         );
     }
 
@@ -1924,6 +2054,36 @@ mod tests {
         sidecar.set_adjust("../escape.jpg", params(2.0));
         let cancel = AtomicBool::new(false);
         let loaded = flush_and_load(&mut sidecar);
+        let source_path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        let original_source = std::fs::read(&source_path).unwrap();
+        let SidecarImportProbe::Current {
+            sidecar: mut probe_sidecar,
+            result: probe_result,
+        } = probe(
+            media.path(),
+            data.path(),
+            ImportFamilies {
+                edits: true,
+                tags: false,
+            },
+            &cancel,
+        )
+        else {
+            panic!("stable invalid source must have a non-writing probe owner");
+        };
+        assert!(matches!(
+            probe_result.edits,
+            SidecarProbeFamilyOutcome::Failed(_)
+        ));
+        assert!(
+            probe_result
+                .source_validation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("writes are disabled"))
+        );
+        probe_sidecar.set_adjust("probe-later.jpg", params(4.0));
+        assert!(!probe_sidecar.flush_blocking());
+        assert_eq!(std::fs::read(&source_path).unwrap(), original_source);
         let prepared = prepare(
             loaded,
             ImportFamilies {
@@ -1934,8 +2094,22 @@ mod tests {
         )
         .unwrap();
 
-        let result = current_result(commit(data.path(), prepared, &cancel));
-        assert!(matches!(result.edits, ImportFamilyOutcome::Failed(_)));
+        let SidecarImportCompletion::Current {
+            mut sidecar,
+            result,
+        } = commit(data.path(), prepared, &cancel)
+        else {
+            panic!("stable invalid source must remain a current, non-install-overwriting snapshot");
+        };
+        let ImportFamilyOutcome::Failed(_) = result.edits else {
+            panic!("escaping key must fail the edit family");
+        };
+        assert!(
+            result
+                .source_validation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("writes are disabled"))
+        );
         let adjustment =
             crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
                 .unwrap();
@@ -1945,6 +2119,59 @@ mod tests {
             adjustment.sidecar_sync_get(&crate::adjustment_db::normalize_path(media.path())),
             None
         );
+
+        sidecar.set_adjust("later.jpg", params(3.0));
+        assert!(
+            !sidecar.flush_blocking(),
+            "a validation-failed source must not report a later flush as durable"
+        );
+        assert_eq!(
+            std::fs::read(source_path).unwrap(),
+            original_source,
+            "a later edit must not overwrite the invalid source"
+        );
+    }
+
+    #[test]
+    fn invalid_unrequested_tag_content_disables_whole_file_writes() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_edit_stores(data.path());
+        let mut source = SidecarFile::new(media.path().to_path_buf());
+        source.set_adjust("valid.jpg", params(1.0));
+        source.set_tags("../escape.jpg", ["#tag"]);
+        let cancel = AtomicBool::new(false);
+        let loaded = flush_and_load(&mut source);
+        let source_path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        let original_source = std::fs::read(&source_path).unwrap();
+        let prepared = prepare(
+            loaded,
+            ImportFamilies {
+                edits: true,
+                tags: false,
+            },
+            &cancel,
+        )
+        .unwrap();
+
+        let SidecarImportCompletion::Current {
+            mut sidecar,
+            result,
+        } = commit(data.path(), prepared, &cancel)
+        else {
+            panic!("stable source must retain a typed current owner");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Applied(_)));
+        assert!(matches!(result.tags, ImportFamilyOutcome::NotRequested));
+        assert!(
+            result
+                .source_validation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("writes are disabled"))
+        );
+        sidecar.set_adjust("valid.jpg", params(9.0));
+        assert!(!sidecar.flush_blocking());
+        assert_eq!(std::fs::read(source_path).unwrap(), original_source);
     }
 
     #[test]
