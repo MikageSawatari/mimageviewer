@@ -62776,6 +62776,53 @@ mod tag_view_navigation_tests {
     use super::*;
 
     #[test]
+    fn toolbar_same_exact_tag_closes_to_the_saved_normal_folder() {
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("toolbar-tag-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.current_folder = Some(origin.clone());
+
+        app.activate_toolbar_tag_view_for_tag("猫");
+        assert!(app.tag_view.active);
+        assert_eq!(app.tag_view.query, "#猫");
+        assert_eq!(app.tag_view.last_executed, "#猫");
+        assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&origin));
+
+        app.activate_toolbar_tag_view_for_tag("猫");
+
+        assert!(!app.tag_view.active);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(app.tag_view.saved_folder.is_none());
+    }
+
+    #[test]
+    fn toolbar_different_or_pending_composite_tag_switches_without_closing() {
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("toolbar-tag-switch-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.current_folder = Some(origin.clone());
+
+        app.activate_toolbar_tag_view_for_tag("猫");
+        app.tag_view.query = "#猫 #犬".to_string();
+        app.activate_toolbar_tag_view_for_tag("猫");
+        assert!(
+            app.tag_view.active,
+            "an edited composite query is not a toggle"
+        );
+        assert_eq!(app.tag_view.query, "#猫");
+        assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&origin));
+
+        app.activate_toolbar_tag_view_for_tag("犬");
+        assert!(
+            app.tag_view.active,
+            "a different pinned tag switches results"
+        );
+        assert_eq!(app.tag_view.query, "#犬");
+        assert_eq!(app.tag_view.last_executed, "#犬");
+        assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&origin));
+    }
+
+    #[test]
     fn tag_view_nav_open_dedupes_and_close_clears_stack() {
         let mut app = setup_app();
         app.tag_view.active = true;
@@ -64391,6 +64438,36 @@ mod smart_folder_transition_tests {
         assert!(!app.global_search.active, "Ctrl+G must be closed");
         assert!(!app.tag_view.active, "Ctrl+T must be closed");
         assert!(!app.is_snapshot_active(), "Snapshot Lock must be released");
+    }
+
+    #[test]
+    fn toolbar_same_exact_tag_restores_the_saved_smart_folder() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("toolbar-tag-smart-origin");
+        let source = app.tmp.path().join("toolbar-tag-smart-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(source.join("book")).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Toolbar tag return", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let smart_path = crate::app::smart_folder::smart_folder_synthetic_path(id);
+
+        app.activate_toolbar_tag_view_for_tag("猫");
+        assert!(app.tag_view.active);
+        assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&smart_path));
+
+        app.activate_toolbar_tag_view_for_tag("猫");
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        assert!(!app.tag_view.active);
+        assert_eq!(app.current_folder.as_ref(), Some(&smart_path));
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.current_smart_folder_id, Some(id));
     }
 
     fn selected_real_path(app: &App) -> Option<&Path> {

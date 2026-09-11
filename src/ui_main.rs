@@ -191,11 +191,12 @@ fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
 }
 
 /// オーバーレイの下地色。文字と枠は `warn_fg_color` を載せるので、それが読める明度にする。
-/// 白い一覧の上で埋もれないことが目的なので、`Frame::popup` の既定 fill は使わない。
+/// 白い一覧の上で埋もれず、背後のチェック状態も判別できる半透明度にするため、
+/// `Frame::popup` の既定 fill は使わない。
 fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
     match dark_mode {
-        false => egui::Color32::from_rgb(255, 243, 209),
-        true => egui::Color32::from_rgb(66, 50, 20),
+        false => egui::Color32::from_rgba_unmultiplied(255, 243, 209, 220),
+        true => egui::Color32::from_rgba_unmultiplied(66, 50, 20, 220),
     }
 }
 
@@ -8884,7 +8885,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
         }
         if let Some(name) = toolbar_tag_search {
-            self.open_tag_view_for_tag(&name);
+            self.activate_toolbar_tag_view_for_tag(&name);
         }
         if let Some(name) = toolbar_tag_container {
             self.request_tag_toggle_for_current_container(&name);
@@ -8904,6 +8905,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
 
         toolbar_fav_nav
+    }
+
+    /// ピン留めタグの左クリックだけが使うタグビュー toggle。
+    ///
+    /// 検索欄の編集中 query や複合 query を「同じタグ」と誤認しないよう、ボタンから作る
+    /// canonical query が現在の query と最後に実行した query の両方に exact 一致した場合だけ
+    /// 既存の close 経路へ渡す。他のタグ導線は従来どおり open/switch のままにする。
+    pub(crate) fn activate_toolbar_tag_view_for_tag(&mut self, tag_name: &str) {
+        let query = crate::tags_db::format_display_tag(tag_name);
+        if query.is_empty() {
+            return;
+        }
+        if self.tag_view.active
+            && self.tag_view.query == query
+            && self.tag_view.last_executed == query
+        {
+            self.close_tag_view();
+        } else {
+            self.open_tag_view_for_tag(tag_name);
+        }
     }
 
     /// ツールバーの空き領域 右クリックメニュー (v2.0.0 Phase 3, §1.2 / §5)。
@@ -21359,6 +21380,69 @@ mod checked_selection_overlay_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn checked_selection_overlay_fill_is_translucent_in_both_themes() {
+        let light = checked_selection_overlay_fill(false);
+        let dark = checked_selection_overlay_fill(true);
+
+        assert_eq!(light.to_srgba_unmultiplied(), [255, 243, 209, 220]);
+        assert_eq!(dark.to_srgba_unmultiplied(), [66, 50, 20, 220]);
+        assert!(light.a() < u8::MAX && dark.a() < u8::MAX);
+
+        fn composite(foreground: egui::Color32, background: egui::Color32) -> [u8; 3] {
+            let [r, g, b, alpha] = foreground.to_srgba_unmultiplied();
+            let [br, bg, bb, _] = background.to_array();
+            let blend = |front: u8, back: u8| {
+                ((u32::from(front) * u32::from(alpha)
+                    + u32::from(back) * u32::from(u8::MAX - alpha)
+                    + 127)
+                    / 255) as u8
+            };
+            [blend(r, br), blend(g, bg), blend(b, bb)]
+        }
+
+        fn relative_luminance(rgb: [u8; 3]) -> f32 {
+            let channel = |value: u8| {
+                let value = f32::from(value) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+        }
+
+        fn contrast(left: egui::Color32, composite_rgb: [u8; 3]) -> f32 {
+            let left = relative_luminance(left.to_srgba_unmultiplied()[..3].try_into().unwrap());
+            let right = relative_luminance(composite_rgb);
+            (left.max(right) + 0.05) / (left.min(right) + 0.05)
+        }
+
+        let light_visuals = crate::os_theme::app_visuals(
+            crate::os_theme::ResolvedTheme::Light,
+            crate::settings::TextContrast::Standard,
+        );
+        let dark_visuals = crate::os_theme::app_visuals(
+            crate::os_theme::ResolvedTheme::Dark,
+            crate::settings::TextContrast::Standard,
+        );
+        assert!(
+            contrast(
+                light_visuals.warn_fg_color,
+                composite(light, egui::Color32::BLACK),
+            ) >= 4.5,
+            "light-theme warning text remains readable over a dark thumbnail"
+        );
+        assert!(
+            contrast(
+                dark_visuals.warn_fg_color,
+                composite(dark, egui::Color32::WHITE),
+            ) >= 4.5,
+            "dark-theme warning text remains readable over a bright thumbnail"
+        );
+    }
 
     #[test]
     fn checked_selection_overlay_is_absent_when_no_items_are_checked() {

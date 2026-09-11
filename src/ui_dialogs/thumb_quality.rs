@@ -32,7 +32,6 @@ use crate::ui_helpers::{
 const THUMB_QUALITY_DIALOG_ID: &str = "サムネイル画質設定";
 const THUMB_QUALITY_DIALOG_MARGIN: egui::Vec2 = egui::vec2(16.0, 24.0);
 const THUMB_QUALITY_COMPACT_WIDTH: f32 = 600.0;
-const THUMB_QUALITY_FOOTER_HEIGHT: f32 = 36.0;
 #[cfg(test)]
 const THUMB_QUALITY_DIALOG_OBSERVATION_ID: &str = "thumb_quality_dialog_observation";
 
@@ -326,6 +325,131 @@ mod tests {
     }
 
     #[test]
+    fn real_dialog_size_settles_without_growing_for_wide_and_narrow_layouts() {
+        for (mode, viewport, cell_size, cell_height) in [
+            (
+                GridViewMode::Thumbnail,
+                egui::vec2(1_280.0, 900.0),
+                320.0,
+                240.0,
+            ),
+            (
+                GridViewMode::Details,
+                egui::vec2(1_280.0, 900.0),
+                1_220.0,
+                28.0,
+            ),
+            (
+                GridViewMode::Thumbnail,
+                egui::vec2(480.0, 420.0),
+                240.0,
+                180.0,
+            ),
+            (
+                GridViewMode::Details,
+                egui::vec2(480.0, 420.0),
+                1_220.0,
+                28.0,
+            ),
+        ] {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts_with_settings(&ctx, &app.settings.ui_font);
+            prepare_dialog(&mut app, mode);
+            app.last_cell_size = cell_size;
+            app.last_cell_h = cell_height;
+            let expected_layout = thumb_quality_dialog_layout(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, viewport),
+                mode == GridViewMode::Thumbnail,
+                cell_size,
+                cell_height,
+                app.effective_thumb_aspect().height_ratio(),
+            );
+
+            let mut frame_heights = Vec::new();
+            let mut settled_heights = Vec::new();
+            for frame in 0..28 {
+                let rect = run_dialog_frame(&mut app, &ctx, viewport, Vec::new());
+                frame_heights.push(rect.height());
+                if frame >= 6 {
+                    settled_heights.push(rect.height());
+                }
+            }
+            let min = settled_heights
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min);
+            let max = settled_heights
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                max - min <= 1.0,
+                "{mode:?} at {viewport:?} kept growing after settlement: {settled_heights:?}"
+            );
+            if viewport.x >= 1_000.0 {
+                let final_height = *frame_heights.last().unwrap();
+                assert!(
+                    final_height <= expected_layout.default_size.y + 64.0,
+                    "{mode:?} grew from its calculated default toward the viewport maximum: \
+                     expected content height {:?}, frames {frame_heights:?}",
+                    expected_layout.default_size.y,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manual_window_resize_is_retained_after_twenty_frames() {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts_with_settings(&ctx, &app.settings.ui_font);
+        let viewport = egui::vec2(1_280.0, 900.0);
+        prepare_dialog(&mut app, GridViewMode::Details);
+
+        let mut before = egui::Rect::NOTHING;
+        for _ in 0..6 {
+            before = run_dialog_frame(&mut app, &ctx, viewport, Vec::new());
+        }
+        let corner = before.max - egui::vec2(2.0, 2.0);
+        run_dialog_frame(
+            &mut app,
+            &ctx,
+            viewport,
+            vec![
+                egui::Event::PointerMoved(corner),
+                pointer_button(corner, true),
+            ],
+        );
+        let resized_corner = corner + egui::vec2(80.0, 60.0);
+        run_dialog_frame(
+            &mut app,
+            &ctx,
+            viewport,
+            vec![egui::Event::PointerMoved(resized_corner)],
+        );
+        let resized = run_dialog_frame(
+            &mut app,
+            &ctx,
+            viewport,
+            vec![pointer_button(resized_corner, false)],
+        );
+        assert!(
+            resized.width() > before.width() + 40.0 && resized.height() > before.height() + 30.0,
+            "resize interaction did not enlarge the window: before={before:?}, resized={resized:?}"
+        );
+
+        let mut final_rect = resized;
+        for _ in 0..22 {
+            final_rect = run_dialog_frame(&mut app, &ctx, viewport, Vec::new());
+        }
+        assert!(
+            (final_rect.size() - resized.size()).abs().max_elem() <= 1.0,
+            "manual size must survive later auto-size passes: resized={resized:?}, final={final_rect:?}"
+        );
+    }
+
+    #[test]
     fn narrow_real_window_scroll_reaches_the_b_apply_response_without_saving() {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
@@ -512,24 +636,58 @@ impl App {
                 .max_size(layout.safe_rect.size())
                 .constrain_to(layout.safe_rect)
                 .show(ctx, |ui| {
-                    let available = ui.available_size().max(egui::vec2(1.0, 1.0));
-                    let footer_height = THUMB_QUALITY_FOOTER_HEIGHT.min(available.y);
-                    let body_size = egui::vec2(
-                        available.x,
-                        (available.y - footer_height - ui.spacing().item_spacing.y).max(0.0),
+                    let content_rect = ui.available_rect_before_wrap();
+                    let mut reserved = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(content_rect)
+                            .layout(egui::Layout::bottom_up(egui::Align::Min)),
                     );
-                    ui.allocate_ui_with_layout(
-                        body_size,
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_max_size(body_size);
-                            ui.spacing_mut().scroll =
-                                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
-                            egui::ScrollArea::vertical()
-                                .id_salt("thumb_quality_dialog_body")
-                                .auto_shrink([false, false])
-                                .max_height(body_size.y)
-                                .show(ui, |ui| {
+                    {
+                        let ui = &mut reserved;
+                            // Lay out the fixed controls first. Their measured height, the
+                            // separator, and the layout spacing are thereby removed from
+                            // `available_size` before the scroll body claims the remainder.
+                            // Keeping this bottom-up avoids feeding an estimated footer height
+                            // back into a resizable Window's next-frame auto-size calculation.
+                            let resize_corner = ui.visuals().resize_corner_size;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(
+                                    ui.available_width(),
+                                    ui.spacing().interact_size.y,
+                                ),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(resize_corner);
+                                    if ui.button("  閉じる  ").clicked() {
+                                        close_requested = true;
+                                    }
+                                    ui.label(format!(
+                                        "現在の設定: {}px / q={}",
+                                        self.settings.thumb_px, self.settings.thumb_quality
+                                    ));
+                                },
+                            );
+                            ui.separator();
+
+                            let body_rect = ui.available_rect_before_wrap();
+                            let mut body = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(body_rect)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            {
+                                    let ui = &mut body;
+                                    let body_size = body_rect.size().max(egui::vec2(1.0, 1.0));
+                                    ui.set_max_size(body_size);
+                                    ui.spacing_mut().scroll =
+                                        super::non_overlapping_dialog_scroll_style(
+                                            ui.spacing().scroll,
+                                        );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("thumb_quality_dialog_body")
+                                        .auto_shrink([false, false])
+                                        .max_height(body_size.y)
+                                        .show(ui, |ui| {
                                     ui.set_max_width(ui.available_width());
                                     if self.tq.sample.is_none() {
                                         if self.tq.load_pending.is_some() {
@@ -658,26 +816,13 @@ impl App {
                                             }
                                         });
                                     }
-                                });
-                        },
-                    );
-
-                    ui.separator();
-                    let resize_corner = ui.visuals().resize_corner_size;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), footer_height.max(1.0)),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(resize_corner);
-                            if ui.button("  閉じる  ").clicked() {
-                                close_requested = true;
+                                        });
                             }
-                            ui.label(format!(
-                                "現在の設定: {}px / q={}",
-                                self.settings.thumb_px, self.settings.thumb_quality
-                            ));
-                        },
-                    );
+                    }
+                    // The Window must observe exactly its current content rect. Child UIs above
+                    // perform the measured split without adding a trailing layout spacing to the
+                    // resizable container's next-frame `last_content_size`.
+                    ui.advance_cursor_after_rect(content_rect);
                     #[cfg(test)]
                     ui.ctx().data_mut(|data| {
                         data.insert_temp(
