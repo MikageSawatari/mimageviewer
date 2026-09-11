@@ -297,3 +297,309 @@ Stage 2 完了後に disposable portable と合成 fixture で実機確認する
 folder の初回 open が UI input/repaint を止めず、最初の thumbnail/fullscreen が補正済みで、
 navigation cancel と別 viewer が破壊されないこと。通常 `%APPDATA%` と既存 portable data は
 使わない。
+
+## 5. 2026-09-11 承認済みモーダル仕様による Stage 2 の縮小
+
+利用者は、sidecar 復旧が必要な限定的な open に限り「サイドカーから設定を復元中」と表示し、
+完了まで他の操作をすべて止める仕様を承認した。この仕様では、§4.4 の全 mutation producer に
+write permit と lossless deferred intent を実装する必要はない。§4.1 の folder-keyed job と
+複数 subscriber も使わず、一つの App-global state が一つの target context を最後まで所有する。
+§4 は待機中も利用者操作を許す仕様へ将来戻す場合の調査記録として残し、次版の実装範囲は本節で
+置き換える。
+
+操作を止めても、sidecar/DB I/O、writer の待機、preview cache の ACK 待ちは UI thread へ
+移さない。モーダルは競合する操作を新しく発生させないための仕様であり、UI thread を block する
+仕組みではない。worker の進捗待ちは毎 frame の poll と repaint deadline で進める。
+
+### 5.1 state owner と pause 位置
+
+`SidecarRestoreState` を App-global な一つの tagged state とし、少なくとも次の phase を持たせる。
+
+- `Checking`: strict load と read-only marker probe の worker を待つ
+- `Quiescing`: 既に受理済みの DB/sidecar writer を完了させ、その結果を反映する
+- `Running`: strict reload、prepare、Stage 1 commit または Missing marker clear を待つ
+- `InvalidatingPreview`: preview cache の clear completion を待つ
+- `Resuming`: DB hydrate と保留した load tail を一度だけ再開する
+
+別 bool、request field、modal field を並立させず、この state の存在自体を全入力 gate と modal の
+根拠にする。state は target の `ViewerContextId`、`items_generation`、normalized folder、request id、
+cancel、worker receiver、load continuation、必要なら deferred fullscreen intent を一体で所有する。
+completion は三つすべてが一致した target だけへ適用し、別 F12 viewer や次 generation へ移送しない。
+registry 上でも同じ target が coordinator に所有された mounted load context のままであることを確認し、
+retired/reused context id や sibling の at-rest state へ continuation を設置しない。
+
+pause 位置は `start_loading_items_inner` の旧同期 `import_sidecar_to_dbs` 呼出点である。ここまでに
+新 items と generation は target へ設置済みだが、6 DB の hydrate、catalog、thumbnail/video worker、
+selection/history と初回表示はまだ始まっていない。この位置で state を立ててから caller へ戻り、
+旧呼出より後ろの処理を typed continuation へ移す。関数入口で folder load 全体を分割して多数の
+caller に別の ownership を作らない。
+
+この関数は旧 import 点より前にも `flush_all_sidecars()` を呼ぶ。現 `SidecarWriter::enqueue` は channel
+send/spawn failure 時に呼出 thread で `write_one` へ同期 fallback するため、復旧候補の open ではそのまま
+UI thread から使わない。pre-flush 位置では dirty `SidecarFile` owner を typed bootstrap/continuation へ
+移し、worker へ渡す immutable `Arc` snapshot だけを作る。実際の queue、send-failure fallback、strict
+idle wait は worker 上で行う。original owner は結果が返るまで state が保持し、spawn/write failure の
+folder は dirty のまま App cache へ戻して DB import を始めない。既存 `SidecarWriter` の通常保存契約や
+coalescing queue を新しい UI-side admission API へ置き換えない。
+
+`Checking` worker はこの pre-flush batch を queue し、strict idle fence が成功した後にだけ最初の
+strict load/probe を行う。同じ folder を離れて直ちに開き直す場合も、未反映の in-process snapshot より
+古い disk を probe しない。pre-flush が無い場合も同じ worker request/result 型を使う。
+
+sidecar backup と tag sidecar backup が両方 OFF、prepared aggregate、synthetic search/rating/tag、
+remote-only source では復旧 state を開始せず、従来の tail を直ちに続ける。通常 folder はその folder、
+ZIP/PDF は実 container の parent を使い、UI thread の追加 `is_dir` ではなく列挙済み source kind から
+決める。metadata transfer など既存の App-global exclusive operation が進行中なら同時開始せず、
+同じ modal ownership の下でその terminal を先に待つ。
+
+### 5.2 worker probe と source cache
+
+common path で writer drain や write transaction を行わないため、最初の worker は Stage 1 に追加する
+read-only probe を呼ぶ。probe は strict `load_for_import` と、要求された edit/tag family の v2 marker
+照合を行い、write transaction、tag backup rotation、marker 更新を一切しない。結果は次を型で
+区別する。
+
+- 全 family が同期済み: source-current sidecar を保持し、conflicting writer が無ければ `Resuming` へ進む
+- Missing かつ marker も無い: empty sidecar を保持し、conflicting writer が無ければ `Resuming` へ進む
+- Missing で古い marker がある: `Quiescing` 後に worker で marker clear を行う
+- marker mismatch: probe snapshot は捨てて `Quiescing` へ進む
+- Unreadable/Corrupt/Unsupported/WriterFailed: disabled sidecar を保持し、marker を
+  変えず警告する。conflicting writer が無ければ `Resuming` へ進む
+- ChangedDuringRead または commit 前 revalidation mismatch: install 可能な sidecar を持たない
+  `SourceChanged` とし、後述の one-shot strict cache reload へ進む
+
+readable だが field の decode/domain/key が不正な場合も writer を止める前に検出できるよう、probe
+では transaction を作らない Stage 1 prepare/validation まで実行してよい。復旧実行時は probe の
+prepared value/source token を再利用しない。
+
+probe outcome が非書込み terminal でも、既に受理された local-adjust/edit-bundle などが commit 前なら、
+その時点の marker が一致していても初回 hydrate は stale になり得る。したがって、どの probe outcome
+でも Resume 前に全 drain 対象の barrier/readiness を確認する。`LocalAdjustWriteHandle` が存在する場合は
+queue snapshot が空でも後述の fence ACK を必ず待つ。それ以外も busy/unconsumed/debounce/queue が一つ
+でも残れば `Quiescing` へ進み、completion と sidecar mirror を反映し、flush fence 後に strict probe を
+やり直す。再 probe の current outcome だけから synchronized/terminal/recovery-required を判断する。
+local-adjust handle が無く、他の全 owner も exact に idle と確認できた synchronized/terminal path だけは
+drain せず直接 Resume できる。
+
+worker から受け取った `SidecarFile` は matching target の cache が未設置のときだけ install し、dirty
+cache を上書きしない。これは後日の `sidecar_mut` が巨大な `mimageviewer.dat` を UI thread で再読込
+することを防ぐためにも必要である。commit 前 revalidation で `SourceChanged` になった場合は stale
+completion を install せず、同じ worker の terminal step で一度だけ strict cache reload を行う。
+連続変更で current snapshot を得られなければ disabled placeholder を返し、UI thread の forgiving
+load へ fallback しない。spawn/channel failure も disabled placeholder と typed error で終端し、
+成功や marker 進行として扱わない。
+
+### 5.3 既存 writer の quiescence
+
+marker mismatch、marker clear、probe terminal 時に既存 writer が一つでも busy の場合、または
+local-adjust fence が必要な場合に `Quiescing` へ進む。新しい user operation は既に modal gate が
+止めているので、ここでは既存
+`metadata_transfer_writers_busy` と
+`quiesce_metadata_transfer_context_writers` の release/ACK/poll 機構を共通 helper に切り出して使う。
+少なくとも次を drain 対象にする。
+
+- tag writer の paused FIFO、legacy tag seed、tag maintenance と App の `tags_db` release/ACK
+- rating、local-adjust、edit preview、book/bookmark、book page copy/move
+- metadata transfer、rename migration、delete/purge、drop copy、新規 folder、batch convert、capture
+- single/bulk edit bundle と content-identity restore
+- `FavoriteViewWriteDebounce` と `FavoriteViewStoreWriter`
+
+`LocalAdjustWriteHandle::has_unfinished_work()` は開始判定の hint にだけ使う。worker は queue item と
+document を取り出してから `process_write` を実行し、completion を送るまでの間、queue、documents、
+result channel がすべて空に見えるためである。state 開始後の新 producer を止めた上で
+`enqueue_fence()` を一度だけ queue 末尾へ積み、UI は非blocking に ACK を poll する。ACK より前に
+publish 済みの全 completion を通常 `apply_local_adjust_write_completion` へ通して sidecar mirror を
+反映し、`local_adjust_write_pending` も空になった後だけ flush/re-probe へ進む。fence の enqueue failure、
+disconnect、worker stop は quiescence failure として import を開始しない。
+
+worker は cancel して値を捨てず、既に受理した job と queue を finite terminal まで進め、その result と
+sidecar mirror を通常 owner へ適用する。queue が空で worker が idle になっただけでは完了にせず、
+completion が UI owner に消費されたことを fence/ACK に含める。writer failure は sidecar import を
+開始せず typed error で modal を終端し、元の operation が保持する retry/通知契約を維持する。復旧の
+ために同じ失敗を無限再投入しない。次段落の favorite-view だけは、失敗 command 自体をこの state が
+保持できるため、intent を失わずに quiescent と判定して import を続けられる明示的な例外である。
+
+favorite-view は `adjustment.db` writer だが既存 helper から漏れており、500 ms debounce もある。
+`Checking` の state 設置から modal 解除まで通常の favorite reconcile/retry submit を止める。
+`Quiescing` では一度だけ `take_all` した command を
+`retry=false` で submit し、全 result の消費と `is_busy == false` を待つ。submit/result failure の
+command は `SidecarRestoreState` が lossless に保持する。DB import の終了後、modal を解く直前に Set は
+通常 debounce、Remove/Clear は順序を保つ FIFO へ戻す。失敗を捨てたり、復旧中に再試行 loop を回したり
+しない。この限定された intent 保持だけを追加し、§4.4 の全 producer 用 deferred-intent 層は作らない。
+
+全 DB completion と sidecar mirror の反映後、state は dirty owner から immutable flush batch を作る。
+recovery worker が既存 SidecarWriter への queue と send-failure fallback を実行し、process-global writer の
+bounded strict idle fence を待つ。UI thread は serialize/write/idle wait を行わない。spawn、writer、
+mutex poison、timeout の失敗では original dirty owner を App cache へ戻し、import を開始しない。idle 後に
+strict probe/load をやり直し、synchronized なら Resume、mismatch ならその新しい owner だけを
+`prepare -> commit` へ渡す。
+これにより、probe と quiescence の間に完了した in-process write を古い probe snapshot で取り込まない。
+
+Missing marker clear も UI thread の既存 DB handle では行わない。canonical DB path と要求 family を
+worker へ値渡しし、edit marker と tag marker をそれぞれの transaction/outcome で clear する。
+cancel、busy、fault では当該 marker を clear 済みと報告しない。
+
+### 5.4 modal と全入力経路
+
+`modal_dialog_block_reason()` は `SidecarRestoreState` を一つの理由として参照する。main grid、embedded
+fullscreen、全 egui viewport は同じ「サイドカーから設定を復元中」表示を使う。state 開始時と各 frame
+で keyboard、text/IME、pointer、wheel、touch、gamepad、shortcut、right-drag など semantic input を
+consume/discard し、button/key release edge だけは hold state の解消へ反映する。入力を保存して modal
+解除後に replay しない。state の解除は `Resuming` が完了した frame の全入力処理より後の App outer
+tail で行い、同じ frame に残った event が通常操作として発火しないようにする。
+
+エクスプローラからの raw dropped file と single-instance activation open path も開始時と各 frame に
+drain/discard する。activation queue を未消費で保持すると解除後に navigation が発火するため不可とする。
+metadata transfer、複数 F12 context、別 viewport からの操作も同じ App-global gate を見る。
+
+main と全 egui viewport の利用者 close は active 中 `ViewportCommand::CancelClose` で抑止する。modal に
+Cancel button や Escape close は置かない。`on_exit` や UI thread で worker を join しない。native video
+と passive detached callback は common modal を迂回するため、個別の sidecar-restore event classifier
+を入口に置く。利用者由来の Close、focus activation、right-drag、parked-live activation、navigation を
+捨て、App-owned mouse/key hold を release/cancel する。一方、OS `Destroyed`、placement の
+Ready/Committed/Retired/Aborted、DPI/geometry/focus bookkeeping、decoder/Anime4K completion など
+不可避の lifecycle/result は処理し続ける。sibling close も許さず、不可避に破棄された target だけを
+generation 不一致として終端する。
+
+この close 抑止には残余リスクがある。`std::fs` の network filesystem read/write は hard cancel や
+移植可能な I/O timeout を持たず、OS/driver が永久に返さなければ worker completion も来ず、承認済みの
+「完了まで全操作を止める」仕様では通常 close もできない。repaint watchdog は stall を記録できるが、
+処理を安全に完了したことにはできない。実装時はこの制約を log/運用記録へ残し、timeout を success や
+marker 進行に変換しない。network data-dir/source の hard-cancel 対応は別 scope とする。
+
+native presenter の中へ新しい dialog renderer は追加しない。通常の folder 切替で既存 presentation
+close が owning egui viewport を露出することを portable test で確認する。opaque native surface が
+残って main/egui modal を隠す経路が見つかった場合は、既存の非同期 presenter close terminal を
+`Quiescing` に含めて modal を露出し、reopen intent を保持する。同期 Win32 待機で隠さない。この方法で
+表示できない場合だけ native-painted modal を別 scope とする。
+
+remote session の acquire/release、disconnect、transport drain など ownership lifecycle は継続する。
+mutation、navigation、user Stop/Close request は protocol の typed `Busy`（HTTP は既存 503）を返し、
+黙って捨てたり解除後に replay したりしない。`BookResumeRead` のような read-only request は現在の
+authoritative state を返してよい。reply 型に Busy が無い mutation は配線前に型を追加する。
+
+### 5.5 初回表示と continuation の完了順
+
+`start_loading_items_inner` から戻った直後に ZIP/PDF finalize や startup caller が
+`open_fullscreen` を直接呼ぶ経路がある。全入口が集約される `open_fullscreen` 冒頭で restore state を
+確認し、matching target の presentation intent だけを state に保持する。raw/final texture request、
+metadata load、video/native presenter、fullscreen worker は起動しない。利用者入力による二つ目の intent
+は input gate で破棄する。intent は context/generation と stable item identity を持ち、復旧 terminal
+後に再照合できた場合だけ通常 `open_fullscreen` を一度呼ぶ。
+
+`Current` completion だけを cache/install 対象にし、family outcome は独立に扱う。edit success/tag
+failure、またはその逆でも、成功 family の transaction/marker は維持し、失敗 family の marker は
+進めない。channel disconnect のように outcome が不明なら DB marker と中央 row を再読込し、推測で
+success にしない。
+
+初回の thumbnail/fullscreen を補正済みにするため、terminal 後は次の順を固定する。
+
+1. edit family に一件でも変化があれば `edit_preview_cache.clear_with_completion()` を発行し、その ACK
+   を `InvalidatingPreview` で待つ。この前に thumbnail worker を開始しない
+2. comic 変化時に `comic_docs` を無効化し、edit/tag の smart-folder/rollup key を refresh する
+3. adjustment/local/crop/mask/conceal/comic を中央 DB から target generation へ hydrate し、probe 前に
+   prewarm 済みだった tag cache も Applied tag outcome 後に再 hydrate する
+4. catalog、thumbnail/video worker、selection/history を保留した既存 tail の順序で再開する
+5. deferred fullscreen intent を通常入口へ戻す
+6. favorite の保留失敗 command を通常 owner へ戻し、その frame の入力処理後に modal を解除する
+
+error、Missing、partial success でも同じ中央 DB hydrate を行い、閲覧を続ける。target context が
+不可避に消滅した場合は continuation と presentation intent を破棄するが、commit 済みの正しい中央 row
+と marker は残す。別 context の items/cache/worker は clear、cancel、hydrate しない。
+
+### 5.6 別 process と線形化点
+
+同じ build flavor で同じ data directory を使う二重起動は、既存 `SingleInstanceGuard` の
+data-dir hash 付き named mutex が排除する。一方、portable と non-portable は base mutex 名が異なるため、
+意図的に同じ `--data-dir` を渡した cross-flavor process、旧版、mIV 以外の SQLite client までは App の
+modal で止められない。そこでは Stage 1 の transaction 契約を維持する。別 writer が先に row を作れば
+transaction 内の
+`INSERT ... ON CONFLICT DO NOTHING` でその row が勝つ。import が先なら、その後の通常 setter/update が
+勝つ。lock を取れなければ family は rollback し marker を進めず、UI は worker の typed failure を
+受ける。
+
+ただし、import が先に write lock を取った短い区間に、busy timeout が無い旧版/cross-flavor viewer の
+UI writer が来た場合、その相手の書込み失敗まで本 process から防ぐことはできない。cross-flavor で一つの
+data directory を同時利用する構成まで正式対応するには、flavor に依存しない per-data-dir interprocess
+mutex を全 writer が取得するか、全 producer が Busy intent を保持して再適用する必要があり、§5 の
+縮小範囲を再び超える。次版の §1.209 では同一 build flavor の既存 single-instance 構成を対応範囲とし、
+cross-flavor shared data-dir について「相手を破壊しない/書込みを失敗させない」とは報告しない。
+
+Disk source の commit 直前 digest revalidation 完了を復旧 snapshot の線形化点とする。それ以前の
+sidecar change は `SourceChanged` で row/marker を書かず、それ以後の external change は次の marker
+mismatch とする。load から commit まで external tool の write/delete を拒否する file lease は、
+外部 tool の保存を失敗させる新仕様なので追加しない。中央 DB の既存 row を sidecar が上書きしない
+authoritative 契約も維持する。
+
+### 5.7 実装範囲と見積り
+
+想定 production 差分は 10--12 file である。
+
+- state/continuation/modal: `src/app.rs`、新規 `src/app/sidecar_restore.rs`、新規
+  `src/ui_dialogs/sidecar_restore.rs`、`src/ui_dialogs/mod.rs`
+- probe/marker clear/writer fence: `src/sidecar_import.rs`、`src/sidecar.rs`
+- drain と favorite intent 保持: `src/ui_dialogs/metadata_transfer.rs`、
+  `src/favorite_view_state.rs`
+- bypass gate: `src/app/native_video.rs`、`src/ui_fullscreen.rs`、
+  `src/app/startup_ops.rs`、`src/remote_ipc/ui.rs`
+
+test は主に新 module の pure transition test、既存 `src/app/tests.rs`、Stage 1 integration fixture へ
+置く。実装、focused test、独立 review と修正で 14--22 時間（2--3 開発日）、最後の disposable
+portable smoke は別に 60--90 分を見込む。portable test で native surface が modal を隠し、既存の
+非同期 close でも露出できないと判明して native-painted modal が必要になれば、native presenter/render
+core と snapshot を追加するため 4--6 時間を別途見込む。
+
+### 5.8 受入 test
+
+- `Checking -> Synced -> Resuming` と `Checking -> Quiescing -> Checking(re-probe) -> Running ->
+  InvalidatingPreview -> Resuming` の pure state transition
+- state が旧 import 点で caller return より先に立ち、6 DB hydrate/catalog/thumbnail/video が未開始で
+  あること
+- tag release/ACK/paused FIFO、local-adjust、book/copy、rename/delete、content-identity/edit-bundle の
+  completion と sidecar mirror を consume 後にだけ flush/reload/import すること
+- pre-flush と最終 flush の channel/spawn failure で UI thread の serialize/write が 0 回、worker が
+  既存 queue/fallback を所有し、失敗 folder の dirty owner が cache に戻って import/marker が始まらないこと
+- synchronized/Missing/disabled probe 中に local-adjust/edit-bundle/favorite completion が残る race で
+  即 Resume せず、全 completion/mirror 反映と flush 後の strict re-probe を通ること
+- local-adjust worker を queue/document の pop 後、`process_write` 内で停止して
+  `has_unfinished_work == false` となる窓でも、fence ACK、completion 適用、pending map の解消前には
+  Resume/flush/import しないこと
+- favorite debounce/in-flight/submit failure/result failure を有限に drain し、失敗 command が modal 後の
+  通常 owner へ順序どおり戻ること
+- main/embedded/detached/native/passive/gamepad/activation/drop/remote の gate table。全 user close と
+  semantic input は抑止し、release edge と不可避 lifecycle/result は進むこと
+- ZIP/PDF の caller が folder load 直後に fullscreen を要求しても intent だけを保持し、terminal 前に
+  raw/final/metadata/video worker を一つも起動しないこと
+- preview clear ACK が最初の thumbnail spawn より先で、comic/rollup、6 DB hydrate、Applied tag cache
+  refresh を終えた初回表示だけが許可されること
+- target id/generation/folder mismatch、不可避 target destruction、複数 F12 sibling の非破壊
+- Missing marker clear、source change、edit/tag partial、busy、fault、panic/channel disconnect の
+  no-false-marker と DB-only recovery
+- 別 connection が import の prepare 前、transaction 待機中、commit 後に row を書く三つの順序
+
+自動 test と build gate 後、使い捨て portable と 430 mixed 合成 fixture で、modal が repaint し、
+keyboard/mouse/close/F12/activation/remote mutation を抑止しながら UI thread が heartbeat を続けること、
+最初の thumbnail/fullscreen が補正済みであることを確認する。通常 `%APPDATA%`、既存 portable data、
+実 sidecar は使わない。
+
+### 5.9 実装 A: worker engine 境界
+
+UI 配線に先行する実装 A は `src/sidecar.rs` と `src/sidecar_import.rs` に限定した。
+`SidecarFlushOwners` は UI cache から移した全 owner を保持し、dirty snapshot だけを
+`SidecarFlushBatch` として worker へ移す。
+通常の `queue_flush` 契約は変更せず、worker 上で既存 queue と channel failure fallback を使い、
+strict bounded idle fence 後の成功だけが retained owner の dirty を解除する。write、spawn 相当の
+channel disconnect、timeout、poison、結果件数不一致は元の dirty owner を返し、復旧を開始しない。
+owner と worker result は batch 固有の型内部 identity で再結合し、別 flush の同件数 result では dirty を
+解除できない。
+
+read-only `probe` は strict source load、全 field validation、edit/tag marker 照合を行い、SQLite write と
+tag backup rotationを行わない。Missing marker clear は canonical `adjustment.db` / `tags.db` だけを開き、
+family ごとの `BEGIN IMMEDIATE` transaction と outcome を持つ。source が新しく現れた場合、cancel、fault、
+busy ではその family を成功扱いせず、別 family の確定済み outcome は明示して維持する。
+
+この段階では App、modal、writer drain、load continuation、preview ACK を配線していないため、単独では
+UI 停止を解決しない。TempDir の焦点検証では lib sidecar-import 27 件、worker flush 5 件、strict
+queue/idle 2 件、owner resolution 2 件、Missing revalidation 1 件、既存 integration 14 件が成功した。
+430 mixed integration の再計測は load 13.282 ms、prepare 6.104 ms、transaction 13.858 ms、commit
+19.391 ms、engine 25.495 ms、end-to-end 38.777 ms であり、UI 配線後の応答性を保証する値ではない。

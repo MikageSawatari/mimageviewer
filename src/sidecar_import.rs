@@ -1,18 +1,19 @@
 //! Transactional sidecar-to-database import engine.
 //!
-//! This module deliberately has no `App` or UI wiring.  It is the stage-one
-//! boundary for moving sidecar import to a worker: loading produces a typed
-//! source identity, preparation performs every fallible decode/serialization
-//! before database locks are taken, and commit uses one transaction for all six
-//! edit stores.  The caller still owns navigation, viewer generations, cache
-//! application, and cancellation lifecycle.
+//! This module deliberately has no `App` or UI wiring.  It owns the worker-safe
+//! engine boundary for sidecar recovery: loading produces a typed source
+//! identity, preparation performs every fallible decode/serialization before
+//! database locks are taken, commit uses one transaction for all six edit
+//! stores, and the Stage 2 probe/marker-clear primitives expose typed terminal
+//! states.  The caller still owns navigation, viewer generations, cache
+//! application, writer quiescence, and cancellation lifecycle.
 
 use std::io::Read;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::sidecar::{
     ImportStats, LoadedSidecarImport, RelKeyKind, SidecarFile, SidecarImportSource, SidecarMask,
@@ -32,6 +33,84 @@ impl ImportFamilies {
         edits: true,
         tags: true,
     };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidecarProbeFamilyOutcome {
+    NotRequested,
+    AlreadySynchronized,
+    ImportRequired,
+    MarkerClearRequired,
+    Cancelled,
+    SourceChanged(String),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarProbeResult {
+    pub edits: SidecarProbeFamilyOutcome,
+    pub tags: SidecarProbeFamilyOutcome,
+    pub load_elapsed: Duration,
+    pub prepare_elapsed: Duration,
+    pub probe_elapsed: Duration,
+}
+
+/// Read-only decision for the Stage 2 restore coordinator.
+///
+/// Only `Current` exposes a `SidecarFile` that may be installed as a current
+/// cache value.  Write-required and source-changed variants deliberately expose
+/// no snapshot; the coordinator must drain writers and run a strict operation.
+pub enum SidecarImportProbe {
+    Current {
+        sidecar: SidecarFile,
+        result: SidecarProbeResult,
+    },
+    ImportRequired {
+        result: SidecarProbeResult,
+    },
+    MarkerClearRequired {
+        result: SidecarProbeResult,
+    },
+    SourceChanged {
+        error: String,
+        result: SidecarProbeResult,
+    },
+    Cancelled {
+        result: SidecarProbeResult,
+    },
+    Failed {
+        error: String,
+        result: SidecarProbeResult,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkerClearReport {
+    pub marker_cleared: bool,
+    pub transaction_committed: bool,
+    pub transaction_elapsed: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingMarkerClearResult {
+    pub edits: ImportFamilyOutcome<MarkerClearReport>,
+    pub tags: ImportFamilyOutcome<MarkerClearReport>,
+    pub elapsed: Duration,
+}
+
+/// Terminal result of clearing markers for a source that was strictly Missing.
+pub enum MissingMarkerClearCompletion {
+    Current {
+        sidecar: SidecarFile,
+        result: MissingMarkerClearResult,
+    },
+    SourceChanged {
+        error: String,
+        result: MissingMarkerClearResult,
+    },
+    Cancelled {
+        result: MissingMarkerClearResult,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -239,6 +318,685 @@ pub fn prepare(
             PreparedFamily::Ready(tag_items)
         },
         prepare_elapsed: started.elapsed(),
+    })
+}
+
+/// Strictly load, validate, and inspect v2 markers without mutating a database.
+///
+/// This function performs filesystem reads, decoding, and SQLite reads and must
+/// run on a worker.  A current snapshot is returned only when no requested
+/// family needs a write.  Stage 2 must still establish its writer barriers
+/// before installing the snapshot or resuming first-display hydration.
+pub fn probe(
+    folder: &Path,
+    data_dir: &Path,
+    families: ImportFamilies,
+    cancel: &AtomicBool,
+) -> SidecarImportProbe {
+    let started = Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        return SidecarImportProbe::Cancelled {
+            result: probe_result(
+                started,
+                Duration::ZERO,
+                Duration::ZERO,
+                requested_probe_cancelled(families.edits),
+                requested_probe_cancelled(families.tags),
+            ),
+        };
+    }
+
+    let load_started = Instant::now();
+    let loaded = SidecarFile::load_for_import(folder);
+    let load_elapsed = load_started.elapsed();
+    match loaded {
+        crate::sidecar::SidecarImportLoad::Loaded(loaded) => {
+            let prepared = match prepare(loaded, families, cancel) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return SidecarImportProbe::Failed {
+                        error: error.clone(),
+                        result: probe_result(
+                            started,
+                            load_elapsed,
+                            Duration::ZERO,
+                            requested_probe_failed(families.edits, &error),
+                            requested_probe_failed(families.tags, &error),
+                        ),
+                    };
+                }
+            };
+            let PreparedSidecarImport {
+                folder_key,
+                sidecar,
+                source,
+                edits,
+                tags,
+                prepare_elapsed,
+            } = prepared;
+            if cancel.load(Ordering::Relaxed)
+                || prepared_family_cancelled(&edits)
+                || prepared_family_cancelled(&tags)
+            {
+                return SidecarImportProbe::Cancelled {
+                    result: probe_result(
+                        started,
+                        load_elapsed,
+                        prepare_elapsed,
+                        reject_probe_cancelled(edits),
+                        reject_probe_cancelled(tags),
+                    ),
+                };
+            }
+            let marker = match &source {
+                SidecarImportSource::Disk(token) => Some(token.sync_marker()),
+                SidecarImportSource::PendingWriter { .. } => None,
+            };
+            let mut edit_outcome =
+                probe_prepared_family(edits, data_dir, &folder_key, marker, MarkerStore::Edits);
+            let mut tag_outcome =
+                probe_prepared_family(tags, data_dir, &folder_key, marker, MarkerStore::Tags);
+            if cancel.load(Ordering::Relaxed) {
+                edit_outcome = reject_probe_outcome_cancelled(edit_outcome);
+                tag_outcome = reject_probe_outcome_cancelled(tag_outcome);
+                return SidecarImportProbe::Cancelled {
+                    result: probe_result(
+                        started,
+                        load_elapsed,
+                        prepare_elapsed,
+                        edit_outcome,
+                        tag_outcome,
+                    ),
+                };
+            }
+            if let Err(error) = crate::sidecar::revalidate_import_source(&sidecar, &source) {
+                edit_outcome = reject_probe_outcome_source_changed(edit_outcome, &error);
+                tag_outcome = reject_probe_outcome_source_changed(tag_outcome, &error);
+                return SidecarImportProbe::SourceChanged {
+                    error,
+                    result: probe_result(
+                        started,
+                        load_elapsed,
+                        prepare_elapsed,
+                        edit_outcome,
+                        tag_outcome,
+                    ),
+                };
+            }
+            let result = probe_result(
+                started,
+                load_elapsed,
+                prepare_elapsed,
+                edit_outcome,
+                tag_outcome,
+            );
+            if probe_requires_import(&result) {
+                SidecarImportProbe::ImportRequired { result }
+            } else {
+                SidecarImportProbe::Current { sidecar, result }
+            }
+        }
+        crate::sidecar::SidecarImportLoad::Missing { sidecar } => {
+            let folder_key = crate::adjustment_db::normalize_path(folder);
+            let mut edit_outcome =
+                probe_missing_family(families.edits, data_dir, &folder_key, MarkerStore::Edits);
+            let mut tag_outcome =
+                probe_missing_family(families.tags, data_dir, &folder_key, MarkerStore::Tags);
+            if cancel.load(Ordering::Relaxed) {
+                edit_outcome = reject_probe_outcome_cancelled(edit_outcome);
+                tag_outcome = reject_probe_outcome_cancelled(tag_outcome);
+                return SidecarImportProbe::Cancelled {
+                    result: probe_result(
+                        started,
+                        load_elapsed,
+                        Duration::ZERO,
+                        edit_outcome,
+                        tag_outcome,
+                    ),
+                };
+            }
+            if let Err(error) = crate::sidecar::revalidate_missing_import_source(folder) {
+                edit_outcome = reject_probe_outcome_source_changed(edit_outcome, &error);
+                tag_outcome = reject_probe_outcome_source_changed(tag_outcome, &error);
+                return SidecarImportProbe::SourceChanged {
+                    error,
+                    result: probe_result(
+                        started,
+                        load_elapsed,
+                        Duration::ZERO,
+                        edit_outcome,
+                        tag_outcome,
+                    ),
+                };
+            }
+            let result = probe_result(
+                started,
+                load_elapsed,
+                Duration::ZERO,
+                edit_outcome,
+                tag_outcome,
+            );
+            if probe_requires_marker_clear(&result) {
+                SidecarImportProbe::MarkerClearRequired { result }
+            } else {
+                SidecarImportProbe::Current { sidecar, result }
+            }
+        }
+        crate::sidecar::SidecarImportLoad::Unreadable { sidecar, error }
+        | crate::sidecar::SidecarImportLoad::Corrupt { sidecar, error } => {
+            terminal_probe(started, load_elapsed, sidecar, families, error)
+        }
+        crate::sidecar::SidecarImportLoad::UnsupportedVersion { sidecar, version } => {
+            terminal_probe(
+                started,
+                load_elapsed,
+                sidecar,
+                families,
+                format!("sidecar version {version} is newer than this application"),
+            )
+        }
+        crate::sidecar::SidecarImportLoad::WriterFailed { sidecar } => terminal_probe(
+            started,
+            load_elapsed,
+            sidecar,
+            families,
+            "sidecar writer previously failed for this folder".to_string(),
+        ),
+        crate::sidecar::SidecarImportLoad::ChangedDuringRead { .. } => {
+            let error = "sidecar changed while its import snapshot was being read".to_string();
+            SidecarImportProbe::SourceChanged {
+                error: error.clone(),
+                result: probe_result(
+                    started,
+                    load_elapsed,
+                    Duration::ZERO,
+                    requested_probe_source_changed(families.edits, &error),
+                    requested_probe_source_changed(families.tags, &error),
+                ),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MarkerStore {
+    Edits,
+    Tags,
+}
+
+impl MarkerStore {
+    fn path_and_table(self, data_dir: &Path) -> (std::path::PathBuf, &'static str) {
+        match self {
+            Self::Edits => (data_dir.join("adjustment.db"), "sidecar_sync"),
+            Self::Tags => (data_dir.join("tags.db"), "tag_sidecar_sync"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Edits => "edit",
+            Self::Tags => "tag",
+        }
+    }
+}
+
+fn probe_result(
+    started: Instant,
+    load_elapsed: Duration,
+    prepare_elapsed: Duration,
+    edits: SidecarProbeFamilyOutcome,
+    tags: SidecarProbeFamilyOutcome,
+) -> SidecarProbeResult {
+    SidecarProbeResult {
+        edits,
+        tags,
+        load_elapsed,
+        prepare_elapsed,
+        probe_elapsed: started.elapsed(),
+    }
+}
+
+fn terminal_probe(
+    started: Instant,
+    load_elapsed: Duration,
+    sidecar: SidecarFile,
+    families: ImportFamilies,
+    error: String,
+) -> SidecarImportProbe {
+    SidecarImportProbe::Current {
+        sidecar,
+        result: probe_result(
+            started,
+            load_elapsed,
+            Duration::ZERO,
+            requested_probe_failed(families.edits, &error),
+            requested_probe_failed(families.tags, &error),
+        ),
+    }
+}
+
+fn requested_probe_cancelled(requested: bool) -> SidecarProbeFamilyOutcome {
+    if requested {
+        SidecarProbeFamilyOutcome::Cancelled
+    } else {
+        SidecarProbeFamilyOutcome::NotRequested
+    }
+}
+
+fn requested_probe_failed(requested: bool, error: &str) -> SidecarProbeFamilyOutcome {
+    if requested {
+        SidecarProbeFamilyOutcome::Failed(error.to_string())
+    } else {
+        SidecarProbeFamilyOutcome::NotRequested
+    }
+}
+
+fn requested_probe_source_changed(requested: bool, error: &str) -> SidecarProbeFamilyOutcome {
+    if requested {
+        SidecarProbeFamilyOutcome::SourceChanged(error.to_string())
+    } else {
+        SidecarProbeFamilyOutcome::NotRequested
+    }
+}
+
+fn reject_probe_cancelled<T>(family: PreparedFamily<T>) -> SidecarProbeFamilyOutcome {
+    match family {
+        PreparedFamily::NotRequested => SidecarProbeFamilyOutcome::NotRequested,
+        PreparedFamily::Ready(_) | PreparedFamily::Cancelled => {
+            SidecarProbeFamilyOutcome::Cancelled
+        }
+        PreparedFamily::Failed(error) => SidecarProbeFamilyOutcome::Failed(error),
+    }
+}
+
+fn reject_probe_outcome_cancelled(outcome: SidecarProbeFamilyOutcome) -> SidecarProbeFamilyOutcome {
+    match outcome {
+        SidecarProbeFamilyOutcome::NotRequested => SidecarProbeFamilyOutcome::NotRequested,
+        SidecarProbeFamilyOutcome::Failed(error) => SidecarProbeFamilyOutcome::Failed(error),
+        _ => SidecarProbeFamilyOutcome::Cancelled,
+    }
+}
+
+fn reject_probe_outcome_source_changed(
+    outcome: SidecarProbeFamilyOutcome,
+    error: &str,
+) -> SidecarProbeFamilyOutcome {
+    match outcome {
+        SidecarProbeFamilyOutcome::NotRequested => SidecarProbeFamilyOutcome::NotRequested,
+        SidecarProbeFamilyOutcome::Failed(error) => SidecarProbeFamilyOutcome::Failed(error),
+        SidecarProbeFamilyOutcome::Cancelled => SidecarProbeFamilyOutcome::Cancelled,
+        _ => SidecarProbeFamilyOutcome::SourceChanged(error.to_string()),
+    }
+}
+
+fn probe_prepared_family<T>(
+    family: PreparedFamily<T>,
+    data_dir: &Path,
+    folder_key: &str,
+    marker: Option<i64>,
+    store: MarkerStore,
+) -> SidecarProbeFamilyOutcome {
+    match family {
+        PreparedFamily::NotRequested => SidecarProbeFamilyOutcome::NotRequested,
+        PreparedFamily::Cancelled => SidecarProbeFamilyOutcome::Cancelled,
+        PreparedFamily::Failed(error) => SidecarProbeFamilyOutcome::Failed(error),
+        PreparedFamily::Ready(_) => {
+            let Some(marker) = marker else {
+                return SidecarProbeFamilyOutcome::ImportRequired;
+            };
+            match read_marker(data_dir, folder_key, store) {
+                Ok(Some(current)) if current == marker => {
+                    SidecarProbeFamilyOutcome::AlreadySynchronized
+                }
+                Ok(_) => SidecarProbeFamilyOutcome::ImportRequired,
+                Err(error) => SidecarProbeFamilyOutcome::Failed(error),
+            }
+        }
+    }
+}
+
+fn probe_missing_family(
+    requested: bool,
+    data_dir: &Path,
+    folder_key: &str,
+    store: MarkerStore,
+) -> SidecarProbeFamilyOutcome {
+    if !requested {
+        return SidecarProbeFamilyOutcome::NotRequested;
+    }
+    match read_marker(data_dir, folder_key, store) {
+        Ok(Some(_)) => SidecarProbeFamilyOutcome::MarkerClearRequired,
+        Ok(None) => SidecarProbeFamilyOutcome::AlreadySynchronized,
+        Err(error) => SidecarProbeFamilyOutcome::Failed(error),
+    }
+}
+
+fn read_marker(
+    data_dir: &Path,
+    folder_key: &str,
+    store: MarkerStore,
+) -> Result<Option<i64>, String> {
+    let (path, table) = store.path_and_table(data_dir);
+    if !path.is_file() {
+        return Err(format!(
+            "required {} marker store is missing: {}",
+            store.label(),
+            path.display()
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot open {} marker store read-only: {error}",
+            store.label()
+        )
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("cannot configure marker read timeout: {error}"))?;
+    connection
+        .query_row(
+            &format!("SELECT sidecar_mtime FROM {table} WHERE folder_key = ?1"),
+            [folder_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("cannot read {} sidecar marker: {error}", store.label()))
+}
+
+fn probe_requires_import(result: &SidecarProbeResult) -> bool {
+    matches!(&result.edits, SidecarProbeFamilyOutcome::ImportRequired)
+        || matches!(&result.tags, SidecarProbeFamilyOutcome::ImportRequired)
+}
+
+fn probe_requires_marker_clear(result: &SidecarProbeResult) -> bool {
+    matches!(
+        &result.edits,
+        SidecarProbeFamilyOutcome::MarkerClearRequired
+    ) || matches!(&result.tags, SidecarProbeFamilyOutcome::MarkerClearRequired)
+}
+
+/// Clear edit/tag markers after a strict Missing load.
+///
+/// Each family owns a separate transaction and outcome.  The source is checked
+/// before either transaction and again between them, so a newly created or
+/// pending sidecar never looks synchronized.  Marker absence is conservative:
+/// an external file created after the final check will mismatch on the next
+/// probe rather than being skipped.
+pub fn clear_missing_markers(
+    folder: &Path,
+    data_dir: &Path,
+    families: ImportFamilies,
+    cancel: &AtomicBool,
+) -> MissingMarkerClearCompletion {
+    clear_missing_markers_with_progress(folder, data_dir, families, cancel, &mut |_, _| {})
+}
+
+fn clear_missing_markers_with_progress(
+    folder: &Path,
+    data_dir: &Path,
+    families: ImportFamilies,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(MarkerStore, &AtomicBool),
+) -> MissingMarkerClearCompletion {
+    let started = Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        return MissingMarkerClearCompletion::Cancelled {
+            result: MissingMarkerClearResult {
+                edits: requested_import_cancelled(families.edits),
+                tags: requested_import_cancelled(families.tags),
+                elapsed: started.elapsed(),
+            },
+        };
+    }
+
+    let sidecar = match SidecarFile::load_for_import(folder) {
+        crate::sidecar::SidecarImportLoad::Missing { sidecar } => sidecar,
+        crate::sidecar::SidecarImportLoad::Loaded(_) => {
+            let error = "sidecar appeared before missing markers were cleared".to_string();
+            return missing_marker_source_changed(started, families, error);
+        }
+        crate::sidecar::SidecarImportLoad::Unreadable { sidecar, error }
+        | crate::sidecar::SidecarImportLoad::Corrupt { sidecar, error } => {
+            return missing_marker_terminal(started, sidecar, families, error);
+        }
+        crate::sidecar::SidecarImportLoad::UnsupportedVersion { sidecar, version } => {
+            return missing_marker_terminal(
+                started,
+                sidecar,
+                families,
+                format!("sidecar version {version} is newer than this application"),
+            );
+        }
+        crate::sidecar::SidecarImportLoad::WriterFailed { sidecar } => {
+            return missing_marker_terminal(
+                started,
+                sidecar,
+                families,
+                "sidecar writer previously failed for this folder".to_string(),
+            );
+        }
+        crate::sidecar::SidecarImportLoad::ChangedDuringRead { .. } => {
+            return missing_marker_source_changed(
+                started,
+                families,
+                "sidecar changed while checking whether it was missing".to_string(),
+            );
+        }
+    };
+
+    if let Err(error) = crate::sidecar::revalidate_missing_import_source(folder) {
+        return MissingMarkerClearCompletion::SourceChanged {
+            error: error.clone(),
+            result: MissingMarkerClearResult {
+                edits: requested_import_source_changed(families.edits, &error),
+                tags: requested_import_source_changed(families.tags, &error),
+                elapsed: started.elapsed(),
+            },
+        };
+    }
+    let folder_key = crate::adjustment_db::normalize_path(folder);
+    let edits = if families.edits {
+        clear_marker_atomic(data_dir, &folder_key, MarkerStore::Edits, cancel, progress)
+    } else {
+        ImportFamilyOutcome::NotRequested
+    };
+    if family_cancelled(&edits) || cancel.load(Ordering::Relaxed) {
+        return MissingMarkerClearCompletion::Cancelled {
+            result: MissingMarkerClearResult {
+                edits,
+                tags: requested_import_cancelled(families.tags),
+                elapsed: started.elapsed(),
+            },
+        };
+    }
+
+    let mut source_change = None;
+    let tags = if families.tags {
+        match crate::sidecar::revalidate_missing_import_source(folder) {
+            Ok(()) => {
+                clear_marker_atomic(data_dir, &folder_key, MarkerStore::Tags, cancel, progress)
+            }
+            Err(error) => {
+                source_change = Some(error.clone());
+                ImportFamilyOutcome::SourceChanged(error)
+            }
+        }
+    } else {
+        ImportFamilyOutcome::NotRequested
+    };
+    let result = MissingMarkerClearResult {
+        edits,
+        tags,
+        elapsed: started.elapsed(),
+    };
+    if family_cancelled(&result.tags) || cancel.load(Ordering::Relaxed) {
+        return MissingMarkerClearCompletion::Cancelled { result };
+    }
+    if let Some(error) = source_change {
+        return MissingMarkerClearCompletion::SourceChanged { error, result };
+    }
+    if let Err(error) = crate::sidecar::revalidate_missing_import_source(folder) {
+        return MissingMarkerClearCompletion::SourceChanged { error, result };
+    }
+    MissingMarkerClearCompletion::Current { sidecar, result }
+}
+
+fn missing_marker_terminal(
+    started: Instant,
+    sidecar: SidecarFile,
+    families: ImportFamilies,
+    error: String,
+) -> MissingMarkerClearCompletion {
+    MissingMarkerClearCompletion::Current {
+        sidecar,
+        result: MissingMarkerClearResult {
+            edits: requested_import_failed(families.edits, &error),
+            tags: requested_import_failed(families.tags, &error),
+            elapsed: started.elapsed(),
+        },
+    }
+}
+
+fn missing_marker_source_changed(
+    started: Instant,
+    families: ImportFamilies,
+    error: String,
+) -> MissingMarkerClearCompletion {
+    MissingMarkerClearCompletion::SourceChanged {
+        error: error.clone(),
+        result: MissingMarkerClearResult {
+            edits: requested_import_source_changed(families.edits, &error),
+            tags: requested_import_source_changed(families.tags, &error),
+            elapsed: started.elapsed(),
+        },
+    }
+}
+
+fn requested_import_cancelled<T>(requested: bool) -> ImportFamilyOutcome<T> {
+    if requested {
+        ImportFamilyOutcome::Cancelled
+    } else {
+        ImportFamilyOutcome::NotRequested
+    }
+}
+
+fn requested_import_source_changed<T>(requested: bool, error: &str) -> ImportFamilyOutcome<T> {
+    if requested {
+        ImportFamilyOutcome::SourceChanged(error.to_string())
+    } else {
+        ImportFamilyOutcome::NotRequested
+    }
+}
+
+fn requested_import_failed<T>(requested: bool, error: &str) -> ImportFamilyOutcome<T> {
+    if requested {
+        ImportFamilyOutcome::Failed(error.to_string())
+    } else {
+        ImportFamilyOutcome::NotRequested
+    }
+}
+
+fn clear_marker_atomic(
+    data_dir: &Path,
+    folder_key: &str,
+    store: MarkerStore,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(MarkerStore, &AtomicBool),
+) -> ImportFamilyOutcome<MarkerClearReport> {
+    if cancel.load(Ordering::Relaxed) {
+        return ImportFamilyOutcome::Cancelled;
+    }
+    let (path, table) = store.path_and_table(data_dir);
+    if !path.is_file() {
+        return ImportFamilyOutcome::Failed(format!(
+            "required {} marker store is missing: {}",
+            store.label(),
+            path.display()
+        ));
+    }
+    let connection = match Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ImportFamilyOutcome::Failed(format!(
+                "cannot open {} marker store: {error}",
+                store.label()
+            ));
+        }
+    };
+    if let Err(error) = connection.busy_timeout(Duration::from_secs(2)) {
+        return ImportFamilyOutcome::Failed(format!(
+            "cannot configure {} marker clear timeout: {error}",
+            store.label()
+        ));
+    }
+    let transaction_started = Instant::now();
+    if let Err(error) = connection.execute_batch("BEGIN IMMEDIATE") {
+        return ImportFamilyOutcome::Failed(format!(
+            "cannot begin {} marker clear: {error}",
+            store.label()
+        ));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = connection.execute_batch("ROLLBACK");
+        return ImportFamilyOutcome::Cancelled;
+    }
+    let current = match connection
+        .query_row(
+            &format!("SELECT sidecar_mtime FROM {table} WHERE folder_key = ?1"),
+            [folder_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+    {
+        Ok(current) => current,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return ImportFamilyOutcome::Failed(format!(
+                "cannot read {} sidecar marker before clear: {error}",
+                store.label()
+            ));
+        }
+    };
+    if current.is_none() {
+        let _ = connection.execute_batch("ROLLBACK");
+        return ImportFamilyOutcome::AlreadySynchronized;
+    }
+    let deleted = match connection.execute(
+        &format!("DELETE FROM {table} WHERE folder_key = ?1"),
+        [folder_key],
+    ) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return ImportFamilyOutcome::Failed(format!(
+                "cannot clear {} sidecar marker: {error}",
+                store.label()
+            ));
+        }
+    };
+    progress(store, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        let _ = connection.execute_batch("ROLLBACK");
+        return ImportFamilyOutcome::Cancelled;
+    }
+    if let Err(error) = connection.execute_batch("COMMIT") {
+        let _ = connection.execute_batch("ROLLBACK");
+        return ImportFamilyOutcome::Failed(format!(
+            "cannot commit {} marker clear: {error}",
+            store.label()
+        ));
+    }
+    ImportFamilyOutcome::Applied(MarkerClearReport {
+        marker_cleared: deleted > 0,
+        transaction_committed: true,
+        transaction_elapsed: transaction_started.elapsed(),
     })
 }
 
@@ -870,6 +1628,11 @@ mod tests {
         drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap());
     }
 
+    fn init_all_stores(data_dir: &Path) {
+        init_edit_stores(data_dir);
+        drop(crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap());
+    }
+
     fn flush_and_load(sidecar: &mut SidecarFile) -> LoadedSidecarImport {
         assert!(sidecar.flush_blocking());
         let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
@@ -896,6 +1659,17 @@ mod tests {
                 panic!("test import was unexpectedly cancelled")
             }
         }
+    }
+
+    fn import_sample_sidecar(media: &Path, data: &Path, cancel: &AtomicBool) {
+        let mut sidecar = SidecarFile::new(media.to_path_buf());
+        sidecar.set_adjust("a.jpg", params(1.0));
+        sidecar.set_tags("a.jpg", ["#sidecar"]);
+        let loaded = flush_and_load(&mut sidecar);
+        let prepared = prepare(loaded, ImportFamilies::ALL, cancel).unwrap();
+        let result = current_result(commit(data, prepared, cancel));
+        assert!(matches!(result.edits, ImportFamilyOutcome::Applied(_)));
+        assert!(matches!(result.tags, ImportFamilyOutcome::Applied(_)));
     }
 
     #[test]
@@ -1392,5 +2166,319 @@ mod tests {
         assert!(matches!(result.edits, ImportFamilyOutcome::Cancelled));
         assert!(matches!(result.tags, ImportFamilyOutcome::Cancelled));
         assert!(!missing_data_dir.exists());
+    }
+
+    #[test]
+    fn read_only_probe_reports_import_without_mutating_stores() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let mut sidecar = SidecarFile::new(media.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", params(1.0));
+        sidecar.set_tags("a.jpg", ["#sidecar"]);
+        assert!(sidecar.flush_blocking());
+
+        let cancel = AtomicBool::new(false);
+        let SidecarImportProbe::ImportRequired { result } =
+            probe(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("fresh sidecar must require an import");
+        };
+        assert_eq!(result.edits, SidecarProbeFamilyOutcome::ImportRequired);
+        assert_eq!(result.tags, SidecarProbeFamilyOutcome::ImportRequired);
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let key = crate::sidecar::reconstruct_image_key(media.path(), "a.jpg");
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert!(adjustment.get_page_params(&key).is_none());
+        assert_eq!(adjustment.sidecar_sync_get(&folder_key), None);
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert!(tags.display_tags_for_item(&key).is_empty());
+        assert_eq!(tags.sidecar_sync_get(&folder_key), None);
+        assert!(!data.path().join("tags.db.bak1").exists());
+    }
+
+    #[test]
+    fn probe_distinguishes_synchronized_and_missing_marker_clear() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+
+        let SidecarImportProbe::Current { sidecar, result } =
+            probe(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("committed sidecar must probe as synchronized");
+        };
+        assert!(!sidecar.items().is_empty());
+        assert_eq!(result.edits, SidecarProbeFamilyOutcome::AlreadySynchronized);
+        assert_eq!(result.tags, SidecarProbeFamilyOutcome::AlreadySynchronized);
+
+        std::fs::remove_file(media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+        let SidecarImportProbe::MarkerClearRequired { result } =
+            probe(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("missing sidecar with old markers must require marker clear");
+        };
+        assert_eq!(result.edits, SidecarProbeFamilyOutcome::MarkerClearRequired);
+        assert_eq!(result.tags, SidecarProbeFamilyOutcome::MarkerClearRequired);
+    }
+
+    #[test]
+    fn missing_marker_clear_commits_each_family_and_preserves_rows() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        std::fs::remove_file(media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+
+        let MissingMarkerClearCompletion::Current { sidecar, result } =
+            clear_missing_markers(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("stable missing source must clear both marker families");
+        };
+        assert!(sidecar.items().is_empty());
+        let ImportFamilyOutcome::Applied(edit_report) = result.edits else {
+            panic!("edit marker was not cleared");
+        };
+        let ImportFamilyOutcome::Applied(tag_report) = result.tags else {
+            panic!("tag marker was not cleared");
+        };
+        assert!(edit_report.marker_cleared && edit_report.transaction_committed);
+        assert!(tag_report.marker_cleared && tag_report.transaction_committed);
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let key = crate::sidecar::reconstruct_image_key(media.path(), "a.jpg");
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert_eq!(adjustment.sidecar_sync_get(&folder_key), None);
+        assert!(adjustment.get_page_params(&key).is_some());
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert_eq!(tags.sidecar_sync_get(&folder_key), None);
+        assert_eq!(tags.display_tags_for_item(&key), vec!["#sidecar"]);
+    }
+
+    #[test]
+    fn marker_clear_fault_keeps_that_marker_and_reports_partial_result() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        std::fs::remove_file(media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+        let connection = Connection::open(data.path().join("adjustment.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_edit_marker_clear
+                 BEFORE DELETE ON sidecar_sync
+                 BEGIN SELECT RAISE(ABORT, 'marker clear fault'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let MissingMarkerClearCompletion::Current { result, .. } =
+            clear_missing_markers(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("a family fault must retain explicit family outcomes");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Failed(_)));
+        assert!(matches!(result.tags, ImportFamilyOutcome::Applied(_)));
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert!(adjustment.sidecar_sync_get(&folder_key).is_some());
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert_eq!(tags.sidecar_sync_get(&folder_key), None);
+    }
+
+    #[test]
+    fn marker_clear_cancel_rolls_back_before_reporting_success() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        std::fs::remove_file(media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+
+        let completion = clear_missing_markers_with_progress(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            &mut |store, cancel| {
+                if matches!(store, MarkerStore::Edits) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        let MissingMarkerClearCompletion::Cancelled { result } = completion else {
+            panic!("cancellation after DELETE must be terminal");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Cancelled));
+        assert!(matches!(result.tags, ImportFamilyOutcome::Cancelled));
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert!(adjustment.sidecar_sync_get(&folder_key).is_some());
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert!(tags.sidecar_sync_get(&folder_key).is_some());
+    }
+
+    #[test]
+    fn sidecar_appearing_after_edit_clear_preserves_applied_and_stops_tags() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        let sidecar_path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        std::fs::remove_file(&sidecar_path).unwrap();
+
+        let completion = clear_missing_markers_with_progress(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            &mut |store, _| {
+                if matches!(store, MarkerStore::Edits) {
+                    std::fs::write(&sidecar_path, br#"{"version":1,"items":{}}"#).unwrap();
+                }
+            },
+        );
+        let MissingMarkerClearCompletion::SourceChanged { result, .. } = completion else {
+            panic!("a sidecar appearing between family transactions must be source-changed");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Applied(_)));
+        assert!(matches!(result.tags, ImportFamilyOutcome::SourceChanged(_)));
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert_eq!(adjustment.sidecar_sync_get(&folder_key), None);
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert!(tags.sidecar_sync_get(&folder_key).is_some());
+    }
+
+    #[test]
+    fn sidecar_appearing_after_tag_clear_keeps_both_applied_outcomes_typed() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        let sidecar_path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        std::fs::remove_file(&sidecar_path).unwrap();
+
+        let completion = clear_missing_markers_with_progress(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            &mut |store, _| {
+                if matches!(store, MarkerStore::Tags) {
+                    std::fs::write(&sidecar_path, br#"{"version":1,"items":{}}"#).unwrap();
+                }
+            },
+        );
+        let MissingMarkerClearCompletion::SourceChanged { result, .. } = completion else {
+            panic!("a sidecar appearing after tag DELETE must fail the outer source state");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Applied(_)));
+        assert!(matches!(result.tags, ImportFamilyOutcome::Applied(_)));
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert_eq!(adjustment.sidecar_sync_get(&folder_key), None);
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert_eq!(tags.sidecar_sync_get(&folder_key), None);
+    }
+
+    #[test]
+    fn missing_marker_clear_rejects_a_new_sidecar_without_touching_markers() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        adjustment.sidecar_sync_upsert(&folder_key, 11).unwrap();
+        drop(adjustment);
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        tags.sidecar_sync_upsert(&folder_key, 22).unwrap();
+        drop(tags);
+        let mut sidecar = SidecarFile::new(media.path().to_path_buf());
+        sidecar.set_adjust("new.jpg", params(2.0));
+        assert!(sidecar.flush_blocking());
+
+        let cancel = AtomicBool::new(false);
+        let MissingMarkerClearCompletion::SourceChanged { result, .. } =
+            clear_missing_markers(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        else {
+            panic!("a newly present sidecar must reject marker clear");
+        };
+        assert!(matches!(
+            result.edits,
+            ImportFamilyOutcome::SourceChanged(_)
+        ));
+        assert!(matches!(result.tags, ImportFamilyOutcome::SourceChanged(_)));
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        assert_eq!(adjustment.sidecar_sync_get(&folder_key), Some(11));
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        assert_eq!(tags.sidecar_sync_get(&folder_key), Some(22));
+    }
+
+    #[test]
+    fn probe_and_marker_clear_pre_cancel_do_no_io() {
+        let media = tempfile::tempdir().unwrap();
+        let data = media.path().join("data-must-stay-missing");
+        let cancel = AtomicBool::new(true);
+
+        let SidecarImportProbe::Cancelled { result } =
+            probe(media.path(), &data, ImportFamilies::ALL, &cancel)
+        else {
+            panic!("pre-cancelled probe must stop before source and database I/O");
+        };
+        assert_eq!(result.edits, SidecarProbeFamilyOutcome::Cancelled);
+        assert_eq!(result.tags, SidecarProbeFamilyOutcome::Cancelled);
+        let MissingMarkerClearCompletion::Cancelled { result } =
+            clear_missing_markers(media.path(), &data, ImportFamilies::ALL, &cancel)
+        else {
+            panic!("pre-cancelled marker clear must stop before database I/O");
+        };
+        assert!(matches!(result.edits, ImportFamilyOutcome::Cancelled));
+        assert!(matches!(result.tags, ImportFamilyOutcome::Cancelled));
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn unstable_missing_load_maps_to_non_installable_source_changed() {
+        let completion = missing_marker_source_changed(
+            Instant::now(),
+            ImportFamilies::ALL,
+            "changed during read".to_string(),
+        );
+        let MissingMarkerClearCompletion::SourceChanged { result, .. } = completion else {
+            panic!("an unstable missing-source load must not expose a Current sidecar");
+        };
+        assert!(matches!(
+            result.edits,
+            ImportFamilyOutcome::SourceChanged(_)
+        ));
+        assert!(matches!(result.tags, ImportFamilyOutcome::SourceChanged(_)));
     }
 }

@@ -312,6 +312,45 @@ pub(crate) fn revalidate_import_source(
     revalidate_import_source_from(sidecar, source, &writer().state)
 }
 
+/// Confirm that the strict import source is still absent.
+///
+/// Missing has no byte identity to bind like [`SidecarDiskToken`].  Marker
+/// clearing therefore uses this fail-closed check immediately before opening a
+/// write transaction.  A pending in-process snapshot or a writer failure takes
+/// precedence over the disk path exactly as it does in [`SidecarFile::load_for_import`].
+pub(crate) fn revalidate_missing_import_source(folder: &Path) -> Result<(), String> {
+    revalidate_missing_import_source_from(folder, &writer().state)
+}
+
+fn revalidate_missing_import_source_from(
+    folder: &Path,
+    writer_state: &WriterState,
+) -> Result<(), String> {
+    if writer_state.pending_import_snapshot(folder)?.is_some() {
+        return Err("missing sidecar was superseded by a pending write".to_string());
+    }
+    if writer_state.is_failed_for_import(folder)? {
+        return Err("sidecar writer failed while validating a missing source".to_string());
+    }
+    match std::fs::metadata(folder.join(SIDECAR_FILENAME)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("missing sidecar source now exists".to_string()),
+        Err(error) => {
+            return Err(format!("cannot validate missing sidecar metadata: {error}"));
+        }
+    }
+    // Close the in-process window around the metadata check.  Stage 2 blocks
+    // new producers before this call; the second lookup also makes this helper
+    // fail closed when used independently in tests or future worker code.
+    if writer_state.pending_import_snapshot(folder)?.is_some() {
+        return Err("missing sidecar was superseded by a pending write".to_string());
+    }
+    if writer_state.is_failed_for_import(folder)? {
+        return Err("sidecar writer failed while validating a missing source".to_string());
+    }
+    Ok(())
+}
+
 fn revalidate_import_source_from(
     sidecar: &SidecarFile,
     source: &SidecarImportSource,
@@ -926,6 +965,217 @@ enum WriteRequest {
     Remove,
 }
 
+/// UI-owned dirty sidecars retained while a worker flushes immutable snapshots.
+///
+/// Stage 2 keeps this owner outside the worker closure.  If thread spawn, queue,
+/// write, or idle-fence validation fails, [`SidecarFlushOwners::resolve`] returns
+/// the original dirty values so the App can put them back in its cache without
+/// reconstructing them from disk.
+pub(crate) struct SidecarFlushOwners {
+    identity: Arc<SidecarFlushIdentity>,
+    sidecars: Vec<SidecarFile>,
+    expected_flushes: usize,
+}
+
+impl SidecarFlushOwners {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sidecars.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sidecars.len()
+    }
+
+    /// Rejoin the UI-owned values with the worker result.
+    ///
+    /// Only a verified success clears `dirty`; every error returns the exact
+    /// original values unchanged so the App can restore their ownership.
+    pub(crate) fn resolve(
+        mut self,
+        result: Result<SidecarFlushReport, String>,
+    ) -> SidecarFlushCompletion {
+        let expected_flushes = self.expected_flushes;
+        match result {
+            Ok(report)
+                if Arc::ptr_eq(&self.identity, &report.identity)
+                    && report.flushed_folders == expected_flushes =>
+            {
+                for sidecar in &mut self.sidecars {
+                    sidecar.dirty = false;
+                    sidecar.dirty_since = None;
+                }
+                SidecarFlushCompletion::Flushed {
+                    sidecars: self.sidecars,
+                    report,
+                }
+            }
+            Ok(report) if !Arc::ptr_eq(&self.identity, &report.identity) => {
+                SidecarFlushCompletion::Failed {
+                    sidecars: self.sidecars,
+                    error: "sidecar flush result belongs to a different owner batch".to_string(),
+                }
+            }
+            Ok(report) => SidecarFlushCompletion::Failed {
+                sidecars: self.sidecars,
+                error: format!(
+                    "sidecar flush reported {} folders for {} expected flushes",
+                    report.flushed_folders, expected_flushes
+                ),
+            },
+            Err(error) => SidecarFlushCompletion::Failed {
+                sidecars: self.sidecars,
+                error,
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SidecarFlushRequest {
+    folder: PathBuf,
+    request: WriteRequest,
+    disabled: bool,
+}
+
+#[derive(Debug)]
+struct SidecarFlushIdentity;
+
+/// Immutable flush work that may be moved to a worker while
+/// [`SidecarFlushOwners`] remains with the state owner.
+pub(crate) struct SidecarFlushBatch {
+    identity: Arc<SidecarFlushIdentity>,
+    requests: Vec<SidecarFlushRequest>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SidecarFlushReport {
+    identity: Arc<SidecarFlushIdentity>,
+    pub(crate) flushed_folders: usize,
+    pub(crate) elapsed: std::time::Duration,
+}
+
+pub(crate) enum SidecarFlushCompletion {
+    Flushed {
+        sidecars: Vec<SidecarFile>,
+        report: SidecarFlushReport,
+    },
+    Failed {
+        sidecars: Vec<SidecarFile>,
+        error: String,
+    },
+}
+
+/// Split sidecars into retained owners and an immutable dirty worker batch.
+///
+/// This function only moves `SidecarFile` values and clones their item `Arc`s;
+/// it does no serialization, filesystem access, channel wait, or SQLite work.
+/// Clean sidecars remain in the retained owner set, so a caller may safely move
+/// its complete cache into this boundary without silently dropping entries.
+pub(crate) fn prepare_worker_flush(
+    sidecars: impl IntoIterator<Item = SidecarFile>,
+) -> (SidecarFlushOwners, SidecarFlushBatch) {
+    let identity = Arc::new(SidecarFlushIdentity);
+    let mut owners = Vec::new();
+    let mut requests = Vec::new();
+    for sidecar in sidecars {
+        if sidecar.dirty {
+            requests.push(SidecarFlushRequest {
+                folder: sidecar.folder.clone(),
+                request: sidecar.write_request(),
+                disabled: sidecar.disabled,
+            });
+        }
+        owners.push(sidecar);
+    }
+    let expected_flushes = requests.len();
+    (
+        SidecarFlushOwners {
+            identity: Arc::clone(&identity),
+            sidecars: owners,
+            expected_flushes,
+        },
+        SidecarFlushBatch { identity, requests },
+    )
+}
+
+impl SidecarFlushBatch {
+    /// Whether this batch has no new dirty snapshots to queue.
+    ///
+    /// This says nothing about the process-global writer: an earlier ordinary
+    /// `queue_flush` may still be in flight after its cache owner became clean.
+    /// The Stage 2 worker must call `run_on_worker` even for an empty batch so
+    /// the strict global idle fence is not skipped.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    /// Queue this batch and wait for the process-global sidecar writer.
+    ///
+    /// This is intentionally blocking and must only run on a worker.  Unlike
+    /// changing the ordinary `queue_flush` contract, it preserves the existing
+    /// coalescing queue and its synchronous channel-failure fallback while
+    /// moving every potentially blocking operation off the UI thread.
+    pub(crate) fn run_on_worker(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<SidecarFlushReport, String> {
+        self.run_with_writer(writer(), timeout)
+    }
+
+    fn run_with_writer(
+        self,
+        writer: &SidecarWriter,
+        timeout: std::time::Duration,
+    ) -> Result<SidecarFlushReport, String> {
+        let started = Instant::now();
+        if self.requests.iter().any(|request| request.disabled) {
+            return Err("disabled sidecar cannot be flushed for import".to_string());
+        }
+        for request in &self.requests {
+            if writer.state.is_failed_for_import(&request.folder)? {
+                return Err(format!(
+                    "sidecar writer previously failed for {}",
+                    request.folder.display()
+                ));
+            }
+        }
+        for request in &self.requests {
+            if let Err(error) =
+                writer.enqueue_for_worker_flush(request.folder.clone(), request.request.clone())
+            {
+                // Earlier requests may already be accepted.  Drain them when
+                // possible before returning the retained owners to the App.
+                let _ = writer.wait_until_idle_strict(timeout);
+                return Err(error);
+            }
+        }
+        writer.wait_until_idle_strict(timeout)?;
+        for request in &self.requests {
+            if writer
+                .state
+                .pending_import_snapshot(&request.folder)?
+                .is_some()
+            {
+                return Err(format!(
+                    "sidecar writer left pending data for {} after its idle fence",
+                    request.folder.display()
+                ));
+            }
+            if writer.state.is_failed_for_import(&request.folder)? {
+                return Err(format!(
+                    "sidecar writer failed for {}",
+                    request.folder.display()
+                ));
+            }
+        }
+        Ok(SidecarFlushReport {
+            identity: self.identity,
+            flushed_folders: self.requests.len(),
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
 struct QueuedWrite {
     /// 積んだ順番。worker は書いた後、これが変わっていなければ pending から外す。
     seq: u64,
@@ -971,6 +1221,15 @@ pub fn wait_for_pending_writes() {
     writer().wait_until_idle();
 }
 
+/// Strict, bounded idle fence for worker-owned recovery orchestration.
+///
+/// The historical exit path above deliberately keeps its forgiving contract.
+/// Sidecar import must instead distinguish timeout and poisoned state from a
+/// successful drain so it never reads stale disk bytes or advances a marker.
+pub(crate) fn wait_for_pending_writes_strict(timeout: std::time::Duration) -> Result<(), String> {
+    writer().wait_until_idle_strict(timeout)
+}
+
 impl SidecarWriter {
     fn spawn() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
@@ -1001,6 +1260,25 @@ impl SidecarWriter {
         }
     }
 
+    /// Strict queue admission used only by a worker-owned restore flush.
+    ///
+    /// The normal enqueue path remains unchanged.  This variant fails before
+    /// publishing anything if either queue mutex is poisoned.  A disconnected
+    /// writer still uses the established synchronous fallback, but the caller
+    /// is the recovery worker rather than the UI thread.
+    fn enqueue_for_worker_flush(
+        &self,
+        folder: PathBuf,
+        request: WriteRequest,
+    ) -> Result<(), String> {
+        self.state.queue_strict(folder.clone(), request)?;
+        if self.tx.send(folder.clone()).is_err() {
+            self.state.write_one(&folder);
+            self.state.finish_one();
+        }
+        Ok(())
+    }
+
     fn is_failed(&self, folder: &Path) -> bool {
         self.state.is_failed(folder)
     }
@@ -1015,6 +1293,36 @@ impl SidecarWriter {
             };
             inflight = next;
         }
+    }
+
+    fn wait_until_idle_strict(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let mut inflight = self
+            .state
+            .inflight
+            .lock()
+            .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+        while *inflight > 0 {
+            let remaining = timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+                format!(
+                    "sidecar writer did not become idle within {} ms",
+                    timeout.as_millis()
+                )
+            })?;
+            let (next, wait) = self
+                .state
+                .idle
+                .wait_timeout(inflight, remaining)
+                .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+            inflight = next;
+            if wait.timed_out() && *inflight > 0 {
+                return Err(format!(
+                    "sidecar writer did not become idle within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1031,6 +1339,30 @@ impl WriterState {
         if let Ok(mut inflight) = self.inflight.lock() {
             *inflight += 1;
         }
+    }
+
+    /// Queue one worker-owned flush without the forgiving poison fallbacks used
+    /// by the historical UI enqueue path.  Both mutexes are acquired before
+    /// either map or counter is changed, so a poison error cannot leave a
+    /// half-published request.
+    fn queue_strict(&self, folder: PathBuf, request: WriteRequest) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "sidecar writer pending state is unavailable".to_string())?;
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+        let next_inflight = inflight
+            .checked_add(1)
+            .ok_or_else(|| "sidecar writer inflight count overflowed".to_string())?;
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pending.insert(folder, QueuedWrite { seq, request });
+        *inflight = next_inflight;
+        Ok(())
     }
 
     fn pending_items(&self, folder: &Path) -> Option<Arc<BTreeMap<String, SidecarEntry>>> {
@@ -1528,6 +1860,226 @@ mod tests {
             aspect_mode: crate::export_crop::CropAspectMode::Ratio4x3,
             source_size: Some([100, 80]),
         }
+    }
+
+    #[test]
+    fn worker_flush_batch_runs_disconnected_writer_fallback_off_the_owner_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+        assert_eq!(owners.len(), 1);
+        assert!(!batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let worker = std::thread::Builder::new()
+            .name("sidecar-flush-batch-test".to_string())
+            .spawn(move || {
+                let name = std::thread::current().name().map(str::to_owned);
+                (
+                    batch.run_with_writer(&writer, std::time::Duration::from_secs(1)),
+                    name,
+                )
+            })
+            .unwrap();
+        let (result, thread_name) = worker.join().unwrap();
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("worker flush did not resolve as success");
+        };
+        assert_eq!(report.flushed_folders, 1);
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+        assert_eq!(thread_name.as_deref(), Some("sidecar-flush-batch-test"));
+        assert!(dir.path().join(SIDECAR_FILENAME).is_file());
+    }
+
+    #[test]
+    fn worker_flush_batch_failure_returns_the_original_dirty_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+
+        let state = Arc::new(WriterState::default());
+        state
+            .failed
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_path_buf());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        assert!(result.as_ref().unwrap_err().contains("previously failed"));
+        let SidecarFlushCompletion::Failed {
+            sidecars: retained,
+            error,
+        } = owners.resolve(result)
+        else {
+            panic!("failed worker flush did not retain dirty owners");
+        };
+        assert!(error.contains("previously failed"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dirty());
+        assert_eq!(retained[0].items().len(), 1);
+        assert!(!dir.path().join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
+    fn worker_flush_write_failure_returns_the_original_dirty_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_folder = root.path().join("removed-before-worker-flush");
+        let mut sidecar = SidecarFile::new(missing_folder.clone());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        assert!(result.as_ref().unwrap_err().contains("failed for"));
+        let SidecarFlushCompletion::Failed {
+            sidecars: retained,
+            error,
+        } = owners.resolve(result)
+        else {
+            panic!("write failure did not retain dirty owners");
+        };
+        assert!(error.contains("failed for"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dirty());
+        assert_eq!(retained[0].folder(), missing_folder);
+        assert!(!missing_folder.join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
+    fn flush_owner_resolution_rejects_an_inconsistent_success_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, _batch) = prepare_worker_flush([sidecar]);
+        let identity = Arc::clone(&owners.identity);
+
+        let SidecarFlushCompletion::Failed { sidecars, error } =
+            owners.resolve(Ok(SidecarFlushReport {
+                identity,
+                flushed_folders: 0,
+                elapsed: std::time::Duration::ZERO,
+            }))
+        else {
+            panic!("inconsistent worker success must fail closed");
+        };
+        assert!(error.contains("0 folders for 1 expected flushes"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn flush_owner_resolution_rejects_a_foreign_batch_result() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut first_sidecar = SidecarFile::new(first.path().to_path_buf());
+        first_sidecar.set_adjust("a.jpg", sample_params());
+        let (first_owners, _first_batch) = prepare_worker_flush([first_sidecar]);
+        let mut second_sidecar = SidecarFile::new(second.path().to_path_buf());
+        second_sidecar.set_adjust("b.jpg", sample_params());
+        let (second_owners, _second_batch) = prepare_worker_flush([second_sidecar]);
+
+        let SidecarFlushCompletion::Failed { sidecars, error } =
+            first_owners.resolve(Ok(SidecarFlushReport {
+                identity: Arc::clone(&second_owners.identity),
+                flushed_folders: 1,
+                elapsed: std::time::Duration::ZERO,
+            }))
+        else {
+            panic!("a foreign worker result must not clean another batch's owners");
+        };
+        assert!(error.contains("different owner batch"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn worker_flush_keeps_clean_cache_owners_without_queueing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = SidecarFile::new(dir.path().to_path_buf());
+        let (owners, batch) = prepare_worker_flush([clean]);
+        assert_eq!(owners.len(), 1);
+        assert!(batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("empty worker batch must preserve its clean owners");
+        };
+        assert_eq!(report.flushed_folders, 0);
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn empty_worker_flush_batch_still_requires_the_global_idle_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = SidecarFile::new(dir.path().to_path_buf());
+        let (owners, batch) = prepare_worker_flush([clean]);
+        assert!(batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        *state.inflight.lock().unwrap() = 1;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_millis(5));
+        assert!(result.as_ref().unwrap_err().contains("did not become idle"));
+        let SidecarFlushCompletion::Failed { sidecars, error } = owners.resolve(result) else {
+            panic!("empty batch must not report success while the global writer is busy");
+        };
+        assert!(error.contains("did not become idle"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn strict_queue_poison_fails_before_publishing_partial_state() {
+        let state = Arc::new(WriterState::default());
+        let poisoned = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.pending.lock().unwrap();
+            panic!("poison pending state for strict admission test");
+        })
+        .join();
+
+        let error = state
+            .queue_strict(PathBuf::from("C:/strict-queue-test"), WriteRequest::Remove)
+            .unwrap_err();
+        assert!(error.contains("pending state is unavailable"));
+        assert_eq!(*state.inflight.lock().unwrap(), 0);
+        assert_eq!(state.next_seq.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn strict_idle_fence_reports_timeout_instead_of_success() {
+        let state = Arc::new(WriterState::default());
+        *state.inflight.lock().unwrap() = 1;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let error = writer
+            .wait_until_idle_strict(std::time::Duration::from_millis(5))
+            .unwrap_err();
+        assert!(error.contains("did not become idle"));
+    }
+
+    #[test]
+    fn missing_import_source_revalidation_rejects_a_pending_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
+        let error = revalidate_missing_import_source_from(dir.path(), &state).unwrap_err();
+        assert!(error.contains("pending write"));
     }
 
     #[test]
