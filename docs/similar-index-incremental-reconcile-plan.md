@@ -430,3 +430,51 @@ freeze は `target/similar-enabled-master-8e5e7-integration-20260911/freeze-r1`�
 集約証跡は `target/similar-enabled-master-8e5e7-integration-20260911/FINAL-VALIDATION.txt`、SHA256 `5AD50576905A489B0691BD2CF1F0C704BA271A716F54055194990A7AA67B1AB8`。終了時 exact staged resident / cargo / rustc はすべて 0。以後の変更は本書の記録だけで、アプリ起動・停止・本番データ操作なし。結合に追加製品修正はなく、独立 review・焦点 gate・full gate・確認 build が完了した。master への取り込みは親に引き渡す。
 
 手動確認用は repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。再有効化後の索引進捗と通知収束、類似タブの移動・比較・履歴、動画再生との併用は統合版での利用者確認に残る。208/210 単体の利用者実機確認済みという証拠を、結合版の実機成功に読み替えない。
+
+## 起動時 Full の実ファイル走査短縮（利用者依頼）
+
+2026-09-11、利用者が結合版を起動し、約12分で確認済み1,632,738 / 発見済み1,635,312（総数未確定）、前回完了4,645,146という画面を提示した。起動時の処理時間解決を明示依頼。基点は `9462456f0`。ログ上の4,600,715行 base load 141.9 ms と array update 85.4 ms は実FS走査時間ではない。通常name/metadata索引は96.272秒でsettled。CPUは観測約54秒で約6.6 CPU秒、低使用率だけでは待ち原因を確定しない。Fullの段階・定期件数・終端時間の通常ログは現状ない。
+
+実装調査は Sol implement_resume、独立設計/差分レビューは別 Sol review_resume、設計判断・文書・gitはroot。起動ごとの停止中変更検出、ページ順、画像判定基準、失敗した旧Completeの保護、cancel/監視gap/DB・検索snapshotの収束を維持する。起動走査を黙って延期・省略したり対象を減らしたりしない。既知の合成DB照合benchmarkを再実行して実FS高速化の証拠に流用しない。
+
+現時点の有力仮説は、ZIPのunchanged判定前の全entry列挙と、PositionedFileReaderの非buffered readによるcentral directory/local headerの小読み取り。by_index_rawもfind_contentを通るため単なる置換でlocal header読みをなくせるとは仮定しない。ZIP共通機構を変える場合は閲覧/サムネ/ネスト/cache clone/cancelの影響と同等性を独立検収する。実装前に使い捨てfixtureで旧新の実I/O回数と結果同等性を確認する計画を固める。
+
+本番ファイル・DBを用いた追加走査、実アプリの起動・停止は行わない。稼働中のバイナリを上書きしない。親はsidecar209でapp.rs等を所有予定、similar/DB/indexerはdupe側、共通領域に届く場合は適用前に調整する。重いCargo/測定は親と枠を調整する。
+
+### 起動 Full 短縮の設計判断
+
+実装担当が依存 zip 2.4.2 の `ZipArchive::new` を確認し、central entry の fixed/name/extra/comment 読みの間に `find_data_start` で local header 30 bytes を読む交互 seek を確認した。単一連続 buffer のみでは central 側が追い出される可能性があるため、reader ごとの bounded small-read cache を2領域程度で評価する。clone は buffer を共有せず空で開始し、cache hit 前にも取消を確認、大readは直接読みへ流す。固定64KiBを全local headerで読み増す方式は採らず、使い捨てfixtureでサイズ候補を比較する。callsだけでなくOS read bytes/requested bytes/elapsedと結果同等性を記録する。
+
+独立Solも、再帰やZIP/PDF列挙省略は停止中変更・page count・failure検出を弱めるため不可と確認した。今回の承認範囲は reader buffering と Full/Delta の観測改善。既存RunningReconcileJobのidentityを使いstart/phase/terminal、約5秒ごとのprocessed/discovered/unchanged/indexed、主要work種別とread calls/bytesを観測する。loggerはscheduler/progress lock外、高頻度item/path logやUI同期I/Oを増やさない。
+
+真に起動Fullを不要にするには停止期間を覆う永続journal/checkpointなどの別設計が必要であり、このchunkへ混ぜない。まず既知ZIP small-readを改善して代表fixtureと利用者の実起動を分けて評価する。局所benchmark成功のみで起動時間の問題全体を解決済みとは扱わない。親からCargo枠を受領、実装担当はzip_loader/similar_indexと関連testだけを編集する。
+
+### ZIP small-read の最初の比較
+
+実zip 2.4.2 / 2,048 entries の使い捨てfixture（debug、warm）でentry metadata同等性を確認。buffer無しは6,147 OS reads / 194,586 bytes / 11.690 ms。256Bは2,562 / 657,430 / 8.294 ms、512Bは2,306 / 1,181,718 / 7.687 ms、1024Bは2,178 / 2,230,294 / 7.523 ms、4096Bは2,081 / 8,521,728 / 7.605 ms。
+
+1024B候補はfixtureの8倍byte上限assertに失敗（11.46倍）したため採用しない。速度差に比べread増幅が大きく、256B×2window（readerあたり512B）を採用方向とする。256Bはこのfixtureでread calls約58.3%減、bytes約3.38倍、elapsed約29%減。4倍という回帰閾値はこのfixtureの条件であって任意workloadの一般上限ではない。実ファイルの総起動時間やUNC上の速度は未測定。失敗候補も含め `target/similar-startup-full-hotpath-20260911/` に記録する。
+
+### ZIP 先行レビューによる前提訂正
+
+独立SolのP2指摘により、上記『ZipArchive::new内部でcentral/local header交互seek』という説明は未検証の誤前提として撤回する。依存zip 2.4.2のnewはcentral directoryを読む経路で、fixtureはその後の全by_indexを含んでいた。6,147→2,562はnew+全entry accessの結果であり、new単体や2window優位の証拠ではない。実装担当はphase別callsと1/2window比較で根拠を取り直し、差がなければ1windowに縮小する。
+
+もう一つのP2はclone時Vec::with_capacityとmissごとのbuffer allocationによる共通page loaderへの退行リスク。固定slot/clone時未確保、miss時capacity再利用へ直し、clone/large-read-onlyで不要確保0、反復missでallocationがboundedである回帰を追加する。最終非test checkの未使用importも修正する。指摘前のfreezeは未承認、旧性能数値は候補実験としてのみ残す。
+
+### ZIP 解析経路の実装・実測による確定
+
+上記P2-2の前提否定は独立担当が撤回した。依存zip 2.4.2の公開commentだけでは内部動作を説明し切れていなかった。実装はget_metadata→read_central_header→central_header_to_zip_file→find_data_startでlocal headerを読み、central_header_endへ戻る（依存read.rs:1259/1267）。最初の実装担当の交互seek観測は正しかった。レビュー自身の誤所見もこの内部call chainに基づき訂正する。
+
+r2 fixtureはnew完了時と後続by_index完了時を分け、全OS readがnew内、後段の追加readは0と確認した。256B 1窓は4,098 reads / 1,050,328 bytes、2窓は2,562 / 657,430。2窓は1窓比でcalls約37.5%減・bytes約37.4%減なので2窓を維持する。baselineは6,147 / 194,586。固定slot/lazy buffer再利用への修正もコンパイル済み、allocator P2の最終検収とcorrectness/telemetry回帰は後続。
+
+### A+B r2 検収と計装契約の確定
+
+ZIPのallocation P2は固定inline slots・lazy確保・miss時再利用で解消、独立承認済み。zip_loader40、incremental30、Full inventory11（benchmark1 ignored）、core/fmt/diff/glyphが成功した。r2 freezeは `target/similar-startup-full-hotpath-20260911/freeze-r2`。
+
+telemetryで不完全走査にもdatabase_published phaseを出すP2が見つかったため、実publish成功branchだけに移し、Full/Deltaのsafe/unsafe phase回帰を追加する。周期の正確な契約は『work完了境界で、前回から5秒以上空いていれば出力する』で、独立timerによる5秒定期出力ではない。長い単一ZIP/PDF列挙中は追加progress行が出ない。有限reporter threadの追加は行わず、この限界を明記する。
+
+また実行時ログにはZIP OS read calls/bytesを追加していない。これらはcfg(test) fixtureの指標であり、通常jobログとは別である。job elapsedの開始はDB open/page-order repair後で、アプリ起動からの時間・watcher barrier待ち・DB openを含まない。既存startup logと併せて読み、job elapsedだけを全起動時間と解釈しない。先行の計装案にあった『定期』『read calls/bytes』はこの確定契約へ置き換える。
+
+### A+B 最終焦点検収
+
+r3でFull/Deltaのdatabase_publishedを実publish成功branch内だけにし、不完全観測はscan_incompleteとした。productionのsafe/unsafe 4経路を通る回帰を含むtelemetry2件が成功、fmt/diff成功。ZIPは承認済みr2と同一。freezeは `target/similar-startup-full-hotpath-20260911/freeze-r3`、source patch SHA256 `E65ECBD80B6B1710125516FF5B2A8F8A45E244A2C0C57B7A0020C72502204639`（正確なdigestは同manifestを正本とする）。独立reviewはP1/P2なし、`review-approval.md` SHA256 `B8132A4F5CDF3583F5E5A6427CB4DE4892D3A8A65366F96B1FB2978ABBA85629`。全体gateと確認buildはこれから行い、実機の総時間改善は未検証。
