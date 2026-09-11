@@ -76,6 +76,10 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
   切り替えるものではない
 
 スクリプトは必要な FFmpeg DLL を変更時だけ出力先へコピーし、成果物を起動しない。
+実行中のアプリを停止できない場合は `.\scripts\build-dev.ps1 -PreserveRuntime` を使う。
+出力先と同じ絶対パスの core または remote が実行中なら、停止せずエラーで終了する。
+この指定を省略した場合は、従来どおり同じ出力先のプロセスを停止してからビルドする。
+停止分岐の回帰は `scripts/test-build-dev-safety.ps1` で実プロセスを操作せず確認できる。
 通常profileを汚さない隔離確認が明示的に必要な場合は、同じバイナリへ
 `--data-dir .\target\dev-runtime\data` を渡す。build flavor自体をportableへ変えない。
 C++ VST3 bridge 自体を変更した場合は、従来どおり先にCMakeでbridgeを再ビルドする。

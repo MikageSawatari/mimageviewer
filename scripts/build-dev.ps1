@@ -24,11 +24,15 @@
 # Usage:
 #   .\scripts\build-dev.ps1
 #   .\scripts\build-dev.ps1 -TestScript
+#   .\scripts\build-dev.ps1 -PreserveRuntime
 #   .\scripts\build-dev.ps1 -WaitForOtherBuildsMinutes 0
 
 [CmdletBinding()]
 param(
     [switch] $TestScript,
+    # Fail when an exact staged development executable is running instead of
+    # stopping it. This keeps a live verification runtime intact.
+    [switch] $PreserveRuntime,
     # Wait this long for another worktree's native build to finish before
     # starting. 0 disables the wait. See Wait-ForOtherNativeBuilds.
     [int] $WaitForOtherBuildsMinutes = 30
@@ -72,7 +76,8 @@ function Stop-StagedProcess {
         [Parameter(Mandatory = $true)]
         [string] $ExePath,
         [Parameter(Mandatory = $true)]
-        [string] $Label
+        [string] $Label,
+        [switch] $PreserveRuntime
     )
 
     if (-not (Test-Path $ExePath -PathType Leaf)) { return }
@@ -83,6 +88,10 @@ function Stop-StagedProcess {
             try { $processPath = $_.Path } catch { $processPath = $null }
             if ($processPath -and
                 [System.IO.Path]::GetFullPath($processPath) -eq $fullPath) {
+                if ($PreserveRuntime) {
+                    throw ("[build-dev] development {0} is running (PID={1}): {2}. -PreserveRuntime refuses to stop it; close it and retry." -f
+                        $Label, $_.Id, $fullPath)
+                }
                 Write-Host ("[build-dev] stopping development {0} (PID={1})" -f $Label, $_.Id)
                 Stop-Process -Id $_.Id -Force -ErrorAction Stop
             }
@@ -157,8 +166,10 @@ try {
     }
 
     # Stop only the development-profile executables when they lock the output.
-    Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core'
-    Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service'
+    Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core' `
+        -PreserveRuntime:$PreserveRuntime
+    Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service' `
+        -PreserveRuntime:$PreserveRuntime
 
     Ensure-LibclangPath
     $featureArgs = @()
