@@ -490,3 +490,14 @@ source不変・fixture変更なしで当該exact1件を1回再実行し、1 pass
 source不変 `51caf188e` の再確認は11:58:23–12:05:30 JST、426.868秒、native exit0 / PASS。本体8,177 passed / 44 ignored、UI48、vendor eframe15を含む全段階が成功した。初回timeoutは保持し、期待・timeout・製品sourceを変えず再実行した。証跡 `target/similar-startup-full-hotpath-20260911/fullgate-r2-51caf188e`、log SHA256 `35FC1FD19A2ACC798E878C7D84599AA24640BD2387FBE997708EFFBC7ECB28FC`。rootも件数/PASSを照合した。
 
 終了時cargo/rustc0、親へCargo枠を返却。ユーザーのexact dev-runtimeが起動中のため、確認buildはまだ開始していない。実行中exeを上書き・停止せず、利用者の終了後に `build-dev.ps1 -PreserveRuntime` を実行する。実機の総起動時間短縮は未検証で、完了宣言の対象外。
+
+### 起動 Full 改善の確認 build 引渡し
+
+利用者のmIV終了通知を受け、親209のCargo終了後に枠を受領した。source `51caf188e` / build HEAD `cef1e68d9`、12:15:38頃–12:22:39 JST、`build-dev.ps1 -PreserveRuntime`、通常feature / dev-runtime profile / jobs=1、421.151秒、exit0。portable featureは無効。前後のexact staged resident0、終了時cargo/rustc0、アプリ起動・停止・本番データ操作なし。
+
+- core: 309,880,320 bytes、mtime12:22:37 JST、SHA256 `8A96BE34F74AC0B322EA970EF81118E65B63B2FE178188307875E3D32BA28512`
+- Remote: 12,197,376 bytes、mtime07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`（変更なし、Cargo再利用）
+
+rootも実成果物hashを照合。証跡は `target/similar-startup-full-hotpath-20260911/build-dev-cef1e68d9/MANIFEST.txt`、build log SHA256 `C18678C0EFD1A5D4DA9C3FE6CC3C8350763521EC637EFE747046740C205BBAD5`。この後は本書の記録のみ。
+
+利用者用コマンドはrepository rootで `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るためinstalled/tray版を先に終了する。起動後の索引確認件数と段階ログを採り、実機総時間が短縮したか、残る律速がどこかを確認する。A+Bの実装・独立レビュー・全体gate・buildは完了したが、起動時Fullそのものは残り、実機の時間問題全体の解決は未確認である。
