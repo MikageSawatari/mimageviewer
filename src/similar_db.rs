@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 pub const HASH_ALGORITHM_VERSION: u32 = 1;
 
 /// `page_index` がどの並べ方で振られているか。
@@ -216,10 +216,16 @@ pub struct SimilarDb {
     conn: Mutex<Connection>,
     #[cfg(test)]
     full_inventory_loads: AtomicUsize,
+    #[cfg(test)]
+    delta_inventory_loads: AtomicUsize,
+    #[cfg(test)]
+    cleanup_incomplete_calls: AtomicUsize,
 }
 
 const FULL_INVENTORY_CANCEL_POLL_ROWS: usize = 4096;
 const FULL_INVENTORY_MAX_CAPACITY_HINT: usize = 16 * 1024 * 1024;
+const CLEANUP_PROGRESS_OPS: i32 = 1_000;
+type CleanupCancel = Arc<dyn Fn() -> bool + Send + Sync + std::panic::RefUnwindSafe>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FullItemObservation {
@@ -277,6 +283,173 @@ pub(crate) struct FullReconcileInventory {
     container_map_growths: usize,
     #[cfg(test)]
     container_record_growths: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeltaScopePlan {
+    pub(crate) directory_contents: Vec<String>,
+    pub(crate) subtrees: Vec<String>,
+    pub(crate) removed_prefixes: Vec<String>,
+}
+
+impl DeltaScopePlan {
+    fn normalize(mut self) -> Self {
+        for scopes in [
+            &mut self.directory_contents,
+            &mut self.subtrees,
+            &mut self.removed_prefixes,
+        ] {
+            scopes.sort();
+            scopes.dedup();
+        }
+        self
+    }
+}
+
+struct DeltaInventoryItem {
+    row: SearchRow,
+    owner: Option<u32>,
+    current_and_published: bool,
+}
+
+struct DeltaInventoryContainer {
+    snapshot: Option<StoredContainer>,
+    member_count: u32,
+    all_members_current: bool,
+}
+
+/// Exact rows covered by one Delta observation. The read transaction ends before workers start;
+/// workers borrow the inventory and only mutate its word-packed seen flags.
+pub(crate) struct DeltaScopedInventory {
+    hash_version: i64,
+    items_by_key: HashMap<String, u32>,
+    items: Vec<DeltaInventoryItem>,
+    containers_by_key: HashMap<String, u32>,
+    containers: Vec<DeltaInventoryContainer>,
+    seen_item_words: Box<[AtomicU64]>,
+    seen_container_words: Box<[AtomicU64]>,
+}
+
+impl DeltaScopedInventory {
+    pub(crate) fn observe_item(
+        &self,
+        item_key: &str,
+        owner: Option<&str>,
+        page_index: Option<u32>,
+        mtime: i64,
+        file_size: i64,
+    ) -> FullItemObservation {
+        let Some(&index) = self.items_by_key.get(item_key) else {
+            return FullItemObservation {
+                exact_current: false,
+                reusable_current_row: false,
+            };
+        };
+        mark_inventory_bit(&self.seen_item_words, index);
+        let item = &self.items[index as usize];
+        let owner_matches = match (item.owner, owner) {
+            (None, None) => true,
+            (Some(stored), Some(observed)) => self
+                .containers_by_key
+                .get(observed)
+                .is_some_and(|&current| current == stored),
+            _ => false,
+        };
+        let metadata_matches = item.current_and_published
+            && item.row.item.mtime == mtime
+            && item.row.item.file_size == file_size;
+        FullItemObservation {
+            exact_current: metadata_matches
+                && owner_matches
+                && item.row.item.page_index == page_index,
+            reusable_current_row: metadata_matches,
+        }
+    }
+
+    pub(crate) fn reusable_item(
+        &self,
+        item_key: &str,
+        mtime: i64,
+        file_size: i64,
+    ) -> Option<StoredItem> {
+        let &index = self.items_by_key.get(item_key)?;
+        let item = &self.items[index as usize];
+        (item.current_and_published
+            && item.row.item.mtime == mtime
+            && item.row.item.file_size == file_size)
+            .then(|| item.row.item.clone())
+    }
+
+    pub(crate) fn mark_item(&self, item_key: &str) {
+        if let Some(&index) = self.items_by_key.get(item_key) {
+            mark_inventory_bit(&self.seen_item_words, index);
+        }
+    }
+
+    pub(crate) fn observe_container(&self, container_key: &str) {
+        if let Some(&index) = self.containers_by_key.get(container_key) {
+            mark_inventory_bit(&self.seen_container_words, index);
+        }
+    }
+
+    pub(crate) fn container_member_count(&self, container_key: &str) -> u32 {
+        self.containers_by_key
+            .get(container_key)
+            .map_or(0, |&index| self.containers[index as usize].member_count)
+    }
+
+    pub(crate) fn container_observation(
+        &self,
+        container_key: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+        hash_version: i64,
+    ) -> FullContainerObservation {
+        let Some(&index) = self.containers_by_key.get(container_key) else {
+            return FullContainerObservation {
+                freshness: Freshness::Missing,
+                member_count: 0,
+            };
+        };
+        let container = &self.containers[index as usize];
+        let freshness = match container.snapshot.as_ref() {
+            Some(snapshot)
+                if snapshot.mtime == mtime
+                    && snapshot.file_size == file_size
+                    && snapshot.page_count == Some(page_count)
+                    && snapshot.scan_state == ScanState::Complete
+                    && container.all_members_current
+                    && hash_version == self.hash_version =>
+            {
+                Freshness::Current
+            }
+            Some(_) => Freshness::Stale,
+            None => Freshness::Missing,
+        };
+        FullContainerObservation {
+            freshness,
+            member_count: container.member_count,
+        }
+    }
+
+    fn item_seen(&self, index: u32) -> bool {
+        inventory_bit_is_set(&self.seen_item_words, index)
+    }
+
+    fn container_seen(&self, index: u32) -> bool {
+        inventory_bit_is_set(&self.seen_container_words, index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeltaPublishResult {
+    Committed {
+        removed: usize,
+        watermark: StoreWatermark,
+    },
+    RequiresFull,
+    Skipped,
 }
 
 impl FullReconcileInventory {
@@ -1006,6 +1179,23 @@ impl Drop for CancellableReadTransaction<'_> {
     }
 }
 
+struct SqlProgressHandlerGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> SqlProgressHandlerGuard<'a> {
+    fn install(conn: &'a Connection, cancel: CleanupCancel) -> Self {
+        conn.progress_handler(CLEANUP_PROGRESS_OPS, Some(move || cancel()));
+        Self { conn }
+    }
+}
+
+impl Drop for SqlProgressHandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
 fn classify_book_read_error(error: rusqlite::Error, cancel: &AtomicBool) -> BookReadError {
     if matches!(
         &error,
@@ -1054,6 +1244,10 @@ impl SimilarDb {
             conn: Mutex::new(conn),
             #[cfg(test)]
             full_inventory_loads: AtomicUsize::new(0),
+            #[cfg(test)]
+            delta_inventory_loads: AtomicUsize::new(0),
+            #[cfg(test)]
+            cleanup_incomplete_calls: AtomicUsize::new(0),
         })
     }
 
@@ -1064,6 +1258,10 @@ impl SimilarDb {
             conn: Mutex::new(conn),
             #[cfg(test)]
             full_inventory_loads: AtomicUsize::new(0),
+            #[cfg(test)]
+            delta_inventory_loads: AtomicUsize::new(0),
+            #[cfg(test)]
+            cleanup_incomplete_calls: AtomicUsize::new(0),
         })
     }
 
@@ -1077,20 +1275,71 @@ impl SimilarDb {
 
     /// 前回停止時に公開されなかった世代だけを掃除する。
     pub fn cleanup_incomplete(&self) -> rusqlite::Result<usize> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = write_transaction(&mut conn)?;
-        let staged = transaction.execute("DELETE FROM item_build", [])?;
-        transaction.execute("DELETE FROM container_build", [])?;
-        let unpublished = load_items_for_container_state(&transaction, ScanState::Building)?;
-        for row in &unpublished {
-            delete_item_with_change(&transaction, row)?;
+        self.cleanup_incomplete_inner(None)
+            .map(|removed| removed.expect("unconditional cleanup cannot be cancelled"))
+    }
+
+    /// scan の入口で、取消を尊重しながら前回の非公開世代だけを掃除する。
+    ///
+    /// worker failure 後の後始末は取消済みでも必要なので無条件版を使う。
+    pub(crate) fn cleanup_incomplete_if(
+        &self,
+        cancel: &Arc<AtomicBool>,
+    ) -> rusqlite::Result<Option<usize>> {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
         }
-        let containers = transaction.execute(
-            "DELETE FROM container WHERE scan_state = ?1",
-            [ScanState::Building as i64],
-        )?;
+        let cancel = Arc::clone(cancel);
+        self.cleanup_incomplete_inner(Some(Arc::new(move || cancel.load(Ordering::Acquire))))
+    }
+
+    fn cleanup_incomplete_inner(
+        &self,
+        cancel: Option<CleanupCancel>,
+    ) -> rusqlite::Result<Option<usize>> {
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.cleanup_incomplete_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
+        }
+        let transaction = write_transaction(&mut conn)?;
+        if cancel.as_ref().is_some_and(|cancel| cancel()) {
+            return Ok(None);
+        }
+        let should_continue = || cancel.as_ref().is_none_or(|cancel| !cancel());
+        let cleanup = if let Some(cancel) = cancel.as_ref() {
+            let _progress = SqlProgressHandlerGuard::install(&transaction, Arc::clone(cancel));
+            cleanup_incomplete_transaction(&transaction, &should_continue)
+        } else {
+            cleanup_incomplete_transaction(&transaction, &should_continue)
+        };
+        let removed = match cleanup {
+            Ok(removed) => removed,
+            Err(error)
+                if cancel.as_ref().is_some_and(|cancel| cancel())
+                    && matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(code, _)
+                            if code.code == rusqlite::ErrorCode::OperationInterrupted
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(removed) = removed else {
+            return Ok(None);
+        };
+        if !should_continue() {
+            return Ok(None);
+        }
         transaction.commit()?;
-        Ok(staged + containers + unpublished.len())
+        Ok(Some(removed))
     }
 
     pub fn item_freshness(
@@ -1316,14 +1565,17 @@ impl SimilarDb {
         )?;
         transaction.execute(
             "INSERT INTO container_build
-             (container_key, kind, page_count, scan_state, generation, mtime, file_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             (container_key, source_parent_key, kind, page_count, scan_state, generation, mtime,
+              file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(container_key) DO UPDATE SET
+               source_parent_key=excluded.source_parent_key,
                kind=excluded.kind, page_count=excluded.page_count,
                scan_state=excluded.scan_state, generation=excluded.generation,
                mtime=excluded.mtime, file_size=excluded.file_size",
             params![
                 container_key,
+                source_parent_key(container_key),
                 kind as i64,
                 i64::from(page_count),
                 ScanState::Building as i64,
@@ -1335,10 +1587,12 @@ impl SimilarDb {
         // 初回だけは公開 table にも Building を記録する。再索引時は既存 Complete を保つ。
         transaction.execute(
             "INSERT OR IGNORE INTO container
-             (container_key, kind, page_count, scan_state, generation, mtime, file_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (container_key, source_parent_key, kind, page_count, scan_state, generation, mtime,
+              file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 container_key,
+                source_parent_key(container_key),
                 kind as i64,
                 i64::from(page_count),
                 ScanState::Building as i64,
@@ -1458,14 +1712,17 @@ impl SimilarDb {
         let generation = current.map_or(1, |(_, generation)| generation.saturating_add(1));
         conn.execute(
             "INSERT INTO container
-             (container_key, kind, page_count, scan_state, generation, mtime, file_size)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)
+             (container_key, source_parent_key, kind, page_count, scan_state, generation, mtime,
+              file_size)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)
              ON CONFLICT(container_key) DO UPDATE SET
+               source_parent_key=excluded.source_parent_key,
                kind=excluded.kind, page_count=NULL, scan_state=excluded.scan_state,
                generation=excluded.generation, mtime=excluded.mtime,
                file_size=excluded.file_size",
             params![
                 container_key,
+                source_parent_key(container_key),
                 kind as i64,
                 ScanState::Failed as i64,
                 generation,
@@ -2029,6 +2286,140 @@ impl SimilarDb {
         }))
     }
 
+    /// Load only rows whose filesystem ownership is covered by this Delta plan.
+    /// The SQLite snapshot is released before scan workers start.
+    pub(crate) fn load_delta_scoped_inventory(
+        &self,
+        scopes: DeltaScopePlan,
+        hash_version: i64,
+        should_continue: impl Fn() -> bool,
+    ) -> rusqlite::Result<Option<DeltaScopedInventory>> {
+        #[cfg(test)]
+        self.delta_inventory_loads.fetch_add(1, Ordering::Relaxed);
+        let scopes = scopes.normalize();
+        let mut conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        if !should_continue() {
+            return Ok(None);
+        }
+        let transaction = conn.transaction()?;
+        let mut items_by_key = HashMap::new();
+        let mut items = Vec::new();
+        let mut containers_by_key = HashMap::new();
+        let mut containers = Vec::new();
+
+        for directory in &scopes.directory_contents {
+            if !load_delta_loose_items_by_parent(
+                &transaction,
+                directory,
+                hash_version,
+                &mut items_by_key,
+                &mut items,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+        }
+        for prefix in scopes.subtrees.iter().chain(scopes.removed_prefixes.iter()) {
+            if !load_delta_loose_items_by_prefix(
+                &transaction,
+                prefix,
+                hash_version,
+                &mut items_by_key,
+                &mut items,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+        }
+
+        let mut candidate_containers = HashSet::new();
+        for directory in &scopes.directory_contents {
+            insert_delta_container_key(&mut candidate_containers, directory.clone())?;
+            if !load_delta_child_file_container_keys(
+                &transaction,
+                directory,
+                &mut candidate_containers,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+            if !load_delta_orphan_container_keys(
+                &transaction,
+                directory,
+                true,
+                &mut candidate_containers,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+        }
+        for prefix in scopes.subtrees.iter().chain(scopes.removed_prefixes.iter()) {
+            if !load_delta_container_keys_by_prefix(
+                &transaction,
+                prefix,
+                &mut candidate_containers,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+            if !load_delta_orphan_container_keys(
+                &transaction,
+                prefix,
+                false,
+                &mut candidate_containers,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+        }
+        let mut sorted_candidate_containers = Vec::new();
+        sorted_candidate_containers
+            .try_reserve_exact(candidate_containers.len())
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other(format!(
+                        "delta sorted container allocation failed: {error}"
+                    ))
+                    .into(),
+                )
+            })?;
+        sorted_candidate_containers.extend(candidate_containers);
+        let mut candidate_containers = sorted_candidate_containers;
+        candidate_containers.sort();
+        for (loaded, container_key) in candidate_containers.into_iter().enumerate() {
+            if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+                return Ok(None);
+            }
+            if !load_delta_container_and_members(
+                &transaction,
+                &container_key,
+                hash_version,
+                &mut containers_by_key,
+                &mut containers,
+                &mut items_by_key,
+                &mut items,
+                &should_continue,
+            )? {
+                return Ok(None);
+            }
+        }
+        if !should_continue() {
+            return Ok(None);
+        }
+        transaction.commit()?;
+        let seen_item_words = inventory_words(items.len())?;
+        let seen_container_words = inventory_words(containers.len())?;
+        Ok(Some(DeltaScopedInventory {
+            hash_version,
+            items_by_key,
+            items,
+            containers_by_key,
+            containers,
+            seen_item_words,
+            seen_container_words,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_full_reconcile_inventory_if(
         &self,
@@ -2191,6 +2582,16 @@ impl SimilarDb {
         self.full_inventory_loads.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn delta_inventory_load_count(&self) -> usize {
+        self.delta_inventory_loads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_incomplete_call_count(&self) -> usize {
+        self.cleanup_incomplete_calls.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_full_reconcile_if(
         &self,
@@ -2226,6 +2627,7 @@ impl SimilarDb {
     /// container whose key is the directory itself.  A subtree/removal scope owns every key below
     /// it.  Seen containers protect their previous Complete pages when enumeration, password, or
     /// decoding failed; only a successful replacement generation may retire those pages.
+    #[cfg(test)]
     pub fn prune_scopes_except_seen(
         &self,
         directory_contents: &[String],
@@ -2253,6 +2655,7 @@ impl SimilarDb {
     /// build tables until this transaction, while loose rows stay in memory, so book/loose
     /// representation changes are never visible half-applied.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn publish_delta_reconcile(
         &self,
         loose_items: &[StoredItem],
@@ -2280,6 +2683,7 @@ impl SimilarDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn publish_delta_reconcile_if(
         &self,
         loose_items: &[StoredItem],
@@ -2324,6 +2728,179 @@ impl SimilarDb {
         }
         transaction.commit()?;
         Ok(removed)
+    }
+
+    /// Publish one Delta using the exact scoped snapshot loaded before filesystem observation.
+    /// A missing or stale summary baseline is returned as typed repair work before any visible
+    /// mutation is made; callers must schedule a Full rather than synchronously counting N rows.
+    pub(crate) fn publish_delta_scoped_reconcile_if(
+        &self,
+        inventory: DeltaScopedInventory,
+        loose_items: &[StoredItem],
+        completed_containers: &[(String, u64)],
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<DeltaPublishResult> {
+        let mut conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        if !should_publish() {
+            return Ok(DeltaPublishResult::Skipped);
+        }
+        let transaction = write_transaction(&mut conn)?;
+        let Some(baseline) = load_valid_summary_baseline(&transaction, hash_version)? else {
+            return Ok(DeltaPublishResult::RequiresFull);
+        };
+
+        prepare_delta_touched_table(&transaction)?;
+        for item in &inventory.items {
+            insert_delta_touched_key(&transaction, &item.row.item.item_key)?;
+        }
+        for item in loose_items {
+            insert_delta_touched_key(&transaction, &item.item_key)?;
+        }
+        for (container_key, generation) in completed_containers {
+            let mut statement = transaction.prepare(
+                "SELECT item_key FROM item_build
+                 WHERE container_key = ?1 AND generation = ?2",
+            )?;
+            let keys = statement
+                .query_map(params![container_key, generation], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for key in keys {
+                insert_delta_touched_key(&transaction, &key)?;
+            }
+        }
+        let visible_before = count_visible_delta_touched(&transaction, hash_version)?;
+
+        for item in loose_items {
+            debug_assert!(item.container_key.is_none());
+            let existing = load_item_raw(&transaction, &item.item_key)?;
+            publish_item(&transaction, existing.as_ref(), item)?;
+        }
+        for (container_key, generation) in completed_containers {
+            complete_container_transaction(&transaction, container_key, *generation)?;
+        }
+
+        let mut container_keys = vec![None; inventory.containers.len()];
+        for (key, &index) in &inventory.containers_by_key {
+            container_keys[index as usize] = Some(key.as_str());
+        }
+        let mut owner_snapshot_unchanged = vec![false; inventory.containers.len()];
+        for (key, &index) in &inventory.containers_by_key {
+            let container = &inventory.containers[index as usize];
+            owner_snapshot_unchanged[index as usize] = match container.snapshot.as_ref() {
+                Some(snapshot) => container_snapshot_matches(&transaction, snapshot)?,
+                None => !transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM container WHERE container_key = ?1)",
+                    [key],
+                    |row| row.get::<_, bool>(0),
+                )?,
+            };
+        }
+
+        prepare_delta_delete_table(&transaction)?;
+        for (index, item) in inventory.items.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    std::io::Error::other("delta item index exceeds u32").into(),
+                )
+            })?;
+            if inventory.item_seen(index)
+                || item
+                    .owner
+                    .is_some_and(|owner| inventory.container_seen(owner))
+                || item
+                    .owner
+                    .is_some_and(|owner| !owner_snapshot_unchanged[owner as usize])
+            {
+                continue;
+            }
+            let owner = item.owner.and_then(|owner| container_keys[owner as usize]);
+            transaction.execute(
+                "INSERT OR IGNORE INTO temp.delta_delete_candidate
+                 (item_id, revision, item_key, container_key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    i64::try_from(item.row.item_id).unwrap_or(i64::MAX),
+                    i64::from(item.row.revision),
+                    item.row.item.item_key,
+                    owner,
+                ],
+            )?;
+        }
+        let removed_items = transaction.execute(&delta_insert_deleted_changes_sql(false), [])?;
+        transaction.execute(&delta_delete_items_sql(false), [])?;
+
+        let mut removed_containers = 0usize;
+        for (key, &index) in &inventory.containers_by_key {
+            let container = &inventory.containers[index as usize];
+            let Some(snapshot) = container.snapshot.as_ref() else {
+                continue;
+            };
+            if inventory.container_seen(index) || !owner_snapshot_unchanged[index as usize] {
+                continue;
+            }
+            removed_containers += transaction.execute(
+                "DELETE FROM container
+                 WHERE container_key = ?1 AND kind = ?2 AND page_count IS ?3
+                   AND scan_state = ?4 AND generation = ?5 AND mtime = ?6 AND file_size = ?7
+                   AND NOT EXISTS (
+                     SELECT 1 FROM item WHERE item.container_key = container.container_key
+                   )",
+                params![
+                    key,
+                    snapshot.kind as i64,
+                    snapshot.page_count.map(i64::from),
+                    snapshot.scan_state as i64,
+                    i64::try_from(snapshot.generation).unwrap_or(i64::MAX),
+                    snapshot.mtime,
+                    snapshot.file_size,
+                ],
+            )?;
+        }
+
+        let visible_after = count_visible_delta_touched(&transaction, hash_version)?;
+        let registered_items = u64::try_from(
+            i128::from(baseline.registered_items) + i128::from(visible_after)
+                - i128::from(visible_before),
+        )
+        .map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure(
+                std::io::Error::other("delta summary count overflow").into(),
+            )
+        })?;
+        let through_change_seq = latest_change_seq(&transaction)?;
+        let updated = transaction.execute(
+            "UPDATE index_run
+             SET registered_items = ?1, completed_at_unix_secs = ?2,
+                 through_change_seq = ?3
+             WHERE singleton = 1 AND store_id = ?4 AND hash_version = ?5
+               AND through_change_seq = ?6",
+            params![
+                i64::try_from(registered_items).unwrap_or(i64::MAX),
+                completed_at_unix_secs,
+                i64::try_from(through_change_seq).unwrap_or(i64::MAX),
+                baseline.store_id.as_slice(),
+                baseline.hash_version,
+                i64::try_from(baseline.through_change_seq).unwrap_or(i64::MAX),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if !should_publish() {
+            return Ok(DeltaPublishResult::Skipped);
+        }
+        transaction.commit()?;
+        Ok(DeltaPublishResult::Committed {
+            removed: removed_items + removed_containers,
+            watermark: StoreWatermark {
+                store_id: baseline.store_id,
+                through_change_seq,
+            },
+        })
     }
 
     /// OFF になった favorite 配下の索引データを、次の全走査の完走を待たずに削除する。
@@ -2403,14 +2980,20 @@ impl SimilarDb {
 
         transaction.execute(
             "UPDATE index_run
-             SET registered_items = (
+             SET store_id = ?2,
+                 through_change_seq = ?3,
+                 registered_items = (
                SELECT COUNT(*) FROM item i
                LEFT JOIN container c ON c.container_key = i.container_key
                WHERE i.hash_version = index_run.hash_version
                  AND (i.container_key IS NULL OR c.scan_state = ?1)
              )
              WHERE singleton = 1",
-            [ScanState::Complete as i64],
+            params![
+                ScanState::Complete as i64,
+                search_store_id(&transaction)?.as_slice(),
+                i64::try_from(latest_change_seq(&transaction)?).unwrap_or(i64::MAX),
+            ],
         )?;
         if !should_publish() {
             return Ok(ConditionalCommit::Skipped);
@@ -2421,6 +3004,7 @@ impl SimilarDb {
 
     /// Refresh the corpus count after a successful delta without replacing the last full-run
     /// failure summary with statistics from one dirty directory.
+    #[cfg(test)]
     pub fn refresh_index_summary_count(
         &self,
         hash_version: i64,
@@ -2459,6 +3043,507 @@ fn normalized_parent(key: &str) -> Option<&str> {
     key.rsplit_once('/').map(|(parent, _)| parent)
 }
 
+fn source_parent_key(key: &str) -> String {
+    let Some(parent) = normalized_parent(key) else {
+        return String::new();
+    };
+    if parent.len() == 2 && parent.as_bytes()[1] == b':' {
+        format!("{parent}/")
+    } else {
+        parent.to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SummaryBaseline {
+    store_id: [u8; 16],
+    through_change_seq: u64,
+    hash_version: i64,
+    registered_items: u64,
+}
+
+fn load_valid_summary_baseline(
+    conn: &Connection,
+    hash_version: i64,
+) -> rusqlite::Result<Option<SummaryBaseline>> {
+    let baseline = conn
+        .query_row(
+            "SELECT store_id, through_change_seq, hash_version, registered_items
+             FROM index_run WHERE singleton = 1",
+            [],
+            |row| {
+                let bytes = row.get::<_, Vec<u8>>(0)?;
+                let store_id: [u8; 16] = bytes.try_into().map_err(|value: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Blob,
+                        "index summary store_id must contain 16 bytes".into(),
+                    )
+                })?;
+                Ok(SummaryBaseline {
+                    store_id,
+                    through_change_seq: i64_to_u64(row.get(1)?, 1)?,
+                    hash_version: row.get(2)?,
+                    registered_items: i64_to_u64(row.get(3)?, 3)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(baseline) = baseline else {
+        return Ok(None);
+    };
+    Ok((baseline.store_id == search_store_id(conn)?
+        && baseline.hash_version == hash_version
+        && baseline.through_change_seq == latest_change_seq(conn)?)
+    .then_some(baseline))
+}
+
+fn prepare_delta_touched_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS delta_touched (
+           item_key TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM temp.delta_touched;",
+    )
+}
+
+fn insert_delta_touched_key(conn: &Connection, item_key: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.delta_touched (item_key) VALUES (?1)",
+        [item_key],
+    )?;
+    Ok(())
+}
+
+fn count_visible_delta_touched(conn: &Connection, hash_version: i64) -> rusqlite::Result<u64> {
+    let count = conn.query_row(
+        &delta_count_visible_touched_sql(false),
+        params![hash_version, ScanState::Complete as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+    i64_to_u64(count, 0)
+}
+
+fn prepare_delta_delete_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS delta_delete_candidate (
+           item_id INTEGER PRIMARY KEY,
+           revision INTEGER NOT NULL,
+           item_key TEXT NOT NULL,
+           container_key TEXT
+         );
+         DELETE FROM temp.delta_delete_candidate;",
+    )
+}
+
+fn container_snapshot_matches(
+    conn: &Connection,
+    snapshot: &StoredContainer,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM container
+           WHERE container_key = ?1 AND kind = ?2 AND page_count IS ?3
+             AND scan_state = ?4 AND generation = ?5 AND mtime = ?6 AND file_size = ?7
+         )",
+        params![
+            snapshot.container_key,
+            snapshot.kind as i64,
+            snapshot.page_count.map(i64::from),
+            snapshot.scan_state as i64,
+            i64::try_from(snapshot.generation).unwrap_or(i64::MAX),
+            snapshot.mtime,
+            snapshot.file_size,
+        ],
+        |row| row.get(0),
+    )
+}
+
+fn descendant_key_bounds(key: &str) -> (String, String) {
+    if key.ends_with('/') {
+        (key.to_owned(), format!("{}0", key.trim_end_matches('/')))
+    } else {
+        (format!("{key}/"), format!("{key}0"))
+    }
+}
+
+fn delta_sql_prefix(explain: bool) -> &'static str {
+    if explain { "EXPLAIN QUERY PLAN " } else { "" }
+}
+
+fn delta_loose_parent_sql(explain: bool) -> String {
+    format!(
+        "{}{SEARCH_ROW_SELECT}
+         WHERE i.container_key IS NULL AND i.source_parent_key = ?1",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_loose_prefix_sql(explain: bool) -> String {
+    format!(
+        "{}{SEARCH_ROW_SELECT}
+         INDEXED BY item_loose_key_idx
+         WHERE i.container_key IS NULL AND i.item_key = ?1
+         UNION ALL
+         {SEARCH_ROW_SELECT}
+         INDEXED BY item_loose_key_idx
+         WHERE i.container_key IS NULL AND i.item_key >= ?2 AND i.item_key < ?3",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_count_visible_touched_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT COUNT(*)
+         FROM temp.delta_touched t
+         CROSS JOIN item i ON i.item_key = t.item_key
+         LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.hash_version = ?1
+           AND (i.container_key IS NULL OR c.scan_state = ?2)",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_insert_deleted_changes_sql(explain: bool) -> String {
+    format!(
+        "{}INSERT INTO item_change (item_id, op, revision, pdq256, quality)
+         SELECT i.item_id, 2, NULL, NULL, NULL
+         FROM temp.delta_delete_candidate d
+         CROSS JOIN item i ON i.item_id = d.item_id
+         WHERE d.revision = i.revision AND d.item_key = i.item_key
+           AND i.container_key IS d.container_key
+         ORDER BY d.item_id",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_delete_items_sql(explain: bool) -> String {
+    format!(
+        "{}DELETE FROM item
+         WHERE item_id IN (
+           SELECT i.item_id FROM temp.delta_delete_candidate d
+           CROSS JOIN item i ON i.item_id = d.item_id
+           WHERE d.revision = i.revision AND d.item_key = i.item_key
+             AND i.container_key IS d.container_key
+         )",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_child_file_container_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT container_key FROM container
+         WHERE source_parent_key = ?1 AND kind IN (?2, ?3)",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_container_prefix_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT container_key FROM container
+         WHERE container_key = ?1 OR (container_key >= ?2 AND container_key < ?3)",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_orphan_container_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT i.container_key, i.kind
+         FROM item i
+         LEFT JOIN container c ON c.container_key = i.container_key
+         WHERE i.container_key IS NOT NULL AND c.container_key IS NULL
+           AND (i.container_key = ?1 OR (i.container_key >= ?2 AND i.container_key < ?3))",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn delta_container_members_sql(explain: bool) -> String {
+    format!(
+        "{}{SEARCH_ROW_SELECT} WHERE i.container_key = ?1",
+        delta_sql_prefix(explain)
+    )
+}
+
+fn push_delta_inventory_item(
+    items_by_key: &mut HashMap<String, u32>,
+    items: &mut Vec<DeltaInventoryItem>,
+    row: SearchRow,
+    owner: Option<u32>,
+    current_and_published: bool,
+) -> rusqlite::Result<()> {
+    if items_by_key.contains_key(&row.item.item_key) {
+        return Ok(());
+    }
+    items_by_key.try_reserve(1).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!(
+                "delta item key inventory allocation failed: {error}"
+            ))
+            .into(),
+        )
+    })?;
+    items.try_reserve(1).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!("delta item inventory allocation failed: {error}"))
+                .into(),
+        )
+    })?;
+    let index = checked_inventory_index(items.len())?;
+    items_by_key.insert(row.item.item_key.clone(), index);
+    items.push(DeltaInventoryItem {
+        row,
+        owner,
+        current_and_published,
+    });
+    Ok(())
+}
+
+fn load_delta_loose_items_by_parent(
+    conn: &Connection,
+    parent: &str,
+    hash_version: i64,
+    items_by_key: &mut HashMap<String, u32>,
+    items: &mut Vec<DeltaInventoryItem>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&delta_loose_parent_sql(false))?;
+    let mut rows = statement.query([parent])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        let row = row_to_search_row(row)?;
+        let current = row.item.hash_version == hash_version;
+        push_delta_inventory_item(items_by_key, items, row, None, current)?;
+        loaded += 1;
+    }
+    Ok(true)
+}
+
+fn load_delta_loose_items_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+    hash_version: i64,
+    items_by_key: &mut HashMap<String, u32>,
+    items: &mut Vec<DeltaInventoryItem>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    let (lower, upper) = descendant_key_bounds(prefix);
+    let mut statement = conn.prepare(&delta_loose_prefix_sql(false))?;
+    let mut rows = statement.query(params![prefix, lower, upper])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        let row = row_to_search_row(row)?;
+        let current = row.item.hash_version == hash_version;
+        push_delta_inventory_item(items_by_key, items, row, None, current)?;
+        loaded += 1;
+    }
+    Ok(true)
+}
+
+fn load_delta_child_file_container_keys(
+    conn: &Connection,
+    parent: &str,
+    keys: &mut HashSet<String>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&delta_child_file_container_sql(false))?;
+    let mut rows = statement.query(params![
+        parent,
+        ContainerKind::Zip as i64,
+        ContainerKind::Pdf as i64
+    ])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        insert_delta_container_key(keys, row.get(0)?)?;
+        loaded += 1;
+    }
+    Ok(true)
+}
+
+fn load_delta_container_keys_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+    keys: &mut HashSet<String>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    let (lower, upper) = descendant_key_bounds(prefix);
+    let mut statement = conn.prepare(&delta_container_prefix_sql(false))?;
+    let mut rows = statement.query(params![prefix, lower, upper])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        insert_delta_container_key(keys, row.get(0)?)?;
+        loaded += 1;
+    }
+    Ok(true)
+}
+
+fn insert_delta_container_key(keys: &mut HashSet<String>, key: String) -> rusqlite::Result<()> {
+    if keys.contains(&key) {
+        return Ok(());
+    }
+    keys.try_reserve(1).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!("delta container key allocation failed: {error}")).into(),
+        )
+    })?;
+    keys.insert(key);
+    Ok(())
+}
+
+/// A missing owner row is invalid but remains observable from item provenance. Include only
+/// recognized owner kinds; malformed kinds make no deletion claim.
+fn load_delta_orphan_container_keys(
+    conn: &Connection,
+    scope: &str,
+    direct_children_only: bool,
+    keys: &mut HashSet<String>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    let (lower, upper) = descendant_key_bounds(scope);
+    let mut statement = conn.prepare(&delta_orphan_container_sql(false))?;
+    let mut rows = statement.query(params![scope, lower, upper])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        let key = row.get::<_, String>(0)?;
+        let item_kind = row.get::<_, i64>(1)?;
+        let recognized = match item_kind {
+            value if value == ItemKind::Image as i64 => key == scope || !direct_children_only,
+            value if value == ItemKind::ZipPage as i64 || value == ItemKind::PdfPage as i64 => {
+                !direct_children_only || source_parent_key(&key) == scope
+            }
+            _ => false,
+        };
+        if recognized {
+            insert_delta_container_key(keys, key)?;
+        }
+        loaded += 1;
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_delta_container_and_members(
+    conn: &Connection,
+    container_key: &str,
+    hash_version: i64,
+    containers_by_key: &mut HashMap<String, u32>,
+    containers: &mut Vec<DeltaInventoryContainer>,
+    items_by_key: &mut HashMap<String, u32>,
+    items: &mut Vec<DeltaInventoryItem>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    if containers_by_key.contains_key(container_key) {
+        return Ok(true);
+    }
+    if !should_continue() {
+        return Ok(false);
+    }
+    let snapshot = conn
+        .query_row(
+            "SELECT container_key, kind, page_count, scan_state, generation, mtime, file_size
+             FROM container WHERE container_key = ?1",
+            [container_key],
+            |row| {
+                Ok(StoredContainer {
+                    container_key: row.get(0)?,
+                    kind: ContainerKind::from_i64(row.get(1)?)?,
+                    page_count: row
+                        .get::<_, Option<i64>>(2)?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, -1))?,
+                    scan_state: ScanState::from_i64(row.get(3)?)?,
+                    generation: i64_to_u64(row.get(4)?, 4)?,
+                    mtime: row.get(5)?,
+                    file_size: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let published = snapshot
+        .as_ref()
+        .is_some_and(|container| container.scan_state == ScanState::Complete);
+    containers_by_key.try_reserve(1).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!("delta container map allocation failed: {error}")).into(),
+        )
+    })?;
+    containers.try_reserve(1).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(
+            std::io::Error::other(format!(
+                "delta container inventory allocation failed: {error}"
+            ))
+            .into(),
+        )
+    })?;
+    let container_index = checked_inventory_index(containers.len())?;
+    containers_by_key.insert(container_key.to_owned(), container_index);
+    containers.push(DeltaInventoryContainer {
+        snapshot,
+        member_count: 0,
+        all_members_current: true,
+    });
+
+    let mut statement = conn.prepare(&delta_container_members_sql(false))?;
+    let mut rows = statement.query([container_key])?;
+    let mut loaded = 0usize;
+    loop {
+        if loaded % FULL_INVENTORY_CANCEL_POLL_ROWS == 0 && !should_continue() {
+            return Ok(false);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        let row = row_to_search_row(row)?;
+        let current = row.item.hash_version == hash_version;
+        let container = &mut containers[container_index as usize];
+        container.member_count = container.member_count.checked_add(1).ok_or_else(|| {
+            rusqlite::Error::ToSqlConversionFailure(
+                std::io::Error::other("delta container member count exceeds u32").into(),
+            )
+        })?;
+        container.all_members_current &= current;
+        push_delta_inventory_item(
+            items_by_key,
+            items,
+            row,
+            Some(container_index),
+            current && published,
+        )?;
+        loaded += 1;
+    }
+    Ok(true)
+}
+
 fn record_completed_index_transaction(
     transaction: &Transaction<'_>,
     hash_version: i64,
@@ -2475,11 +3560,14 @@ fn record_completed_index_transaction(
     )?;
     transaction.execute(
         "INSERT INTO index_run
-         (singleton, hash_version, completed_at_unix_secs, registered_items,
+         (singleton, store_id, through_change_seq, hash_version,
+          completed_at_unix_secs, registered_items,
           password_required_pdfs, corrupt_containers, zero_page_containers,
           decode_failures, io_failures)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(singleton) DO UPDATE SET
+           store_id=excluded.store_id,
+           through_change_seq=excluded.through_change_seq,
            hash_version=excluded.hash_version,
            completed_at_unix_secs=excluded.completed_at_unix_secs,
            registered_items=excluded.registered_items,
@@ -2489,6 +3577,8 @@ fn record_completed_index_transaction(
            decode_failures=excluded.decode_failures,
            io_failures=excluded.io_failures",
         params![
+            search_store_id(transaction)?.as_slice(),
+            i64::try_from(latest_change_seq(transaction)?).unwrap_or(i64::MAX),
             hash_version,
             completed_at_unix_secs,
             registered_items,
@@ -2606,6 +3696,8 @@ fn refresh_index_summary_count_transaction(
     transaction.execute(
         "UPDATE index_run
          SET completed_at_unix_secs = ?2,
+             store_id = ?4,
+             through_change_seq = ?5,
              registered_items = (
                SELECT COUNT(*) FROM item i
                LEFT JOIN container c ON c.container_key = i.container_key
@@ -2616,7 +3708,9 @@ fn refresh_index_summary_count_transaction(
         params![
             hash_version,
             completed_at_unix_secs,
-            ScanState::Complete as i64
+            ScanState::Complete as i64,
+            search_store_id(transaction)?.as_slice(),
+            i64::try_from(latest_change_seq(transaction)?).unwrap_or(i64::MAX),
         ],
     )?;
     Ok(())
@@ -2672,10 +3766,13 @@ fn complete_container_transaction(
     }
     transaction.execute(
         "INSERT INTO container
-         (container_key, kind, page_count, scan_state, generation, mtime, file_size)
-         SELECT container_key, kind, page_count, ?3, generation, mtime, file_size
+         (container_key, source_parent_key, kind, page_count, scan_state, generation, mtime,
+          file_size)
+         SELECT container_key, source_parent_key, kind, page_count, ?3, generation, mtime,
+                file_size
          FROM container_build WHERE container_key = ?1 AND generation = ?2
          ON CONFLICT(container_key) DO UPDATE SET
+           source_parent_key=excluded.source_parent_key,
            kind=excluded.kind, page_count=excluded.page_count,
            scan_state=excluded.scan_state, generation=excluded.generation,
            mtime=excluded.mtime, file_size=excluded.file_size",
@@ -2724,14 +3821,18 @@ fn publish_item(
         })?;
         conn.execute(
             "UPDATE item SET revision=?2, item_key=?3, kind=?4, container_key=?5,
-               page_index=?6, mtime=?7, file_size=?8, hash_version=?9, pdq256=?10,
-               quality=?11, width=?12, height=?13, format=?14 WHERE item_id=?1",
+               source_parent_key=?6, page_index=?7, mtime=?8, file_size=?9,
+               hash_version=?10, pdq256=?11, quality=?12, width=?13, height=?14,
+               format=?15 WHERE item_id=?1",
             params![
                 i64::try_from(existing.item_id).unwrap_or(i64::MAX),
                 i64::from(revision),
                 item.item_key,
                 item.kind as i64,
                 item.container_key,
+                item.container_key
+                    .is_none()
+                    .then(|| source_parent_key(&item.item_key)),
                 item.page_index.map(i64::from),
                 item.mtime,
                 item.file_size,
@@ -2747,10 +3848,26 @@ fn publish_item(
     } else {
         conn.execute(
             "INSERT INTO item
-             (revision, item_key, kind, container_key, page_index, mtime, file_size,
-              hash_version, pdq256, quality, width, height, format)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params_from_iter(item_params(item, None)),
+             (revision, item_key, kind, container_key, source_parent_key, page_index, mtime,
+              file_size, hash_version, pdq256, quality, width, height, format)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                item.item_key,
+                item.kind as i64,
+                item.container_key,
+                item.container_key
+                    .is_none()
+                    .then(|| source_parent_key(&item.item_key)),
+                item.page_index.map(i64::from),
+                item.mtime,
+                item.file_size,
+                item.hash_version,
+                item.pdq256.as_slice(),
+                i64::from(item.quality),
+                i64::from(item.width),
+                i64::from(item.height),
+                item.format,
+            ],
         )?;
         (
             i64_to_u64(conn.last_insert_rowid(), 0)?,
@@ -2902,17 +4019,73 @@ fn load_items_for_container_raw(
         .collect()
 }
 
-fn load_items_for_container_state(
+fn cleanup_incomplete_item_ids_sql(explain: bool) -> String {
+    format!(
+        "{}SELECT i.item_id
+         FROM container c
+         CROSS JOIN item i INDEXED BY item_container_idx
+           ON i.container_key = c.container_key
+         WHERE c.scan_state = ?1
+         ORDER BY i.item_id",
+        if explain { "EXPLAIN QUERY PLAN " } else { "" }
+    )
+}
+
+fn load_item_ids_for_container_state_if(
     conn: &Connection,
     state: ScanState,
-) -> rusqlite::Result<Vec<SearchRow>> {
-    let mut statement = conn.prepare(&format!(
-        "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key=i.container_key
-         WHERE c.scan_state=?1 ORDER BY i.item_id"
-    ))?;
-    statement
-        .query_map([state as i64], row_to_search_row)?
-        .collect()
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<Option<Vec<u64>>> {
+    let mut statement = conn.prepare(&cleanup_incomplete_item_ids_sql(false))?;
+    let mut rows = statement.query([state as i64])?;
+    let mut item_ids = Vec::new();
+    loop {
+        if !should_continue() {
+            return Ok(None);
+        }
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        item_ids.push(i64_to_u64(row.get(0)?, 0)?);
+    }
+    Ok(Some(item_ids))
+}
+
+fn cleanup_incomplete_transaction(
+    transaction: &Transaction<'_>,
+    should_continue: &dyn Fn() -> bool,
+) -> rusqlite::Result<Option<usize>> {
+    if !should_continue() {
+        return Ok(None);
+    }
+    let staged = transaction.execute("DELETE FROM item_build", [])?;
+    transaction.execute("DELETE FROM container_build", [])?;
+    let Some(unpublished) =
+        load_item_ids_for_container_state_if(transaction, ScanState::Building, should_continue)?
+    else {
+        return Ok(None);
+    };
+    for item_id in &unpublished {
+        if !should_continue() {
+            return Ok(None);
+        }
+        insert_item_change(transaction, *item_id, ItemChangeOp::Delete, None, None)?;
+        transaction.execute(
+            "DELETE FROM item WHERE item_id = ?1",
+            [i64::try_from(*item_id).unwrap_or(i64::MAX)],
+        )?;
+    }
+    if !should_continue() {
+        return Ok(None);
+    }
+    let containers = transaction.execute(
+        "DELETE FROM container WHERE scan_state = ?1",
+        [ScanState::Building as i64],
+    )?;
+    if !should_continue() {
+        return Ok(None);
+    }
+    Ok(Some(staged + containers + unpublished.len()))
 }
 
 fn load_staged_items(
@@ -3462,6 +4635,63 @@ fn stored_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
 }
 
+fn schema_column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+         )",
+        params![table, column],
+        |row| row.get(0),
+    )
+}
+
+fn add_schema_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    if !schema_column_exists(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+    }
+    Ok(())
+}
+
+/// Populate the normalized parent columns without retaining the complete key corpus in memory.
+/// The migration transaction is intentionally atomic; the bounded batches only cap Rust memory.
+fn backfill_source_parent_keys(
+    conn: &Connection,
+    table: &str,
+    key_column: &str,
+    predicate: &str,
+) -> rusqlite::Result<()> {
+    let mut after_rowid = i64::MIN;
+    loop {
+        let rows = {
+            let mut statement = conn.prepare(&format!(
+                "SELECT rowid, {key_column} FROM {table}
+                 WHERE rowid > ?1 AND ({predicate}) ORDER BY rowid LIMIT 4096"
+            ))?;
+            statement
+                .query_map([after_rowid], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let Some(&(last_rowid, _)) = rows.last() else {
+            break;
+        };
+        let mut update = conn.prepare(&format!(
+            "UPDATE {table} SET source_parent_key = ?2 WHERE rowid = ?1"
+        ))?;
+        for (rowid, key) in rows {
+            update.execute(params![rowid, source_parent_key(&key)])?;
+        }
+        after_rowid = last_rowid;
+    }
+    Ok(())
+}
+
 fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     // 定常状態では書き込みロックを一切取らない。索引 worker・配列更新 worker・パネル照会・
     // 集計はそれぞれ別の接続でこの店を開くので、開くこと自体が writer になると互いに競合する。
@@ -3477,7 +4707,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         // ロックを待っている間に、別の接続が作成か移行を終えていた。
         return transaction.commit();
     }
-    // 中断しても v1 のまま残るか v2 へ移り切るかのどちらかになるよう、退避・作成・移送・
+    // 中断しても旧schemaのまま残るかv5へ移り切るかのどちらかになるよう、退避・作成・移送・
     // user_version の更新を一つの transaction に入れる。
     let migrating_v1 = user_version == 0 && is_v1_layout(&transaction)?;
     if migrating_v1 {
@@ -3487,10 +4717,11 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         // 起動時の振り直しに任せる。署名は変わらないので再索引は起きない。
         transaction.execute_batch(
             "ALTER TABLE search_content_state
-               ADD COLUMN page_order_version INTEGER NOT NULL DEFAULT 0;
-             PRAGMA user_version = 3;",
+               ADD COLUMN page_order_version INTEGER NOT NULL DEFAULT 0;",
         )?;
-    } else if user_version != SCHEMA_VERSION {
+    } else if !matches!(user_version, 3 | 4) {
+        // Only the known v1/v2/v3/v4 layouts are migrated. Preserve the existing recovery contract
+        // for an unknown generation instead of guessing at its table meanings.
         transaction.execute_batch(
             "DROP TABLE IF EXISTS item_change;
              DROP TABLE IF EXISTS item_build;
@@ -3509,6 +4740,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
            revision INTEGER NOT NULL CHECK(revision > 0),
            kind INTEGER NOT NULL,
            container_key TEXT,
+           source_parent_key TEXT,
            page_index INTEGER,
            mtime INTEGER NOT NULL,
            file_size INTEGER NOT NULL,
@@ -3532,6 +4764,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS container (
            container_key TEXT PRIMARY KEY,
+           source_parent_key TEXT,
            kind INTEGER NOT NULL,
            page_count INTEGER,
            scan_state INTEGER NOT NULL,
@@ -3541,6 +4774,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS container_build (
            container_key TEXT PRIMARY KEY,
+           source_parent_key TEXT,
            kind INTEGER NOT NULL,
            page_count INTEGER NOT NULL,
            scan_state INTEGER NOT NULL,
@@ -3577,6 +4811,8 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS index_run (
            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           store_id BLOB NOT NULL CHECK(length(store_id) = 16),
+           through_change_seq INTEGER NOT NULL,
            hash_version INTEGER NOT NULL,
            completed_at_unix_secs INTEGER NOT NULL,
            registered_items INTEGER NOT NULL,
@@ -3591,7 +4827,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
            store_id BLOB NOT NULL CHECK(length(store_id) = 16),
            page_order_version INTEGER NOT NULL
          );
-         PRAGMA user_version = 3;",
+         ",
     )?;
     if migrating_v1 {
         copy_v1_rows_into_v2(&transaction)?;
@@ -3602,12 +4838,78 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          VALUES (1, ?1, ?2)",
         params![store_id.as_slice(), PAGE_ORDER_VERSION],
     )?;
+
+    add_schema_column_if_missing(
+        &transaction,
+        "item",
+        "source_parent_key",
+        "source_parent_key TEXT",
+    )?;
+    add_schema_column_if_missing(
+        &transaction,
+        "container",
+        "source_parent_key",
+        "source_parent_key TEXT",
+    )?;
+    add_schema_column_if_missing(
+        &transaction,
+        "container_build",
+        "source_parent_key",
+        "source_parent_key TEXT",
+    )?;
+    add_schema_column_if_missing(&transaction, "index_run", "store_id", "store_id BLOB")?;
+    add_schema_column_if_missing(
+        &transaction,
+        "index_run",
+        "through_change_seq",
+        "through_change_seq INTEGER",
+    )?;
+
+    backfill_source_parent_keys(
+        &transaction,
+        "item",
+        "item_key",
+        "container_key IS NULL AND source_parent_key IS NULL",
+    )?;
+    backfill_source_parent_keys(
+        &transaction,
+        "container",
+        "container_key",
+        "source_parent_key IS NULL",
+    )?;
+    backfill_source_parent_keys(
+        &transaction,
+        "container_build",
+        "container_key",
+        "source_parent_key IS NULL",
+    )?;
+    let current_store_id = search_store_id(&transaction)?;
+    let through_change_seq = latest_change_seq(&transaction)?;
+    transaction.execute(
+        "UPDATE index_run
+         SET store_id = ?1, through_change_seq = ?2
+         WHERE singleton = 1",
+        params![
+            current_store_id.as_slice(),
+            i64::try_from(through_change_seq).unwrap_or(i64::MAX)
+        ],
+    )?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS item_source_parent_idx
+           ON item(source_parent_key, item_id) WHERE container_key IS NULL;
+         CREATE INDEX IF NOT EXISTS item_loose_key_idx
+           ON item(item_key) WHERE container_key IS NULL;
+         CREATE INDEX IF NOT EXISTS container_source_parent_idx
+           ON container(source_parent_key, kind, container_key);
+         PRAGMA user_version = 5;",
+    )?;
     transaction.commit()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
 
     fn item(key: &str, container: Option<&str>, page: Option<u32>, marker: u8) -> StoredItem {
         StoredItem {
@@ -3638,6 +4940,61 @@ mod tests {
             .unwrap();
         }
         db.complete_container(book, generation).unwrap();
+    }
+
+    fn publish_test_container(
+        db: &SimilarDb,
+        key: &str,
+        kind: ContainerKind,
+        pages: &[(&str, u8)],
+    ) {
+        let generation = db
+            .begin_container_build(key, kind, pages.len() as u32, 1, 2)
+            .unwrap();
+        for (page_index, (page_key, marker)) in pages.iter().enumerate() {
+            let mut page = item(page_key, Some(key), Some(page_index as u32), *marker);
+            page.kind = match kind {
+                ContainerKind::Zip => ItemKind::ZipPage,
+                ContainerKind::Pdf => ItemKind::PdfPage,
+                ContainerKind::ImageFolder => ItemKind::Image,
+            };
+            db.stage_item(generation, &page).unwrap();
+        }
+        db.complete_container(key, generation).unwrap();
+    }
+
+    fn delta_inventory(db: &SimilarDb, plan: DeltaScopePlan) -> DeltaScopedInventory {
+        db.load_delta_scoped_inventory(plan, current_hash_version(), || true)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn downgrade_current_store(path: &Path, schema_version: i64) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("DROP INDEX item_loose_key_idx;")
+            .unwrap();
+        if schema_version < 4 {
+            conn.execute_batch(
+                "DROP INDEX item_source_parent_idx;
+                 DROP INDEX container_source_parent_idx;
+                 ALTER TABLE item DROP COLUMN source_parent_key;
+                 ALTER TABLE container DROP COLUMN source_parent_key;
+                 ALTER TABLE container_build DROP COLUMN source_parent_key;
+                 ALTER TABLE index_run DROP COLUMN store_id;
+                 ALTER TABLE index_run DROP COLUMN through_change_seq;",
+            )
+            .unwrap();
+        }
+        if schema_version == 2 {
+            conn.execute_batch(
+                "ALTER TABLE search_content_state DROP COLUMN page_order_version;
+                 ALTER TABLE search_content_state
+                   ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            )
+            .unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {schema_version};"))
+            .unwrap();
     }
 
     #[test]
@@ -4429,20 +5786,141 @@ mod tests {
         assert_eq!(base.applied_seq, 0);
     }
 
-    /// v2 の店を開き直したときに作り直されないこと。ここが逆になると、起動のたびに索引が
-    /// 消える。`is_v1_layout` は形で判定するので、番号の一致だけに頼らず両方を確かめる。
+    /// Every known normalized store generation is migrated in place.  The fixture deliberately
+    /// removes the newer columns/index after publishing data so a version-number-only implementation would
+    /// either drop the corpus or fail to reconstruct its parent and summary baseline.
     #[test]
-    fn reopening_a_v2_store_keeps_its_rows() {
+    fn schema_v5_migrates_v2_v3_and_v4_in_place_and_reopens() {
+        for legacy_version in [2, 3, 4] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join(format!("v{legacy_version}.db"));
+            let expected_store;
+            {
+                let db = SimilarDb::open_at(&path).unwrap();
+                db.upsert_loose_item(&item("c:/library/kept.jpg", None, None, 9))
+                    .unwrap();
+                publish_test_container(
+                    &db,
+                    "c:/library/book.zip",
+                    ContainerKind::Zip,
+                    &[("c:/library/book.zip\u{1f}page.jpg", 7)],
+                );
+                db.record_completed_index(
+                    current_hash_version(),
+                    123,
+                    CompletedIndexStats {
+                        io_failures: 4,
+                        ..CompletedIndexStats::default()
+                    },
+                )
+                .unwrap();
+                expected_store = db.search_store_id().unwrap();
+            }
+            downgrade_current_store(&path, legacy_version);
+            if legacy_version == 4 {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_v4_item_parent_rewrite
+                       BEFORE UPDATE OF source_parent_key ON item
+                       BEGIN SELECT RAISE(ABORT, 'v4 item parent was already populated'); END;
+                     CREATE TRIGGER reject_v4_container_parent_rewrite
+                       BEFORE UPDATE OF source_parent_key ON container
+                       BEGIN SELECT RAISE(ABORT, 'v4 container parent was already populated'); END;
+                     CREATE TRIGGER reject_v4_build_parent_rewrite
+                       BEFORE UPDATE OF source_parent_key ON container_build
+                       BEGIN SELECT RAISE(ABORT, 'v4 build parent was already populated'); END;",
+                )
+                .unwrap();
+            }
+
+            for _ in 0..2 {
+                let db = SimilarDb::open_at(&path).unwrap();
+                let base = db.load_base_search_rows(current_hash_version()).unwrap();
+                assert_eq!(base.records.len(), 2);
+                assert_eq!(base.store_id, expected_store);
+                let summary = db
+                    .load_index_summary(current_hash_version())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(summary.registered_items, 2);
+                assert_eq!(summary.stats.io_failures, 4);
+                let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+                assert_eq!(stored_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+                assert!(schema_column_exists(&conn, "item", "source_parent_key").unwrap());
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type = 'index' AND name = 'item_loose_key_idx'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT source_parent_key FROM item WHERE item_key = 'c:/library/kept.jpg'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                    "c:/library"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT source_parent_key FROM container
+                         WHERE container_key = 'c:/library/book.zip'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                    "c:/library"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_v5_migration_failure_rolls_back_and_can_be_reopened() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("similar.db");
+        let path = tmp.path().join("rollback.db");
         {
             let db = SimilarDb::open_at(&path).unwrap();
-            db.upsert_loose_item(&item("kept", None, None, 9)).unwrap();
+            db.upsert_loose_item(&item("c:/library/kept.jpg", None, None, 9))
+                .unwrap();
         }
-        let db = SimilarDb::open_at(&path).unwrap();
-        let base = db.load_base_search_rows(current_hash_version()).unwrap();
-        assert_eq!(base.records.len(), 1);
-        assert_eq!(base.records[0].signature, [9; 32]);
+        downgrade_current_store(&path, 3);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO item
+                 (revision, item_key, kind, container_key, page_index, mtime, file_size,
+                  hash_version, pdq256, quality, width, height, format)
+                 VALUES (1, x'FF', 0, NULL, NULL, 1, 1, ?1, zeroblob(32), 1, 1, 1, 1)",
+                [current_hash_version()],
+            )
+            .unwrap();
+        }
+
+        assert!(SimilarDb::open_at(&path).is_err());
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(stored_schema_version(&conn).unwrap(), 3);
+            assert!(!schema_column_exists(&conn, "item", "source_parent_key").unwrap());
+            conn.execute("DELETE FROM item WHERE typeof(item_key) = 'blob'", [])
+                .unwrap();
+        }
+        let reopened = SimilarDb::open_at(&path).unwrap();
+        assert!(
+            reopened
+                .load_item("c:/library/kept.jpg", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            stored_schema_version(&reopened.conn.lock().unwrap()).unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     /// 一括移行を待てる時間が実際に設定されていること。既定の 5 秒に戻ると、移行中に別 worker
@@ -4631,6 +6109,233 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn insert_unpublished_container_items(
+        db: &SimilarDb,
+        container_key: &str,
+        item_count: usize,
+    ) -> Vec<u64> {
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        conn.execute(
+            "INSERT INTO container
+             (container_key, source_parent_key, kind, page_count, scan_state, generation,
+              mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 1)",
+            params![
+                container_key,
+                source_parent_key(container_key),
+                ContainerKind::Zip as i64,
+                i64::try_from(item_count).unwrap(),
+                ScanState::Building as i64,
+            ],
+        )
+        .unwrap();
+        let mut item_ids = Vec::with_capacity(item_count);
+        for page_index in 0..item_count {
+            let key = format!("{container_key}\u{1f}{page_index:05}.jpg");
+            let mut page = item(
+                &key,
+                Some(container_key),
+                Some(u32::try_from(page_index).unwrap()),
+                u8::try_from(page_index % 251).unwrap(),
+            );
+            page.kind = ItemKind::ZipPage;
+            item_ids.push(publish_item(&conn, None, &page).unwrap().item_id);
+        }
+        item_ids
+    }
+
+    #[test]
+    fn incomplete_cleanup_removes_only_building_members_and_journals_them_in_item_order() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/loose.jpg", None, None, 1))
+            .unwrap();
+        publish_test_book(
+            &db,
+            "c:/library/complete",
+            &[("c:/library/complete/a.jpg", 2)],
+        );
+        let building_ids = insert_unpublished_container_items(&db, "c:/library/incomplete.zip", 3);
+        let generation = {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "INSERT INTO container_build
+                 (container_key, source_parent_key, kind, page_count, scan_state, generation,
+                  mtime, file_size)
+                 SELECT container_key, source_parent_key, kind, page_count, scan_state,
+                        generation, mtime, file_size
+                 FROM container WHERE container_key = 'c:/library/incomplete.zip'",
+                [],
+            )
+            .unwrap();
+            let generation = 1_u64;
+            conn.execute(
+                "INSERT INTO item_build
+                 (item_key, kind, container_key, page_index, mtime, file_size, hash_version,
+                  pdq256, quality, width, height, format, generation)
+                 VALUES ('staged', ?1, 'c:/library/incomplete.zip', 0, 1, 1, ?2,
+                         zeroblob(32), 1, 1, 1, 1, ?3)",
+                params![
+                    ItemKind::ZipPage as i64,
+                    current_hash_version(),
+                    i64::try_from(generation).unwrap()
+                ],
+            )
+            .unwrap();
+            generation
+        };
+        assert_eq!(generation, 1);
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+
+        assert_eq!(db.cleanup_incomplete().unwrap(), 5);
+
+        assert!(
+            db.load_item("c:/library/loose.jpg", current_hash_version())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.load_book_pages("c:/library/complete", current_hash_version())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.count_staged(), 0);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM container WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        let changes = db.load_item_changes_after(before_seq).unwrap().changes;
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.item_id)
+                .collect::<Vec<_>>(),
+            building_ids
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.op == ItemChangeOp::Delete)
+        );
+    }
+
+    #[test]
+    fn incomplete_cleanup_cancel_rolls_back_and_clears_the_progress_handler() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let building_ids = insert_unpublished_container_items(&db, "c:/library/incomplete.zip", 32);
+        let before_seq = db.load_item_changes_after(0).unwrap().latest_seq;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let cancel_checks = Arc::clone(&checks);
+        let cancelled = db
+            .cleanup_incomplete_inner(Some(Arc::new(move || {
+                cancel_checks.fetch_add(1, Ordering::AcqRel) >= 8
+            })))
+            .unwrap();
+
+        assert_eq!(cancelled, None);
+        assert!(checks.load(Ordering::Acquire) >= 9);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM item WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            i64::try_from(building_ids.len()).unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM container WHERE container_key = ?1",
+                ["c:/library/incomplete.zip"],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        assert_eq!(
+            db.load_item_changes_after(before_seq).unwrap().changes,
+            Vec::new()
+        );
+
+        assert_eq!(db.cleanup_incomplete().unwrap(), building_ids.len() + 1);
+        db.upsert_loose_item(&item("after-cleanup", None, None, 7))
+            .unwrap();
+    }
+
+    fn incomplete_cleanup_query_evidence(unrelated_rows: usize) -> (String, i32, i32, i32) {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, source_parent_key, page_index,
+                    mtime, file_size, hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('c:/outside/%08d.jpg', value), 0, NULL, 'c:/outside', NULL,
+                        1, 1, ?2, zeroblob(32), 1, 1, 1, 1 FROM ids",
+                params![
+                    i64::try_from(unrelated_rows).unwrap(),
+                    current_hash_version()
+                ],
+            )
+            .unwrap();
+        }
+        insert_unpublished_container_items(&db, "c:/target/incomplete.zip", 8);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        let plan = conn
+            .prepare(&cleanup_incomplete_item_ids_sql(true))
+            .unwrap()
+            .query_map([ScanState::Building as i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        let mut statement = conn
+            .prepare(&cleanup_incomplete_item_ids_sql(false))
+            .unwrap();
+        let item_ids = statement
+            .query_map([ScanState::Building as i64], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(item_ids.len(), 8);
+        (
+            plan,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+        )
+    }
+
+    #[test]
+    fn incomplete_cleanup_query_work_is_independent_of_unrelated_item_count() {
+        let small = incomplete_cleanup_query_evidence(4_096);
+        let large = incomplete_cleanup_query_evidence(32_768);
+        println!("cleanup query K=8: N=4096 {small:?}; N=32768 {large:?}");
+        for evidence in [&small, &large] {
+            assert!(evidence.0.contains("SCAN c"), "{}", evidence.0);
+            assert!(evidence.0.contains("item_container_idx"), "{}", evidence.0);
+            assert!(!evidence.0.contains("SCAN i"), "{}", evidence.0);
+        }
+        assert!(
+            large.1 <= small.1.saturating_add(32),
+            "cleanup VM work grew with unrelated items: small={small:?}, large={large:?}"
+        );
+        assert_eq!(large.2, small.2);
+        assert_eq!(large.3, small.3);
     }
 
     #[test]
@@ -5132,6 +6837,481 @@ mod tests {
         assert_eq!(
             db.load_index_summary(current_hash_version()).unwrap(),
             Some(previous_summary)
+        );
+    }
+
+    #[test]
+    fn delta_scoped_directory_contents_selects_only_observed_ownership() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/loose.jpg", None, None, 1))
+            .unwrap();
+        publish_test_container(
+            &db,
+            "c:/library/archive.zip",
+            ContainerKind::Zip,
+            &[("c:/library/archive.zip\u{1f}page.jpg", 2)],
+        );
+        publish_test_container(
+            &db,
+            "c:/library/document.pdf",
+            ContainerKind::Pdf,
+            &[("c:/library/document.pdf\u{1f}0", 3)],
+        );
+        publish_test_book(
+            &db,
+            "c:/library/child-book",
+            &[("c:/library/child-book/page.jpg", 4)],
+        );
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                directory_contents: vec!["c:/library".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+        let mut items = inventory
+            .items_by_key
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        items.sort_unstable();
+        assert_eq!(
+            items,
+            vec![
+                "c:/library/archive.zip\u{1f}page.jpg",
+                "c:/library/document.pdf\u{1f}0",
+                "c:/library/loose.jpg",
+            ]
+        );
+        assert!(
+            inventory
+                .containers_by_key
+                .contains_key("c:/library/archive.zip")
+        );
+        assert!(
+            inventory
+                .containers_by_key
+                .contains_key("c:/library/document.pdf")
+        );
+        assert!(
+            !inventory
+                .containers_by_key
+                .contains_key("c:/library/child-book")
+        );
+        assert!(
+            !inventory
+                .items_by_key
+                .contains_key("c:/library/child-book/page.jpg")
+        );
+    }
+
+    #[test]
+    fn delta_scoped_drive_root_parent_is_preserved() {
+        assert_eq!(source_parent_key("c:/root.jpg"), "c:/");
+        assert_eq!(source_parent_key("c:/library/root.jpg"), "c:/library");
+        assert_eq!(
+            source_parent_key("//server/share/root.jpg"),
+            "//server/share"
+        );
+
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/root.jpg", None, None, 1))
+            .unwrap();
+        publish_test_container(
+            &db,
+            "c:/archive.zip",
+            ContainerKind::Zip,
+            &[("c:/archive.zip\u{1f}page.jpg", 2)],
+        );
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                directory_contents: vec!["c:/".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+        assert!(inventory.items_by_key.contains_key("c:/root.jpg"));
+        assert!(inventory.containers_by_key.contains_key("c:/archive.zip"));
+        assert!(
+            inventory
+                .items_by_key
+                .contains_key("c:/archive.zip\u{1f}page.jpg")
+        );
+    }
+
+    #[test]
+    fn delta_scoped_child_scope_retires_an_image_book_without_pruning_its_sibling() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(
+            &db,
+            "c:/library/child-book",
+            &[("c:/library/child-book/page.jpg", 1)],
+        );
+        publish_test_book(
+            &db,
+            "c:/library/child-book-old",
+            &[("c:/library/child-book-old/page.jpg", 2)],
+        );
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                removed_prefixes: vec!["c:/library/child-book".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+
+        let result = db
+            .publish_delta_scoped_reconcile_if(
+                inventory,
+                &[],
+                &[],
+                current_hash_version(),
+                2,
+                || true,
+            )
+            .unwrap();
+        let DeltaPublishResult::Committed { removed, watermark } = result else {
+            panic!("valid scoped deletion must commit");
+        };
+        assert_eq!(removed, 2, "one page and its container are retired");
+        assert!(watermark.through_change_seq > 0);
+        let keys = db
+            .load_search_rows(current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.item_key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["c:/library/child-book-old/page.jpg"]);
+        assert_eq!(
+            db.load_index_summary(current_hash_version())
+                .unwrap()
+                .unwrap()
+                .registered_items,
+            1
+        );
+    }
+
+    #[test]
+    fn delta_scoped_identity_checks_preserve_new_members_owner_moves_and_generations() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        publish_test_book(&db, "c:/library/book", &[("c:/library/book/old.jpg", 1)]);
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                subtrees: vec!["c:/library".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "UPDATE item SET container_key = NULL, source_parent_key = 'c:/library/book',
+                                 page_index = NULL
+                 WHERE item_key = 'c:/library/book/old.jpg'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET generation = generation + 1
+                 WHERE container_key = 'c:/library/book'",
+                [],
+            )
+            .unwrap();
+            publish_item(
+                &conn,
+                None,
+                &item(
+                    "c:/library/book/new.jpg",
+                    Some("c:/library/book"),
+                    Some(1),
+                    2,
+                ),
+            )
+            .unwrap();
+            // Keep the baseline exact for this adversarial identity-only race. Production writes
+            // advance item_change and therefore conservatively schedule a Full before finalizing.
+            conn.execute(
+                "UPDATE index_run SET through_change_seq =
+                   COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'item_change'), 0)
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        }
+
+        let result = db
+            .publish_delta_scoped_reconcile_if(
+                inventory,
+                &[],
+                &[],
+                current_hash_version(),
+                2,
+                || true,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            DeltaPublishResult::Committed { removed: 0, .. }
+        ));
+        let mut keys = db
+            .load_search_rows(current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.item_key)
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "c:/library/book/new.jpg".to_owned(),
+                "c:/library/book/old.jpg".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_scoped_invalid_summary_requests_full_without_mutation() {
+        for invalidation in ["store", "hash", "seq"] {
+            let db = SimilarDb::open_in_memory().unwrap();
+            db.upsert_loose_item(&item("c:/library/keep.jpg", None, None, 1))
+                .unwrap();
+            db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+                .unwrap();
+            let inventory = delta_inventory(
+                &db,
+                DeltaScopePlan {
+                    directory_contents: vec!["c:/library".to_owned()],
+                    ..DeltaScopePlan::default()
+                },
+            );
+            let before = db.load_search_rows(current_hash_version()).unwrap();
+            {
+                let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+                match invalidation {
+                    "store" => {
+                        conn.execute(
+                            "UPDATE index_run SET store_id = zeroblob(16) WHERE singleton = 1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "hash" => {
+                        conn.execute(
+                            "UPDATE index_run SET hash_version = hash_version + 1
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "seq" => {
+                        conn.execute(
+                            "UPDATE index_run SET through_change_seq = through_change_seq + 1
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let result = db
+                .publish_delta_scoped_reconcile_if(
+                    inventory,
+                    &[],
+                    &[],
+                    current_hash_version(),
+                    2,
+                    || true,
+                )
+                .unwrap();
+            assert_eq!(result, DeltaPublishResult::RequiresFull, "{invalidation}");
+            assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn delta_scoped_cancel_rolls_back_rows_journal_and_summary() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/remove.jpg", None, None, 1))
+            .unwrap();
+        let summary = db
+            .record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                directory_contents: vec!["c:/library".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+        let before_rows = db.load_search_rows(current_hash_version()).unwrap();
+        let before_changes = db.load_item_changes_after(0).unwrap();
+        let checks = AtomicUsize::new(0);
+
+        let result = db
+            .publish_delta_scoped_reconcile_if(
+                inventory,
+                &[],
+                &[],
+                current_hash_version(),
+                2,
+                || checks.fetch_add(1, Ordering::AcqRel) == 0,
+            )
+            .unwrap();
+        assert_eq!(result, DeltaPublishResult::Skipped);
+        assert_eq!(
+            db.load_search_rows(current_hash_version()).unwrap(),
+            before_rows
+        );
+        assert_eq!(db.load_item_changes_after(0).unwrap(), before_changes);
+        assert_eq!(
+            db.load_index_summary(current_hash_version()).unwrap(),
+            Some(summary)
+        );
+    }
+
+    #[test]
+    fn delta_scoped_parent_indexes_keep_candidate_count_independent_of_store_size() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 10000
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, source_parent_key, page_index,
+                    mtime, file_size, hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('c:/outside/%05d.jpg', value), 0, NULL, 'c:/outside', NULL,
+                        1, 1, ?1, zeroblob(32), 1, 1, 1, 1 FROM ids",
+                [current_hash_version()],
+            )
+            .unwrap();
+        }
+        db.upsert_loose_item(&item("c:/target/a.jpg", None, None, 1))
+            .unwrap();
+        db.upsert_loose_item(&item("c:/target/b.jpg", None, None, 2))
+            .unwrap();
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+
+        let inventory = delta_inventory(
+            &db,
+            DeltaScopePlan {
+                directory_contents: vec!["c:/target".to_owned()],
+                ..DeltaScopePlan::default()
+            },
+        );
+        assert_eq!(inventory.items.len(), 2);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        let detail = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT item_id FROM item
+                 WHERE source_parent_key = ?1 AND container_key IS NULL",
+            )
+            .unwrap()
+            .query_map(["c:/target"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(detail.contains("item_source_parent_idx"), "{detail}");
+    }
+
+    #[test]
+    fn delta_scoped_loose_loader_cancels_mid_stream_and_releases_the_database() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 9000
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, source_parent_key, page_index,
+                    mtime, file_size, hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('c:/target/%05d.jpg', value), 0, NULL, 'c:/target', NULL,
+                        1, 1, ?1, zeroblob(32), 1, 1, 1, 1 FROM ids",
+                [current_hash_version()],
+            )
+            .unwrap();
+        }
+        let polls = AtomicUsize::new(0);
+        let inventory = db
+            .load_delta_scoped_inventory(
+                DeltaScopePlan {
+                    directory_contents: vec!["c:/target".to_owned()],
+                    ..DeltaScopePlan::default()
+                },
+                current_hash_version(),
+                || polls.fetch_add(1, Ordering::AcqRel) < 2,
+            )
+            .unwrap();
+        assert!(inventory.is_none());
+        assert_eq!(polls.load(Ordering::Acquire), 3);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM item", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9000
+        );
+    }
+
+    #[test]
+    fn delta_scoped_container_member_loader_cancels_mid_stream_and_releases_the_database() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute(
+                "INSERT INTO container
+                   (container_key, source_parent_key, kind, page_count, scan_state, generation,
+                    mtime, file_size)
+                 VALUES ('c:/target/book.zip', 'c:/target', ?1, 9000, ?2, 1, 1, 1)",
+                params![ContainerKind::Zip as i64, ScanState::Complete as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "WITH RECURSIVE ids(value) AS (
+                   VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 9000
+                 )
+                 INSERT INTO item
+                   (revision, item_key, kind, container_key, source_parent_key, page_index,
+                    mtime, file_size, hash_version, pdq256, quality, width, height, format)
+                 SELECT 1, printf('c:/target/book.zip\\u001f%05d.jpg', value), ?1,
+                        'c:/target/book.zip', NULL, value - 1, 1, 1, ?2,
+                        zeroblob(32), 1, 1, 1, 1 FROM ids",
+                params![ItemKind::ZipPage as i64, current_hash_version()],
+            )
+            .unwrap();
+        }
+        let polls = AtomicUsize::new(0);
+        let inventory = db
+            .load_delta_scoped_inventory(
+                DeltaScopePlan {
+                    subtrees: vec!["c:/target".to_owned()],
+                    ..DeltaScopePlan::default()
+                },
+                current_hash_version(),
+                || polls.fetch_add(1, Ordering::AcqRel) < 7,
+            )
+            .unwrap();
+        assert!(inventory.is_none());
+        assert_eq!(polls.load(Ordering::Acquire), 8);
+        let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM item", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9000
         );
     }
 
