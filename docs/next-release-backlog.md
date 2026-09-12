@@ -24,6 +24,93 @@
 ---
 
 ## 1. 優先候補
+### 1.222 viewer context audit の CI が 2 件で落ちたまま — v3.9.0 公開時に残した (2026-09-12)
+
+- 出典: v3.9.0 公開作業での CI 確認 (run `34677345883` / HEAD `5de2b6d4e`)。
+  **`cargo fmt --check` と `cargo check (ubuntu / non-Windows cfg)` は緑**。v3.8.0 で残っていた
+  `cfg(windows)` 漏れ 3 件と A6 誤検知 49 件は `9ce433709` で解消済み。残るのは次の 2 件だけ。
+- **どちらも配布バイナリの挙動には影響しないので、v3.9.0 は赤のまま公開した** (利用者判断)。
+  修正は `tools/viewer_context_audit/src/lib.rs` で、公開担当の範囲外として開発側へ差し戻す。
+
+#### (1) A2b `src/app.rs` `resume_loading_items_after_sidecar`
+
+> A2b src/app.rs:26713 resume_loading_items_after_sidecar: 7 distinct ViewerContextBundle fields
+> occur in mem::swap/replace/take arguments: adjustment_page_params, comic_pages, conceal_pages,
+> export_crop_page_settings, local_adjust_pages, mask_pages, view_trim_page_overrides
+
+- **コードは変わっていない。** v3.8.0 では同じ 7 行が `start_loading_items_inner` の中にあり
+  (v3.8.0 の `src/app.rs:26378`〜`26488`、関数は `25801` から)、その関数は A2b の
+  `ALLOWLIST_ENTRIES` に登録済みだった。§1.209 で取り込みを UI スレッドから外すために
+  `9c9df532c` が関数を 2 つへ割った結果、登録済みの後半が新しい関数名へ移り、
+  (ファイル + 関数名) をキーにする監査の対象から外れた。
+- 7 件はいずれも `self.<field> = std::mem::take(&mut metadata.<field>)` /
+  `(&mut prepared.<field>)` で、受け側は prepared payload であって別の App や context ではない。
+  既存 `start_loading_items_inner` の理由書き (prepared payload から mounted projection へ
+  完了したロードを設置するもので、既存 context の抽出・移譲ではない) がそのまま当てはまる。
+- 対応候補は allowlist への追加だが、**機械的に足さず**、分割後も同じ不変条件
+  (取り込み完了までの世代整合、取消・フォルダ移動・別窓での所有境界) が保たれているかを
+  検収してから登録する。分割前後で監査の網が緩まないかも見る。
+
+#### (2) A4 `src/app/viewer_context_registry.rs:1166` `video_seek_strip_test_script_snapshot`
+
+> A4 ... unexpected public API fingerprint: inherent fn #[cfg(windows)] <'a> ContextRef<'a> ::
+> #[cfg(feature = "test-script")] pub(in crate::app) fn video_seek_strip_test_script_snapshot(self,)
+> -> crate::test_script::TestScriptSeekStripSnapshot
+
+- `095c82276` (動画 strip 寿命の S4 自動テスト) で追加された API。`#[cfg(windows)]` +
+  `#[cfg(feature = "test-script")]` + `pub(in crate::app)`。
+- **`test-script` feature は `build-portable.ps1 -SmokeTestScript` (使い捨て smoke 専用) でしか
+  有効にならない**ので、`build-dist.ps1` が作る 4 成果物にはこの API は存在しない。
+- A4 は「公開 API の意味を検収してから登録する」ルールなので、`PUBLIC_API_ALLOWLIST` への
+  追加は snapshot が読み取り専用で、他 context の状態を触らないことを確認してから行う。
+
+#### 関連 (同じ CI では落ちないが、ビルドで毎回出る警告)
+
+- `clashing_extern_declarations`: `GetProcessMemoryInfo` が `src/similar_index.rs:6593` と
+  `src/similar_db/full_inventory_benchmark_tests.rs:922` で、それぞれ `ProcessMemoryCounters` /
+  `ProcessMemoryCountersEx` を取る別シグネチャとして宣言されている。**両方とも `cfg(test)` 配下**で、
+  各呼び出しは自分の構造体と `cb` を渡しているので配布物には影響しない。宣言を 1 か所へ寄せると消える。
+
+- 規模 / 優先度: Small / P2。CI を緑へ戻す。2 リリース連続で赤のまま出しているので、次版では先に片付ける。
+
+### 1.221 右クリックメニューの mIV 項目を表示・並べ替えできるようにする — >>378 (2026-09-12)
+
+- 出典: >>378。利用者から、右クリックメニューの項目を編集したいとの要望。
+- 対象は、グリッドとフルスクリーンの共通モデル (`context_menu_model`) が生成する
+  **mImageViewer側の項目**。環境設定に一覧を設け、項目ごとの表示ON/OFFと順序変更、
+  既定へ戻す操作を用意する。既定値は現在の表示内容・順序を維持する。
+- 同じ並び設定をグリッド / フルスクリーンで共有し、その場面で利用できない項目は従来どおり省く。
+  表示対象を減らしても、キー割り当てや上部メニューなど別の入口は変更しない。
+- `MenuCommand` の表示名ではなく、永続化用の安定IDで順序と非表示を保存する。新しい項目は
+  既存利用者の並びを壊さず既定位置へ追加し、未知・廃止IDは安全に無視する。
+- 登録済み外部ツール、関連付けアプリなどの動的な項目は、個々をこの画面で並べ替えず
+  **グループ単位の固定枠**として扱う。個別の並びは各機能が現在持つ順序を使う。
+- **Windows Shell側の項目は個別の識別・並べ替えをしない。** Shellが返す項目群は、現在の
+  サブメニュー / 併記設定を保った1つの固定枠とし、内部の表示内容と順序はWindowsへ任せる。
+- 実装時は [右クリックメニュー統一設計](context-menu-unification-plan.md) を正本として更新する。
+  共通モデルを設定で解決してからnative Win32 / egui fallbackの両描画へ渡し、描画側ごとに
+  フィルタや並べ替えを重複実装しない。非表示後の空サブメニューと不要な区切り線も正規化する。
+- 回帰確認: 実項目 / 仮想項目 / 混在選択、グリッド / フルスクリーン、native / egui fallback、
+  外部ツール、Windows項目のサブメニュー / 併記、設定round-trip、新規ID追加時の補完。
+- 規模 / 優先度: Medium / P2。
+
+### 1.220 切り取り中の実ファイル・フォルダを半透明で表示する — >>378 (2026-09-12)
+
+- 出典: >>378。エクスプローラーのように、切り取り中の項目を一覧で半透明にしてほしいとの要望。
+- Shellクリップボードが `CF_HDROP` と移動 (`Preferred DropEffect = MOVE`) を示している間、
+  対象の実ファイル・実フォルダをサムネイル表示と詳細表示の両方で半透明にする。
+  ZIP/PDF内ページなどの仮想項目、フルスクリーンの画像本体、実ファイル自体は変更しない。
+- 半透明化してもカーソル、チェック、hover、選択枠などの操作状態は判別できるようにする。
+  パス比較はWindowsの大文字・小文字差と表記揺れを吸収する正規化済み実パスで行う。
+- mIVから切り取った直後だけのboolを各項目へ足さない。切り取り直後に共通のクリップボード状態を
+  更新し、貼り付け完了、コピー / 別の切り取り、外部アプリによるクリップボード変更で解除する。
+  Windowsのclipboard change通知を入口にし、描画フレームごとの同期clipboard読み取りは行わない。
+- 複数ウィンドウでは同じシステムクリップボード状態を共有し、片方での切り取り・貼り付け・
+  上書きを全グリッドへ反映する。移動後の一覧再読み込みと競合して古い項目を暗く残さない。
+- 回帰確認: 単一 / 複数 / フォルダ混在、コピーでは暗くならない、外部clipboard上書き、
+  貼り付け成功 / 失敗 / 中止、フォルダ移動後の再表示、複数ウィンドウ、詳細 / サムネイル表示。
+- 規模 / 優先度: Small-Medium / P2。Windows clipboard通知と複数ウィンドウ共有まで含めて確認する。
+
 ### 1.218 見開きの先頭・末尾にある単ページを本来の側へ配置する — >>384-386 (2026-09-11)
 
 - 出典: >>384 で、見開き時の末尾へ白・黒・任意色のページを添えて位置を揃えたいとの要望。
