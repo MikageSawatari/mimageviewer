@@ -192,11 +192,9 @@ fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     });
 }
 
-const V3_8_HIGHLIGHTS_WITH_SIMILAR: &[HighlightItem] = &[
-    HighlightItem {
-        title: "同じ絵の別バージョンを探せます",
-        body: "お気に入りごとに「別バージョン索引」を ON にすると (既定は OFF)、フルスクリーン右パネルの「類似」で、いま見ている画像と同じ絵を別の大きさ・形式から探せます。画像単位と本単位の両方で探せ、本単位ではどのページが一致しているかも表示します。",
-    },
+// v3.8.0 は別バージョン索引を休止したまま出荷したので、この版の告知は 2 件のまま固定する。
+// 機能そのものの告知は、実際に使えるようになった v3.9.0 のエントリが持つ。
+const V3_8_HIGHLIGHTS: &[HighlightItem] = &[
     HighlightItem {
         title: "画像・動画の余白色を選べます",
         body: "静止画・本の画像の外側、静止画サムネイル列の空欄、動画の映像の外側に使う色を、黒 / 灰 / 白と任意の色から選べます (既定は黒のままです)。環境設定 → 表示 → 閲覧表示 にあります。",
@@ -207,20 +205,10 @@ const V3_8_HIGHLIGHTS_WITH_SIMILAR: &[HighlightItem] = &[
     },
 ];
 
-const V3_8_HIGHLIGHTS_WITHOUT_SIMILAR: &[HighlightItem] = &[
-    V3_8_HIGHLIGHTS_WITH_SIMILAR[1],
-    V3_8_HIGHLIGHTS_WITH_SIMILAR[2],
-];
-
-const fn v3_8_highlights(
-    capability: crate::similar_index::SimilarFeatureCapability,
-) -> &'static [HighlightItem] {
-    if capability.is_enabled() {
-        V3_8_HIGHLIGHTS_WITH_SIMILAR
-    } else {
-        V3_8_HIGHLIGHTS_WITHOUT_SIMILAR
-    }
-}
+const V3_9_HIGHLIGHTS: &[HighlightItem] = &[HighlightItem {
+    title: "同じ絵の別バージョンを探せます",
+    body: "お気に入りごとに「別バージョン索引」を ON にすると (既定は OFF)、フルスクリーン右パネルの「類似」で、いま見ている画像と同じ絵を別の大きさ・形式から探せます。画像単位と本単位の両方で探せ、本単位ではどのページが一致しているかも表示します。",
+}];
 
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
@@ -832,12 +820,19 @@ const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "3.8.0",
         // 末尾の表紙は既定 ON で、更新しただけで見開きの見え方が変わるため必読へ置く。
-        // 別バージョン索引は既定 OFF、余白色の既定は従来どおり黒なので新機能側にまとめる。
+        // 余白色の既定は従来どおり黒なので新機能側にまとめる。
         must_read: &[HighlightItem {
             title: "見開きの最後に表紙を添えるようになりました",
             body: "「表紙あり」の見開きで先頭と末尾がどちらも単独ページになる本では、最後のページの隣へ先頭の表紙を並べます。表示だけの追加で、ページ数・ページ送り・シークバー・読書位置は変わりません。既定は ON です。環境設定 → 表示 → 閲覧表示 で全体を切り替えられ、本ごとにはフルスクリーンの表示モードメニューから選べます。",
         }],
-        highlights: v3_8_highlights(crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY),
+        highlights: V3_8_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "3.9.0",
+        // 既定値も既存の操作の意味も変えていないので必読は無し。別バージョン索引は
+        // 既定 OFF の新機能なので新機能側だけで告知する。
+        must_read: &[],
+        highlights: V3_9_HIGHLIGHTS,
     },
 ];
 
@@ -1021,34 +1016,50 @@ mod tests {
     }
 
     #[test]
-    fn v3_8_highlights_follow_the_shared_similar_feature_capability() {
-        let paused = v3_8_highlights(crate::similar_index::SimilarFeatureCapability::Paused);
-        assert_eq!(paused.len(), 2);
+    fn similar_search_is_announced_by_the_version_that_shipped_it() {
+        // v3.8.0 は休止したまま出荷したので、この版の告知に別バージョン索引は出ない。
+        // v3.8.0 から上げた利用者は v3.9.0 のエントリしか見ないため、告知はそちらが持つ。
+        let v3_8 = table()
+            .iter()
+            .find(|entry| entry.version == "3.8.0")
+            .expect("v3.8.0 entry");
+        assert_eq!(v3_8.highlights.len(), 2);
         assert!(
-            paused
+            v3_8.highlights
                 .iter()
                 .all(|item| !item.title.contains("別バージョン"))
         );
-        assert!(paused.iter().any(|item| item.title.contains("余白色")));
         assert!(
-            paused
+            v3_8.highlights
+                .iter()
+                .any(|item| item.title.contains("余白色"))
+        );
+        assert!(
+            v3_8.highlights
                 .iter()
                 .any(|item| item.title.contains("マウスボタン"))
         );
 
-        let enabled = v3_8_highlights(crate::similar_index::SimilarFeatureCapability::Enabled);
-        assert_eq!(enabled.len(), 3);
+        let v3_9 = table()
+            .iter()
+            .find(|entry| entry.version == "3.9.0")
+            .expect("v3.9.0 entry");
+        assert!(v3_9.must_read.is_empty());
         assert!(
-            enabled
+            v3_9.highlights
                 .iter()
                 .any(|item| item.title.contains("別バージョン"))
         );
-        let shipped = table().last().unwrap().highlights;
-        assert_eq!(shipped.len(), enabled.len());
         assert!(
-            shipped
-                .iter()
-                .any(|item| item.title.contains("別バージョン"))
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY.is_enabled(),
+            "v3.9.0 announces the feature, so the product build must actually have it"
+        );
+
+        let upgraded = highlights_to_show(Some("3.8.0"), "3.9.0", table());
+        assert_eq!(
+            versions(&upgraded),
+            ["3.9.0"],
+            "a v3.8.0 user must be told about the feature on the first v3.9.0 launch"
         );
     }
 
