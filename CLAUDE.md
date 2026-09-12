@@ -1345,9 +1345,12 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 | 経路 | 呼び出し元 | 書き込む物 | 条件 |
 | --- | --- | --- | --- |
 | レーティング | `rating_write_worker` → `xmp_writer::apply_rating` | `xmp:Rating` | 設定 `write_rating_to_xmp` (**既定 OFF**) + `GridItem::Image` かつ JPEG / PNG / WebP。製本ページは除外 |
-| 旧 XMP タグの取り込み後削除 | `tag_legacy_xmp_worker` → `xmp_writer::apply_tag_op(TagOp::ClearMiv)` | `dc:subject` から `#` 始まりの要素だけ除去 | ユーザーが「旧XMPタグを取り込んでファイルから削除」を明示実行したときのみ |
 
-どちらも `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
+**旧 XMP タグの経路は 2 つとも既に無い。** 手動の「旧XMPタグを取り込む / 取り込んでファイルから削除」は
+`e63600147` (2026-08-30、v3.4.0) で、初訪問時の自動 seed は v3.9.1 で撤去した (`39390ec77`、§1.226)。
+`src/tag_legacy_xmp_worker.rs` も `src/tag_legacy_seed_worker.rs` も存在しない。**復活させない。**
+
+この経路は `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
 並走させると後勝ちで相手の編集を消すため)。**新しい書き込み経路を足すときもこのロックを通す**。
 
 ### ExifTool でのラウンドトリップ検証
