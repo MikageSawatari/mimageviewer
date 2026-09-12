@@ -239,6 +239,12 @@ pub(crate) struct FullContainerObservation {
     pub(crate) member_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FullContainerPreopen {
+    pub(crate) page_count: u32,
+    pub(crate) member_count: u32,
+}
+
 struct FullInventoryItem {
     item_id: u64,
     owner: Option<u32>,
@@ -503,6 +509,37 @@ impl FullReconcileInventory {
         self.containers_by_key
             .get(container_key)
             .map_or(0, |&index| self.containers[index as usize].member_count)
+    }
+
+    /// Return the complete saved container evidence that lets an initial Full reconcile trust
+    /// filesystem metadata without opening the ZIP/PDF first.
+    ///
+    /// This is deliberately stricter than the post-open freshness check: any malformed or
+    /// internally inconsistent snapshot falls back to the established enumeration path.
+    pub(crate) fn preopen_current_container(
+        &self,
+        container_key: &str,
+        expected_kind: ContainerKind,
+        mtime: i64,
+        file_size: i64,
+        hash_version: i64,
+    ) -> Option<FullContainerPreopen> {
+        let &index = self.containers_by_key.get(container_key)?;
+        let container = &self.containers[index as usize];
+        let snapshot = container.snapshot.as_ref()?;
+        let page_count = u32::try_from(snapshot.page_count?).ok()?;
+        (snapshot.kind == expected_kind as i64
+            && snapshot.scan_state == ScanState::Complete as i64
+            && page_count > 0
+            && container.member_count == page_count
+            && snapshot.mtime == mtime
+            && snapshot.file_size == file_size
+            && container.all_members_current
+            && hash_version == self.hash_version)
+            .then_some(FullContainerPreopen {
+                page_count,
+                member_count: container.member_count,
+            })
     }
 
     pub(crate) fn container_observation(
@@ -7876,6 +7913,152 @@ mod tests {
             !inventory
                 .observe_item("book/page", Some("book"), Some(0), 10, 20)
                 .reusable_current_row
+        );
+    }
+
+    #[test]
+    fn full_inventory_preopen_requires_complete_consistent_current_evidence() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for key in [
+            "good",
+            "wrong-kind",
+            "member-mismatch",
+            "old-member",
+            "failed",
+            "zero",
+            "missing-count",
+            "overflow-count",
+            "invalid-kind",
+        ] {
+            let page_key = format!("{key}/0");
+            publish_test_container(&db, key, ContainerKind::Zip, &[(page_key.as_str(), 1)]);
+        }
+        {
+            let conn = db.conn.lock().unwrap_or_else(|error| error.into_inner());
+            conn.execute("DELETE FROM item WHERE container_key='member-mismatch'", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE item SET hash_version=?1 WHERE container_key='old-member'",
+                [current_hash_version() - 1],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET scan_state=?1 WHERE container_key='failed'",
+                [ScanState::Failed as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET page_count=0 WHERE container_key='zero'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET page_count=NULL WHERE container_key='missing-count'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET page_count=?1 WHERE container_key='overflow-count'",
+                [i64::from(u32::MAX) + 1],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE container SET kind=99 WHERE container_key='invalid-kind'",
+                [],
+            )
+            .unwrap();
+        }
+        let inventory = full_inventory(&db);
+
+        assert_eq!(
+            inventory.preopen_current_container(
+                "good",
+                ContainerKind::Zip,
+                1,
+                2,
+                current_hash_version(),
+            ),
+            Some(FullContainerPreopen {
+                page_count: 1,
+                member_count: 1,
+            })
+        );
+        for key in [
+            "member-mismatch",
+            "old-member",
+            "failed",
+            "zero",
+            "missing-count",
+            "overflow-count",
+            "invalid-kind",
+        ] {
+            assert!(
+                inventory
+                    .preopen_current_container(
+                        key,
+                        ContainerKind::Zip,
+                        1,
+                        2,
+                        current_hash_version(),
+                    )
+                    .is_none(),
+                "{key} must fall back to opening the container"
+            );
+        }
+        assert!(
+            inventory
+                .preopen_current_container(
+                    "wrong-kind",
+                    ContainerKind::Pdf,
+                    1,
+                    2,
+                    current_hash_version(),
+                )
+                .is_none()
+        );
+        assert!(
+            inventory
+                .preopen_current_container(
+                    "good",
+                    ContainerKind::Zip,
+                    2,
+                    2,
+                    current_hash_version(),
+                )
+                .is_none()
+        );
+        assert!(
+            inventory
+                .preopen_current_container(
+                    "good",
+                    ContainerKind::Zip,
+                    1,
+                    3,
+                    current_hash_version(),
+                )
+                .is_none()
+        );
+        assert!(
+            inventory
+                .preopen_current_container(
+                    "good",
+                    ContainerKind::Zip,
+                    1,
+                    2,
+                    current_hash_version() + 1,
+                )
+                .is_none()
+        );
+        assert!(
+            inventory
+                .preopen_current_container(
+                    "missing",
+                    ContainerKind::Zip,
+                    1,
+                    2,
+                    current_hash_version(),
+                )
+                .is_none()
         );
     }
 

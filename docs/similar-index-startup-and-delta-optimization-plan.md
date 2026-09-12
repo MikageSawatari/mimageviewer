@@ -39,6 +39,13 @@ source調査ではSimilar内のmtime/sizeは既にDirEntry metadataからFileCan
 
 directory/root mtimeだけで再帰確認を省略しない。ZIP/PDFの現在性判定はページ数等も含むため、mtime/sizeだけで書庫列挙を省く案は採用しない。コンテナ・アイテム索引の観測結果は対象と情報が異なり、そのまま類似索引の完全性証明にはならない。USN等による停止中の変更追跡は今回の範囲外。CPU並列度増加による短縮も音声への影響があるため先行しない。
 
+2026-09-12 の §1.228 では、実測で無変更 PDF の列挙が起動 Full の律速と分かり、利用者が
+同一 `mtime` / size の Complete コンテナを更新なしとして扱うことを了承した。この旧判断は
+`FullReason::Initial` に限って置き換える。保存済み page count、member count、Complete、kind、
+全 member/current hash の一致まで既存 Full inventory で確認し、どれか不明なら従来の列挙へ戻す。
+Delta と Initial 以外の Full は変更しない。確定契約は
+[§1.228 計画](section228-similar-container-preopen-plan.md)を参照。
+
 ### 更新：scope限定DB処理
 
 FS走査とDB候補取得が同じtyped scope planを使う。現在の `item_key` UNIQUE、`container_key` PRIMARY KEY、`item(container_key,page_index)` indexをまず評価し、親パスの検索index等が必要ならmigration費用を含め別途確定する。文字列全件走査をSQL関数やメモリループへ移しただけの実装は不可。

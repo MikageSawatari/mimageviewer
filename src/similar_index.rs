@@ -1113,6 +1113,23 @@ impl FullReason {
             Self::Manual => "manual",
         }
     }
+
+    fn container_preopen_policy(self) -> ContainerPreopenPolicy {
+        match self {
+            Self::Initial => ContainerPreopenPolicy::InitialMetadataTrust,
+            Self::Reconfigure
+            | Self::Overflow
+            | Self::WatchRecovery
+            | Self::SummaryRepair
+            | Self::Manual => ContainerPreopenPolicy::MustOpen,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerPreopenPolicy {
+    InitialMetadataTrust,
+    MustOpen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1691,7 +1708,12 @@ impl SchedulerState {
         let should_replace = self.pending_full.is_none_or(|pending| {
             intent.config_epoch > pending.config_epoch
                 || intent.config_epoch == pending.config_epoch
-                    && intent.required_gap_epoch > pending.required_gap_epoch
+                    && (intent.required_gap_epoch > pending.required_gap_epoch
+                        || intent.required_gap_epoch == pending.required_gap_epoch
+                            && pending.reason.container_preopen_policy()
+                                == ContainerPreopenPolicy::InitialMetadataTrust
+                            && intent.reason.container_preopen_policy()
+                                == ContainerPreopenPolicy::MustOpen)
         });
         if should_replace {
             self.pending_full = Some(intent);
@@ -2814,11 +2836,12 @@ impl SimilarIndexScheduler {
                     scheduler: Arc::downgrade(&self),
                 };
                 let scan = match plan.running.kind {
-                    ReconcileJobKind::Full(_) => run_index_job(
+                    ReconcileJobKind::Full(intent) => run_index_job(
                         &db,
                         &plan.config.scan_roots(),
                         &plan.config.excluded_root_keys,
                         &plan.config.pdf_passwords,
+                        intent.reason.container_preopen_policy(),
                         plan.config.activity_gate.as_deref(),
                         &plan.running.cancel,
                         &self.progress,
@@ -4793,6 +4816,7 @@ fn run_index_job(
     roots: &[PathBuf],
     excluded_root_keys: &[String],
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
+    container_preopen_policy: ContainerPreopenPolicy,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
@@ -4856,6 +4880,7 @@ fn run_index_job(
                     db,
                     excluded_root_keys,
                     pdf_passwords,
+                    container_preopen_policy,
                     activity_gate,
                     cancel,
                     progress,
@@ -5126,6 +5151,7 @@ fn run_delta_index_job(
                     db,
                     &config.excluded_root_keys,
                     &config.pdf_passwords,
+                    ContainerPreopenPolicy::MustOpen,
                     config.activity_gate.as_deref(),
                     cancel,
                     progress,
@@ -5230,6 +5256,7 @@ struct ScanContext<'a> {
     db: &'a SimilarDb,
     excluded_root_keys: &'a [String],
     pdf_passwords: &'a crate::pdf_passwords::PdfPasswordStore,
+    container_preopen_policy: ContainerPreopenPolicy,
     cancel: &'a Arc<AtomicBool>,
     aggregate: &'a ScanAggregate<'a>,
     report: IndexReport,
@@ -5253,6 +5280,7 @@ fn scan_worker_loop(
     db: &SimilarDb,
     excluded_root_keys: &[String],
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
+    container_preopen_policy: ContainerPreopenPolicy,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &Arc<AtomicBool>,
     progress: &Arc<Mutex<IndexProgress>>,
@@ -5279,6 +5307,7 @@ fn scan_worker_loop(
             db,
             excluded_root_keys,
             pdf_passwords,
+            container_preopen_policy,
             cancel,
             aggregate,
             report: IndexReport::default(),
@@ -5449,6 +5478,28 @@ impl ScanContext<'_> {
                 current_hash_version(),
             )),
         }
+    }
+
+    fn preopen_current_container(
+        &self,
+        container_key: &str,
+        expected_kind: ContainerKind,
+        mtime: i64,
+        file_size: i64,
+    ) -> Option<crate::similar_db::FullContainerPreopen> {
+        if self.container_preopen_policy != ContainerPreopenPolicy::InitialMetadataTrust {
+            return None;
+        }
+        let ScanPass::Full(inventory) = self.pass else {
+            return None;
+        };
+        inventory.preopen_current_container(
+            container_key,
+            expected_kind,
+            mtime,
+            file_size,
+            current_hash_version(),
+        )
     }
 
     fn preserve_current_container(&mut self, container_key: &str) -> Result<u64, String> {
@@ -5776,6 +5827,23 @@ impl ScanContext<'_> {
     fn process_zip(&mut self, candidate: &FileCandidate) -> Result<(), String> {
         let container_key = crate::search_index_db::normalize_path(&candidate.path);
         self.mark_container_seen(&container_key);
+        if let Some(current) = self.preopen_current_container(
+            &container_key,
+            ContainerKind::Zip,
+            candidate.mtime,
+            candidate.file_size,
+        ) {
+            if self.cancelled() {
+                return Ok(());
+            }
+            if let Some(telemetry) = self.aggregate.telemetry {
+                telemetry.observe_zip_pages(current.page_count as usize);
+            }
+            self.report.discovered += u64::from(current.page_count);
+            self.report.unchanged += u64::from(current.member_count);
+            self.report.processed += u64::from(current.member_count);
+            return Ok(());
+        }
         let entries = match crate::zip_loader::enumerate_image_entries(&candidate.path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -5894,6 +5962,23 @@ impl ScanContext<'_> {
     fn process_pdf(&mut self, candidate: &FileCandidate) -> Result<(), String> {
         let container_key = crate::search_index_db::normalize_path(&candidate.path);
         self.mark_container_seen(&container_key);
+        if let Some(current) = self.preopen_current_container(
+            &container_key,
+            ContainerKind::Pdf,
+            candidate.mtime,
+            candidate.file_size,
+        ) {
+            if self.cancelled() {
+                return Ok(());
+            }
+            if let Some(telemetry) = self.aggregate.telemetry {
+                telemetry.observe_pdf_pages(current.page_count as usize);
+            }
+            self.report.discovered += u64::from(current.page_count);
+            self.report.unchanged += u64::from(current.member_count);
+            self.report.processed += u64::from(current.member_count);
+            return Ok(());
+        }
         let password = self.pdf_passwords.get(&candidate.path);
         let pages = match crate::pdf_loader::enumerate_pages_with_cancel(
             &candidate.path,
@@ -6658,6 +6743,23 @@ mod tests {
         assert_eq!(FullReason::Overflow.label(), "overflow");
         assert_eq!(FullReason::SummaryRepair.label(), "summary_repair");
         assert_eq!(FullReason::Manual.label(), "manual");
+        assert_eq!(
+            FullReason::Initial.container_preopen_policy(),
+            ContainerPreopenPolicy::InitialMetadataTrust
+        );
+        for reason in [
+            FullReason::Reconfigure,
+            FullReason::Overflow,
+            FullReason::WatchRecovery,
+            FullReason::SummaryRepair,
+            FullReason::Manual,
+        ] {
+            assert_eq!(
+                reason.container_preopen_policy(),
+                ContainerPreopenPolicy::MustOpen,
+                "{reason:?} must retain the established container-open path"
+            );
+        }
         assert!(!telemetry.claim_progress_log(4_999));
         assert!(telemetry.claim_progress_log(5_000));
         assert!(!telemetry.claim_progress_log(9_999));
@@ -6701,6 +6803,7 @@ mod tests {
             &[],
             &[],
             &passwords,
+            ContainerPreopenPolicy::MustOpen,
             None,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(IndexProgress::Idle)),
@@ -6730,6 +6833,7 @@ mod tests {
             &[missing],
             &[],
             &passwords,
+            ContainerPreopenPolicy::MustOpen,
             None,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(IndexProgress::Idle)),
@@ -7324,6 +7428,7 @@ mod tests {
                     &[],
                     &[],
                     passwords,
+                    ContainerPreopenPolicy::MustOpen,
                     Some(gate),
                     cancel,
                     progress,
@@ -7355,6 +7460,7 @@ mod tests {
                 &[],
                 &[],
                 &passwords,
+                ContainerPreopenPolicy::MustOpen,
                 Some(&active_gate),
                 &Arc::new(AtomicBool::new(false)),
                 &Arc::new(Mutex::new(IndexProgress::Idle)),
@@ -7388,6 +7494,7 @@ mod tests {
                     &[],
                     &[],
                     passwords,
+                    ContainerPreopenPolicy::MustOpen,
                     Some(gate),
                     cancel,
                     progress,
@@ -7519,6 +7626,7 @@ mod tests {
             &[root.path().to_path_buf()],
             &[],
             &passwords,
+            ContainerPreopenPolicy::MustOpen,
             None,
             &cancel,
             &progress,
@@ -7541,6 +7649,187 @@ mod tests {
                 .iter()
                 .all(|container| container.page_count == Some(3))
         );
+    }
+
+    fn candidate_from_file(path: PathBuf) -> FileCandidate {
+        let metadata = std::fs::metadata(&path).unwrap();
+        FileCandidate {
+            path,
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: i64::try_from(metadata.len()).unwrap(),
+        }
+    }
+
+    fn publish_candidate_container(
+        db: &SimilarDb,
+        candidate: &FileCandidate,
+        kind: ContainerKind,
+        pages: u32,
+    ) {
+        let container_key = crate::search_index_db::normalize_path(&candidate.path);
+        let generation = db
+            .begin_container_build(
+                &container_key,
+                kind,
+                pages,
+                candidate.mtime,
+                candidate.file_size,
+            )
+            .unwrap();
+        for page_index in 0..pages {
+            let mut page = row(1, "placeholder", [page_index as u8; 32], 10).item;
+            page.item_key = match kind {
+                ContainerKind::Zip => {
+                    item_key_for_zip_page(&candidate.path, &format!("page-{page_index:04}.jpg"))
+                }
+                ContainerKind::Pdf => item_key_for_pdf_page(&candidate.path, page_index),
+                ContainerKind::ImageFolder => unreachable!("this helper covers file containers"),
+            };
+            page.kind = match kind {
+                ContainerKind::Zip => ItemKind::ZipPage,
+                ContainerKind::Pdf => ItemKind::PdfPage,
+                ContainerKind::ImageFolder => unreachable!("this helper covers file containers"),
+            };
+            page.container_key = Some(container_key.clone());
+            page.page_index = Some(page_index);
+            page.mtime = candidate.mtime;
+            page.file_size = candidate.file_size;
+            db.stage_item(generation, &page).unwrap();
+        }
+        db.complete_container(&container_key, generation).unwrap();
+    }
+
+    fn populate_invalid_file_container_fixture(
+        db: &SimilarDb,
+        root: &Path,
+    ) -> (FileCandidate, FileCandidate) {
+        let zip_path = root.join("unchanged.zip");
+        let pdf_path = root.join("unchanged.pdf");
+        std::fs::write(&zip_path, b"not a zip").unwrap();
+        std::fs::write(&pdf_path, b"not a pdf").unwrap();
+        let zip = candidate_from_file(zip_path);
+        let pdf = candidate_from_file(pdf_path);
+        publish_candidate_container(db, &zip, ContainerKind::Zip, 2);
+        publish_candidate_container(db, &pdf, ContainerKind::Pdf, 2);
+        (zip, pdf)
+    }
+
+    #[test]
+    fn initial_full_reuses_complete_zip_and_pdf_without_opening_them() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_in_memory().unwrap();
+        populate_invalid_file_container_fixture(&db, root.path());
+        let rows_before = db.load_search_rows(current_hash_version()).unwrap();
+        let changes_before = db.load_item_changes_after(0).unwrap();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let telemetry = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
+            config_epoch: 1,
+            required_gap_epoch: 0,
+            reason: FullReason::Initial,
+        }));
+
+        let outcome = run_index_job(
+            &db,
+            &[root.path().to_path_buf()],
+            &[],
+            &passwords,
+            ContainerPreopenPolicy::InitialMetadataTrust,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+            Some(&telemetry),
+        )
+        .unwrap();
+
+        assert!(outcome.prune_safe);
+        assert_eq!(outcome.report.discovered, 4);
+        assert_eq!(outcome.report.processed, 4);
+        assert_eq!(outcome.report.unchanged, 4);
+        assert_eq!(outcome.report.indexed, 0);
+        assert_eq!(outcome.report.corrupt_containers, 0);
+        assert!(outcome.report.errors.is_empty());
+        assert_eq!(telemetry.work.zip_pages.load(Ordering::Relaxed), 2);
+        assert_eq!(telemetry.work.pdf_pages.load(Ordering::Relaxed), 2);
+        assert_eq!(db.load_complete_containers().unwrap().len(), 2);
+        assert_eq!(
+            db.load_search_rows(current_hash_version()).unwrap(),
+            rows_before,
+            "the fast path must preserve existing member signatures and revisions"
+        );
+        assert_eq!(
+            db.load_item_changes_after(0).unwrap(),
+            changes_before,
+            "marking a current container seen must not publish item changes"
+        );
+    }
+
+    #[test]
+    fn non_initial_full_and_delta_keep_opening_complete_containers() {
+        let root = tempfile::tempdir().unwrap();
+        let full_db = SimilarDb::open_in_memory().unwrap();
+        populate_invalid_file_container_fixture(&full_db, root.path());
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let full = run_index_job(
+            &full_db,
+            &[root.path().to_path_buf()],
+            &[],
+            &passwords,
+            FullReason::Reconfigure.container_preopen_policy(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(IndexProgress::Idle)),
+            &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(full.report.unchanged, 0);
+        assert_eq!(full.report.corrupt_containers, 2);
+        assert_eq!(full_db.load_complete_containers().unwrap().len(), 2);
+
+        let delta_db = SimilarDb::open_in_memory().unwrap();
+        let (zip, _) = populate_invalid_file_container_fixture(&delta_db, root.path());
+        let inventory = delta_db
+            .load_delta_scoped_inventory(
+                crate::similar_db::DeltaScopePlan {
+                    directory_contents: vec![crate::search_index_db::normalize_path(root.path())],
+                    ..crate::similar_db::DeltaScopePlan::default()
+                },
+                current_hash_version(),
+                || true,
+            )
+            .unwrap()
+            .unwrap();
+        let progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        let aggregate = ScanAggregate::new(&progress);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let publication = DeltaPublication::default();
+        let mut context = ScanContext {
+            db: &delta_db,
+            excluded_root_keys: &[],
+            pdf_passwords: &passwords,
+            container_preopen_policy: ContainerPreopenPolicy::InitialMetadataTrust,
+            cancel: &cancel,
+            aggregate: &aggregate,
+            report: IndexReport::default(),
+            local_seen: ScanLocalSeen::Delta,
+            prune_safe: true,
+            array_refresh: &ArrayRefreshNotifier {
+                scheduler: Weak::new(),
+            },
+            pass: ScanPass::Delta {
+                inventory: &inventory,
+                publication: &publication,
+            },
+        };
+        context.process_zip(&zip).unwrap();
+        assert_eq!(context.report.unchanged, 0);
+        assert_eq!(context.report.corrupt_containers, 1);
+        assert_eq!(delta_db.load_complete_containers().unwrap().len(), 2);
     }
 
     use crate::similar_db::SearchRow;
@@ -8514,6 +8803,7 @@ mod tests {
         let context = ScanContext {
             db: &db,
             pdf_passwords: &passwords,
+            container_preopen_policy: ContainerPreopenPolicy::MustOpen,
             cancel: &cancel,
             aggregate: &aggregate,
             report: IndexReport::default(),
@@ -9610,6 +9900,58 @@ mod tests {
                 required_gap_epoch: 9,
                 reason: FullReason::Overflow,
             })
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_manual_replaces_waiting_initial_at_the_same_identity() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Pending);
+        state.merge_full_intent(initial_full_intent());
+        assert!(
+            !state.has_runnable_work(),
+            "initial Full waits for its watch"
+        );
+        state.merge_full_intent(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 0,
+            reason: FullReason::Manual,
+        });
+        state.merge_full_intent(initial_full_intent());
+
+        let pending = state
+            .pending_full
+            .expect("manual Full intent remains pending");
+        assert_eq!(pending.reason, FullReason::Manual);
+        assert_eq!(
+            pending.reason.container_preopen_policy(),
+            ContainerPreopenPolicy::MustOpen
+        );
+    }
+
+    #[test]
+    fn incremental_reconcile_manual_survives_an_interrupted_initial_at_the_same_identity() {
+        let favorite_id = Uuid::new_v4();
+        let root = PathBuf::from("c:/library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        let plan = state.take_next_job().expect("initial Full starts");
+        state.merge_full_intent(FullIntent {
+            config_epoch: 7,
+            required_gap_epoch: 0,
+            reason: FullReason::Manual,
+        });
+
+        state.restore_unfinished_job(&plan, false);
+
+        let pending = state
+            .pending_full
+            .expect("manual Full intent survives restart");
+        assert_eq!(pending.reason, FullReason::Manual);
+        assert_eq!(
+            pending.reason.container_preopen_policy(),
+            ContainerPreopenPolicy::MustOpen
         );
     }
 

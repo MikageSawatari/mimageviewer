@@ -447,6 +447,13 @@ freeze は `target/similar-enabled-master-8e5e7-integration-20260911/freeze-r1`�
 
 独立Solも、再帰やZIP/PDF列挙省略は停止中変更・page count・failure検出を弱めるため不可と確認した。今回の承認範囲は reader buffering と Full/Delta の観測改善。既存RunningReconcileJobのidentityを使いstart/phase/terminal、約5秒ごとのprocessed/discovered/unchanged/indexed、主要work種別とread calls/bytesを観測する。loggerはscheduler/progress lock外、高頻度item/path logやUI同期I/Oを増やさない。
 
+上記2点は2026-09-11時点の既存 freshness と当該chunkの判断である。2026-09-12 の §1.228 では
+利用者の明示判断により、起動時 Initial Full だけ、Complete/kind/保存page count/同数member/
+mtime/size/all-members-current/hash-versionの全証拠が揃う場合に限りopen前再利用を認めた。
+post-open freshnessへ新条件は加えず、証拠不足なら従来列挙へ戻す。Delta、password/root
+Reconfigure、Manual、Overflow、WatchRecovery、SummaryRepairは列挙を維持する。詳細は
+[§1.228 計画](section228-similar-container-preopen-plan.md)を参照。
+
 真に起動Fullを不要にするには停止期間を覆う永続journal/checkpointなどの別設計が必要であり、このchunkへ混ぜない。まず既知ZIP small-readを改善して代表fixtureと利用者の実起動を分けて評価する。局所benchmark成功のみで起動時間の問題全体を解決済みとは扱わない。親からCargo枠を受領、実装担当はzip_loader/similar_indexと関連testだけを編集する。
 
 ### ZIP small-read の最初の比較
