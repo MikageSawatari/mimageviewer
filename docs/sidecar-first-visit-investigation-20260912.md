@@ -54,3 +54,56 @@ v3.9.0 で `G:\home\comfyui\202609-21\_ランウェイのモデル` を初めて
 sidecar flush/probeから入力解放までが約22msだったこと、固定見出しが実処理phaseを誤認させた
 ことである。100msの安全gateやwriter待機を変更せず、見出しをphaseに合わせるUI改善は
 別項目として扱う。
+
+## 旧XMPタグ自動seedの廃止方針（利用者了承済み）
+
+利用者は2026-09-12に、v1.0の旧XMP `#タグ`を今後自動救済しないことを了承した。
+日常利用してきたデータは既に移行済みとの判断であり、旧データ救済という機能の削除も明示的な
+仕様変更として承認済みである。実装は進行中の依存更新が終わった後に別chunkで行う。
+
+現行の利用者向け手動取り込み／取り込み後削除は2026-08-30のcommit `e63600147`で既に削除され、
+`src/tag_legacy_xmp_worker.rs`も存在しない。このため手動機能の復活は行わない。
+
+### 後続実装の範囲
+
+次の自動seed入口と、そのowner・待機・結果適用だけを一貫して撤去する。
+
+- 通常の一覧／フォルダloadで `prewarm_grid_tags` から現在の実Image／Videoを渡す入口。
+- prepared subfolder／aggregate loadが保持する `legacy_paths` と直接spawnする入口。
+- 明示メタ情報importの終端refreshがcontextごとの `legacy_seed_paths` を収集し、cache反映後に
+  再spawnする入口。
+- `App`／`ViewerContextBundle`の `tag_legacy_seed_pending` owner、poll・cancel・repaint、
+  metadata-transfer／sidecar-restoreのquiescence待機。
+- `tag_legacy_seed_worker`と、自動seedだけが使うbounded `dc:subject` reader／判定helper。
+
+入口を止めるだけのdead code化ではなく、context mount／退役、metadata import、sidecar restoreに
+残るpending ownerを型ごと整理する。これにより初訪問でファイルごとのXMPを読まず、sidecar確認が
+旧タグseed完了を待つこともなくなる。
+
+### 維持する境界
+
+- `tags.db`の既存タグと `tag_item_state` は削除・再構築しない。`tag_item_state`は通常編集、
+  sidecar import、metadata importでも使う現役の決定台帳であり、空にしたタグが
+  `mimageviewer.dat`から復活するのを防ぐ。
+- `tag_item_state(source='xmp_legacy')`の既存行もそのまま保持する。自動seed廃止時にDB全件走査や
+  source書換えは行わない。
+- `mimageviewer.dat`のタグbackup／復元と、`tag_sidecar_backup_enabled`の現行契約を維持する。
+- 起動時に旧TantivyのSTORED tagsを一度だけtags.dbへ移すmigrationは今回据え置く。完了meta後は
+  即returnするため、今回観測したフォルダ初訪問I/Oの原因ではない。
+- XMP rating、説明、生成情報等の一般XMP metadata読取／書込を維持する。外部JSON／TXT sidecarも
+  mIV旧XMPタグとは別系統である。
+- 通常のタグ付与／削除／全clearは引き続きtags.dbを正本とし、設定ON時だけ
+  `mimageviewer.dat`へmirrorする。現行 `TagJobKind::ClearMiv` はXMP削除ではなくtags.db上の
+  mIVタグclearなので残す。
+
+### 受入条件
+
+- 通常load、prepared subfolder load、metadata import終端refreshのいずれもlegacy seed workerを
+  生成せず、初訪問のXMPファイル読取を行わない。
+- sidecar restore／metadata transferは存在しないlegacy seed pendingを待たず、他のwriter・DB
+  barrierは従来どおり維持する。
+- 旧XMPにだけ存在する未移行 `#タグ`はtags.dbへ現れず、元ファイルも変更されない。
+- 既存tags.dbタグ、空の決定state、sidecarからの復元、通常タグ操作とUndo／Redo、ratingを含む
+  一般XMP処理が変わらない。
+- contextのmount／退役とprocess exitにlegacy ownerが残らず、関連する通常／prepared／
+  metadata-import／sidecar-quiescence回帰を更新する。
