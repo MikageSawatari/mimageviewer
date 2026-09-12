@@ -34944,6 +34944,32 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     #[cfg(windows)]
+    fn parking_ends_the_single_foreground_wipe_session_and_reentry_gets_guidance() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/compare-wipe-park.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.compare_view_mode = CompareViewMode::Wipe {
+            fraction: 0.3,
+            interaction: CompareWipeInteraction::Ready,
+        };
+
+        app.reset_detached_pause_foreground_modes(idx);
+
+        assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
+        app.compare_view_mode = CompareViewMode::wipe_with_guidance(0.5);
+        assert!(matches!(
+            app.compare_view_mode,
+            CompareViewMode::Wipe {
+                interaction: CompareWipeInteraction::Guidance(
+                    CompareWipeGuidancePhase::Unclassified
+                ),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn panorama_detection_has_one_entry_for_stills_and_display_oriented_video() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

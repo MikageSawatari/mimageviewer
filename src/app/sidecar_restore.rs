@@ -483,7 +483,7 @@ impl App {
         // These owners were derived before the modal began, so filtering RawInput alone cannot
         // release them.  End the gestures explicitly on every mounted-context pass; none of the
         // transient pointer deltas is replayed after restore.
-        self.compare_wipe_dragging = false;
+        self.compare_view_mode.cancel_wipe_drag();
         self.fs_middle_zoom_drag = None;
         self.mouse_middle_click_start = None;
         self.analysis_guide_drag = None;

@@ -1454,6 +1454,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-12 §1.223 比較ワイプ境界の初回案内（親Codex／独立Sol合意）**
+
+比較ワイプの初回案内を別のApp boolやcontext mapへ追加せず、既存の
+`CompareViewMode::Wipe`へfractionとtyped interaction（Guidance / Ready / Dragging）を一体で
+所有させる。入力stateは実合成境界と同じrectを使う既存drag reducerだけが更新し、main / navigatorの
+CPU・GPU描画は同じstateを読む。準備済みpairを実際に描ける前のhoverでは案内を消費しない。
+
+detachedは現行のsingle-foreground比較契約を維持し、park前に既存`deactivate_compare_view`で比較を
+終了する。passive snapshotや入力のない一時mountへ比較stateを複製せず、次のforeground entryで新しい
+Guidanceを作る。viewport predicate、host identity、placement、focus、geometry、registryのmount/swap/
+retire規則は変更しない。これは既存mode/fraction/dragの分裂を解消する入力所有の統合であり、§2が
+禁じるdetached向けの症状guardではない。
+
 **2026-09-12 旧XMPタグ自動seedのcontext owner撤去（利用者了承・親Codex／独立Sol合意）**
 
 フォルダ通常load、prepared subfolder、明示metadata import終端refreshから起動していた

@@ -286,6 +286,7 @@ fn fullscreen_secondary_press_owner_for_frame(
 const COMPARE_INDICATOR_MAX_WIDTH: u32 = 72;
 const COMPARE_INDICATOR_MAX_HEIGHT: u32 = 54;
 const COMPARE_WIPE_GRAB_HALF_WIDTH: f32 = 14.0;
+const COMPARE_WIPE_GUIDANCE_HANDLE_RADIUS: f32 = 9.0;
 const COMPARE_SPREAD_UNAVAILABLE_MESSAGE: &str =
     "見開き表示では比較できません。単ページ表示に切り替えてください";
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
@@ -12294,17 +12295,81 @@ fn compare_wipe_screen_x(draw_rect: egui::Rect, fraction: f32) -> f32 {
     draw_rect.left() + draw_rect.width() * fraction.clamp(0.0, 1.0)
 }
 
-fn compare_wipe_line_visible(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompareWipeAffordance {
+    Hidden,
+    StandardLine,
+    Guidance,
+}
+
+fn compare_wipe_guidance_colors() -> (egui::Color32, egui::Color32) {
+    (
+        egui::Color32::from_black_alpha(220),
+        egui::Color32::from_white_alpha(235),
+    )
+}
+
+fn compare_wipe_affordance(
     draw_rect: egui::Rect,
     pointer_hover_pos: Option<egui::Pos2>,
     fraction: f32,
-    dragging: bool,
+    interaction: crate::app::CompareWipeInteraction,
     ctrl_held: bool,
-) -> bool {
-    if dragging {
-        return !ctrl_held;
+) -> CompareWipeAffordance {
+    match interaction {
+        crate::app::CompareWipeInteraction::Guidance(_) => CompareWipeAffordance::Guidance,
+        crate::app::CompareWipeInteraction::Dragging if !ctrl_held => {
+            CompareWipeAffordance::StandardLine
+        }
+        crate::app::CompareWipeInteraction::Dragging => CompareWipeAffordance::Hidden,
+        crate::app::CompareWipeInteraction::Ready
+            if pointer_hover_pos
+                .is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction)) =>
+        {
+            CompareWipeAffordance::StandardLine
+        }
+        crate::app::CompareWipeInteraction::Ready => CompareWipeAffordance::Hidden,
     }
-    pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
+}
+
+fn reduce_compare_wipe_interaction(
+    interaction: crate::app::CompareWipeInteraction,
+    guidance_drawable: bool,
+    hover_hit: bool,
+    press_hit: bool,
+    primary_pressed: bool,
+    primary_released: bool,
+) -> crate::app::CompareWipeInteraction {
+    use crate::app::{CompareWipeGuidancePhase, CompareWipeInteraction};
+
+    if primary_released {
+        return if matches!(interaction, CompareWipeInteraction::Dragging) {
+            CompareWipeInteraction::Ready
+        } else {
+            interaction
+        };
+    }
+    if primary_pressed && press_hit {
+        return CompareWipeInteraction::Dragging;
+    }
+    if !guidance_drawable {
+        return interaction;
+    }
+    match interaction {
+        CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Unclassified) if hover_hit => {
+            CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::AwaitingExit)
+        }
+        CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Unclassified) => {
+            CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Armed)
+        }
+        CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::AwaitingExit) if !hover_hit => {
+            CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Armed)
+        }
+        CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Armed) if hover_hit => {
+            CompareWipeInteraction::Ready
+        }
+        _ => interaction,
+    }
 }
 
 fn compare_wipe_fraction_from_screen_x(
@@ -28670,45 +28735,65 @@ impl App {
         ctx: &egui::Context,
         draw_rect: egui::Rect,
         viewport_rect: egui::Rect,
+        guidance_drawable: bool,
     ) -> bool {
-        let crate::app::CompareViewMode::Wipe { fraction } = self.compare_view_mode else {
-            self.compare_wipe_dragging = false;
+        let crate::app::CompareViewMode::Wipe {
+            fraction,
+            interaction,
+        } = self.compare_view_mode
+        else {
             return false;
         };
         if draw_rect.width() <= 1.0 {
             return false;
         }
 
-        let (primary_pressed, primary_down, primary_released, pointer_pos) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
-            )
-        });
+        let (primary_pressed, primary_down, primary_released, interact_pos, hover_pos) =
+            ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_released(),
+                    i.pointer.interact_pos(),
+                    i.pointer.hover_pos(),
+                )
+            });
+        let pointer_pos = interact_pos.or(hover_pos);
+        let was_dragging = matches!(interaction, crate::app::CompareWipeInteraction::Dragging);
+        let press_hit = pointer_pos
+            .map(|p| compare_wipe_grab_hit(draw_rect, p, fraction))
+            .unwrap_or(false);
+        let hover_hit = hover_pos
+            .map(|p| compare_wipe_grab_hit(draw_rect, p, fraction))
+            .unwrap_or(false);
+        let interaction = reduce_compare_wipe_interaction(
+            interaction,
+            guidance_drawable,
+            hover_hit,
+            press_hit,
+            primary_pressed,
+            primary_released,
+        );
+        self.compare_view_mode = crate::app::CompareViewMode::Wipe {
+            fraction,
+            interaction,
+        };
+
         if primary_released {
-            let was_dragging = self.compare_wipe_dragging;
-            self.compare_wipe_dragging = false;
             return was_dragging;
         }
 
-        let hit = pointer_pos
-            .map(|p| compare_wipe_grab_hit(draw_rect, p, fraction))
-            .unwrap_or(false);
-        if hit {
+        if press_hit {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if primary_pressed && hit {
-            self.compare_wipe_dragging = true;
-        }
-        if self.compare_wipe_dragging && primary_down {
+        if matches!(interaction, crate::app::CompareWipeInteraction::Dragging) && primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(new_fraction) =
                     compare_wipe_fraction_from_screen_x(draw_rect, viewport_rect, pos.x)
                 {
                     self.compare_view_mode = crate::app::CompareViewMode::Wipe {
                         fraction: new_fraction,
+                        interaction,
                     };
                     ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     ctx.request_repaint();
@@ -30035,43 +30120,52 @@ impl App {
         let ctrl_held =
             crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(ctrl_held_via_os);
 
-        let shader_shape =
-            self.compare_preparation
-                .prepared_pair()
-                .and_then(|pair| match mode {
-                    crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
-                        COMPARE_NAVIGATOR_SHADER_SLOT,
-                        layout.content_rect,
-                        pair,
-                        crate::compare_wgpu::CompareShaderMode::Wipe,
-                        fraction,
-                        None,
-                        ctx.pixels_per_point(),
-                    ),
-                    crate::app::CompareViewMode::Diff => self.compare_shader_shape(
-                        COMPARE_NAVIGATOR_SHADER_SLOT,
-                        layout.content_rect,
-                        pair,
-                        crate::compare_wgpu::CompareShaderMode::Diff,
-                        0.5,
-                        None,
-                        ctx.pixels_per_point(),
-                    ),
-                    crate::app::CompareViewMode::Off
-                    | crate::app::CompareViewMode::PinnedNormal => None,
-                });
+        let shader_shape = self
+            .compare_preparation
+            .prepared_pair()
+            .and_then(|pair| match mode {
+                crate::app::CompareViewMode::Wipe { fraction, .. } => self.compare_shader_shape(
+                    COMPARE_NAVIGATOR_SHADER_SLOT,
+                    layout.content_rect,
+                    pair,
+                    crate::compare_wgpu::CompareShaderMode::Wipe,
+                    fraction,
+                    None,
+                    ctx.pixels_per_point(),
+                ),
+                crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                    COMPARE_NAVIGATOR_SHADER_SLOT,
+                    layout.content_rect,
+                    pair,
+                    crate::compare_wgpu::CompareShaderMode::Diff,
+                    0.5,
+                    None,
+                    ctx.pixels_per_point(),
+                ),
+                crate::app::CompareViewMode::Off | crate::app::CompareViewMode::PinnedNormal => {
+                    None
+                }
+            });
         if let Some(shader_shape) = shader_shape {
             painter.add(shader_shape.shape);
-            if let crate::app::CompareViewMode::Wipe { fraction } = mode
-                && compare_wipe_line_visible(
+            if let crate::app::CompareViewMode::Wipe {
+                fraction,
+                interaction,
+            } = mode
+            {
+                let affordance = compare_wipe_affordance(
                     shader_shape.draw_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
-                    self.compare_wipe_dragging,
+                    interaction,
                     ctrl_held,
-                )
-            {
-                Self::paint_compare_wipe_line(painter, shader_shape.draw_rect, fraction);
+                );
+                Self::paint_compare_wipe_affordance(
+                    painter,
+                    shader_shape.draw_rect,
+                    fraction,
+                    affordance,
+                );
             }
             return true;
         }
@@ -30093,7 +30187,10 @@ impl App {
                 };
                 paint_texture(painter, &tex);
             }
-            crate::app::CompareViewMode::Wipe { fraction } => {
+            crate::app::CompareViewMode::Wipe {
+                fraction,
+                interaction,
+            } => {
                 let current =
                     self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
                 let pinned =
@@ -30108,15 +30205,19 @@ impl App {
                     egui::pos2(wipe_x, layout.content_rect.bottom()),
                 );
                 paint_texture(&painter.with_clip_rect(pinned_clip), &pinned);
-                if compare_wipe_line_visible(
+                let affordance = compare_wipe_affordance(
                     layout.content_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
-                    self.compare_wipe_dragging,
+                    interaction,
                     ctrl_held,
-                ) {
-                    Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
-                }
+                );
+                Self::paint_compare_wipe_affordance(
+                    painter,
+                    layout.content_rect,
+                    fraction,
+                    affordance,
+                );
             }
             crate::app::CompareViewMode::Diff => {
                 let Some(tex) =
@@ -31304,8 +31405,16 @@ impl App {
                 )
             })
             .unwrap_or(compare_base_rect);
+        let compare_guidance_drawable = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.compare_prepared_pair_matches(idx));
         if !cursor_in_panel
-            && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
+            && self.handle_compare_wipe_drag(
+                ctx,
+                compare_drag_rect,
+                compare_base_rect,
+                compare_guidance_drawable,
+            )
         {
             return (FsPageNav::None, false);
         }
@@ -36277,7 +36386,7 @@ impl App {
                         self.compare_preparation =
                             crate::app::ComparePreparationState::WaitingForSource(request);
                         self.clear_compare_gpu_pair();
-                        self.compare_wipe_dragging = false;
+                        self.compare_view_mode.cancel_wipe_drag();
                         self.show_feedback_toast("比較表示を準備中".to_string());
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -37331,7 +37440,7 @@ impl App {
             .compare_preparation
             .prepared_pair()
             .and_then(|pair| match mode {
-                crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                crate::app::CompareViewMode::Wipe { fraction, .. } => self.compare_shader_shape(
                     COMPARE_MAIN_SHADER_SLOT,
                     image_rect,
                     pair,
@@ -37363,17 +37472,25 @@ impl App {
                 &bg_style,
             );
             ui.painter().add(shader_shape.shape);
-            if let crate::app::CompareViewMode::Wipe { fraction } = mode
-                && compare_wipe_line_visible(
+            if let crate::app::CompareViewMode::Wipe {
+                fraction,
+                interaction,
+            } = mode
+            {
+                let affordance = compare_wipe_affordance(
                     shader_shape.draw_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
-                    self.compare_wipe_dragging,
+                    interaction,
                     ctrl_held,
-                )
-            {
+                );
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
-                Self::draw_compare_wipe_line(ui, shader_shape.draw_rect, fraction);
+                Self::draw_compare_wipe_affordance(
+                    ui,
+                    shader_shape.draw_rect,
+                    fraction,
+                    affordance,
+                );
             }
             return true;
         }
@@ -37398,7 +37515,10 @@ impl App {
                 );
                 true
             }
-            crate::app::CompareViewMode::Wipe { fraction } => {
+            crate::app::CompareViewMode::Wipe {
+                fraction,
+                interaction,
+            } => {
                 let current =
                     self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
                 let pinned =
@@ -37436,15 +37556,14 @@ impl App {
                     Some(clip),
                     fit_scale_limits,
                 );
-                if compare_wipe_line_visible(
+                let affordance = compare_wipe_affordance(
                     ref_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
-                    self.compare_wipe_dragging,
+                    interaction,
                     ctrl_held,
-                ) {
-                    Self::draw_compare_wipe_line(ui, ref_rect, fraction);
-                }
+                );
+                Self::draw_compare_wipe_affordance(ui, ref_rect, fraction, affordance);
                 true
             }
             crate::app::CompareViewMode::Diff => {
@@ -37503,19 +37622,51 @@ impl App {
         );
     }
 
-    fn paint_compare_wipe_line(painter: &egui::Painter, image_rect: egui::Rect, fraction: f32) {
+    fn paint_compare_wipe_affordance(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        fraction: f32,
+        affordance: CompareWipeAffordance,
+    ) {
+        if matches!(affordance, CompareWipeAffordance::Hidden) {
+            return;
+        }
         let x = compare_wipe_screen_x(image_rect, fraction);
+        let segment = [
+            egui::pos2(x, image_rect.top()),
+            egui::pos2(x, image_rect.bottom()),
+        ];
+        if matches!(affordance, CompareWipeAffordance::Guidance) {
+            let painter = painter.with_clip_rect(image_rect);
+            let (dark, light) = compare_wipe_guidance_colors();
+            painter.line_segment(segment, egui::Stroke::new(5.0, dark));
+            painter.line_segment(segment, egui::Stroke::new(2.0, light));
+            let center = egui::pos2(x, image_rect.center().y);
+            painter.circle_filled(center, COMPARE_WIPE_GUIDANCE_HANDLE_RADIUS, dark);
+            painter.circle_stroke(
+                center,
+                COMPARE_WIPE_GUIDANCE_HANDLE_RADIUS,
+                egui::Stroke::new(2.0, light),
+            );
+            painter.line_segment(
+                [center - egui::vec2(4.0, 0.0), center + egui::vec2(4.0, 0.0)],
+                egui::Stroke::new(2.0, light),
+            );
+            return;
+        }
         painter.line_segment(
-            [
-                egui::pos2(x, image_rect.top()),
-                egui::pos2(x, image_rect.bottom()),
-            ],
+            segment,
             egui::Stroke::new(2.0, egui::Color32::from_white_alpha(150)),
         );
     }
 
-    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
-        Self::paint_compare_wipe_line(ui.painter(), image_rect, fraction);
+    fn draw_compare_wipe_affordance(
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        fraction: f32,
+        affordance: CompareWipeAffordance,
+    ) {
+        Self::paint_compare_wipe_affordance(ui.painter(), image_rect, fraction, affordance);
     }
 
     fn draw_compare_pin_indicator(
@@ -41681,7 +41832,6 @@ impl App {
             }
         } else {
             self.compare_view_mode = next_mode;
-            self.compare_wipe_dragging = false;
             let reused = self.compare_prepared_pair_matches(fs_idx);
             if reused {
                 if let Some(pair) = self.compare_preparation.prepared_pair() {
@@ -41721,9 +41871,8 @@ impl App {
         }
         let next_mode = match self.compare_view_mode {
             crate::app::CompareViewMode::Wipe { .. } => crate::app::CompareViewMode::Off,
-            _ => crate::app::CompareViewMode::Wipe { fraction: 0.5 },
+            _ => crate::app::CompareViewMode::wipe_with_guidance(0.5),
         };
-        self.compare_wipe_dragging = false;
         if matches!(next_mode, crate::app::CompareViewMode::Wipe { .. }) {
             self.compare_view_mode = next_mode;
             self.ensure_compare_prepared_pair(ctx, fs_idx);
@@ -41749,7 +41898,6 @@ impl App {
             crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
             _ => crate::app::CompareViewMode::Diff,
         };
-        self.compare_wipe_dragging = false;
         if matches!(next_mode, crate::app::CompareViewMode::Diff) {
             self.compare_view_mode = next_mode;
             self.ensure_compare_prepared_pair(ctx, fs_idx);
@@ -53375,7 +53523,7 @@ mod tests {
     fn flat_navigator_is_allowed_during_compare_display() {
         let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
-        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+        app.compare_view_mode = crate::app::CompareViewMode::wipe_with_guidance(0.5);
 
         assert!(app.fs_navigator_allowed(&ctx, fs_idx));
     }
@@ -57703,7 +57851,7 @@ mod tests {
                             ctx,
                             image_rect,
                             7,
-                            crate::app::CompareViewMode::Wipe { fraction: 0.5 },
+                            crate::app::CompareViewMode::wipe_with_guidance(0.5),
                             None,
                         );
                     });
@@ -57809,7 +57957,7 @@ mod tests {
             Some(ComparePrepareOutput::ShaderPair)
         );
         assert_eq!(
-            ComparePrepareOutput::for_mode(CompareViewMode::Wipe { fraction: 0.5 }, true),
+            ComparePrepareOutput::for_mode(CompareViewMode::wipe_with_guidance(0.5), true),
             Some(ComparePrepareOutput::ShaderPair)
         );
         assert_eq!(
@@ -57817,7 +57965,7 @@ mod tests {
             Some(ComparePrepareOutput::DiffTexture)
         );
         assert_eq!(
-            ComparePrepareOutput::for_mode(CompareViewMode::Wipe { fraction: 0.5 }, false),
+            ComparePrepareOutput::for_mode(CompareViewMode::wipe_with_guidance(0.5), false),
             Some(ComparePrepareOutput::WipeTextures)
         );
         assert_eq!(
@@ -57847,6 +57995,79 @@ mod tests {
             COMPARE_SPREAD_UNAVAILABLE_MESSAGE,
             "見開き表示では比較できません。単ページ表示に切り替えてください"
         );
+    }
+
+    #[test]
+    fn wipe_toggle_starts_fresh_guidance_after_each_terminal() {
+        use crate::app::{CompareViewMode, CompareWipeGuidancePhase, CompareWipeInteraction};
+
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let pinned =
+            std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::LIGHT_BLUE));
+        app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            pixels: pinned.clone(),
+            indicator_pixels: pinned,
+            indicator_texture: None,
+            display_name: "pinned".to_string(),
+            source_idx: fs_idx,
+            external_item_key: None,
+            source_size: [2, 3],
+        });
+
+        for _ in 0..2 {
+            app.toggle_compare_wipe_mode(&ctx, fs_idx);
+            assert!(matches!(
+                app.compare_view_mode,
+                CompareViewMode::Wipe {
+                    fraction: 0.5,
+                    interaction: CompareWipeInteraction::Guidance(
+                        CompareWipeGuidancePhase::Unclassified
+                    ),
+                }
+            ));
+            app.toggle_compare_wipe_mode(&ctx, fs_idx);
+            assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
+        }
+    }
+
+    #[test]
+    fn compare_preparation_invalidation_preserves_guidance_but_ends_dragging() {
+        use crate::app::{CompareViewMode, CompareWipeGuidancePhase, CompareWipeInteraction};
+
+        let mut app = crate::app::setup_app_for_test();
+        let request = crate::app::ComparePrepareRequest {
+            current_idx: 7,
+            pinned_source_idx: 2,
+            output: crate::app::ComparePrepareOutput::WipeTextures,
+        };
+        app.compare_preparation = crate::app::ComparePreparationState::WaitingForSource(request);
+        app.compare_view_mode = CompareViewMode::Wipe {
+            fraction: 0.25,
+            interaction: CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Armed),
+        };
+        app.invalidate_compare_prepared_for_idx(7);
+        assert!(matches!(
+            app.compare_view_mode,
+            CompareViewMode::Wipe {
+                interaction: CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Armed),
+                ..
+            }
+        ));
+
+        app.compare_preparation = crate::app::ComparePreparationState::WaitingForSource(request);
+        app.compare_view_mode = CompareViewMode::Wipe {
+            fraction: 0.25,
+            interaction: CompareWipeInteraction::Dragging,
+        };
+        app.invalidate_compare_prepared_for_idx(7);
+        assert!(matches!(
+            app.compare_view_mode,
+            CompareViewMode::Wipe {
+                interaction: CompareWipeInteraction::Ready,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -57946,7 +58167,7 @@ mod tests {
     #[test]
     fn entering_spread_mode_ends_active_comparison() {
         let mut app = crate::app::setup_app_for_test();
-        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+        app.compare_view_mode = crate::app::CompareViewMode::wipe_with_guidance(0.5);
         app.spread_mode = SpreadMode::Rtl;
 
         app.end_comparison_for_spread_mode_if_needed();
@@ -58000,7 +58221,7 @@ mod tests {
             source_size: [2, 3],
         });
         app.fullscreen_idx = Some(7);
-        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+        app.compare_view_mode = crate::app::CompareViewMode::wipe_with_guidance(0.5);
         let request = crate::app::ComparePrepareRequest {
             current_idx: 7,
             pinned_source_idx: 2,
@@ -58056,7 +58277,7 @@ mod tests {
             source_size: [2, 3],
         });
         app.fullscreen_idx = Some(7);
-        app.compare_view_mode = crate::app::CompareViewMode::Wipe { fraction: 0.5 };
+        app.compare_view_mode = crate::app::CompareViewMode::wipe_with_guidance(0.5);
         let request = crate::app::ComparePrepareRequest {
             current_idx: 7,
             pinned_source_idx: 2,
@@ -67420,34 +67641,289 @@ mod tests {
     }
 
     #[test]
-    fn compare_wipe_line_uses_drag_or_grab_band_and_ctrl_only_suppresses_drag() {
+    fn compare_wipe_affordance_preserves_hover_and_drag_visibility_after_guidance() {
+        use crate::app::CompareWipeInteraction;
+
         let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
         let fraction = 0.25;
         let line_x = compare_wipe_screen_x(image, fraction);
         let line_pos = Some(egui::pos2(line_x, image.center().y));
 
-        assert!(!compare_wipe_line_visible(
-            image, None, fraction, false, false
+        assert_eq!(
+            compare_wipe_affordance(image, None, fraction, CompareWipeInteraction::Ready, false),
+            CompareWipeAffordance::Hidden
+        );
+        assert_eq!(
+            compare_wipe_affordance(
+                image,
+                line_pos,
+                fraction,
+                CompareWipeInteraction::Ready,
+                false,
+            ),
+            CompareWipeAffordance::StandardLine
+        );
+        assert_eq!(
+            compare_wipe_affordance(
+                image,
+                line_pos,
+                fraction,
+                CompareWipeInteraction::Ready,
+                true,
+            ),
+            CompareWipeAffordance::StandardLine,
+            "Ctrl must keep the existing hover-only line visible"
+        );
+        assert_eq!(
+            compare_wipe_affordance(
+                image,
+                Some(egui::pos2(image.right() - 1.0, image.center().y)),
+                fraction,
+                CompareWipeInteraction::Ready,
+                false,
+            ),
+            CompareWipeAffordance::Hidden
+        );
+        assert_eq!(
+            compare_wipe_affordance(
+                image,
+                None,
+                fraction,
+                CompareWipeInteraction::Dragging,
+                false,
+            ),
+            CompareWipeAffordance::StandardLine
+        );
+        assert_eq!(
+            compare_wipe_affordance(
+                image,
+                line_pos,
+                fraction,
+                CompareWipeInteraction::Dragging,
+                true,
+            ),
+            CompareWipeAffordance::Hidden,
+            "Ctrl must retain the existing drag-only suppression"
+        );
+    }
+
+    #[test]
+    fn compare_wipe_guidance_requires_a_drawable_exit_and_reentry() {
+        use crate::app::{
+            CompareWipeGuidancePhase as Phase, CompareWipeInteraction as Interaction,
+        };
+
+        let initial = Interaction::Guidance(Phase::Unclassified);
+        assert_eq!(
+            reduce_compare_wipe_interaction(initial, false, true, true, false, false),
+            initial,
+            "preparation frames must not consume guidance before it can be painted"
+        );
+        let waiting_for_exit =
+            reduce_compare_wipe_interaction(initial, true, true, true, false, false);
+        assert_eq!(
+            waiting_for_exit,
+            Interaction::Guidance(Phase::AwaitingExit),
+            "a cursor already on the boundary at entry must not consume guidance"
+        );
+        assert_eq!(
+            reduce_compare_wipe_interaction(waiting_for_exit, true, true, true, false, false),
+            waiting_for_exit,
+            "stationary hover must keep the entry guidance"
+        );
+        let armed =
+            reduce_compare_wipe_interaction(waiting_for_exit, true, false, false, false, false);
+        assert_eq!(armed, Interaction::Guidance(Phase::Armed));
+        assert_eq!(
+            reduce_compare_wipe_interaction(armed, true, true, true, false, false),
+            Interaction::Ready,
+            "only a later intentional boundary hover returns to hover-only display"
+        );
+
+        let initial_outside =
+            reduce_compare_wipe_interaction(initial, true, false, false, false, false);
+        assert_eq!(initial_outside, Interaction::Guidance(Phase::Armed));
+        assert_eq!(
+            compare_wipe_affordance(
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(400.0, 300.0)),
+                None,
+                0.5,
+                initial_outside,
+                false,
+            ),
+            CompareWipeAffordance::Guidance,
+            "the first drawable frame must show guidance even when the pointer starts outside"
+        );
+    }
+
+    #[test]
+    fn compare_wipe_guidance_allows_explicit_drag_and_release() {
+        use crate::app::{
+            CompareWipeGuidancePhase as Phase, CompareWipeInteraction as Interaction,
+        };
+
+        for initial in [
+            Interaction::Guidance(Phase::Unclassified),
+            Interaction::Guidance(Phase::AwaitingExit),
+            Interaction::Guidance(Phase::Armed),
+            Interaction::Ready,
+        ] {
+            assert_eq!(
+                reduce_compare_wipe_interaction(initial, false, false, true, true, false),
+                Interaction::Dragging,
+                "an explicit press keeps the existing prepare-time drag admission"
+            );
+        }
+        assert_eq!(
+            reduce_compare_wipe_interaction(Interaction::Dragging, true, true, true, false, true,),
+            Interaction::Ready
+        );
+        let armed = Interaction::Guidance(Phase::Armed);
+        assert_eq!(
+            reduce_compare_wipe_interaction(armed, true, false, false, false, true),
+            armed,
+            "an unrelated release must not consume guidance"
+        );
+        assert_eq!(
+            reduce_compare_wipe_interaction(armed, true, true, true, true, true),
+            armed,
+            "a short click with press and release in one frame must not leave a drag owner"
+        );
+        assert_eq!(
+            reduce_compare_wipe_interaction(Interaction::Ready, true, true, true, true, true),
+            Interaction::Ready,
+            "release precedence must preserve the pre-guidance click contract"
+        );
+        assert_eq!(
+            reduce_compare_wipe_interaction(armed, true, false, true, false, false),
+            armed,
+            "an interact owner without hover ownership must not consume hover guidance"
+        );
+    }
+
+    #[test]
+    fn compare_wipe_guidance_line_and_handle_remain_visible_on_light_and_dark_images() {
+        use crate::app::{
+            CompareWipeGuidancePhase as Phase, CompareWipeInteraction as Interaction,
+        };
+
+        let image = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(800.0, 600.0));
+        let guidance = Interaction::Guidance(Phase::Armed);
+        assert_eq!(
+            compare_wipe_affordance(image, None, 0.5, guidance, false),
+            CompareWipeAffordance::Guidance
+        );
+        assert_eq!(
+            compare_wipe_affordance(image, None, 0.5, guidance, true),
+            CompareWipeAffordance::Guidance,
+            "Ctrl suppression belongs only to an active drag"
+        );
+        assert!(
+            COMPARE_WIPE_GUIDANCE_HANDLE_RADIUS + 1.0 <= COMPARE_WIPE_GRAB_HALF_WIDTH,
+            "the visible handle and its stroke must remain within the existing grab band"
+        );
+
+        fn composite(foreground: egui::Color32, background: egui::Color32) -> egui::Color32 {
+            let fg = foreground.to_srgba_unmultiplied();
+            let bg = background.to_srgba_unmultiplied();
+            let alpha = fg[3] as f32 / 255.0;
+            egui::Color32::from_rgb(
+                (fg[0] as f32 * alpha + bg[0] as f32 * (1.0 - alpha)).round() as u8,
+                (fg[1] as f32 * alpha + bg[1] as f32 * (1.0 - alpha)).round() as u8,
+                (fg[2] as f32 * alpha + bg[2] as f32 * (1.0 - alpha)).round() as u8,
+            )
+        }
+
+        let (dark, light) = compare_wipe_guidance_colors();
+        assert!(
+            crate::os_theme::contrast_ratio(
+                composite(dark, egui::Color32::WHITE),
+                egui::Color32::WHITE
+            ) >= 7.0,
+            "the dark under-stroke and handle fill must remain readable over a light image"
+        );
+        assert!(
+            crate::os_theme::contrast_ratio(
+                composite(light, egui::Color32::BLACK),
+                egui::Color32::BLACK
+            ) >= 7.0,
+            "the light stroke and handle outline must remain readable over a dark image"
+        );
+    }
+
+    #[test]
+    fn compare_wipe_production_painter_emits_guidance_shapes_only_for_guidance() {
+        fn painted_shapes(
+            image: egui::Rect,
+            affordance: CompareWipeAffordance,
+        ) -> Vec<egui::epaint::ClippedShape> {
+            let ctx = egui::Context::default();
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("compare-wipe-guidance-test"),
+                    ));
+                    App::paint_compare_wipe_affordance(&painter, image, 0.25, affordance);
+                },
+            )
+            .shapes
+        }
+
+        let image = egui::Rect::from_min_max(egui::pos2(40.0, 30.0), egui::pos2(600.0, 450.0));
+        assert!(painted_shapes(image, CompareWipeAffordance::Hidden).is_empty());
+
+        let standard = painted_shapes(image, CompareWipeAffordance::StandardLine);
+        assert_eq!(standard.len(), 1);
+        assert!(matches!(
+            &standard[0].shape,
+            egui::Shape::LineSegment { points, stroke }
+                if points[0].x == compare_wipe_screen_x(image, 0.25)
+                    && points[1].x == points[0].x
+                    && stroke.width == 2.0
+                    && stroke.color == egui::Color32::from_white_alpha(150)
         ));
-        assert!(compare_wipe_line_visible(
-            image, line_pos, fraction, false, false
-        ));
-        assert!(compare_wipe_line_visible(
-            image, line_pos, fraction, false, true
-        ));
-        assert!(!compare_wipe_line_visible(
-            image,
-            Some(egui::pos2(image.right() - 1.0, image.center().y)),
-            fraction,
-            false,
-            false
-        ));
-        assert!(compare_wipe_line_visible(
-            image, None, fraction, true, false
-        ));
-        assert!(!compare_wipe_line_visible(
-            image, line_pos, fraction, true, true
-        ));
+
+        let guidance = painted_shapes(image, CompareWipeAffordance::Guidance);
+        assert_eq!(
+            guidance.len(),
+            5,
+            "two boundary strokes plus a three-shape handle"
+        );
+        assert!(guidance.iter().all(|shape| shape.clip_rect == image));
+        let line_x = compare_wipe_screen_x(image, 0.25);
+        let mut vertical_lines = 0;
+        let mut horizontal_lines = 0;
+        let mut circles = 0;
+        for clipped in &guidance {
+            match &clipped.shape {
+                egui::Shape::LineSegment { points, .. } if points[0].x == points[1].x => {
+                    vertical_lines += 1;
+                    assert_eq!(points[0].x, line_x);
+                    assert_eq!(points[0].y, image.top());
+                    assert_eq!(points[1].y, image.bottom());
+                }
+                egui::Shape::LineSegment { points, .. } => {
+                    horizontal_lines += 1;
+                    assert_eq!(points[0].y, image.center().y);
+                    assert_eq!(points[1].y, image.center().y);
+                }
+                egui::Shape::Circle(circle) => {
+                    circles += 1;
+                    assert_eq!(circle.center, egui::pos2(line_x, image.center().y));
+                    assert_eq!(circle.radius, COMPARE_WIPE_GUIDANCE_HANDLE_RADIUS);
+                }
+                shape => panic!("unexpected guidance shape: {shape:?}"),
+            }
+        }
+        assert_eq!((vertical_lines, horizontal_lines, circles), (2, 1, 2));
     }
 
     #[test]

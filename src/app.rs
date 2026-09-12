@@ -3357,8 +3357,30 @@ pub(crate) struct BookBookmarkPanelResolution {
 pub(crate) enum CompareViewMode {
     Off,
     PinnedNormal,
-    Wipe { fraction: f32 },
+    Wipe {
+        fraction: f32,
+        interaction: CompareWipeInteraction,
+    },
     Diff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompareWipeGuidancePhase {
+    /// The first drawable frame has not classified whether the pointer already overlaps the line.
+    Unclassified,
+    /// The pointer overlapped the line on the first drawable frame. It must leave before a later
+    /// hover can count as an intentional interaction.
+    AwaitingExit,
+    /// The pointer has been observed outside the line after entry and a later re-entry may consume
+    /// the guidance.
+    Armed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompareWipeInteraction {
+    Guidance(CompareWipeGuidancePhase),
+    Ready,
+    Dragging,
 }
 
 impl Default for CompareViewMode {
@@ -3370,6 +3392,23 @@ impl Default for CompareViewMode {
 impl CompareViewMode {
     pub(crate) fn is_overlay(self) -> bool {
         matches!(self, Self::Wipe { .. } | Self::Diff)
+    }
+
+    pub(crate) fn wipe_with_guidance(fraction: f32) -> Self {
+        Self::Wipe {
+            fraction,
+            interaction: CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Unclassified),
+        }
+    }
+
+    /// End only an active pointer drag. Guidance belongs to the Wipe session and survives source
+    /// preparation invalidation until it has actually been shown and intentionally approached.
+    pub(crate) fn cancel_wipe_drag(&mut self) {
+        if let Self::Wipe { interaction, .. } = self
+            && matches!(interaction, CompareWipeInteraction::Dragging)
+        {
+            *interaction = CompareWipeInteraction::Ready;
+        }
     }
 }
 
@@ -12590,7 +12629,6 @@ pub struct App {
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
     pub(crate) compare_preparation: ComparePreparationState,
     pub(crate) compare_prepared_next_key: u64,
-    pub(crate) compare_wipe_dragging: bool,
     /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
     pub(crate) select_after_load: Option<String>,
 
@@ -16071,7 +16109,6 @@ impl App {
             compare_pin_pending: None,
             compare_preparation: ComparePreparationState::Unprepared,
             compare_prepared_next_key: 1,
-            compare_wipe_dragging: false,
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_rotation_reset_confirm: false,
@@ -66081,7 +66118,6 @@ impl App {
             return;
         }
         self.compare_view_mode = CompareViewMode::Off;
-        self.compare_wipe_dragging = false;
         if let Some(pair) = self.compare_preparation.prepared_pair() {
             crate::logger::log(format!(
                 "[compare-memory] stage=pinned-hidden-retained target={}x{} current_input={}x{} pinned_input={}x{} output=pinned-texture cpu_total_bytes={} gpu_textures={} reuse=next-c",
@@ -66113,7 +66149,6 @@ impl App {
             self.compare_preparation = ComparePreparationState::Unprepared;
         }
         self.clear_compare_gpu_pair();
-        self.compare_wipe_dragging = false;
         if released_cpu_bytes > 0 {
             crate::logger::log(format!(
                 "[compare-memory] stage=deactivate cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 release_order=before_next_prepare",
@@ -66138,7 +66173,7 @@ impl App {
             self.clear_compare_gpu_pair();
         }
         if affected {
-            self.compare_wipe_dragging = false;
+            self.compare_view_mode.cancel_wipe_drag();
         }
     }
 
@@ -66150,7 +66185,6 @@ impl App {
     pub(crate) fn invalidate_all_compare_prepared(&mut self) {
         self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
-        self.compare_wipe_dragging = false;
         // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
         // 旧フォントのまま残る。スロット + 進行中の pin worker / load も落とす (Codex P2)。
         // ユーザーは必要なら再ピンする (フォントパック導入/削除は稀な操作)。
@@ -66233,7 +66267,7 @@ impl App {
         self.thumb_adjust_tex.clear();
         self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
-        self.compare_wipe_dragging = false;
+        self.compare_view_mode.cancel_wipe_drag();
         self.clear_all_final_pipeline_caches();
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
