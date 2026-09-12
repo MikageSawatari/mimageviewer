@@ -216,4 +216,32 @@ Remote 1件を停止する事故があった。利用者へ報告済み、再起
 
 類似検索・コンテナ索引の製品変更は `12e9b8008`、`2b03c73b6` までmasterへ統合済み。実機測定の最新記録はdupeのdoc-only `54c36d6b6` / `a691aee59` を参照。類似差分27〜61ms、コンテナ同件数108秒→15.4秒/56秒→9.9秒。前後のキャッシュ条件は統制していない。
 
-残る今回の製品実装は動画メモリ消費の§1.190と列幅§1.211。自動余白カット§1.216は利用者指定で後続版へ延期し、設計を保持する。実機自動検証は次回以降リリース前に約20分の枠を想定、診断版を事前準備し具体suiteの了承後に実行する。
+この時点（§1.219着手前）で残る今回の製品実装は動画メモリ消費の§1.190と列幅§1.211だった。自動余白カット§1.216は利用者指定で後続版へ延期し、設計を保持する。実機自動検証は次回以降リリース前に約20分の枠を想定、診断版を事前準備し具体suiteの了承後に実行する。
+
+## 2026-09-12 追加実装と確認状況
+
+§1.214の追加調整は `fd738d277` で実装した。半透明alpha 220を維持したまま、件数overlayを
+選択checkの実描画位置から8pt下へ移し、利用者確認済み。§1.211と動画strip表示寿命の修正は
+`78dde1fd0` で実装し、利用者から短時間の試用では問題なさそうとの報告を受けた。ただし、
+この確認だけで§1.190に記録した過去のメモリpeak全量の原因を解消したとは扱わない。
+動画stripの実列数とHUD hide/show寿命を確認するS4自動テストは、9/12 04:32 JSTまでに
+使い捨てportableで実機成功・独立承認済み。実presenterのreported列数30とApp visible/Whole axisの30が
+一致し、settled Hiddenの750msと再表示でsession・worker・request・decoder生成数を維持した。
+初回はsandboxのforeground HWND取得失敗で判定前に終了し、同じ成果物を正規の対話desktopで
+1回再実行して成功した。両runの対象PIDは終了済みで、通常版の起動・停止は行っていない。
+記録は `target/next-version-work/ui-smoke-overnight-20260912/s4-execution-manifest.json`、
+SHA256 `B0B8E9A8E240C64EBC875FAC7CFC53E1E3D329AF89141BD22D409FD2C823A250`。
+これは短いHUD寿命回帰であり、長時間のメモリ使用量や旧報告の全条件を検証したものではない。
+
+§1.219は `dbd7b4efc` で実装・独立承認済み。圧縮した対応ページ帯では、候補の実描画列が
+1ptなのに最低3ptの見える枠を描き、入力だけが1ptのraw columnを参照していた。このため見えている
+□の内側でも隣のtarget無しcolumnを押す場合があった。候補pageと3ptのhit/outline rectを一度だけ
+解決し、hover、thumbnail、caption、pressが同じownerを使うよう修正した。実際のlocked panelから
+strip押下、production dispatcher、候補完了、見開き上の単ページpreview、release復帰までを結ぶ
+回帰はLTR/RTL × 広幅/圧縮帯の4ケースで成功し、通常の長押し表示、worker失敗、source失効、
+context切替・遅着取消も既存回帰で維持した。
+
+同checkpointの全gateはmain 8294成功/0失敗/45 ignored、workspace/integration/doc/vendorも成功し、
+`build-dev.ps1 -PreserveRuntime`も成功した。確認用core SHA256は
+`73D8F06154308EAE029BF2074DC0AFDCCF17EC007087843F3AABDFD2185C1BB6`。実アプリの起動・停止は
+行っておらず、§1.219の利用者実機確認は未実施。
