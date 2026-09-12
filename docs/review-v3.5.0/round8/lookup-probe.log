@@ -1,0 +1,5 @@
+lifecycle PASS: Image/ZIP/PDF; At -> Absent -> reordered At; stale At rejected; duplicate keys preserved; Global/Favorite/Page passthrough
+items=10000, changed=1, present=true, unresolved_ms=2.703, bulk_resolved_ms=0.956
+items=10000, changed=1000, present=true, unresolved_ms=2906.546, bulk_resolved_ms=2.220
+items=10000, changed=5000, present=true, unresolved_ms=14739.178, bulk_resolved_ms=7.262
+items=10000, changed=5000, present=false, unresolved_ms=15083.340, bulk_resolved_ms=2.012

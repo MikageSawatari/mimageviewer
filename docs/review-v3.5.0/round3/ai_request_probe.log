@@ -1,0 +1,3 @@
+dims=[1024, 1024] request_requires_runtime=true actual_ai_size_eligible=true
+dims=[2048, 2048] request_requires_runtime=true actual_ai_size_eligible=false
+dims=[4096, 2160] request_requires_runtime=true actual_ai_size_eligible=false

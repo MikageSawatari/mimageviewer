@@ -1,0 +1,5 @@
+first worker complete: delivered=8 queued=2 UI_repaint_requested=false ninth=["old-handler"]
+one manual frame to drain result: queued=2 next_worker_started=false UI_repaint_requested=false
+control with repeated manual polls: ninth=["new-handler"] remaining=0
+picker belongs to B; terminal batch dispatched in B; dispatch_allowed=false; A=2 B=4 undo=[("B", 1, 4)]
+picker belongs to B; terminal batch dispatched in A; dispatch_allowed=false; A=4 B=4 undo=[("A", 1, 4)]

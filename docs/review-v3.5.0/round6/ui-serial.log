@@ -1,0 +1,244 @@
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `viewer_context_registry::ViewerContextId` is more private than the item `RingPickerState::owner`
+    --> src\ring_shortcut.rs:2435:5
+     |
+2435 |     pub owner: crate::app::ViewerContextId,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `RingPickerState::owner` is reachable at visibility `pub`
+     |
+note: but type `viewer_context_registry::ViewerContextId` is only usable at visibility `pub(crate)`
+    --> src\app\viewer_context_registry.rs:6:1
+     |
+   6 | pub(crate) struct ViewerContextId(u64);
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: methods `preview_current_folder_rating` and `set_local_adjust_layers_for_idx_memory_only_defer_render` are never used
+     --> src\app.rs:49427:19
+      |
+14977 | impl App {
+      | -------- methods in this implementation
+...
+49427 |     pub(crate) fn preview_current_folder_rating(&mut self, stars: u8) -> Result<bool, String> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+55375 |     pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `build_launch_request` is never used
+    --> src\external_tool.rs:1090:15
+     |
+1090 | pub(crate) fn build_launch_request(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_launch_operation` is never used
+    --> src\external_tool.rs:1306:15
+     |
+1306 | pub(crate) fn build_launch_operation(
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `is_empty` is never used
+   --> src\items_generation_cache.rs:424:19
+    |
+282 | impl<T> ItemsGenerationVec<T> {
+    | ----------------------------- method in this implementation
+...
+424 |     pub(crate) fn is_empty(&self) -> bool {
+    |                   ^^^^^^^^
+
+warning: method `seam_ratio` is never used
+  --> src\sns_split.rs:67:12
+   |
+20 | impl SnsTarget {
+   | -------------- method in this implementation
+...
+67 |     pub fn seam_ratio(self) -> f32 {
+   |            ^^^^^^^^^^
+
+warning: method `seam_ratio_parts` is never used
+   --> src\sns_split.rs:158:12
+    |
+157 | impl SnsSplitLayout {
+    | ------------------- method in this implementation
+158 |     pub fn seam_ratio_parts(self) -> (u128, u128) {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: method `drawn_visible_len` is never used
+    --> src\ui_fullscreen.rs:4210:8
+     |
+4150 | impl ContinuousReadingPageSize {
+     | ------------------------------ method in this implementation
+...
+4210 |     fn drawn_visible_len(&self, axis: ContinuousAxis, pixels_per_point: f32) -> f32 {
+     |        ^^^^^^^^^^^^^^^^^
+
+warning: method `capture_container_rating_undo` is never used
+   --> src\undo_ops.rs:699:19
+    |
+673 | impl App {
+    | -------- method in this implementation
+...
+699 |     pub(crate) fn capture_container_rating_undo(&mut self, before: u8, after: u8) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `seek_for_remote_streaming` is never used
+    --> src\video\mod.rs:8730:19
+     |
+7533 | impl VideoPlayer {
+     | ---------------- method in this implementation
+...
+8730 |     pub(crate) fn seek_for_remote_streaming(&self, target_secs: f64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `command_tx` and `next_owner_id` are never read
+   --> src\video\audio.rs:269:5
+    |
+268 | pub(crate) struct AudioTapController {
+    |                   ------------------ fields in this struct
+269 |     command_tx: Sender<AudioTapCommand>,
+    |     ^^^^^^^^^^
+270 |     next_owner_id: Arc<AtomicU64>,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `AudioTapController` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: variant `Attach` is never constructed
+   --> src\video\audio.rs:283:5
+    |
+282 | enum AudioTapCommand {
+    |      --------------- variant in this enum
+283 |     Attach(ActiveAudioTap),
+    |     ^^^^^^
+
+warning: method `attach` is never used
+   --> src\video\audio.rs:294:19
+    |
+293 | impl AudioTapController {
+    | ----------------------- method in this implementation
+294 |     pub(crate) fn attach(
+    |                   ^^^^^^
+
+warning: field `next_remote_local_mute_owner` is never read
+   --> src\video\clock.rs:167:5
+    |
+ 98 | pub struct AvClock {
+    |            ------- field in this struct
+...
+167 |     next_remote_local_mute_owner: AtomicU64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `acquire_remote_local_output_mute` is never used
+   --> src\video\clock.rs:910:19
+    |
+236 | impl AvClock {
+    | ------------ method in this implementation
+...
+910 |     pub(crate) fn acquire_remote_local_output_mute(self: &Arc<Self>) -> RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RemoteLocalOutputMuteLease` is never constructed
+   --> src\video\clock.rs:968:19
+    |
+968 | pub(crate) struct RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `Timeout` is never constructed
+  --> src\video\stream\session.rs:97:5
+   |
+92 | pub(crate) enum StreamResourceError {
+   |                 ------------------- variant in this enum
+...
+97 |     Timeout,
+   |     ^^^^^^^
+   |
+   = note: `StreamResourceError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `mimageviewer` (lib) generated 22 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 30s
+     Running tests\ui_snapshot.rs (target\debug\deps\ui_snapshot-7133b0f8b79cac24.exe)
+
+running 43 tests
+test bookmark_time_and_tag_badges_dark ... ok
+test cell_filename_mixed_glyphs_dark ... ok
+test changelog_markdown_dark ... ok
+test changelog_markdown_light ... ok
+test compact_file_format_badges_light ... ok
+test content_restore_prompt_light ... ok
+test content_restore_prompt_long_paths ... ok
+test custom_ui_font_meiryo_bold_alignment_dark ... ok
+test fullscreen_page_wait_indicator_dark ... ok
+test fullscreen_prefetch_direction_dark ... ok
+test metadata_text_fallback_emoji_symbols_dark ... ok
+test music_touch_panel_handles_observed_dark ... ok
+test native_video_touch_first_run_help_learned_hidden_dark ... ok
+test native_video_touch_first_run_help_unlearned_100_dark ... ok
+test network_data_dir_notice_dark ... ok
+test preferences_video_bar_visibility_dark ... ok
+test preferences_video_thumbnail_indicator_dark ... ok
+test rating_shares_the_bottom_row_with_a_centred_filename_dark ... ok
+test recommended_ui_font_biz_udp_gothic_9pt_alignment_dark ... ok
+test recommended_ui_font_meiryo_10pt_alignment_dark ... ok
+test recommended_ui_font_meiryo_ui_10pt_alignment_dark ... ok
+test smoke_label_and_button_dark ... ok
+test smoke_label_and_button_light ... ok
+test stats_histogram_compact_columns_light ... ok
+test still_mouse_panel_callout_dark ... ok
+test still_touch_first_run_help_learned_hidden_dark ... ok
+test still_touch_first_run_help_unlearned_100_dark ... ok
+test still_touch_left_panel_open_has_only_right_handle_dark ... ok
+test still_touch_panel_handles_latched_dark ... ok
+test still_touch_panel_handles_unlatched_dark ... ok
+test susie_diagnostic_disabled_by_settings ... ok
+test susie_diagnostic_not_initialized ... ok
+test susie_diagnostic_ready_after_recovery ... ok
+test susie_diagnostic_ready_but_empty ... ok
+test susie_diagnostic_ready_with_plugins ... ok
+test susie_diagnostic_ready_with_plugins_dark ... ok
+test susie_diagnostic_worker_missing ... ok
+test susie_diagnostic_worker_spawn_failed ... ok
+test susie_diagnostic_workers_exhausted ... ok
+test text_contrast_strong_dark ... ok
+test text_contrast_strong_light ... ok
+test video_thumbnail_indicator_modes_and_dense_badges_dark ... ok
+test whats_new_dialog_multi_version_dark ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.29s
+

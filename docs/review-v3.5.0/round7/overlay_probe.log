@@ -1,0 +1,4 @@
+video picker belongs to B; terminal in B: App picker closed=true, B native overlay still visible=false
+video picker belongs to B; terminal in A: App picker closed=true, B native overlay still visible=false
+video picker belongs to B; terminal in C: App picker closed=true, B native overlay still visible=false
+video picker belongs to B; terminal in closed: App picker closed=true, B native overlay still visible=true

@@ -1,0 +1,163 @@
+path	review_area	added	deleted	verification
+Cargo.lock	R14 R15	4	4	版番号・変更案内を照合（配布物作成未実施）
+Cargo.toml	R14 R15	1	1	版番号・変更案内を照合（配布物作成未実施）
+README.md	R14 R15	19	1	版番号・変更案内を照合（配布物作成未実施）
+docs/README.md	R14 R15	5	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/architecture-overview.md	R14 R15	15	1	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/async-architecture.md	R14 R15	6	1	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/bake-stage-unification-plan.md	R01 R02 R03 R05	178	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-context-menu-unify-a-brief.md	R01 R02 R03 R05	136	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-context-menu-unify-b-brief.md	R01 R02 R03 R05	93	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p0-brief.md	R01 R02 R03 R05	183	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p1-brief.md	R01 R02 R03 R05	166	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p1b-brief.md	R01 R02 R03 R05	94	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p1c-brief.md	R01 R02 R03 R05	101	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p1d-brief.md	R01 R02 R03 R05	85	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p2a-brief.md	R01 R02 R03 R05	111	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p2b1-brief.md	R01 R02 R03 R05	115	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p2b2-brief.md	R01 R02 R03 R05	99	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p2c-brief.md	R01 R02 R03 R05	71	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-external-tool-p3-brief.md	R01 R02 R03 R05	110	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-item-kind-matrix-brief.md	R01 R02 R03 R05	106	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/codex-tag-page-support-survey-brief.md	R14 R15	94	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/lane-display-geometry.md	R06	140	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/lane-export-batch.md	R05	129	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/lane-rating-time-order.md	R09	118	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/lane-seek-strip-modes.md	R07	129	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/review-bake-stage-and-external-tool.md	R01 R02 R03 R05	114	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/review-findings-bake-stage-raw.md	R01 R02 R03 R05	27	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/briefs/review-status-bake-stage.md	R01 R02 R03 R05	49	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/context-menu-unification-plan.md	R01 R02 R03 R05	389	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/detached-rework-plan.md	R04 R08 R11 R13	122	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/display-pipeline.md	R06	34	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/external-tool-launch-plan.md	R01 R02 R03 R05	1185	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/fullscreen-side-panel-mode-plan.md	R08	48	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/item-kind-capability-matrix.md	R01 R02 R03 R05	224	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/key-customization-impl-plan.md	R12	3	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/keymap-spec.md	R12	17	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/keymap.ini.default	R12	14	1	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/next-release-backlog.md	R14 R15	437	471	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/panorama-360-view-plan.md	R11	55	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/rating-list-view-plan.md	R09	17	8	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/release-verification-records.md	R14 R15	50	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/review-v3.3.0/README.md	R14 R15	2	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/settings-sqlite-migration.md	R10	48	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/shell-file-operations-context-menu-plan.md	R01 R02 R03 R05	19	13	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/spec.md	R14 R15	110	17	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/tag-page-support-survey.md	R14 R15	369	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/toolbar-customization-plan.md	R12	3	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/ui-responsiveness.md	R14 R15	15	0	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/video-architecture.md	R07	57	24	仕様/計画/過去レビューとして現行差分と照合（関連節）
+docs/video-seek-strip-plan.md	R07	99	2	仕様/計画/過去レビューとして現行差分と照合（関連節）
+htdocs/mimageviewer/index.html	R14 R15	5	4	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/adjustment.html	R05	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/analysis.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/annotation.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/books.html	R05	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/changelog.html	R14 R15	23	1	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/conceal.html	R05	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/erase.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/export.html	R05	40	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/external-tools.html	R01 R02 R03	205	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/faq.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/formats.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/fullscreen.html	R06 R08 R11	28	3	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/gamepad.html	R12	8	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/getting-started.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/grid.html	R09	14	9	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/index.html	R14 R15	8	1	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/known-issues.html	R14 R15	1	6	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/local-adjustment.html	R05	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/metadata-transfer.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/music.html	R08	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/remote.html	R13	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/search.html	R09	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/settings.html	R10	26	3	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/shortcuts.html	R12	4	1	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/stack.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/tags.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/troubleshooting.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/tut-cache.html	R14 R15	5	4	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/tut-grid-power.html	R09	4	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/tut-rating.html	R09	3	1	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/tutorial.html	R14 R15	1	0	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/manual/video.html	R07	38	11	案内/記述の変更を確認（ブラウザ表示未確認）
+htdocs/mimageviewer/privacy.html	R14 R15	7	0	案内/記述の変更を確認（ブラウザ表示未確認）
+installer/mimageviewer.iss	R14 R15	1	1	版番号・変更案内を照合（配布物作成未実施）
+installer/readme.txt	R14 R15	1	1	版番号・変更案内を照合（配布物作成未実施）
+installer/readme_portable.txt	R14 R15	1	1	版番号・変更案内を照合（配布物作成未実施）
+src/ai/final_pipeline.rs	R05 R13	8	2	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app.rs	R01 R02 R04 R05 R07 R08 R09 R10 R11 R12 R13 R14	705	308	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/gamepad_input.rs	R12	42	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/metadata_ops.rs	R04 R14	1	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/native_video.rs	R07 R08 R12	400	61	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/runtime_ops.rs	R04	6	3	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/smart_folder.rs	R09	61	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/tests.rs	R01 R02 R04 R05 R06 R07 R08 R09 R10 R11 R12 R13 R14 R15	955	31	コード差分と関連するproducer/consumer/lifecycleを確認
+src/app/viewer_context_registry.rs	R04 R08 R11 R13	18	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/bake_stage.rs	R05	119	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/bookmark_browser.rs	R09	153	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/books.rs	R05	453	33	コード差分と関連するproducer/consumer/lifecycleを確認
+src/capture.rs	R02 R05	30	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/comic_db.rs	R04	51	10	コード差分と関連するproducer/consumer/lifecycleを確認
+src/conceal_db.rs	R04	33	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/content_identity.rs	R06 R14	3	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/context_menu_model.rs	R01 R03 R04 R12	1010	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/displayed_image_transform.rs	R06	312	70	コード差分と関連するproducer/consumer/lifecycleを確認
+src/edit_bundle.rs	R04	1	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/edit_bundle_app.rs	R04	97	11	コード差分と関連するproducer/consumer/lifecycleを確認
+src/edit_bundle_bulk.rs	R04	2000	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/export_batch.rs	R05 R13	243	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/export_crop.rs	R04 R11	288	16	コード差分と関連するproducer/consumer/lifecycleを確認
+src/export_dialog.rs	R05 R13	411	82	コード差分と関連するproducer/consumer/lifecycleを確認
+src/external_tool.rs	R01 R02 R03 R05 R12 R13	4043	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/file_drag.rs	R14	52	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/folder_tree.rs	R14	8	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/gamepad.rs	R12	81	2	コード差分と関連するproducer/consumer/lifecycleを確認
+src/gpu_lanczos.rs	R06	51	35	コード差分と関連するproducer/consumer/lifecycleを確認
+src/grid_item.rs	R01 R03 R14	116	2	コード差分と関連するproducer/consumer/lifecycleを確認
+src/keymap.rs	R01 R05 R07 R12	272	3	コード差分と関連するproducer/consumer/lifecycleを確認
+src/lib.rs	R14	6	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/local_adjust_write_worker.rs	R04	43	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/mask_db.rs	R04	42	4	コード差分と関連するproducer/consumer/lifecycleを確認
+src/materializer.rs	R02 R05 R13	2112	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/name_bulk_indexer.rs	R14	27	2	コード差分と関連するproducer/consumer/lifecycleを確認
+src/native_context_menu.rs	R01 R03	755	113	コード差分と関連するproducer/consumer/lifecycleを確認
+src/open_with.rs	R01 R03	919	44	コード差分と関連するproducer/consumer/lifecycleを確認
+src/operation_customize_share.rs	R10 R12	53	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/panorama.rs	R11	86	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/rating_view.rs	R09	146	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/remote_ipc/container.rs	R05 R13	1	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/rotation_db.rs	R04	10	3	コード差分と関連するproducer/consumer/lifecycleを確認
+src/settings.rs	R01 R05 R07 R09 R10 R12	473	28	コード差分と関連するproducer/consumer/lifecycleを確認
+src/settings_db.rs	R01 R05 R07 R09 R10 R12	1199	56	コード差分と関連するproducer/consumer/lifecycleを確認
+src/tag_legacy_xmp_worker.rs	R14	0	267	コード差分と関連するproducer/consumer/lifecycleを確認
+src/tag_ops.rs	R14	3	245	コード差分と関連するproducer/consumer/lifecycleを確認
+src/tags_db.rs	R14	1	3	コード差分と関連するproducer/consumer/lifecycleを確認
+src/tray_integration.rs	R14	1	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_adjustment_panel.rs	R05 R14	5	5	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_crop.rs	R11	57	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/cache_manager.rs	R07	6	5	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/context_menu.rs	R01 R02 R03 R04 R05 R12	989	986	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/export_batch.rs	R05 R13	310	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/metadata_transfer.rs	R14	0	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/mod.rs	R05 R14	1	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/preferences.rs	R01 R10 R12	528	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/preferences/pages.rs	R01 R05 R07 R08 R10 R12	888	10	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_dialogs/preferences/search_index.rs	R01 R05 R07 R12	53	3	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_fullscreen.rs	R02 R04 R05 R06 R07 R08 R11 R12	1346	334	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_helpers.rs	R12	53	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_main.rs	R01 R03 R04 R05 R09 R12 R14	684	149	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_metadata_panel.rs	R08	67	12	コード差分と関連するproducer/consumer/lifecycleを確認
+src/ui_music_panels.rs	R08	50	5	コード差分と関連するproducer/consumer/lifecycleを確認
+src/undo_stack.rs	R04	159	2	コード差分と関連するproducer/consumer/lifecycleを確認
+src/version_highlights.rs	R14 R15	35	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/mod.rs	R07	57	44	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/native_presenter/overlay_draw.rs	R07 R08	54	22	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/native_presenter/render_core.rs	R07 R08 R12	1219	240	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/native_presenter/surface_policy.rs	R07 R08	2	1	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/seek_strip.rs	R07	76	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/seek_strip_layout.rs	R07	678	0	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/seek_strip_wave.rs	R07	344	18	コード差分と関連するproducer/consumer/lifecycleを確認
+src/video/tile_thumb_cache.rs	R07	331	12	コード差分と関連するproducer/consumer/lifecycleを確認
+tests/export_integration.rs	R05 R15	143	1	test差分・全体gateで確認

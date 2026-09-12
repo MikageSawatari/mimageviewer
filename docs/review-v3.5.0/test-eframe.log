@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src\lib.rs (vendor\eframe\target\debug\deps\eframe-918e86f9b822d668.exe)
+
+running 15 tests
+test native::run::tests::idle_hidden_scheduler_does_not_create_a_heartbeat ... ok
+test native::run::tests::idle_invisible_window_does_not_gain_a_heartbeat ... ok
+test native::run::tests::immediate_invisible_repaint_is_delayed_to_minimum_interval ... ok
+test native::run::tests::later_invisible_repaint_is_not_accelerated ... ok
+test native::run::tests::dirty_state_is_independent_per_window ... ok
+test native::run::tests::hidden_bootstrap_bypasses_requested_work_throttle ... ok
+test native::run::tests::redraw_requested_records_dirty_without_paint_claim ... ok
+test native::run::tests::only_interactive_resize_reason_is_allowed_inline ... ok
+test native::run::tests::immediate_child_promotes_repaint_to_parent_window ... ok
+test native::run::tests::hidden_requested_work_is_throttled_to_100_ms ... ok
+test native::run::tests::closing_window_discards_dirty_schedule_and_readiness_wake ... ok
+test native::run::tests::repaint_requested_while_painting_waits_for_next_epoch ... ok
+test native::run::tests::same_window_damage_coalesces_to_latest_surface ... ok
+test native::run::tests::ordinary_work_can_only_be_claimed_by_outer_phase ... ok
+test native::run::tests::windows_process_test::synchronous_damage_returns_before_outer_paint_gate ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+

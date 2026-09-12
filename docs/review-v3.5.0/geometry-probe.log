@@ -1,0 +1,16 @@
+continuous ppp=1 gap_setting=0 expected_px=0 actual_px=1 first_bottom=500 next_top=501
+continuous ppp=1 gap_setting=1 expected_px=1 actual_px=2 first_bottom=500 next_top=502
+continuous ppp=1 gap_setting=20 expected_px=20 actual_px=21 first_bottom=500 next_top=521
+continuous ppp=1.25 gap_setting=0 expected_px=0 actual_px=0.99998474 first_bottom=500 next_top=501
+continuous ppp=1.25 gap_setting=1 expected_px=1 actual_px=0.99998474 first_bottom=500 next_top=501
+continuous ppp=1.25 gap_setting=20 expected_px=25 actual_px=25.999985 first_bottom=500 next_top=526
+continuous ppp=1.5 gap_setting=0 expected_px=0 actual_px=1.0000305 first_bottom=499.99997 next_top=501
+continuous ppp=1.5 gap_setting=1 expected_px=2 actual_px=2.0000153 first_bottom=499.99997 next_top=502
+continuous ppp=1.5 gap_setting=20 expected_px=30 actual_px=31.00003 first_bottom=499.99997 next_top=531
+continuous ppp=2 gap_setting=0 expected_px=0 actual_px=1 first_bottom=500 next_top=501
+continuous ppp=2 gap_setting=1 expected_px=2 actual_px=3 first_bottom=500 next_top=503
+continuous ppp=2 gap_setting=20 expected_px=40 actual_px=41 first_bottom=500 next_top=541
+music full_width=640 reserved=320 reconstructed=375 drawn_right=695 overflow=55
+music full_width=800 reserved=400 reconstructed=415 drawn_right=815 overflow=15
+music full_width=860 reserved=430 reconstructed=430 drawn_right=860 overflow=0
+music full_width=1200 reserved=430 reconstructed=430 drawn_right=1200 overflow=0

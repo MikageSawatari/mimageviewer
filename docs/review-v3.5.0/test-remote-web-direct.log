@@ -1,0 +1,2382 @@
+TAP version 13
+# Subtest: settle follows superseded, current request, applied, and requested/displayed order
+ok 1 - settle follows superseded, current request, applied, and requested/displayed order
+  ---
+  duration_ms: 0.9374
+  type: 'test'
+  ...
+# Subtest: settle reports failure instead of rollback when displayed is unresolved
+ok 2 - settle reports failure instead of rollback when displayed is unresolved
+  ---
+  duration_ms: 0.1447
+  type: 'test'
+  ...
+# Subtest: rewind is expected-scoped and idempotent
+ok 3 - rewind is expected-scoped and idempotent
+  ---
+  duration_ms: 0.4856
+  type: 'test'
+  ...
+# Subtest: only request pushes history and only an effective rewind replaces it
+ok 4 - only request pushes history and only an effective rewind replaces it
+  ---
+  duration_ms: 0.1372
+  type: 'test'
+  ...
+# Subtest: reanchor replaces both grouping identities and marks missing sides unresolved
+ok 5 - reanchor replaces both grouping identities and marks missing sides unresolved
+  ---
+  duration_ms: 0.1599
+  type: 'test'
+  ...
+# Subtest: request never moves displayed and display never moves requested
+ok 6 - request never moves displayed and display never moves requested
+  ---
+  duration_ms: 0.0891
+  type: 'test'
+  ...
+# Subtest: display(null) leaves the displayed snapshot unchanged
+ok 7 - display(null) leaves the displayed snapshot unchanged
+  ---
+  duration_ms: 0.1245
+  type: 'test'
+  ...
+# Subtest: a tokenless redraw of requested B still rolls back to displayed A
+ok 8 - a tokenless redraw of requested B still rolls back to displayed A
+  ---
+  duration_ms: 0.1196
+  type: 'test'
+  ...
+# Subtest: a tokenless bookmark-style jump to C rolls back to displayed A
+ok 9 - a tokenless bookmark-style jump to C rolls back to displayed A
+  ---
+  duration_ms: 0.2305
+  type: 'test'
+  ...
+# Subtest: a non-position redraw reports failure without moving position
+ok 10 - a non-position redraw reports failure without moving position
+  ---
+  duration_ms: 0.2846
+  type: 'test'
+  ...
+# Subtest: late settlement from an old grouping cannot select the new group at its index
+ok 11 - late settlement from an old grouping cannot select the new group at its index
+  ---
+  duration_ms: 0.1365
+  type: 'test'
+  ...
+# Subtest: all position operation sequences through length four preserve invariants
+ok 12 - all position operation sequences through length four preserve invariants
+  ---
+  duration_ms: 30.9078
+  type: 'test'
+  ...
+1..12
+# tests 12
+# suites 0
+# pass 12
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 43.9766
+TAP version 13
+# Subtest: audio-only server state hides the video surface without changing the media owner
+ok 1 - audio-only server state hides the video surface without changing the media owner
+  ---
+  duration_ms: 0.7279
+  type: 'test'
+  ...
+# Subtest: blocked remote session stops playback once and prevents another poll
+ok 2 - blocked remote session stops playback once and prevents another poll
+  ---
+  duration_ms: 0.5602
+  type: 'test'
+  ...
+# Subtest: video reconnect resumes the captured position and play intent
+ok 3 - video reconnect resumes the captured position and play intent
+  ---
+  duration_ms: 0.1147
+  type: 'test'
+  ...
+# Subtest: video start ends a busy attempt visibly instead of retrying forever
+ok 4 - video start ends a busy attempt visibly instead of retrying forever
+  ---
+  duration_ms: 0.4179
+  type: 'test'
+  ...
+# Subtest: stage 4 video panel exposes functions and jump tabs in that order
+ok 5 - stage 4 video panel exposes functions and jump tabs in that order
+  ---
+  duration_ms: 0.108
+  type: 'test'
+  ...
+# Subtest: VST3 processing failures remain visible while the video keeps a playable status
+ok 6 - VST3 processing failures remain visible while the video keeps a playable status
+  ---
+  duration_ms: 0.1096
+  type: 'test'
+  ...
+# Subtest: video EOF follows the PC continuous OFF and loop OFF stop rule
+ok 7 - video EOF follows the PC continuous OFF and loop OFF stop rule
+  ---
+  duration_ms: 0.1558
+  type: 'test'
+  ...
+# Subtest: video EOF advances or wraps for the two PC continuous modes
+ok 8 - video EOF advances or wraps for the two PC continuous modes
+  ---
+  duration_ms: 0.0683
+  type: 'test'
+  ...
+# Subtest: whole and section loop policies return to the PC-owned interval start
+ok 9 - whole and section loop policies return to the PC-owned interval start
+  ---
+  duration_ms: 0.3039
+  type: 'test'
+  ...
+# Subtest: hls.js starts at the requested generation origin and uses every buffer limit
+ok 10 - hls.js starts at the requested generation origin and uses every buffer limit
+  ---
+  duration_ms: 0.2633
+  type: 'test'
+  ...
+# Subtest: hls error telemetry keeps typed playback facts and drops URLs and exception text
+ok 11 - hls error telemetry keeps typed playback facts and drops URLs and exception text
+  ---
+  duration_ms: 0.4024
+  type: 'test'
+  ...
+# Subtest: playback issue reports omit the remote session credential
+ok 12 - playback issue reports omit the remote session credential
+  ---
+  duration_ms: 0.1291
+  type: 'test'
+  ...
+# Subtest: video health samples distinguish buffer starvation from a stopped playback layer
+ok 13 - video health samples distinguish buffer starvation from a stopped playback layer
+  ---
+  duration_ms: 0.2508
+  type: 'test'
+  ...
+# Subtest: video health normal tier has no path while debug context adds a bounded remote address
+ok 14 - video health normal tier has no path while debug context adds a bounded remote address
+  ---
+  duration_ms: 0.1897
+  type: 'test'
+  ...
+# Subtest: video health periodic eligibility follows play intent, not media time progress
+ok 15 - video health periodic eligibility follows play intent, not media time progress
+  ---
+  duration_ms: 0.0644
+  type: 'test'
+  ...
+# Subtest: video health timer emits every ten seconds even when playback time is unchanged
+ok 16 - video health timer emits every ten seconds even when playback time is unchanged
+  ---
+  duration_ms: 0.143
+  type: 'test'
+  ...
+# Subtest: fragment load metrics use hls loading timestamps without copying its URL
+ok 17 - fragment load metrics use hls loading timestamps without copying its URL
+  ---
+  duration_ms: 0.0929
+  type: 'test'
+  ...
+# Subtest: runtime waiting has one bounded terminal instead of an infinite buffering notice
+ok 18 - runtime waiting has one bounded terminal instead of an infinite buffering notice
+  ---
+  duration_ms: 0.1139
+  type: 'test'
+  ...
+# Subtest: media play rejection names have distinct recovery owners
+ok 19 - media play rejection names have distinct recovery owners
+  ---
+  duration_ms: 0.0542
+  type: 'test'
+  ...
+# Subtest: a paused stalled event cannot create a waiting owner without play intent
+ok 20 - a paused stalled event cannot create a waiting owner without play intent
+  ---
+  duration_ms: 0.1148
+  type: 'test'
+  ...
+# Subtest: stable playback progress resolves the waiting owner and its notice
+ok 21 - stable playback progress resolves the waiting owner and its notice
+  ---
+  duration_ms: 1.2998
+  type: 'test'
+  ...
+# Subtest: autoplay wait survives playback observations until an explicit play succeeds
+ok 22 - autoplay wait survives playback observations until an explicit play succeeds
+  ---
+  duration_ms: 0.0749
+  type: 'test'
+  ...
+# Subtest: a native playing event cannot dismiss the autoplay activation notice
+ok 23 - a native playing event cannot dismiss the autoplay activation notice
+  ---
+  duration_ms: 0.1075
+  type: 'test'
+  ...
+# Subtest: an autoplay rejection waits for one explicit tap and leaves stall monitoring
+ok 24 - an autoplay rejection waits for one explicit tap and leaves stall monitoring
+  ---
+  duration_ms: 0.4518
+  type: 'test'
+  ...
+# Subtest: an interrupted play promise does not masquerade as an autoplay block
+ok 25 - an interrupted play promise does not masquerade as an autoplay block
+  ---
+  duration_ms: 0.1435
+  type: 'test'
+  ...
+# Subtest: terminal playback failure clears the waiting owner before showing reconnect
+ok 26 - terminal playback failure clears the waiting owner before showing reconnect
+  ---
+  duration_ms: 0.1163
+  type: 'test'
+  ...
+# Subtest: fatal hls errors are recorded before entering the reconnect terminal
+ok 27 - fatal hls errors are recorded before entering the reconnect terminal
+  ---
+  duration_ms: 0.2274
+  type: 'test'
+  ...
+# Subtest: an attached visible playback with no progress reaches the reconnect terminal
+ok 28 - an attached visible playback with no progress reaches the reconnect terminal
+  ---
+  duration_ms: 0.1409
+  type: 'test'
+  ...
+# Subtest: video seek drag maps pointer travel to the visible timeline scale
+ok 29 - video seek drag maps pointer travel to the visible timeline scale
+  ---
+  duration_ms: 0.2732
+  type: 'test'
+  ...
+# Subtest: iOS and iPadOS detection includes desktop-mode iPad without matching PCs
+ok 30 - iOS and iPadOS detection includes desktop-mode iPad without matching PCs
+  ---
+  duration_ms: 0.2374
+  type: 'test'
+  ...
+# Subtest: volume controls are always present for video and audio
+ok 31 - volume controls are always present for video and audio
+  ---
+  duration_ms: 0.1739
+  type: 'test'
+  ...
+# Subtest: iOS volume notice is conditional while tap and drag behavior stays unchanged
+ok 32 - iOS volume notice is conditional while tap and drag behavior stays unchanged
+  ---
+  duration_ms: 0.6674
+  type: 'test'
+  ...
+# Subtest: volume drag shares the relative range calculation and ignores press position
+ok 33 - volume drag shares the relative range calculation and ignores press position
+  ---
+  duration_ms: 0.1321
+  type: 'test'
+  ...
+# Subtest: video seek pointer maps micro travel to an absolute tap and threshold travel to a relative drag
+ok 34 - video seek pointer maps micro travel to an absolute tap and threshold travel to a relative drag
+  ---
+  duration_ms: 0.4591
+  type: 'test'
+  ...
+# Subtest: seek preview advances from seeking through decoded thumbnail to playback
+ok 35 - seek preview advances from seeking through decoded thumbnail to playback
+  ---
+  duration_ms: 0.1502
+  type: 'test'
+  ...
+# Subtest: seek target remains the displayed position until replacement playback lands
+ok 36 - seek target remains the displayed position until replacement playback lands
+  ---
+  duration_ms: 0.0595
+  type: 'test'
+  ...
+# Subtest: repeated relative seek previews accumulate from the latest requested position
+ok 37 - repeated relative seek previews accumulate from the latest requested position
+  ---
+  duration_ms: 0.1067
+  type: 'test'
+  ...
+# Subtest: relative seek preview returns to the landed playback position
+ok 38 - relative seek preview returns to the landed playback position
+  ---
+  duration_ms: 0.1197
+  type: 'test'
+  ...
+# Subtest: failed relative seek does not strand or clear a newer requested position
+ok 39 - failed relative seek does not strand or clear a newer requested position
+  ---
+  duration_ms: 0.0529
+  type: 'test'
+  ...
+# Subtest: video surface consumes native zoom gestures but preserves interactive controls
+ok 40 - video surface consumes native zoom gestures but preserves interactive controls
+  ---
+  duration_ms: 0.0681
+  type: 'test'
+  ...
+# Subtest: playback is never held for a missing seek thumbnail
+ok 41 - playback is never held for a missing seek thumbnail
+  ---
+  duration_ms: 0.0348
+  type: 'test'
+  ...
+# Subtest: seek drag keeps only the latest server-approved thumbnail request
+ok 42 - seek drag keeps only the latest server-approved thumbnail request
+  ---
+  duration_ms: 0.0448
+  type: 'test'
+  ...
+# Subtest: playlist 409 refreshes generation from state and recovers
+ok 43 - playlist 409 refreshes generation from state and recovers
+  ---
+  duration_ms: 13.145
+  type: 'test'
+  ...
+# Subtest: four seconds of playlist 503 remains waiting inside the recovery budget
+ok 44 - four seconds of playlist 503 remains waiting inside the recovery budget
+  ---
+  duration_ms: 1.2353
+  type: 'test'
+  ...
+# Subtest: playlist recovery fails only when its elapsed-time budget is exhausted
+ok 45 - playlist recovery fails only when its elapsed-time budget is exhausted
+  ---
+  duration_ms: 1.214
+  type: 'test'
+  ...
+# Subtest: same-generation switch requests share one recovery loop
+ok 46 - same-generation switch requests share one recovery loop
+  ---
+  duration_ms: 0.448
+  type: 'test'
+  ...
+# Subtest: newer generation replaces and aborts the older recovery loop
+ok 47 - newer generation replaces and aborts the older recovery loop
+  ---
+  duration_ms: 0.2342
+  type: 'test'
+  ...
+# Subtest: generation switch silences the old HLS instance before recovery starts
+ok 48 - generation switch silences the old HLS instance before recovery starts
+  ---
+  duration_ms: 0.1207
+  type: 'test'
+  ...
+# Subtest: generation switch reports failure when its one owner budget expires
+ok 49 - generation switch reports failure when its one owner budget expires
+  ---
+  duration_ms: 0.1803
+  type: 'test'
+  ...
+# Subtest: user video errors hide internal stage details and keep code-based guidance
+ok 50 - user video errors hide internal stage details and keep code-based guidance
+  ---
+  duration_ms: 0.105
+  type: 'test'
+  ...
+1..50
+# tests 50
+# suites 0
+# pass 50
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 42.2385
+TAP version 13
+# Subtest: manifest describes the standalone shell and every supplied icon
+ok 1 - manifest describes the standalone shell and every supplied icon
+  ---
+  duration_ms: 7.1507
+  type: 'test'
+  ...
+# Subtest: HTML advertises the PWA and iOS standalone metadata
+ok 2 - HTML advertises the PWA and iOS standalone metadata
+  ---
+  duration_ms: 1.1743
+  type: 'test'
+  ...
+# Subtest: the shell registers a root-scoped service worker without script caching
+ok 3 - the shell registers a root-scoped service worker without script caching
+  ---
+  duration_ms: 3.8322
+  type: 'test'
+  ...
+# Subtest: legacy image URLs include the remote state generation
+ok 4 - legacy image URLs include the remote state generation
+  ---
+  duration_ms: 4.6139
+  type: 'test'
+  ...
+# Subtest: the startup path never touches a singleton declared after boot runs
+ok 5 - the startup path never touches a singleton declared after boot runs
+  ---
+  duration_ms: 5.0515
+  type: 'test'
+  ...
+# Subtest: the service worker only falls back for failed page navigations
+ok 6 - the service worker only falls back for failed page navigations
+  ---
+  duration_ms: 0.9657
+  type: 'test'
+  ...
+# Subtest: API requests bypass the worker while a 502 navigation uses the cached guide
+ok 7 - API requests bypass the worker while a 502 navigation uses the cached guide
+  ---
+  duration_ms: 13.1449
+  type: 'test'
+  ...
+# Subtest: successful navigations always return the current network response
+ok 8 - successful navigations always return the current network response
+  ---
+  duration_ms: 1.2514
+  type: 'test'
+  ...
+# Subtest: the offline cache contains only the static connection guide
+ok 9 - the offline cache contains only the static connection guide
+  ---
+  duration_ms: 0.7632
+  type: 'test'
+  ...
+# Subtest: the offline guide is standalone, actionable, and uses the manifest background
+ok 10 - the offline guide is standalone, actionable, and uses the manifest background
+  ---
+  duration_ms: 0.9303
+  type: 'test'
+  ...
+# Subtest: the hidden attribute always overrides component display rules
+ok 11 - the hidden attribute always overrides component display rules
+  ---
+  duration_ms: 1.0845
+  type: 'test'
+  ...
+# Subtest: update banner resolves viewport width before laying out text and buttons
+ok 12 - update banner resolves viewport width before laying out text and buttons
+  ---
+  duration_ms: 1.6448
+  type: 'test'
+  ...
+# Subtest: adjustment ranges keep normalized handles and expose their actual values
+ok 13 - adjustment ranges keep normalized handles and expose their actual values
+  ---
+  duration_ms: 3.1623
+  type: 'test'
+  ...
+# Subtest: session epoch removes page preflight and repeated active acquisition
+ok 14 - session epoch removes page preflight and repeated active acquisition
+  ---
+  duration_ms: 5.008
+  type: 'test'
+  ...
+# Subtest: remote session acquisition refreshes the canonical home data coordinator
+ok 15 - remote session acquisition refreshes the canonical home data coordinator
+  ---
+  duration_ms: 4.063
+  type: 'test'
+  ...
+# Subtest: the running app version comes from the shell and acquisition can reload only once
+ok 16 - the running app version comes from the shell and acquisition can reload only once
+  ---
+  duration_ms: 3.051
+  type: 'test'
+  ...
+# Subtest: critical telemetry is submitted before session-transition UI side effects
+ok 17 - critical telemetry is submitted before session-transition UI side effects
+  ---
+  duration_ms: 4.7122
+  type: 'test'
+  ...
+# Subtest: prefetch retention is count-only and every eviction is queued as telemetry
+ok 18 - prefetch retention is count-only and every eviction is queued as telemetry
+  ---
+  duration_ms: 11.4887
+  type: 'test'
+  ...
+# Subtest: decode-ahead starts only after a committed display and records reuse
+ok 19 - decode-ahead starts only after a committed display and records reuse
+  ---
+  duration_ms: 5.3916
+  type: 'test'
+  ...
+# Subtest: video health HUD and persistent debug-tier warning stay wired
+ok 20 - video health HUD and persistent debug-tier warning stay wired
+  ---
+  duration_ms: 4.8431
+  type: 'test'
+  ...
+# Subtest: colorize controls use the adjustment preview and commit path without losing custom points
+ok 21 - colorize controls use the adjustment preview and commit path without losing custom points
+  ---
+  duration_ms: 6.274
+  type: 'test'
+  ...
+# Subtest: safe areas protect portrait bars and landscape side controls
+ok 22 - safe areas protect portrait bars and landscape side controls
+  ---
+  duration_ms: 4.5153
+  type: 'test'
+  ...
+# Subtest: search and tags keep flexible home tabs and iOS-safe text input sizing
+ok 23 - search and tags keep flexible home tabs and iOS-safe text input sizing
+  ---
+  duration_ms: 0.9242
+  type: 'test'
+  ...
+# Subtest: still-image panel reserves the agreed viewport while its transparent shield owns input
+ok 24 - still-image panel reserves the agreed viewport while its transparent shield owns input
+  ---
+  duration_ms: 3.2014
+  type: 'test'
+  ...
+# Subtest: adjustment slider resets keep a stable reserved layout slot
+ok 25 - adjustment slider resets keep a stable reserved layout slot
+  ---
+  duration_ms: 3.9348
+  type: 'test'
+  ...
+# Subtest: adjustment ranges yield vertical pan without weakening viewer gesture owners
+ok 26 - adjustment ranges yield vertical pan without weakening viewer gesture owners
+  ---
+  duration_ms: 1.7321
+  type: 'test'
+  ...
+# Subtest: image fit transforms only the page layer while controls stay its siblings
+ok 27 - image fit transforms only the page layer while controls stay its siblings
+  ---
+  duration_ms: 4.0233
+  type: 'test'
+  ...
+# Subtest: browser, viewer, and layout geometry are attached to image and refit events
+ok 28 - browser, viewer, and layout geometry are attached to image and refit events
+  ---
+  duration_ms: 4.7999
+  type: 'test'
+  ...
+# Subtest: viewer taps dispatch immediately and have no application double-tap fit path
+ok 29 - viewer taps dispatch immediately and have no application double-tap fit path
+  ---
+  duration_ms: 3.3237
+  type: 'test'
+  ...
+# Subtest: page request feedback precedes load while display position commits at replacement
+ok 30 - page request feedback precedes load while display position commits at replacement
+  ---
+  duration_ms: 3.4088
+  type: 'test'
+  ...
+# Subtest: page position movement, history, open, and reanchor have one structural owner
+ok 31 - page position movement, history, open, and reanchor have one structural owner
+  ---
+  duration_ms: 4.014
+  type: 'test'
+  ...
+# Subtest: a thrown page load still reaches the outcome contract instead of the render error path
+ok 32 - a thrown page load still reaches the outcome contract instead of the render error path
+  ---
+  duration_ms: 3.5369
+  type: 'test'
+  ...
+# Subtest: image tiles preserve portrait and landscape shape below a separate label row
+ok 33 - image tiles preserve portrait and landscape shape below a separate label row
+  ---
+  duration_ms: 3.8456
+  type: 'test'
+  ...
+# Subtest: the grid owns pinch scaling while one-finger vertical scroll stays native
+ok 34 - the grid owns pinch scaling while one-finger vertical scroll stays native
+  ---
+  duration_ms: 3.6033
+  type: 'test'
+  ...
+# Subtest: the grid tracks finger contact with touch events because pointers are cancelled
+ok 35 - the grid tracks finger contact with touch events because pointers are cancelled
+  ---
+  duration_ms: 3.5225
+  type: 'test'
+  ...
+# Subtest: video owns repeated taps and pinch without allowing native page zoom
+ok 36 - video owns repeated taps and pinch without allowing native page zoom
+  ---
+  duration_ms: 2.4935
+  type: 'test'
+  ...
+# Subtest: image and video seek share tap-or-relative-drag handling without replacing native range semantics
+ok 37 - image and video seek share tap-or-relative-drag handling without replacing native range semantics
+  ---
+  duration_ms: 4.6941
+  type: 'test'
+  ...
+# Subtest: video volume is always present and only its iOS notice is platform-gated
+ok 38 - video volume is always present and only its iOS notice is platform-gated
+  ---
+  duration_ms: 2.4958
+  type: 'test'
+  ...
+# Subtest: viewer status overlays belong to the HUD and leave with it
+ok 39 - viewer status overlays belong to the HUD and leave with it
+  ---
+  duration_ms: 0.8866
+  type: 'test'
+  ...
+# Subtest: a page that never boots says so instead of staying black
+ok 40 - a page that never boots says so instead of staying black
+  ---
+  duration_ms: 2.8715
+  type: 'test'
+  ...
+# Subtest: sorting hands the bar back, and form controls keep the page typography
+ok 41 - sorting hands the bar back, and form controls keep the page typography
+  ---
+  duration_ms: 3.3153
+  type: 'test'
+  ...
+1..41
+# tests 41
+# suites 0
+# pass 41
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 160.8327
+TAP version 13
+# Subtest: page timing averages have no estimate for zero samples
+ok 1 - page timing averages have no estimate for zero samples
+  ---
+  duration_ms: 0.5477
+  type: 'test'
+  ...
+# Subtest: page timing averages one successful page
+ok 2 - page timing averages one successful page
+  ---
+  duration_ms: 0.5919
+  type: 'test'
+  ...
+# Subtest: page timing history keeps the newest ten pages per preset
+ok 3 - page timing history keeps the newest ten pages per preset
+  ---
+  duration_ms: 0.1684
+  type: 'test'
+  ...
+# Subtest: page timing transfer duration never becomes negative
+ok 4 - page timing transfer duration never becomes negative
+  ---
+  duration_ms: 0.117
+  type: 'test'
+  ...
+# Subtest: page timing storage is separate, versioned, and failure-safe
+ok 5 - page timing storage is separate, versioned, and failure-safe
+  ---
+  duration_ms: 0.2753
+  type: 'test'
+  ...
+# Subtest: re-displaying the same fetched page is not a new timing sample
+ok 6 - re-displaying the same fetched page is not a new timing sample
+  ---
+  duration_ms: 0.1077
+  type: 'test'
+  ...
+1..6
+# tests 6
+# suites 0
+# pass 6
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 7.5715
+TAP version 13
+# Subtest: pageResourceKey changes for every byte-affecting field
+ok 1 - pageResourceKey changes for every byte-affecting field
+  ---
+  duration_ms: 0.8015
+  type: 'test'
+  ...
+# Subtest: pageResourceKey recursively normalizes object key order
+ok 2 - pageResourceKey recursively normalizes object key order
+  ---
+  duration_ms: 0.1215
+  type: 'test'
+  ...
+# Subtest: pageResourceKey keeps JSON field boundaries unambiguous
+ok 3 - pageResourceKey keeps JSON field boundaries unambiguous
+  ---
+  duration_ms: 0.1447
+  type: 'test'
+  ...
+# Subtest: adjustment previews are distinct non-cacheable resources
+ok 4 - adjustment previews are distinct non-cacheable resources
+  ---
+  duration_ms: 0.0818
+  type: 'test'
+  ...
+# Subtest: a display group becomes ready exactly once after every member settles
+ok 5 - a display group becomes ready exactly once after every member settles
+  ---
+  duration_ms: 1.5752
+  type: 'test'
+  ...
+# Subtest: a fully cached display group is ready without starting work
+ok 6 - a fully cached display group is ready without starting work
+  ---
+  duration_ms: 0.1872
+  type: 'test'
+  ...
+# Subtest: one failed spread member fails the group without discarding its sibling
+ok 7 - one failed spread member fails the group without discarding its sibling
+  ---
+  duration_ms: 0.2317
+  type: 'test'
+  ...
+# Subtest: an aborted member has a typed group failure reason
+ok 8 - an aborted member has a typed group failure reason
+  ---
+  duration_ms: 0.1631
+  type: 'test'
+  ...
+# Subtest: a new display request retries a failed key while plan demand remains
+ok 9 - a new display request retries a failed key while plan demand remains
+  ---
+  duration_ms: 0.4711
+  type: 'test'
+  ...
+# Subtest: only requests waiting on the failed attempt receive its terminal result
+ok 10 - only requests waiting on the failed attempt receive its terminal result
+  ---
+  duration_ms: 0.308
+  type: 'test'
+  ...
+# Subtest: a retry starts for the new request while the failed request remains open
+ok 11 - a retry starts for the new request while the failed request remains open
+  ---
+  duration_ms: 0.1657
+  type: 'test'
+  ...
+# Subtest: plan failure memory clears after no demand and invalidate
+ok 12 - plan failure memory clears after no demand and invalidate
+  ---
+  duration_ms: 0.1847
+  type: 'test'
+  ...
+# Subtest: settled job history is bounded without evicting a running job
+ok 13 - settled job history is bounded without evicting a running job
+  ---
+  duration_ms: 4.3909
+  type: 'test'
+  ...
+# Subtest: the history bound never rewrites the current job of a demanded key
+ok 14 - the history bound never rewrites the current job of a demanded key
+  ---
+  duration_ms: 2.8136
+  type: 'test'
+  ...
+# Subtest: a prefetch job promotes once and never demotes
+ok 15 - a prefetch job promotes once and never demotes
+  ---
+  duration_ms: 0.286
+  type: 'test'
+  ...
+# Subtest: foreground jobs start at foreground priority and never promote
+ok 16 - foreground jobs start at foreground priority and never promote
+  ---
+  duration_ms: 0.1652
+  type: 'test'
+  ...
+# Subtest: work is cancelled only when its last display and plan demand disappear
+ok 17 - work is cancelled only when its last display and plan demand disappear
+  ---
+  duration_ms: 0.1134
+  type: 'test'
+  ...
+# Subtest: setPlan cancels active work but not a plan member that never started
+ok 18 - setPlan cancels active work but not a plan member that never started
+  ---
+  duration_ms: 0.0693
+  type: 'test'
+  ...
+# Subtest: prefetch admission gates only prefetch and resumes on a later mutation
+ok 19 - prefetch admission gates only prefetch and resumes on a later mutation
+  ---
+  duration_ms: 0.2436
+  type: 'test'
+  ...
+# Subtest: prefetch admission receives candidates in plan order and stops at the first refusal
+ok 20 - prefetch admission receives candidates in plan order and stops at the first refusal
+  ---
+  duration_ms: 0.0945
+  type: 'test'
+  ...
+# Subtest: prefetch concurrency is bounded and the next plan member starts on settle
+ok 21 - prefetch concurrency is bounded and the next plan member starts on settle
+  ---
+  duration_ms: 0.1178
+  type: 'test'
+  ...
+# Subtest: late completion after release is ignored
+ok 22 - late completion after release is ignored
+  ---
+  duration_ms: 0.1175
+  type: 'test'
+  ...
+# Subtest: an old job cannot affect a newer job for the same key
+ok 23 - an old job cannot affect a newer job for the same key
+  ---
+  duration_ms: 0.0729
+  type: 'test'
+  ...
+# Subtest: invalidate cancels every running job and fails each pending group once
+ok 24 - invalidate cancels every running job and fails each pending group once
+  ---
+  duration_ms: 0.1854
+  type: 'test'
+  ...
+# Subtest: release is idempotent, IDs are unique, and duplicate keys count once
+ok 25 - release is idempotent, IDs are unique, and duplicate keys count once
+  ---
+  duration_ms: 0.2557
+  type: 'test'
+  ...
+# Subtest: protected keys put every display demand before the plan order
+ok 26 - protected keys put every display demand before the plan order
+  ---
+  duration_ms: 0.1106
+  type: 'test'
+  ...
+# Subtest: all coordinator operation sequences through length four preserve invariants
+ok 27 - all coordinator operation sequences through length four preserve invariants
+  ---
+  duration_ms: 94.5113
+  type: 'test'
+  ...
+1..27
+# tests 27
+# suites 0
+# pass 27
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 118.9647
+TAP version 13
+# Subtest: local settings use the current defaults when no value exists
+ok 1 - local settings use the current defaults when no value exists
+  ---
+  duration_ms: 1.0017
+  type: 'test'
+  ...
+# Subtest: invalid local settings fall back without throwing
+ok 2 - invalid local settings fall back without throwing
+  ---
+  duration_ms: 0.2961
+  type: 'test'
+  ...
+# Subtest: local settings serialize and restore as one versioned value
+ok 3 - local settings serialize and restore as one versioned value
+  ---
+  duration_ms: 0.106
+  type: 'test'
+  ...
+# Subtest: storage failures use in-memory defaults and never escape
+ok 4 - storage failures use in-memory defaults and never escape
+  ---
+  duration_ms: 0.2286
+  type: 'test'
+  ...
+# Subtest: storage helpers use one aggregate key
+ok 5 - storage helpers use one aggregate key
+  ---
+  duration_ms: 0.1809
+  type: 'test'
+  ...
+# Subtest: older version-one values add the gesture help default
+ok 6 - older version-one values add the gesture help default
+  ---
+  duration_ms: 0.1854
+  type: 'test'
+  ...
+# Subtest: grid column settings clamp per field without replacing existing values
+ok 7 - grid column settings clamp per field without replacing existing values
+  ---
+  duration_ms: 0.1954
+  type: 'test'
+  ...
+# Subtest: prefetch depth validates each field without changing version-one settings
+ok 8 - prefetch depth validates each field without changing version-one settings
+  ---
+  duration_ms: 0.1758
+  type: 'test'
+  ...
+# Subtest: all image quality choices round-trip as device-local settings
+ok 9 - all image quality choices round-trip as device-local settings
+  ---
+  duration_ms: 0.3882
+  type: 'test'
+  ...
+# Subtest: image quality defaults to standard and rejects unknown values
+ok 10 - image quality defaults to standard and rejects unknown values
+  ---
+  duration_ms: 0.3373
+  type: 'test'
+  ...
+# Subtest: adjustment tab order and normalization follow the available desktop sections
+ok 11 - adjustment tab order and normalization follow the available desktop sections
+  ---
+  duration_ms: 0.1777
+  type: 'test'
+  ...
+1..11
+# tests 11
+# suites 0
+# pass 11
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 11.4531
+TAP version 13
+# Subtest: the browser rule keeps every tap as a candidate and uses its own slop
+ok 1 - the browser rule keeps every tap as a candidate and uses its own slop
+  ---
+  duration_ms: 0.9353
+  type: 'test'
+  ...
+# Subtest: a recognized pair does not consume its second tap
+ok 2 - a recognized pair does not consume its second tap
+  ---
+  duration_ms: 0.0902
+  type: 'test'
+  ...
+# Subtest: document observer preserves every touchend and reports recognized pairs
+ok 3 - document observer preserves every touchend and reports recognized pairs
+  ---
+  duration_ms: 0.562
+  type: 'test'
+  ...
+# Subtest: document observer leaves multi-touch out of the pair sequence
+ok 4 - document observer leaves multi-touch out of the pair sequence
+  ---
+  duration_ms: 0.203
+  type: 'test'
+  ...
+# Subtest: buttons, links, inputs, and plain elements share the observation contract
+ok 5 - buttons, links, inputs, and plain elements share the observation contract
+  ---
+  duration_ms: 0.232
+  type: 'test'
+  ...
+# Subtest: the document observer uses the browser recognition window
+ok 6 - the document observer uses the browser recognition window
+  ---
+  duration_ms: 0.1117
+  type: 'test'
+  ...
+# Subtest: pickers and labels are observed without suppressing their defaults
+ok 7 - pickers and labels are observed without suppressing their defaults
+  ---
+  duration_ms: 0.151
+  type: 'test'
+  ...
+1..7
+# tests 7
+# suites 0
+# pass 7
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 8.798
+TAP version 13
+# Subtest: relative range drag follows travel, clamps, and snaps independently of press position
+ok 1 - relative range drag follows travel, clamps, and snaps independently of press position
+  ---
+  duration_ms: 1.2081
+  type: 'test'
+  ...
+# Subtest: seek range uses a drag-biased six-pixel tap threshold and remembers peak travel
+ok 2 - seek range uses a drag-biased six-pixel tap threshold and remembers peak travel
+  ---
+  duration_ms: 0.4567
+  type: 'test'
+  ...
+# Subtest: seek range tap maps its press position through LTR and RTL track geometry
+ok 3 - seek range tap maps its press position through LTR and RTL track geometry
+  ---
+  duration_ms: 0.1975
+  type: 'test'
+  ...
+# Subtest: positive logarithmic adjustment ranges match egui normalized positions
+ok 4 - positive logarithmic adjustment ranges match egui normalized positions
+  ---
+  duration_ms: 0.1027
+  type: 'test'
+  ...
+# Subtest: adjustment reset visibility follows defaults, epsilon, and disabled state
+ok 5 - adjustment reset visibility follows defaults, epsilon, and disabled state
+  ---
+  duration_ms: 0.1043
+  type: 'test'
+  ...
+# Subtest: session acquisition policy separates passive detection from explicit recovery
+ok 6 - session acquisition policy separates passive detection from explicit recovery
+  ---
+  duration_ms: 0.5275
+  type: 'test'
+  ...
+# Subtest: one acquisition intent keeps waiting for a draining owner without a fixed deadline
+ok 7 - one acquisition intent keeps waiting for a draining owner without a fixed deadline
+  ---
+  duration_ms: 0.1191
+  type: 'test'
+  ...
+# Subtest: session control blocks only explicit ownership revocation
+ok 8 - session control blocks only explicit ownership revocation
+  ---
+  duration_ms: 0.1122
+  type: 'test'
+  ...
+# Subtest: a host-disconnect response becomes one blocking control transition
+ok 9 - a host-disconnect response becomes one blocking control transition
+  ---
+  duration_ms: 0.1867
+  type: 'test'
+  ...
+# Subtest: session transition telemetry records the observer before UI side effects
+ok 10 - session transition telemetry records the observer before UI side effects
+  ---
+  duration_ms: 0.2945
+  type: 'test'
+  ...
+# Subtest: session transition telemetry rejects unbounded observation values
+ok 11 - session transition telemetry rejects unbounded observation values
+  ---
+  duration_ms: 0.2045
+  type: 'test'
+  ...
+# Subtest: uncaught JS, terminal playback failures and session transitions are immediate
+ok 12 - uncaught JS, terminal playback failures and session transitions are immediate
+  ---
+  duration_ms: 0.1112
+  type: 'test'
+  ...
+# Subtest: normal telemetry keeps health facts but removes path, message and identity fields
+ok 13 - normal telemetry keeps health facts but removes path, message and identity fields
+  ---
+  duration_ms: 0.468
+  type: 'test'
+  ...
+# Subtest: normal telemetry keeps typed refresh exits while omitting diagnostics
+ok 14 - normal telemetry keeps typed refresh exits while omitting diagnostics
+  ---
+  duration_ms: 0.113
+  type: 'test'
+  ...
+# Subtest: page identity comparison distinguishes PDF documents, ZIP entries, and files
+ok 15 - page identity comparison distinguishes PDF documents, ZIP entries, and files
+  ---
+  duration_ms: 0.2884
+  type: 'test'
+  ...
+# Subtest: addressed POST moves every filesystem path into repeated query arguments
+ok 16 - addressed POST moves every filesystem path into repeated query arguments
+  ---
+  duration_ms: 0.2934
+  type: 'test'
+  ...
+# Subtest: normal mismatch telemetry retains only the two typed page identities
+ok 17 - normal mismatch telemetry retains only the two typed page identities
+  ---
+  duration_ms: 0.1529
+  type: 'test'
+  ...
+# Subtest: visual viewport scale telemetry is normalized and emitted only after a material change
+ok 18 - visual viewport scale telemetry is normalized and emitted only after a material change
+  ---
+  duration_ms: 0.1769
+  type: 'test'
+  ...
+# Subtest: viewer layout telemetry preserves bounded geometry without any content identity
+ok 19 - viewer layout telemetry preserves bounded geometry without any content identity
+  ---
+  duration_ms: 0.1015
+  type: 'test'
+  ...
+# Subtest: normal telemetry keeps the running and served app versions without session identity
+ok 20 - normal telemetry keeps the running and served app versions without session identity
+  ---
+  duration_ms: 0.0589
+  type: 'test'
+  ...
+# Subtest: debug telemetry keeps diagnostic context but redacts the live session capability
+ok 21 - debug telemetry keeps diagnostic context but redacts the live session capability
+  ---
+  duration_ms: 0.171
+  type: 'test'
+  ...
+# Subtest: remote session correlation is a stable truncated SHA-256 derivative
+ok 22 - remote session correlation is a stable truncated SHA-256 derivative
+  ---
+  duration_ms: 0.2121
+  type: 'test'
+  ...
+# Subtest: session failure detection ignores feature-level 409 responses
+ok 23 - session failure detection ignores feature-level 409 responses
+  ---
+  duration_ms: 0.0635
+  type: 'test'
+  ...
+# Subtest: session control remains modal through reconnect until acquisition succeeds
+ok 24 - session control remains modal through reconnect until acquisition succeeds
+  ---
+  duration_ms: 0.063
+  type: 'test'
+  ...
+# Subtest: session owner badge keeps active and superseded ownership explicit
+ok 25 - session owner badge keeps active and superseded ownership explicit
+  ---
+  duration_ms: 0.0514
+  type: 'test'
+  ...
+# Subtest: the owner badge announces changes, and only lingers when control is elsewhere
+ok 26 - the owner badge announces changes, and only lingers when control is elsewhere
+  ---
+  duration_ms: 0.0785
+  type: 'test'
+  ...
+# Subtest: viewer keys map to the shared page and menu commands
+ok 27 - viewer keys map to the shared page and menu commands
+  ---
+  duration_ms: 0.2046
+  type: 'test'
+  ...
+# Subtest: media keys and tap zones map to the existing media command layer
+ok 28 - media keys and tap zones map to the existing media command layer
+  ---
+  duration_ms: 0.0855
+  type: 'test'
+  ...
+# Subtest: standard MSE selects hls.js even when canPlayType reports maybe
+ok 29 - standard MSE selects hls.js even when canPlayType reports maybe
+  ---
+  duration_ms: 0.0648
+  type: 'test'
+  ...
+# Subtest: WebKit ManagedMediaSource keeps a supported HLS stream on the native path
+ok 30 - WebKit ManagedMediaSource keeps a supported HLS stream on the native path
+  ---
+  duration_ms: 0.0895
+  type: 'test'
+  ...
+# Subtest: native HLS is the fallback when iOS has no MSE
+ok 31 - native HLS is the fallback when iOS has no MSE
+  ---
+  duration_ms: 0.1088
+  type: 'test'
+  ...
+# Subtest: missing MSE and native HLS reports unsupported playback
+ok 32 - missing MSE and native HLS reports unsupported playback
+  ---
+  duration_ms: 0.0544
+  type: 'test'
+  ...
+# Subtest: startup detects a deadline with no fetched media segment
+ok 33 - startup detects a deadline with no fetched media segment
+  ---
+  duration_ms: 0.095
+  type: 'test'
+  ...
+# Subtest: a newer build reloads once on acquisition and stays a banner while active
+ok 34 - a newer build reloads once on acquisition and stays a banner while active
+  ---
+  duration_ms: 0.1245
+  type: 'test'
+  ...
+# Subtest: the timeline is anchored once per generation, not on every state poll
+ok 35 - the timeline is anchored once per generation, not on every state poll
+  ---
+  duration_ms: 0.125
+  type: 'test'
+  ...
+# Subtest: whole-video position composes source origin with the media element playhead
+ok 36 - whole-video position composes source origin with the media element playhead
+  ---
+  duration_ms: 0.1301
+  type: 'test'
+  ...
+# Subtest: seek bar keeps its absolute target across delayed session acquisition
+ok 37 - seek bar keeps its absolute target across delayed session acquisition
+  ---
+  duration_ms: 0.0781
+  type: 'test'
+  ...
+# Subtest: explicit zero restart overrides saved resume while an initial open preserves it
+ok 38 - explicit zero restart overrides saved resume while an initial open preserves it
+  ---
+  duration_ms: 0.0767
+  type: 'test'
+  ...
+# Subtest: three seconds of waiting only proposes one lower quality
+ok 39 - three seconds of waiting only proposes one lower quality
+  ---
+  duration_ms: 0.0687
+  type: 'test'
+  ...
+# Subtest: stream HTTP statuses distinguish session and generation conflicts
+ok 40 - stream HTTP statuses distinguish session and generation conflicts
+  ---
+  duration_ms: 0.083
+  type: 'test'
+  ...
+# Subtest: quality presets keep their traffic estimates attached to the command value
+ok 41 - quality presets keep their traffic estimates attached to the command value
+  ---
+  duration_ms: 0.0729
+  type: 'test'
+  ...
+# Subtest: image quality presets keep six deterministic long-side limits
+ok 42 - image quality presets keep six deterministic long-side limits
+  ---
+  duration_ms: 0.0633
+  type: 'test'
+  ...
+# Subtest: only the most expensive image quality warns about page turns
+ok 43 - only the most expensive image quality warns about page turns
+  ---
+  duration_ms: 0.0582
+  type: 'test'
+  ...
+# Subtest: one image quality step never more than doubles the cost
+ok 44 - one image quality step never more than doubles the cost
+  ---
+  duration_ms: 0.0935
+  type: 'test'
+  ...
+# Subtest: RTL reverses only physical horizontal viewer keys and tap zones
+ok 45 - RTL reverses only physical horizontal viewer keys and tap zones
+  ---
+  duration_ms: 0.0916
+  type: 'test'
+  ...
+# Subtest: spread cycle, RTL predicate and portrait fallback match the viewer contract
+ok 46 - spread cycle, RTL predicate and portrait fallback match the viewer contract
+  ---
+  duration_ms: 0.1154
+  type: 'test'
+  ...
+# Subtest: opening a container in portrait plans no persistent spread write
+ok 47 - opening a container in portrait plans no persistent spread write
+  ---
+  duration_ms: 0.0732
+  type: 'test'
+  ...
+# Subtest: an explicit portrait selection writes the selected mode, not effective Single
+ok 48 - an explicit portrait selection writes the selected mode, not effective Single
+  ---
+  duration_ms: 0.0557
+  type: 'test'
+  ...
+# Subtest: fit mode cycle and request width use the actual rendered image width
+ok 49 - fit mode cycle and request width use the actual rendered image width
+  ---
+  duration_ms: 0.1133
+  type: 'test'
+  ...
+# Subtest: every center tap resolves immediately to the bars command
+ok 50 - every center tap resolves immediately to the bars command
+  ---
+  duration_ms: 0.041
+  type: 'test'
+  ...
+# Subtest: each edge tap resolves immediately to page navigation
+ok 51 - each edge tap resolves immediately to page navigation
+  ---
+  duration_ms: 0.0407
+  type: 'test'
+  ...
+# Subtest: spread layout fits the combined pages and preserves the configured gap
+ok 52 - spread layout fits the combined pages and preserves the configured gap
+  ---
+  duration_ms: 0.2765
+  type: 'test'
+  ...
+# Subtest: page display slots follow the physical left-to-right group order
+ok 53 - page display slots follow the physical left-to-right group order
+  ---
+  duration_ms: 0.0846
+  type: 'test'
+  ...
+# Subtest: remote state generation ignores stale observations and changes only after initialization
+ok 54 - remote state generation ignores stale observations and changes only after initialization
+  ---
+  duration_ms: 0.0954
+  type: 'test'
+  ...
+# Subtest: a page response attests exactly the generation requested by its viewer group
+ok 55 - a page response attests exactly the generation requested by its viewer group
+  ---
+  duration_ms: 0.0633
+  type: 'test'
+  ...
+# Subtest: every page in one viewer group snapshots the same remote state generation
+ok 56 - every page in one viewer group snapshots the same remote state generation
+  ---
+  duration_ms: 0.0722
+  type: 'test'
+  ...
+# Subtest: foreground page loading keeps one active group and replaces the pending group
+ok 57 - foreground page loading keeps one active group and replaces the pending group
+  ---
+  duration_ms: 0.0623
+  type: 'test'
+  ...
+# Subtest: page loading busy feedback spans the whole queue interval
+ok 58 - page loading busy feedback spans the whole queue interval
+  ---
+  duration_ms: 0.0522
+  type: 'test'
+  ...
+# Subtest: an adjustment commit skips only its redundant adjustment refresh
+ok 59 - an adjustment commit skips only its redundant adjustment refresh
+  ---
+  duration_ms: 0.0465
+  type: 'test'
+  ...
+# Subtest: page edge messages distinguish start, end and RTL guidance
+ok 60 - page edge messages distinguish start, end and RTL guidance
+  ---
+  duration_ms: 0.0869
+  type: 'test'
+  ...
+# Subtest: grid keys mirror parent, history, selection and page defaults
+ok 61 - grid keys mirror parent, history, selection and page defaults
+  ---
+  duration_ms: 0.1702
+  type: 'test'
+  ...
+# Subtest: editable controls suppress every shortcut
+ok 62 - editable controls suppress every shortcut
+  ---
+  duration_ms: 0.0449
+  type: 'test'
+  ...
+# Subtest: escape closes the shared menu in every screen context
+ok 63 - escape closes the shared menu in every screen context
+  ---
+  duration_ms: 0.0534
+  type: 'test'
+  ...
+# Subtest: viewer tap zones and wheel inputs emit the same commands
+ok 64 - viewer tap zones and wheel inputs emit the same commands
+  ---
+  duration_ms: 0.0793
+  type: 'test'
+  ...
+# Subtest: viewer seek uses one physical tick per page group and real page labels
+ok 65 - viewer seek uses one physical tick per page group and real page labels
+  ---
+  duration_ms: 0.1792
+  type: 'test'
+  ...
+# Subtest: viewer seek keeps logical values and delegates RTL geometry to the native range
+ok 66 - viewer seek keeps logical values and delegates RTL geometry to the native range
+  ---
+  duration_ms: 0.1292
+  type: 'test'
+  ...
+# Subtest: viewer group load completion runs post-display only for an applied current request
+ok 67 - viewer group load completion runs post-display only for an applied current request
+  ---
+  duration_ms: 0.3782
+  type: 'test'
+  ...
+# Subtest: viewer group load completion rejects an old page-group context at the same index
+ok 68 - viewer group load completion rejects an old page-group context at the same index
+  ---
+  duration_ms: 0.0707
+  type: 'test'
+  ...
+# Subtest: viewer seek relative drag mirrors physical RTL travel
+ok 69 - viewer seek relative drag mirrors physical RTL travel
+  ---
+  duration_ms: 0.1833
+  type: 'test'
+  ...
+# Subtest: viewer seek hides only its range for a one-image sequence
+ok 70 - viewer seek hides only its range for a one-image sequence
+  ---
+  duration_ms: 0.0517
+  type: 'test'
+  ...
+# Subtest: viewer seek media presentation matches the core mixed-media summary
+ok 71 - viewer seek media presentation matches the core mixed-media summary
+  ---
+  duration_ms: 0.1353
+  type: 'test'
+  ...
+# Subtest: viewer gesture separates vertical and horizontal swipes
+ok 72 - viewer gesture separates vertical and horizontal swipes
+  ---
+  duration_ms: 0.1723
+  type: 'test'
+  ...
+# Subtest: viewer panel dimensions follow portrait bottom-half and landscape left-40-percent rules
+ok 73 - viewer panel dimensions follow portrait bottom-half and landscape left-40-percent rules
+  ---
+  duration_ms: 0.132
+  type: 'test'
+  ...
+# Subtest: viewer panel open and close transitions request image refits
+ok 74 - viewer panel open and close transitions request image refits
+  ---
+  duration_ms: 0.14
+  type: 'test'
+  ...
+# Subtest: viewer panel shell transition shares open and orientation state without image policy
+ok 75 - viewer panel shell transition shares open and orientation state without image policy
+  ---
+  duration_ms: 0.0652
+  type: 'test'
+  ...
+# Subtest: an open viewer panel changes side and refits when orientation changes
+ok 76 - an open viewer panel changes side and refits when orientation changes
+  ---
+  duration_ms: 0.6677
+  type: 'test'
+  ...
+# Subtest: orientation spread refresh keeps the mounted viewer and its open panel
+ok 77 - orientation spread refresh keeps the mounted viewer and its open panel
+  ---
+  duration_ms: 0.1061
+  type: 'test'
+  ...
+# Subtest: viewer panel swipe uses the existing gesture arbitration without stealing taps, paging, or pan
+ok 78 - viewer panel swipe uses the existing gesture arbitration without stealing taps, paging, or pan
+  ---
+  duration_ms: 0.1619
+  type: 'test'
+  ...
+# Subtest: viewer gesture rejects sub-threshold motion and prioritizes pan
+ok 79 - viewer gesture rejects sub-threshold motion and prioritizes pan
+  ---
+  duration_ms: 0.0582
+  type: 'test'
+  ...
+# Subtest: viewer drag ownership follows transform and fit-mode overflow owners
+ok 80 - viewer drag ownership follows transform and fit-mode overflow owners
+  ---
+  duration_ms: 0.1051
+  type: 'test'
+  ...
+# Subtest: stage-owned drag axes stay pan-owned at an edge while unowned axes still swipe
+ok 81 - stage-owned drag axes stay pan-owned at an edge while unowned axes still swipe
+  ---
+  duration_ms: 0.0636
+  type: 'test'
+  ...
+# Subtest: reading progress batching emits latest only and force-flushes the final position
+ok 82 - reading progress batching emits latest only and force-flushes the final position
+  ---
+  duration_ms: 0.1338
+  type: 'test'
+  ...
+# Subtest: keyboard help defaults to pointer capability and remembers real key input
+ok 83 - keyboard help defaults to pointer capability and remembers real key input
+  ---
+  duration_ms: 0.093
+  type: 'test'
+  ...
+# Subtest: grid cursor uses the same keyboard-availability signal as shortcut hints
+ok 84 - grid cursor uses the same keyboard-availability signal as shortcut hints
+  ---
+  duration_ms: 0.0774
+  type: 'test'
+  ...
+# Subtest: grid navigation uses columns, page rows and clamps to valid entries
+ok 85 - grid navigation uses columns, page rows and clamps to valid entries
+  ---
+  duration_ms: 0.0916
+  type: 'test'
+  ...
+# Subtest: grid layout derives columns from target width and applies the tile aspect
+ok 86 - grid layout derives columns from target width and applies the tile aspect
+  ---
+  duration_ms: 0.1808
+  type: 'test'
+  ...
+# Subtest: grid label height is chosen once from collection metadata
+ok 87 - grid label height is chosen once from collection metadata
+  ---
+  duration_ms: 0.1065
+  type: 'test'
+  ...
+# Subtest: grid column override clamps, returns to auto, and selects by measured size
+ok 88 - grid column override clamps, returns to auto, and selects by measured size
+  ---
+  duration_ms: 0.0951
+  type: 'test'
+  ...
+# Subtest: grid column override field selects by measured viewport size
+ok 89 - grid column override field selects by measured viewport size
+  ---
+  duration_ms: 0.0283
+  type: 'test'
+  ...
+# Subtest: grid pinch changes one column only after a symmetric scale threshold
+ok 90 - grid pinch changes one column only after a symmetric scale threshold
+  ---
+  duration_ms: 0.0754
+  type: 'test'
+  ...
+# Subtest: grid scroll extent and snapping stay on whole row boundaries
+ok 91 - grid scroll extent and snapping stay on whole row boundaries
+  ---
+  duration_ms: 0.0948
+  type: 'test'
+  ...
+# Subtest: row snapping waits for the finger to leave, not for the pointer stream to stop
+ok 92 - row snapping waits for the finger to leave, not for the pointer stream to stop
+  ---
+  duration_ms: 0.0449
+  type: 'test'
+  ...
+# Subtest: grid scrollbar visibility never depends on the measured track
+ok 93 - grid scrollbar visibility never depends on the measured track
+  ---
+  duration_ms: 0.0664
+  type: 'test'
+  ...
+# Subtest: grid scrollbar hides when the list fits and maps both endpoints
+ok 94 - grid scrollbar hides when the list fits and maps both endpoints
+  ---
+  duration_ms: 0.1368
+  type: 'test'
+  ...
+# Subtest: grid scrollbar thumb and scroll position round trip
+ok 95 - grid scrollbar thumb and scroll position round trip
+  ---
+  duration_ms: 0.0931
+  type: 'test'
+  ...
+# Subtest: grid scrollbar item number stays within the item range
+ok 96 - grid scrollbar item number stays within the item range
+  ---
+  duration_ms: 0.0754
+  type: 'test'
+  ...
+# Subtest: grid return scrolls only enough to reveal the previously viewed item
+ok 97 - grid return scrolls only enough to reveal the previously viewed item
+  ---
+  duration_ms: 0.1904
+  type: 'test'
+  ...
+# Subtest: grid return clamps the old range instead of jumping to the top when the item is gone
+ok 98 - grid return clamps the old range instead of jumping to the top when the item is gone
+  ---
+  duration_ms: 0.059
+  type: 'test'
+  ...
+# Subtest: an untouched grid has no anchor while a real first-item selection anchors item zero
+ok 99 - an untouched grid has no anchor while a real first-item selection anchors item zero
+  ---
+  duration_ms: 0.1339
+  type: 'test'
+  ...
+# Subtest: grid viewport memory keeps multi-level round trips independent
+ok 100 - grid viewport memory keeps multi-level round trips independent
+  ---
+  duration_ms: 0.1639
+  type: 'test'
+  ...
+# Subtest: grid viewport memory keeps scroll while viewer and parent navigation update the target
+ok 101 - grid viewport memory keeps scroll while viewer and parent navigation update the target
+  ---
+  duration_ms: 0.0602
+  type: 'test'
+  ...
+# Subtest: grid viewport memory evicts the least recently used context
+ok 102 - grid viewport memory evicts the least recently used context
+  ---
+  duration_ms: 0.1391
+  type: 'test'
+  ...
+# Subtest: thumbnail responses apply only to the tile generation and item that requested them
+ok 103 - thumbnail responses apply only to the tile generation and item that requested them
+  ---
+  duration_ms: 0.0497
+  type: 'test'
+  ...
+# Subtest: thumbnail concurrency leaves one shared heavy slot for page and container work
+ok 104 - thumbnail concurrency leaves one shared heavy slot for page and container work
+  ---
+  duration_ms: 0.0801
+  type: 'test'
+  ...
+# Subtest: thumbnail retry policy retries only transient failures with a bounded backoff
+ok 105 - thumbnail retry policy retries only transient failures with a bounded backoff
+  ---
+  duration_ms: 0.0879
+  type: 'test'
+  ...
+# Subtest: thumbnail admission busy returns to the queue without spending retry budget
+ok 106 - thumbnail admission busy returns to the queue without spending retry budget
+  ---
+  duration_ms: 0.0286
+  type: 'test'
+  ...
+# Subtest: page prefetch follows reading direction and accepts a future spread
+ok 107 - page prefetch follows reading direction and accepts a future spread
+  ---
+  duration_ms: 0.1696
+  type: 'test'
+  ...
+# Subtest: decode-ahead retains the current display unit and two units on each side
+ok 108 - decode-ahead retains the current display unit and two units on each side
+  ---
+  duration_ms: 0.0954
+  type: 'test'
+  ...
+# Subtest: prefetch HUD splits around the current page regardless of last movement
+ok 109 - prefetch HUD splits around the current page regardless of last movement
+  ---
+  duration_ms: 0.1021
+  type: 'test'
+  ...
+# Subtest: prefetch HUD summary exposes ready active and missing counts
+ok 110 - prefetch HUD summary exposes ready active and missing counts
+  ---
+  duration_ms: 0.113
+  type: 'test'
+  ...
+# Subtest: page prefetch window narrows only until the first move in each book
+ok 111 - page prefetch window narrows only until the first move in each book
+  ---
+  duration_ms: 0.0808
+  type: 'test'
+  ...
+# Subtest: page planning and cache retention follow configured counts independently
+ok 112 - page planning and cache retention follow configured counts independently
+  ---
+  duration_ms: 0.0732
+  type: 'test'
+  ...
+# Subtest: page resource admission evicts oldest unprotected entries only
+ok 113 - page resource admission evicts oldest unprotected entries only
+  ---
+  duration_ms: 0.1486
+  type: 'test'
+  ...
+# Subtest: page resource admission ignores bytes and closes only at a protected count limit
+ok 114 - page resource admission ignores bytes and closes only at a protected count limit
+  ---
+  duration_ms: 0.0425
+  type: 'test'
+  ...
+# Subtest: page prefetch admission busy retains the plan without consuming a page
+ok 115 - page prefetch admission busy retains the plan without consuming a page
+  ---
+  duration_ms: 0.1347
+  type: 'test'
+  ...
+# Subtest: page display history records applied and rejected boundaries without paths or secrets
+ok 116 - page display history records applied and rejected boundaries without paths or secrets
+  ---
+  duration_ms: 0.3731
+  type: 'test'
+  ...
+# Subtest: loading indicator appears only after the stable delay threshold
+ok 117 - loading indicator appears only after the stable delay threshold
+  ---
+  duration_ms: 0.0921
+  type: 'test'
+  ...
+# Subtest: viewer transform commands dispatch through one pure state transition
+ok 118 - viewer transform commands dispatch through one pure state transition
+  ---
+  duration_ms: 0.1151
+  type: 'test'
+  ...
+# Subtest: zooming out is not stopped at the size the picture happens to be laid out at
+ok 119 - zooming out is not stopped at the size the picture happens to be laid out at
+  ---
+  duration_ms: 0.1405
+  type: 'test'
+  ...
+# Subtest: a pinch keeps the point between the fingers between the fingers
+ok 120 - a pinch keeps the point between the fingers between the fingers
+  ---
+  duration_ms: 0.1013
+  type: 'test'
+  ...
+# Subtest: admission retry honours Retry-After and stays within a usable range
+ok 121 - admission retry honours Retry-After and stays within a usable range
+  ---
+  duration_ms: 0.0651
+  type: 'test'
+  ...
+# Subtest: a drifted visual viewport is pulled back and recorded
+ok 122 - a drifted visual viewport is pulled back and recorded
+  ---
+  duration_ms: 0.0964
+  type: 'test'
+  ...
+# Subtest: a browser-zoomed viewport is left alone, because the drift is the user panning
+ok 123 - a browser-zoomed viewport is left alone, because the drift is the user panning
+  ---
+  duration_ms: 0.0412
+  type: 'test'
+  ...
+# Subtest: document scroll counts as drift even when the visual viewport reports zero
+ok 124 - document scroll counts as drift even when the visual viewport reports zero
+  ---
+  duration_ms: 0.0346
+  type: 'test'
+  ...
+# Subtest: showing half a page halves the box but still asks for the whole page
+ok 125 - showing half a page halves the box but still asks for the whole page
+  ---
+  duration_ms: 0.4162
+  type: 'test'
+  ...
+# Subtest: the doubled request width still respects the cap
+ok 126 - the doubled request width still respects the cap
+  ---
+  duration_ms: 0.1272
+  type: 'test'
+  ...
+# Subtest: the crop is a CSS position, and only for a half
+ok 127 - the crop is a CSS position, and only for a half
+  ---
+  duration_ms: 0.0593
+  type: 'test'
+  ...
+# Subtest: split modes carry a reading direction but are not part of the cycle
+ok 128 - split modes carry a reading direction but are not part of the cycle
+  ---
+  duration_ms: 0.1006
+  type: 'test'
+  ...
+1..128
+# tests 128
+# suites 0
+# pass 128
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 38.4009
+TAP version 13
+# Subtest: PIN login uses a text-capable mobile keyboard without text correction
+ok 1 - PIN login uses a text-capable mobile keyboard without text correction
+  ---
+  duration_ms: 0.9667
+  type: 'test'
+  ...
+# Subtest: view trim keeps the core book shape and switches spread controls without page state
+ok 2 - view trim keeps the core book shape and switches spread controls without page state
+  ---
+  duration_ms: 0.5651
+  type: 'test'
+  ...
+# Subtest: sort state accepts only server-provided options and keeps a visible lock reason
+ok 3 - sort state accepts only server-provided options and keeps a visible lock reason
+  ---
+  duration_ms: 0.1261
+  type: 'test'
+  ...
+# Subtest: session identity revocation tolerates a video viewer without page-load invalidation
+ok 4 - session identity revocation tolerates a video viewer without page-load invalidation
+  ---
+  duration_ms: 0.1173
+  type: 'test'
+  ...
+# Subtest: continuous video navigation stops at the end or wraps to the first video
+ok 5 - continuous video navigation stops at the end or wraps to the first video
+  ---
+  duration_ms: 0.1336
+  type: 'test'
+  ...
+# Subtest: open telemetry records the requested kind, media kind, and reached route
+ok 6 - open telemetry records the requested kind, media kind, and reached route
+  ---
+  duration_ms: 0.1529
+  type: 'test'
+  ...
+# Subtest: browser double-tap telemetry keeps the recognized observation
+ok 7 - browser double-tap telemetry keeps the recognized observation
+  ---
+  duration_ms: 0.1834
+  type: 'test'
+  ...
+# Subtest: favorite search route preserves encoded query and kind
+ok 8 - favorite search route preserves encoded query and kind
+  ---
+  duration_ms: 0.3134
+  type: 'test'
+  ...
+# Subtest: drive list uses the core-owned collection route
+ok 9 - drive list uses the core-owned collection route
+  ---
+  duration_ms: 0.2237
+  type: 'test'
+  ...
+# Subtest: collection image routes keep optional ids distinct from the image marker
+ok 10 - collection image routes keep optional ids distinct from the image marker
+  ---
+  duration_ms: 0.4051
+  type: 'test'
+  ...
+# Subtest: favorite search distinguishes empty, disabled, and unavailable states
+ok 11 - favorite search distinguishes empty, disabled, and unavailable states
+  ---
+  duration_ms: 0.1162
+  type: 'test'
+  ...
+# Subtest: favorite search result title keeps the searched words on screen
+ok 12 - favorite search result title keeps the searched words on screen
+  ---
+  duration_ms: 0.085
+  type: 'test'
+  ...
+# Subtest: favorite search runs only when the form is submitted
+ok 13 - favorite search runs only when the form is submitted
+  ---
+  duration_ms: 0.237
+  type: 'test'
+  ...
+# Subtest: tag route preserves encoded tag and every item kind
+ok 14 - tag route preserves encoded tag and every item kind
+  ---
+  duration_ms: 0.1776
+  type: 'test'
+  ...
+# Subtest: tag filtering is local partial matching and switches to one flat section
+ok 15 - tag filtering is local partial matching and switches to one flat section
+  ---
+  duration_ms: 0.2707
+  type: 'test'
+  ...
+# Subtest: tag item states and title keep the requested tag visible
+ok 16 - tag item states and title keep the requested tag visible
+  ---
+  duration_ms: 0.1
+  type: 'test'
+  ...
+# Subtest: legacy image telemetry resolves rejection and folder route without entryIndex
+ok 17 - legacy image telemetry resolves rejection and folder route without entryIndex
+  ---
+  duration_ms: 0.0627
+  type: 'test'
+  ...
+# Subtest: a folder-list video uses its absorbed sidecar as the thumbnail source
+ok 18 - a folder-list video uses its absorbed sidecar as the thumbnail source
+  ---
+  duration_ms: 0.1987
+  type: 'test'
+  ...
+# Subtest: grid return identity matches collection and addressed forms of the same item
+ok 19 - grid return identity matches collection and addressed forms of the same item
+  ---
+  duration_ms: 0.0567
+  type: 'test'
+  ...
+# Subtest: book bookmark rows preserve DB order and keep hint separate from resolved target
+ok 20 - book bookmark rows preserve DB order and keep hint separate from resolved target
+  ---
+  duration_ms: 0.2379
+  type: 'test'
+  ...
+# Subtest: container opening resumes the matching page and otherwise falls back safely
+ok 21 - container opening resumes the matching page and otherwise falls back safely
+  ---
+  duration_ms: 0.1426
+  type: 'test'
+  ...
+# Subtest: a collection root returns to its list without exposing a root kind
+ok 22 - a collection root returns to its list without exposing a root kind
+  ---
+  duration_ms: 0.0531
+  type: 'test'
+  ...
+# Subtest: every iPhone viewer menu page stays within the fixed action limit
+ok 23 - every iPhone viewer menu page stays within the fixed action limit
+  ---
+  duration_ms: 0.2511
+  type: 'test'
+  ...
+# Subtest: viewer display menu contains only controls for the current view
+ok 24 - viewer display menu contains only controls for the current view
+  ---
+  duration_ms: 0.1662
+  type: 'test'
+  ...
+# Subtest: still-image panel exposes the agreed tabs in desktop order
+ok 25 - still-image panel exposes the agreed tabs in desktop order
+  ---
+  duration_ms: 0.056
+  type: 'test'
+  ...
+# Subtest: adjustment panel exposes only implemented sections in desktop order
+ok 26 - adjustment panel exposes only implemented sections in desktop order
+  ---
+  duration_ms: 0.047
+  type: 'test'
+  ...
+# Subtest: adjustment tabs keep shared actions outside and preserve range pointer handlers
+ok 27 - adjustment tabs keep shared actions outside and preserve range pointer handlers
+  ---
+  duration_ms: 2.1428
+  type: 'test'
+  ...
+# Subtest: post filter groups keep server order and show the paint-time note once in basic
+ok 28 - post filter groups keep server order and show the paint-time note once in basic
+  ---
+  duration_ms: 1.3916
+  type: 'test'
+  ...
+# Subtest: adjustment touch cancellation restores the starting value without committing
+ok 29 - adjustment touch cancellation restores the starting value without committing
+  ---
+  duration_ms: 1.0263
+  type: 'test'
+  ...
+# Subtest: adjustment horizontal touch drag still previews and commits
+ok 30 - adjustment horizontal touch drag still previews and commits
+  ---
+  duration_ms: 0.5072
+  type: 'test'
+  ...
+# Subtest: adjustment pointer tap is absolute while drag remains relative
+ok 31 - adjustment pointer tap is absolute while drag remains relative
+  ---
+  duration_ms: 0.6192
+  type: 'test'
+  ...
+# Subtest: view trim pointer tap is absolute, drag is relative, and cancellation restores
+ok 32 - view trim pointer tap is absolute, drag is relative, and cancellation restores
+  ---
+  duration_ms: 0.6983
+  type: 'test'
+  ...
+# Subtest: adjustment preview keeps one request in flight and coalesces to the latest value
+ok 33 - adjustment preview keeps one request in flight and coalesces to the latest value
+  ---
+  duration_ms: 6.2293
+  type: 'test'
+  ...
+# Subtest: container-style latest-only refresh always displays the last grouping
+ok 34 - container-style latest-only refresh always displays the last grouping
+  ---
+  duration_ms: 0.8452
+  type: 'test'
+  ...
+# Subtest: latest-only refresh distinguishes failure from supersede
+ok 35 - latest-only refresh distinguishes failure from supersede
+  ---
+  duration_ms: 0.1874
+  type: 'test'
+  ...
+# Subtest: container refresh records the internal exception but returns only Japanese feedback
+ok 36 - container refresh records the internal exception but returns only Japanese feedback
+  ---
+  duration_ms: 0.7345
+  type: 'test'
+  ...
+# Subtest: viewer update context exits keep each pre-load reason distinct
+ok 37 - viewer update context exits keep each pre-load reason distinct
+  ---
+  duration_ms: 0.071
+  type: 'test'
+  ...
+# Subtest: identical container-style refreshes join the active owner
+ok 38 - identical container-style refreshes join the active owner
+  ---
+  duration_ms: 0.1031
+  type: 'test'
+  ...
+# Subtest: page load queue emits one busy interval across pending replacements
+ok 39 - page load queue emits one busy interval across pending replacements
+  ---
+  duration_ms: 0.3757
+  type: 'test'
+  ...
+# Subtest: page load queue clear resolves active and pending requests as superseded
+ok 40 - page load queue clear resolves active and pending requests as superseded
+  ---
+  duration_ms: 0.1443
+  type: 'test'
+  ...
+# Subtest: page load queue rejects a current run error but hides an old failed result
+ok 41 - page load queue rejects a current run error but hides an old failed result
+  ---
+  duration_ms: 0.3261
+  type: 'test'
+  ...
+# Subtest: display leases are all registered before the first page fetch begins
+ok 42 - display leases are all registered before the first page fetch begins
+  ---
+  duration_ms: 1.4173
+  type: 'test'
+  ...
+# Subtest: releasing one overlapping display does not cancel their shared page job
+ok 43 - releasing one overlapping display does not cancel their shared page job
+  ---
+  duration_ms: 0.6693
+  type: 'test'
+  ...
+# Subtest: a planned prefetch promotes once and batches the display identity
+ok 44 - a planned prefetch promotes once and batches the display identity
+  ---
+  duration_ms: 0.4888
+  type: 'test'
+  ...
+# Subtest: only jobs whose final demand disappears are released in one tick
+ok 45 - only jobs whose final demand disappears are released in one tick
+  ---
+  duration_ms: 0.2572
+  type: 'test'
+  ...
+# Subtest: Cancelled 409 is terminal and never enters the busy retry loop
+ok 46 - Cancelled 409 is terminal and never enters the busy retry loop
+  ---
+  duration_ms: 0.3663
+  type: 'test'
+  ...
+# Subtest: page count retention stays bounded and protects coordinator-owned keys
+ok 47 - page count retention stays bounded and protects coordinator-owned keys
+  ---
+  duration_ms: 0.4175
+  type: 'test'
+  ...
+# Subtest: every cache deletion reports its reason and retained byte accounting
+ok 48 - every cache deletion reports its reason and retained byte accounting
+  ---
+  duration_ms: 0.125
+  type: 'test'
+  ...
+# Subtest: deep page prefetch is limited by page count and not retained bytes
+ok 49 - deep page prefetch is limited by page count and not retained bytes
+  ---
+  duration_ms: 3.8763
+  type: 'test'
+  ...
+# Subtest: full count limit evicts a farther planned page before fetching a nearer one
+ok 50 - full count limit evicts a farther planned page before fetching a nearer one
+  ---
+  duration_ms: 0.7654
+  type: 'test'
+  ...
+# Subtest: full count limit never evicts a nearer page to start a farther request
+ok 51 - full count limit never evicts a nearer page to start a farther request
+  ---
+  duration_ms: 0.2029
+  type: 'test'
+  ...
+# Subtest: retained pages stay bounded even when the prefetch plan is empty
+ok 52 - retained pages stay bounded even when the prefetch plan is empty
+  ---
+  duration_ms: 0.7267
+  type: 'test'
+  ...
+# Subtest: a foreground admission retry stops when its own load is aborted
+ok 53 - a foreground admission retry stops when its own load is aborted
+  ---
+  duration_ms: 0.3852
+  type: 'test'
+  ...
+# Subtest: page demand adapter reports HUD states and refreshes on start settle cancel and evict
+ok 54 - page demand adapter reports HUD states and refreshes on start settle cancel and evict
+  ---
+  duration_ms: 2.2178
+  type: 'test'
+  ...
+# Subtest: remote adjustment normalization keeps valid local slider defaults and bounds
+ok 55 - remote adjustment normalization keeps valid local slider defaults and bounds
+  ---
+  duration_ms: 0.2162
+  type: 'test'
+  ...
+# Subtest: AI progress shows only server counters and never invents a percentage
+ok 56 - AI progress shows only server counters and never invents a percentage
+  ---
+  duration_ms: 0.1326
+  type: 'test'
+  ...
+# Subtest: archive progress uses only monotonic core counters and no invented percentage
+ok 57 - archive progress uses only monotonic core counters and no invented percentage
+  ---
+  duration_ms: 0.1161
+  type: 'test'
+  ...
+# Subtest: archive recovery requires the exact idempotency request id
+ok 58 - archive recovery requires the exact idempotency request id
+  ---
+  duration_ms: 0.0781
+  type: 'test'
+  ...
+# Subtest: AI recovery prefers the exact request and otherwise only resumes a running group
+ok 59 - AI recovery prefers the exact request and otherwise only resumes a running group
+  ---
+  duration_ms: 0.0915
+  type: 'test'
+  ...
+# Subtest: AI polling stops in background and uses the agreed foreground backoff
+ok 60 - AI polling stops in background and uses the agreed foreground backoff
+  ---
+  duration_ms: 0.0755
+  type: 'test'
+  ...
+# Subtest: automatic AI completion stays silent only when every page is not applicable
+ok 61 - automatic AI completion stays silent only when every page is not applicable
+  ---
+  duration_ms: 0.0537
+  type: 'test'
+  ...
+# Subtest: remote colorize normalization preserves custom points and clamps desktop ranges
+ok 62 - remote colorize normalization preserves custom points and clamps desktop ranges
+  ---
+  duration_ms: 0.1193
+  type: 'test'
+  ...
+# Subtest: plain image media routes resolve their containing folder
+ok 63 - plain image media routes resolve their containing folder
+  ---
+  duration_ms: 0.1651
+  type: 'test'
+  ...
+# Subtest: an absolute image path opens by its file address
+ok 64 - an absolute image path opens by its file address
+  ---
+  duration_ms: 0.9816
+  type: 'test'
+  ...
+# Subtest: tapping a video grid tile preserves the video route
+ok 65 - tapping a video grid tile preserves the video route
+  ---
+  duration_ms: 0.1849
+  type: 'test'
+  ...
+# Subtest: tapping an audio grid tile opens the shared media viewer route
+ok 66 - tapping an audio grid tile opens the shared media viewer route
+  ---
+  duration_ms: 0.1558
+  type: 'test'
+  ...
+# Subtest: session acquisition refreshes favorites and home once without taking the viewer
+ok 67 - session acquisition refreshes favorites and home once without taking the viewer
+  ---
+  duration_ms: 0.2069
+  type: 'test'
+  ...
+# Subtest: initial loading consumes an already completed acquisition refresh without duplicate requests
+ok 68 - initial loading consumes an already completed acquisition refresh without duplicate requests
+  ---
+  duration_ms: 0.1505
+  type: 'test'
+  ...
+# Subtest: successful session home refresh redraws only the visible home data tab
+ok 69 - successful session home refresh redraws only the visible home data tab
+  ---
+  duration_ms: 0.0932
+  type: 'test'
+  ...
+# Subtest: failed session home refresh preserves the last good places and smart folders
+ok 70 - failed session home refresh preserves the last good places and smart folders
+  ---
+  duration_ms: 0.1652
+  type: 'test'
+  ...
+# Subtest: initial home failure keeps its empty-state behavior separate from session refresh
+ok 71 - initial home failure keeps its empty-state behavior separate from session refresh
+  ---
+  duration_ms: 0.151
+  type: 'test'
+  ...
+# Subtest: losing a session does not refresh home data until a new session is acquired
+ok 72 - losing a session does not refresh home data until a new session is acquired
+  ---
+  duration_ms: 0.9103
+  type: 'test'
+  ...
+# Subtest: resolved audio and video opens enter the media viewer instead of the image viewer
+ok 73 - resolved audio and video opens enter the media viewer instead of the image viewer
+  ---
+  duration_ms: 0.1095
+  type: 'test'
+  ...
+# Subtest: tapping an archive grid tile starts the archive job route without a thumbnail request
+ok 74 - tapping an archive grid tile starts the archive job route without a thumbnail request
+  ---
+  duration_ms: 0.1058
+  type: 'test'
+  ...
+# Subtest: image viewer applies seek direction to the native range control
+ok 75 - image viewer applies seek direction to the native range control
+  ---
+  duration_ms: 0.2579
+  type: 'test'
+  ...
+# Subtest: viewer generation invalidation cancels fetch and rejects a late decode replacement
+ok 76 - viewer generation invalidation cancels fetch and rejects a late decode replacement
+  ---
+  duration_ms: 0.107
+  type: 'test'
+  ...
+# Subtest: decoded unit cancellation releases an out-of-window decode and never starts without bytes
+ok 77 - decoded unit cancellation releases an out-of-window decode and never starts without bytes
+  ---
+  duration_ms: 0.494
+  type: 'test'
+  ...
+# Subtest: viewer reuses retained image elements and reports reuse and miss timings
+ok 78 - viewer reuses retained image elements and reports reuse and miss timings
+  ---
+  duration_ms: 13.042
+  type: 'test'
+  ...
+# Subtest: viewer load executes fetch, decode, layout and atomic replacement
+ok 79 - viewer load executes fetch, decode, layout and atomic replacement
+  ---
+  duration_ms: 0.9732
+  type: 'test'
+  ...
+# Subtest: rapid page loads finish the active request and start only the latest pending request
+ok 80 - rapid page loads finish the active request and start only the latest pending request
+  ---
+  duration_ms: 0.9944
+  type: 'test'
+  ...
+# Subtest: single and spread loads classify success, fetch, decode, and current abort outcomes
+ok 81 - single and spread loads classify success, fetch, decode, and current abort outcomes
+  ---
+  duration_ms: 5.9177
+  type: 'test'
+  ...
+# Subtest: a superseded spread cannot replace the newer spread outcome
+ok 82 - a superseded spread cannot replace the newer spread outcome
+  ---
+  duration_ms: 0.9504
+  type: 'test'
+  ...
+# Subtest: AI status stays compact until tapped and keeps errors readable
+ok 83 - AI status stays compact until tapped and keeps errors readable
+  ---
+  duration_ms: 0.2843
+  type: 'test'
+  ...
+# Subtest: the AI status offers no cancel control, matching the desktop viewer
+ok 84 - the AI status offers no cancel control, matching the desktop viewer
+  ---
+  duration_ms: 0.0667
+  type: 'test'
+  ...
+# Subtest: AI result identity mismatch is not applied or automatically fetched again
+ok 85 - AI result identity mismatch is not applied or automatically fetched again
+  ---
+  duration_ms: 0.6346
+  type: 'test'
+  ...
+# Subtest: viewer refuses a page response without a generation attestation
+ok 86 - viewer refuses a page response without a generation attestation
+  ---
+  duration_ms: 0.4277
+  type: 'test'
+  ...
+# Subtest: legacy image requests snapshot and attest their remote state generation
+ok 87 - legacy image requests snapshot and attest their remote state generation
+  ---
+  duration_ms: 0.5028
+  type: 'test'
+  ...
+# Subtest: viewer rejects a mismatched page identity without display or retry and reports both identities
+ok 88 - viewer rejects a mismatched page identity without display or retry and reports both identities
+  ---
+  duration_ms: 0.3354
+  type: 'test'
+  ...
+# Subtest: spread waits for both pages and atomically replaces the page layer
+ok 89 - spread waits for both pages and atomically replaces the page layer
+  ---
+  duration_ms: 1.4182
+  type: 'test'
+  ...
+# Subtest: spread rejects one mismatched page before replacing either side
+ok 90 - spread rejects one mismatched page before replacing either side
+  ---
+  duration_ms: 0.7082
+  type: 'test'
+  ...
+# Subtest: folder list becomes renderable before spread metadata and open waits for it
+ok 91 - folder list becomes renderable before spread metadata and open waits for it
+  ---
+  duration_ms: 1.5712
+  type: 'test'
+  ...
+# Subtest: a previous folder container result cannot satisfy the current folder
+ok 92 - a previous folder container result cannot satisfy the current folder
+  ---
+  duration_ms: 0.9916
+  type: 'test'
+  ...
+# Subtest: standalone reload is local and preserves the current hash
+ok 93 - standalone reload is local and preserves the current hash
+  ---
+  duration_ms: 0.0739
+  type: 'test'
+  ...
+# Subtest: a coordinated display retries momentary admission refusal with the same lease
+ok 94 - a coordinated display retries momentary admission refusal with the same lease
+  ---
+  duration_ms: 201.3543
+  type: 'test'
+  ...
+# Subtest: latest-only preview supersession exposes a cancellation hook
+ok 95 - latest-only preview supersession exposes a cancellation hook
+  ---
+  duration_ms: 0.2678
+  type: 'test'
+  ...
+# Subtest: the measurement HUD stays off until someone asks for it
+ok 96 - the measurement HUD stays off until someone asks for it
+  ---
+  duration_ms: 0.0365
+  type: 'test'
+  ...
+# Subtest: the measurement HUD leaves the page alone while the bars are hidden
+ok 97 - the measurement HUD leaves the page alone while the bars are hidden
+  ---
+  duration_ms: 0.0268
+  type: 'test'
+  ...
+# Subtest: the measurement HUD stays closed once dismissed, and never shows signed out
+ok 98 - the measurement HUD stays closed once dismissed, and never shows signed out
+  ---
+  duration_ms: 0.0263
+  type: 'test'
+  ...
+# Subtest: the half you are reading survives a rebuild of the page groups
+ok 99 - the half you are reading survives a rebuild of the page groups
+  ---
+  duration_ms: 0.1033
+  type: 'test'
+  ...
+# Subtest: asking for a half that no longer exists lands on the page itself
+ok 100 - asking for a half that no longer exists lands on the page itself
+  ---
+  duration_ms: 0.0404
+  type: 'test'
+  ...
+1..100
+# tests 100
+# suites 0
+# pass 100
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 274.9932
