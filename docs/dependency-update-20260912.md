@@ -71,9 +71,11 @@ core and remote service, by the launcher. Validation must therefore cover:
    `scripts/build-release.ps1 -PreserveRuntime`, followed by hash checks that
    the launcher inputs use the selected dependency bytes.
 
-No application is launched as part of this dependency update. Interactive PDF
-and video confirmation remains a separate explicitly approved verification
-session.
+No application was launched by the automated dependency-update checks. On
+2026-09-12, the user launched the unsigned release confirmation build prepared
+by this update and reported that PDF viewing and video playback appeared to
+work correctly. That report refers to the release artifacts recorded below;
+the user did not independently calculate or compare their hashes.
 
 ## Validation record
 
@@ -91,6 +93,12 @@ session.
   single-thread rerun then passed all 48 snapshots. This is recorded as a gate
   anomaly rather than a PDFium regression; a similar wgpu snapshot-process
   crash predates this update, but its cause remains unproven.
+- A subsequent full workspace gate run with `RUST_TEST_THREADS=1` for that
+  invocation completed successfully. Its main library result was 8299 passed,
+  0 failed, and 45 ignored; `ui_snapshot` passed 48 of 48 in the same full run,
+  and all remaining workspace, vendor egui, egui-wgpu, eframe, and documentation
+  gates passed. This serial result is recorded separately and does not establish
+  the cause of the earlier parallel access violation.
 
 After the user closed the existing mImageViewer processes, the unsigned release
 core, embedded-web remote service, and launcher were built with
@@ -107,4 +115,6 @@ binary was reused.
 The rebuilt core contains the new PDFium DLL exactly once and contains no exact
 copy of the previous `154.0.8035.0` DLL. The rebuilt launcher contains the exact
 rebuilt core and remote executable once each, and contains each of the six
-selected FFmpeg DLLs exactly once. The application was not launched.
+selected FFmpeg DLLs exactly once. Automated checks did not launch the
+application; the user then used this confirmation build for the PDF and video
+check described above.
