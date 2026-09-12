@@ -114,6 +114,12 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     },
     AllowlistEntry {
         file: "src/app.rs",
+        function: "resume_loading_items_after_sidecar",
+        rule: Rule::A2b,
+        reason: "Installs seven fields from the prepared payload owned by SidecarLoadContinuation into the current mounted projection. The async terminal takes this Live continuation only while target context, items generation, and source folder still match; a retired, replaced, or navigated-away target cancels and discards it, so these mem::take calls cannot transfer an existing viewer context or publish into a sibling.",
+    },
+    AllowlistEntry {
+        file: "src/app.rs",
         function: "remove_items_batch",
         rule: Rule::A2b,
         reason: "Takes, index-shifts, and immediately reassigns per-item maps after batch deletion; every value stays in the same mounted context and the temporary ownership exists only to transform keys in place.",
@@ -126,7 +132,9 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     },
 ];
 
-// A4 excludes cfg(test)-gated API and freezes only the production registry surface below.
+// A4 excludes cfg(test)-gated API and freezes the registry surface available to ordinary or
+// feature-selected builds below. That includes exact test-script feature hooks: they are absent
+// from distribution builds, but still cross the ContextRef ownership boundary when enabled.
 // The ownership design named a viewer_context_registry::test_access namespace that was never
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
@@ -160,6 +168,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn vst3_deferred_media_open (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_lanczos_cache (self) -> & 'a crate :: gpu_lanczos :: GpuLanczosCache",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn similar_panel (self) -> & 'a crate :: ui_metadata_panel :: SimilarPanelState",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > :: # [cfg (feature = \"test-script\")] pub (in crate :: app) fn video_seek_strip_test_script_snapshot (self ,) -> crate :: test_script :: TestScriptSeekStripSnapshot",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn selected (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_state (self) -> Option < & 'a BookmarkViewState >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn archive_source_override (self) -> Option < & 'a Path >",
@@ -2034,6 +2043,30 @@ mod tests {
             &audit_public_api("pub struct Demo;", &refs).unwrap(),
             Rule::A4
         ));
+    }
+
+    #[test]
+    fn a4_freezes_feature_gated_context_snapshot_visibility() {
+        let allowed = r#"
+            #[cfg(windows)]
+            pub(in crate::app) struct ContextRef<'a> { value: &'a () }
+            #[cfg(windows)]
+            impl<'a> ContextRef<'a> {
+                #[cfg(feature = "test-script")]
+                pub(in crate::app) fn snapshot(self) -> usize { 0 }
+            }
+        "#;
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(audit_public_api(allowed, &refs).unwrap().is_empty());
+
+        for changed in [
+            allowed.replace("#[cfg(feature = \"test-script\")]", ""),
+            allowed.replace("pub(in crate::app) fn snapshot", "pub(crate) fn snapshot"),
+        ] {
+            let violations = audit_public_api(&changed, &refs).unwrap();
+            assert!(has_rule(&violations, Rule::A4), "{violations:#?}");
+        }
     }
 
     #[test]

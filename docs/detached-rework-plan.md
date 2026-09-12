@@ -1454,6 +1454,25 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-13 §1.222 viewer context監査の現行所有境界への追随（親Codex／独立Sol合意）**
+
+`viewer_context_audit` A2bへ`App::resume_loading_items_after_sidecar`をexact登録する。この7件の
+`mem::take`は、§1.209より前に既登録`start_loading_items_inner`内にあったtailを非同期継続へ
+分離したもので、`SidecarLoadContinuation`が所有するprepared payloadから現在mount済みprojectionへ
+installする。終端はtarget context、items generation、source folderがすべて一致するときだけLive継続を
+取り出し、retire、別世代、folder移動ではcancel済みDiscardedへ変えてresumeしない。別viewer contextの
+既存stateを移送する経路ではない。
+
+A4へWindowsかつ`test-script` feature限定の
+`ContextRef::video_seek_strip_test_script_snapshot`をfull fingerprintでexact登録する。MountedとAtRestの
+各`VideoSeekStripRuntime`を共有参照から値snapshotへ変換する診断専用APIで、contextのmount、swap、
+generation、worker、cacheを変更しない。監査rule、field閾値、可視性／cfg分類、既知指摘は変更せず、
+A2bはallowlist無効時にも再検出し、A4はfeature cfgまたは可視性がfingerprintから変われば再検出する。
+
+修正前の実repository auditはこのA2bとA4だけの2違反だった。修正後はaudit crate 35件と通常auditが
+成功し、`--no-allowlist`では既登録5件のA2bすべて（このresumeを含む）が再露出した。A4はfocused
+mutationでfeature cfg削除と可視性拡大の双方を拒否した。
+
 **2026-09-12 §1.223 比較ワイプ境界の初回案内（親Codex／独立Sol合意）**
 
 比較ワイプの初回案内を別のApp boolやcontext mapへ追加せず、既存の

@@ -131,6 +131,11 @@ Reconfigure、修復、手動Full、Deltaは従来どおり開く。これによ
 
 ### 1.222 viewer context audit の CI が 2 件で落ちたまま — v3.9.0 公開時に残した (2026-09-12)
 
+- 2026-09-13: 対象の所有境界を検収し、exact登録だけで修正。監査unit 35/35、通常repository audit exit0。
+  `--no-allowlist`ではA2bの検出を維持し、A4はcfg削除・可視性拡大mutationを検出する回帰で確認。
+  製品コード・監査規則は変更していない。リモートCIの再実行は未実施。
+  証跡: `target/section222-viewer-context-audit-20260913*`、判断記録は`detached-rework-plan.md`。
+
 - 出典: v3.9.0 公開作業での CI 確認 (run `34677345883` / HEAD `5de2b6d4e`)。
   **`cargo fmt --check` と `cargo check (ubuntu / non-Windows cfg)` は緑**。v3.8.0 で残っていた
   `cfg(windows)` 漏れ 3 件と A6 誤検知 49 件は `9ce433709` で解消済み。残るのは次の 2 件だけ。
