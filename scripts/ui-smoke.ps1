@@ -19,10 +19,12 @@ Automation must not pass this switch until that approval has been obtained.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
+    [ValidatePattern('^[0-9]+x[0-9]+$')]
+    [string] $Idle198WindowSize = '1328x900',
     [switch] $InteractiveApproved
 )
 
@@ -133,6 +135,29 @@ function Write-UiSmokeJson {
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-PngDimensions {
+    param([string] $Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $signature = @(137, 80, 78, 71, 13, 10, 26, 10)
+    if ($bytes.Length -lt 24) {
+        throw "[ui-smoke] PNG is too short: $Path"
+    }
+    for ($index = 0; $index -lt $signature.Count; $index++) {
+        if ($bytes[$index] -ne $signature[$index]) {
+            throw "[ui-smoke] PNG signature is invalid: $Path"
+        }
+    }
+    $width = ([uint32]$bytes[16] -shl 24) -bor
+        ([uint32]$bytes[17] -shl 16) -bor
+        ([uint32]$bytes[18] -shl 8) -bor
+        [uint32]$bytes[19]
+    $height = ([uint32]$bytes[20] -shl 24) -bor
+        ([uint32]$bytes[21] -shl 16) -bor
+        ([uint32]$bytes[22] -shl 8) -bor
+        [uint32]$bytes[23]
+    return [ordered]@{ width = [uint32]$width; height = [uint32]$height }
+}
+
 function Write-UiSmokeEvent {
     param([string] $Message)
     $line = "{0} {1}" -f [DateTime]::UtcNow.ToString('o'), $Message
@@ -210,6 +235,25 @@ function Register-UiSmokeEvidenceFile {
     })
 }
 
+function Register-UiSmokeEvidenceDirectory {
+    param(
+        [string] $Path,
+        [string] $Kind
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    $runRoot = Get-NormalizedPath $script:runDir
+    $directory = Get-NormalizedPath $Path
+    if (-not $directory.StartsWith(($runRoot + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[$Kind] run evidence directory escaped the run directory: $directory"
+    }
+    Assert-NoReparsePath $directory $repoRoot $Kind
+    Assert-NoReparseTree $directory $Kind
+    foreach ($file in (Get-ChildItem -LiteralPath $directory -File -Recurse)) {
+        $relative = $file.FullName.Substring($runRoot.Length).TrimStart('\')
+        Register-UiSmokeEvidenceFile $file.FullName $relative $Kind
+    }
+}
+
 function Add-UiSmokeEvidenceDirectory {
     param(
         [string] $SourceRoot,
@@ -248,6 +292,33 @@ function Try-AddUiSmokeEvidenceDirectory {
     )
     try {
         Add-UiSmokeEvidenceDirectory $SourceRoot $RelativeDestination $Kind
+    }
+    catch {
+        [void]$script:archiveErrors.Add("${Kind}: $($_.Exception.Message)")
+    }
+}
+
+function Try-RegisterUiSmokeEvidenceFile {
+    param(
+        [string] $Path,
+        [string] $RelativePath,
+        [string] $Kind
+    )
+    try {
+        Register-UiSmokeEvidenceFile $Path $RelativePath $Kind
+    }
+    catch {
+        [void]$script:archiveErrors.Add("${Kind}: $($_.Exception.Message)")
+    }
+}
+
+function Try-RegisterUiSmokeEvidenceDirectory {
+    param(
+        [string] $Path,
+        [string] $Kind
+    )
+    try {
+        Register-UiSmokeEvidenceDirectory $Path $Kind
     }
     catch {
         [void]$script:archiveErrors.Add("${Kind}: $($_.Exception.Message)")
@@ -350,6 +421,21 @@ function Test-UiSmokeDeadlineReached {
     return $ElapsedMilliseconds -ge $DeadlineMilliseconds
 }
 
+function Get-Idle198FocusWaitDisposition {
+    param(
+        [long] $ElapsedMilliseconds,
+        [long] $DeadlineMilliseconds,
+        [long] $FocusElapsedMilliseconds
+    )
+    if (Test-UiSmokeDeadlineReached $ElapsedMilliseconds $DeadlineMilliseconds) {
+        return 'ScenarioTimedOut'
+    }
+    if ($FocusElapsedMilliseconds -ge 20000L) {
+        return 'FocusUnavailable'
+    }
+    return 'Continue'
+}
+
 function Invoke-UiSmokeCapturedProcess {
     param(
         [string] $FilePath,
@@ -402,7 +488,17 @@ function Save-UiSmokeEvidence {
         if ($script:fixtureGeneratorPdfDependencyPath) {
             Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPdfDependencyPath 'inputs/fixture-generator-pdf-dependency.py' 'fixture-generator-pdf-dependency'
         }
+        if ($script:postAnalyzerPath) {
+            Try-AddUiSmokeEvidenceFile $script:postAnalyzerPath 'inputs/post-analyzer.py' 'post-analyzer'
+        }
+        if ($script:sharedAnalyzerPath) {
+            Try-AddUiSmokeEvidenceFile $script:sharedAnalyzerPath 'inputs/shared-analyzer.py' 'shared-analyzer'
+        }
         Try-AddUiSmokeEvidenceDirectory (Join-Path $dataDir 'logs') 'logs' 'application-log'
+        if ($script:lifetimeSamplesPath) {
+            Try-RegisterUiSmokeEvidenceFile $script:lifetimeSamplesPath 'lifetime-samples.jsonl' 'process-lifetime'
+        }
+        Try-RegisterUiSmokeEvidenceDirectory (Join-Path $script:runDir 'analysis') 'post-analysis'
     }
 
     if ($script:archiveErrors.Count -gt 0) {
@@ -461,6 +557,8 @@ function Save-UiSmokeEvidence {
         button_helper_failure = $script:buttonHelperFailure
         button_helper_finalization_error = $script:buttonHelperFinalizationError
         exact_app_termination_permitted = $script:mayTerminateExactApp
+        idle198_window_size = if ($Scenario -eq 'Idle198Convergence') { $Idle198WindowSize } else { $null }
+        lifetime_sample_interval_ms = if ($Scenario -eq 'Idle198Convergence') { 250 } else { $null }
     }
     try {
         Write-UiSmokeJson (Join-Path $script:runDir 'run-metadata.json') $metadata
@@ -553,6 +651,11 @@ $script:fixtureDir = $null
 $script:fixtureGeneratorPath = $null
 $script:fixtureGeneratorDependencyPath = $null
 $script:fixtureGeneratorPdfDependencyPath = $null
+$script:postAnalyzerPath = $null
+$script:sharedAnalyzerPath = $null
+$script:lifetimeSamplesPath = $null
+$script:processStartUtc = $null
+$script:idle198SampleIndex = 0
 $script:mayTerminateExactApp = $true
 $script:buttonHelperHandle = $null
 $script:buttonHelperStatus = $null
@@ -571,7 +674,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag')
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -801,6 +904,66 @@ if ($script:archiveErrors.Count -gt 0) {
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"Single","default_reading_flow":"Paged","fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"still_seek_strip_visible":true,"still_seek_strip_height":"large"}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
+    'Idle198Convergence' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\idle198-convergence'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\idle198-convergence.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_idle198_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $script:postAnalyzerPath = Join-Path $PSScriptRoot 'analyze_idle198_convergence.py'
+        $script:sharedAnalyzerPath = Join-Path $PSScriptRoot 'analyze_perf.py'
+
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\idle198-convergence') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($inputPath in @(
+            $candidateScriptPath,
+            $candidateFixtureGeneratorPath,
+            $candidateFixtureGeneratorDependencyPath,
+            $script:postAnalyzerPath,
+            $script:sharedAnalyzerPath
+        )) {
+            Assert-NoReparsePath $inputPath $repoRoot 'idle198-input'
+            if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+                throw "[ui-smoke] idle198 input not found: $inputPath"
+            }
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        Assert-NoReparsePath $candidateFixtureDir $repoRoot 'idle198-fixture'
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] idle198 fixture generator failed with exit $LASTEXITCODE"
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'idle198-fixture'
+        $pngFiles = @(Get-ChildItem -LiteralPath $candidateFixtureDir -Filter '*.png' -File | Sort-Object Name)
+        if ($pngFiles.Count -ne 4 -or @($pngFiles | Where-Object { $_.Length -le 0 }).Count -ne 0) {
+            throw '[ui-smoke] idle198 fixture must contain exactly four non-empty PNG files'
+        }
+        $fixtureHashes = @()
+        for ($page = 1; $page -le 4; $page++) {
+            $expectedName = 'idle198-{0:D3}.png' -f $page
+            if ($pngFiles[$page - 1].Name -ne $expectedName) {
+                throw '[ui-smoke] idle198 fixture names are not the expected contiguous sequence'
+            }
+            $dimensions = Get-PngDimensions $pngFiles[$page - 1].FullName
+            if ($dimensions.width -ne 884 -or $dimensions.height -ne 444) {
+                throw "[ui-smoke] idle198 fixture $expectedName was $($dimensions.width)x$($dimensions.height), expected 884x444"
+            }
+            $fixtureHashes += (Get-FileHash -LiteralPath $pngFiles[$page - 1].FullName -Algorithm SHA256).Hash
+        }
+        if (@($fixtureHashes | Sort-Object -Unique).Count -ne 4) {
+            throw '[ui-smoke] idle198 fixture images are not byte-distinct'
+        }
+        if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -Force).Count -ne 4) {
+            throw '[ui-smoke] idle198 fixture directory contains unexpected entries'
+        }
+        $settingsJson = '{"thumb_idle_upgrade":true,"grid_cols":10,"grid_view_mode":"Thumbnail","thumb_aspect_auto":false,"thumb_aspect":"Portrait3x4"}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
 }
 
 $script:scriptPath = $candidateScriptPath
@@ -819,8 +982,221 @@ public static class MivUiSmokeWindow
 {
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
 '@
+}
+
+function Get-UiSmokeForegroundIdentity {
+    $foregroundHwnd = [MivUiSmokeWindow]::GetForegroundWindow()
+    [uint32]$foregroundPid = 0
+    if ($foregroundHwnd -ne [IntPtr]::Zero) {
+        $null = [MivUiSmokeWindow]::GetWindowThreadProcessId($foregroundHwnd, [ref]$foregroundPid)
+    }
+    return [ordered]@{
+        hwnd = $foregroundHwnd.ToInt64()
+        pid = [uint32]$foregroundPid
+    }
+}
+
+function Get-Idle198ObservedMarkers {
+    $markers = @(
+        'idle198:small:begin',
+        'idle198:374:begin',
+        'idle198:374:end',
+        'idle198:enlarged:begin',
+        'idle198:enlarged:end'
+    )
+    $perfPath = Join-Path $dataDir 'logs\perf_events.jsonl'
+    if (-not (Test-Path -LiteralPath $perfPath -PathType Leaf)) { return @() }
+    $stream = $null
+    $reader = $null
+    try {
+        # The live perf writer intentionally permits concurrent readers. Match
+        # that contract here: File.ReadAllText opens with FileShare.Read and is
+        # rejected while the writer still has write access on Windows.
+        $stream = [System.IO.FileStream]::new(
+            $perfPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        $reader = [System.IO.StreamReader]::new(
+            $stream,
+            [System.Text.Encoding]::UTF8,
+            $true,
+            4096,
+            $false)
+        $text = $reader.ReadToEnd()
+        $observed = @()
+        foreach ($markerName in $markers) {
+            if ($text.Contains(('"message":"{0}"' -f $markerName))) {
+                $observed += $markerName
+            }
+        }
+        return $observed
+    }
+    catch {
+        return @()
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Write-Idle198LifetimeSample {
+    param(
+        [System.Diagnostics.Stopwatch] $Clock,
+        [string] $Phase
+    )
+    if ($Scenario -ne 'Idle198Convergence' -or -not $script:lifetimeSamplesPath) { return }
+    $preAlive = $false
+    try {
+        $script:process.Refresh()
+        $preAlive = -not $script:process.HasExited
+    }
+    catch {
+        $preAlive = $false
+    }
+    $preForeground = Get-UiSmokeForegroundIdentity
+    $observedMarkers = @(Get-Idle198ObservedMarkers)
+    $postAlive = $false
+    try {
+        $script:process.Refresh()
+        $postAlive = -not $script:process.HasExited
+    }
+    catch {
+        $postAlive = $false
+    }
+    $postForeground = Get-UiSmokeForegroundIdentity
+    $matches = $preAlive -and $postAlive -and
+        ([int]$preForeground.pid -eq [int]$script:startedPid) -and
+        ([int]$postForeground.pid -eq [int]$script:startedPid)
+    if ($observedMarkers -contains 'idle198:enlarged:end') {
+        $Phase = 'final-marker-observed'
+    }
+    $sample = [ordered]@{
+        schema_version = 2
+        sample_index = $script:idle198SampleIndex
+        elapsed_ms = $Clock.ElapsedMilliseconds
+        sampled_utc = [DateTime]::UtcNow.ToString('o')
+        phase = $Phase
+        app_pid = $script:startedPid
+        process_start_utc = $script:processStartUtc
+        pre_alive = $preAlive
+        pre_foreground_hwnd = $preForeground.hwnd
+        pre_foreground_pid = $preForeground.pid
+        post_alive = $postAlive
+        post_foreground_hwnd = $postForeground.hwnd
+        post_foreground_pid = $postForeground.pid
+        alive = $postAlive
+        foreground_hwnd = $postForeground.hwnd
+        foreground_pid = $postForeground.pid
+        matches_expected_process = $matches
+        observed_markers = $observedMarkers
+    }
+    $script:idle198SampleIndex++
+    $line = ($sample | ConvertTo-Json -Compress) + [Environment]::NewLine
+    [System.IO.File]::AppendAllText(
+        $script:lifetimeSamplesPath,
+        $line,
+        (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Invoke-Idle198PostAnalysis {
+    $analysisDir = Join-Path $script:runDir 'analysis'
+    New-Item -ItemType Directory -Path $analysisDir -Force | Out-Null
+    Assert-NoReparsePath $analysisDir $repoRoot 'idle198-analysis'
+    $perfPath = Join-Path $dataDir 'logs\perf_events.jsonl'
+    if (-not (Test-Path -LiteralPath $perfPath -PathType Leaf)) {
+        Write-UiSmokeEvent 'idle198 analysis: perf_events.jsonl is missing'
+        return 2
+    }
+
+    $pythonCommand = Get-Command -Name 'python.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $reportPath = Join-Path $analysisDir 'idle198-convergence.json'
+    $customStdout = Join-Path $analysisDir 'idle198-convergence.stdout.log'
+    $customStderr = Join-Path $analysisDir 'idle198-convergence.stderr.log'
+    $customArguments = @(
+        $script:postAnalyzerPath,
+        $perfPath,
+        '--fixture-dir', $script:fixtureDir,
+        '--expected-pid', $script:startedPid.ToString([System.Globalization.CultureInfo]::InvariantCulture),
+        '--lifetime-samples', $script:lifetimeSamplesPath,
+        '--json-out', $reportPath
+    )
+    $customProcess = Invoke-UiSmokeCapturedProcess `
+        $pythonCommand.Source `
+        $customArguments `
+        $repoRoot `
+        $customStdout `
+        $customStderr
+    Write-UiSmokeEvent "idle198 correlation exit: $($customProcess.ExitCode)"
+    if ($customProcess.ExitCode -ne 0) {
+        return [int]$customProcess.ExitCode
+    }
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+        Write-UiSmokeEvent 'idle198 analysis: correlation report is missing'
+        return 2
+    }
+    try {
+        $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        Write-UiSmokeEvent "idle198 analysis: invalid correlation report: $($_.Exception.Message)"
+        return 2
+    }
+    if ($report.status -ne 'pass') {
+        Write-UiSmokeEvent "idle198 analysis: unexpected report status $($report.status)"
+        return 2
+    }
+
+    $windows = @(
+        [ordered]@{ name = '374'; value = $report.quiet_windows.quality374 },
+        [ordered]@{ name = 'enlarged'; value = $report.quiet_windows.enlarged }
+    )
+    foreach ($window in $windows) {
+        if ($null -eq $window.value) {
+            Write-UiSmokeEvent "idle198 analysis: $($window.name) quiet window is missing"
+            return 2
+        }
+        $startText = ([double]$window.value.quiet_start_t).ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+        $endText = ([double]$window.value.quiet_end_t).ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+        $jsonOut = Join-Path $analysisDir ("idle-health-{0}.json" -f $window.name)
+        $stdout = Join-Path $analysisDir ("idle-health-{0}.stdout.log" -f $window.name)
+        $stderr = Join-Path $analysisDir ("idle-health-{0}.stderr.log" -f $window.name)
+        $idleArguments = @(
+            $script:sharedAnalyzerPath,
+            $perfPath,
+            'idle-health',
+            '--start-t', $startText,
+            '--end-t', $endText,
+            '--expected-pid', $script:startedPid.ToString([System.Globalization.CultureInfo]::InvariantCulture),
+            '--allow-sleeping-window',
+            '--require-work-key', 'idle198-001.png',
+            '--json-out', $jsonOut
+        )
+        $idleProcess = Invoke-UiSmokeCapturedProcess `
+            $pythonCommand.Source `
+            $idleArguments `
+            $repoRoot `
+            $stdout `
+            $stderr
+        Write-UiSmokeEvent "idle198 idle-health $($window.name) exit: $($idleProcess.ExitCode)"
+        if ($idleProcess.ExitCode -ne 0) {
+            return [int]$idleProcess.ExitCode
+        }
+    }
+    return 0
 }
 
 $arguments = @(
@@ -830,6 +1206,14 @@ $arguments = @(
     '--settings-override', $settingsPath,
     $fixtureDir
 )
+    if ($Scenario -eq 'Idle198Convergence') {
+        $arguments = @('--window-size', $Idle198WindowSize) + $arguments
+        $script:lifetimeSamplesPath = Join-Path $script:runDir 'lifetime-samples.jsonl'
+        [System.IO.File]::WriteAllText(
+            $script:lifetimeSamplesPath,
+            '',
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
     Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
     Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'
     Try-AddUiSmokeEvidenceDirectory $fixtureDir 'inputs/fixture' 'fixture'
@@ -841,6 +1225,12 @@ $arguments = @(
     }
     if ($script:fixtureGeneratorPdfDependencyPath) {
         Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPdfDependencyPath 'inputs/fixture-generator-pdf-dependency.py' 'fixture-generator-pdf-dependency'
+    }
+    if ($script:postAnalyzerPath) {
+        Try-AddUiSmokeEvidenceFile $script:postAnalyzerPath 'inputs/post-analyzer.py' 'post-analyzer'
+    }
+    if ($script:sharedAnalyzerPath) {
+        Try-AddUiSmokeEvidenceFile $script:sharedAnalyzerPath 'inputs/shared-analyzer.py' 'shared-analyzer'
     }
     if ($Scenario -eq 'NativeTopPanoramaClick') {
         if (-not (Test-Path -LiteralPath $buttonHelperIntegrationPath -PathType Leaf)) {
@@ -903,8 +1293,12 @@ $arguments = @(
                 $PID,
                 $script:startedPid)
     }
+    if ($Scenario -eq 'Idle198Convergence') {
+        $script:processStartUtc = $script:process.StartTime.ToUniversalTime().ToString('o')
+    }
     Write-UiSmokeEvent "started PID: $($script:startedPid)"
 
+    $focusAcquired = $false
     $focusStartMilliseconds = $scenarioClock.ElapsedMilliseconds
     while (-not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds) -and
         ($scenarioClock.ElapsedMilliseconds - $focusStartMilliseconds) -lt 20000L) {
@@ -912,15 +1306,46 @@ $arguments = @(
         if ($script:process.HasExited) { break }
         if ($script:process.MainWindowHandle -ne 0) {
             $null = [MivUiSmokeWindow]::SetForegroundWindow($script:process.MainWindowHandle)
-            break
+            if ($Scenario -eq 'Idle198Convergence') {
+                Start-Sleep -Milliseconds 50
+                $foreground = Get-UiSmokeForegroundIdentity
+                if ([int]$foreground.pid -eq [int]$script:startedPid) {
+                    $focusAcquired = $true
+                    break
+                }
+            }
+            else {
+                $focusAcquired = $true
+                break
+            }
         }
         Start-Sleep -Milliseconds 100
     }
 
+    $focusDisposition = Get-Idle198FocusWaitDisposition `
+        $scenarioClock.ElapsedMilliseconds `
+        $timeoutMilliseconds `
+        ($scenarioClock.ElapsedMilliseconds - $focusStartMilliseconds)
+    if ($Scenario -eq 'Idle198Convergence' -and
+        -not $script:process.HasExited -and
+        -not $focusAcquired -and
+        $focusDisposition -eq 'FocusUnavailable') {
+        throw '[ui-smoke] idle198 could not confirm the exact app process in the foreground'
+    }
+    if ($Scenario -eq 'Idle198Convergence' -and
+        -not $script:process.HasExited -and
+        -not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds)) {
+        Write-Idle198LifetimeSample $scenarioClock 'focus-acquired'
+    }
+
     while (-not $script:process.HasExited -and
         -not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds)) {
-        Start-Sleep -Milliseconds 100
+        $pollMilliseconds = if ($Scenario -eq 'Idle198Convergence') { 250 } else { 100 }
+        Start-Sleep -Milliseconds $pollMilliseconds
         $script:process.Refresh()
+        if ($Scenario -eq 'Idle198Convergence' -and -not $script:process.HasExited) {
+            Write-Idle198LifetimeSample $scenarioClock 'running'
+        }
     }
     if (-not $script:process.HasExited) {
         $script:timedOut = $true
@@ -948,6 +1373,14 @@ $arguments = @(
             $script:failureMessage = "application exited with code $processExitCode"
         }
         Write-UiSmokeEvent "exit: $processExitCode"
+        if ($Scenario -eq 'Idle198Convergence' -and $processExitCode -eq 0) {
+            $analysisExitCode = Invoke-Idle198PostAnalysis
+            if ($analysisExitCode -ne 0) {
+                $script:runExitCode = $analysisExitCode
+                $script:runPhase = if ($analysisExitCode -eq 2) { 'environment-failed' } else { 'analysis-failed' }
+                $script:failureMessage = "idle198 post-analysis failed with exit $analysisExitCode"
+            }
+        }
     }
 }
 catch {

@@ -841,3 +841,20 @@ synthetic egui pointer、動画は実Windows MouseMove（2点配送と上HUD表�
 （SHA256 `387A045F05C538A8E4BC2D8A3E2ECA374DDC41C074CC384373408F5D6964CCE6`）。
 Idle198Convergenceは通常版の索引更新負荷が継続しているため、このsuiteでは未実施。
 実行結果と到達した経路は段階ごとに作業台帳へ記録する。
+
+### Idle198 未コミット分の整理（2026-09-12）
+
+`scripts/ui-smoke.ps1` のIdle198分と、解析器・Python単体テスト・PowerShell契約テスト・
+生成fixture・Rhaiの5新規ファイルは、9/7からこのCodex開発タスクで進めていた専用自動検証。
+後続S4とは別に保持していた差分のコミット整理漏れであり、製品の未完了修正ではない。
+対応する設計は `target/v370-work/idle198-isolated-live-scenario-design.md`。
+
+9/12の非対話確認で解析器16件、PowerShell 5.1/7のIdle198契約・7シナリオのapproval guard、
+Rhai構文、異なる4枚の884×444 PNG生成が成功。通常製品コードの変更はない。
+実機成功は未確認のまま。9/7のrunは前面PIDの不一致とmarker読み取り問題でexit 2だった。
+現在の実装は共有読み取り、perf marker時刻を正本とする区間、ROOTのfocus/identity確認を含むが、
+これら修正後の実機成功へ読み替えない。通常のperf smoke / idle-healthの代替にはしない。
+実行は引き続き専用の了承枠・使い捨てportableに限定し、通常build/testから自動起動しない。
+独立レビューでblocking指摘なしとして受入。非対話検証の記録は
+`target/next-version-work/idle198-automation-checkpoint-20260912/manifest.json`
+（SHA256 `C97386BD1339F664448CEFF482B734787B4B6DBC1CBAD6F444EF0BB97B46399F`）。
