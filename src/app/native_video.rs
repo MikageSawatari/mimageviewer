@@ -342,6 +342,20 @@ pub(super) struct VideoSeekStripSession {
     /// 一緒に入っているので書かない。「保存済みか」を各 save 呼び出し側で個別に
     /// 記録し直さずに済ませるための持ち方。
     range_edited_at_save_generation: Option<u64>,
+    #[cfg(feature = "test-script")]
+    last_presented_receipt: Option<VideoSeekStripTestScriptReceipt>,
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoSeekStripTestScriptReceipt {
+    visible: bool,
+    source_epoch: u64,
+    session_id: crate::video::seek_strip::SeekStripSessionId,
+    generation: u64,
+    layout_revision: Option<crate::video::seek_strip::SeekStripLayoutRevision>,
+    reported_count: Option<usize>,
+    window_applied: bool,
 }
 
 #[cfg(windows)]
@@ -393,6 +407,8 @@ impl VideoSeekStripSession {
             visible_pending_since: None,
             visible_pending_reported: false,
             range_edited_at_save_generation: None,
+            #[cfg(feature = "test-script")]
+            last_presented_receipt: None,
         }
     }
 }
@@ -440,6 +456,68 @@ impl VideoSeekStripRuntime {
                 .map(|worker| worker.identity_for_test())
                 .unwrap_or_default(),
         ))
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+impl VideoSeekStripRuntime {
+    pub(super) fn test_script_snapshot(&self) -> crate::test_script::TestScriptSeekStripSnapshot {
+        let Self::Open(session) = self else {
+            return crate::test_script::TestScriptSeekStripSnapshot::closed();
+        };
+        let worker = session
+            .thumbnail_worker
+            .as_ref()
+            .map(|worker| worker.test_script_observation());
+        let receipt = session.last_presented_receipt;
+        crate::test_script::TestScriptSeekStripSnapshot {
+            state: match session.presentation {
+                VideoSeekStripPresentationState::AwaitingFirstPresent => "awaiting",
+                VideoSeekStripPresentationState::Visible => "visible",
+                VideoSeekStripPresentationState::Suspended => "suspended",
+            }
+            .to_string(),
+            session_id: Some(session.session_id.0),
+            source_epoch: Some(session.source_epoch),
+            items_generation: Some(session.items_generation),
+            owner_fs_idx: Some(session.owner_fs_idx),
+            layout_revision: Some(session.layout_revision.0),
+            mode: match session.center.mode() {
+                crate::settings::VideoSeekStripMode::Thumbnails => "thumbnails",
+                crate::settings::VideoSeekStripMode::Waveform => "waveform",
+            }
+            .to_string(),
+            span: match session.span {
+                crate::video::seek_strip_layout::SeekStripSpan::Window => "window",
+                crate::video::seek_strip_layout::SeekStripSpan::Whole => "whole",
+            }
+            .to_string(),
+            visible_count: Some(session.visible_count),
+            axis_cell_count: match &session.axis {
+                VideoSeekStripAxisState::Resolving { .. } => None,
+                VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+            },
+            last_sent_request_id: session.last_sent_thumbnail_request_id,
+            last_finished_request_id: worker
+                .as_ref()
+                .and_then(|worker| worker.last_finished_request_id),
+            worker_instance_id: worker.as_ref().map(|worker| worker.instance_id),
+            decoder_open_count: worker.as_ref().map(|worker| worker.decoder_open_count),
+            worker_status: worker
+                .as_ref()
+                .map(|worker| worker.status)
+                .unwrap_or("none")
+                .to_string(),
+            receipt_present: receipt.is_some(),
+            receipt_visible: receipt.is_some_and(|receipt| receipt.visible),
+            receipt_source_epoch: receipt.map(|receipt| receipt.source_epoch),
+            receipt_session_id: receipt.map(|receipt| receipt.session_id.0),
+            receipt_generation: receipt.map(|receipt| receipt.generation),
+            receipt_layout_revision: receipt
+                .and_then(|receipt| receipt.layout_revision.map(|v| v.0)),
+            receipt_reported_count: receipt.and_then(|receipt| receipt.reported_count),
+            receipt_window_applied: receipt.is_some_and(|receipt| receipt.window_applied),
+        }
     }
 }
 
@@ -5832,6 +5910,18 @@ impl App {
                         }
                         window_applied = true;
                     }
+                    #[cfg(feature = "test-script")]
+                    {
+                        session.last_presented_receipt = Some(VideoSeekStripTestScriptReceipt {
+                            visible,
+                            source_epoch,
+                            session_id: stamp.session_id,
+                            generation: stamp.generation,
+                            layout_revision: window.map(|window| window.stamp.layout_revision),
+                            reported_count: window.map(|window| window.visible_count),
+                            window_applied,
+                        });
+                    }
                 }
                 if visible
                     && let Some(window) = window
@@ -9223,6 +9313,8 @@ impl App {
                 visible_pending_since: None,
                 visible_pending_reported: false,
                 range_edited_at_save_generation: None,
+                #[cfg(feature = "test-script")]
+                last_presented_receipt: None,
             }));
         true
     }
@@ -17002,6 +17094,30 @@ mod native_video_key_observation_tests {
                 if center_index.to_bits() == 8.5f64.to_bits()
         ));
         assert_eq!(session.last_sent_thumbnail_request_id, Some(2));
+        #[cfg(feature = "test-script")]
+        {
+            let diagnostic = app.video_seek_strip_runtime.test_script_snapshot();
+            assert_eq!(diagnostic.state, "visible");
+            assert_eq!(diagnostic.session_id, Some(presentation_stamp.session_id.0));
+            assert_eq!(diagnostic.source_epoch, Some(0));
+            assert_eq!(diagnostic.receipt_source_epoch, Some(0));
+            assert_eq!(
+                diagnostic.receipt_session_id,
+                Some(presentation_stamp.session_id.0)
+            );
+            assert_eq!(diagnostic.receipt_generation, Some(1));
+            assert_eq!(
+                diagnostic.receipt_layout_revision,
+                Some(render_stamp.layout_revision.0)
+            );
+            assert_eq!(diagnostic.receipt_reported_count, Some(17));
+            assert!(diagnostic.receipt_visible);
+            assert!(diagnostic.receipt_window_applied);
+            assert_eq!(diagnostic.visible_count, Some(17));
+            assert_eq!(diagnostic.axis_cell_count, Some(17));
+            assert_eq!(diagnostic.last_sent_request_id, Some(2));
+            assert!(diagnostic.worker_instance_id.is_some_and(|id| id != 0));
+        }
     }
 
     #[test]

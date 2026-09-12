@@ -1610,6 +1610,7 @@ mod tests {
             paint_source_texture: "source".to_string(),
             painted_page_index: Some(page_index),
             paint_revision: 1,
+            seek_strip: crate::test_script::TestScriptSeekStripSnapshot::closed(),
         }
     }
 

@@ -701,6 +701,95 @@ Canvasはchrome inventory版から独立し、
 後続単位に残す。非対話検証と独立review後も、明示了承を得たportable liveが終わるまで実機PASSとは
 扱わない。
 
+## S4: 動画stripの実列数とHUD hide/show寿命 (§1.211)
+
+2026-09-11の実機再現では、Whole表示のstripが中央9セルのままになった。成功したpresenterが返した
+実レイアウト通知とAppの初期9セルの間に、単体回帰だけでは覆えない非同期境界が残っていた。
+修正後は`SeekStripPresentation::Visible { window }`が可視性と最終passのwindowを一つのlatest snapshotで
+運び、Appは同じsession/generationを確認してからlayout revisionが一致するwindowだけを軸へ適用する。
+追加liveは、このproduction経路とHUD hide/showのresource寿命を同じ実動画で確認する。
+
+### 最小scenario
+
+scenario名は`NativeSeekStripWholeLifecycle`とする。既存native video fixture、detached window選択、
+`move_native_canvas`、`reveal_native_top_panorama`、runnerの期限・cleanup・証拠archiveを再利用する。
+fixtureは空のportable dataへ720x576、25fps、約80秒のMP4を1本生成する。設定overrideはdetached open、
+thumbnail、Whole、Smallest height、lockなしを明示する。4:3素材と低いstrip heightは一般的な別窓幅で
+実列数を9より大きくするためであり、正解列数そのものはhard-codeしない。presenterの報告値が9以下なら
+期待値を書き換えず、fixture/window前提不成立として実測値を証拠へ残す。
+
+1. gridからfixtureを1本だけ別窓videoへ開き、window id、context serial、viewport、host、HWND、
+   source epoch、generationを固定する。
+2. `move_native_canvas(0.5, 0.5, ...)`でHUD外へ実MouseMoveし、AppがSuspendedになるまで待つ。
+   これを最初のHidden→Visible通知順を再現する基線とする。ここではworker未生成を許容する。
+3. `reveal_native_top_panorama(...)`で上端へ実MouseMoveし、同じownerの実Responseと最初の
+   `Visible { window }`を待つ。reported countが9より大きく、Appの`visible_count`とWhole axis cell countが
+   reported countに一致することを確認する。workerが現在requestを手放すまで待つ。
+4. 再び中央へ実MouseMoveし、Hidden適用済みのSuspendedと直前requestの完了を両方待ってから、
+   session/worker identity、軸と列数、最後のrequest id、decoder-open countを保存する。その後、
+   上端へ戻して二度目のVisibleを待つ。
+5. 二度目のhide/showでsession/thumbnail workerが替わらず、Hidden適用後に新requestが増えず、
+   再表示後にもstrip decoder生成回数が増えないことを確認して正常終了する。
+
+初回materialize直前から受理済みだったrequestはHidden後に完了してよい。この場合はcell数や
+`last_finished_request_id`が進み得るので、Hidden区間の完全静止を成功条件にしない。禁止するのは
+Hidden適用後の新session、新worker、新requestである。decoderはfresh fixtureで一度以上開くことを
+期待するが、HW→SW fallback等の実経路を固定回数1と仮定せず、最初のsettled観測後から再表示完了まで
+追加生成がないことを判定する。
+
+### 最小診断投影
+
+現`TestScriptWindowSnapshot`にはseek-strip情報がなく、通常logだけではRhaiがexact contextの列数と
+worker寿命を判定できない。`test-script` feature限定で、既存window snapshotへread-onlyの
+`seek_strip` mapを加える。`test_script_window_snapshots`は既に`with_viewer_context_ref`からAtRestの
+detached contextを読むため、snapshotのためのmount/deposit、worker drain、request発行は行わない。
+App-globalな重複状態も作らない。
+
+必要な値は次に限定する。
+
+- `closed | awaiting | visible | suspended`、session id、source epoch、placement generation、layout revision
+- mode/span、実compound handlerが最後に受信したstamp/reported countとwindow適用結果
+- Appの`visible_count`、Whole axis cell count、最後に送ったrequest idとworkerのfinished request id
+- thumbnail workerのchecked nonzero instance serial
+- worker-local decoder-open serial/countと現在のstatus
+
+worker serialとdecoder-open countは`test-script`限定の観測値としてworker所有に置き、pointer addressや
+process-global latest値をidentityに使わない。decoder countは実open境界だけで進める。通常profileの
+worker、decoder、request順序は変えない。既存のstate-change log
+`seek-strip presented update published`、`apply presented update`、`video-seek-strip-thumbs decoder ready`
+もrun証拠へ保存するが、per-frame logや別のpost-run推定をscenarioの成功正本にしない。
+reported receiptはAppの現在`visible_count`やaxisから逆算せず、実handlerが受けたcompoundのstamp/countと
+`window_applied`をsession ownerへ別値として記録する。これにより通知値、適用値、結果の軸を独立に照合する。
+
+feature限定projectionには、context Aのsnapshotがcontext Bのsession/workerを返さないこと、closedでは
+値を返さないこと、snapshot取得でrequest/finished idが変化しないことを非対話回帰として付ける。
+Rhaiはactual `Visible { window }`反映後の値だけを読み、window存在やHUD Responseだけを列成功へ
+読み替えない。
+
+### 実行単位と範囲
+
+最小liveは新scenario 1本で、`NativeMouseMove`と`NativeTopPanoramaHover`の実入力部分を内包する。
+2026-09-10に合格したMultiWindowPdf、StillStripDrag、NativeMouseMove、NativeTopPanoramaHoverの4本を
+毎回再実行しない。snapshot型や共通runnerの変更がその4本へ及ぶ場合は非対話compile/policy回帰を行い、
+live baselineが必要なら共有経路が最も近い`NativeTopPanoramaHover`だけを追加候補にする。
+位置だけを変えたUIはheadless snapshotで足りる場合、このnative suiteへ増やさない。
+
+実装見積はfeature限定projection、Rhai/runner接続、focused回帰まで3〜5時間。warm buildとportable準備は
+10〜25分、live 1本はfixture生成・起動・cleanup・archiveを含め5分程度を見込む。実行は一つの
+`target/portable-smoke` ownerで直列化し、通常APPDATA、dev-runtime、installed appを起動・停止しない。
+runは固定期限でAppをexact PIDだけcleanupし、証拠archive後に使い捨てdataを片付ける。2026-09-12の
+了承枠では08:45 JST以降に新runを開始せず、09:00 JSTまでにcleanupを完了する。
+
+§1.219の類似previewは実装freeze後に別scenarioとして判断する。今回のstrip用snapshotへ類似UIの状態を
+混ぜず、同じportable ownerと時間枠を共有する場合だけrunner実行順を統合する。
+
+2026-09-12にS4のfeature限定snapshot、worker-local観測、Rhaiとrunner接続を実装した。通常・
+`test-script`両方のcore check、Rhai compile、実compound handler receipt、context非mount読取、
+worker-local checked counter、PowerShell 5.1/7 approval guardの非対話検証は合格した。portable build後の
+実機runでは実compoundが30列を報告し、Appのvisible countとWhole axisも30へ更新した。settled Hidden後の
+750msと二度目のVisibleでsession、worker、request、decoder-open count、axisを保持し、scenarioはexit 0。
+証拠は`target/next-version-work/ui-smoke-overnight-20260912/s4-execution-manifest.json`へ保存した。
+
 ## 検証記録
 
 S3aのraw識別子診断は、WndProc入口と既存metadata照合位置でGetMessageExtraInfoを

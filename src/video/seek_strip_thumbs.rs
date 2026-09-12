@@ -1153,6 +1153,8 @@ struct SharedState {
     /// supersede / cancel で途中で抜けた場合も含む。app はこれを見て「まだ処理中なので
     /// 待つ」と「もう手を離しているので、未着セルがあるなら頼み直す」を区別する。
     last_finished_request_id: Option<u64>,
+    #[cfg(feature = "test-script")]
+    decoder_open_count: u64,
     #[cfg(any(test, feature = "dev-tools"))]
     decode_diagnostics: StripThumbnailDecodeDiagnostics,
     fill_wait_emitted_request_id: Option<u64>,
@@ -1168,6 +1170,8 @@ impl SharedState {
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
             last_finished_request_id: None,
+            #[cfg(feature = "test-script")]
+            decoder_open_count: 0,
             #[cfg(any(test, feature = "dev-tools"))]
             decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             fill_wait_emitted_request_id: None,
@@ -1212,8 +1216,43 @@ pub(crate) struct SeekStripThumbnailWorker {
     state: Arc<Mutex<SharedState>>,
     cancel: Arc<AtomicBool>,
     next_request_id: AtomicU64,
+    #[cfg(feature = "test-script")]
+    test_script_instance_id: u64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
+
+#[cfg(feature = "test-script")]
+static NEXT_TEST_SCRIPT_WORKER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "test-script")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeekStripThumbnailTestScriptObservation {
+    pub(crate) instance_id: u64,
+    pub(crate) decoder_open_count: u64,
+    pub(crate) last_finished_request_id: Option<u64>,
+    pub(crate) status: &'static str,
+}
+
+#[cfg(feature = "test-script")]
+fn allocate_test_script_worker_instance_id() -> u64 {
+    NEXT_TEST_SCRIPT_WORKER_INSTANCE_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("test-script seek-strip worker instance ids exhausted")
+}
+
+#[cfg(feature = "test-script")]
+fn record_test_script_decoder_open(state: &Mutex<SharedState>) {
+    let mut shared = lock_recover(state);
+    shared.decoder_open_count = shared
+        .decoder_open_count
+        .checked_add(1)
+        .expect("test-script seek-strip decoder-open count exhausted");
+}
+
+#[cfg(not(feature = "test-script"))]
+fn record_test_script_decoder_open(_state: &Mutex<SharedState>) {}
 
 struct SeekStripWorkerConfig {
     path: PathBuf,
@@ -1277,6 +1316,8 @@ impl SeekStripThumbnailWorker {
             state,
             cancel,
             next_request_id: AtomicU64::new(1),
+            #[cfg(feature = "test-script")]
+            test_script_instance_id: allocate_test_script_worker_instance_id(),
             thread,
         }
     }
@@ -1343,6 +1384,24 @@ impl SeekStripThumbnailWorker {
     /// ワーカーが最後に手を離した要求の id。**全セルが揃ったという意味ではない。**
     pub(crate) fn last_finished_request_id(&self) -> Option<u64> {
         lock_recover(&self.state).last_finished_request_id
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_observation(&self) -> SeekStripThumbnailTestScriptObservation {
+        let shared = lock_recover(&self.state);
+        let status = match &shared.status {
+            StripThumbnailWorkerStatus::Running => "running",
+            StripThumbnailWorkerStatus::MaterialUnavailable(_) => "material_unavailable",
+            StripThumbnailWorkerStatus::DecoderUnavailable(_) => "decoder_unavailable",
+            StripThumbnailWorkerStatus::Cancelled => "cancelled",
+            StripThumbnailWorkerStatus::ThreadSpawnFailed(_) => "thread_spawn_failed",
+        };
+        SeekStripThumbnailTestScriptObservation {
+            instance_id: self.test_script_instance_id,
+            decoder_open_count: shared.decoder_open_count,
+            last_finished_request_id: shared.last_finished_request_id,
+            status,
+        }
     }
     /// 現在までの画像・型付き失敗を shallow clone して返す。
     pub(crate) fn snapshot(&self) -> StripThumbnailSnapshot {
@@ -1804,6 +1863,7 @@ fn process_window_request(
         match SeekStripDecoder::open(path, use_hw, StripDecodeMode::KeyframesOnly) {
             Ok(decoder) => {
                 record_decoder_path(state, &decoder);
+                record_test_script_decoder_open(state);
                 runtime.decoder = Some(decoder);
             }
             Err(error) => {
@@ -1916,6 +1976,7 @@ fn process_window_request(
                 ) {
                     Ok(decoder) => {
                         record_decoder_path(state, &decoder);
+                        record_test_script_decoder_open(state);
                         runtime.decoder = Some(decoder);
                         retry_with_software = true;
                     }
@@ -1987,6 +2048,7 @@ fn process_window_request(
                     match SeekStripDecoder::open(path, false, mode) {
                         Ok(decoder) => {
                             record_decoder_path(state, &decoder);
+                            record_test_script_decoder_open(state);
                             runtime.decoder = Some(decoder);
                             retry_with_software = true;
                         }
@@ -4485,5 +4547,39 @@ mod tests {
         assert_eq!(pending.replace(make(2)).map(|request| request.id), Some(1));
         assert_eq!(pending.replace(make(3)).map(|request| request.id), Some(2));
         assert_eq!(pending.take().map(|request| request.id), Some(3));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn test_script_worker_observation_uses_checked_worker_local_counters() {
+        let first = SeekStripThumbnailWorker::spawn(
+            PathBuf::from("missing-first.mp4"),
+            false,
+            None,
+            80.0,
+            1.0,
+            1.0,
+        );
+        let second = SeekStripThumbnailWorker::spawn(
+            PathBuf::from("missing-second.mp4"),
+            false,
+            None,
+            80.0,
+            1.0,
+            1.0,
+        );
+        record_test_script_decoder_open(&first.state);
+        record_test_script_decoder_open(&first.state);
+        let first_observation = first.test_script_observation();
+        let second_observation = second.test_script_observation();
+
+        assert_ne!(first_observation.instance_id, 0);
+        assert_ne!(second_observation.instance_id, 0);
+        assert_ne!(
+            first_observation.instance_id,
+            second_observation.instance_id
+        );
+        assert_eq!(first_observation.decoder_open_count, 2);
+        assert_eq!(second_observation.decoder_open_count, 0);
     }
 }

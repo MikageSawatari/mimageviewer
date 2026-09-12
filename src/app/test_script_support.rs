@@ -193,6 +193,7 @@ impl App {
                 paint_source_texture: String::new(),
                 painted_page_index: None,
                 paint_revision: 0,
+                seek_strip: context.video_seek_strip_test_script_snapshot(),
             }
         })
     }
@@ -546,6 +547,83 @@ mod tests {
         assert!(
             window.identity.is_none(),
             "no host was created by observation"
+        );
+    }
+
+    #[test]
+    fn seek_strip_snapshot_reads_each_bundle_owner_without_mounting_or_mutating_it() {
+        let mut app = crate::app::setup_app_for_test();
+        let root_path = PathBuf::from(r"C:\videos\root.mp4");
+        app.items = vec![GridItem::Video(root_path.clone())];
+        app.fullscreen_idx = Some(0);
+        let root_worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(root_path.clone(), None);
+        app.seed_video_seek_strip_context_for_test(root_path, root_worker, 101, 17, 102);
+        let root_context = app.viewer_context_main();
+
+        let detached_path = PathBuf::from(r"C:\videos\detached.mp4");
+        let detached_context = app.build_window_context_for_test(706, |app| {
+            app.items = vec![GridItem::Video(detached_path.clone())];
+            app.fullscreen_idx = Some(0);
+            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                detached_path.clone(),
+                None,
+            );
+            app.seed_video_seek_strip_context_for_test(detached_path, worker, 201, 23, 202);
+        });
+        assert_eq!(
+            app.viewer_context_residence(root_context),
+            ContextResidence::Mounted
+        );
+        assert_eq!(
+            app.viewer_context_residence(detached_context),
+            ContextResidence::AtRest
+        );
+
+        let before_root = app
+            .with_viewer_context_ref(root_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("root diagnostic");
+        let before_detached = app
+            .with_viewer_context_ref(detached_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("detached diagnostic");
+        let windows = app.test_script_window_snapshots();
+        let after_root = app
+            .with_viewer_context_ref(root_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("root diagnostic after snapshot");
+        let after_detached = app
+            .with_viewer_context_ref(detached_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("detached diagnostic after snapshot");
+
+        assert_eq!(
+            before_root, after_root,
+            "snapshot observation must be read-only"
+        );
+        assert_eq!(
+            before_detached, after_detached,
+            "at-rest observation must be read-only"
+        );
+        assert_eq!(before_root.session_id, Some(101));
+        assert_eq!(before_root.visible_count, Some(17));
+        assert_eq!(before_detached.session_id, Some(201));
+        assert_eq!(before_detached.visible_count, Some(23));
+        assert_ne!(before_root.session_id, before_detached.session_id);
+        let detached = windows
+            .iter()
+            .find(|window| window.window_id == Some(706))
+            .expect("detached window diagnostic");
+        assert_eq!(detached.seek_strip, before_detached);
+        assert_eq!(
+            app.viewer_context_residence(detached_context),
+            ContextResidence::AtRest,
+            "diagnostic observation must not mount the detached owner"
         );
     }
 

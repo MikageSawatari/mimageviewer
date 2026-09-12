@@ -210,6 +210,136 @@ struct TestScriptPaintEvidenceKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptSeekStripSnapshot {
+    pub(crate) state: String,
+    pub(crate) session_id: Option<u64>,
+    pub(crate) source_epoch: Option<u64>,
+    pub(crate) items_generation: Option<u64>,
+    pub(crate) owner_fs_idx: Option<usize>,
+    pub(crate) layout_revision: Option<u64>,
+    pub(crate) mode: String,
+    pub(crate) span: String,
+    pub(crate) visible_count: Option<usize>,
+    pub(crate) axis_cell_count: Option<usize>,
+    pub(crate) last_sent_request_id: Option<u64>,
+    pub(crate) last_finished_request_id: Option<u64>,
+    pub(crate) worker_instance_id: Option<u64>,
+    pub(crate) decoder_open_count: Option<u64>,
+    pub(crate) worker_status: String,
+    pub(crate) receipt_present: bool,
+    pub(crate) receipt_visible: bool,
+    pub(crate) receipt_source_epoch: Option<u64>,
+    pub(crate) receipt_session_id: Option<u64>,
+    pub(crate) receipt_generation: Option<u64>,
+    pub(crate) receipt_layout_revision: Option<u64>,
+    pub(crate) receipt_reported_count: Option<usize>,
+    pub(crate) receipt_window_applied: bool,
+}
+
+impl TestScriptSeekStripSnapshot {
+    pub(crate) fn closed() -> Self {
+        Self {
+            state: "closed".to_string(),
+            session_id: None,
+            source_epoch: None,
+            items_generation: None,
+            owner_fs_idx: None,
+            layout_revision: None,
+            mode: "none".to_string(),
+            span: "none".to_string(),
+            visible_count: None,
+            axis_cell_count: None,
+            last_sent_request_id: None,
+            last_finished_request_id: None,
+            worker_instance_id: None,
+            decoder_open_count: None,
+            worker_status: "none".to_string(),
+            receipt_present: false,
+            receipt_visible: false,
+            receipt_source_epoch: None,
+            receipt_session_id: None,
+            receipt_generation: None,
+            receipt_layout_revision: None,
+            receipt_reported_count: None,
+            receipt_window_applied: false,
+        }
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("state".into(), self.state.clone().into());
+        map.insert("session_id".into(), optional_rhai_u64(self.session_id));
+        map.insert("source_epoch".into(), optional_rhai_u64(self.source_epoch));
+        map.insert(
+            "items_generation".into(),
+            optional_rhai_u64(self.items_generation),
+        );
+        map.insert(
+            "owner_fs_idx".into(),
+            optional_rhai_usize(self.owner_fs_idx),
+        );
+        map.insert(
+            "layout_revision".into(),
+            optional_rhai_u64(self.layout_revision),
+        );
+        map.insert("mode".into(), self.mode.clone().into());
+        map.insert("span".into(), self.span.clone().into());
+        map.insert(
+            "visible_count".into(),
+            optional_rhai_usize(self.visible_count),
+        );
+        map.insert(
+            "axis_cell_count".into(),
+            optional_rhai_usize(self.axis_cell_count),
+        );
+        map.insert(
+            "last_sent_request_id".into(),
+            optional_rhai_u64(self.last_sent_request_id),
+        );
+        map.insert(
+            "last_finished_request_id".into(),
+            optional_rhai_u64(self.last_finished_request_id),
+        );
+        map.insert(
+            "worker_instance_id".into(),
+            optional_rhai_u64(self.worker_instance_id),
+        );
+        map.insert(
+            "decoder_open_count".into(),
+            optional_rhai_u64(self.decoder_open_count),
+        );
+        map.insert("worker_status".into(), self.worker_status.clone().into());
+        map.insert("receipt_present".into(), self.receipt_present.into());
+        map.insert("receipt_visible".into(), self.receipt_visible.into());
+        map.insert(
+            "receipt_source_epoch".into(),
+            optional_rhai_u64(self.receipt_source_epoch),
+        );
+        map.insert(
+            "receipt_session_id".into(),
+            optional_rhai_u64(self.receipt_session_id),
+        );
+        map.insert(
+            "receipt_generation".into(),
+            optional_rhai_u64(self.receipt_generation),
+        );
+        map.insert(
+            "receipt_layout_revision".into(),
+            optional_rhai_u64(self.receipt_layout_revision),
+        );
+        map.insert(
+            "receipt_reported_count".into(),
+            optional_rhai_usize(self.receipt_reported_count),
+        );
+        map.insert(
+            "receipt_window_applied".into(),
+            self.receipt_window_applied.into(),
+        );
+        map
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) identity: Option<TestScriptWindowIdentity>,
     pub(crate) role: String,
@@ -233,6 +363,7 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) paint_source_texture: String,
     pub(crate) painted_page_index: Option<usize>,
     pub(crate) paint_revision: u64,
+    pub(crate) seek_strip: TestScriptSeekStripSnapshot,
 }
 
 impl TestScriptWindowSnapshot {
@@ -322,12 +453,28 @@ impl TestScriptWindowSnapshot {
             "paint_revision".into(),
             saturating_rhai_int(self.paint_revision).into(),
         );
+        map.insert(
+            "seek_strip".into(),
+            Dynamic::from_map(self.seek_strip.to_rhai_map()),
+        );
         map
     }
 }
 
 fn saturating_rhai_int(value: u64) -> rhai::INT {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn optional_rhai_u64(value: Option<u64>) -> Dynamic {
+    value
+        .map(|value| Dynamic::from(saturating_rhai_int(value)))
+        .unwrap_or_else(|| Dynamic::from(-1_i64))
+}
+
+fn optional_rhai_usize(value: Option<usize>) -> Dynamic {
+    value
+        .map(|value| Dynamic::from(i64::try_from(value).unwrap_or(i64::MAX)))
+        .unwrap_or_else(|| Dynamic::from(-1_i64))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3546,6 +3693,32 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn native_seek_strip_whole_lifecycle_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/native-seek-strip-whole-lifecycle.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_seek_strip_fixture_exceeds_the_nine_cell_fallback_at_a_bounded_width() {
+        let cell_height = crate::video::seek_strip_layout::SeekStripHeightValues::default()
+            .points(crate::video::seek_strip_layout::SeekStripHeight::Smallest)
+            - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
+        let count = crate::video::seek_strip_layout::whole_cell_count(
+            400.0,
+            cell_height,
+            Some(720.0 / 576.0),
+        );
+        assert!(count > 9, "the S4 fixture must distinguish the fallback");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_mouse_runtime_failures_are_environment_failures() {
         let (bridge, rx, _) = runner_bridge(ready_snapshot());
         spawn_script_source("move_native_canvas(0.5, 0.5, 1000);".to_string(), bridge).unwrap();
@@ -4211,6 +4384,7 @@ mod tests {
             paint_source_texture: String::new(),
             painted_page_index: None,
             paint_revision: 0,
+            seek_strip: TestScriptSeekStripSnapshot::closed(),
         }
     }
 

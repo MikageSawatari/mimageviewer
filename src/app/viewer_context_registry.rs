@@ -1162,6 +1162,18 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    #[cfg(feature = "test-script")]
+    pub(in crate::app) fn video_seek_strip_test_script_snapshot(
+        self,
+    ) -> crate::test_script::TestScriptSeekStripSnapshot {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.video_seek_strip_runtime.test_script_snapshot(),
+            ContextRefSource::AtRest(bundle) => {
+                bundle.video_seek_strip_runtime.test_script_snapshot()
+            }
+        }
+    }
+
     pub(in crate::app) fn selected(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.selected,

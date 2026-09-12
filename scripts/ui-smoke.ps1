@@ -19,7 +19,7 @@ Automation must not pass this switch until that approval has been obtained.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'StillStripDrag')]
+    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -571,7 +571,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'StillStripDrag')
+    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -683,11 +683,12 @@ if ($script:archiveErrors.Count -gt 0) {
         $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
-    { $_ -in @('NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick') } {
+    { $_ -in @('NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle') } {
         $scenarioSlug = switch ($Scenario) {
             'NativeMouseMove' { 'native-mouse-move' }
             'NativeTopPanoramaHover' { 'native-top-panorama-hover' }
             'NativeTopPanoramaClick' { 'native-top-panorama-click' }
+            'NativeSeekStripWholeLifecycle' { 'native-seek-strip-whole-lifecycle' }
         }
         $scenarioRoot = Join-Path $targetRoot (Join-Path 'ui-smoke' $scenarioSlug)
         $candidateScriptPath = Join-Path $PSScriptRoot (Join-Path 'ui-smoke' ($scenarioSlug + '.rhai'))
@@ -706,12 +707,22 @@ if ($script:archiveErrors.Count -gt 0) {
             throw '[ui-smoke] ffmpeg.exe was not found on PATH'
         }
         $videoPath = Join-Path $candidateFixtureDir ($scenarioSlug + '.mp4')
-        $ffmpegArgs = @(
-            '-hide_banner', '-loglevel', 'error', '-y',
-            '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10',
-            '-t', '120', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart', $videoPath
-        )
+        $ffmpegArgs = if ($Scenario -eq 'NativeSeekStripWholeLifecycle') {
+            @(
+                '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'lavfi', '-i', 'testsrc2=size=720x576:rate=25',
+                '-t', '80', '-an', '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p', '-movflags', '+faststart', $videoPath
+            )
+        }
+        else {
+            @(
+                '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10',
+                '-t', '120', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart', $videoPath
+            )
+        }
         & $ffmpegCommand.Source $ffmpegArgs
         if ($LASTEXITCODE -ne 0) {
             throw "[ui-smoke] video fixture generator failed with exit $LASTEXITCODE"
@@ -724,7 +735,12 @@ if ($script:archiveErrors.Count -gt 0) {
         if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
             throw "[ui-smoke] scenario script not found: $candidateScriptPath"
         }
-        $settingsJson = '{"detached_viewer_open_images_in_window":true}'
+        $settingsJson = if ($Scenario -eq 'NativeSeekStripWholeLifecycle') {
+            '{"detached_viewer_open_images_in_window":true,"video_seek_strip_state":"thumbnails","video_seek_strip_last_choice":"thumbnails","video_seek_strip_span":"whole","video_seek_strip_height":"smallest","video_seek_strip_locked":false}'
+        }
+        else {
+            '{"detached_viewer_open_images_in_window":true}'
+        }
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
     'StillStripDrag' {
