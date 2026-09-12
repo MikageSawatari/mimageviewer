@@ -1198,6 +1198,10 @@ struct SimilarPanelActions {
     /// 「長押し表示」で新しく始まった primary press。held level からgestureを再生成せず、
     /// release/focus終端は所有viewportの入力段が処理する。
     peek_press: Option<crate::similar_preview::SimilarPreviewCandidate>,
+    /// A raw primary edge over the relation strip. Keep this as a draw result so the App can
+    /// attach the owning fullscreen session and seek-strip state even when egui does not admit
+    /// the press to `peek_press`.
+    relation_press_observation: Option<RelationPressObservation>,
     /// ページ帯から選ばれた相手の本のページ。
     open_page: Option<TracedSimilarAction<(String, crate::similar_index::SimilarItemTarget)>>,
     /// A completed visit selected from this viewer's transient similar-book history.
@@ -1205,6 +1209,15 @@ struct SimilarPanelActions {
     /// このフレームで実際に clip 内へ描いたサムネイル request。worker dispatch と GPU
     /// upload はこの需要を優先し、スクロール外の旧要求で新しい表示を待たせない。
     thumbnail_demand: SimilarThumbDemand,
+}
+
+#[derive(Clone)]
+struct RelationPressObservation {
+    candidate: Option<crate::similar_preview::SimilarPreviewCandidate>,
+    raw_column: usize,
+    resolved_column: Option<usize>,
+    response_hovered: bool,
+    response_down_on: bool,
 }
 
 /// 比較スロットから見た 1 件の状態。ボタンの見え方を決める。
@@ -1961,7 +1974,19 @@ impl App {
         // deriving the preview session; the ordered capture reducer has already committed any
         // preceding canvas release from this same input frame.
         self.capture_region_selection = None;
+        let spread = self
+            .fullscreen_idx
+            .map(|page_idx| self.resolve_visible_spread_pair(page_idx));
+        let strip_setting_visible = self.settings.still_seek_strip_visible;
+        let strip_active_previous_frame = !self.still_seek_thumbnail_pages.is_empty();
         let Some(session) = self.similar_preview_session(ctx) else {
+            crate::similar_preview::log_panel_press_rejected(
+                candidate,
+                strip_setting_visible,
+                strip_active_previous_frame,
+                spread,
+                "session_unavailable",
+            );
             return;
         };
         let viewport = self.fs_pdf_display_target.unwrap_or_else(|| {
@@ -1972,12 +1997,40 @@ impl App {
                 crate::pdf_loader::PdfDisplayFitMode::Page,
             )
         });
-        self.similar_panel.preview.begin_candidate_press(
+        let _press_id = self.similar_panel.preview.begin_candidate_press_from_panel(
             ctx,
             candidate,
             &self.pdf_passwords,
             viewport,
             session,
+            strip_setting_visible,
+            strip_active_previous_frame,
+            spread.unwrap_or(crate::ui_fullscreen::SpreadPair::Single),
+        );
+    }
+
+    fn log_similar_relation_press_observation(
+        &mut self,
+        ctx: &egui::Context,
+        observation: &RelationPressObservation,
+    ) {
+        let spread = self
+            .fullscreen_idx
+            .map(|page_idx| self.resolve_visible_spread_pair(page_idx));
+        let session = self.similar_preview_session(ctx);
+        crate::similar_preview::log_relation_press_observed(
+            observation.candidate.as_ref(),
+            observation.raw_column,
+            observation.resolved_column,
+            observation.response_hovered,
+            observation.response_down_on,
+            session,
+            ctx.viewport_id(),
+            self.items_generation,
+            self.fullscreen_idx,
+            self.settings.still_seek_strip_visible,
+            !self.still_seek_thumbnail_pages.is_empty(),
+            spread,
         );
     }
 
@@ -2630,6 +2683,10 @@ impl App {
 
         self.similar_panel
             .finish_thumbnail_frame(ctx, &similar_actions.thumbnail_demand);
+
+        if let Some(observation) = similar_actions.relation_press_observation.as_ref() {
+            self.log_similar_relation_press_observation(ctx, observation);
+        }
 
         if let Some(hit) = similar_actions.pin_hit.take() {
             self.pin_similar_hit(ctx, &hit, full_rect);
@@ -4628,6 +4685,49 @@ fn draw_page_strip(
         ));
     }
 
+    let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
+    if let Some(raw_press_pos) = primary_pressed
+        .then(|| ui.input(|input| input.pointer.interact_pos()))
+        .flatten()
+        .filter(|pos| rect.contains(*pos))
+    {
+        // `hovered` is a presentation snapshot. An overlapping drag response can suppress it
+        // after egui has already assigned this strip the click. Use only the position carried by
+        // this response's interaction ownership to start the hold preview; the raw position below
+        // remains diagnostic-only and can never admit another widget's press.
+        let owned_press_pos = response
+            .is_pointer_button_down_on()
+            .then(|| response.interact_pointer_pos())
+            .flatten()
+            .filter(|pos| rect.contains(*pos));
+        let raw_column =
+            ((raw_press_pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+        let resolved_pos = owned_press_pos.unwrap_or(raw_press_pos);
+        let resolved_raw_column =
+            ((resolved_pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+        let target_hit = resolve_strip_target_hit(
+            &first_target,
+            rect,
+            strip.len(),
+            resolved_raw_column,
+            resolved_pos,
+        );
+        let candidate = target_hit
+            .and_then(|hit| strip.get(hit.page))
+            .and_then(|entry| entry.match_override())
+            .and_then(crate::similar_preview::SimilarPreviewCandidate::for_book_match);
+        actions.relation_press_observation = Some(RelationPressObservation {
+            candidate: candidate.clone(),
+            raw_column,
+            resolved_column: target_hit.map(|hit| hit.column),
+            response_hovered: response.hovered(),
+            response_down_on: response.is_pointer_button_down_on(),
+        });
+        if owned_press_pos.is_some() {
+            actions.peek_press = candidate;
+        }
+    }
+
     let Some(pos) = response.hover_pos() else {
         return;
     };
@@ -4697,13 +4797,6 @@ fn draw_page_strip(
             }
         }
     });
-    if response.is_pointer_button_down_on()
-        && ui.input(|input| input.pointer.primary_pressed())
-        && let Some(candidate) =
-            crate::similar_preview::SimilarPreviewCandidate::for_book_match(entry)
-    {
-        actions.peek_press = Some(candidate);
-    }
 }
 
 /// いま見ているページを指す ▼ の高さ。帯の上に確保する。
@@ -7203,6 +7296,211 @@ mod similar_panel_tests {
             release_actions.open_page.is_none(),
             "the completed click belongs only to the explicit move button"
         );
+    }
+
+    #[test]
+    fn book_strip_press_keeps_response_owned_input_when_hover_is_suppressed() {
+        use crate::similar_index::BookPageState;
+
+        let relations = test_book_relations(vec![strip_page(BookPageState::Strong, Some(7))]);
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let mut state = SimilarPanelState::default();
+        let mut origin_columns = None;
+        let drag_owner_id = egui::Id::new("book-strip-overlapping-drag-owner");
+        let mut strip_rect = None;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                let mut actions = super::SimilarPanelActions::default();
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut actions,
+                    );
+                    let rect = super::take_book_strip_rect_for_test()
+                        .expect("the production strip must expose its actual response rect");
+                    strip_rect = Some(rect);
+                });
+            },
+        );
+        let registered_rect =
+            strip_rect.expect("the bootstrap frame must register the production strip");
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                let mut actions = super::SimilarPanelActions::default();
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut actions,
+                    );
+                    assert_eq!(
+                        super::take_book_strip_rect_for_test(),
+                        Some(registered_rect),
+                        "the overlapping drag owner must cover the production strip"
+                    );
+                });
+            },
+        );
+        let strip_center = registered_rect.center();
+
+        let mut press_actions = super::SimilarPanelActions::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: strip_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let drag_owner =
+                        ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        &mut origin_columns,
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &mut press_actions,
+                    );
+                    assert!(drag_owner.dragged());
+                });
+            },
+        );
+        let observation = press_actions
+            .relation_press_observation
+            .as_ref()
+            .expect("the raw press must be observed at the production strip");
+        assert!(!observation.response_hovered);
+        assert!(observation.response_down_on);
+        assert!(
+            press_actions.peek_press.is_some(),
+            "the response-owned press must not depend on the separate hover snapshot"
+        );
+    }
+
+    #[test]
+    fn book_strip_press_never_uses_another_response_raw_position() {
+        use crate::similar_index::BookPageState;
+
+        let relations = test_book_relations(vec![strip_page(BookPageState::Strong, Some(7))]);
+        let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let drag_owner_id = egui::Id::new("book-strip-top-drag-owner");
+        let mut state = SimilarPanelState::default();
+        let mut origin_columns = None;
+        let mut strip_rect = None;
+
+        let draw = |ctx: &egui::Context,
+                    state: &mut SimilarPanelState,
+                    origin_columns: &mut Option<super::OriginStripColumns>,
+                    actions: &mut super::SimilarPanelActions,
+                    known_rect: Option<egui::Rect>| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| {
+                    super::draw_page_strip(
+                        ui,
+                        strip,
+                        &[0],
+                        origin_columns,
+                        state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        actions,
+                    );
+                    let rect = super::take_book_strip_rect_for_test()
+                        .expect("the production strip must expose its actual response rect");
+                    if let Some(known_rect) = known_rect {
+                        assert_eq!(rect, known_rect);
+                    }
+                    let drag_owner = ui.interact(rect, drag_owner_id, egui::Sense::drag());
+                    (rect, drag_owner.is_pointer_button_down_on())
+                })
+                .inner
+        };
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                let mut actions = super::SimilarPanelActions::default();
+                strip_rect = Some(draw(ctx, &mut state, &mut origin_columns, &mut actions, None).0);
+            },
+        );
+        let strip_rect = strip_rect.expect("the bootstrap frame must register the strip");
+        let mut actions = super::SimilarPanelActions::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: strip_rect.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                let (_, other_response_down) = draw(
+                    ctx,
+                    &mut state,
+                    &mut origin_columns,
+                    &mut actions,
+                    Some(strip_rect),
+                );
+                assert!(other_response_down);
+            },
+        );
+        let observation = actions
+            .relation_press_observation
+            .as_ref()
+            .expect("the diagnostic observes a raw press over the strip");
+        assert!(!observation.response_down_on);
+        assert!(actions.peek_press.is_none());
     }
 
     #[test]

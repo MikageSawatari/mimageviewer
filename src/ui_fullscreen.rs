@@ -21834,7 +21834,9 @@ impl App {
                             || mouse_nav.is_some()
                             || jump_to.is_some()
                         {
-                            self.similar_panel.preview.end_gesture();
+                            self.similar_panel
+                                .preview
+                                .end_gesture_with_reason("navigation_or_close");
                         }
                         let similar_preview_asset = self.similar_preview_asset_for_frame(ctx);
 
@@ -21864,6 +21866,14 @@ impl App {
                                 let bg_style = self.fs_bg_style(ctx);
                                 self.draw_similar_preview_asset(ui, image_rect, asset, &bg_style)
                             });
+                        if let Some(asset) = similar_preview_asset.as_ref() {
+                            asset.log_first_body_draw(
+                                similar_preview_presentation.is_some(),
+                                self.settings.still_seek_strip_visible,
+                                !self.still_seek_thumbnail_pages.is_empty(),
+                                spread_pair,
+                            );
+                        }
                         if similar_preview_presentation.is_none() {
                             if self.continuous_reading_active_for_idx(fs_idx) {
                                 navigator_texture_sources = self.draw_fs_continuous_reading(
@@ -30470,7 +30480,9 @@ impl App {
             );
         }
         if navigator_reservation.is_some() {
-            self.similar_panel.preview.end_gesture();
+            self.similar_panel
+                .preview
+                .end_gesture_with_reason("navigator_reserved");
         }
         let navigator_consumed = if navigator_reservation.is_some() {
             true
@@ -53698,12 +53710,14 @@ mod tests {
         assert!(!app.fullscreen_navigator_interaction.is_active());
     }
 
-    fn navigator_ordered_input(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+    fn navigator_ordered_input_for_screen(
+        events: Vec<egui::Event>,
+        time: f64,
+        screen_size: egui::Vec2,
+        native_pixels_per_point: f32,
+    ) -> egui::RawInput {
         let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1200.0, 800.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
             time: Some(time),
             events,
             ..Default::default()
@@ -53714,6 +53728,15 @@ mod tests {
             .unwrap()
             .focused = Some(true);
         input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .native_pixels_per_point = Some(native_pixels_per_point);
+        input
+    }
+
+    fn navigator_ordered_input(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+        navigator_ordered_input_for_screen(events, time, egui::vec2(1200.0, 800.0), 1.0)
     }
 
     fn navigator_button_event(
@@ -53726,6 +53749,20 @@ mod tests {
             button,
             pressed,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn navigator_key_event(
+        key: egui::Key,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
         }
     }
 
@@ -54205,12 +54242,45 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn run_real_book_strip_preview_spread_case(
-        case: &str,
+    #[derive(Clone, Copy)]
+    struct RealBookStripPreviewCase<'a> {
+        name: &'a str,
         spread_mode: crate::settings::SpreadMode,
         origin_page_count: usize,
-    ) {
-        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        current_idx: usize,
+        target_origin_slot: usize,
+        still_seek_strip_visible: bool,
+        realistic_image_folder_resources: bool,
+        screen_size: egui::Vec2,
+        native_pixels_per_point: f32,
+        info_panel_locked: bool,
+        navigator_visible: bool,
+        top_bar_locked: bool,
+        strip_height: crate::settings::StillSeekStripHeight,
+    }
+
+    fn run_real_book_strip_preview_spread_case(fixture: RealBookStripPreviewCase<'_>) {
+        let RealBookStripPreviewCase {
+            name: case,
+            spread_mode,
+            origin_page_count,
+            current_idx,
+            target_origin_slot,
+            still_seek_strip_visible,
+            realistic_image_folder_resources,
+            screen_size,
+            native_pixels_per_point,
+            info_panel_locked,
+            navigator_visible,
+            top_bar_locked,
+            strip_height,
+        } = fixture;
+        let (mut app, _, setup_fs_idx) = setup_flat_navigator_input_test();
+        assert_eq!(
+            setup_fs_idx, 0,
+            "the shared fixture must start at its first slot"
+        );
+        let fs_idx = current_idx;
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
         configure_similar_preview_layout_mode(
@@ -54220,16 +54290,67 @@ mod tests {
         );
         app.spread_mode = spread_mode;
         app.native_video_in_window_active = true;
-        app.fs_info_panel.locked = true;
+        app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+        app.settings.fullscreen_navigator_visible = navigator_visible;
+        app.settings.fullscreen_top_bar_locked = top_bar_locked;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.fs_info_panel.locked = info_panel_locked;
         app.similar_panel.select_similar_tab_for_test();
+        app.settings.still_seek_strip_visible = false;
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::None);
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Always;
+        app.settings.still_seek_strip_height = strip_height;
 
         let origin_paths = (0..origin_page_count)
             .map(|page| PathBuf::from(format!(r"C:\preview\origin\{page:04}.png")))
             .collect::<Vec<_>>();
-        let target_origin_slot = origin_page_count * 2 / 3;
         let target_path = PathBuf::from(r"D:\preview\candidate\0007.png");
-        app.items[fs_idx] = GridItem::Image(origin_paths[0].clone());
-        app.items[fs_idx + 1] = GridItem::Image(origin_paths[1].clone());
+        app.items = origin_paths.iter().cloned().map(GridItem::Image).collect();
+        assert!(
+            app.items
+                .iter()
+                .all(|item| matches!(item, GridItem::Image(_))),
+            "{case}: image-folder-as-book fixture must contain ordinary image rows"
+        );
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.fullscreen_idx = Some(fs_idx);
+        app.fs_cache.clear();
+        if realistic_image_folder_resources {
+            for (idx, thumbnail) in app.thumbnails.iter_mut().enumerate() {
+                *thumbnail = ThumbnailState::Loaded {
+                    tex: ctx.load_texture(
+                        format!("{case}_loaded_seek_thumbnail_{idx}"),
+                        egui::ColorImage::filled([94, 136], egui::Color32::from_rgb(77, 91, 118)),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 136,
+                    },
+                    from_edit_preview: false,
+                    rendered_at_px: 136,
+                    source_dims: Some((1248, 1800)),
+                    layout_dims: None,
+                };
+            }
+        }
+        for idx in 0..app.items.len() {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        let SpreadPair::Double { left, right } = app.resolve_visible_spread_pair(fs_idx) else {
+            panic!("{case}: second-page fixture must resolve a spread display unit");
+        };
+        if spread_mode == crate::settings::SpreadMode::RtlCover && fs_idx == 1 {
+            assert_eq!(
+                (left, right),
+                (2, 1),
+                "{case}: page two must resolve through the production RTL-cover spread"
+            );
+        }
+        let original_page_indices = [left, right];
         app.similar_panel.set_book_query_override_for_test(
             fullscreen_book_query_for_strip_preview(
                 &origin_paths,
@@ -54240,7 +54361,7 @@ mod tests {
         app.similar_panel.set_item_query_override_for_test(
             crate::similar_index::ItemQuery::Ready(crate::similar_index::ItemMatches {
                 origin: crate::similar_index::OriginItem {
-                    item_key: crate::similar_index::item_key_for_file(&origin_paths[0]),
+                    item_key: crate::similar_index::item_key_for_file(&origin_paths[fs_idx]),
                     kind: crate::similar_db::ItemKind::Image,
                     mtime: 11,
                     file_size: 13,
@@ -54248,7 +54369,7 @@ mod tests {
                     height: 1600,
                     format: crate::similar_image::SimilarImageFormat::Png,
                     target: Some(crate::similar_index::SimilarItemTarget::File(
-                        origin_paths[0].clone(),
+                        origin_paths[fs_idx].clone(),
                     )),
                 },
                 hits: Vec::new(),
@@ -54256,30 +54377,97 @@ mod tests {
             true,
         );
 
-        let original_ids = [
+        let original_ids = original_page_indices.map(|idx| {
             insert_similar_preview_dispatcher_static_page(
                 &mut app,
                 &ctx,
-                fs_idx,
-                &format!("{case}_left"),
-                egui::Color32::DARK_RED,
-            ),
-            insert_similar_preview_dispatcher_static_page(
-                &mut app,
-                &ctx,
-                fs_idx + 1,
-                &format!("{case}_right"),
-                egui::Color32::DARK_GREEN,
-            ),
-        ];
+                idx,
+                &format!("{case}_{idx}"),
+                if idx == left {
+                    egui::Color32::DARK_RED
+                } else {
+                    egui::Color32::DARK_GREEN
+                },
+            )
+        });
         let expected_idx = app.fullscreen_idx;
         let expected_generation = app.items_generation;
         let expected_reading_flow = app.reading_flow;
         let expected_page_slice = app.fullscreen_page_slice;
 
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let panel_hover_pos = egui::pos2(screen_size.x - 1.0, screen_size.y * 0.45);
+        let initial_events = (!info_panel_locked)
+            .then(|| vec![egui::Event::PointerMoved(panel_hover_pos)])
+            .unwrap_or_default();
+        let _ = ctx.run(
+            navigator_ordered_input_for_screen(
+                initial_events,
+                0.0,
+                screen_size,
+                native_pixels_per_point,
+            ),
+            |ctx| app.render_fullscreen_viewport(ctx),
+        );
+        let actual_screen = ctx.content_rect();
+        assert_eq!(actual_screen.min, egui::Pos2::ZERO);
+        assert!(
+            (actual_screen.width() - screen_size.x).abs() <= 1.0 / native_pixels_per_point
+                && (actual_screen.height() - screen_size.y).abs() <= 1.0 / native_pixels_per_point,
+            "{case}: test input must retain the reported logical viewport; actual={actual_screen:?}, expected={screen_size:?}"
+        );
+        assert_eq!(
+            ctx.native_pixels_per_point(),
+            Some(native_pixels_per_point),
+            "{case}: test input must retain the reported native DPI scale"
+        );
+        assert_eq!(
+            app.viewer_presentation,
+            crate::app::ViewerPresentation::MainWindow,
+            "{case}: reported path is the embedded MainWindow presenter"
+        );
+        assert_eq!(
+            app.fs_info_panel.locked, info_panel_locked,
+            "{case}: fixture must retain the requested side-panel owner"
+        );
+        assert_eq!(
+            app.settings.fullscreen_navigator_visible, navigator_visible,
+            "{case}: fixture must retain the requested navigator setting"
+        );
+        if still_seek_strip_visible {
+            let shift = egui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            let mut toggle_input = navigator_ordered_input_for_screen(
+                vec![
+                    navigator_key_event(egui::Key::S, true, shift),
+                    navigator_key_event(egui::Key::S, false, shift),
+                ],
+                0.01,
+                screen_size,
+                native_pixels_per_point,
+            );
+            toggle_input.modifiers = shift;
+            let _ = ctx.run(toggle_input, |ctx| app.render_fullscreen_viewport(ctx));
+            assert!(
+                app.settings.still_seek_strip_visible,
+                "{case}: the production Shift+S action must enable the strip"
+            );
+            let _ = ctx.run(
+                navigator_ordered_input_for_screen(
+                    Vec::new(),
+                    0.02,
+                    screen_size,
+                    native_pixels_per_point,
+                ),
+                |ctx| app.render_fullscreen_viewport(ctx),
+            );
+        }
+        assert_eq!(
+            !app.still_seek_thumbnail_pages.is_empty(),
+            still_seek_strip_visible,
+            "{case}: fixture must execute the requested Shift+S strip content path"
+        );
         let strip_rect =
             crate::ui_metadata_panel::take_book_strip_rect_for_test().unwrap_or_else(|| {
                 panic!("{case}: real locked Similar panel must draw the book strip")
@@ -54294,7 +54482,12 @@ mod tests {
             .unwrap_or_else(|| panic!("{case}: target must own an actually painted strip column"))
             .center();
         let _ = ctx.run(
-            navigator_ordered_input(vec![egui::Event::PointerMoved(press_pos)], 0.05),
+            navigator_ordered_input_for_screen(
+                vec![egui::Event::PointerMoved(press_pos)],
+                0.05,
+                screen_size,
+                native_pixels_per_point,
+            ),
             |ctx| app.render_fullscreen_viewport(ctx),
         );
         let hover_rect = crate::ui_metadata_panel::take_book_strip_rect_for_test()
@@ -54305,12 +54498,14 @@ mod tests {
             .preview
             .queue_test_completion_for_next_press();
         let _ = ctx.run(
-            navigator_ordered_input(
+            navigator_ordered_input_for_screen(
                 vec![
                     egui::Event::PointerMoved(press_pos),
                     navigator_button_event(press_pos, egui::PointerButton::Primary, true),
                 ],
                 0.1,
+                screen_size,
+                native_pixels_per_point,
             ),
             |ctx| app.render_fullscreen_viewport(ctx),
         );
@@ -54325,6 +54520,12 @@ mod tests {
                     "{case}: strip press must reach the production preview owner; initial={strip_rect:?}, hover={hover_rect:?}, pressed={pressed_rect:?}, press={press_pos:?}"
                 )
             });
+        let (press_id, authorized_before_completion) = app
+            .similar_panel
+            .preview
+            .active_diagnostic_ids_for_test()
+            .expect("the accepted panel gesture owns one diagnostic operation");
+        assert_eq!(authorized_before_completion, None);
         assert_eq!(candidate.item_key, target_key);
         assert_eq!(
             candidate.target,
@@ -54339,32 +54540,87 @@ mod tests {
             session.layout_mode,
             crate::similar_preview::SimilarPreviewLayoutMode::Spread
         );
+        assert_eq!(
+            !app.still_seek_thumbnail_pages.is_empty(),
+            still_seek_strip_visible,
+            "{case}: the Shift+S strip must remain on its real path during the panel press"
+        );
 
+        // The actual worker does not complete in the press frame. Keep the physical button held
+        // across ordinary fullscreen frames so a later strip/navigator layer cannot silently
+        // retire the panel-owned gesture while the candidate is still loading.
+        for time in [0.15, 0.2, 0.25] {
+            let _ = ctx.run(
+                navigator_ordered_input_for_screen(
+                    Vec::new(),
+                    time,
+                    screen_size,
+                    native_pixels_per_point,
+                ),
+                |ctx| app.render_fullscreen_viewport(ctx),
+            );
+            assert!(
+                app.similar_panel
+                    .preview
+                    .active_candidate_for_test()
+                    .is_some(),
+                "{case}: loading candidate was retired while the panel press stayed held"
+            );
+            assert_eq!(
+                !app.still_seek_thumbnail_pages.is_empty(),
+                still_seek_strip_visible,
+                "{case}: requested strip state changed while the preview worker was pending"
+            );
+        }
+
+        let candidate_pixels = if realistic_image_folder_resources {
+            [1248, 1800]
+        } else {
+            [24, 16]
+        };
         completion
             .send_prepared(
                 Arc::new(egui::ColorImage::filled(
-                    [24, 16],
+                    candidate_pixels,
                     egui::Color32::LIGHT_BLUE,
                 )),
-                [2400, 1600],
+                candidate_pixels,
                 None,
                 29,
             )
             .expect("production strip press must own the queued deterministic receiver");
-        let preview_output = ctx.run(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let preview_output = ctx.run(
+            navigator_ordered_input_for_screen(
+                Vec::new(),
+                0.3,
+                screen_size,
+                native_pixels_per_point,
+            ),
+            |ctx| app.render_fullscreen_viewport(ctx),
+        );
+        assert_eq!(
+            !app.still_seek_thumbnail_pages.is_empty(),
+            still_seek_strip_visible,
+            "{case}: candidate frame must execute the same Shift+S strip state"
+        );
         let candidate_id = app
             .similar_panel
             .preview
             .cached_texture()
             .expect("held strip completion must install the candidate texture")
             .id();
+        let (_, request_id) = app
+            .similar_panel
+            .preview
+            .active_diagnostic_ids_for_test()
+            .expect("the held completion must retain its diagnostic operation");
+        let request_id = request_id.expect("the accepted completion authorizes one request");
         let preview_primitives =
             ctx.tessellate(preview_output.shapes, preview_output.pixels_per_point);
         assert!(
-            similar_preview_mesh_count(&preview_primitives, candidate_id) >= 2,
-            "{case}: candidate must replace the spread in both body and navigator"
+            similar_preview_mesh_count(&preview_primitives, candidate_id)
+                >= if navigator_visible { 2 } else { 1 },
+            "{case}: candidate must replace the spread in the body and any enabled navigator"
         );
         for original_id in original_ids {
             assert_eq!(
@@ -54375,13 +54631,15 @@ mod tests {
         }
 
         let release_output = ctx.run(
-            navigator_ordered_input(
+            navigator_ordered_input_for_screen(
                 vec![navigator_button_event(
                     press_pos,
                     egui::PointerButton::Primary,
                     false,
                 )],
-                0.3,
+                0.4,
+                screen_size,
+                native_pixels_per_point,
             ),
             |ctx| app.render_fullscreen_viewport(ctx),
         );
@@ -54392,7 +54650,7 @@ mod tests {
             0,
             "{case}: release must retire the temporary candidate in the same frame"
         );
-        let resolved_ids = [fs_idx, fs_idx + 1].map(|idx| {
+        let resolved_ids = original_page_indices.map(|idx| {
             app.resolve_fs_display_tex(idx, false)
                 .unwrap_or_else(|| {
                     panic!("{case}: release must retain page {idx} display resource")
@@ -54412,18 +54670,140 @@ mod tests {
         assert_eq!(app.reading_flow, expected_reading_flow);
         assert_eq!(app.fullscreen_page_slice, expected_page_slice);
         assert_eq!(app.spread_mode, spread_mode);
+        let target_diagnostics =
+            crate::similar_preview::diagnostic_lines_for_target_for_test(&target_key);
+        assert!(target_diagnostics.iter().any(|line| {
+            line.contains("event=relation_press_observed")
+                && line.contains("response_hovered=true")
+                && line.contains("response_down_on=true")
+                && line.contains(&format!("strip_setting_visible={still_seek_strip_visible}"))
+                && line.contains(&format!(
+                    "strip_active_previous_frame={still_seek_strip_visible}"
+                ))
+                && line.contains("items_generation=")
+                && line.contains("page_idx=")
+                && line.contains("spread=")
+        }));
+        let diagnostics = crate::similar_preview::diagnostic_lines_for_press_for_test(press_id);
+        for expected in [
+            "event=gesture_begin",
+            "event=worker_start",
+            "event=panel_press_admitted",
+            "event=completion_received",
+            "event=completion_accepted",
+            "event=body_draw",
+            "event=gesture_end",
+            "reason=primary_released",
+        ] {
+            assert!(
+                diagnostics.iter().any(|line| line.contains(expected)),
+                "{case}: diagnostic sequence missed {expected:?}; lines={diagnostics:#?}"
+            );
+        }
+        assert!(diagnostics.iter().all(|line| {
+            !line.contains("C:\\") && !line.contains("D:\\") && !line.contains("candidate.png")
+        }));
+        assert!(diagnostics.iter().any(|line| {
+            line.contains(&format!("request_id={request_id} "))
+                && line.contains("event=body_draw")
+                && line.contains(if still_seek_strip_visible {
+                    "strip_setting_visible=true"
+                } else {
+                    "strip_setting_visible=false"
+                })
+                && line.contains(if still_seek_strip_visible {
+                    "strip_active_previous_frame=true"
+                } else {
+                    "strip_active_previous_frame=false"
+                })
+        }));
+        let ordered_events = [
+            "event=panel_press_admitted",
+            "event=gesture_begin",
+            "event=worker_start",
+            "event=completion_received",
+            "event=completion_accepted",
+            "event=body_draw",
+            "event=gesture_end",
+        ];
+        let mut cursor = 0;
+        for expected in ordered_events {
+            let Some(offset) = diagnostics[cursor..]
+                .iter()
+                .position(|line| line.contains(expected))
+            else {
+                panic!("{case}: missing ordered diagnostic {expected}; lines={diagnostics:#?}");
+            };
+            cursor += offset + 1;
+        }
     }
 
     #[cfg(windows)]
     #[test]
     fn real_book_strip_press_previews_one_page_over_wide_and_compressed_spreads() {
-        for (case, spread_mode, origin_page_count) in [
-            ("ltr_wide", crate::settings::SpreadMode::Ltr, 4),
-            ("rtl_wide", crate::settings::SpreadMode::Rtl, 4),
-            ("ltr_compressed", crate::settings::SpreadMode::Ltr, 600),
-            ("rtl_compressed", crate::settings::SpreadMode::Rtl, 600),
-        ] {
-            run_real_book_strip_preview_spread_case(case, spread_mode, origin_page_count);
+        // `Keymap::consume_action` gives the process-global Win32 test frame precedence over
+        // egui input. Keep this real Shift+S fixture isolated from key-input tests so a foreign
+        // active ROOT frame cannot hide the egui edge under the full parallel lib suite.
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _clear = ClearTestKeyFrame;
+        crate::key_input::clear_test_frame();
+        for still_seek_strip_visible in [false, true] {
+            for (case, spread_mode, origin_page_count) in [
+                ("ltr_wide", crate::settings::SpreadMode::Ltr, 4),
+                ("rtl_wide", crate::settings::SpreadMode::Rtl, 4),
+                ("ltr_compressed", crate::settings::SpreadMode::Ltr, 600),
+                ("rtl_compressed", crate::settings::SpreadMode::Rtl, 600),
+            ] {
+                run_real_book_strip_preview_spread_case(RealBookStripPreviewCase {
+                    name: case,
+                    spread_mode,
+                    origin_page_count,
+                    current_idx: 0,
+                    target_origin_slot: origin_page_count * 2 / 3,
+                    still_seek_strip_visible,
+                    realistic_image_folder_resources: false,
+                    screen_size: egui::vec2(1200.0, 800.0),
+                    native_pixels_per_point: 1.0,
+                    info_panel_locked: true,
+                    navigator_visible: true,
+                    top_bar_locked: false,
+                    strip_height: crate::settings::StillSeekStripHeight::Large,
+                });
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_page_image_folder_strip_preview_survives_loaded_shift_s_strip() {
+        // See the companion wide/compressed fixture: the production Shift+S edge is egui-owned,
+        // so process-global native test input must stay empty for this test's whole lifetime.
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let _clear = ClearTestKeyFrame;
+        crate::key_input::clear_test_frame();
+        for still_seek_strip_visible in [false, true] {
+            run_real_book_strip_preview_spread_case(RealBookStripPreviewCase {
+                name: "image_folder_second_page",
+                spread_mode: crate::settings::SpreadMode::RtlCover,
+                origin_page_count: 32,
+                current_idx: 1,
+                target_origin_slot: 1,
+                still_seek_strip_visible,
+                realistic_image_folder_resources: true,
+                // The report came from a 1853x1103 physical viewport at 150% scale.
+                screen_size: egui::vec2(1853.0 / 1.5, 1103.0 / 1.5),
+                native_pixels_per_point: 1.5,
+                info_panel_locked: false,
+                navigator_visible: false,
+                top_bar_locked: true,
+                strip_height: crate::settings::StillSeekStripHeight::Maximum,
+            });
         }
     }
 

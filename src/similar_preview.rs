@@ -5,10 +5,84 @@
 //! source, park, and close invalidations advance the owner generation and reject late results.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
 use eframe::egui;
+
+static NEXT_SIMILAR_PREVIEW_PRESS_ID: AtomicU64 = AtomicU64::new(1);
+
+fn diagnostic_target_kind(target: &crate::similar_index::SimilarItemTarget) -> &'static str {
+    match target {
+        crate::similar_index::SimilarItemTarget::File(_) => "file",
+        crate::similar_index::SimilarItemTarget::ZipPage { .. } => "zip_page",
+        crate::similar_index::SimilarItemTarget::PdfPage { .. } => "pdf_page",
+    }
+}
+
+fn diagnostic_target_token(item_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(item_key.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn log_similar_preview_diagnostic(
+    event: &'static str,
+    press_id: Option<u64>,
+    request_id: Option<u64>,
+    details: impl std::fmt::Display,
+) {
+    let press_id = press_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    let request_id = request_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    let line = format!(
+        "[similar-preview] event={event} press_id={press_id} request_id={request_id} {details}"
+    );
+    crate::logger::log(line.clone());
+    #[cfg(test)]
+    SIMILAR_PREVIEW_DIAGNOSTICS_FOR_TEST
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(line);
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_lines_for_press_for_test(press_id: u64) -> Vec<String> {
+    let needle = format!("press_id={press_id} ");
+    SIMILAR_PREVIEW_DIAGNOSTICS_FOR_TEST
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|line| line.contains(&needle))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_lines_for_target_for_test(item_key: &str) -> Vec<String> {
+    let needle = format!("target_token={}", diagnostic_target_token(item_key));
+    SIMILAR_PREVIEW_DIAGNOSTICS_FOR_TEST
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|line| line.contains(&needle))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+static SIMILAR_PREVIEW_DIAGNOSTICS_FOR_TEST: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
 
 /// One indexed page that the viewer may show while the primary pointer remains held.
 ///
@@ -40,6 +114,119 @@ impl SimilarPreviewCandidate {
             indexed_file_size: page.other_file_size,
         })
     }
+
+    fn diagnostic_kind(&self) -> &'static str {
+        diagnostic_target_kind(&self.target)
+    }
+
+    fn diagnostic_token(&self) -> String {
+        diagnostic_target_token(&self.item_key)
+    }
+}
+
+fn diagnostic_spread(spread: crate::ui_fullscreen::SpreadPair) -> String {
+    match spread {
+        crate::ui_fullscreen::SpreadPair::Single => "single".to_owned(),
+        crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+            format!("double:{left},{right}")
+        }
+    }
+}
+
+/// Record the actual fullscreen state that admitted a panel press without exposing paths.
+fn log_panel_press_admitted(
+    press_id: u64,
+    candidate: &SimilarPreviewCandidate,
+    session: SimilarPreviewSession,
+    strip_setting_visible: bool,
+    strip_active_previous_frame: bool,
+    spread: crate::ui_fullscreen::SpreadPair,
+) {
+    log_similar_preview_diagnostic(
+        "panel_press_admitted",
+        Some(press_id),
+        None,
+        format!(
+            "target_kind={} target_token={} viewport={:?} items_generation={} page_idx={} page_slice={:?} layout={:?} strip_setting_visible={} strip_active_previous_frame={} spread={}",
+            candidate.diagnostic_kind(),
+            candidate.diagnostic_token(),
+            session.viewport,
+            session.items_generation,
+            session.page_idx,
+            session.page_slice,
+            session.layout_mode,
+            strip_setting_visible,
+            strip_active_previous_frame,
+            diagnostic_spread(spread),
+        ),
+    );
+}
+
+/// A visible panel press could not create a viewer session. This is intentionally path-free.
+pub(crate) fn log_panel_press_rejected(
+    candidate: &SimilarPreviewCandidate,
+    strip_setting_visible: bool,
+    strip_active_previous_frame: bool,
+    spread: Option<crate::ui_fullscreen::SpreadPair>,
+    reason: &'static str,
+) {
+    let spread = spread.map_or_else(|| "none".to_owned(), diagnostic_spread);
+    log_similar_preview_diagnostic(
+        "panel_press_rejected",
+        None,
+        None,
+        format!(
+            "reason={reason} target_kind={} target_token={} strip_setting_visible={} strip_active_previous_frame={} spread={spread}",
+            candidate.diagnostic_kind(),
+            candidate.diagnostic_token(),
+            strip_setting_visible,
+            strip_active_previous_frame,
+        ),
+    );
+}
+
+/// Record a primary edge over the relation strip before egui response ownership decides whether
+/// it can start the shared preview gesture. This distinguishes a missing hit from another layer
+/// owning the same pointer without changing admission.
+pub(crate) fn log_relation_press_observed(
+    candidate: Option<&SimilarPreviewCandidate>,
+    raw_column: usize,
+    resolved_column: Option<usize>,
+    response_hovered: bool,
+    response_down_on: bool,
+    session: Option<SimilarPreviewSession>,
+    viewport: egui::ViewportId,
+    items_generation: u64,
+    page_idx: Option<usize>,
+    strip_setting_visible: bool,
+    strip_active_previous_frame: bool,
+    spread: Option<crate::ui_fullscreen::SpreadPair>,
+) {
+    let (kind, token) = candidate.map_or_else(
+        || ("none", "none".to_owned()),
+        |candidate| (candidate.diagnostic_kind(), candidate.diagnostic_token()),
+    );
+    let session_page_slice = session
+        .map(|session| format!("{:?}", session.page_slice))
+        .unwrap_or_else(|| "none".to_owned());
+    let session_layout = session
+        .map(|session| format!("{:?}", session.layout_mode))
+        .unwrap_or_else(|| "none".to_owned());
+    let spread = spread.map_or_else(|| "none".to_owned(), diagnostic_spread);
+    log_similar_preview_diagnostic(
+        "relation_press_observed",
+        None,
+        None,
+        format!(
+            "raw_column={raw_column} resolved_column={} response_hovered={response_hovered} response_down_on={response_down_on} target_kind={kind} target_token={token} viewport={viewport:?} items_generation={items_generation} page_idx={} page_slice={session_page_slice} layout={session_layout} strip_setting_visible={strip_setting_visible} strip_active_previous_frame={strip_active_previous_frame} spread={spread}",
+            resolved_column
+                .map(|column| column.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            page_idx
+                .map(|page_idx| page_idx.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+        ),
+    );
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +371,12 @@ pub(crate) struct SimilarPreviewAsset {
     source_version: SimilarPreviewSourceVersion,
     session: SimilarPreviewSession,
     owner_generation: u64,
+    press_id: u64,
+    /// Set only on the clone returned by the completion frame. The cached owner always stores
+    /// `None`, so the body-paint diagnostic cannot repeat on later frames. This is the current
+    /// validation request, which can differ from `paint_resource_id` when a cached image is
+    /// re-authorized by an `Unchanged` result.
+    diagnostic_authorized_request_id: Option<u64>,
 }
 
 impl SimilarPreviewAsset {
@@ -192,6 +385,36 @@ impl SimilarPreviewAsset {
             items: self.owner_generation,
             input: self.paint_resource_id,
         }
+    }
+
+    pub(crate) fn log_first_body_draw(
+        &self,
+        painted: bool,
+        strip_setting_visible: bool,
+        strip_active_previous_frame: bool,
+        spread: crate::ui_fullscreen::SpreadPair,
+    ) {
+        let Some(request_id) = self.diagnostic_authorized_request_id else {
+            return;
+        };
+        log_similar_preview_diagnostic(
+            "body_draw",
+            Some(self.press_id),
+            Some(request_id),
+            format!(
+                "outcome={} strip_setting_visible={} strip_active_previous_frame={} spread={} target_kind={} target_token={}",
+                if painted {
+                    "painted"
+                } else {
+                    "geometry_rejected"
+                },
+                strip_setting_visible,
+                strip_active_previous_frame,
+                diagnostic_spread(spread),
+                diagnostic_target_kind(&self.stamp.target),
+                diagnostic_target_token(&self.stamp.item_key),
+            ),
+        );
     }
 }
 
@@ -297,8 +520,14 @@ enum SimilarPreviewGesture {
         session: SimilarPreviewSession,
         owner_generation: u64,
         press_id: u64,
-        authorized_request_id: Option<u64>,
+        authorization: Option<SimilarPreviewAuthorization>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct SimilarPreviewAuthorization {
+    request_id: u64,
+    body_observation_pending: bool,
 }
 
 #[derive(Default)]
@@ -309,7 +538,6 @@ pub(crate) struct SimilarPreviewState {
     preparation: SimilarPreviewPreparation,
     cached: Option<SimilarPreviewAsset>,
     next_request_id: u64,
-    next_press_id: u64,
     #[cfg(test)]
     test_receivers:
         std::collections::VecDeque<mpsc::Receiver<Result<SimilarPreviewWorkerResult, String>>>,
@@ -330,7 +558,8 @@ impl SimilarPreviewState {
         let Some(candidate) = SimilarPreviewCandidate::for_hit(hit) else {
             return false;
         };
-        self.begin_candidate_press(ctx, &candidate, passwords, pdf_viewport, session)
+        self.begin_candidate_press(ctx, &candidate, passwords, pdf_viewport, session);
+        true
     }
 
     pub(crate) fn begin_candidate_press(
@@ -340,19 +569,76 @@ impl SimilarPreviewState {
         passwords: &crate::pdf_passwords::PdfPasswordStore,
         pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
         session: SimilarPreviewSession,
-    ) -> bool {
+    ) -> u64 {
+        self.begin_candidate_press_inner(ctx, candidate, passwords, pdf_viewport, session, None)
+    }
+
+    pub(crate) fn begin_candidate_press_from_panel(
+        &mut self,
+        ctx: &egui::Context,
+        candidate: &SimilarPreviewCandidate,
+        passwords: &crate::pdf_passwords::PdfPasswordStore,
+        pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
+        session: SimilarPreviewSession,
+        strip_setting_visible: bool,
+        strip_active_previous_frame: bool,
+        spread: crate::ui_fullscreen::SpreadPair,
+    ) -> u64 {
+        self.begin_candidate_press_inner(
+            ctx,
+            candidate,
+            passwords,
+            pdf_viewport,
+            session,
+            Some((strip_setting_visible, strip_active_previous_frame, spread)),
+        )
+    }
+
+    fn begin_candidate_press_inner(
+        &mut self,
+        ctx: &egui::Context,
+        candidate: &SimilarPreviewCandidate,
+        passwords: &crate::pdf_passwords::PdfPasswordStore,
+        pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
+        session: SimilarPreviewSession,
+        panel_context: Option<(bool, bool, crate::ui_fullscreen::SpreadPair)>,
+    ) -> u64 {
         let stamp = SimilarPreviewStamp::for_candidate(candidate, passwords, pdf_viewport);
         self.observe_session(session);
         self.observe_indexed_stamp(&stamp);
-        let press_id = self.next_press_id.wrapping_add(1).max(1);
-        self.next_press_id = press_id;
+        let press_id = NEXT_SIMILAR_PREVIEW_PRESS_ID.fetch_add(1, Ordering::Relaxed);
+        if let Some((strip_setting_visible, strip_active_previous_frame, spread)) = panel_context {
+            log_panel_press_admitted(
+                press_id,
+                candidate,
+                session,
+                strip_setting_visible,
+                strip_active_previous_frame,
+                spread,
+            );
+        }
         self.gesture = SimilarPreviewGesture::Holding {
             stamp: stamp.clone(),
             session,
             owner_generation: self.owner_generation,
             press_id,
-            authorized_request_id: None,
+            authorization: None,
         };
+        log_similar_preview_diagnostic(
+            "gesture_begin",
+            Some(press_id),
+            None,
+            format!(
+                "target_kind={} target_token={} viewport={:?} items_generation={} page_idx={} page_slice={:?} layout={:?}",
+                candidate.diagnostic_kind(),
+                candidate.diagnostic_token(),
+                session.viewport,
+                session.items_generation,
+                session.page_idx,
+                session.page_slice,
+                session.layout_mode,
+            ),
+        );
         let cached_source_version = self
             .cached
             .as_ref()
@@ -373,7 +659,7 @@ impl SimilarPreviewState {
                 cached_source_version,
             },
         );
-        true
+        press_id
     }
 
     /// Feed the current Item query result into the preview freshness owner.
@@ -427,32 +713,80 @@ impl SimilarPreviewState {
         if let Some(stamp) = stale_credential {
             self.invalidate_updated_source(&stamp);
         }
-        if input.primary_released || !input.primary_down || !input.viewport_focused {
-            self.end_gesture();
+        if input.primary_released {
+            self.end_gesture_with_reason("primary_released");
+        } else if !input.primary_down {
+            self.end_gesture_with_reason("primary_not_down");
+        } else if !input.viewport_focused {
+            self.end_gesture_with_reason("viewport_focus_lost");
         }
-        self.poll_worker(ctx, passwords);
-        let SimilarPreviewGesture::Holding {
-            stamp,
-            session: owner_session,
-            owner_generation,
-            authorized_request_id: Some(_),
-            ..
-        } = &self.gesture
-        else {
-            return None;
+        let _ = self.poll_worker(ctx, passwords);
+        let (stamp, owner_session, owner_generation, press_id) = match &self.gesture {
+            SimilarPreviewGesture::Holding {
+                stamp,
+                session,
+                owner_generation,
+                press_id,
+                authorization: Some(_),
+            } => (stamp.clone(), *session, *owner_generation, *press_id),
+            SimilarPreviewGesture::Holding { .. } | SimilarPreviewGesture::Idle => return None,
         };
-        self.cached
+        let mut asset = self
+            .cached
             .as_ref()
             .filter(|asset| {
-                asset.stamp == *stamp
-                    && asset.session == *owner_session
-                    && asset.owner_generation == *owner_generation
+                asset.stamp == stamp
+                    && asset.session == owner_session
+                    && asset.owner_generation == owner_generation
             })
-            .cloned()
+            .cloned()?;
+        let diagnostic_request_id = match &mut self.gesture {
+            SimilarPreviewGesture::Holding {
+                stamp: current_stamp,
+                session,
+                owner_generation: current_generation,
+                press_id: current_press_id,
+                authorization: Some(authorization),
+            } if *current_stamp == stamp
+                && *session == owner_session
+                && *current_generation == owner_generation
+                && *current_press_id == press_id
+                && authorization.body_observation_pending =>
+            {
+                authorization.body_observation_pending = false;
+                Some(authorization.request_id)
+            }
+            SimilarPreviewGesture::Holding { .. } | SimilarPreviewGesture::Idle => None,
+        };
+        asset.press_id = press_id;
+        asset.diagnostic_authorized_request_id = diagnostic_request_id;
+        Some(asset)
     }
 
     /// End only the current presentation right. Preparation and a valid cache keep running.
     pub(crate) fn end_gesture(&mut self) {
+        self.end_gesture_with_reason("explicit");
+    }
+
+    pub(crate) fn end_gesture_with_reason(&mut self, reason: &'static str) {
+        if let SimilarPreviewGesture::Holding {
+            stamp,
+            press_id,
+            authorization,
+            ..
+        } = &self.gesture
+        {
+            log_similar_preview_diagnostic(
+                "gesture_end",
+                Some(*press_id),
+                authorization.map(|authorization| authorization.request_id),
+                format!(
+                    "reason={reason} target_kind={} target_token={}",
+                    diagnostic_target_kind(&stamp.target),
+                    diagnostic_target_token(&stamp.item_key),
+                ),
+            );
+        }
         self.gesture = SimilarPreviewGesture::Idle;
     }
 
@@ -470,9 +804,9 @@ impl SimilarPreviewState {
         if !has_live_scope {
             return;
         }
+        self.end_gesture_with_reason("owner_invalidated");
         self.owner_generation = self.owner_generation.wrapping_add(1).max(1);
         self.session = None;
-        self.gesture = SimilarPreviewGesture::Idle;
         self.cached = None;
         self.cancel_preparation(None);
     }
@@ -487,7 +821,7 @@ impl SimilarPreviewState {
             self.preparation,
             SimilarPreviewPreparation::Running(_) | SimilarPreviewPreparation::Draining { .. }
         ) {
-            self.poll_worker(ctx, passwords);
+            let _ = self.poll_worker(ctx, passwords);
         }
     }
 
@@ -542,13 +876,29 @@ impl SimilarPreviewState {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_diagnostic_ids_for_test(&self) -> Option<(u64, Option<u64>)> {
+        let SimilarPreviewGesture::Holding {
+            press_id,
+            authorization,
+            ..
+        } = &self.gesture
+        else {
+            return None;
+        };
+        Some((
+            *press_id,
+            authorization.map(|authorization| authorization.request_id),
+        ))
+    }
+
     fn observe_session(&mut self, session: SimilarPreviewSession) {
         if self.session == Some(session) {
             return;
         }
+        self.end_gesture_with_reason("session_changed");
         self.owner_generation = self.owner_generation.wrapping_add(1).max(1);
         self.session = Some(session);
-        self.gesture = SimilarPreviewGesture::Idle;
         self.cached = None;
         self.cancel_preparation(None);
     }
@@ -595,7 +945,7 @@ impl SimilarPreviewState {
             &self.gesture,
             SimilarPreviewGesture::Holding { stamp, .. } if stamp.is_stale_against(current)
         ) {
-            self.gesture = SimilarPreviewGesture::Idle;
+            self.end_gesture_with_reason("source_changed");
         }
         match std::mem::take(&mut self.preparation) {
             SimilarPreviewPreparation::Running(pending)
@@ -659,6 +1009,21 @@ impl SimilarPreviewState {
         let request_id = self.next_request_id.wrapping_add(1).max(1);
         self.next_request_id = request_id;
         let cancel = Arc::new(AtomicBool::new(false));
+        log_similar_preview_diagnostic(
+            "worker_start",
+            Some(request.press_id),
+            Some(request_id),
+            format!(
+                "target_kind={} target_token={} viewport={:?} items_generation={} page_idx={} page_slice={:?} layout={:?}",
+                diagnostic_target_kind(&request.stamp.target),
+                diagnostic_target_token(&request.stamp.item_key),
+                request.session.viewport,
+                request.session.items_generation,
+                request.session.page_idx,
+                request.session.page_slice,
+                request.session.layout_mode,
+            ),
+        );
 
         #[cfg(test)]
         if let Some(rx) = self.test_receivers.pop_front() {
@@ -682,6 +1047,22 @@ impl SimilarPreviewState {
                     validate_or_prepare_similar_preview(&worker_request, worker_cancel.clone())
                 }))
                 .unwrap_or_else(|_| Err("画像の準備に失敗しました".to_owned()));
+                let outcome = match &result {
+                    Ok(SimilarPreviewWorkerResult::Unchanged { .. }) => "unchanged",
+                    Ok(SimilarPreviewWorkerResult::Prepared { .. }) => "prepared",
+                    Err(_) => "failed",
+                };
+                log_similar_preview_diagnostic(
+                    "worker_terminal",
+                    Some(worker_request.press_id),
+                    Some(request_id),
+                    format!(
+                        "outcome={outcome} cancelled={} target_kind={} target_token={}",
+                        worker_cancel.load(Ordering::Relaxed),
+                        diagnostic_target_kind(&worker_request.stamp.target),
+                        diagnostic_target_token(&worker_request.stamp.item_key),
+                    ),
+                );
                 let _ = tx.send(result);
                 repaint.request_repaint_of(egui::ViewportId::ROOT);
             });
@@ -693,6 +1074,12 @@ impl SimilarPreviewState {
                 rx,
             });
         } else {
+            log_similar_preview_diagnostic(
+                "worker_terminal",
+                Some(request.press_id),
+                Some(request_id),
+                "outcome=spawn_failed",
+            );
             self.preparation = SimilarPreviewPreparation::Failed {
                 request,
                 error: "画像準備ワーカーを開始できませんでした".to_owned(),
@@ -704,21 +1091,46 @@ impl SimilarPreviewState {
         &mut self,
         ctx: &egui::Context,
         passwords: &crate::pdf_passwords::PdfPasswordStore,
-    ) {
+    ) -> Option<u64> {
         match std::mem::take(&mut self.preparation) {
-            SimilarPreviewPreparation::Idle => {}
-            failed @ SimilarPreviewPreparation::Failed { .. } => self.preparation = failed,
+            SimilarPreviewPreparation::Idle => None,
+            failed @ SimilarPreviewPreparation::Failed { .. } => {
+                self.preparation = failed;
+                None
+            }
             SimilarPreviewPreparation::Running(pending) => match pending.rx.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => {
                     self.preparation = SimilarPreviewPreparation::Running(pending);
+                    None
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.accept_completion(
-                    ctx,
-                    passwords,
-                    pending,
-                    Err("画像の準備が終了しました".to_owned()),
-                ),
-                Ok(result) => self.accept_completion(ctx, passwords, pending, result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log_similar_preview_diagnostic(
+                        "completion_received",
+                        Some(pending.request.press_id),
+                        Some(pending.request_id),
+                        "outcome=disconnected",
+                    );
+                    self.accept_completion(
+                        ctx,
+                        passwords,
+                        pending,
+                        Err("画像の準備が終了しました".to_owned()),
+                    )
+                }
+                Ok(result) => {
+                    let outcome = match &result {
+                        Ok(SimilarPreviewWorkerResult::Unchanged { .. }) => "unchanged",
+                        Ok(SimilarPreviewWorkerResult::Prepared { .. }) => "prepared",
+                        Err(_) => "failed",
+                    };
+                    log_similar_preview_diagnostic(
+                        "completion_received",
+                        Some(pending.request.press_id),
+                        Some(pending.request_id),
+                        format!("outcome={outcome}"),
+                    );
+                    self.accept_completion(ctx, passwords, pending, result)
+                }
             },
             SimilarPreviewPreparation::Draining { pending, mut next } => {
                 match pending.rx.try_recv() {
@@ -733,6 +1145,7 @@ impl SimilarPreviewState {
                         }
                     }
                 }
+                None
             }
         }
     }
@@ -747,16 +1160,38 @@ impl SimilarPreviewState {
             && request.stamp.credentials_are_current(passwords)
     }
 
+    fn request_rejection_reason(
+        &self,
+        request: &SimilarPreviewRequest,
+        passwords: &crate::pdf_passwords::PdfPasswordStore,
+    ) -> Option<&'static str> {
+        if self.session != Some(request.session) {
+            Some("session_changed")
+        } else if self.owner_generation != request.owner_generation {
+            Some("owner_generation_changed")
+        } else if !request.stamp.credentials_are_current(passwords) {
+            Some("credentials_changed")
+        } else {
+            None
+        }
+    }
+
     fn accept_completion(
         &mut self,
         ctx: &egui::Context,
         passwords: &crate::pdf_passwords::PdfPasswordStore,
         pending: SimilarPreviewPending,
         result: Result<SimilarPreviewWorkerResult, String>,
-    ) {
+    ) -> Option<u64> {
         let request = pending.request;
-        if !self.request_is_current(&request, passwords) {
-            return;
+        if let Some(reason) = self.request_rejection_reason(&request, passwords) {
+            log_similar_preview_diagnostic(
+                "completion_rejected",
+                Some(request.press_id),
+                Some(pending.request_id),
+                format!("reason={reason}"),
+            );
+            return None;
         }
         let accepted = match result {
             Ok(SimilarPreviewWorkerResult::Unchanged { source_version }) => self
@@ -796,6 +1231,8 @@ impl SimilarPreviewState {
                     source_version,
                     session: request.session,
                     owner_generation: request.owner_generation,
+                    press_id: request.press_id,
+                    diagnostic_authorized_request_id: None,
                 })
             }
             Err(error) => Err(error),
@@ -803,22 +1240,35 @@ impl SimilarPreviewState {
         match accepted {
             Ok(asset) => {
                 self.cached = Some(asset);
-                if let SimilarPreviewGesture::Holding {
+                let authorized = if let SimilarPreviewGesture::Holding {
                     stamp,
                     session,
                     owner_generation,
                     press_id,
-                    authorized_request_id,
+                    authorization,
                 } = &mut self.gesture
                     && *stamp == request.stamp
                     && *session == request.session
                     && *owner_generation == request.owner_generation
                     && *press_id == request.press_id
                 {
-                    *authorized_request_id = Some(pending.request_id);
-                }
+                    *authorization = Some(SimilarPreviewAuthorization {
+                        request_id: pending.request_id,
+                        body_observation_pending: true,
+                    });
+                    true
+                } else {
+                    false
+                };
+                log_similar_preview_diagnostic(
+                    "completion_accepted",
+                    Some(request.press_id),
+                    Some(pending.request_id),
+                    format!("gesture_authorized={authorized}"),
+                );
                 self.preparation = SimilarPreviewPreparation::Idle;
                 ctx.request_repaint();
+                authorized.then_some(pending.request_id)
             }
             Err(error) => {
                 if self
@@ -828,7 +1278,14 @@ impl SimilarPreviewState {
                 {
                     self.cached = None;
                 }
+                log_similar_preview_diagnostic(
+                    "completion_failed",
+                    Some(request.press_id),
+                    Some(pending.request_id),
+                    "reason=worker_or_validation_error",
+                );
                 self.preparation = SimilarPreviewPreparation::Failed { request, error };
+                None
             }
         }
     }
@@ -1247,6 +1704,91 @@ mod tests {
             .presentation_for_frame(&ctx, session(0), input(true), &passwords)
             .expect("validation authorizes this press");
         assert_eq!(asset.source_size, egui::vec2(20.0, 10.0));
+    }
+
+    #[test]
+    fn cached_same_target_revalidation_logs_the_new_request_body_once() {
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let hit = hit(r"C:\cached.png", 1);
+        let mut state = SimilarPreviewState::default();
+
+        let first = state.queue_test_worker();
+        assert!(state.begin_press(&ctx, &hit, &passwords, viewport(), session(0)));
+        first.send(Ok(prepared(1))).unwrap();
+        state.poll_background(&ctx, &passwords);
+        let first_asset = state
+            .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+            .expect("first preparation authorizes the pressed candidate");
+        let Some((first_press_id, Some(first_request_id))) = state.active_diagnostic_ids_for_test()
+        else {
+            panic!("first request should be authorized");
+        };
+        first_asset.log_first_body_draw(
+            true,
+            false,
+            false,
+            crate::ui_fullscreen::SpreadPair::Single,
+        );
+        state.end_gesture();
+
+        let validate = state.queue_test_worker();
+        assert!(state.begin_press(&ctx, &hit, &passwords, viewport(), session(0)));
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_none(),
+            "a cached resource still waits for current-request validation"
+        );
+        validate
+            .send(Ok(SimilarPreviewWorkerResult::Unchanged {
+                source_version: fake_source_version(1),
+            }))
+            .unwrap();
+        state.poll_background(&ctx, &passwords);
+        let second_asset = state
+            .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+            .expect("unchanged validation re-authorizes the cached candidate");
+        let Some((second_press_id, Some(second_request_id))) =
+            state.active_diagnostic_ids_for_test()
+        else {
+            panic!("second request should be authorized");
+        };
+        assert_ne!(second_press_id, first_press_id);
+        assert_ne!(second_request_id, first_request_id);
+        assert_eq!(
+            second_asset.paint_resource_id, first_request_id,
+            "the cached paint resource keeps its original identity"
+        );
+        second_asset.log_first_body_draw(
+            true,
+            true,
+            true,
+            crate::ui_fullscreen::SpreadPair::Double { left: 2, right: 1 },
+        );
+
+        let later_frame_asset = state
+            .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+            .expect("the authorized cached preview remains visible while held");
+        later_frame_asset.log_first_body_draw(
+            true,
+            true,
+            true,
+            crate::ui_fullscreen::SpreadPair::Double { left: 2, right: 1 },
+        );
+
+        let diagnostics = diagnostic_lines_for_press_for_test(second_press_id);
+        let body_draws: Vec<_> = diagnostics
+            .iter()
+            .filter(|line| line.contains("event=body_draw"))
+            .collect();
+        assert_eq!(
+            body_draws.len(),
+            1,
+            "body draw is logged once per authorization"
+        );
+        assert!(body_draws[0].contains(&format!("request_id={second_request_id} ")));
+        assert!(!body_draws[0].contains(&format!("request_id={first_request_id} ")));
     }
 
     #[test]
@@ -1676,6 +2218,68 @@ mod tests {
             panic!("changed source must be decoded");
         };
         assert_eq!(pixels.source_dims, [20, 10]);
+    }
+
+    #[test]
+    fn real_worker_diagnostics_correlate_terminal_before_ui_accept_without_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("diagnostic-candidate.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([7, 8, 9, 255]))
+            .save(&path)
+            .unwrap();
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let hit = hit(&path.to_string_lossy(), 1);
+        let mut state = SimilarPreviewState::default();
+        assert!(state.begin_press(&ctx, &hit, &passwords, viewport(), session(0)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (press_id, request_id) = loop {
+            if state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_some()
+            {
+                let Some((press_id, Some(request_id))) = state.active_diagnostic_ids_for_test()
+                else {
+                    panic!("accepted real-worker completion should expose its diagnostic ids");
+                };
+                break (press_id, request_id);
+            }
+            assert!(
+                state.has_pending_worker_for_test(),
+                "real worker must either remain pending or install a presentation"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real diagnostic worker should finish within the focused timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+
+        let lines = diagnostic_lines_for_press_for_test(press_id);
+        let ordered = [
+            "event=worker_start",
+            "event=worker_terminal",
+            "event=completion_received",
+            "event=completion_accepted",
+        ];
+        let mut cursor = 0;
+        for expected in ordered {
+            let Some(offset) = lines[cursor..]
+                .iter()
+                .position(|line| line.contains(expected))
+            else {
+                panic!("missing ordered diagnostic {expected}; lines={lines:#?}");
+            };
+            cursor += offset + 1;
+        }
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains(&format!("request_id={request_id} "))
+                    || line.contains("request_id=none "))
+        );
+        let raw_path = path.to_string_lossy();
+        assert!(lines.iter().all(|line| !line.contains(raw_path.as_ref())));
     }
 
     #[test]
