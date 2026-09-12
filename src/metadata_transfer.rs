@@ -445,6 +445,8 @@ struct PortableContainerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_cover_spread: Option<crate::settings::FinalCoverSpreadPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    singleton_spread_placement: Option<crate::settings::SingletonSpreadPlacementPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     view_trim: Option<crate::view_trim::ViewTrimBookState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     folder_thumb_pin: Option<PortableFolderThumbPin>,
@@ -454,12 +456,16 @@ impl PortableContainerState {
     fn is_empty(&self) -> bool {
         self.spread.is_none()
             && self.final_cover_spread.is_none()
+            && self.singleton_spread_placement.is_none()
             && self.view_trim.is_none()
             && self.folder_thumb_pin.is_none()
     }
 
     fn has_view_state(&self) -> bool {
-        self.spread.is_some() || self.final_cover_spread.is_some() || self.view_trim.is_some()
+        self.spread.is_some()
+            || self.final_cover_spread.is_some()
+            || self.singleton_spread_placement.is_some()
+            || self.view_trim.is_some()
     }
 }
 
@@ -2456,6 +2462,61 @@ where
                 }
             }
         }
+        let has_singleton_placement_table = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'singleton_spread_placements'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if has_singleton_placement_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.preference
+                       FROM metadata_transfer_container_scope AS s
+                       CROSS JOIN singleton_spread_placements AS p
+                      WHERE p.path = s.item_key
+                         OR (s.include_nested != 0
+                             AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let value = row.get::<_, i32>(1)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        crate::settings::SingletonSpreadPlacementPreference::from_int(value),
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, preference) = row.map_err(db_error)?;
+                let Some(preference) = preference else {
+                    continue;
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .singleton_spread_placement = Some(preference);
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .singleton_spread_placement = Some(preference);
+                    }
+                }
+            }
+        }
     }
 
     let view_trim_path = data_dir.join("view_trim.db");
@@ -4378,6 +4439,14 @@ fn apply_entry(
         )?;
         delete_container_key_family(
             tx,
+            "spread.singleton_spread_placements",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
             "view_trim.view_trim_books",
             "book_key",
             &container_source_key,
@@ -4647,6 +4716,14 @@ fn insert_container_state(
     if let Some(preference) = state.final_cover_spread {
         tx.prepare_cached(
             "INSERT INTO spread.final_cover_spreads (path, preference) VALUES (?1, ?2)",
+        )
+        .map_err(db_error)?
+        .execute(params![stripped_key, preference.to_int()])
+        .map_err(db_error)?;
+    }
+    if let Some(preference) = state.singleton_spread_placement {
+        tx.prepare_cached(
+            "INSERT INTO spread.singleton_spread_placements (path, preference) VALUES (?1, ?2)",
         )
         .map_err(db_error)?
         .execute(params![stripped_key, preference.to_int()])
@@ -6916,7 +6993,7 @@ mod tests {
     }
 
     #[test]
-    fn final_cover_only_container_state_round_trips_without_materializing_spread_rows() {
+    fn independent_spread_preferences_round_trip_without_materializing_spread_rows() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -6937,7 +7014,13 @@ mod tests {
         source_spread
             .execute(
                 "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2), (?2, 0)",
-                params![source_key, source_nested],
+                params![&source_key, &source_nested],
+            )
+            .unwrap();
+        source_spread
+            .execute(
+                "INSERT INTO singleton_spread_placements (path, preference) VALUES (?1, 1), (?2, 0)",
+                params![&source_key, &source_nested],
             )
             .unwrap();
 
@@ -6958,6 +7041,14 @@ mod tests {
         assert_eq!(
             entry.nested_containers[0].state.final_cover_spread,
             Some(crate::settings::FinalCoverSpreadPreference::FollowGlobal)
+        );
+        assert_eq!(
+            entry.container_state.singleton_spread_placement,
+            Some(crate::settings::SingletonSpreadPlacementPreference::Place)
+        );
+        assert_eq!(
+            entry.nested_containers[0].state.singleton_spread_placement,
+            Some(crate::settings::SingletonSpreadPlacementPreference::FollowGlobal)
         );
 
         copy_sidecar_bundle(&source, &destination);
@@ -6991,6 +7082,20 @@ mod tests {
                 Some(&destination_book),
             ),
             crate::settings::FinalCoverSpreadPreference::Off
+        );
+        assert_eq!(
+            spread.get_singleton_spread_placement_preference_with_fallback(
+                &destination_nested,
+                Some(&destination_book),
+            ),
+            crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+        );
+        assert_eq!(
+            spread.get_singleton_spread_placement_preference_with_fallback(
+                &destination_absent,
+                Some(&destination_book),
+            ),
+            crate::settings::SingletonSpreadPlacementPreference::Place
         );
     }
 

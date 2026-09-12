@@ -1467,6 +1467,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
     FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
+        singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
         pages: vec![FsDisplayUnitHoldoverPage {
             occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
             layout_size: texture.size_vec2(),
@@ -31951,6 +31952,8 @@ mod pipeline_cache_refactor_tests {
         FsHoldover::FinalEffectSourceReload(FinalEffectSourceReloadHoldover {
             target_idx,
             previous: FsDisplayUnitHoldover {
+                singleton_placement:
+                    crate::displayed_image_transform::SingletonSpreadPlacement::Center,
                 pages: vec![FsDisplayUnitHoldoverPage {
                     occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
                         page_idx, target_idx,

@@ -592,6 +592,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表紙", "末尾", "見開き", "本ごとの設定"]
     ),
     entry!(
+        "spread/singleton-placement",
+        SpreadMode,
+        "見開きの先頭・末尾の単ページを片側に配置",
+        ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
+    ),
+    entry!(
         "spread/reading-flow",
         SpreadMode,
         "デフォルトの連結方式",

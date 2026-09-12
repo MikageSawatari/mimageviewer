@@ -800,6 +800,7 @@ fn collection_spread_payload(
                 pages,
                 presentation: None,
                 slice: crate::ui_fullscreen::remote_page_slice(group.slice),
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
             })
         })
         .collect();

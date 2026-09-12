@@ -39,7 +39,7 @@ use crate::displayed_image_transform::{
     DisplayedImageGeometry, DisplayedImageGeometryInput, DisplayedImageTransform,
     DisplayedImageTransformInput, FullscreenFitScaleLimits, FullscreenPageLayout,
     FullscreenPageLayoutKind, ImagePaintQuad, RectPixelFit, ResolvedDisplayPlacement,
-    ResolvedZTransform, ZAimBasis, ZTransformInput, physical_pixel_scale,
+    ResolvedZTransform, SingletonSpreadPlacement, ZAimBasis, ZTransformInput, physical_pixel_scale,
     physical_scale_is_near_integer, quantize_points_to_physical_pixels, z_cursor_image_px,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
@@ -2795,7 +2795,25 @@ fn normal_zoom_pan(transform: DisplayedImageTransform) -> Option<(f32, egui::Vec
         ResolvedDisplayPlacement::Normal { zoom_pan } => {
             Some(zoom_pan.unwrap_or((1.0, egui::Vec2::ZERO)))
         }
+        ResolvedDisplayPlacement::SingletonSpread { zoom_pan, .. } => {
+            Some(zoom_pan.unwrap_or((1.0, egui::Vec2::ZERO)))
+        }
         ResolvedDisplayPlacement::Z { .. } => None,
+    }
+}
+
+fn singleton_spread_projected_gap_correction(
+    placement: ResolvedDisplayPlacement,
+    zoom_ratio: f32,
+) -> egui::Vec2 {
+    let ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } = placement else {
+        return egui::Vec2::ZERO;
+    };
+    let correction = gap.max(0.0) * (1.0 - zoom_ratio) * 0.5;
+    match side {
+        SingletonSpreadPlacement::Left => egui::vec2(-correction, 0.0),
+        SingletonSpreadPlacement::Right => egui::vec2(correction, 0.0),
+        SingletonSpreadPlacement::Center => egui::Vec2::ZERO,
     }
 }
 
@@ -2849,9 +2867,10 @@ fn clamp_fullscreen_pan_from_layout(
             let current_anchor = page.viewport_rect.center() + base_pan;
             let proposed_anchor = page.viewport_rect.center() + proposed_pan;
             let drawn_rect = fs_navigator_source_rect_aabb(&page, page.uv_rect);
+            let gap_correction = singleton_spread_projected_gap_correction(page.placement, ratio);
             let projected_rect = egui::Rect::from_min_max(
-                proposed_anchor + (drawn_rect.min - current_anchor) * ratio,
-                proposed_anchor + (drawn_rect.max - current_anchor) * ratio,
+                proposed_anchor + (drawn_rect.min - current_anchor) * ratio + gap_correction,
+                proposed_anchor + (drawn_rect.max - current_anchor) * ratio + gap_correction,
             );
             let correction = pan_correction_for_minimum_overlap(projected_rect, page.viewport_rect);
             Some((correction.length_sq(), proposed_pan + correction))
@@ -6843,6 +6862,24 @@ const PANORAMA_PROJECTION_POPUP_TEXT_LEFT: f32 = 48.0;
 /// 上バーのポップアップ余白 (画面端との最小距離)。
 const BAR_POPUP_SCREEN_MARGIN: f32 = 8.0;
 
+fn draw_spread_popup_heading(ui: &mut egui::Ui, label: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.min.x + 8.0, rect.min.y + 16.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(150),
+    );
+}
+
+fn allocate_spread_popup_row(ui: &mut egui::Ui) -> egui::Rect {
+    let (row_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
+    egui::Rect::from_min_size(row_rect.min, egui::vec2(row_rect.width(), 32.0))
+}
+
 /// 上バーのボタンから吊り下がるポップアップを画面内へ収める。
 ///
 /// ボタンは右端から左へ並ぶので、**右寄りのボタンでは左寄せのままだと画面外へ出る**
@@ -7626,6 +7663,7 @@ impl VerticalReadingPage {
 struct ContinuousReadingUnitSpec {
     anchor_idx: usize,
     presentation: Vec<SpreadPageOccurrence>,
+    singleton_placement: SingletonSpreadPlacement,
     /// 分割中に、この段が元ページのどちら側か。分割していなければ `Full`。
     ///
     /// **同じ `anchor_idx` の段が 2 つ縦に並ぶ**ので、現在位置の照合は左右まで見る。
@@ -7647,6 +7685,7 @@ impl ContinuousReadingUnitSpec {
                 })
                 .collect(),
             slice: crate::page_split::PageSlice::Full,
+            singleton_placement: SingletonSpreadPlacement::Center,
         }
     }
 
@@ -7654,6 +7693,7 @@ impl ContinuousReadingUnitSpec {
         Self {
             anchor_idx: composition.navigation_anchor_idx(),
             presentation: composition.pages_in_screen_order(spread_mode),
+            singleton_placement: composition.singleton_placement(),
             slice: crate::page_split::PageSlice::Full,
         }
     }
@@ -7668,6 +7708,7 @@ impl ContinuousReadingUnitSpec {
                 navigation_anchor_idx: anchor_idx,
             }],
             slice,
+            singleton_placement: SingletonSpreadPlacement::Center,
         }
     }
 
@@ -7810,6 +7851,7 @@ struct ContinuousReadingUnitSize {
     height: f32,
     page_gap: f32,
     logical_scale: f32,
+    singleton_placement: SingletonSpreadPlacement,
 }
 
 fn apply_continuous_spread_geometry(
@@ -7847,8 +7889,11 @@ fn continuous_spread_fit_width(
     flow: ReadingFlow,
     fit_mode: FullscreenFitMode,
     spread_gap: f32,
+    singleton_placement: SingletonSpreadPlacement,
 ) -> (f32, f32) {
-    if page_count == 1
+    if page_count == 1 && singleton_placement != SingletonSpreadPlacement::Center {
+        ((base_width * 2.0).max(1.0), spread_gap.max(0.0))
+    } else if page_count == 1
         && spread_mode.is_spread()
         && flow.is_vertical()
         && matches!(fit_mode, FullscreenFitMode::Width)
@@ -7942,6 +7987,23 @@ fn continuous_unit_layout(
     pixels_per_point: f32,
 ) -> ContinuousUnitLayout {
     let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
+    if let [page] = size.pages.as_slice()
+        && size.singleton_placement != SingletonSpreadPlacement::Center
+    {
+        let (x_lo, x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
+        let (y_lo, y_hi) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
+        let visible_width = (x_hi - x_lo).max(1.0 / pixels_per_point.max(1.0));
+        let visible_height = (y_hi - y_lo).max(1.0 / pixels_per_point.max(1.0));
+        let slot_x = match size.singleton_placement {
+            SingletonSpreadPlacement::Left => 0.0,
+            SingletonSpreadPlacement::Right => visible_width + page_gap,
+            SingletonSpreadPlacement::Center => unreachable!(),
+        };
+        return ContinuousUnitLayout {
+            page_origins: vec![egui::vec2(slot_x - x_lo, -y_lo)],
+            drawn_size: egui::vec2(visible_width * 2.0 + page_gap, visible_height),
+        };
+    }
     // 置く前の可視上端 (ページ中心を原点とした値)。ここから各ページの原点を決める。
     let raw_top = size
         .pages
@@ -9602,11 +9664,36 @@ impl App {
         if !self.spread_mode.is_spread() || self.fullscreen_idx != Some(navigation_anchor_idx) {
             return None;
         }
-        let mut pages = self.fullscreen_page_layout.spread_occurrences()?.to_vec();
-        if self.spread_mode.is_rtl() {
-            pages.reverse();
+        match self.fullscreen_page_layout.kind() {
+            FullscreenPageLayoutKind::Single => {
+                let page = self.fullscreen_page_layout.single_page()?;
+                let occurrence = page.occurrence();
+                if occurrence.navigation_anchor_idx != navigation_anchor_idx {
+                    return None;
+                }
+                let mut composition = SpreadDisplayComposition::from_presentation_pages(
+                    navigation_anchor_idx,
+                    vec![occurrence],
+                )?;
+                composition.singleton_placement = match page.transform.placement {
+                    ResolvedDisplayPlacement::SingletonSpread { side, .. }
+                    | ResolvedDisplayPlacement::Z {
+                        singleton_side: side,
+                        ..
+                    } => side,
+                    ResolvedDisplayPlacement::Normal { .. } => SingletonSpreadPlacement::Center,
+                };
+                Some(composition)
+            }
+            FullscreenPageLayoutKind::Spread => {
+                let mut pages = self.fullscreen_page_layout.spread_occurrences()?.to_vec();
+                if self.spread_mode.is_rtl() {
+                    pages.reverse();
+                }
+                SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
+            }
+            FullscreenPageLayoutKind::Empty | FullscreenPageLayoutKind::Continuous => None,
         }
-        SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
     }
 
     fn capture_fs_navigation_display_unit(
@@ -9622,9 +9709,10 @@ impl App {
         rendition_ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<FsDisplayUnitHoldover> {
+        let canonical = self.spread_display_composition_for_anchor(idx);
         let composition = self
             .painted_spread_display_composition(idx)
-            .unwrap_or_else(|| self.spread_display_composition_for_anchor(idx));
+            .unwrap_or(canonical);
         let pair = composition.spread_pair(self.spread_mode);
         let mut unit =
             self.capture_fs_display_unit_with_rendition_for_pair(rendition_ctx, idx, pair)?;
@@ -9641,6 +9729,7 @@ impl App {
         for (page, occurrence) in unit.pages.iter_mut().zip(occurrences) {
             page.occurrence = occurrence;
         }
+        unit.singleton_placement = composition.singleton_placement();
         Some(unit)
     }
 
@@ -9668,7 +9757,10 @@ impl App {
                     rotation,
                     content_bbox,
                 )?;
-                Some(FsDisplayUnitHoldover { pages: vec![page] })
+                Some(FsDisplayUnitHoldover {
+                    pages: vec![page],
+                    singleton_placement: SingletonSpreadPlacement::Center,
+                })
             }
             SpreadPair::Double { left, right } => {
                 let left_rotation = self.get_rotation(left);
@@ -9718,6 +9810,7 @@ impl App {
                 )?;
                 Some(FsDisplayUnitHoldover {
                     pages: vec![left_page, right_page],
+                    singleton_placement: SingletonSpreadPlacement::Center,
                 })
             }
         }
@@ -11385,6 +11478,7 @@ impl App {
         ctx: &egui::Context,
         image_rect: egui::Rect,
         fs_idx: usize,
+        singleton_placement: SingletonSpreadPlacement,
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
     ) -> Option<DisplayedImageTransform> {
@@ -11417,6 +11511,7 @@ impl App {
                 None,
                 FsPageLayoutSource::CurrentItem,
                 None,
+                singleton_placement,
                 paint_resource.as_ref(),
                 state.thumb_tex.as_ref(),
                 state.is_video,
@@ -11479,6 +11574,11 @@ impl App {
                     active,
                     factor: self.fs_zoom_factor,
                     zoom_pan: None,
+                    singleton_side: singleton_placement,
+                    singleton_gap: quantize_points_to_physical_pixels(
+                        self.settings.spread_page_gap_px.min(200) as f32,
+                        ctx.pixels_per_point(),
+                    ),
                 },
             },
             active,
@@ -11489,7 +11589,8 @@ impl App {
         self.fs_zoom_factor = resolved.factor;
         let zoom_pan = match resolved.transform.placement {
             ResolvedDisplayPlacement::Z { zoom_pan, .. } => zoom_pan,
-            ResolvedDisplayPlacement::Normal { .. } => None,
+            ResolvedDisplayPlacement::Normal { .. }
+            | ResolvedDisplayPlacement::SingletonSpread { .. } => None,
         };
         let bg_style = self.fs_bg_style(ctx);
         // **返すのは実際に描いた transform。** `draw_fs_image` は渡した矩形をテクスチャに
@@ -11503,6 +11604,7 @@ impl App {
             Some(source_size),
             FsPageLayoutSource::CurrentItem,
             Some(resolved.transform),
+            singleton_placement,
             paint_resource.as_ref(),
             state.thumb_tex.as_ref(),
             false,
@@ -13216,6 +13318,7 @@ impl SpreadPageOccurrence {
 pub(crate) struct SpreadDisplayComposition {
     navigation_anchor_idx: usize,
     pages: Vec<SpreadPageOccurrence>,
+    singleton_placement: SingletonSpreadPlacement,
 }
 
 impl SpreadDisplayComposition {
@@ -13254,6 +13357,7 @@ impl SpreadDisplayComposition {
         Some(Self {
             navigation_anchor_idx,
             pages,
+            singleton_placement: SingletonSpreadPlacement::Center,
         })
     }
 
@@ -13270,6 +13374,10 @@ impl SpreadDisplayComposition {
             .iter()
             .filter_map(|page| (page.role == SpreadPageRole::Navigation).then_some(page.idx))
             .collect()
+    }
+
+    pub(crate) fn singleton_placement(&self) -> SingletonSpreadPlacement {
+        self.singleton_placement
     }
 
     fn with_navigation_anchor(mut self, navigation_anchor_idx: usize) -> Option<Self> {
@@ -13340,34 +13448,52 @@ fn compose_spread_navigation_unit(
     is_last_unit: bool,
     spread_mode: SpreadMode,
     final_cover_enabled: bool,
+    singleton_placement_enabled: bool,
     complete_book_eligible: bool,
 ) -> Option<SpreadDisplayComposition> {
-    let base =
+    let mut base =
         SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, navigation_pages)?;
-    if !final_cover_enabled
-        || !complete_book_eligible
-        || !spread_mode.has_cover()
-        || !is_last_unit
-        || first_unit_pages.len() != 1
-        || last_unit_pages.len() != 1
-        || navigation_pages != last_unit_pages
+    if final_cover_enabled
+        && complete_book_eligible
+        && spread_mode.has_cover()
+        && is_last_unit
+        && first_unit_pages.len() == 1
+        && last_unit_pages.len() == 1
+        && navigation_pages == last_unit_pages
     {
-        return Some(base);
+        let cover_idx = first_unit_pages[0];
+        if cover_idx != navigation_anchor_idx {
+            base.pages.push(SpreadPageOccurrence {
+                idx: cover_idx,
+                role: SpreadPageRole::FrontCoverSupplement,
+                navigation_anchor_idx,
+            });
+        }
     }
-    let cover_idx = first_unit_pages[0];
-    if cover_idx == navigation_anchor_idx {
-        return Some(base);
+    if spread_mode.is_spread()
+        && singleton_placement_enabled
+        && complete_book_eligible
+        && base.pages.len() == 1
+    {
+        let first = navigation_pages == first_unit_pages;
+        base.singleton_placement = if first {
+            let right = spread_mode.is_rtl() ^ spread_mode.has_cover();
+            if right {
+                SingletonSpreadPlacement::Right
+            } else {
+                SingletonSpreadPlacement::Left
+            }
+        } else if is_last_unit && navigation_pages == last_unit_pages {
+            if spread_mode.is_rtl() {
+                SingletonSpreadPlacement::Right
+            } else {
+                SingletonSpreadPlacement::Left
+            }
+        } else {
+            SingletonSpreadPlacement::Center
+        };
     }
-    let mut pages = base.pages;
-    pages.push(SpreadPageOccurrence {
-        idx: cover_idx,
-        role: SpreadPageRole::FrontCoverSupplement,
-        navigation_anchor_idx,
-    });
-    Some(SpreadDisplayComposition {
-        navigation_anchor_idx,
-        pages,
-    })
+    Some(base)
 }
 
 /// Compose a cached navigation unit for painting without changing its unit
@@ -13379,6 +13505,7 @@ fn resolve_spread_display_composition(
     unit_pos: usize,
     spread_mode: SpreadMode,
     final_cover_enabled: bool,
+    singleton_placement_enabled: bool,
     complete_book_eligible: bool,
 ) -> Option<SpreadDisplayComposition> {
     let unit = units.get(unit_pos)?;
@@ -13392,6 +13519,7 @@ fn resolve_spread_display_composition(
         unit_pos + 1 == units.len(),
         spread_mode,
         final_cover_enabled,
+        singleton_placement_enabled,
         complete_book_eligible,
     )
 }
@@ -13778,6 +13906,7 @@ fn build_spread_display_units_with_predicates(
 pub(crate) struct RemotePageGroupSpec {
     pub(crate) indices: Vec<usize>,
     pub(crate) slice: crate::page_split::PageSlice,
+    pub(crate) singleton_placement: SingletonSpreadPlacement,
     /// Full screen-order presentation only when it differs from the navigation
     /// pages. Ordinary groups omit it to keep Remote payload budgets stable.
     pub(crate) presentation: Option<Vec<SpreadPageOccurrence>>,
@@ -13788,6 +13917,7 @@ impl RemotePageGroupSpec {
         Self {
             indices,
             slice: crate::page_split::PageSlice::Full,
+            singleton_placement: SingletonSpreadPlacement::Center,
             presentation: None,
         }
     }
@@ -13798,7 +13928,14 @@ pub(crate) fn build_remote_spread_page_groups(
     spread_mode: SpreadMode,
     is_landscape: &[bool],
 ) -> Vec<RemotePageGroupSpec> {
-    build_remote_spread_page_groups_with_composition(items, spread_mode, is_landscape, false, false)
+    build_remote_spread_page_groups_with_composition(
+        items,
+        spread_mode,
+        is_landscape,
+        false,
+        false,
+        false,
+    )
 }
 
 pub(crate) fn build_remote_spread_page_groups_with_composition(
@@ -13806,6 +13943,7 @@ pub(crate) fn build_remote_spread_page_groups_with_composition(
     spread_mode: SpreadMode,
     is_landscape: &[bool],
     final_cover_enabled: bool,
+    singleton_placement_enabled: bool,
     complete_book_eligible: bool,
 ) -> Vec<RemotePageGroupSpec> {
     let visible = (0..items.len()).collect::<Vec<_>>();
@@ -13820,6 +13958,7 @@ pub(crate) fn build_remote_spread_page_groups_with_composition(
         .map(|step| RemotePageGroupSpec {
             indices: vec![step.source_idx],
             slice: step.slice,
+            singleton_placement: SingletonSpreadPlacement::Center,
             presentation: None,
         })
         .collect();
@@ -13850,6 +13989,7 @@ pub(crate) fn build_remote_spread_page_groups_with_composition(
                 unit_pos,
                 spread_mode,
                 final_cover_enabled,
+                singleton_placement_enabled,
                 complete_book_eligible,
             )
             .expect("remote unit position comes from the same non-empty unit list");
@@ -13860,6 +14000,7 @@ pub(crate) fn build_remote_spread_page_groups_with_composition(
             {
                 group.presentation = Some(composition.pages_in_screen_order(spread_mode));
             }
+            group.singleton_placement = composition.singleton_placement();
             group
         })
         .collect()
@@ -15470,7 +15611,7 @@ impl App {
 
     /// Prove the expensive, item-list-dependent part once when the spread-unit cache token is
     /// built. `nav` stays in the existing reader order; this never invents a second sort order.
-    fn final_cover_spread_complete_page_permutation(&self, nav: &[usize]) -> bool {
+    fn spread_complete_page_permutation(&self, nav: &[usize]) -> bool {
         #[cfg(test)]
         FINAL_COVER_ELIGIBILITY_SCAN_COUNT
             .set(FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get().saturating_add(1));
@@ -15485,7 +15626,7 @@ impl App {
 
     /// Transient surface state remains a cheap per-frame gate. The complete-list proof above is
     /// owned by the same cached navigation token used to compose the visible unit.
-    fn final_cover_spread_context_eligible(&self) -> bool {
+    fn spread_complete_book_context_eligible(&self) -> bool {
         if !matches!(
             self.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Folder
@@ -15502,8 +15643,8 @@ impl App {
         true
     }
 
-    fn final_cover_spread_complete_book_eligible(&mut self, nav: &[usize]) -> bool {
-        if !self.final_cover_spread_context_eligible() {
+    fn spread_complete_book_eligible(&mut self, nav: &[usize]) -> bool {
+        if !self.spread_complete_book_context_eligible() {
             return false;
         }
         if let Some(complete) = self
@@ -15512,7 +15653,7 @@ impl App {
         {
             return complete;
         }
-        let complete = self.final_cover_spread_complete_page_permutation(nav);
+        let complete = self.spread_complete_page_permutation(nav);
         self.spread_display_units_cache
             .set_complete_page_permutation(nav, self.items_generation, complete);
         complete
@@ -15536,16 +15677,19 @@ impl App {
             self.get_nav_indices()
         };
         let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+        let singleton_placement_enabled =
+            self.singleton_spread_placement_enabled_for_current_book();
         let units = self.build_spread_display_units_for_nav(&nav);
-        let eligible = self.spread_mode.has_cover()
-            && final_cover_enabled
-            && self.final_cover_spread_complete_book_eligible(&nav);
+        let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
+            || singleton_placement_enabled)
+            && self.spread_complete_book_eligible(&nav);
         let composition = find_spread_display_unit(&units, anchor_idx).and_then(|(unit_pos, _)| {
             resolve_spread_display_composition(
                 &units,
                 unit_pos,
                 self.spread_mode,
                 final_cover_enabled,
+                singleton_placement_enabled,
                 eligible,
             )
         });
@@ -22016,6 +22160,7 @@ impl App {
                                                 ctx,
                                                 image_rect,
                                                 fs_idx,
+                                                display_composition.singleton_placement(),
                                                 &state,
                                                 still_seek_geometry,
                                             );
@@ -22122,6 +22267,7 @@ impl App {
                                                     source_size,
                                                     FsPageLayoutSource::CurrentItem,
                                                     None,
+                                                    display_composition.singleton_placement(),
                                                     paint_resource.as_ref(),
                                                     state.thumb_tex.as_ref(),
                                                     state.is_video,
@@ -22796,6 +22942,8 @@ impl App {
                         let reading_direction_before = self.reading_direction;
                         let final_cover_preference_before =
                             self.final_cover_spread_preference;
+                        let singleton_placement_preference_before =
+                            self.singleton_spread_placement_preference;
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
                         // 音楽ビューも画像用の上部ホバーバーは出さない (music view が自前で
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
@@ -22961,6 +23109,7 @@ impl App {
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
                                 &mut self.final_cover_spread_preference,
+                                &mut self.singleton_spread_placement_preference,
                                 &mut self.spread_popup_open,
                                 is_spread_double,
                                 &mut self.local_adjust_mode,
@@ -23251,6 +23400,17 @@ impl App {
                             // the common setter observes the transition.
                             self.final_cover_spread_preference = final_cover_preference_before;
                             self.set_final_cover_spread_preference_for_fullscreen(
+                                ctx,
+                                preference,
+                            );
+                        }
+                        if self.singleton_spread_placement_preference
+                            != singleton_placement_preference_before
+                        {
+                            let preference = self.singleton_spread_placement_preference;
+                            self.singleton_spread_placement_preference =
+                                singleton_placement_preference_before;
+                            self.set_singleton_spread_placement_preference_for_fullscreen(
                                 ctx,
                                 preference,
                             );
@@ -33983,6 +34143,7 @@ impl App {
         source_size: Option<egui::Vec2>,
         layout_source: FsPageLayoutSource,
         resolved_transform: Option<DisplayedImageTransform>,
+        singleton_placement: SingletonSpreadPlacement,
         tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
         thumb_tex: Option<&egui::TextureHandle>,
         is_video: bool,
@@ -34046,7 +34207,20 @@ impl App {
                 pixels_per_point: ui.ctx().pixels_per_point(),
                 placement: resolved_transform
                     .map(|transform| transform.placement)
-                    .unwrap_or(ResolvedDisplayPlacement::Normal { zoom_pan }),
+                    .unwrap_or_else(|| {
+                        if singleton_placement == SingletonSpreadPlacement::Center {
+                            ResolvedDisplayPlacement::Normal { zoom_pan }
+                        } else {
+                            ResolvedDisplayPlacement::SingletonSpread {
+                                side: singleton_placement,
+                                gap: quantize_points_to_physical_pixels(
+                                    self.settings.spread_page_gap_px.min(200) as f32,
+                                    ui.ctx().pixels_per_point(),
+                                ),
+                                zoom_pan,
+                            }
+                        }
+                    }),
             };
             let transform = match resolved_transform {
                 Some(layout) => {
@@ -34549,6 +34723,52 @@ impl App {
         self.invalidate_final_cover_spread_display(ctx);
     }
 
+    fn persist_current_singleton_spread_placement_preference(&self) {
+        let Some(key) = self.spread_container_key_with_fallback() else {
+            return;
+        };
+        let Some(db) = self.spread_db.as_ref() else {
+            return;
+        };
+        if let Err(error) = db.set_singleton_spread_placement_preference(
+            &key.exact,
+            key.fallback.as_deref(),
+            self.singleton_spread_placement_preference,
+        ) {
+            crate::logger::log(format!(
+                "spread: failed to save singleton placement preference: {error}"
+            ));
+        } else {
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
+    }
+
+    pub(crate) fn invalidate_singleton_spread_placement_display(&mut self, ctx: &egui::Context) {
+        self.invalidate_fullscreen_display_unit_owners();
+        self.clear_final_effect_source_reload_holdover();
+        self.fullscreen_page_layout.clear();
+        self.reset_continuous_reading_transform();
+        if let Some(idx) = self.fullscreen_idx {
+            self.reconcile_fs_navigation_sequence_to_canonical_unit(idx);
+        }
+        ctx.request_repaint();
+    }
+
+    fn set_singleton_spread_placement_preference_for_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        preference: crate::settings::SingletonSpreadPlacementPreference,
+    ) {
+        if self.singleton_spread_placement_preference == preference {
+            return;
+        }
+        self.singleton_spread_placement_preference = preference;
+        self.persist_current_singleton_spread_placement_preference();
+        self.invalidate_singleton_spread_placement_display(ctx);
+    }
+
     pub(crate) fn reset_continuous_reading_transform(&mut self) {
         self.fs_vertical_scroll = 0.0;
         self.fs_pan = egui::Vec2::ZERO;
@@ -34913,16 +35133,19 @@ impl App {
         } else if self.spread_mode.is_spread() {
             let spread_mode = self.spread_mode;
             let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+            let singleton_placement_enabled =
+                self.singleton_spread_placement_enabled_for_current_book();
             let units = self.build_spread_display_units_for_nav(&image_indices);
-            let eligible = spread_mode.has_cover()
-                && final_cover_enabled
-                && self.final_cover_spread_complete_book_eligible(&image_indices);
+            let eligible = ((spread_mode.has_cover() && final_cover_enabled)
+                || singleton_placement_enabled)
+                && self.spread_complete_book_eligible(&image_indices);
             image_units.extend((0..units.len()).filter_map(|unit_pos| {
                 resolve_spread_display_composition(
                     &units,
                     unit_pos,
                     spread_mode,
                     final_cover_enabled,
+                    singleton_placement_enabled,
                     eligible,
                 )
                 .map(|composition| ContinuousReadingUnitSpec::composition(composition, spread_mode))
@@ -35080,6 +35303,7 @@ impl App {
                 page_gap: 0.0,
                 logical_scale: 1.0,
                 pages: vec![page],
+                singleton_placement: unit.singleton_placement,
             };
         }
 
@@ -35089,6 +35313,7 @@ impl App {
             height: 1.0,
             page_gap: 0.0,
             logical_scale: 1.0,
+            singleton_placement: SingletonSpreadPlacement::Center,
         };
         apply_continuous_spread_geometry(&mut size, false);
         size
@@ -35111,7 +35336,9 @@ impl App {
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
         );
-        let page_gap = if base.pages.len() > 1 {
+        let page_gap = if base.pages.len() > 1
+            || base.singleton_placement != SingletonSpreadPlacement::Center
+        {
             spread_gap
         } else {
             0.0
@@ -35123,6 +35350,7 @@ impl App {
             flow,
             fit_mode,
             spread_gap,
+            base.singleton_placement,
         );
         let target_w = (image_rect.width() * zoom - fit_gap_total).max(1.0);
         let target_h = (image_rect.height() * zoom).max(1.0);
@@ -35133,10 +35361,12 @@ impl App {
                 FullscreenFitMode::Height => target_h / base.height.max(1.0),
                 FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
                 FullscreenFitMode::Page => {
-                    (target_w / base.width.max(1.0)).min(target_h / base.height.max(1.0))
+                    (target_w / fit_width.max(1.0)).min(target_h / base.height.max(1.0))
                 }
                 FullscreenFitMode::MarginFit => {
-                    if flow.is_horizontal() {
+                    if base.singleton_placement != SingletonSpreadPlacement::Center {
+                        (target_w / fit_width.max(1.0)).min(target_h / base.height.max(1.0))
+                    } else if flow.is_horizontal() {
                         target_h / base.height.max(1.0)
                     } else {
                         target_w / fit_width.max(1.0)
@@ -35160,6 +35390,7 @@ impl App {
             flow,
             fit_mode,
             spread_gap,
+            base.singleton_placement,
         );
         base.width = (layout_width * scale + fit_gap_total).max(1.0);
         base.height = (base.height * scale).max(1.0);
@@ -38053,6 +38284,7 @@ impl App {
                             post_filter: page.post_filter,
                         },
                         None,
+                        unit.singleton_placement,
                         Some(&page.texture),
                         None,
                         false,
@@ -38418,6 +38650,8 @@ impl App {
                     active: self.fs_zoom_active,
                     factor: self.fs_zoom_factor,
                     zoom_pan: resolved_zoom_pan,
+                    singleton_side: SingletonSpreadPlacement::Center,
+                    singleton_gap: 0.0,
                 }
             } else {
                 ResolvedDisplayPlacement::Normal {
@@ -39024,6 +39258,8 @@ impl App {
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
         final_cover_spread_preference: &mut crate::settings::FinalCoverSpreadPreference,
+        singleton_spread_placement_preference:
+            &mut crate::settings::SingletonSpreadPlacementPreference,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
         _local_adjust_mode: &mut bool,
@@ -39889,12 +40125,14 @@ impl App {
             let popup_x = next_x;
             let popup_y = bar_rect.max.y + 4.0;
             let popup_w = 230.0_f32;
-            let popup_h = (SpreadMode::all().len()
+            let popup_row_count = SpreadMode::all().len()
                 + ReadingFlow::all().len()
                 + crate::settings::FinalCoverSpreadPreference::all().len()
-                + 2) as f32
-                * 36.0
-                + 120.0;
+                + crate::settings::SingletonSpreadPlacementPreference::all().len()
+                + 2;
+            let popup_content_h = 8.0 + 5.0 * 28.0 + popup_row_count as f32 * 36.0;
+            let popup_h = popup_content_h
+                .min((ctx.available_rect().bottom() - popup_y - BAR_POPUP_SCREEN_MARGIN).max(1.0));
             let popup_rect = egui::Rect::from_min_size(
                 egui::pos2(popup_x, popup_y),
                 egui::vec2(popup_w, popup_h),
@@ -39916,221 +40154,251 @@ impl App {
                 egui::StrokeKind::Outside,
             );
 
-            let mut item_y = popup_rect.min.y + 4.0;
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                "ページ構成",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
+            let popup_inner = popup_rect.shrink(4.0);
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(popup_inner)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |popup_ui| {
+                    popup_ui.set_width(popup_inner.width());
+                    popup_ui.set_height(popup_inner.height());
+                    popup_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    let scroll_output = egui::ScrollArea::vertical()
+                        .id_salt("fs_spread_popup_scroll")
+                        .auto_shrink([false, false])
+                        .show_viewport(popup_ui, |scroll_ui, _viewport| {
+                            scroll_ui.spacing_mut().item_spacing.y = 0.0;
+                            draw_spread_popup_heading(scroll_ui, "ページ構成");
+                            for &mode in SpreadMode::all() {
+                                let item_rect = allocate_spread_popup_row(scroll_ui);
+                                let item_resp = scroll_ui.interact(
+                                    item_rect,
+                                    egui::Id::new(format!("spread_popup_{}", mode.to_int())),
+                                    egui::Sense::click(),
+                                );
+                                let is_current = *spread_mode == mode;
+                                let bg = if is_current {
+                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                } else if item_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+
+                                // アイコン (左側)
+                                let icon_center =
+                                    egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
+                                draw_spread_icon(scroll_ui.painter(), icon_center, 7.0, mode);
+
+                                // ラベル (右側)
+                                scroll_ui.painter().text(
+                                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    mode.label(),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_gray(220),
+                                );
+
+                                if let Some(shortcut_label) = spread_mode_key_action(mode)
+                                    .and_then(|action| keymap.first_chord_label(action))
+                                {
+                                    scroll_ui.painter().text(
+                                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format!("[{shortcut_label}]"),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::from_gray(140),
+                                    );
+                                }
+
+                                if item_resp.clicked() {
+                                    *spread_mode = mode;
+                                    if mode.is_rtl() {
+                                        *reading_direction = ReadingDirection::Rtl;
+                                    } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover)
+                                    {
+                                        *reading_direction = ReadingDirection::Ltr;
+                                    }
+                                    *spread_popup_open = false;
+                                }
+                            }
+
+                            draw_spread_popup_heading(scroll_ui, "連結方式");
+                            for &flow in ReadingFlow::all() {
+                                let item_rect = allocate_spread_popup_row(scroll_ui);
+                                let item_resp = scroll_ui.interact(
+                                    item_rect,
+                                    egui::Id::new(format!("reading_flow_popup_{}", flow.to_int())),
+                                    egui::Sense::click(),
+                                );
+                                let is_current = *reading_flow == flow;
+                                let bg = if is_current {
+                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                } else if item_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+                                scroll_ui.painter().text(
+                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    flow.label(),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_gray(220),
+                                );
+                                if let Some(shortcut_label) =
+                                    keymap.first_chord_label(KeyAction::FsReadingFlowCycle)
+                                {
+                                    let suffix = if flow == ReadingFlow::Paged {
+                                        ""
+                                    } else {
+                                        "循環"
+                                    };
+                                    scroll_ui.painter().text(
+                                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format!("[{shortcut_label}{suffix}]"),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::from_gray(140),
+                                    );
+                                }
+                                if item_resp.clicked() {
+                                    *reading_flow = flow;
+                                    *spread_popup_open = false;
+                                }
+                            }
+
+                            draw_spread_popup_heading(scroll_ui, "横方向");
+                            for &direction in &[ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                                let item_rect = allocate_spread_popup_row(scroll_ui);
+                                let item_resp = scroll_ui.interact(
+                                    item_rect,
+                                    egui::Id::new(format!(
+                                        "reading_direction_popup_{}",
+                                        direction.to_int()
+                                    )),
+                                    egui::Sense::click(),
+                                );
+                                let is_current = *reading_direction == direction;
+                                let bg = if is_current {
+                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                } else if item_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+                                scroll_ui.painter().text(
+                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    direction.label(),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_gray(220),
+                                );
+                                if let Some(shortcut_label) =
+                                    keymap.first_chord_label(KeyAction::FsReadingDirectionToggle)
+                                {
+                                    scroll_ui.painter().text(
+                                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format!("[{shortcut_label}]"),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::from_gray(140),
+                                    );
+                                }
+                                if item_resp.clicked() {
+                                    *reading_direction = direction;
+                                    *spread_popup_open = false;
+                                }
+                            }
+
+                            draw_spread_popup_heading(scroll_ui, "末尾に表紙を添える");
+                            for &preference in crate::settings::FinalCoverSpreadPreference::all() {
+                                let item_rect = allocate_spread_popup_row(scroll_ui);
+                                let item_resp = scroll_ui.interact(
+                                    item_rect,
+                                    egui::Id::new(format!(
+                                        "final_cover_spread_popup_{}",
+                                        preference.to_int()
+                                    )),
+                                    egui::Sense::click(),
+                                );
+                                let is_current = *final_cover_spread_preference == preference;
+                                let bg = if is_current {
+                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                } else if item_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+                                scroll_ui.painter().text(
+                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    preference.label(),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_gray(220),
+                                );
+                                if item_resp.clicked() {
+                                    *final_cover_spread_preference = preference;
+                                    *spread_popup_open = false;
+                                }
+                            }
+
+                            draw_spread_popup_heading(scroll_ui, "端の単ページ配置");
+                            for &preference in
+                                crate::settings::SingletonSpreadPlacementPreference::all()
+                            {
+                                let item_rect = allocate_spread_popup_row(scroll_ui);
+                                let item_resp = scroll_ui.interact(
+                                    item_rect,
+                                    egui::Id::new(format!(
+                                        "singleton_spread_placement_popup_{}",
+                                        preference.to_int()
+                                    )),
+                                    egui::Sense::click(),
+                                );
+                                let is_current =
+                                    *singleton_spread_placement_preference == preference;
+                                let bg = if is_current {
+                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                } else if item_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+                                scroll_ui.painter().text(
+                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    preference.label(),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_gray(220),
+                                );
+                                if item_resp.clicked() {
+                                    *singleton_spread_placement_preference = preference;
+                                    *spread_popup_open = false;
+                                }
+                            }
+                        });
+                    #[cfg(not(test))]
+                    let _ = &scroll_output;
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("fs_spread_popup_scroll_test_output"),
+                            (
+                                scroll_output.id,
+                                scroll_output.state.offset,
+                                scroll_output.inner_rect,
+                                scroll_output.content_size,
+                            ),
+                        );
+                    });
+                },
             );
-            item_y += 28.0;
-            for &mode in SpreadMode::all() {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(format!("spread_popup_{}", mode.to_int())),
-                    egui::Sense::click(),
-                );
-                let is_current = *spread_mode == mode;
-                let bg = if is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-
-                // アイコン (左側)
-                let icon_center = egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
-                draw_spread_icon(ui.painter(), icon_center, 7.0, mode);
-
-                // ラベル (右側)
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    mode.label(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-
-                if let Some(shortcut_label) =
-                    spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
-                {
-                    ui.painter().text(
-                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                        egui::Align2::RIGHT_CENTER,
-                        format!("[{shortcut_label}]"),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(140),
-                    );
-                }
-
-                if item_resp.clicked() {
-                    *spread_mode = mode;
-                    if mode.is_rtl() {
-                        *reading_direction = ReadingDirection::Rtl;
-                    } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
-                        *reading_direction = ReadingDirection::Ltr;
-                    }
-                    *spread_popup_open = false;
-                }
-                item_y += 36.0;
-            }
-
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                "連結方式",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-            item_y += 28.0;
-            for &flow in ReadingFlow::all() {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(format!("reading_flow_popup_{}", flow.to_int())),
-                    egui::Sense::click(),
-                );
-                let is_current = *reading_flow == flow;
-                let bg = if is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    flow.label(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-                if let Some(shortcut_label) =
-                    keymap.first_chord_label(KeyAction::FsReadingFlowCycle)
-                {
-                    let suffix = if flow == ReadingFlow::Paged {
-                        ""
-                    } else {
-                        "循環"
-                    };
-                    ui.painter().text(
-                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                        egui::Align2::RIGHT_CENTER,
-                        format!("[{shortcut_label}{suffix}]"),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(140),
-                    );
-                }
-                if item_resp.clicked() {
-                    *reading_flow = flow;
-                    *spread_popup_open = false;
-                }
-                item_y += 36.0;
-            }
-
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                "横方向",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-            item_y += 28.0;
-            for &direction in &[ReadingDirection::Ltr, ReadingDirection::Rtl] {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(format!("reading_direction_popup_{}", direction.to_int())),
-                    egui::Sense::click(),
-                );
-                let is_current = *reading_direction == direction;
-                let bg = if is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    direction.label(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-                if let Some(shortcut_label) =
-                    keymap.first_chord_label(KeyAction::FsReadingDirectionToggle)
-                {
-                    ui.painter().text(
-                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                        egui::Align2::RIGHT_CENTER,
-                        format!("[{shortcut_label}]"),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(140),
-                    );
-                }
-                if item_resp.clicked() {
-                    *reading_direction = direction;
-                    *spread_popup_open = false;
-                }
-                item_y += 36.0;
-            }
-
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                "末尾に表紙を添える",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-            item_y += 28.0;
-            for &preference in crate::settings::FinalCoverSpreadPreference::all() {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(format!("final_cover_spread_popup_{}", preference.to_int())),
-                    egui::Sense::click(),
-                );
-                let is_current = *final_cover_spread_preference == preference;
-                let bg = if is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    preference.label(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-                if item_resp.clicked() {
-                    *final_cover_spread_preference = preference;
-                    *spread_popup_open = false;
-                }
-                item_y += 36.0;
-            }
 
             // ポップアップ外クリックで閉じる
             let pointer_pos = ctx.input(|i| i.pointer.press_origin());
@@ -49598,6 +49866,8 @@ mod tests {
                     let mut reading_direction = ReadingDirection::Ltr;
                     let mut final_cover_spread_preference =
                         crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+                    let mut singleton_spread_placement_preference =
+                        crate::settings::SingletonSpreadPlacementPreference::FollowGlobal;
                     let mut spread_popup_open = false;
                     let mut local_adjust_mode = false;
                     let mut fit_popup_open = false;
@@ -49647,6 +49917,7 @@ mod tests {
                         &mut reading_flow,
                         &mut reading_direction,
                         &mut final_cover_spread_preference,
+                        &mut singleton_spread_placement_preference,
                         &mut spread_popup_open,
                         is_spread_double,
                         &mut local_adjust_mode,
@@ -49700,6 +49971,243 @@ mod tests {
                 });
         });
         (positions, projection_items)
+    }
+
+    struct SpreadPopupTestState {
+        open: bool,
+        singleton_preference: crate::settings::SingletonSpreadPlacementPreference,
+    }
+
+    fn spread_popup_test_frame(
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        events: Vec<egui::Event>,
+        state: &mut SpreadPopupTestState,
+        target: crate::settings::SingletonSpreadPlacementPreference,
+    ) -> Option<egui::Rect> {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(full_rect),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let keymap = Keymap::default();
+                    let mut close = false;
+                    let mut page_nav = FsPageNav::None;
+                    let mut side_panel_mode_pressed = false;
+                    let mut overflow_request = None;
+                    let mut slideshow_playing = false;
+                    let mut slideshow_interval = 5.0;
+                    let mut slideshow_end_action = SlideshowEndAction::default();
+                    let mut rotation_choice = None;
+                    let mut panorama_pressed = false;
+                    let mut panorama_projection_popup_open = false;
+                    let mut panorama_projection_choice = None;
+                    let mut spread_mode = SpreadMode::Ltr;
+                    let mut reading_flow = ReadingFlow::Paged;
+                    let mut reading_direction = ReadingDirection::Ltr;
+                    let mut final_cover_spread_preference =
+                        crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+                    let mut local_adjust_mode = false;
+                    let mut fit_popup_open = false;
+                    let mut slideshow_popup_open = false;
+                    let mut slideshow_wait = 1.0;
+                    let mut slideshow_scroll = 1.0;
+                    let mut slideshow_percent = 100;
+                    let mut fit_mode_choice = None;
+                    let mut fit_no_upscale_choice = None;
+                    let mut fit_no_downscale_choice = None;
+                    let mut view_trim_mode = false;
+                    let mut tile_pressed = false;
+                    let mut vst_pressed = false;
+                    let mut copy_pressed = false;
+                    let mut copy_region_pressed = false;
+                    let mut window_mode_pressed = false;
+                    let mut top_bar_lock_pressed = false;
+                    App::draw_fs_hover_bar(
+                        ui,
+                        ctx,
+                        &keymap,
+                        full_rect,
+                        &[],
+                        &mut close,
+                        &mut page_nav,
+                        crate::settings::FsSidePanelMode::Hover,
+                        &mut side_panel_mode_pressed,
+                        false,
+                        false,
+                        &mut overflow_request,
+                        &mut slideshow_playing,
+                        &mut slideshow_interval,
+                        &mut slideshow_end_action,
+                        crate::rotation_db::Rotation::None,
+                        &mut rotation_choice,
+                        None,
+                        false,
+                        false,
+                        &mut panorama_pressed,
+                        crate::panorama::PanoProjection::Perspective,
+                        &mut panorama_projection_popup_open,
+                        &mut panorama_projection_choice,
+                        &mut spread_mode,
+                        &mut reading_flow,
+                        &mut reading_direction,
+                        &mut final_cover_spread_preference,
+                        &mut state.singleton_preference,
+                        &mut state.open,
+                        false,
+                        &mut local_adjust_mode,
+                        false,
+                        FullscreenFitMode::Page,
+                        false,
+                        false,
+                        &mut fit_popup_open,
+                        &mut slideshow_popup_open,
+                        &mut slideshow_wait,
+                        &mut slideshow_scroll,
+                        &mut slideshow_percent,
+                        &mut fit_mode_choice,
+                        &mut fit_no_upscale_choice,
+                        &mut fit_no_downscale_choice,
+                        &mut view_trim_mode,
+                        false,
+                        false,
+                        None,
+                        false,
+                        &mut tile_pressed,
+                        false,
+                        false,
+                        &mut vst_pressed,
+                        &mut copy_pressed,
+                        &mut copy_region_pressed,
+                        false,
+                        false,
+                        &mut window_mode_pressed,
+                        true,
+                        &mut top_bar_lock_pressed,
+                        false,
+                        None,
+                        false,
+                        1,
+                    );
+                });
+        });
+        ctx.read_response(egui::Id::new(format!(
+            "singleton_spread_placement_popup_{}",
+            target.to_int()
+        )))
+        .map(|response| response.rect)
+    }
+
+    #[test]
+    fn singleton_spread_preferences_remain_scrollable_and_clickable_on_short_viewports() {
+        for height in [576.0, 720.0] {
+            for &target in crate::settings::SingletonSpreadPlacementPreference::all() {
+                let ctx = egui::Context::default();
+                let full_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, height));
+                let mut state = SpreadPopupTestState {
+                    open: true,
+                    singleton_preference: if target
+                        == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    {
+                        crate::settings::SingletonSpreadPlacementPreference::Center
+                    } else {
+                        crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    },
+                };
+                let first_row =
+                    spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target)
+                        .expect("all popup rows retain their interaction owner while clipped");
+                assert!(
+                    !full_rect.contains_rect(first_row),
+                    "the regression requires a clipped endpoint row at height={height}: {first_row:?}"
+                );
+
+                let popup_point = ctx
+                    .read_response(egui::Id::new(format!(
+                        "spread_popup_{}",
+                        SpreadMode::all()[0].to_int()
+                    )))
+                    .expect("the first visible popup row owns the scroll pointer")
+                    .rect
+                    .center();
+                spread_popup_test_frame(
+                    &ctx,
+                    full_rect,
+                    vec![egui::Event::PointerMoved(popup_point)],
+                    &mut state,
+                    target,
+                );
+                assert!(
+                    ctx.read_response(egui::Id::new(format!(
+                        "spread_popup_{}",
+                        SpreadMode::all()[0].to_int()
+                    )))
+                    .is_some_and(|response| response.hovered()),
+                    "the visible first row must own the pointer before scrolling"
+                );
+                let target_rect = spread_popup_test_frame(
+                    &ctx,
+                    full_rect,
+                    vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -2_000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    &mut state,
+                    target,
+                )
+                .unwrap();
+                let target_content_rect =
+                    spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target)
+                        .unwrap_or(target_rect);
+                let scroll_output: (egui::Id, egui::Vec2, egui::Rect, egui::Vec2) = ctx
+                    .data_mut(|data| {
+                        data.get_temp(egui::Id::new("fs_spread_popup_scroll_test_output"))
+                    })
+                    .expect("spread popup scroll output");
+                let target_rect = target_content_rect.translate(-scroll_output.1);
+                assert!(
+                    full_rect.contains_rect(target_rect),
+                    "height={height} target={target:?} did not scroll into view: {target_rect:?}; scroll={scroll_output:?}"
+                );
+
+                let pos = target_rect.center();
+                spread_popup_test_frame(
+                    &ctx,
+                    full_rect,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    &mut state,
+                    target,
+                );
+                spread_popup_test_frame(
+                    &ctx,
+                    full_rect,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    &mut state,
+                    target,
+                );
+                assert_eq!(state.singleton_preference, target);
+                assert!(!state.open, "selection must close the popup");
+            }
+        }
     }
 
     /// 投影ボタンは × / 鍵の隣 (右端寄り) にあるので、そこから吊り下げる一覧が
@@ -50689,6 +51197,7 @@ mod tests {
         app.fs_nav_locked_gen = Some(12);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
+                singleton_placement: SingletonSpreadPlacement::Center,
                 pages: vec![
                     navigation_holdover_page(2, page_2),
                     navigation_holdover_page(3, shared_page_3.clone()),
@@ -50750,6 +51259,7 @@ mod tests {
         app.fs_nav_locked_gen = Some(13);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
+                singleton_placement: SingletonSpreadPlacement::Center,
                 pages: vec![
                     navigation_holdover_page(2, page_2),
                     navigation_holdover_page(3, shared_page_3.clone()),
@@ -51073,6 +51583,57 @@ mod tests {
                 painted_screen
             );
         }
+    }
+
+    #[test]
+    fn navigation_capture_keeps_the_singleton_side_that_was_actually_painted() {
+        let ctx = egui::Context::default();
+        let mut app = final_cover_local_test_app(1);
+        app.spread_mode = SpreadMode::Ltr;
+        app.fullscreen_idx = Some(0);
+        app.settings.singleton_spread_placement_enabled = true;
+        let pixels =
+            std::sync::Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::LIGHT_BLUE));
+        let texture = ctx.load_texture(
+            "painted-singleton-capture",
+            pixels.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([8, 12]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        app.fullscreen_page_layout.push_occurrence(
+            navigator_test_transform(
+                0,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::SingletonSpread {
+                    side: SingletonSpreadPlacement::Left,
+                    gap: 20.0,
+                    zoom_pan: None,
+                },
+            ),
+            SpreadPageOccurrence::navigation(0, 0),
+        );
+
+        // Change the effective preference after paint. Capture must describe the old pixels,
+        // rather than recomputing placement from the new preference/proof.
+        app.settings.singleton_spread_placement_enabled = false;
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        let captured = app.capture_fs_display_unit(0).unwrap();
+        assert_eq!(captured.singleton_placement, SingletonSpreadPlacement::Left);
     }
 
     #[test]
@@ -51471,6 +52032,7 @@ mod tests {
             app.fullscreen_idx = Some(1);
             app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
                 previous: Some(FsDisplayUnitHoldover {
+                    singleton_placement: SingletonSpreadPlacement::Center,
                     pages: vec![navigation_holdover_page(0, held_texture.clone())],
                 }),
                 chrome: FsNavigationChromeContinuation::None,
@@ -51579,6 +52141,7 @@ mod tests {
         app.fs_nav_locked_gen = Some(21);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
+                singleton_placement: SingletonSpreadPlacement::Center,
                 pages: vec![navigation_holdover_page(0, held_texture)],
             }),
             chrome: FsNavigationChromeContinuation::None,
@@ -52324,6 +52887,7 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         let previous = FsDisplayUnitHoldover {
+            singleton_placement: SingletonSpreadPlacement::Center,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 texture: FullscreenPaintResource::direct(old.clone()),
@@ -52918,6 +53482,7 @@ mod tests {
             Some(FullscreenPaintResource::direct(live.clone())),
         );
         let holdover = FsDisplayUnitHoldover {
+            singleton_placement: SingletonSpreadPlacement::Center,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
                 layout_size: held.size_vec2(),
@@ -53192,6 +53757,46 @@ mod tests {
     }
 
     #[test]
+    fn singleton_spread_pan_clamp_preserves_the_fixed_gap_and_keeps_the_page_recoverable() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 640.0));
+        let zoom = 3.0;
+        let gap = 28.0;
+        let make_layout = |pan| {
+            let mut layout = FullscreenPageLayout::default();
+            layout.begin(FullscreenPageLayoutKind::Single);
+            layout.push(
+                DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
+                    page_idx: 1,
+                    viewport_rect: viewport,
+                    source_size: egui::vec2(800.0, 1200.0),
+                    texture_size: egui::vec2(800.0, 1200.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: FullscreenFitMode::Page,
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement: ResolvedDisplayPlacement::SingletonSpread {
+                        side: SingletonSpreadPlacement::Right,
+                        gap,
+                        zoom_pan: Some((zoom, pan)),
+                    },
+                })
+                .unwrap(),
+            );
+            layout
+        };
+        let layout = make_layout(egui::Vec2::ZERO);
+        let pan =
+            clamp_fullscreen_pan_from_layout(&layout, zoom, egui::vec2(100_000.0, -100_000.0));
+        assert_ne!(pan, egui::vec2(100_000.0, -100_000.0));
+        let moved = make_layout(pan);
+        let page = moved.single_page().unwrap().transform;
+        assert!(page.visible_source_uv_rect(viewport).is_some());
+    }
+
+    #[test]
     fn spread_pan_clamp_uses_resolved_zoom_pan_and_keeps_a_page_visible() {
         let viewport = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1000.0, 640.0));
         let zoom = 3.0;
@@ -53252,6 +53857,8 @@ mod tests {
                 active: true,
                 factor: 3.0,
                 zoom_pan: Some((3.0, egui::Vec2::ZERO)),
+                singleton_side: SingletonSpreadPlacement::Center,
+                singleton_gap: 0.0,
             },
         ));
         assert_eq!(
@@ -57542,6 +58149,7 @@ mod tests {
             FsHoldover::FinalEffectSourceReload(crate::app::FinalEffectSourceReloadHoldover {
                 target_idx: 0,
                 previous: FsDisplayUnitHoldover {
+                    singleton_placement: SingletonSpreadPlacement::Center,
                     pages: vec![FsDisplayUnitHoldoverPage {
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
                         layout_size: texture.size_vec2(),
@@ -57569,6 +58177,7 @@ mod tests {
         ));
 
         let folder_navigation = FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
+            singleton_placement: SingletonSpreadPlacement::Center,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 layout_size: texture.size_vec2(),
@@ -65069,7 +65678,7 @@ mod tests {
         ] {
             for (unit_pos, unit) in units.iter().enumerate() {
                 let composition =
-                    resolve_spread_display_composition(&units, unit_pos, mode, false, true)
+                    resolve_spread_display_composition(&units, unit_pos, mode, false, false, true)
                         .unwrap();
                 assert_eq!(composition.navigation_anchor_idx(), unit.anchor_idx());
                 assert_eq!(composition.navigation_pages(), unit.pages);
@@ -65109,13 +65718,14 @@ mod tests {
         ];
 
         let leading =
-            resolve_spread_display_composition(&units, 0, SpreadMode::LtrCover, true, true)
+            resolve_spread_display_composition(&units, 0, SpreadMode::LtrCover, true, false, true)
                 .unwrap();
         assert_eq!(leading.navigation_pages(), vec![0]);
         assert_eq!(leading.pages_in_reading_order().len(), 1);
 
-        let ltr = resolve_spread_display_composition(&units, 2, SpreadMode::LtrCover, true, true)
-            .unwrap();
+        let ltr =
+            resolve_spread_display_composition(&units, 2, SpreadMode::LtrCover, true, false, true)
+                .unwrap();
         assert_eq!(ltr.navigation_anchor_idx(), 3);
         assert_eq!(ltr.navigation_pages(), vec![3]);
         assert_eq!(
@@ -65171,6 +65781,7 @@ mod tests {
                 1,
                 mode,
                 enabled,
+                false,
                 eligible,
             )
             .unwrap();
@@ -65187,15 +65798,145 @@ mod tests {
                 pages: vec![1, 2],
             },
         ];
-        let composition =
-            resolve_spread_display_composition(&paired_last, 1, SpreadMode::LtrCover, true, true)
-                .unwrap();
+        let composition = resolve_spread_display_composition(
+            &paired_last,
+            1,
+            SpreadMode::LtrCover,
+            true,
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(composition.navigation_pages(), vec![1, 2]);
         assert!(
             composition
                 .pages_in_reading_order()
                 .iter()
                 .all(|page| page.role == SpreadPageRole::Navigation)
+        );
+    }
+
+    #[test]
+    fn singleton_endpoint_placement_is_owned_only_by_spread_modes() {
+        let singleton = [0usize];
+        for mode in [
+            SpreadMode::Single,
+            SpreadMode::Vertical,
+            SpreadMode::SplitLtr,
+            SpreadMode::SplitRtl,
+        ] {
+            let composition = compose_spread_navigation_unit(
+                0, &singleton, &singleton, &singleton, true, mode, false, true, true,
+            )
+            .unwrap();
+            assert_eq!(
+                composition.singleton_placement(),
+                SingletonSpreadPlacement::Center,
+                "{mode:?} must not inherit spread-only endpoint placement"
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_endpoint_sides_follow_spread_phase_and_one_page_uses_first_priority() {
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![10],
+            },
+            SpreadDisplayUnit {
+                nav_start: 1,
+                pages: vec![20],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![30],
+            },
+        ];
+        for (mode, first_side, last_side) in [
+            (
+                SpreadMode::Ltr,
+                SingletonSpreadPlacement::Left,
+                SingletonSpreadPlacement::Left,
+            ),
+            (
+                SpreadMode::LtrCover,
+                SingletonSpreadPlacement::Right,
+                SingletonSpreadPlacement::Left,
+            ),
+            (
+                SpreadMode::Rtl,
+                SingletonSpreadPlacement::Right,
+                SingletonSpreadPlacement::Right,
+            ),
+            (
+                SpreadMode::RtlCover,
+                SingletonSpreadPlacement::Left,
+                SingletonSpreadPlacement::Right,
+            ),
+        ] {
+            assert_eq!(
+                resolve_spread_display_composition(&units, 0, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                first_side,
+                "{mode:?} first endpoint"
+            );
+            assert_eq!(
+                resolve_spread_display_composition(&units, 1, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                SingletonSpreadPlacement::Center,
+                "{mode:?} middle singleton"
+            );
+            assert_eq!(
+                resolve_spread_display_composition(&units, 2, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                last_side,
+                "{mode:?} last endpoint"
+            );
+
+            let one_page = [SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![10],
+            }];
+            assert_eq!(
+                resolve_spread_display_composition(&one_page, 0, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                first_side,
+                "{mode:?} one-page book must use first-page phase"
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_placement_requires_complete_book_and_a_real_single_page_presentation() {
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![0],
+            },
+            SpreadDisplayUnit {
+                nav_start: 1,
+                pages: vec![1],
+            },
+        ];
+        assert_eq!(
+            resolve_spread_display_composition(&units, 0, SpreadMode::Ltr, false, true, false,)
+                .unwrap()
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+
+        let supplemented =
+            resolve_spread_display_composition(&units, 1, SpreadMode::LtrCover, true, true, true)
+                .unwrap();
+        assert_eq!(supplemented.pages_in_reading_order().len(), 2);
+        assert_eq!(
+            supplemented.singleton_placement(),
+            SingletonSpreadPlacement::Center
         );
     }
 
@@ -65215,7 +65956,7 @@ mod tests {
         app.build_spread_display_units_for_nav(&nav);
 
         assert!(!app.page_order_locked_for_current_view());
-        assert!(app.final_cover_spread_complete_book_eligible(&nav));
+        assert!(app.spread_complete_book_eligible(&nav));
         let composition = app.spread_display_composition_for_anchor(3);
         assert_eq!(composition.navigation_pages(), vec![3]);
         assert_eq!(
@@ -65250,12 +65991,12 @@ mod tests {
         app.build_spread_display_units_for_nav(&complete);
 
         app.stack_mode_requested = true;
-        assert!(!app.final_cover_spread_complete_book_eligible(&complete));
+        assert!(!app.spread_complete_book_eligible(&complete));
         app.stack_mode_requested = false;
         app.visible_indices.pop();
         let partial = app.current_grid_order().to_vec();
         app.build_spread_display_units_for_nav(&partial);
-        assert!(!app.final_cover_spread_complete_book_eligible(&partial));
+        assert!(!app.spread_complete_book_eligible(&partial));
     }
 
     fn final_cover_local_test_app(item_count: usize) -> crate::app::AppTestEnvForTest {
@@ -65581,6 +66322,7 @@ mod tests {
                     SpreadPageOccurrence::final_cover_supplement(0, 3),
                 ],
                 slice: crate::page_split::PageSlice::Full,
+                singleton_placement: SingletonSpreadPlacement::Center,
             },
         ];
 
@@ -65643,6 +66385,7 @@ mod tests {
             crate::app::FinalEffectSourceReloadHoldover {
                 target_idx: 3,
                 previous: FsDisplayUnitHoldover {
+                    singleton_placement: SingletonSpreadPlacement::Center,
                     pages: vec![navigation_holdover_page(3, texture)],
                 },
                 started_at: std::time::Instant::now(),
@@ -65775,6 +66518,7 @@ mod tests {
             &[false; 4],
             true,
             true,
+            true,
         );
         assert_eq!(
             groups
@@ -65784,7 +66528,15 @@ mod tests {
             vec![vec![0], vec![1, 2], vec![3]]
         );
         assert!(groups[0].presentation.is_none());
+        assert_eq!(
+            groups[0].singleton_placement,
+            SingletonSpreadPlacement::Right
+        );
         assert!(groups[1].presentation.is_none());
+        assert_eq!(
+            groups[1].singleton_placement,
+            SingletonSpreadPlacement::Center
+        );
         assert_eq!(
             groups[2].presentation.as_deref(),
             Some(
@@ -65803,15 +66555,26 @@ mod tests {
                 .as_slice()
             )
         );
+        assert_eq!(
+            groups[2].singleton_placement,
+            SingletonSpreadPlacement::Center,
+            "the real two-page final-cover presentation is not an endpoint singleton"
+        );
 
         let incomplete = build_remote_spread_page_groups_with_composition(
             &items,
             SpreadMode::LtrCover,
             &[false; 4],
             true,
+            true,
             false,
         );
         assert!(incomplete.iter().all(|group| group.presentation.is_none()));
+        assert!(
+            incomplete
+                .iter()
+                .all(|group| group.singleton_placement == SingletonSpreadPlacement::Center)
+        );
     }
 
     #[test]
@@ -68329,6 +69092,7 @@ mod tests {
             height: page_height,
             page_gap: 0.0,
             logical_scale: physical_pixel_scale(pixels_per_point),
+            singleton_placement: SingletonSpreadPlacement::Center,
         };
 
         for offset in offsets {
@@ -68341,6 +69105,39 @@ mod tests {
             assert_f32_close(rects[0].1.min.x * pixels_per_point % 1.0, 0.0);
             assert_f32_close(rects[0].1.min.y * pixels_per_point % 1.0, 0.0);
             assert_f32_close(rects[0].1.height() * pixels_per_point, 101.0);
+        }
+    }
+
+    #[test]
+    fn continuous_singleton_reserves_one_virtual_peer_slot_without_adding_a_page() {
+        let pixels_per_point = 1.5;
+        let page =
+            ContinuousReadingPageSize::full(SpreadPageOccurrence::navigation(7, 7), 400.0, 600.0);
+        let gap = quantize_points_to_physical_pixels(19.0, pixels_per_point);
+        for (placement, expected_min_x) in [
+            (SingletonSpreadPlacement::Left, 100.0),
+            (SingletonSpreadPlacement::Right, 100.0 + 400.0 + gap),
+        ] {
+            let size = ContinuousReadingUnitSize {
+                pages: vec![page.clone()],
+                width: 400.0 * 2.0 + gap,
+                height: 600.0,
+                page_gap: gap,
+                logical_scale: 1.0,
+                singleton_placement: placement,
+            };
+            let unit_rect = egui::Rect::from_min_size(
+                egui::pos2(100.0, 50.0),
+                egui::vec2(400.0 * 2.0 + gap, 600.0),
+            );
+            let rects = continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+            assert_eq!(rects.len(), 1, "placement must not create a peer page");
+            assert_eq!(rects[0].0.idx, 7);
+            assert_f32_close(rects[0].1.min.x, expected_min_x);
+            assert_f32_close(rects[0].1.width(), 400.0);
+
+            let layout = continuous_unit_layout(&size, pixels_per_point);
+            assert_f32_close(layout.drawn_size.x, 400.0 * 2.0 + gap);
         }
     }
 
@@ -68372,6 +69169,7 @@ mod tests {
                     height: page_height,
                     page_gap: 0.0,
                     logical_scale: physical_pixel_scale(pixels_per_point),
+                    singleton_placement: SingletonSpreadPlacement::Center,
                 };
                 let gap_px = (quantize_points_to_physical_pixels(gap, pixels_per_point)
                     * pixels_per_point)
@@ -68440,6 +69238,7 @@ mod tests {
                     height: 1.0,
                     page_gap: 0.0,
                     logical_scale: physical_pixel_scale(pixels_per_point),
+                    singleton_placement: SingletonSpreadPlacement::Center,
                 };
                 // 本番と同じく、置いた後の大きさを unit の長さにする。
                 let drawn = continuous_unit_layout(&size, pixels_per_point).drawn_size;
@@ -68525,6 +69324,7 @@ mod tests {
                             height: *height,
                             page_gap: 0.0,
                             logical_scale: physical_pixel_scale(pixels_per_point),
+                            singleton_placement: SingletonSpreadPlacement::Center,
                         };
                         let unit_rect = egui::Rect::from_center_size(
                             egui::pos2(0.0, *offset),
@@ -68893,6 +69693,7 @@ mod tests {
                 ReadingFlow::Vertical,
                 FullscreenFitMode::Width,
                 4.0,
+                SingletonSpreadPlacement::Center,
             ),
             (200.0, 4.0)
         );
@@ -68904,6 +69705,7 @@ mod tests {
                 ReadingFlow::Vertical,
                 FullscreenFitMode::Height,
                 4.0,
+                SingletonSpreadPlacement::Center,
             ),
             (100.0, 0.0)
         );
@@ -68915,6 +69717,7 @@ mod tests {
                 ReadingFlow::Vertical,
                 FullscreenFitMode::Width,
                 4.0,
+                SingletonSpreadPlacement::Center,
             ),
             (100.0, 0.0)
         );
@@ -68934,6 +69737,7 @@ mod tests {
             height: 100.0,
             page_gap: 0.0,
             logical_scale: 1.0,
+            singleton_placement: SingletonSpreadPlacement::Center,
         };
         let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
         assert_eq!(rects.len(), 1);
@@ -69113,6 +69917,7 @@ mod tests {
             height: 100.0,
             page_gap: 0.0,
             logical_scale: 1.0,
+            singleton_placement: SingletonSpreadPlacement::Center,
         };
 
         let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
@@ -69155,6 +69960,7 @@ mod tests {
             height: 120.0,
             page_gap: 10.0,
             logical_scale: 1.0,
+            singleton_placement: SingletonSpreadPlacement::Center,
         };
 
         let rects = continuous_reading_page_rects(unit_rect, &size, 1.0);
@@ -69188,6 +69994,7 @@ mod tests {
                 height: 1.0,
                 page_gap: 0.0,
                 logical_scale: 1.0,
+                singleton_placement: SingletonSpreadPlacement::Center,
             };
             apply_continuous_spread_geometry(&mut size, false);
             size.width = size.width * scale + 1.0;
@@ -69253,6 +70060,7 @@ mod tests {
                     height: 1.0,
                     page_gap: 0.0,
                     logical_scale: 1.0,
+                    singleton_placement: SingletonSpreadPlacement::Center,
                 };
                 apply_continuous_spread_geometry(
                     &mut size,

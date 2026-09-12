@@ -2830,3 +2830,20 @@ ZIP の中身が 1 つのフォルダにまとまっていると、本体は `co
 キーを求めるためだけに書庫を開くことになる。**サーバは既に解決結果を応答へ載せている**
 ので、端末がそれを使えばよい。ずれを見つけやすくするため、要求側と実効側でキーが別行に
 なることを ui.rs の試験で固定した。
+
+## 16. 見開き端の単ページ配置 (§1.218、2026-09-13)
+
+coreの共通`SpreadDisplayComposition`が、complete-book proofとcanonical unit位置から
+`Center / Left / Right`を解決する。Remote serverはその値を`PageGroup.singleton_spread_placement`へ
+写すだけで、container / ZIP / PDFごとの端判定を複製しない。旧payloadでfieldが無い場合は
+`Center`。collection、truncated、syntheticなど本全体を証明できない列も`Center`である。
+
+Webは表示する1page自身を左右へ複製した寸法の仮想2-slot canvasとgapをlayoutとして確保し、選んだ
+slotへ実imageを1件だけ置く。`anchor / pages / presentation / slice`、DOM child、page request、decode
+leaseは増やさない。Page / Width / Originalのrefit、resize、調整blob差し替えも同じgroup-owned
+placementを使う。actual DOM回帰はLeft / Rightそれぞれで`ImageViewer.loadGroup`を通し、image 1件、
+仮想幅`2 * page + gap`、dataset、各refitとadjustment replacement後の維持を固定する。
+
+本別設定は`全体設定に従う / 配置する / 中央表示`のtyped writeで、全体既定はOFF。書込後のrefreshは
+現在anchor / slice / historyを維持し、group layoutだけを更新する。詳細は
+[§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。

@@ -2910,6 +2910,55 @@ impl FinalCoverSpreadPreference {
     }
 }
 
+/// Whether an endpoint singleton in spread mode follows the global placement
+/// setting or is overridden for the current book container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SingletonSpreadPlacementPreference {
+    #[default]
+    FollowGlobal,
+    Place,
+    Center,
+}
+
+impl SingletonSpreadPlacementPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::Place, Self::Center]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::Place => "配置する",
+            Self::Center => "中央表示",
+        }
+    }
+
+    pub(crate) const fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::Place => true,
+            Self::Center => false,
+        }
+    }
+
+    pub(crate) const fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::Place => 1,
+            Self::Center => 2,
+        }
+    }
+
+    pub(crate) const fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::Place),
+            2 => Some(Self::Center),
+            _ => None,
+        }
+    }
+}
+
 // ReadingFlow (フルスクリーン連結方式)
 // -----------------------------------------------------------------------
 
@@ -4310,6 +4359,9 @@ pub struct Settings {
     /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
     #[serde(default = "default_true")]
     pub final_cover_spread_enabled: bool,
+    /// 見開きの先頭・末尾に残る単ページを、本来の左右へ置く全体既定。
+    #[serde(default)]
+    pub singleton_spread_placement_enabled: bool,
     /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
     #[serde(default = "default_spread_page_gap_px")]
     pub spread_page_gap_px: u32,
@@ -6491,6 +6543,7 @@ impl Default for Settings {
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
+            singleton_spread_placement_enabled: false,
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
@@ -12512,6 +12565,27 @@ mod tests {
             );
         }
         assert_eq!(FinalCoverSpreadPreference::from_int(3), None);
+    }
+
+    #[test]
+    fn singleton_spread_placement_defaults_off_and_book_preference_resolves_explicitly() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.singleton_spread_placement_enabled);
+        assert!(SingletonSpreadPlacementPreference::FollowGlobal.effective(true));
+        assert!(!SingletonSpreadPlacementPreference::FollowGlobal.effective(false));
+        assert!(SingletonSpreadPlacementPreference::Place.effective(false));
+        assert!(!SingletonSpreadPlacementPreference::Center.effective(true));
+        for preference in [
+            SingletonSpreadPlacementPreference::FollowGlobal,
+            SingletonSpreadPlacementPreference::Place,
+            SingletonSpreadPlacementPreference::Center,
+        ] {
+            assert_eq!(
+                SingletonSpreadPlacementPreference::from_int(preference.to_int()),
+                Some(preference)
+            );
+        }
+        assert_eq!(SingletonSpreadPlacementPreference::from_int(3), None);
     }
 
     #[test]

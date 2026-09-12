@@ -14,9 +14,10 @@ use mimageviewer_ipc::{
     RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
     RemoteEntryKind, RemoteFinalCoverSpreadPreference, RemotePageDisplaySlot,
     RemotePagePresentationRole, RemotePagePresentationSlot, RemotePageRenderContext,
-    RemoteReadingDirection, RemoteSpreadMode, RemoteSubresource, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
-    ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
+    RemoteReadingDirection, RemoteSingletonSpreadPlacement,
+    RemoteSingletonSpreadPlacementPreference, RemoteSpreadMode, RemoteSubresource,
+    RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
+    RemoteWriteResult, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
 };
 
 use super::path_guard::{
@@ -1923,6 +1924,8 @@ struct SpreadPayload {
     reading_direction: RemoteReadingDirection,
     final_cover_preference: RemoteFinalCoverSpreadPreference,
     final_cover_enabled: bool,
+    singleton_placement_preference: RemoteSingletonSpreadPlacementPreference,
+    singleton_placement_enabled: bool,
     spread_page_gap_px: u32,
     image_count: usize,
     video_count: usize,
@@ -2751,7 +2754,8 @@ impl ContainerEngine {
         }
         match request {
             RemoteWriteRequest::SetSpread { address, .. }
-            | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. } => {
+            | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. }
+            | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { address, .. } => {
                 let resolved = self
                     .resolve(address)
                     .map_err(remote_write_error_from_media)?;
@@ -4542,6 +4546,8 @@ impl ContainerEngine {
             reading_direction: spread.reading_direction,
             final_cover_spread_preference: spread.final_cover_preference,
             final_cover_spread_enabled: spread.final_cover_enabled,
+            singleton_spread_placement_preference: spread.singleton_placement_preference,
+            singleton_spread_placement_enabled: spread.singleton_placement_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4694,6 +4700,8 @@ impl ContainerEngine {
             reading_direction: spread.reading_direction,
             final_cover_spread_preference: spread.final_cover_preference,
             final_cover_spread_enabled: spread.final_cover_enabled,
+            singleton_spread_placement_preference: spread.singleton_placement_preference,
+            singleton_spread_placement_enabled: spread.singleton_placement_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4777,6 +4785,8 @@ impl ContainerEngine {
             reading_direction: spread.reading_direction,
             final_cover_spread_preference: spread.final_cover_preference,
             final_cover_spread_enabled: spread.final_cover_enabled,
+            singleton_spread_placement_preference: spread.singleton_placement_preference,
+            singleton_spread_placement_enabled: spread.singleton_placement_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4806,7 +4816,7 @@ impl ContainerEngine {
         } else {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (stored_mode, stored_direction, final_cover_preference) =
+        let (stored_mode, stored_direction, final_cover_preference, singleton_placement_preference) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref());
         let source_items = source_items.unwrap_or(items);
         let (default_mode, default_direction) = if use_book_defaults {
@@ -4840,11 +4850,14 @@ impl ContainerEngine {
         };
         let final_cover_enabled =
             final_cover_preference.effective(reading_settings.final_cover_spread_enabled);
+        let singleton_placement_enabled = singleton_placement_preference
+            .effective(reading_settings.singleton_spread_placement_enabled);
         let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_composition(
             items,
             core_spread_mode(effective),
             &landscape,
             final_cover_enabled,
+            singleton_placement_enabled,
             complete_book_eligible,
         );
         let container_address = page_identity_from_resolved(resolved, &request.address.subresource);
@@ -4883,6 +4896,9 @@ impl ContainerEngine {
                     pages,
                     presentation,
                     slice: crate::ui_fullscreen::remote_page_slice(group.slice),
+                    singleton_placement: remote_singleton_spread_placement(
+                        group.singleton_placement,
+                    ),
                 })
             })
             .collect::<Vec<_>>();
@@ -4892,6 +4908,10 @@ impl ContainerEngine {
             reading_direction,
             final_cover_preference: remote_final_cover_preference(final_cover_preference),
             final_cover_enabled,
+            singleton_placement_preference: remote_singleton_spread_placement_preference(
+                singleton_placement_preference,
+            ),
+            singleton_placement_enabled,
             spread_page_gap_px: reading_settings.spread_page_gap_px,
             image_count,
             video_count,
@@ -4908,6 +4928,7 @@ impl ContainerEngine {
         Option<crate::settings::SpreadMode>,
         Option<crate::settings::ReadingDirection>,
         crate::settings::FinalCoverSpreadPreference,
+        crate::settings::SingletonSpreadPlacementPreference,
     ) {
         let db = self
             .spread_db
@@ -4921,7 +4942,16 @@ impl ContainerEngine {
             .as_ref()
             .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
             .unwrap_or_default();
-        (stored.mode, stored.direction, final_cover_preference)
+        let singleton_placement_preference = db
+            .as_ref()
+            .map(|db| db.get_singleton_spread_placement_preference_with_fallback(key, fallback))
+            .unwrap_or_default();
+        (
+            stored.mode,
+            stored.direction,
+            final_cover_preference,
+            singleton_placement_preference,
+        )
     }
 
     fn remote_view_trim_plan(
@@ -6694,6 +6724,38 @@ fn remote_final_cover_preference(
     }
 }
 
+fn remote_singleton_spread_placement_preference(
+    preference: crate::settings::SingletonSpreadPlacementPreference,
+) -> RemoteSingletonSpreadPlacementPreference {
+    match preference {
+        crate::settings::SingletonSpreadPlacementPreference::FollowGlobal => {
+            RemoteSingletonSpreadPlacementPreference::FollowGlobal
+        }
+        crate::settings::SingletonSpreadPlacementPreference::Place => {
+            RemoteSingletonSpreadPlacementPreference::Place
+        }
+        crate::settings::SingletonSpreadPlacementPreference::Center => {
+            RemoteSingletonSpreadPlacementPreference::Center
+        }
+    }
+}
+
+fn remote_singleton_spread_placement(
+    placement: crate::displayed_image_transform::SingletonSpreadPlacement,
+) -> RemoteSingletonSpreadPlacement {
+    match placement {
+        crate::displayed_image_transform::SingletonSpreadPlacement::Center => {
+            RemoteSingletonSpreadPlacement::Center
+        }
+        crate::displayed_image_transform::SingletonSpreadPlacement::Left => {
+            RemoteSingletonSpreadPlacement::Left
+        }
+        crate::displayed_image_transform::SingletonSpreadPlacement::Right => {
+            RemoteSingletonSpreadPlacement::Right
+        }
+    }
+}
+
 fn remote_page_presentation_role(
     role: crate::ui_fullscreen::SpreadPageRole,
 ) -> RemotePagePresentationRole {
@@ -7298,6 +7360,7 @@ mod tests {
                 pages: vec![entry.address.clone()],
                 presentation: None,
                 slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
             })
             .collect();
         ContainerPayload {
@@ -7318,6 +7381,9 @@ mod tests {
             reading_direction: RemoteReadingDirection::Ltr,
             final_cover_spread_preference: RemoteFinalCoverSpreadPreference::FollowGlobal,
             final_cover_spread_enabled: true,
+            singleton_spread_placement_preference:
+                RemoteSingletonSpreadPlacementPreference::FollowGlobal,
+            singleton_spread_placement_enabled: false,
             image_count: total,
             video_count: 0,
             other_count: 0,
@@ -10345,6 +10411,7 @@ mod tests {
         let engine = ContainerEngine::new(crate::settings::Settings {
             default_spread_mode: crate::settings::SpreadMode::LtrCover,
             default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            singleton_spread_placement_enabled: true,
             ..Default::default()
         });
         *engine
@@ -10389,6 +10456,18 @@ mod tests {
             assert_eq!(spread.image_count, 1);
             assert_eq!(spread.video_count, 0);
             assert_eq!(spread.other_count, 0);
+            assert_eq!(
+                spread.singleton_placement_preference,
+                RemoteSingletonSpreadPlacementPreference::FollowGlobal
+            );
+            assert!(spread.singleton_placement_enabled);
+            assert_eq!(spread.groups.len(), 1);
+            assert_eq!(spread.groups[0].pages.len(), 1);
+            assert_eq!(
+                spread.groups[0].singleton_placement,
+                RemoteSingletonSpreadPlacement::Right,
+                "one-page {extension} must use the LtrCover first-page slot"
+            );
         }
     }
 

@@ -1486,6 +1486,20 @@ Guidanceを作る。viewport predicate、host identity、placement、focus、geo
 retire規則は変更しない。これは既存mode/fraction/dragの分裂を解消する入力所有の統合であり、§2が
 禁じるdetached向けの症状guardではない。
 
+**2026-09-13 §1.218 見開き端の単ページ配置（親Codex／独立Sol構造合意・実装済み）**
+
+先頭・末尾の単ページを本来の側へ置く機能は、detached専用判定を追加せず、既存の
+`SpreadDisplayComposition`へtyped placementを統合した。main / linked F12 / 複数windowは、mountした
+`ViewerContextBundle`が所有する本別3状態と、共通のpaged / continuous / Z layoutを使う。park時は
+`FsDisplayUnitHoldover`が実paint transformからcaptureしたplacementを保持し、current settingsや別contextの
+unit列から再判定しない。全体設定変更は`FollowGlobal`のAtRest ownerだけを既存registry transactionで
+invalidateし、明示overrideの兄弟contextは変更しない。viewport、host、focus、placement、generation、
+park / mount / retire規則に新しいdetached分岐や時間guardを足していない。
+
+Remoteも同じcompositionからserde default `Center`のplacementを受け取る。空き側はlayout上の仮想slotだけで、
+source、page occurrence、request、DOM imageを増やさない。詳細と回帰は
+[§1.218設計・検証記録](section218-singleton-spread-placement.md)に残す。
+
 **2026-09-12 旧XMPタグ自動seedのcontext owner撤去（利用者了承・親Codex／独立Sol合意）**
 
 フォルダ通常load、prepared subfolder、明示metadata import終端refreshから起動していた

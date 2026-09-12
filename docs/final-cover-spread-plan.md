@@ -204,6 +204,13 @@ B2r6の最終独立reviewはP1/P2なしで承認。中央setterはitems世代が
 
 ## 後続の受入確認
 
+2026-09-13の§1.218では、先頭・末尾の単ページを本来の側へ置く機能を独立設定として追加した。
+本機能の`FrontCoverSupplement`とnavigation/presentation分離はそのまま維持する。共通compositionはまず
+末尾表紙補助を解決し、補助後も実1pageでcomplete-book proofを満たす場合だけsingleton placementを
+付けるため、表紙を添えて実2pageになった末尾へ片側配置を重ねない。両機能は`spread.db`で別table、
+metadata transferでも別fieldとして移送し、どちらかを変更して他方のrowをmaterializeしない。
+詳細は[§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。
+
 | 境界 | 必須の確認 |
 | --- | --- |
 | 共通構成 | LTR/RTL、両端Single、1ページ本、末尾Double、横長/保存回転/ずらし、OFF、非Cover、完全列条件。navigation列とページ数を保存 |

@@ -437,6 +437,16 @@ unit anchor と role で区別する。保持対象は残存 unit の source の
 Remote は navigation の `PageGroup.anchor/pages/slice` を維持し、補助のある group だけに
 role 付き `presentation` を付加する。仕様・検証状況は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。
 
+端の単ページを本来の側へ置く設定では、同じ `SpreadDisplayComposition` が
+`Center / Left / Right` の layout projection を所有する。末尾表紙補助を解決した後も実 1 page で、
+全ページを含む本であることを証明できる先頭・末尾 unit だけが対象になる。先頭側は cover 位相を含む
+見開き mode、末尾側は綴じ方向から決まり、1 page 本は先頭規則を優先する。空き側は同じ page 寸法を
+使う仮想 slot であり、`SpreadPair`、navigation、occurrence、page count、source request は増やさない。
+paged / Z / 連結読み / Remote は composition の placement と物理 pixel 量子化済み gap を共用する。
+`FullscreenPageLayout` は実際に描いた側を transform に残し、navigator・範囲選択・edit hit はその値を読む。
+holdover は capture 時の transform から placement を取り込み、後から設定や canonical unit を再解決しない。
+詳細は[端の単ページ配置の設計・検証記録](section218-singleton-spread-placement.md)を参照。
+
 paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
 表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
 GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
@@ -464,7 +474,8 @@ Ctrl+↑↓ のフォルダ横断と、同じ表示ユニットの final-effect 
   `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
   canonical coordinate source size、PDF page box（通常画像は source size）由来の独立した
   canonical layout size、実表示に使った単ページ / 見開き側別 content bbox、paint-time
-  post-filter と診断 identity を所有する。
+  post-filter と診断 identity を所有する。片側配置した endpoint singleton では、実paint transformが
+  確定した `Left / Right` も unit に保持し、待機中に中央へ戻さない。
 - `FinalEffectSourceReload { target_idx, previous, started_at }`: PDF の Z ズーム再レンダなど、同じ
   表示ユニットの source が差し替わる直前に、`previous.pages` へ単ページまたは見開き全体を保持する。
   `capture_final_effect_source_reload_holdover` だけが作り、左右別 slot は持たない。`started_at` は

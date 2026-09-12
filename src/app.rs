@@ -8590,6 +8590,9 @@ pub(crate) struct FinalEffectSourceReloadHoldover {
 pub(crate) struct FsDisplayUnitHoldover {
     /// 画面上の順序。単ページは 1 要素、見開きは [left, right] の 2 要素。
     pub(crate) pages: Vec<FsDisplayUnitHoldoverPage>,
+    /// Capture-time layout projection. Folder/navigation changes must not
+    /// re-derive this from the subsequently mounted context.
+    pub(crate) singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement,
 }
 
 #[derive(Clone)]
@@ -13380,6 +13383,8 @@ pub struct App {
     /// フォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
+    pub(crate) singleton_spread_placement_preference:
+        crate::settings::SingletonSpreadPlacementPreference,
     /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
     /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
     pub(crate) spread_shift_anchor_idx: Option<usize>,
@@ -16376,6 +16381,8 @@ impl App {
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
+            singleton_spread_placement_preference:
+                crate::settings::SingletonSpreadPlacementPreference::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -20522,6 +20529,11 @@ impl App {
             .effective(self.settings.final_cover_spread_enabled)
     }
 
+    pub(crate) fn singleton_spread_placement_enabled_for_current_book(&self) -> bool {
+        self.singleton_spread_placement_preference
+            .effective(self.settings.singleton_spread_placement_enabled)
+    }
+
     /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
     /// **ルート表示の扱いだけ** 異なる。
     ///
@@ -20589,6 +20601,9 @@ impl App {
             .unwrap_or_default();
         self.final_cover_spread_preference = db
             .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
+            .unwrap_or_default();
+        self.singleton_spread_placement_preference = db
+            .map(|db| db.get_singleton_spread_placement_preference_with_fallback(key, fallback))
             .unwrap_or_default();
         let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
@@ -30910,6 +30925,8 @@ impl App {
             self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
             self.final_cover_spread_preference = container.final_cover_spread_preference;
+            self.singleton_spread_placement_preference =
+                container.singleton_spread_placement_preference;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
                 crate::view_trim::ViewTrimApplyMode::Page => {

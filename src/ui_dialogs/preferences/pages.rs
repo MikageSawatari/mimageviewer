@@ -8734,6 +8734,12 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
+    anchored(ui, state, "spread/singleton-placement", |ui, state| {
+        draw_singleton_spread_placement_setting(
+            ui,
+            &mut state.settings.singleton_spread_placement_enabled,
+        );
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/reading-flow", |ui, state| {
         let s = &mut state.settings;
@@ -9043,6 +9049,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
     ui.checkbox(enabled, "末尾に表紙を添える");
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+pub(super) fn draw_singleton_spread_placement_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "見開きの先頭・末尾の単ページを片側に配置");
+    ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
 }
 
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {

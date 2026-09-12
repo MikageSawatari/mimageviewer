@@ -310,6 +310,7 @@ pub(crate) struct RemoteReadingSettings {
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
     pub(crate) final_cover_spread_enabled: bool,
+    pub(crate) singleton_spread_placement_enabled: bool,
     pub(crate) spread_page_gap_px: u32,
 }
 
@@ -319,6 +320,7 @@ impl RemoteReadingSettings {
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
+            singleton_spread_placement_enabled: settings.singleton_spread_placement_enabled,
             spread_page_gap_px: settings.spread_page_gap_px,
         }
     }
@@ -811,6 +813,11 @@ impl SettingsDb {
                 &inner.conn,
                 "final_cover_spread_enabled",
                 || fallback.final_cover_spread_enabled,
+            )?,
+            singleton_spread_placement_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "singleton_spread_placement_enabled",
+                || fallback.singleton_spread_placement_enabled,
             )?,
             spread_page_gap_px: read_settings_kv_typed(&inner.conn, "spread_page_gap_px", || {
                 fallback.spread_page_gap_px
@@ -4929,6 +4936,7 @@ mod tests {
         live.default_spread_mode = crate::settings::SpreadMode::RtlCover;
         live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
         live.final_cover_spread_enabled = false;
+        live.singleton_spread_placement_enabled = true;
         live.spread_page_gap_px = 19;
         db.save_full(&live).unwrap();
 
@@ -4936,6 +4944,7 @@ mod tests {
         fallback.default_spread_mode = crate::settings::SpreadMode::Ltr;
         fallback.default_reading_direction = crate::settings::ReadingDirection::Ltr;
         fallback.final_cover_spread_enabled = true;
+        fallback.singleton_spread_placement_enabled = false;
         fallback.spread_page_gap_px = 3;
         assert_eq!(
             db.load_remote_reading_settings(&fallback).unwrap(),
@@ -4946,13 +4955,14 @@ mod tests {
             .lock()
             .unwrap()
             .conn
-            .execute(
-                "DELETE FROM settings_kv WHERE key = 'final_cover_spread_enabled'",
-                [],
+            .execute_batch(
+                "DELETE FROM settings_kv WHERE key = 'final_cover_spread_enabled';
+                 DELETE FROM settings_kv WHERE key = 'singleton_spread_placement_enabled';",
             )
             .unwrap();
         let loaded = db.load_remote_reading_settings(&fallback).unwrap();
         assert!(loaded.final_cover_spread_enabled);
+        assert!(!loaded.singleton_spread_placement_enabled);
         assert_eq!(loaded.default_spread_mode, live.default_spread_mode);
         assert_eq!(
             loaded.default_reading_direction,

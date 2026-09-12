@@ -1,11 +1,11 @@
 use mimageviewer_ipc::{
     RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState,
     RemoteAiModelCatalog, RemoteAiModelOption, RemoteFinalCoverSpreadPreference, RemoteItemState,
-    RemoteReadingDirection, RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource,
-    RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
-    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
-    TailnetProbe, VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError,
-    VideoStreamErrorCode,
+    RemoteReadingDirection, RemoteSessionIdentity, RemoteSingletonSpreadPlacementPreference,
+    RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus, RemoteWriteError,
+    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
+    SessionConnectionKind, SessionResponse, SessionStatus, TailnetProbe, VideoStreamControlAction,
+    VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -1837,6 +1837,10 @@ impl crate::app::App {
                 address,
                 preference,
             } => self.persist_remote_final_cover_spread_preference(address, *preference),
+            RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
+                address,
+                preference,
+            } => self.persist_remote_singleton_spread_placement_preference(address, *preference),
             RemoteWriteRequest::RecordReadingProgress {
                 address,
                 context_address,
@@ -2103,6 +2107,47 @@ impl crate::app::App {
             Err(error) => {
                 crate::logger::log(format!(
                     "remote_ipc: UI write failed kind=set_final_cover_spread_preference duration_ms={:.1} error={error}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "spread.db への保存に失敗しました",
+                )
+            }
+        }
+    }
+
+    fn persist_remote_singleton_spread_placement_preference(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        preference: RemoteSingletonSpreadPlacementPreference,
+    ) -> RemoteWriteResponse {
+        let key = match remote_spread_key(address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let Some(db) = self.spread_db.as_mut() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "spread.db を開けなかったため保存できません",
+            );
+        };
+        let started = std::time::Instant::now();
+        match db.set_singleton_spread_placement_preference(
+            &key.exact,
+            key.fallback.as_deref(),
+            core_singleton_spread_placement_preference(preference),
+        ) {
+            Ok(()) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write applied kind=set_singleton_spread_placement_preference duration_ms={:.1}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: UI write failed kind=set_singleton_spread_placement_preference duration_ms={:.1} error={error}",
                     started.elapsed().as_secs_f64() * 1000.0
                 ));
                 write_error(
@@ -3788,6 +3833,22 @@ fn core_final_cover_spread_preference(
         }
         RemoteFinalCoverSpreadPreference::On => crate::settings::FinalCoverSpreadPreference::On,
         RemoteFinalCoverSpreadPreference::Off => crate::settings::FinalCoverSpreadPreference::Off,
+    }
+}
+
+fn core_singleton_spread_placement_preference(
+    preference: RemoteSingletonSpreadPlacementPreference,
+) -> crate::settings::SingletonSpreadPlacementPreference {
+    match preference {
+        RemoteSingletonSpreadPlacementPreference::FollowGlobal => {
+            crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+        }
+        RemoteSingletonSpreadPlacementPreference::Place => {
+            crate::settings::SingletonSpreadPlacementPreference::Place
+        }
+        RemoteSingletonSpreadPlacementPreference::Center => {
+            crate::settings::SingletonSpreadPlacementPreference::Center
+        }
     }
 }
 

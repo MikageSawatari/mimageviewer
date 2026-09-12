@@ -2309,6 +2309,8 @@ impl App {
                 let old_fullscreen_side_panel_mode =
                     self.settings.fullscreen_side_panel_mode.normalized();
                 let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
+                let old_singleton_spread_placement_enabled =
+                    self.settings.singleton_spread_placement_enabled;
                 let old_ui_font = self.settings.ui_font.clone();
                 let old_creative_luts = self.settings.creative_luts.clone();
                 let mut creative_lut_transaction =
@@ -2379,6 +2381,17 @@ impl App {
                         == crate::settings::FinalCoverSpreadPreference::FollowGlobal
                     {
                         self.invalidate_final_cover_spread_display(ctx);
+                    }
+                }
+                if old_singleton_spread_placement_enabled
+                    != self.settings.singleton_spread_placement_enabled
+                {
+                    #[cfg(windows)]
+                    self.invalidate_singleton_spread_placement_in_parked_contexts();
+                    if self.singleton_spread_placement_preference
+                        == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    {
+                        self.invalidate_singleton_spread_placement_display(ctx);
                     }
                 }
                 #[cfg(windows)]
@@ -3950,6 +3963,31 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_final_cover_spread_setting");
+    }
+
+    #[test]
+    fn singleton_spread_placement_setting_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut enabled = true;
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(540.0, 100.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    draw_singleton_spread_placement_setting(ui, &mut enabled);
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_singleton_spread_placement_setting");
     }
 
     fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {

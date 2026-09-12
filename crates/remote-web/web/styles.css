@@ -1319,6 +1319,14 @@ select {
   will-change: transform;
 }
 
+.viewer-pages[data-singleton-placement="left"] {
+  justify-content: flex-start;
+}
+
+.viewer-pages[data-singleton-placement="right"] {
+  justify-content: flex-end;
+}
+
 .viewer-boundary-message {
   position: absolute;
   z-index: 3;

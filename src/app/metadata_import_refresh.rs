@@ -76,6 +76,8 @@ pub(crate) struct ContainerStateResult {
     pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
     pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
+    pub(crate) singleton_spread_placement_preference:
+        crate::settings::SingletonSpreadPlacementPreference,
     pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
 }
 
@@ -539,12 +541,18 @@ fn build_context_result(
                 let final_cover_spread_preference = spread_db
                     .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
                     .unwrap_or_default();
+                let singleton_spread_placement_preference = spread_db
+                    .map(|db| {
+                        db.get_singleton_spread_placement_preference_with_fallback(path, fallback)
+                    })
+                    .unwrap_or_default();
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
                 ContainerStateResult {
                     spread_mode,
                     reading_flow,
                     reading_direction,
                     final_cover_spread_preference,
+                    singleton_spread_placement_preference,
                     view_trim,
                 }
             })
@@ -779,8 +787,8 @@ mod tests {
     }
 
     #[test]
-    fn final_cover_refresh_preserves_nested_fallback_and_explicit_follow_global() {
-        use crate::settings::FinalCoverSpreadPreference;
+    fn spread_preferences_refresh_preserves_nested_fallback_and_explicit_follow_global() {
+        use crate::settings::{FinalCoverSpreadPreference, SingletonSpreadPlacementPreference};
 
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -791,6 +799,13 @@ mod tests {
         crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
         spread_db
             .set_final_cover_spread_preference(&root, None, FinalCoverSpreadPreference::Off)
+            .unwrap();
+        spread_db
+            .set_singleton_spread_placement_preference(
+                &root,
+                None,
+                SingletonSpreadPlacementPreference::Center,
+            )
             .unwrap();
 
         let refresh = || {
@@ -819,10 +834,17 @@ mod tests {
             .next()
             .and_then(|context| context.container_state)
             .expect("container state should be rebuilt")
-            .final_cover_spread_preference
         };
 
-        assert_eq!(refresh(), FinalCoverSpreadPreference::Off);
+        let state = refresh();
+        assert_eq!(
+            state.final_cover_spread_preference,
+            FinalCoverSpreadPreference::Off
+        );
+        assert_eq!(
+            state.singleton_spread_placement_preference,
+            SingletonSpreadPlacementPreference::Center
+        );
 
         spread_db
             .set_final_cover_spread_preference(
@@ -831,7 +853,22 @@ mod tests {
                 FinalCoverSpreadPreference::FollowGlobal,
             )
             .unwrap();
-        assert_eq!(refresh(), FinalCoverSpreadPreference::FollowGlobal);
+        spread_db
+            .set_singleton_spread_placement_preference(
+                &nested,
+                Some(&root),
+                SingletonSpreadPlacementPreference::FollowGlobal,
+            )
+            .unwrap();
+        let state = refresh();
+        assert_eq!(
+            state.final_cover_spread_preference,
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(
+            state.singleton_spread_placement_preference,
+            SingletonSpreadPlacementPreference::FollowGlobal
+        );
     }
 
     #[test]

@@ -3262,6 +3262,96 @@ test("spread waits for both pages and atomically replaces the page layer", async
   viewer.destroy();
 });
 
+test("singleton spread loadGroup keeps one DOM page and its virtual side through refit", async () => {
+  const stage = new FakeElement("div");
+  stage.clientWidth = 1600;
+  stage.clientHeight = 1000;
+  const pageLayer = new FakeElement("div");
+  const initialImage = new FakeElement("img");
+  pageLayer.append(initialImage);
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage,
+    pageLayer,
+    image: initialImage,
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  const page = (side) => ({
+    entry: { name: `${side} endpoint` },
+    info: { width: 1200, height: 1800 },
+    request: {
+      url: `/api/page?test=singleton-${side}`,
+      cacheKey: `singleton-${side}@1334`,
+      remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
+      address: TEST_PAGE_ADDRESS,
+      width: 1334,
+      cssWidth: 667,
+      dpr: 2,
+      layout: { cssWidth: 667 },
+      fitMode: "page",
+      dynamicInfo: true,
+      infoCacheKey: `singleton-${side}`,
+      containerInfoKey: "book-singleton",
+    },
+  });
+
+  for (const side of ["left", "right"]) {
+    const displayed = await viewer.loadGroup({
+      pages: [page(side)],
+      name: `${side} endpoint`,
+      fitMode: "page",
+      gap: 12,
+      singletonPlacement: side,
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.deepEqual(displayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
+    assert.equal(pageLayer.children.length, 1);
+    assert.equal(viewer.images.length, 1);
+    assert.equal(pageLayer.dataset.singletonPlacement, side);
+    assert.equal(pageLayer.dataset.singletonGap, "12");
+    const assertVirtualExtent = () => {
+      const pageWidth = parseFloat(viewer.images[0].style.width);
+      const layerWidth = parseFloat(pageLayer.style.width);
+      assert.ok(Math.abs(layerWidth - (pageWidth * 2 + 12)) < 0.01);
+      assert.equal(pageLayer.children.length, 1);
+      assert.equal(viewer.images.length, 1);
+      assert.equal(pageLayer.dataset.singletonPlacement, side);
+      assert.equal(pageLayer.dataset.singletonGap, "12");
+    };
+    assertVirtualExtent();
+
+    for (const fitMode of ["width", "original", "page"]) {
+      assert.equal(viewer.refitVisibleContent(fitMode), true);
+      assertVirtualExtent();
+    }
+
+    const previous = viewer.images[0];
+    assert.equal(
+      await viewer.replacePageBlobs([
+        { pageIndex: 0, blob: new Blob([side]), alt: `${side} adjusted` },
+      ]),
+      true,
+    );
+    assert.notEqual(viewer.images[0], previous);
+    assert.equal(pageLayer.children.length, 1);
+    assert.equal(pageLayer.dataset.singletonPlacement, side);
+    assert.equal(pageLayer.dataset.singletonGap, "12");
+    // The production DOM copies CSSStyleDeclaration.cssText during adjustment
+    // replacement; this lightweight fake models the typed dataset instead. A
+    // refit proves that the retained owner still reconstructs the same extent.
+    assert.equal(viewer.refitVisibleContent("page"), true);
+    assertVirtualExtent();
+  }
+  viewer.destroy();
+});
+
 test("spread rejects one mismatched page before replacing either side", async () => {
   const requested = (pageNumber) => ({
     path: testPath("books/spread.pdf"),

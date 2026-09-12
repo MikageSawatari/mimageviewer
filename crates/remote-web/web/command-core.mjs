@@ -21,6 +21,9 @@ export const CommandName = Object.freeze({
   FINAL_COVER_FOLLOW_GLOBAL: "final_cover_follow_global",
   FINAL_COVER_ON: "final_cover_on",
   FINAL_COVER_OFF: "final_cover_off",
+  SINGLETON_PLACEMENT_FOLLOW_GLOBAL: "singleton_placement_follow_global",
+  SINGLETON_PLACEMENT_PLACE: "singleton_placement_place",
+  SINGLETON_PLACEMENT_CENTER: "singleton_placement_center",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -1206,6 +1209,7 @@ export function viewerSpreadLayout({
   viewportHeight,
   devicePixelRatio,
   gap = 0,
+  singletonPlacement = "center",
   maxRequestWidth = 8192,
 }) {
   const sources = (pages ?? []).map((page) => ({
@@ -1214,19 +1218,34 @@ export function viewerSpreadLayout({
   }));
   if (!sources.length) return { pages: [], gap: 0 };
   if (sources.length === 1) {
-    const page = viewerImageLayout({
-      mode,
-      sourceWidth: sources[0].width,
-      sourceHeight: sources[0].height,
-      viewportWidth,
-      viewportHeight,
-      devicePixelRatio,
-      maxRequestWidth,
-    });
+    const placement = ["left", "right"].includes(singletonPlacement)
+      ? singletonPlacement
+      : "center";
+    const resolvedGap = placement === "center" ? 0 : Math.max(0, Number(gap) || 0);
+    const availableWidth = Math.max(1, Number(viewportWidth) || 1);
+    const availableHeight = Math.max(1, Number(viewportHeight) || 1);
+    const source = sources[0];
+    const virtualSourceWidth = placement === "center" ? source.width : source.width * 2;
+    const contentWidth = Math.max(1, availableWidth - resolvedGap);
+    const scale = mode === FitMode.ORIGINAL
+      ? 1
+      : mode === FitMode.WIDTH
+        ? contentWidth / virtualSourceWidth
+        : Math.min(contentWidth / virtualSourceWidth, availableHeight / source.height);
+    const dpr = Math.max(0.25, Number(devicePixelRatio) || 1);
+    const page = {
+      cssWidth: source.width * scale,
+      cssHeight: source.height * scale,
+      requestWidth: Math.max(
+        1,
+        Math.min(maxRequestWidth, Math.ceil(source.width * scale * (mode === FitMode.ORIGINAL ? 1 : dpr)))
+      ),
+    };
     return {
       pages: [page],
-      gap: 0,
-      cssWidth: page.cssWidth,
+      gap: resolvedGap,
+      singletonPlacement: placement,
+      cssWidth: placement === "center" ? page.cssWidth : page.cssWidth * 2 + resolvedGap,
       cssHeight: page.cssHeight,
     };
   }
@@ -1262,6 +1281,7 @@ export function viewerSpreadLayout({
     gap: resolvedGap,
     cssWidth: pageLayouts.reduce((sum, page) => sum + page.cssWidth, 0) + resolvedGap,
     cssHeight,
+    singletonPlacement: "center",
   };
 }
 

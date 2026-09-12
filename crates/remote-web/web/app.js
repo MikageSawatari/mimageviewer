@@ -1402,6 +1402,8 @@ const state = {
   spreadPageGapPx: 0,
   finalCoverSpreadPreference: "follow_global",
   finalCoverSpreadEnabled: true,
+  singletonSpreadPlacementPreference: "follow_global",
+  singletonSpreadPlacementEnabled: false,
   forceSinglePage: false,
   localSettings: LOCAL_SETTINGS_LOAD.settings,
   localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
@@ -2852,6 +2854,21 @@ function dispatchCommand(requested, meta = {}) {
       handled = requestFinalCoverSpreadPreference(
         preferences[requested.name]
       );
+    } else if (
+      [
+        CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL,
+        CommandName.SINGLETON_PLACEMENT_PLACE,
+        CommandName.SINGLETON_PLACEMENT_CENTER,
+      ].includes(requested.name)
+    ) {
+      const preferences = {
+        [CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.SINGLETON_PLACEMENT_PLACE]: "place",
+        [CommandName.SINGLETON_PLACEMENT_CENTER]: "center",
+      };
+      handled = requestSingletonSpreadPlacementPreference(
+        preferences[requested.name]
+      );
     } else if (requested.name.startsWith("spread_")) {
       const spreadModes = {
         [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
@@ -4217,6 +4234,12 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
       data.final_cover_spread_preference
     ),
     finalCoverSpreadEnabled: data.final_cover_spread_enabled !== false,
+    singletonSpreadPlacementPreference:
+      normalizeSingletonSpreadPlacementPreference(
+        data.singleton_spread_placement_preference
+      ),
+    singletonSpreadPlacementEnabled:
+      data.singleton_spread_placement_enabled === true,
     imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
     videoCount: Math.max(0, Math.floor(Number(data.video_count) || 0)),
     otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
@@ -4244,6 +4267,10 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
   state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
   state.finalCoverSpreadPreference = state.container.finalCoverSpreadPreference;
   state.finalCoverSpreadEnabled = state.container.finalCoverSpreadEnabled;
+  state.singletonSpreadPlacementPreference =
+    state.container.singletonSpreadPlacementPreference;
+  state.singletonSpreadPlacementEnabled =
+    state.container.singletonSpreadPlacementEnabled;
   state.forceSinglePage = forceSinglePage;
   setContainerPageGroups(data.page_groups ?? [], nextPageGroups);
   const resumeEntryIndex = state.container.resumePage
@@ -4331,6 +4358,7 @@ function setSinglePageGroups() {
     navigationEntries: [entry],
     presentationSlots: [{ entry, role: "navigation" }],
     slice: PageSlice.FULL,
+    singletonPlacement: "center",
   }));
   state.seekPageGroups = state.images.map((_, index) => [index]);
   reanchorViewerPageGroups(previousPosition);
@@ -4340,6 +4368,8 @@ function setSinglePageGroups() {
   state.spreadPageGapPx = 0;
   state.finalCoverSpreadPreference = "follow_global";
   state.finalCoverSpreadEnabled = true;
+  state.singletonSpreadPlacementPreference = "follow_global";
+  state.singletonSpreadPlacementEnabled = false;
   state.forceSinglePage = false;
 }
 
@@ -4405,7 +4435,10 @@ export function normalizeContainerPageGroups(groups, images) {
       if (presentationSlots === null) {
         throw new TypeError("ページの表示構成が不正です。");
       }
-      return { anchor, navigationEntries, presentationSlots, slice };
+      const singletonPlacement = ["left", "right"].includes(group.singleton_placement)
+        ? group.singleton_placement
+        : "center";
+      return { anchor, navigationEntries, presentationSlots, slice, singletonPlacement };
     })
     .filter(Boolean);
   if (!normalized.length && images.length) {
@@ -4414,6 +4447,7 @@ export function normalizeContainerPageGroups(groups, images) {
       navigationEntries: [entry],
       presentationSlots: [{ entry, role: "navigation" }],
       slice: PageSlice.FULL,
+      singletonPlacement: "center",
     }));
   }
   return normalized;
@@ -4430,11 +4464,27 @@ export function normalizeFinalCoverSpreadPreference(value) {
     : "follow_global";
 }
 
+export function normalizeSingletonSpreadPlacementPreference(value) {
+  return ["follow_global", "place", "center"].includes(value)
+    ? value
+    : "follow_global";
+}
+
 export function finalCoverSpreadWriteRequest(address, preference) {
   const normalized = normalizeFinalCoverSpreadPreference(preference);
   if (!remoteAddressLooksValid(address) || normalized !== preference) return null;
   return {
     kind: "set_final_cover_spread_preference",
+    address,
+    preference: normalized,
+  };
+}
+
+export function singletonSpreadPlacementWriteRequest(address, preference) {
+  const normalized = normalizeSingletonSpreadPlacementPreference(preference);
+  if (!remoteAddressLooksValid(address) || normalized !== preference) return null;
+  return {
+    kind: "set_singleton_spread_placement_preference",
     address,
     preference: normalized,
   };
@@ -5223,6 +5273,45 @@ function requestFinalCoverSpreadPreference(preference) {
           writeError instanceof Error
             ? writeError.message
             : "末尾の表紙見開き設定を保存できませんでした。"
+        );
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
+    }
+  });
+  return true;
+}
+
+function requestSingletonSpreadPlacementPreference(preference) {
+  const normalized = normalizeSingletonSpreadPlacementPreference(preference);
+  if (!state.container || normalized !== preference) return false;
+  const address = state.container.address;
+  const writeRequest = singletonSpreadPlacementWriteRequest(address, normalized);
+  if (!writeRequest) return false;
+  const identity = activeSpreadContextIdentity();
+  const sequence = ++spreadWriteSequence;
+  state.singletonSpreadPlacementPreference = normalized;
+  state.container.singletonSpreadPlacementPreference = normalized;
+  spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
+    let writeError = null;
+    try {
+      await apiAddressPostJson("/api/write", writeRequest);
+    } catch (error) {
+      writeError = error;
+    }
+    if (
+      sequence === spreadWriteSequence &&
+      activeSpreadContextIdentity() === identity
+    ) {
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(),
+        "singleton_spread_placement_refresh"
+      );
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(
+          writeError instanceof Error
+            ? writeError.message
+            : "端の単ページ配置を保存できませんでした。"
         );
       } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
         state.viewer?.showBoundaryMessage(refresh.message);
@@ -6700,6 +6789,7 @@ function viewerImageFailureForDisplay(
     (
       renderTrigger === "spread_refresh" ||
       renderTrigger === "final_cover_spread_refresh" ||
+      renderTrigger === "singleton_spread_placement_refresh" ||
       renderTrigger === "viewport_resize"
     )
   ) {
@@ -6784,7 +6874,10 @@ async function updateViewerImage(
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: presentationEntries.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationEntries.length > 1 || group.singletonPlacement !== "center"
+        ? state.spreadPageGapPx
+        : 0,
+      singletonPlacement: group.singletonPlacement,
     });
     pages = presentationSlots.map(({ entry, role }, pageIndex) => ({
       entry,
@@ -6825,6 +6918,7 @@ async function updateViewerImage(
       decodedUnitKey: identity,
       positionSnapshot: loadRequest,
       slice: group.slice,
+      singletonPlacement: group.singletonPlacement,
     });
     if (result?.outcome !== ViewerGroupLoadOutcome.APPLIED) {
       pageDemandAdapter.releaseDisplay(displayRequestId);
@@ -7017,7 +7111,10 @@ async function schedulePageDecodeAhead(viewer) {
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: presentationSlots.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationSlots.length > 1 || group.singletonPlacement !== "center"
+        ? state.spreadPageGapPx
+        : 0,
+      singletonPlacement: group.singletonPlacement,
     });
     const pageGenerations = viewerPageGroupGenerationSnapshot(
       generationSnapshot,
@@ -7180,7 +7277,10 @@ async function schedulePagePrefetch(viewer) {
         viewportWidth: viewer.stage.clientWidth || window.innerWidth,
         viewportHeight: viewer.stage.clientHeight || window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
-        gap: presentationSlots.length > 1 ? state.spreadPageGapPx : 0,
+        gap: presentationSlots.length > 1 || targetGroup.singletonPlacement !== "center"
+          ? state.spreadPageGapPx
+          : 0,
+        singletonPlacement: targetGroup.singletonPlacement,
       });
       return {
         groupKey,
@@ -8372,6 +8472,7 @@ const MenuPageAction = Object.freeze({
   RATING: "menu_page_rating",
   DISPLAY: "menu_page_display",
   SPREAD: "menu_page_spread",
+  SINGLETON_PLACEMENT: "menu_page_singleton_placement",
   POSITION: "menu_page_position",
 });
 
@@ -8448,6 +8549,9 @@ export function viewerMenuDefinitions({
   supportsFinalCoverSetting = false,
   finalCoverPreference = "follow_global",
   finalCoverEnabled = true,
+  supportsSingletonPlacementSetting = false,
+  singletonPlacementPreference = "follow_global",
+  singletonPlacementEnabled = false,
 }) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
   const mainActions = [
@@ -8543,6 +8647,41 @@ export function viewerMenuDefinitions({
               ],
             ]
           : []),
+        ...(supportsSingletonPlacementSetting
+          ? [[
+              MenuPageAction.SINGLETON_PLACEMENT,
+              "端の単ページ配置",
+              singletonPlacementPreference === "follow_global"
+                ? singletonPlacementEnabled
+                  ? "全体設定: 配置する"
+                  : "全体設定: 中央"
+                : singletonPlacementPreference === "place"
+                  ? "この本: 配置する"
+                  : "この本: 中央",
+              { menuPage: "singleton_placement" },
+            ]]
+          : []),
+      ],
+    },
+    singleton_placement: {
+      title: "端の単ページ配置",
+      actions: [
+        back,
+        [
+          CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL,
+          `${singletonPlacementPreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          singletonPlacementEnabled ? "現在: 配置する" : "現在: 中央",
+        ],
+        [
+          CommandName.SINGLETON_PLACEMENT_PLACE,
+          `${singletonPlacementPreference === "place" ? "✓ " : ""}本来の側へ配置`,
+          "この本",
+        ],
+        [
+          CommandName.SINGLETON_PLACEMENT_CENTER,
+          `${singletonPlacementPreference === "center" ? "✓ " : ""}中央に表示`,
+          "この本",
+        ],
       ],
     },
     position: {
@@ -8564,6 +8703,9 @@ function menuDefinition(context, page = "main") {
       supportsFinalCoverSetting: Boolean(state.container),
       finalCoverPreference: state.finalCoverSpreadPreference,
       finalCoverEnabled: state.finalCoverSpreadEnabled,
+      supportsSingletonPlacementSetting: Boolean(state.container),
+      singletonPlacementPreference: state.singletonSpreadPlacementPreference,
+      singletonPlacementEnabled: state.singletonSpreadPlacementEnabled,
     });
     return definitions[page] ?? definitions.main;
   }
@@ -12588,7 +12730,8 @@ export class ImageViewer {
           job.renderTrigger,
           job.displayRequestId,
           job.decodedUnitKey,
-          job.slice
+          job.slice,
+          job.singletonPlacement
         )
         : this.loadMeasuredImage(
           job.request,
@@ -12599,7 +12742,9 @@ export class ImageViewer {
           job.renderTrigger,
           job.displayRequestId,
           job.decodedUnitKey,
-          job.slice
+          job.slice,
+          job.singletonPlacement,
+          job.gap
         ),
       (job) => {
         pageDemandAdapter.releaseDisplay(job?.displayRequestId);
@@ -12679,6 +12824,8 @@ export class ImageViewer {
     decodedUnitKey = null,
     positionSnapshot = null,
     slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    gap = 0,
   }) {
     const resolvedSeekState = seekState ?? {
       visible: count > 1,
@@ -12707,6 +12854,8 @@ export class ImageViewer {
       displayRequestId,
       decodedUnitKey,
       slice,
+      singletonPlacement,
+      gap,
     });
   }
 
@@ -12741,6 +12890,7 @@ export class ImageViewer {
     decodedUnitKey = null,
     positionSnapshot = null,
     slice = PageSlice.FULL,
+    singletonPlacement = "center",
   }) {
     if (pages.length === 1) {
       return this.load({
@@ -12758,6 +12908,8 @@ export class ImageViewer {
         decodedUnitKey,
         positionSnapshot,
         slice,
+        singletonPlacement,
+        gap,
       });
     }
     const resolvedSeekState = seekState ?? {
@@ -12787,6 +12939,7 @@ export class ImageViewer {
       displayRequestId,
       decodedUnitKey,
       slice,
+      singletonPlacement,
     });
   }
 
@@ -12939,12 +13092,27 @@ export class ImageViewer {
     return Object.values(PageSlice).includes(slice) ? slice : PageSlice.FULL;
   }
 
-  setLayout(fitMode, layout, info, image = this.image, slice = PageSlice.FULL) {
+  setLayout(
+    fitMode,
+    layout,
+    info,
+    image = this.image,
+    slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    singletonGap = 0
+  ) {
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
     this.pageLayer.style.gap = "0px";
+    this.pageLayer.dataset.singletonPlacement = singletonPlacement;
+    this.pageLayer.dataset.singletonGap = String(
+      singletonPlacement === "center" ? 0 : Math.max(0, Number(singletonGap) || 0)
+    );
     this.applyImageBox(image, layout, info, slice);
-    this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
+    const layerWidth = singletonPlacement === "center"
+      ? layout.cssWidth
+      : layout.cssWidth * 2 + Math.max(0, Number(singletonGap) || 0);
+    this.setPageLayerSize(layerWidth, layout.cssHeight);
     // 始点を決めるのは placeInitialStageScroll の役目。ここで 0 に戻すと、原寸の
     // 中央寄せを毎回打ち消す。
     this.placeInitialStageScroll();
@@ -12992,6 +13160,9 @@ export class ImageViewer {
     }));
     if (sources.some((source) => !(source.width > 0 && source.height > 0))) return false;
     const slice = this.imagePageSlice();
+    const singletonPlacement = ["left", "right"].includes(
+      this.pageLayer.dataset.singletonPlacement
+    ) ? this.pageLayer.dataset.singletonPlacement : "center";
     const layout = viewerSlicedSpreadLayout({
       mode: fitMode,
       pages: sources,
@@ -12999,11 +13170,18 @@ export class ImageViewer {
       viewportWidth: this.stage.clientWidth || window.innerWidth,
       viewportHeight: this.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: this.images.length > 1 ? Number.parseFloat(this.pageLayer.style.gap) || 0 : 0,
+      gap: this.images.length > 1
+        ? Number.parseFloat(this.pageLayer.style.gap) || 0
+        : Number.parseFloat(this.pageLayer.dataset.singletonGap) || 0,
+      singletonPlacement,
     });
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
     this.pageLayer.style.gap = `${layout.gap}px`;
+    this.pageLayer.dataset.singletonPlacement = layout.singletonPlacement ?? "center";
+    this.pageLayer.dataset.singletonGap = String(
+      layout.singletonPlacement === "center" ? 0 : Math.max(0, Number(layout.gap) || 0)
+    );
     this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
     this.images.forEach((image, index) => {
       this.applyImageBox(image, layout.pages[index], null, slice);
@@ -13100,7 +13278,9 @@ export class ImageViewer {
     renderTrigger,
     displayRequestId,
     decodedUnitKey,
-    slice = PageSlice.FULL
+    slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    singletonGap = 0
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = request.cacheKey ? [request.cacheKey] : [];
@@ -13193,6 +13373,8 @@ export class ImageViewer {
           viewportHeight: this.stage.clientHeight || window.innerHeight,
           devicePixelRatio: request.dpr,
           maxRequestWidth: 8192,
+          gap: singletonPlacement === "center" ? 0 : singletonGap,
+          singletonPlacement,
         }).pages[0];
         resolvedInfo = actualInfo;
         request.cssWidth = resolvedLayout.cssWidth;
@@ -13212,7 +13394,15 @@ export class ImageViewer {
       }
       phase = "apply";
       this.resetTransform();
-      this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage, slice);
+      this.setLayout(
+        request.fitMode,
+        resolvedLayout,
+        resolvedInfo,
+        decodedImage,
+        slice,
+        singletonPlacement,
+        singletonGap
+      );
       decodedImage.style.transform = "none";
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(decodedImage);
@@ -13334,7 +13524,8 @@ export class ImageViewer {
     renderTrigger,
     displayRequestId,
     decodedUnitKey,
-    slice = PageSlice.FULL
+    slice = PageSlice.FULL,
+    singletonPlacement = "center"
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = pages.map(({ request }) => request.cacheKey).filter(Boolean);
@@ -13448,6 +13639,8 @@ export class ImageViewer {
       this.fitMode = fitMode;
       this.stage.dataset.fitMode = fitMode;
       this.pageLayer.style.gap = `${resolvedLayout.gap}px`;
+      this.pageLayer.dataset.singletonPlacement = "center";
+      this.pageLayer.dataset.singletonGap = "0";
       this.setPageLayerSize(resolvedLayout.cssWidth, resolvedLayout.cssHeight);
       decodedImages.forEach((decoded, index) => {
         const layout = resolvedLayout.pages[index];

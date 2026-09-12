@@ -847,7 +847,10 @@ mod tests {
         let one = measure_batch_database_opens(1);
         let hundred = measure_batch_database_opens(100);
 
-        assert_eq!(one, 30, "22 store copy + 1 origin batch + 7 runtime reads");
+        assert_eq!(
+            one, 31,
+            "22 store copy + 1 origin batch + 8 runtime reads, including singleton placement"
+        );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }
 
