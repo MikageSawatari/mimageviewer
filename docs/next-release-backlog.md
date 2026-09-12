@@ -29,6 +29,70 @@
 
 ## 1. 優先候補
 
+### 1.228 起動時の類似索引が、変更の無い ZIP / PDF も開いて中身を数え直す (2026-09-12)
+
+- 出典: v3.9.1 の公開前検証。idle-health の 1 本目で初回スキャンの待ちが長く、利用者が
+  ディスクのアクティブ率 100% を観測して質問したことから調査した。**v3.9.1 の退行ではない**
+  (`git diff v3.9.0..HEAD -- src/similar_index.rs src/similar_db.rs src/indexer_*.rs
+  src/search_watcher.rs` は空)。
+- 起動時の `kind=full reason=initial` が **391 秒**かかった。結果は
+  `processed=4,656,819 / unchanged=4,647,312 / indexed=1,346`。**465 万件を確認して、
+  作り直したのは 1,346 件だけ**。
+
+#### 作業時間の内訳 (同じ実行の `similar reconcile work timing`、並列合算)
+
+| 種別 | 件数 | 合計 | 1 件あたり |
+| --- | ---: | ---: | ---: |
+| ディレクトリ | 41,969 | 14.7 秒 | 0.35 ms |
+| ばら画像 | 192,732 | 10.5 秒 | 0.05 ms |
+| 画像本 | 27,916 | 93.6 秒 | 3.4 ms |
+| ZIP | 3,404 | 83.3 秒 | 24.5 ms |
+| **PDF** | **3,580** | **4,512 秒** | **1,260 ms** (最大 12,248 ms) |
+
+**PDF だけで全作業時間の約 96%。** その全量が「変わっていない」の確認に費やされている。
+
+#### 原因 — 判定はあるが、開いた後にやっている
+
+コンテナ本体の同一性判定は `container_observation()` に既にあり、`mtime` / `file_size` /
+`page_count` / `scan_state == Complete` / `all_members_current` / `hash_version` が揃えば
+`Freshness::Current` として中身をまるごと飛ばす ([similar_db.rs:401](../src/similar_db.rs:401))。
+
+問題は順序。この判定が引数に `page_count` を要求するため、呼び出し側は先に実ファイルを開く。
+
+- ZIP: エントリ列挙 → ページ順ソート → `page_count` → 判定
+  ([similar_index.rs:5831](../src/similar_index.rs:5831))
+- PDF: `enumerate_pages_with_cancel` (PDFium worker) → `page_count` → 判定
+  ([similar_index.rs:5954](../src/similar_index.rs:5954))
+
+`candidate.mtime` と `candidate.file_size` は**ディレクトリ走査の時点で既に手元にある**のに、
+開いてからでないと使われない。
+
+#### 対応方針 (2026-09-12 利用者判断)
+
+**先に container key で DB の記録を引き、`mtime` と `file_size` が一致すれば開かずに確定させる。**
+`page_count` は保存済みの値を使う。`scan_state` / `all_members_current` / `hash_version` は
+DB 側の値なので、開かなくても従来どおり確認できる。
+
+- **仕様判断**: 「mtime とサイズが同じなのに中身が変わっている」ケースは通常ほぼ無いため、
+  **その場合は更新なしとして扱ってよい** (利用者了承済み)。ばら画像は既に mtime + サイズだけで
+  判定している (`item_metadata_matches`) ので、コンテナへ同じ信頼度を広げるだけで一貫する。
+- 期待効果: 変更の無い起動では PDF 4,512 秒と ZIP 83 秒がほぼ消え、ディレクトリ走査と
+  ばら画像の stat だけが残る。**391 秒が桁で縮む見込み** (未測定)。
+- 画像本 (27,916 件 / 93.6 秒) はディレクトリ走査そのものなので、この変更の対象外。
+
+#### 守る条件
+
+- 一致しなかったコンテナは従来どおり開いて作り直す。`begin_container_build` 以降の
+  generation / publish 経路は変えない。
+- `scan_state != Complete`、`all_members_current == false`、`hash_version` 不一致は
+  これまでどおり再構築する。**mtime/サイズの一致だけで、これらを飛ばさない。**
+- パスワード付き PDF、0 ページ、破損など既存の型付き失敗の記録経路を維持する。
+- `kind=delta reason=watch_change` は現状 10〜48 ms で完了しており、そちらの挙動は変えない。
+- 回帰確認: 無変更での再起動が短くなること、コンテナを差し替えたとき (mtime 変化) は
+  作り直すこと、ページ追加・削除、ZIP / PDF / 画像本それぞれ、途中取消。
+
+- 規模 / 優先度: Small〜Medium / **P2**。次リリース対象 (利用者指定)。
+
 2026-09-12指定の直列実装順は [v3.9.0後の開発計画](post-v3.9.0-sequential-work.md) を参照。
 §1.115 → PDFium/FFmpeg → §1.226（追加指定）→ §1.223 → §1.222 → §1.218 → §1.212 → §1.164 → §1.221 → §1.220。
 以下の節の配置順は着手順ではない。
