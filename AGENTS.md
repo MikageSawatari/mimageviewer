@@ -5,6 +5,61 @@ contains the broader project context and operational notes; read only the
 sections relevant to the current task instead of treating the whole file as
 always-active guidance.
 
+## Model Roles And Coordination
+
+- Default for Codex-led development: parent `gpt-6-astra` / `medium`;
+  implementation and tests `gpt-5.6-sol` / `xhigh`; independent review
+  `gpt-5.6-sol` / `xhigh`, with a reviewer separate from the implementer.
+  Later explicit user instructions override these defaults. Do not automatically
+  escalate to Astra high, max, or ultra during this usage-saving trial.
+- Starting with the next release after the 2026-09-09 role decision, release
+  preparation and publishing are led by ClaudeCode Opus. This includes the
+  release checklist from changelog/version updates through distribution builds,
+  signing, GitHub Release, website updates, and distribution-channel submissions.
+  Development remains Codex-led with the model roles above. See
+  [the release handoff](docs/release-operations.md#開発と公開の担当・引き継ぎ).
+- Routine release operations do not require a Codex coordinator, subagent team,
+  or automatic Codex review. ClaudeCode Opus follows the existing release gates
+  and user approvals, reusing valid development evidence. Product-code fixes,
+  dependency upgrades, and build/signing/deployment logic changes found during
+  release work return to the development workflow; routine version, changelog,
+  and release-metadata edits remain with the release lead.
+- This policy authorizes bounded subagents for substantial implementation and
+  independent review. Handle simple questions and minor documentation changes
+  locally; do not create a team solely to satisfy the role table.
+- Instructions do not change the running model. Use explicit model/effort
+  overrides where supported, with a bounded handoff rather than full-history
+  inheritance. The user selects the parent in the GUI. Report a mismatch or
+  unavailable override without claiming the requested setting is active; do not
+  silently change personal config or substitute a more expensive model.
+- At a role change, finish the current safe checkpoint and hand off the diff,
+  rationale, open findings, and valid verification evidence. Reconfigure an
+  existing reviewer if supported; otherwise use a new reviewer with the requested
+  settings. Do not repeat completed work or keep assigning work to the old role.
+- The parent defines scope, invariants, acceptance criteria, and file ownership
+  once per coherent chunk. Implementers verify key premises and make routine
+  decisions within that scope; report contradictions, scope changes, and blockers.
+  One writer owns each shared file. Do not require approval for every small edit.
+- Review important ownership/asynchronous/multi-window designs before substantial
+  implementation, and review coherent changes at completion. Check the design
+  itself, not just compliance with the implementation brief. Follow-up review
+  focuses on findings and their affected paths; broaden when new evidence warrants
+  it. Do not waive important defects or cap necessary correction rounds.
+- Keep internal messages to decisions, material discoveries, blockers, handoffs,
+  and completion. Avoid repeated status queries or unchanged acknowledgements;
+  continue useful independent work or wait. Keep user-facing progress updates.
+- Assign verification ownership and reuse valid results under
+  [the build/test policy](docs/development-build-and-test.md#検証の担当と結果の再利用).
+  Required regression/full gates, verification builds, interactive approval,
+  real-data protection, and feature preservation remain mandatory.
+- For Codex-led development, historical ClaudeCode design/acceptance duties map to the
+  parent and independent reviewer above. Required structural agreement means
+  agreement between that design lead and independent reviewer, with implementation
+  premise checks by the implementer. Preserve historical records and detached
+  plan constraints/decision recording. This mapping does not transfer release
+  ownership to Codex. Explicit ClaudeCode-led development tasks retain their
+  requested lead and use the independent review policy in `CLAUDE.md`.
+
 ## Before Editing
 
 - Start by identifying the affected area and read the matching docs from

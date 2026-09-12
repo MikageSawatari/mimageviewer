@@ -7,6 +7,17 @@
 コマンド・ログ抜粋など、そのまま示すべき固有部分は原文のままでよい)。コミットメッセージや
 コード内コメントは従来どおり (本書の各節の方針に従う)。
 
+## 開発・公開担当とレビューの既定
+
+モデル分担と調整の正本は [AGENTS.md の Model Roles And Coordination](AGENTS.md#model-roles-and-coordination)。
+新規のCodex主導タスク、途中の担当変更、独立レビューではこの節を読む。
+Codex主導時の旧ClaudeCode/Codex担当名は同節の役割へ読み替え、過去の合意・検証記録は保持する。
+開発はCodex Astra mediumが指示担当、実装・テストと独立レビューは別担当のSol xhighとする。
+2026-09-09の担当変更決定後、次回リリースから公開準備・公開作業は **ClaudeCode Opus** が主導する。
+公開時は下記リリースチェックリストと [担当・引き継ぎ](docs/release-operations.md#開発と公開の担当・引き継ぎ) に従う。
+明示された別の担当指定を優先する。文書だけではGUIのモデル設定や起動済みの担当は変わらない。
+検証の集約・再実行条件は [開発ビルドとテスト](docs/development-build-and-test.md#検証の担当と結果の再利用) を参照。
+
 ## 作業開始時に必読
 
 **修正作業を始める前に、必ず `docs/README.md` から関連する設計ドキュメントを開いて全体像を把握すること。**
@@ -1616,13 +1627,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ## リリース手順チェックリスト
 
+**担当: 次回リリースからClaudeCode Opus (2026-09-09決定)。** Phase 0〜5の公開準備、
+配布ビルド・署名、公開、配布チャネルへの反映を通して担当する。開発側から対象commitと
+検証記録を受け取り、定型公開作業ごとのCodexレビューや親役の追加は不要。
+製品コード等の修正が必要になった場合の境界は
+[開発と公開の担当・引き継ぎ](docs/release-operations.md#開発と公開の担当・引き継ぎ) を参照する。
+
 リリース時は以下を漏れなく更新・作成すること。
 
 **過去リリースで踏んだ落とし穴・判断基準・復旧手順は
 [docs/release-operations.md](docs/release-operations.md) に集約している。**
 本チェックリストが手順の正本で、release-operations.md はその補助 (stale core cache /
 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 /
-配布チャネル別の注意など)。リリースを別セッションや Codex に引き継ぐ前に一読する。
+配布チャネル別の注意など)。開発担当からClaudeCode Opusの公開タスクへ引き継ぐ際に一読する。
 
 ### Phase 0: 変更履歴の準備とユーザーレビュー (必ず最初)
 
@@ -1714,6 +1731,16 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - 載せる基準: ①通常の操作で遭遇し得る ②不具合だと思う見た目をしている ③回避策があるか
      「環境のせいではない」と言える ④次の版で直らない。backlog の大半は設計上の負債なので載せない。
    - **このステップを飛ばすとページが腐る**。以前ページを置いたときに放置されて消えた経緯がある。
+6.6. **サイトマップを再生成** — htdocs の編集がすべて終わったら
+   `python scripts/gen-sitemap-xml.py` を実行して `htdocs/sitemap.xml` を作り直し、
+   出力に出た added / removed が意図どおりか確認してコミットする。sitemap.xml は
+   **生成物**なので手で編集しない。`<lastmod>` は git の最終コミット日から取るため、
+   **htdocs の編集をコミットした後に実行する** (未コミットのページは当日付になる)。
+   `--check` を付けると書き換えずに、古ければ exit 1 で知らせる。
+   - **このステップを飛ばすと sitemap が静かに腐る**。2026-09 の点検時、8/23 から
+     37 ページが変わったのに `<lastmod>` が 1 つも動いておらず、`manual/external-tools.html`
+     は追加されたまま一度も sitemap に入っていなかった。手順のどこからも参照されて
+     いなかったので、腐る以外の道が無かった。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
@@ -1974,6 +2001,14 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
 
 ## Codex CLI レビュー
 
+担当・実施粒度は [AGENTS.md](AGENTS.md#model-roles-and-coordination) に従う。
+Codex主導で独立レビュー担当を使える場合はその担当を再利用し、同じ差分のCLIレビューを重ねない。
+ClaudeCode主導の開発またはCLIレビューが必要な場合は以下を使い、新規reviewは「モデル指定について」の
+Sol / xhighを明示する。重要指摘の修正・再確認は維持し、小さな中間変更ごとの承認は求めない。
+以下の自発的レビュー規則は開発変更が対象。ClaudeCode Opusによる定型の公開準備・公開作業
+(版番号・更新履歴・公開メタデータの更新を含む) には適用しない。
+利用者が明示的にレビューを依頼した場合、または製品コード等の開発変更が生じた場合は実施する。
+
 ユーザーから「Codex にレビューしてもらって」「Codex レビューを取って」等と指示された場合は、
 **ユーザーに手作業で中継してもらわず、`codex` CLI を直接叩いて結果を取り込む**。
 
@@ -2186,21 +2221,18 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 
 ### モデル指定について
 
-利用モデルは `~/.codex/config.toml` の `model` フィールドに書いてあり、`codex exec` は
-そこで指定されたモデルで動く (対話モードで表示される `model: <name>` と同じ)。
-以下のケースで失敗することがある:
+新規の独立レビューは個人configの既定値に依存させず、次を明示する。
+この節の簡略化したCLI例にも、実行時には同じmodel/effortを付ける。
 
-- **CLI が古い**: 新モデル (例: `gpt-5.5`) は CLI 更新が必要。対話起動時に
-  `Update available! X.Y.Z -> A.B.C` が出ていたら `npm install -g @openai/codex` で更新。
-  対話モードでは動くのに `codex exec` で「model doesn't exist」が出る場合、
-  まさにこの状態。
-- **アカウントの制限**: ChatGPT アカウントでは `gpt-5` / `o3` 等の生モデル ID は
-  使えず、Codex 向けに用意された ID (`gpt-5.5` / `gpt-5.4` 等) のみ。
-- **config のタイポ**: 利用可能なモデル一覧は `~/.codex/models_cache.json` の
-  `models[].slug` で確認できる。
+```bash
+codex exec --model gpt-5.6-sol -c 'model_reasoning_effort="xhigh"' --sandbox read-only -o <FILE> "<review prompt>"
+```
 
-`-c model="<name>"` で 1 回限りの override も可能。デフォルト設定を書き換える前に
-ユーザーに相談すること (config はユーザーの個人設定で、勝手に変えない)。
+同じレビューの継続は既存のresume手順を使い、旧Astra担当等からの移行時はmodel/effortが
+実際に切り替わったことを確認する。切り替えられなければ、既知指摘・判断根拠・対象差分と
+検証記録を指定モデルの新しい担当へ渡す。解決済み事項の全件再レビューは不要。
+利用可否やoverrideの失敗はCLIの実出力で確認し、未確認の設定を適用済みと報告しない。
+個人の `~/.codex/config.toml` は、このリポジトリの既定分担を理由に書き換えない。
 
 ## 実機検証用バイナリの準備 (Windows ネイティブ機能)
 
@@ -2443,7 +2475,7 @@ reparse point 共有しない**。個別サブディレクトリ単位でも禁�
 
 - Comfortable reading C++ but not familiar with Rust's borrow checker details
 - Has RTX 4090, Windows 11
-- AI-assisted development workflow: Claude generates code, user reviews and tests
+- AI-assisted development workflow: role defaults and independent AI review are defined in `AGENTS.md`; user performs approved/manual verification as required
 
 ## Claude Code tool call reliability rules（ツール呼び出しの生テキスト漏れ対策）
 
