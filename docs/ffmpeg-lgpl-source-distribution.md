@@ -1,6 +1,6 @@
 # FFmpeg LGPL Source Distribution Notes
 
-Last updated: 2026-08-04
+Last updated: 2026-09-12
 
 mImageViewer bundles BtbN FFmpeg LGPL shared DLLs under `vendor/ffmpeg/`.
 The current build is LGPLv3-or-later because the bundled DLLs contain
@@ -69,12 +69,19 @@ curl -sSL --fail -o htdocs/mimageviewer/ffmpeg-<BUILD-ID>-source.tar.gz \
 ```
 
 `<BUILD-ID>` is the version string from the DLLs, e.g.
-`ffmpeg-n7.1.5-12-g1fdbca85aa-source.tar.gz`. Verify after downloading:
+`ffmpeg-n7.1.5-16-g9a4bb2c579-source.tar.gz`. Verify after downloading:
 
 - `tar tzf <file> | head -1` shows the full commit hash in the top-level
   directory name, which must match the short hash in `vendor/ffmpeg/VERSION`
 - `tar xzf <file> -O <dir>/RELEASE` shows the base release version
 - record the `sha256sum` with the release materials
+
+The current corresponding-source archive is
+`ffmpeg-n7.1.5-16-g9a4bb2c579-source.tar.gz`. Its SHA-256 is
+`0fc3518ed595a37a507add4ecdfdf834dfceba27020b539a6b7ac1e6fd243bb0`,
+its top-level directory identifies the full commit
+`9a4bb2c579a16b0469759743d6917d9e8e3cb8c6`, and `RELEASE` contains
+`7.1.5`.
 
 Keep the tarballs of previous releases in place. Users of an older
 mImageViewer are entitled to the source matching *their* build.
