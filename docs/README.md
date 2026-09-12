@@ -26,6 +26,7 @@
 | [post-v3.8.0-priority-work.md](post-v3.8.0-priority-work.md) | v3.8.0公開後の優先修正。§1.208動画音声モード、§1.209サイドカー取り込み、類似索引改善、CIの担当・不変条件・検収判断 |
 | [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [dependency-update-20260912.md](dependency-update-20260912.md) | PDFium 8044更新とFFmpeg現行維持の理由、ライセンス、非対話試験、確認buildの内包照合 |
+| [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
 | [section115-revalidation-plan.md](section115-revalidation-plan.md) | §1.115最大化別窓の再確認。現backendの表示順、利用者の確認結果、完了判断と独立残件 |
 | [next-version-mouse-seek-plan.md](next-version-mouse-seek-plan.md) | 戻る・進むボタンの二重シークと長押し差異の入力元調査、限定診断、再導入条件 |
 | [next-version-background-color-plan.md](next-version-background-color-plan.md) | 画像・本の余白色と透過画像内背景を分離する設計、回転・別窓・連結の描画契約 |

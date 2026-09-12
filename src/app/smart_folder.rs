@@ -2329,7 +2329,6 @@ fn prepare_smart_folder(
             tags_cache,
             local_adjust_pages,
             video_pin_blobs,
-            legacy_paths: Vec::new(),
             folder_pin_map: None,
             aggregate: Some(super::subfolder_expansion::PreparedAggregateMetadata {
                 adjustment_page_params,

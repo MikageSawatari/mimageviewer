@@ -404,7 +404,6 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) tags_cache: HashMap<String, Vec<String>>,
     pub(crate) local_adjust_pages: HashSet<usize>,
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
-    pub(crate) legacy_paths: Vec<PathBuf>,
     /// サブ展開は synthetic path のため、通常フォルダの同期 lookup を使わず prepare
     /// worker でコンテナ項目だけを一括照会する。スマートフォルダは aggregate 側に持つ。
     pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
@@ -1308,16 +1307,7 @@ fn prepare_subfolder_expansion(
         return Ok(None);
     }
 
-    // 数百万件では正規化キー文字列だけでも大きい。legacy seed 用 path snapshot を
-    // 作る前に DB lookup 用バッファを明示的に解放して peak memory を抑える。
     drop(key_by_idx);
-    let legacy_paths = items
-        .iter()
-        .filter_map(|item| match item {
-            GridItem::Image(path) | GridItem::Video(path) => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
     Ok(Some(PreparedSubfolderExpansion {
         snapshot,
         show_toast,
@@ -1329,7 +1319,6 @@ fn prepare_subfolder_expansion(
             tags_cache,
             local_adjust_pages,
             video_pin_blobs,
-            legacy_paths,
             folder_pin_map: Some(folder_pin_map),
             aggregate: None,
         },

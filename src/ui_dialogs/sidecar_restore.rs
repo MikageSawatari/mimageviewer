@@ -1,14 +1,17 @@
 use crate::app::App;
 
-pub(crate) fn draw_sidecar_restore_modal(ctx: &egui::Context, detail: &str) {
+pub(crate) fn draw_sidecar_restore_modal(
+    ctx: &egui::Context,
+    presentation: crate::app::SidecarRestorePresentation,
+) {
     egui::Modal::new(egui::Id::new("sidecar_restore_modal")).show(ctx, |ui| {
         ui.set_min_width(340.0);
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.heading("サイドカーから設定を復元中");
+            ui.heading(presentation.heading);
         });
         ui.add_space(6.0);
-        ui.label(detail);
+        ui.label(presentation.detail);
         ui.small("完了するまでこのままお待ちください。");
     });
 }
@@ -28,6 +31,6 @@ impl App {
             ctx.request_repaint_after(remaining);
             return;
         }
-        draw_sidecar_restore_modal(ctx, state.label());
+        draw_sidecar_restore_modal(ctx, state.presentation());
     }
 }

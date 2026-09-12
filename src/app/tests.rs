@@ -1619,7 +1619,6 @@ fn metadata_context_result(
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
-        legacy_seed_paths: Vec::new(),
     }
 }
 
@@ -2007,7 +2006,7 @@ fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
     });
 
     app.begin_metadata_import_terminal_refresh();
-    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
         .take_metadata_import_refresh_requests()
         .into_iter()
@@ -2073,7 +2072,7 @@ fn metadata_refresh_context_identity_survives_main_promotion() {
     let requested_context_id = app.viewer_context_main();
 
     app.begin_metadata_import_terminal_refresh();
-    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
         .take_metadata_import_refresh_requests()
         .into_iter()
@@ -2141,7 +2140,7 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
     });
 
     app.begin_metadata_import_terminal_refresh();
-    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let requests = app.take_metadata_import_refresh_requests();
 
     assert!(
@@ -2538,7 +2537,7 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
 
     app.begin_metadata_import_terminal_refresh();
     assert!(
-        app.advance_metadata_import_terminal_refresh(Path::new(r"C:\unrelated"), false, false,),
+        app.advance_metadata_import_terminal_refresh(Path::new(r"C:\unrelated"), false),
         "a missing bundle must not replace a completed traversal result"
     );
 
@@ -3079,7 +3078,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     });
 
     app.begin_metadata_import_terminal_refresh();
-    assert!(!app.advance_metadata_import_terminal_refresh(&root, false, true));
+    assert!(!app.advance_metadata_import_terminal_refresh(&root, false));
     let first_frame_items = app
         .metadata_import_refresh_index
         .as_ref()
@@ -3087,7 +3086,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
         .next_item;
     assert!((1..=2_048).contains(&first_frame_items));
 
-    while !app.advance_metadata_import_terminal_refresh(&root, false, true) {}
+    while !app.advance_metadata_import_terminal_refresh(&root, false) {}
     let requests = app.take_metadata_import_refresh_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
@@ -3103,11 +3102,50 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
         requests[0].items.iter().all(|item| item.tags),
         "ordinary images are explicit tag refresh targets"
     );
+}
+
+#[test]
+fn grid_tag_prewarm_does_not_import_legacy_xmp_subjects() {
+    let mut app = phase_c_support::setup_app();
+    app.settings.write_rating_to_xmp = false;
+    let path = app.tmp.path().join("legacy-only.jpg");
+    let xmp = br#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject><rdf:Bag><rdf:li>#legacy-only</rdf:li></rdf:Bag></dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+    let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+    let payload = xmp_id.iter().chain(xmp.iter()).copied().collect::<Vec<_>>();
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+    jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    jpeg.extend_from_slice(&payload);
+    jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x02, 0xff, 0xd9]);
+    std::fs::write(&path, &jpeg).unwrap();
     assert_eq!(
-        requests[0].legacy_seed_paths.len(),
-        5_000,
-        "legacy seed paths are collected inside the frame-budgeted snapshot"
+        crate::xmp_reader::try_read_dc_subject(&path).unwrap(),
+        vec!["#legacy-only".to_string()],
+        "一般XMP readerは廃止対象ではない"
     );
+
+    app.items = vec![GridItem::Image(path.clone())];
+    app.prewarm_grid_tags();
+
+    let key = crate::tags_db::item_key_for_path(&path);
+    assert_eq!(app.tags_cache.get(&key), Some(&Vec::new()));
+    let db = app.tags_db.as_ref().expect("test tags db");
+    assert!(db.display_tags_for_item(&key).is_empty());
+    assert!(
+        !db.has_item_state(&key),
+        "通常表示は旧XMPを読み取った決定stateを作らない"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        jpeg,
+        "元ファイルを変更しない"
+    );
+    assert!(app.tag_prewarm_pending.is_none());
 }
 
 #[test]
@@ -3160,7 +3198,6 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
-        legacy_seed_paths: Vec::new(),
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(detached_id)],
@@ -3306,7 +3343,7 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
     });
 
     app.begin_metadata_import_terminal_refresh();
-    while !app.advance_metadata_import_terminal_refresh(&root, false, false) {}
+    while !app.advance_metadata_import_terminal_refresh(&root, false) {}
     let requests = app.take_metadata_import_refresh_requests();
     let request = requests
         .iter()
@@ -3661,7 +3698,6 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
-            legacy_seed_paths: Vec::new(),
         }],
         page_snapshot: None,
         errors: Vec::new(),
@@ -3732,7 +3768,7 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
 
 #[cfg(windows)]
 #[test]
-fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_workers() {
+fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_readers() {
     use crate::settings::FacetEditFlag;
 
     let mut app = phase_c_support::setup_app();
@@ -3795,7 +3831,6 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
-        legacy_seed_paths: vec![tagged_path.clone(), untagged_path.clone()],
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(active_id), context(paused_id)],
@@ -3831,8 +3866,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
     let assert_context =
         |tags_cache: &std::collections::HashMap<String, Vec<String>>,
          visible_indices: &[usize],
-         xmp_worker: &Option<crate::tag_prewarm::TagPrewarmPending>,
-         legacy_worker: &Option<crate::tag_legacy_seed_worker::LegacySeedPending>| {
+         xmp_worker: &Option<crate::tag_prewarm::TagPrewarmPending>| {
             assert_eq!(
                 tags_cache.get(&untagged_key),
                 Some(&Vec::new()),
@@ -3840,20 +3874,17 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
             );
             assert_eq!(visible_indices, &[0], "Tagged filterは未タグitemを除外する");
             assert!(xmp_worker.is_some(), "XMP rating hydrationを再生成する");
-            assert!(legacy_worker.is_some(), "legacy XMP tag seedを再生成する");
         };
     assert_context(
         &app.tags_cache,
         &app.visible_indices,
         &app.tag_prewarm_pending,
-        &app.tag_legacy_seed_pending,
     );
     app.with_active_viewer_context(|active| {
         assert_context(
             &active.tags_cache,
             &active.visible_indices,
             &active.tag_prewarm_pending,
-            &active.tag_legacy_seed_pending,
         );
     })
     .unwrap();
@@ -3862,7 +3893,6 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
             &paused.tags_cache,
             &paused.visible_indices,
             &paused.tag_prewarm_pending,
-            &paused.tag_legacy_seed_pending,
         );
     })
     .unwrap();
@@ -3940,7 +3970,6 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
 
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
-    let temp = tempfile::TempDir::new().unwrap();
     let image_path = PathBuf::from(r"C:\Pictures\a.jpg");
     let rating_key = crate::adjustment_db::normalize_path(&image_path);
     let items = vec![GridItem::Image(image_path)];
@@ -3955,25 +3984,17 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     app.settings.write_rating_to_xmp = true;
     app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
     app.tag_write_handle = Some(crate::tag_write_worker::TagWriteHandle::spawn());
-    app.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
-        temp.path().join("main"),
-        Vec::new(),
-    ));
 
-    let configure_context = |bundle: &mut App, name: &str, folder: &str| {
+    let configure_context = |bundle: &mut App, folder: &str| {
         bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-        bundle.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
-            temp.path().join(name),
-            Vec::new(),
-        ));
     };
     app.build_active_context_for_test(None, DetachedSource::Image, |active| {
-        configure_context(active, "active", r"C:\Pictures\Child");
+        configure_context(active, r"C:\Pictures\Child");
     });
     app.push_window_context_for_test(&ctx, 113, |paused| {
-        configure_context(paused, "paused", r"C:\Pictures\Child\Paused");
+        configure_context(paused, r"C:\Pictures\Child\Paused");
     });
 
     // bundle退避後に別contextでratingが更新された状態を作る。quiesceの一時mountで
@@ -3996,7 +4017,7 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "legacy writers and tag DB release must finish after transfer drain starts"
+            "rating readers and tag DB release must finish after transfer drain starts"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -4014,17 +4035,14 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
 
     assert_eq!(app.rating_cache.get(&0), Some(&4));
     assert!(app.tag_prewarm_pending.is_none());
-    assert!(app.tag_legacy_seed_pending.is_none());
     app.with_active_viewer_context(|active| {
         assert_eq!(active.rating_cache.get(&0), Some(&4));
         assert!(active.tag_prewarm_pending.is_none());
-        assert!(active.tag_legacy_seed_pending.is_none());
     })
     .unwrap();
     app.with_window_viewer_context(113, |paused| {
         assert_eq!(paused.rating_cache.get(&0), Some(&4));
         assert!(paused.tag_prewarm_pending.is_none());
-        assert!(paused.tag_legacy_seed_pending.is_none());
     })
     .unwrap();
     assert_eq!(
@@ -26666,7 +26684,7 @@ mod favorite_adjustment_defaults_tests {
         app.install_new_items(items, metas);
 
         app.begin_metadata_import_terminal_refresh();
-        while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false, false) {}
+        while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
         let requests = app.take_metadata_import_refresh_requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
@@ -69684,7 +69702,6 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
         tags_cache: Default::default(),
         local_adjust_pages: std::collections::HashSet::from([0]),
         video_pin_blobs: Default::default(),
-        legacy_paths: Vec::new(),
         folder_pin_map: None,
         aggregate: Some(crate::app::subfolder_expansion::PreparedAggregateMetadata {
             adjustment_page_params: std::collections::HashMap::from([(0, params.clone())]),

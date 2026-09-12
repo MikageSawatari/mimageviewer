@@ -235,7 +235,7 @@ permit を接続ごとに後付けするのではなく、値を最後まで所�
 最低 15 系統ある。内訳は page adjustment、favorite adjustment params、mask、conceal、crop、
 comic、book page copy/move、local-adjust worker、tag write worker、tag editor maintenance、
 favorite-view worker、single/bulk edit bundle、rename migration、content-identity/delete、
-metadata transfer/legacy-tag seed である。旧 sidecar import はこれらと競合する 16 番目の writer
+metadata transfer である。旧 sidecar import はこれらと競合する 16 番目の writer
 として coordinator 側へ置換する。Stage 2 の実装前に call-site audit test/list を固定し、新しい
 direct writer が permit を迂回した時に review だけへ依存しない形を選ぶ。
 
@@ -294,7 +294,7 @@ authoritative replay、Pending source の commit 前 revalidation、stale comple
 `src/tag_write_worker.rs`、`src/local_adjust_write_worker.rs`、`src/favorite_view_state.rs`、
 `src/edit_bundle.rs`、`src/edit_bundle_app.rs`、`src/edit_bundle_bulk.rs`、
 `src/rename_key_migration.rs`、`src/content_identity/restore.rs`、`src/delete_worker.rs`、
-`src/metadata_transfer.rs`、`src/tag_legacy_seed_worker.rs`、`src/ui_dialogs/tag_editor.rs`、
+`src/metadata_transfer.rs`、`src/ui_dialogs/tag_editor.rs`、
 App/continuation は `src/app.rs`、`src/app/viewer_context_registry.rs`、
 `src/app/snapshot_ops.rs`、`src/ui_fullscreen.rs`、`src/app/tests.rs` が候補になる。低層 API で permit
 を型として強制する設計を選ぶ場合は 7 DB module も増える。実装量は focused test と設計 review を
@@ -434,7 +434,7 @@ sidecar owner は下記 in-place reservation が守る。ここでは既存
 `quiesce_metadata_transfer_context_writers` の release/ACK/poll 機構を共通 helper に切り出して使う。
 少なくとも次を drain 対象にする。
 
-- tag writer の paused FIFO、legacy tag seed、tag maintenance と App の `tags_db` release/ACK
+- tag writer の paused FIFO、tag maintenance と App の `tags_db` release/ACK
 - rating、local-adjust、edit preview、book/bookmark、book page copy/move
 - metadata transfer、rename migration、delete/purge、drop copy、新規 folder、batch convert、capture
 - single/bulk edit bundle と content-identity restore
@@ -485,8 +485,9 @@ cancel、busy、fault では当該 marker を clear 済みと報告しない。
 ### 5.4 target modal と入力境界
 
 `modal_dialog_block_reason()` は `SidecarRestoreState` を一つの理由として参照する。projected context が
-restore target と一致する main grid / embedded fullscreen / egui viewport だけが
-「サイドカーから設定を復元中」表示を使う。target では state 開始時と各 frame
+restore target と一致する main grid / embedded fullscreen / egui viewport だけがphase別modalを表示する。
+`Checking` / `Quiescing` / `InvalidatingPreview` / `Resuming` は各処理を説明し、実際に中央DBへimportする
+`Running` だけが「サイドカーから設定を復元中」を使う。target では state 開始時と各 frame
 で keyboard、text/IME、pointer、wheel、touch、gamepad、shortcut、right-drag など semantic input を
 consume/discard し、button/key release edge だけは hold state の解消へ反映する。入力を保存して modal
 解除後に replay しない。state の解除は `Resuming` が完了した frame の全入力処理より後の App outer

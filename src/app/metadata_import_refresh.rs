@@ -49,8 +49,6 @@ pub(crate) struct ContextRequest {
     pub(crate) context_id: ViewerContextId,
     pub(crate) items_generation: u64,
     pub(crate) items: Vec<ItemKey>,
-    /// UIの段階snapshot中に収集済みのlegacy XMP tag seed対象。
-    pub(crate) legacy_seed_paths: Vec<PathBuf>,
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
     pub(crate) spread_container_fallback: Option<PathBuf>,
@@ -71,8 +69,6 @@ pub(crate) struct ContextResult {
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
     pub(crate) container_state: Option<ContainerStateResult>,
-    /// `ContextRequest`からcloneせず所有権を返し、UIで再走査せずworkerを再生成する。
-    pub(crate) legacy_seed_paths: Vec<PathBuf>,
 }
 
 pub(crate) struct ContainerStateResult {
@@ -571,7 +567,6 @@ fn build_context_result(
         video_pin_blobs,
         video_items,
         container_state,
-        legacy_seed_paths: request.legacy_seed_paths,
     })
 }
 
@@ -613,9 +608,28 @@ mod tests {
         let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let key = "c:/pictures/a.jpg".to_string();
-        let untagged_key = "c:/pictures/b.jpg".to_string();
+        let legacy_xmp_path = temp.path().join("legacy-only.jpg");
+        let xmp = br#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject><rdf:Bag><rdf:li>#legacy-only</rdf:li></rdf:Bag></dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload = xmp_id.iter().chain(xmp.iter()).copied().collect::<Vec<_>>();
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x02, 0xff, 0xd9]);
+        std::fs::write(&legacy_xmp_path, &jpeg).unwrap();
+        assert_eq!(
+            crate::xmp_reader::try_read_dc_subject(&legacy_xmp_path).unwrap(),
+            vec!["#legacy-only".to_string()],
+            "一般XMP readerはmetadata refreshでも現役"
+        );
+        let untagged_key = crate::tags_db::item_key_for_path(&legacy_xmp_path);
         let tag_only_key = "c:/pictures/search-container".to_string();
-        let legacy_seed_path = PathBuf::from("c:/pictures/a.jpg");
         crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
             .unwrap()
             .set(&key, 4)
@@ -668,7 +682,6 @@ mod tests {
                         video_size: 0,
                     },
                 ],
-                legacy_seed_paths: vec![legacy_seed_path.clone()],
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
                 spread_container_fallback: None,
@@ -705,9 +718,9 @@ mod tests {
         assert!(!context.rating_cache.as_ref().unwrap().contains_key(&5));
         assert_eq!(context.current_rating, Some(4));
         assert_eq!(
-            context.legacy_seed_paths,
-            vec![legacy_seed_path],
-            "legacy seed path ownership must round-trip through the refresh worker"
+            std::fs::read(&legacy_xmp_path).unwrap(),
+            jpeg,
+            "metadata refreshは旧XMP原本を変更しない"
         );
     }
 
@@ -731,7 +744,6 @@ mod tests {
                     video_path: None,
                     video_size: 0,
                 }],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,
@@ -788,7 +800,6 @@ mod tests {
                     context_id: ViewerContextId::for_test(0),
                     items_generation: 1,
                     items: Vec::new(),
-                    legacy_seed_paths: Vec::new(),
                     current_rating_key: None,
                     spread_container_path: Some(nested.clone()),
                     spread_container_fallback: Some(root.clone()),
@@ -873,7 +884,6 @@ mod tests {
                         video_size: 0,
                     },
                 ],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,
@@ -934,7 +944,6 @@ mod tests {
                     video_path: Some(video.clone()),
                     video_size: 123,
                 }],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,

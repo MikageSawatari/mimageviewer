@@ -1454,6 +1454,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-12 旧XMPタグ自動seedのcontext owner撤去（利用者了承・親Codex／独立Sol合意）**
+
+フォルダ通常load、prepared subfolder、明示metadata import終端refreshから起動していた
+legacy XMP tag seedを廃止し、`ViewerContextBundle` / Appのpending、mount/deposit/Drop cancel、
+poll/repaint、metadata-transfer／sidecar-restoreのquiescence待機を一体で撤去した。ratingの
+context-owned prewarm、metadata refreshのcontext identity／late-retire、ほかのwriter barrierは維持する。
+これは利用者がv1.0救済終了を明示了承した機能撤去に伴い、存在しないworker ownerをdetached lifecycleへ
+残さない整理である。detached predicate、viewport／host、placement、focus、geometry、context registryの
+mount/swap/retire規則には変更を加えない。
+
 **2026-09-10 末尾に表紙を添える見開き（機能branchで実装・独立レビュー・狭域検証済み、未統合）**
 
 親と独立Sol/xhighは、NavigationとFrontCoverSupplementを同じtyped composition / demandに所有させる構造を事前確認した。利用者指定の役割移行により旧ClaudeCode検収は独立Solへ移管し、実装Solとは別担当とする。全gate後の追加指摘もB2r6で独立検収し、commit bc8aa8c21で本体8074件とUI48件・vendorを含む再fullgate、確認core/Remote buildが完了。その後、利用者から本体/Remote/連結/F12/ずらしの動作良好報告を受領した。master統合と統合後検証は別段階である。

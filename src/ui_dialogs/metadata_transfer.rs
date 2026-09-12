@@ -386,21 +386,12 @@ impl App {
             }
         }
         let refresh_target = self.metadata_transfer.as_ref().and_then(|state| {
-            matches!(state.stage, Stage::RefreshPreparing).then(|| {
-                let changed_tags = state
-                    .pending_import_result
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .is_some_and(|summary| summary.changed.tags);
-                (state.root.clone(), state.recursive, changed_tags)
-            })
+            matches!(state.stage, Stage::RefreshPreparing)
+                .then(|| (state.root.clone(), state.recursive))
         });
-        let refresh_ready =
-            refresh_target
-                .as_ref()
-                .is_some_and(|(root, recursive, changed_tags)| {
-                    self.advance_metadata_import_terminal_refresh(root, *recursive, *changed_tags)
-                });
+        let refresh_ready = refresh_target.as_ref().is_some_and(|(root, recursive)| {
+            self.advance_metadata_import_terminal_refresh(root, *recursive)
+        });
         if refresh_ready {
             let requests = self.take_metadata_import_refresh_requests();
             if let Some(state) = self.metadata_transfer.as_mut() {

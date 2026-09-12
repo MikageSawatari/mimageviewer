@@ -175,6 +175,7 @@ mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
 mod sidecar_restore;
+pub(crate) use sidecar_restore::SidecarRestorePresentation;
 pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
@@ -2750,9 +2751,7 @@ struct MetadataImportRefreshIndex {
     next_item: usize,
     complete: bool,
     affected: bool,
-    collect_legacy_seed_paths: bool,
     items: Vec<metadata_import_refresh::ItemKey>,
-    legacy_seed_paths: Vec<PathBuf>,
     current_rating_key: Option<String>,
     folder_pin_paths: Vec<PathBuf>,
     folder_pin_aliases: Vec<(String, String)>,
@@ -12893,8 +12892,6 @@ pub struct App {
     /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
     /// 未処理 idx に対してのみ発生させる。フォルダ切替で `prewarm_grid_tags` が clear する。
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
-    /// 旧 XMP `#タグ` を `tags.db` へ一度だけ seed する保険 worker。
-    pub(crate) tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
     /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
@@ -16182,7 +16179,6 @@ impl App {
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
-            tag_legacy_seed_pending: None,
             delete_pending: None,
             batch_convert: None,
             delete_purge_retry_pending: None,
@@ -26545,18 +26541,9 @@ impl App {
                 pending.cancel();
             }
             self.tag_prewarm_queued.clear();
-            if let Some(pending) = self.tag_legacy_seed_pending.take() {
-                pending.cancel();
-            }
             self.replace_tags_cache(std::mem::take(&mut prepared.tags_cache));
             if self.settings.write_rating_to_xmp {
                 self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-            }
-            if self.tags_db.is_some() {
-                self.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
-                    crate::data_dir::get(),
-                    std::mem::take(&mut prepared.legacy_paths),
-                ));
             }
         } else {
             self.prewarm_grid_tags();
@@ -29245,9 +29232,6 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
-        if let Some(pending) = self.tag_legacy_seed_pending.take() {
-            pending.cancel();
-        }
 
         // キューに残った旧 idx リクエストを排水。items_gen 差異で最終的には破棄されるが、
         // worker が pop した直後は decode を走らせ始めてしまうので、明示的に捨てる。
@@ -30191,7 +30175,6 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
-        collect_legacy_seed_paths: bool,
     ) -> bool {
         const MAX_ITEMS_PER_FRAME: usize = 2_048;
         const MAX_TIME_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(3);
@@ -30201,7 +30184,6 @@ impl App {
         let mut complete = self.advance_current_metadata_import_terminal_index(
             import_root,
             recursive,
-            collect_legacy_seed_paths,
             &mut remaining,
             deadline,
         );
@@ -30212,7 +30194,6 @@ impl App {
                     app.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
-                        collect_legacy_seed_paths,
                         &mut remaining,
                         deadline,
                     )
@@ -30238,7 +30219,6 @@ impl App {
                         app.advance_current_metadata_import_terminal_index(
                             import_root,
                             recursive,
-                            collect_legacy_seed_paths,
                             &mut remaining,
                             deadline,
                         )
@@ -30267,17 +30247,13 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
-        collect_legacy_seed_paths: bool,
         remaining: &mut usize,
         deadline: std::time::Instant,
     ) -> bool {
         let restart = self
             .metadata_import_refresh_index
             .as_ref()
-            .is_none_or(|index| {
-                index.items_generation != self.items_generation
-                    || index.collect_legacy_seed_paths != collect_legacy_seed_paths
-            });
+            .is_none_or(|index| index.items_generation != self.items_generation);
         if restart {
             let affected = self.current_folder.as_deref().is_some_and(|path| {
                 metadata_import_context_path_is_affected(path, import_root, recursive)
@@ -30295,9 +30271,7 @@ impl App {
                 current_rating_key,
                 affected,
                 complete: !affected || self.items.is_empty(),
-                collect_legacy_seed_paths,
                 folder_pin_paths,
-                legacy_seed_paths: Vec::new(),
                 ..MetadataImportRefreshIndex::default()
             });
         }
@@ -30332,14 +30306,6 @@ impl App {
                 || self.rotation_cache.contains_key(&item_index);
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
-            if index.collect_legacy_seed_paths
-                && !self.items_are_global_search_view
-                && !self.items_are_tag_view
-                && !self.idx_is_compiled_book_page(item_index)
-                && let GridItem::Image(path) | GridItem::Video(path) = item
-            {
-                index.legacy_seed_paths.push(path.clone());
-            }
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
             if let Some(target) = folder_pin_target {
@@ -30422,7 +30388,6 @@ impl App {
                 context_id,
                 items_generation: index.items_generation,
                 items: index.items,
-                legacy_seed_paths: index.legacy_seed_paths,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
                 spread_container_fallback,
@@ -30481,15 +30446,13 @@ impl App {
     /// 転送開始前に、現在mount中のcontextが持つmetadata writerを静止させる。
     ///
     /// XMP rating prewarmはファイルread結果をUI pollでDBへ反映するため、handleを取消・破棄
-    /// すれば以後書込みを生成しない。legacy seedはworker自身がtags.dbへ書くので取消による
-    /// 中途半端な打切りはせず、完了結果をcontextへ適用してhandleが消えるまで待つ。
+    /// すれば以後書込みを生成しない。
     fn quiesce_current_metadata_transfer_context_writers(&mut self) -> bool {
         if let Some(pending) = self.tag_prewarm_pending.take() {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
-        self.poll_tag_legacy_seed_results();
-        self.tag_legacy_seed_pending.is_some()
+        false
     }
 
     /// main / active detached / paused detachedの全context writerを静止させる。
@@ -30580,7 +30543,7 @@ impl App {
     }
 
     /// 転送待機で取消したXMP rating readerを、完了・開始失敗・待機キャンセル後に
-    /// contextごとへ戻す。legacy seedは安全に完走させているため再生成しない。
+    /// contextごとへ戻す。
     fn ensure_mounted_tag_prewarm_started(&mut self) {
         if !self.items.is_empty() && self.tag_prewarm_pending.is_none() {
             self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
@@ -30840,7 +30803,6 @@ impl App {
         }
         let rating_cache_replaced = result.rating_cache.is_some();
         let tags_cache_replaced = result.tags_cache.is_some();
-        let legacy_seed_paths = std::mem::take(&mut result.legacy_seed_paths);
         let rebuild_display =
             rating_cache_replaced || tags_cache_replaced || result.page_state.is_some();
         if let Some(ratings) = result.rating_cache.take() {
@@ -30858,9 +30820,6 @@ impl App {
                 pending.cancel();
             }
             self.tag_prewarm_queued.clear();
-            if let Some(pending) = self.tag_legacy_seed_pending.take() {
-                pending.cancel();
-            }
             DetailsCellContentRevisions::bump(&mut self.details_cell_content_revisions.tags);
         }
         if let Some(page) = result.page_state.take() {
@@ -30966,14 +30925,11 @@ impl App {
             self.music_bookmarks.clear();
             self.music_bookmarks_loaded_for = None;
         }
-        // 古いDB snapshotの結果を防ぐため上で取消したcontext所有workerを、
+        // 古いDB snapshotの結果を防ぐため上で取消したcontext所有のrating readerを、
         // 完成cacheの適用後に同じcontextへ再生成する。これをmount中に行うことで
         // main / active detached / paused detached がそれぞれ自分のhandleを持つ。
         if (rating_cache_replaced || tags_cache_replaced) && self.settings.write_rating_to_xmp {
             self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-        }
-        if tags_cache_replaced {
-            self.start_tag_legacy_seed(legacy_seed_paths);
         }
         // visible_indices / facet / details order / selectionはViewerContextBundle所有。
         // cacheを適用したcontextをmountしている間に一体で再計算する。
@@ -44279,7 +44235,6 @@ impl App {
                 // active bundle を mount している間に回収し、main grid へ結果を混入させない。
                 app.poll_metadata_load();
                 app.poll_tag_prewarm_results();
-                app.poll_tag_legacy_seed_results();
                 // 名前 facet の正規化結果も items と同じ bundle が所有する。active detached
                 // を mount したこの境界で pending を回収し、main の cache へ混入させない。
                 // 入力の debounce (App 全体の状態) は main を mount した本流だけが進める。
@@ -52713,9 +52668,6 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
-        if let Some(pending) = self.tag_legacy_seed_pending.take() {
-            pending.cancel();
-        }
 
         let mut keys = Vec::new();
         for item in &self.items {
@@ -52741,37 +52693,6 @@ impl App {
         if self.settings.write_rating_to_xmp {
             self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
         }
-        self.start_tag_legacy_seed_for_current_items();
-    }
-
-    fn start_tag_legacy_seed_for_current_items(&mut self) {
-        if self.items_are_global_search_view || self.items_are_tag_view {
-            return;
-        }
-        let paths = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !self.idx_is_compiled_book_page(*idx))
-            .filter_map(|(_, item)| match item {
-                GridItem::Image(path) | GridItem::Video(path) => Some(path.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        self.start_tag_legacy_seed(paths);
-    }
-
-    fn start_tag_legacy_seed(&mut self, paths: Vec<PathBuf>) {
-        if self.tags_db.is_none() {
-            return;
-        }
-        if paths.is_empty() {
-            return;
-        }
-        self.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
-            crate::data_dir::get(),
-            paths,
-        ));
     }
 
     /// 毎フレーム呼ぶ: 現在の画面付近にある Image のうち、rating DB が未登録のものを
@@ -52884,68 +52805,6 @@ impl App {
         // 期待するのは DB が 0 = 未登録のときだけ)。
         if !rating_hydrations.is_empty() {
             self.hydrate_ratings_from_xmp(rating_hydrations);
-        }
-    }
-
-    pub(crate) fn poll_tag_legacy_seed_results(&mut self) {
-        let Some(pending) = self.tag_legacy_seed_pending.as_ref() else {
-            return;
-        };
-        match pending.rx.try_recv() {
-            Ok(Ok(result)) => {
-                self.tag_legacy_seed_pending = None;
-                self.apply_tag_legacy_seed_result(result);
-            }
-            Ok(Err(msg)) => {
-                self.tag_legacy_seed_pending = None;
-                crate::logger::log(format!("[TAG] legacy seed failed: {msg}"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.tag_legacy_seed_pending = None;
-            }
-        }
-    }
-
-    fn apply_tag_legacy_seed_result(
-        &mut self,
-        result: crate::tag_legacy_seed_worker::LegacySeedResult,
-    ) {
-        let report = result.report.clone();
-        let mut changed = false;
-        for (path, tags) in result.cache_updates {
-            let key = crate::tags_db::item_key_for_path(&path);
-            self.set_tags_cache_entry(key, tags.clone());
-            if let Some(target) = crate::tag_write_worker::sidecar_target_for_real_file(&path) {
-                self.mirror_tag_sidecar_update(&target, &tags);
-            }
-            changed = true;
-        }
-        if changed {
-            self.schedule_current_smart_folder_metadata_refresh(
-                smart_folder::SmartFolderMetadataDependency::Tags,
-            );
-        }
-        if changed && self.settings.facet_filter.uses_tag_state() {
-            self.rebuild_visible_indices_preserving_facet_scope();
-        }
-        if report.imported_items > 0
-            || report.marked_empty_items > 0
-            || report.read_errors > 0
-            || report.db_errors > 0
-        {
-            crate::logger::log(format!(
-                "[TAG] legacy seed complete: candidates={} read={} imported_items={} \
-                 inserted_tags={} marked_empty={} skipped_decided={} read_errors={} db_errors={}",
-                report.candidate_items,
-                report.read_items,
-                report.imported_items,
-                report.inserted_tags,
-                report.marked_empty_items,
-                report.skipped_decided_items,
-                report.read_errors,
-                report.db_errors
-            ));
         }
     }
 
@@ -71789,7 +71648,6 @@ impl App {
         self.poll_pano_high_res(ctx);
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
-        self.poll_tag_legacy_seed_results();
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_file_drop_pending();
@@ -71865,7 +71723,6 @@ impl App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
-            || self.tag_legacy_seed_pending.is_some()
             || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {

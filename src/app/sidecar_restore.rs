@@ -229,6 +229,64 @@ enum Phase {
     Resuming,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhaseName {
+    Checking,
+    Quiescing,
+    Running,
+    CacheRefreshing,
+    InvalidatingPreview,
+    Resuming,
+}
+
+impl Phase {
+    fn name(&self) -> PhaseName {
+        match self {
+            Self::Checking(_) => PhaseName::Checking,
+            Self::Quiescing(_) => PhaseName::Quiescing,
+            Self::Running(_) => PhaseName::Running,
+            Self::CacheRefreshing(_) => PhaseName::CacheRefreshing,
+            Self::InvalidatingPreview(_) => PhaseName::InvalidatingPreview,
+            Self::Resuming => PhaseName::Resuming,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SidecarRestorePresentation {
+    pub(crate) heading: &'static str,
+    pub(crate) detail: &'static str,
+}
+
+fn presentation_for_phase(phase: PhaseName) -> SidecarRestorePresentation {
+    match phase {
+        PhaseName::Checking => SidecarRestorePresentation {
+            heading: "保存されている設定を確認中",
+            detail: "保存されている設定を確認しています。",
+        },
+        PhaseName::Quiescing => SidecarRestorePresentation {
+            heading: "保存中の設定を確定中",
+            detail: "保存中の変更が完了するまで待っています。",
+        },
+        PhaseName::Running => SidecarRestorePresentation {
+            heading: "サイドカーから設定を復元中",
+            detail: "保存されていた設定を読み込んでいます。",
+        },
+        PhaseName::CacheRefreshing => SidecarRestorePresentation {
+            heading: "保存されている設定を再確認中",
+            detail: "現在のファイル状態を確認しています。",
+        },
+        PhaseName::InvalidatingPreview => SidecarRestorePresentation {
+            heading: "表示を更新中",
+            detail: "設定に合わせて表示を更新しています。",
+        },
+        PhaseName::Resuming => SidecarRestorePresentation {
+            heading: "表示を準備中",
+            detail: "確認済みの設定を表示へ反映しています。",
+        },
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PreviewClearPoll {
     Pending,
@@ -342,15 +400,8 @@ impl SidecarRestoreState {
         true
     }
 
-    pub(crate) fn label(&self) -> &'static str {
-        match self.phase {
-            Phase::Checking(_) => "サイドカーを確認中",
-            Phase::Quiescing(_) => "保存中の設定を確定中",
-            Phase::Running(_) => "サイドカーから設定を復元中",
-            Phase::CacheRefreshing(_) => "サイドカー状態を更新中",
-            Phase::InvalidatingPreview(_) => "表示キャッシュを更新中",
-            Phase::Resuming => "復元した設定を反映中",
-        }
+    pub(crate) fn presentation(&self) -> SidecarRestorePresentation {
+        presentation_for_phase(self.phase.name())
     }
 
     pub(crate) fn modal_delay_remaining(&self, now: std::time::Instant) -> std::time::Duration {
@@ -1970,6 +2021,28 @@ fn marker_clear_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_presentation_names_the_actual_restore_step() {
+        let cases = [
+            (PhaseName::Checking, "保存されている設定を確認中"),
+            (PhaseName::Quiescing, "保存中の設定を確定中"),
+            (PhaseName::Running, "サイドカーから設定を復元中"),
+            (PhaseName::CacheRefreshing, "保存されている設定を再確認中"),
+            (PhaseName::InvalidatingPreview, "表示を更新中"),
+            (PhaseName::Resuming, "表示を準備中"),
+        ];
+        for (phase, expected_heading) in cases {
+            let presentation = presentation_for_phase(phase);
+            assert_eq!(presentation.heading, expected_heading);
+            assert!(!presentation.detail.is_empty());
+            assert_eq!(
+                presentation.heading.contains("復元中"),
+                phase == PhaseName::Running,
+                "復元中と表示できるのはDB importを実行するphaseだけ"
+            );
+        }
+    }
 
     fn empty_edit_rollup() -> EditRollupSnapshot {
         EditRollupSnapshot {

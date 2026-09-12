@@ -262,8 +262,8 @@ AND `facet_filter` を合成して `visible_indices` を作る ([docs/details-vi
   出さない。再 ingest で順次空になる。**移行は再 ingest より先に走らせる**。
 - `SourceKind::Sidecar` (外部 JSON/TXT サイドカーの別系統メタ, [src/fts_index.rs:81](../src/fts_index.rs)) は
   mIV タグと無関係なので**そのまま**。
-- **注意 (Codex P2)**: ここで消すのは **検索ソースとしての** XMP/`dc:subject` 読み。§7.2 の
-  **legacy seed worker (tags.db への一度きり移行) は別経路として残す**。両者を別名にして取り違えない。
+- **2026-09-12 更新**: 検索ソースとしての XMP/`dc:subject` 読みに加え、§7.2 の
+  legacy seed workerも利用者了承のうえで撤去した。一般XMP metadataとratingは別経路として維持する。
 
 ### 5.5 タグビューの stale パス処理 (Codex P2)
 
@@ -362,10 +362,10 @@ Shell 成功 path だけを、共通 delete worker が全 path-keyed store と�
 `SELECT … GROUP BY tag_key`、前方一致 = `tag_key LIKE ? ESCAPE '\'` (入力を NFKC 正規化 + escape、§8.1)、最近使用 =
 `GROUP BY tag_key ORDER BY MAX(applied_at) DESC`。別途 MRU リストは持たない。
 
-### 6.6 コンテキストメニュー: 過去ファイルの後始末 (任意)
+### 6.6 コンテキストメニュー: 過去ファイルの後始末 (廃止済みの履歴)
 
-- 「タグを取り込んでファイルから削除」「タグを取り込む (ファイルはそのまま)」を追加 (§7.2)。
-- フォルダ/ライブラリ一括版も用意。
+- 「タグを取り込んでファイルから削除」「タグを取り込む (ファイルはそのまま)」を追加する設計だったが、
+  選択item版を2026-08-30に廃止した。フォルダ／ライブラリ一括版も実装しない。
 
 ---
 
@@ -390,11 +390,14 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   `tags` からの復活を防ぐ)。
 - **起動順の固定 (Codex P2)**: この一括移行は **FTS 再構築 (旧 STORED `tags` を消し得る) より前**に
   走らせる。順序 = legacy 一括移行 → (必要なら) FTS 再構築 / 通常 ingest。
-- **取り込んだ各 `item_key` に `tag_item_state` (source='tantivy_migration') を記録**する (§7.2 と同じ台帳)。これで §7.2 の遅延 seed が
-  「移行済み」と判定してファイル XMP を読み直さず、ユーザーが `tags.db` で削除したタグが復活しない。
-  一括移行 (§7.1) と遅延 seed (§7.2) はこの単一台帳を共有する。
+- **取り込んだ各 `item_key` に `tag_item_state` (source='tantivy_migration') を記録**する。
+  旧XMP自動seedの撤去後も、Tantivy移行の完了記録とタグ決定状態としてこの台帳を維持する。
 
-### 7.2 遅延取り込み + リバイバル防止 (保険経路) — 実装済み (2026-06-12)
+### 7.2 遅延取り込み + リバイバル防止 (保険経路) — 2026-09-12 廃止
+
+以下は2026-06-12に導入した当時の設計記録である。日常利用済みデータは移行済みとしてv1.0救済を
+終了する利用者了承を得て、自動seedの3入口、context owner、待機、worker、専用bounded readerを
+2026-09-12に撤去した。既存 `item_tags` / `tag_item_state` は走査・削除せず保持する。
 
 お気に入り外などで **Tantivy に索引されていないファイル**の v1.0 埋め込み `#タグ` は §7.1 に乗らない。
 保険として、フォルダを開いた時に **専用の legacy seed worker** がファイル XMP の `#タグ` を読み
@@ -415,7 +418,10 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 - **ファイル mtime が変わっても再 seed しない** (他アプリの後付け編集で旧タグが復活するのを防ぐ)。
   再取り込みは §7.3 の明示コマンド経由のみ。
 
-### 7.3 ファイルからの除去 (明示・任意) — 選択中 item 実装済み (2026-06-12)
+### 7.3 ファイルからの除去 (明示・任意) — 2026-08-30 廃止
+
+以下は実装当時の設計記録である。利用者向け手動取り込み／取り込み後削除と専用workerは
+2026-08-30に撤去済みで、2026-09-12の自動seed撤去時に復活させないと決定した。
 
 - 右クリック「タグを取り込んでファイルから削除」で、ファイル内の `#タグ` を除去 (+ 余った
   動画 `.xmp` 削除)。アトミック書き込み ([src/xmp_writer.rs](../src/xmp_writer.rs) を再利用)。
@@ -461,9 +467,9 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
     **統合規則**: 移行/付与時に同一 `tag_key` へ正規化される表示違いが出たら、表示形 1 つ (最新
     `applied_at`) に寄せ、適用 (item_tags 行) を union する。
   - **`tag_item_state` の立て方 (Codex P2)**: 「この item_key のタグは tags.db が決定済み」を表す行。
-    通常編集 (付与/削除/全クリア)・§7.1 一括移行・§7.2 legacy XMP seed・§4.1 sidecar import の各経路で、
-    その item_key を処理した時点で upsert する。**legacy seed と sidecar import はこの行が在れば skip**する
-    (タグを全削除して空になった item も復活させない)。旧 `xmp_migrated` はこの表に統合 (source='xmp_legacy')。
+    通常編集 (付与/削除/全クリア)・§7.1 一括移行・§4.1 sidecar import の各経路で、その item_key を
+    処理した時点でupsertする。sidecar importはこの行が在ればskipし、タグを全削除して空になったitemも
+    復活させない。廃止したlegacy XMP seedが作った `source='xmp_legacy'` の既存行も歴史値として保持する。
   - **前方一致検索のワイルドカード対策 (Codex P3)**: タグ名は `%` / `_` を含み得るので、入力を同じく
     NFKC 正規化した上で `%`/`_`/`\` を escape して `LIKE ? ESCAPE '\'` で引く (既存
     [src/adjustment_db.rs:327](../src/adjustment_db.rs) `escape_like_pattern` を再利用) か range query にする。
@@ -526,9 +532,8 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   保存は `#` なし。
 - [src/sidecar.rs](../src/sidecar.rs): `SidecarEntry` に `tags`、`tag_sidecar_backup_enabled` で gate、
   実ファイル 5 種のキー拡張 (§4.1)。**実装済み (2026-06-12)**。
-- [src/tag_legacy_xmp_worker.rs](../src/tag_legacy_xmp_worker.rs): §7.3 の明示取り込み / 取り込み後削除。
-  選択中の Image / Video を対象に、`tag_item_state` を bypass して XMP `#` タグを union し、削除モードでは
-  DB 更新成功後に `#` 要素だけ除去する。**実装済み (2026-06-12、フォルダ/ライブラリ再帰一括は後続)**。
+- `src/tag_legacy_xmp_worker.rs`: §7.3 の明示取り込み／取り込み後削除として2026-06-12に実装したが、
+  2026-08-30に製品とsourceを撤去済み。フォルダ／ライブラリ再帰版も実装しない。
 - [src/ui_metadata_panel.rs](../src/ui_metadata_panel.rs): タグセクション mIV のみ、外部タグ区別表示を削除。
 - 移行: Tantivy `tags` 走査 → `#` 剥がし → `tags.db` 一括コピー (§7.1)。
 

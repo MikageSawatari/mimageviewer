@@ -120,8 +120,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [tags_db.rs](../src/tags_db.rs) | mIV タグ正本。`item_tags` / `tag_item_state` / `tag_meta` と `tag_key` 正規化 helper |
 | [tag_ops.rs](../src/tag_ops.rs) | UI からのタグ操作ファサード。all-or-nothing 判定後に tags.db worker へ投入 |
 | [tag_write_worker.rs](../src/tag_write_worker.rs) | UI → tags.db 更新 worker。通常タグ操作では XMP/Tantivy を更新しない |
-| [tag_legacy_xmp_worker.rs](../src/tag_legacy_xmp_worker.rs) | 旧 XMP `dc:subject` / 動画 `.xmp` に残る `#` タグの明示取り込みと、取り込み後削除 |
-| [xmp_writer.rs](../src/xmp_writer.rs) | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去用の補助に縮退 |
+| [xmp_writer.rs](../src/xmp_writer.rs) | XMP ratingなど現役metadataの書換 helper。旧XMPタグ移行用の呼び出しは廃止済み |
 
 ---
 
@@ -135,7 +134,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
 | `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
-| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。旧 XMP/Tantivy タグの移行フラグと、任意のタグ sidecar backup import 同期状態もここに置く |
+| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy一回移行フラグ、既存の歴史的XMP移行状態、任意のタグsidecar backup import同期状態もここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`
@@ -391,14 +390,11 @@ Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待�
 `fts_index` wipe / `FtsIndex::open_at` より前。移行済みフラグは
 `tags.db.tag_meta.legacy_tantivy_imported` に置く。
 
-Tantivy 移行に乗らない未索引ファイルは、フォルダ表示時の legacy seed worker が
-XMP `dc:subject` の `#` タグを一度だけ `tags.db` へ取り込む。自動 seed では
-大量ファイル処理時のディスク占有を避けるため、メディア本体の読み取りは先頭 2MiB
-までに制限する (動画の同名 `.xmp` sidecar は全体を読む)。ユーザーが明示的に
-「旧XMPタグを取り込む」「旧XMPタグを取り込んでファイルから削除」を実行した場合は、
-`tag_item_state` の有無に関係なく選択中の画像/動画を読み直し、既存 tags.db タグへ
-union する。削除モードでは DB 更新成功後に `#` 要素だけを除去し、非 `#` の外部タグは
-保持する。
+フォルダ表示時に未索引ファイルのXMP `dc:subject`を読む自動seedは、v1.0救済終了について
+2026-09-12に利用者了承を得て撤去した。手動の「旧XMPタグを取り込む／取り込んで削除」も
+2026-08-30に撤去済みであり、未移行のXMP `#` タグを新たに `tags.db` へ取り込む経路はない。
+既存の `item_tags` / `tag_item_state`（`source='xmp_legacy'`を含む）は走査・削除せず保持する。
+一般XMP metadata、rating、非`#`の `dc:subject` を扱う現役機能には影響しない。
 
 ### 4.10 外部メタデータサイドカー (画像のみ、INDEX_VERSION=8)
 

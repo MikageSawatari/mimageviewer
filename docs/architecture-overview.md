@@ -178,7 +178,7 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
 | `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
 | `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
-| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` / `app/metadata_import_refresh.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path・media kind・file size検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンをworkerで移送する。変換済みRAR / 7z / LZH / nested-archive ZIPはsource container keyと環境固有cache ZIP page keyを相互変換する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアをattached connectionへまとめ、外側transactionを256項目 / 64 MiB / 500 msで区切り、項目内SAVEPOINTで失敗を隔離する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当する。開始前にはmain / active detached / paused detachedのmetadata writerを静止・drainし、終了時にXMP readerをcontextごと再開する。DB更新中は既存cacheを安定snapshotとして保ち、終端時に影響contextのcompact keyとlegacy seed path snapshotを専用workerへ渡す。一括再取得したcacheは未タグの読込済みsentinelも含め、items世代照合後にcontextごと所有権を置換して表示集合とcontext所有XMP workerを再構築する。外部snapshot反映はApp-globalなfacet scope / suppressionを変更せず、bookmark presence更新も保持中の全contextへ在メモリ反映する |
+| `metadata_transfer.rs` / `ui_dialogs/metadata_transfer.rs` / `app/metadata_import_refresh.rs` | 実フォルダ単位の明示メタ情報移送。`mimageviewer.meta.miv` directory の原子的generation pointer + フォルダ単位JSON Lines shard、root-relative path・media kind・file size検証、再帰走査、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / 6種のページ編集 / 代表サムネ・動画ピンをworkerで移送する。変換済みRAR / 7z / LZH / nested-archive ZIPはsource container keyと環境固有cache ZIP page keyを相互変換する。export / preview / importはshardを逐次処理し、総項目数・総sidecarサイズの固定上限を持たない。importは15ストアをattached connectionへまとめ、外側transactionを256項目 / 64 MiB / 500 msで区切り、項目内SAVEPOINTで失敗を隔離する。UIは完全モーダルの確認・固定高進捗・キャンセルと未保存view-trimのメモリsnapshotだけを担当する。開始前にはmain / active detached / paused detachedのmetadata writerを静止・drainし、終了時にXMP rating readerをcontextごと再開する。DB更新中は既存cacheを安定snapshotとして保ち、終端時に影響contextのcompact keyを専用workerへ渡す。一括再取得したcacheは未タグの読込済みsentinelも含め、items世代照合後にcontextごと所有権を置換して表示集合とcontext所有rating readerを再構築する。旧XMPタグの自動seedは2026-09-12に撤去した。外部snapshot反映はApp-globalなfacet scope / suppressionを変更せず、bookmark presence更新も保持中の全contextへ在メモリ反映する |
 | App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
 
 ### マルチウィンドウ / detached viewer (F12)
@@ -284,8 +284,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `tags_db.rs` | `%APPDATA%/mimageviewer/tags.db`。`item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本。最初のタグ書き込み前に `tags.db.bak1..bak10` の世代バックアップをローテート。設定 ON 時だけ `mimageviewer.dat` に実ファイルタグをバックアップし、import 同期状態はタグ用に独立管理する |
 | `tag_ops.rs` | UI からのタグ操作ファサード。6 種の実パス item を対象に all-or-nothing 付与/削除を決め、worker へ投入 |
 | `tag_write_worker.rs` | UI → tags.db 更新 worker。通常タグ操作ではメディア本体 / XMP サイドカー / Tantivy へ書き込まない |
-| `tag_legacy_xmp_worker.rs` | 旧バージョンが XMP `dc:subject` / 動画 `.xmp` に残した `#` タグを、ユーザー明示操作で `tags.db` へ union する worker。「取り込んで削除」では DB 反映成功後に `#` 要素だけを除去し、空殻になった動画 `.xmp` だけを削除する |
-| `xmp_writer.rs` | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去系の補助に縮退、rating 書込みでは引き続き使用 |
+| `xmp_writer.rs` | XMP ratingなど現役metadataの書換 helper。旧XMPタグの自動seedと手動移行は廃止済み |
 
 ### その他
 
@@ -394,7 +393,7 @@ v2.7.0では安定化のためメニュー入口を一時非表示にしたが�
 
 `ファイル > メタ情報をエクスポート / インポート` は、自動バックアップの
 `mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v7 は評価、
-タグ（名前・適用時刻と旧XMP seedを制御する決定状態）、サムネイル付き動画・音声ブックマーク /
+タグ（名前・適用時刻と空タグを含む決定状態）、サムネイル付き動画・音声ブックマーク /
 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
 部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop は通常DB /
 sidecarと同じ矩形と基準ラスタ寸法の組を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は

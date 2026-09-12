@@ -782,7 +782,6 @@ pub(in crate::app) struct ViewerContextBundle {
     tags_cache: std::collections::HashMap<String, Vec<String>>,
     tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     tag_prewarm_queued: std::collections::HashSet<usize>,
-    tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
     pending_finalize: std::collections::HashSet<usize>,
     // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
     // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
@@ -1267,9 +1266,6 @@ impl ViewerContextBundle {
         if let Some(pending) = self.tag_prewarm_pending.as_ref() {
             pending.cancel();
         }
-        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
-            pending.cancel();
-        }
         if let Some(pending) = self.metadata_pending.as_ref() {
             pending.cancel();
         }
@@ -1415,7 +1411,6 @@ impl ViewerContextBundle {
             tags_cache: std::collections::HashMap::new(),
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
-            tag_legacy_seed_pending: None,
             pending_finalize: std::collections::HashSet::new(),
             tx,
             rx,
@@ -1767,7 +1762,6 @@ impl App {
             tags_cache,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            tag_legacy_seed_pending,
             pending_finalize,
             tx,
             rx,
@@ -2014,7 +2008,6 @@ impl App {
         swap_field!(tags_cache);
         swap_field!(tag_prewarm_pending);
         swap_field!(tag_prewarm_queued);
-        swap_field!(tag_legacy_seed_pending);
         swap_field!(pending_finalize);
         // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
         // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
@@ -2323,7 +2316,6 @@ impl App {
             tags_cache,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            tag_legacy_seed_pending,
             pending_finalize,
             tx,
             rx,
@@ -2708,7 +2700,6 @@ impl App {
             metadata_pending,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            tag_legacy_seed_pending,
             pending_finalize,
             tx,
             rx,

@@ -18151,9 +18151,13 @@ impl App {
         let mut render_batch = DetachedImageWindowEventBatch::default();
         let mut unconfirmed_deferred_registered = false;
         for window in &deferred_windows {
-            let sidecar_restore_detail = self
+            let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
-                .then(|| self.sidecar_restore.as_ref().map(|state| state.label()))
+                .then(|| {
+                    self.sidecar_restore
+                        .as_ref()
+                        .map(|state| state.presentation())
+                })
                 .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
@@ -18199,7 +18203,7 @@ impl App {
             let shared = self.deferred_detached_image_window_shared(view);
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
-                if sidecar_restore_detail.is_some() {
+                if sidecar_restore_presentation.is_some() {
                     App::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
                 let Some(view) = shared.view() else {
@@ -18240,9 +18244,9 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                let viewport_close_requested = sidecar_restore_detail.is_none()
+                let viewport_close_requested = sidecar_restore_presentation.is_none()
                     && vp_ctx.input(|i| i.viewport().close_requested());
-                let right_drag = sidecar_restore_detail
+                let right_drag = sidecar_restore_presentation
                     .is_none()
                     .then(|| shared.capture_right_drag_event(vp_ctx, focused))
                     .flatten();
@@ -18288,11 +18292,14 @@ impl App {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
                     });
-                if sidecar_restore_detail.is_some() {
+                if sidecar_restore_presentation.is_some() {
                     bar_close_requested = false;
                 }
-                if let Some(detail) = sidecar_restore_detail {
-                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(vp_ctx, detail);
+                if let Some(presentation) = sidecar_restore_presentation {
+                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(
+                        vp_ctx,
+                        presentation,
+                    );
                 }
                 // Passive deferred still windows carry only pointer samples back to the root;
                 // they contain no text input, so IME state remains owned by the root App pass.
@@ -18320,9 +18327,13 @@ impl App {
         }
 
         for window in parked_live_windows {
-            let sidecar_restore_detail = self
+            let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
-                .then(|| self.sidecar_restore.as_ref().map(|state| state.label()))
+                .then(|| {
+                    self.sidecar_restore
+                        .as_ref()
+                        .map(|state| state.presentation())
+                })
                 .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
@@ -18391,7 +18402,7 @@ impl App {
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
-                if sidecar_restore_detail.is_some() {
+                if sidecar_restore_presentation.is_some() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
@@ -18426,7 +18437,7 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                if sidecar_restore_detail.is_none()
+                if sidecar_restore_presentation.is_none()
                     && vp_ctx.input(|i| i.viewport().close_requested())
                 {
                     viewport_close_requested = true;
@@ -18442,7 +18453,7 @@ impl App {
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
-                    if sidecar_restore_detail.is_some() {
+                    if sidecar_restore_presentation.is_some() {
                         return (false, false, false, false, false, None, false, false, false);
                     }
                     let primary_pressed = i.pointer.primary_pressed();
@@ -18511,12 +18522,15 @@ impl App {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
                     });
-                if sidecar_restore_detail.is_some() {
+                if sidecar_restore_presentation.is_some() {
                     bar_close_requested = false;
                 }
                 self.show_remote_session_dialog(vp_ctx);
-                if let Some(detail) = sidecar_restore_detail {
-                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(vp_ctx, detail);
+                if let Some(presentation) = sidecar_restore_presentation {
+                    crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(
+                        vp_ctx,
+                        presentation,
+                    );
                 }
             });
             #[cfg(windows)]
