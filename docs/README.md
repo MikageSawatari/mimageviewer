@@ -24,6 +24,7 @@
 | [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
 | [next-version-development.md](next-version-development.md) | v3.7.0 後の開発台帳。延期した動画マウスシークと画像・本の余白背景色の範囲、担当、検証条件 |
 | [post-v3.8.0-priority-work.md](post-v3.8.0-priority-work.md) | v3.8.0公開後の優先修正。§1.208動画音声モード、§1.209サイドカー取り込み、類似索引改善、CIの担当・不変条件・検収判断 |
+| [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [next-version-mouse-seek-plan.md](next-version-mouse-seek-plan.md) | 戻る・進むボタンの二重シークと長押し差異の入力元調査、限定診断、再導入条件 |
 | [next-version-background-color-plan.md](next-version-background-color-plan.md) | 画像・本の余白色と透過画像内背景を分離する設計、回転・別窓・連結の描画契約 |
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
