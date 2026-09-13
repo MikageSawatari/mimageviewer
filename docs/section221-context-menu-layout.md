@@ -1,7 +1,7 @@
 # §1.221 右クリックメニュー構成
 
-> 状態: 初回実装・区切り線追補を完了。表示場面プレビュー追補は実装・自動検証済み、
-> verification build待ち（2026-09-13）。
+> 状態: 初回実装・区切り線追補・表示場面プレビュー追補を実装・自動検証・確認build済み
+> （2026-09-13）。
 > 正本は `docs/next-release-backlog.md` §1.221。
 
 ## 目的と境界
@@ -143,6 +143,12 @@ Stack、複数実ファイル選択、フルスクリーン画像・動画を持
 - `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --all -- --check`、UI glyph、
   viewer context audit、diff checkはすべてexit 0。ログは同directoryの`static.{stdout,stderr}.log`
   と`static.exit.txt`に保存した。
-- `scripts/build-dev.ps1 -PreserveRuntime`は、dev-runtimeのcore / remoteが利用者稼働中だったため
-  agentは停止せず保留した。今回追補より前のbuildを検証証拠として再利用していない。
+- source freezeとresident不在を再確認して`./scripts/build-dev.ps1 -PreserveRuntime`を実行し、exit 0。
+  coreはSHA-256 `8F867A41B3F20E9AB57E2F80DD90FA82B4809720D35808AC52237DC48397BF4E`
+  （2026-09-13 20:18:11 JST）。remote serviceはPreserveRuntimeにより既存成果物
+  `A03CE402A7137613E063867C9F8338BEDC5C338FE8897325007BB35110935C64`
+  （2026-09-13 03:16:07 JST）を保持した。build後もresidentは0件で、agentはアプリを起動・停止していない。
+  buildログは同directoryの`build-dev.stdout.log`（`7C741DECEFAFEB8E583858E9A6CA13EEDE311C270F399F8BD5AC51B6280DCC85`）、
+  `build-dev.stderr.log`（`862992F17444A35A3AE82E3CF2D837A619C31AE3C180A224F38E3F84F2E3C689`）、
+  `build-dev.exit.txt`（`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`、内容0）。
 - この追補のexact source / golden hashは同directoryの`source-freeze.sha256.txt`を正本とする。
