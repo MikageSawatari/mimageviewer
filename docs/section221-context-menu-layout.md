@@ -1,6 +1,8 @@
 # §1.221 右クリックメニュー構成
 
-> 状態: 実装・自動回帰検証済み（2026-09-13）。正本は `docs/next-release-backlog.md` §1.221。
+> 状態: 初回実装・区切り線追補を完了。表示場面プレビュー追補は実装・自動検証済み、
+> verification build待ち（2026-09-13）。
+> 正本は `docs/next-release-backlog.md` §1.221。
 
 ## 目的と境界
 
@@ -38,12 +40,29 @@ slot の間だけで並べ替え、fixed slot の位置と内容は動かさな�
 ## 保存・共有・UI
 
 `Settings.context_menu_layout` は `serde(default)` の独立設定で、旧 settings は空の標準設定として
-読む。「表示 → メニュー構成」に右クリック専用 section を置き、Root / Open With を別々に編集し、
-各項目の「前の区切り線」を標準 / 表示 / 非表示から選べるようにし、すべて表示と既定へ戻す操作を
-用意する。標準の有無は場面の capability により変わるため、設定画面では明示した「表示」だけを
-小線で示す。1項目だけの Open With 階層には意味のない上下ボタンを出さない。操作カスタマイズ共有
-JSON にも同フィールドを含める。
-旧 JSON で欠落した場合は標準値となり、replace-only 取り込みは右クリック設定も標準へ置き換える。
+読む。内部の区切り線は引き続き `Inherit / Present / Absent` の3状態で保存し、操作カスタマイズ共有
+JSON にも同フィールドを含める。旧 JSON で欠落した場合は標準値となり、replace-only 取り込みは
+右クリック設定も標準へ置き換える。
+
+環境設定は「通常メニュー」と「右クリックメニュー」を別ページにする。右クリック側では Root /
+Open With を別々に編集し、1項目だけの Open With 階層には意味のない上下ボタンを出さない。
+確認用の表示場面を選ぶと、`context_menu_model` が固定fixtureをproductionの
+`build_context_menu`へ通し、各stable leafがその場面で対象になるか、実際に直前の区切り線が
+表示されるかを返す。UI側にitem-kind/capability表を複製しない。
+
+設定画面の主表示は「表示 / 非表示」の2値とし、`Inherit` は実際の解決値へ「（既定）」を添える。
+利用者が2値を選んだ時だけ `Present / Absent` を全場面共通の明示値として保存する。個別の既定復帰と、
+表示・順序を保ったまま区切り線だけを全て既定へ戻す操作を用意する。選択場面で対象外、項目非表示、
+同階層の先頭で最終normalizeにより線を置けない場合は理由を出して操作を無効にする。対象外・
+非表示の項目には、項目表示をONにしたとき実際に現れる別の固定sceneを同じbuilder結果から案内する。
+先頭や対象外でも保存済みの明示値がある場合は、個別の既定復帰だけは行える。設定ページを開く、
+場面を切り替える、プレビューを読むだけでは保存対象の `Settings` を変更しない。
+
+固定sceneは一覧の画像、通常フォルダの余白、ZIP本体（閲覧履歴）、検索結果の画像、PDF内ページ、
+Stack、複数実ファイル選択、フルスクリーン画像・動画を持つ。さらに外部ツール1件・関連付けアプリ
+1件を含む画像sceneを別に置く。通常sceneには両動的groupを含めず、各sceneのラベルと説明にfixture
+条件を明記する。これは実行中のフォルダやOS関連付けの列挙ではなく、場面差を確認する固定例である。
+全stable leafが少なくとも1sceneで対象になることを回帰で固定する。
 
 ## 受入条件
 
@@ -51,8 +70,14 @@ JSON にも同フィールドを含める。
 - unavailable item は復活せず、unknown / duplicate / wrong-parent を無視し、新 ID は既定位置へ補完。
 - static reorder / hide / separator override 後も外部ツール、Open With、関連付けアプリ、Windows Shell の固定位置と内部順を維持。
 - native / egui が同じ resolved preorder を使い、正規化後に不正 separator や空 submenu がない。
-- 環境設定のスクロール、上下移動、非表示、区切り3値、すべて表示、既定戻しが実 widget から反映される。
+- 環境設定のスクロール、上下移動、非表示、区切りの実2値、個別・一括の既定復帰、すべて表示が
+  実widgetから反映される。内部3状態と旧保存値は維持する。
 - settings と操作カスタマイズ共有の round-trip、区切りfield欠落を含む旧 payload の標準置換、unknown / duplicate sanitize を固定する。
+- 固定sceneが全stable leafを覆い、NewFolderは画像ファイル場面で対象外、通常フォルダ余白で対象になる。
+- previewの区切り線はproduction builderの最終treeと一致し、関連付けアプリ有無、先頭、hidden、
+  unavailableを区別する。scene閲覧・切替後も保存対象`Settings`全体がexact不変。
+- 「通常メニュー」と「右クリックメニュー」が別の環境設定ページ・検索項目になり、右クリックページで
+  2値変更、個別既定復帰、区切り線だけ全既定復帰を操作できる。
 
 ## 検証記録（2026-09-13）
 
@@ -97,3 +122,27 @@ JSON にも同フィールドを含める。
 
 本書は上表の source / golden 14 path を freeze とする。検証記録自身の hash は本文追記後に
 別途照合する。
+
+## 表示場面プレビュー追補の検証（2026-09-13）
+
+- production builder由来の場面preview 3件、設定UI 7件、設定検索索引 10件、ページ閲覧・
+  scene切替後も保存対象`Settings`全体が不変であるactual-widget回帰 1件、計21件が成功した。
+  全27 stable leafの場面被覆、画像fileと通常folder余白、検索結果、ZIP本体（閲覧履歴）、
+  PDF内ページ、動的groupなし / 外部tool1件・関連付けapp1件の固定条件、先頭 / hidden /
+  unavailable、個別・全separator resetを直接確認した。
+- `tests/snapshots/preferences_context_menu_layout{,_open_with}.png`を更新した。二値の実表示、
+  既定線の小線、対象外 / 先頭、Root / Open Withの列揃えを目視確認済み。tooltipだけで案内する
+  表示可能sceneは同じbuilder結果を使うため、goldenのpixel差分には含まれない。
+- `RUST_TEST_THREADS=1`で`./scripts/test-full.ps1 -SuppressCrashDialogs`を実行し、main
+  8382 passed / 0 failed / 45 ignored、UI snapshot 50/50、workspace / integration / doc / vendor
+  全target（egui 25 / egui-wgpu 9 / eframe 15を含む）が成功した。process error modeも復帰した。
+  完全ログは`target/section221-scene-preview-20260913/test-full.stdout.log`（SHA-256
+  `FEA167105F766A22647C77A767EE5E2C17FA4E4E93C8B2BC5004CD923EABF775`）、
+  `test-full.stderr.log`（`1F8A377C7828DC5168696D43B92EC69B3E9B63239A7D10FBDD183CF0EA606EA2`）、
+  `test-full.exit.txt`（`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`、内容0）。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --all -- --check`、UI glyph、
+  viewer context audit、diff checkはすべてexit 0。ログは同directoryの`static.{stdout,stderr}.log`
+  と`static.exit.txt`に保存した。
+- `scripts/build-dev.ps1 -PreserveRuntime`は、dev-runtimeのcore / remoteが利用者稼働中だったため
+  agentは停止せず保留した。今回追補より前のbuildを検証証拠として再利用していない。
+- この追補のexact source / golden hashは同directoryの`source-freeze.sha256.txt`を正本とする。

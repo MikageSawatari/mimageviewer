@@ -361,6 +361,301 @@ impl ContextMenuLayoutSettings {
     pub fn show_all(&mut self) {
         self.hidden_items.clear();
     }
+
+    /// 明示した区切り線だけを既定へ戻す。表示/順序の設定は維持する。
+    pub(crate) fn reset_separators(&mut self) {
+        self.separators.clear();
+    }
+}
+
+/// 環境設定で右クリックメニューの表示差を確認する、固定の代表場面。
+///
+/// 実行中の App state や OS の関連付けを読まず、[`build_context_menu`] と同じ
+/// capability predicate を純粋な fixture へ適用する。場面の選択自体は保存しない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ContextMenuPreviewScenario {
+    #[default]
+    GridImage,
+    GridImageWithDynamicApps,
+    GridFolderBackground,
+    GridZipReadingHistory,
+    GridSearchImage,
+    GridPdfPage,
+    GridStack,
+    GridCheckedRealFiles,
+    FullscreenImage,
+    FullscreenVideo,
+}
+
+impl ContextMenuPreviewScenario {
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::GridImage,
+        Self::GridImageWithDynamicApps,
+        Self::GridFolderBackground,
+        Self::GridZipReadingHistory,
+        Self::GridSearchImage,
+        Self::GridPdfPage,
+        Self::GridStack,
+        Self::GridCheckedRealFiles,
+        Self::FullscreenImage,
+        Self::FullscreenVideo,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::GridImage => "一覧：画像ファイル",
+            Self::GridImageWithDynamicApps => {
+                "一覧：画像ファイル（外部ツール1件・関連付けアプリ1件）"
+            }
+            Self::GridFolderBackground => "一覧：通常フォルダの余白",
+            Self::GridZipReadingHistory => "一覧：ZIP本体（閲覧履歴）",
+            Self::GridSearchImage => "一覧：画像ファイル（検索結果）",
+            Self::GridPdfPage => "一覧：PDF内ページ",
+            Self::GridStack => "一覧：スタック",
+            Self::GridCheckedRealFiles => "一覧：複数の実ファイルを選択",
+            Self::FullscreenImage => "フルスクリーン：画像",
+            Self::FullscreenVideo => "フルスクリーン：動画",
+        }
+    }
+
+    pub(crate) const fn condition_note(self) -> &'static str {
+        match self {
+            Self::GridImageWithDynamicApps => {
+                "確認用の固定条件として、登録済み外部ツール1件と関連付けアプリ1件を含めます。"
+            }
+            _ => "確認用の固定条件では、登録済み外部ツールと関連付けアプリを含めません。",
+        }
+    }
+
+    fn input(self, layout: ContextMenuLayoutSettings) -> ContextMenuInput {
+        let (kind, surface) = match self {
+            Self::GridImage | Self::GridImageWithDynamicApps | Self::GridSearchImage => {
+                (ContextMenuItemKind::Image, ContextMenuSurface::Grid)
+            }
+            Self::GridFolderBackground => (ContextMenuItemKind::Folder, ContextMenuSurface::Grid),
+            Self::GridZipReadingHistory => (ContextMenuItemKind::ZipFile, ContextMenuSurface::Grid),
+            Self::GridPdfPage => (ContextMenuItemKind::PdfPage, ContextMenuSurface::Grid),
+            Self::GridStack => (ContextMenuItemKind::Stack, ContextMenuSurface::Grid),
+            Self::GridCheckedRealFiles => (ContextMenuItemKind::Image, ContextMenuSurface::Grid),
+            Self::FullscreenImage => (ContextMenuItemKind::Image, ContextMenuSurface::Fullscreen),
+            Self::FullscreenVideo => (ContextMenuItemKind::Video, ContextMenuSurface::Fullscreen),
+        };
+        let is_folder_context = self == Self::GridFolderBackground;
+        let has_checked = self == Self::GridCheckedRealFiles;
+        let in_search = self == Self::GridSearchImage;
+        let reading_history = self == Self::GridZipReadingHistory;
+        let normal_pin = matches!(
+            self,
+            Self::GridImage | Self::GridImageWithDynamicApps | Self::FullscreenImage
+        );
+        let has_dynamic_apps = self == Self::GridImageWithDynamicApps;
+        ContextMenuInput {
+            kind,
+            surface,
+            is_folder_context,
+            has_checked,
+            checked_count: usize::from(has_checked) * 2,
+            checked_file_operation_selection: if has_checked {
+                CheckedFileOperationSelection::RealOnly
+            } else {
+                CheckedFileOperationSelection::Empty
+            },
+            can_use_folder_commands: is_folder_context,
+            can_paste_edit_bundle: true,
+            has_explorer_folder: true,
+            view: ContextMenuViewFlags {
+                in_search,
+                search: in_search,
+                reading_history,
+                ..ContextMenuViewFlags::default()
+            },
+            pin: normal_pin.then(|| ContextMenuActionState {
+                label: "📌 代表サムネに固定".to_string(),
+                enabled: true,
+                disabled_reason: None,
+            }),
+            external_tools: has_dynamic_apps
+                .then(|| ExternalToolMenuEntry {
+                    tool_id: ExternalToolId(1),
+                    label: "登録済み外部ツール（確認用）".to_string(),
+                    enabled: true,
+                    disabled_reason: None,
+                })
+                .into_iter()
+                .collect(),
+            associated_apps: has_dynamic_apps
+                .then(|| AssociatedAppMenuEntry {
+                    display_name: "関連付けアプリ（確認用）".to_string(),
+                    handler_id: "context-menu-preview".to_string(),
+                    is_recommended: true,
+                })
+                .into_iter()
+                .collect(),
+            shortcuts: ContextMenuShortcutLabels::default(),
+            layout,
+        }
+    }
+}
+
+/// 選択した代表場面における、静的項目の実表示状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextMenuPreviewItemState {
+    /// capability-filtered tree に存在しない。
+    Unavailable,
+    /// 場面には存在するが、利用者の項目表示設定で隠れている。
+    Hidden,
+    /// 同階層の先頭なので、最終 normalize 後に直前の線を置けない。
+    First,
+    /// 項目が描画され、直前の線の有無を変更できる。
+    Available { separator_before: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextMenuPreview {
+    states: Vec<(ContextMenuItemId, ContextMenuPreviewItemState)>,
+    available_scenarios: Vec<(ContextMenuItemId, Vec<ContextMenuPreviewScenario>)>,
+}
+
+impl ContextMenuPreview {
+    pub(crate) fn state(&self, item: ContextMenuItemId) -> ContextMenuPreviewItemState {
+        self.states
+            .iter()
+            .find_map(|(candidate, state)| (*candidate == item).then_some(*state))
+            .unwrap_or(ContextMenuPreviewItemState::Unavailable)
+    }
+
+    /// 項目表示を ON にしたとき、production builder が項目を含める固定確認場面。
+    pub(crate) fn available_scenarios(
+        &self,
+        item: ContextMenuItemId,
+    ) -> &[ContextMenuPreviewScenario] {
+        self.available_scenarios
+            .iter()
+            .find_map(|(candidate, scenarios)| (*candidate == item).then_some(scenarios.as_slice()))
+            .unwrap_or(&[])
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RenderedPreviewItem {
+    first: bool,
+    separator_before: bool,
+}
+
+fn collect_rendered_preview_items(
+    nodes: &[MenuNode],
+    parent: ContextMenuParentId,
+    out: &mut Vec<(ContextMenuItemId, RenderedPreviewItem)>,
+) {
+    let mut saw_content = false;
+    let mut separator_before = false;
+    for node in nodes {
+        match node {
+            MenuNode::Separator => separator_before = true,
+            MenuNode::Item { command, .. } => {
+                if let Some(item) = ContextMenuItemId::from_command(command)
+                    && item.parent() == parent
+                {
+                    out.push((
+                        item,
+                        RenderedPreviewItem {
+                            first: !saw_content,
+                            separator_before,
+                        },
+                    ));
+                }
+                saw_content = true;
+                separator_before = false;
+            }
+            MenuNode::Submenu { children, .. } => {
+                if parent == ContextMenuParentId::Root {
+                    collect_rendered_preview_items(children, ContextMenuParentId::OpenWith, out);
+                }
+                saw_content = true;
+                separator_before = false;
+            }
+        }
+    }
+}
+
+fn rendered_preview_items(nodes: &[MenuNode]) -> Vec<(ContextMenuItemId, RenderedPreviewItem)> {
+    let mut out = Vec::new();
+    collect_rendered_preview_items(nodes, ContextMenuParentId::Root, &mut out);
+    out
+}
+
+/// 選択場面を production menu builder へ通し、最終描画 tree の区切り線を返す。
+///
+/// capability 判定もここで共有し、設定 UI 側へ item-kind predicate を複製しない。
+pub(crate) fn context_menu_layout_preview(
+    scenario: ContextMenuPreviewScenario,
+    layout: &ContextMenuLayoutSettings,
+) -> ContextMenuPreview {
+    let rendered = rendered_preview_items(&build_context_menu(&scenario.input(layout.clone())));
+    let mut all_visible_layout = layout.clone();
+    all_visible_layout.show_all();
+    let scenario_capabilities: Vec<_> = ContextMenuPreviewScenario::ALL
+        .iter()
+        .copied()
+        .map(|candidate| {
+            (
+                candidate,
+                rendered_preview_items(&build_context_menu(
+                    &candidate.input(all_visible_layout.clone()),
+                )),
+            )
+        })
+        .collect();
+    let capability = scenario_capabilities
+        .iter()
+        .find_map(|(candidate, items)| (*candidate == scenario).then_some(items.as_slice()))
+        .unwrap_or(&[]);
+
+    let states = ContextMenuItemId::ALL
+        .iter()
+        .copied()
+        .map(|item| {
+            let state = if !capability.iter().any(|(candidate, _)| *candidate == item) {
+                ContextMenuPreviewItemState::Unavailable
+            } else if !layout.is_visible(item) {
+                ContextMenuPreviewItemState::Hidden
+            } else if let Some((_, rendered)) =
+                rendered.iter().find(|(candidate, _)| *candidate == item)
+            {
+                if rendered.first {
+                    ContextMenuPreviewItemState::First
+                } else {
+                    ContextMenuPreviewItemState::Available {
+                        separator_before: rendered.separator_before,
+                    }
+                }
+            } else {
+                debug_assert!(false, "visible capability item missing from resolved menu");
+                ContextMenuPreviewItemState::Unavailable
+            };
+            (item, state)
+        })
+        .collect();
+    let available_scenarios = ContextMenuItemId::ALL
+        .iter()
+        .copied()
+        .map(|item| {
+            let scenarios = scenario_capabilities
+                .iter()
+                .filter_map(|(scenario, items)| {
+                    items
+                        .iter()
+                        .any(|(candidate, _)| *candidate == item)
+                        .then_some(*scenario)
+                })
+                .collect();
+            (item, scenarios)
+        })
+        .collect();
+    ContextMenuPreview {
+        states,
+        available_scenarios,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1254,6 +1549,106 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn preview_scenarios_cover_every_configurable_leaf_through_the_production_builder() {
+        let layout = ContextMenuLayoutSettings::default();
+        let uncovered: Vec<_> = ContextMenuItemId::ALL
+            .iter()
+            .copied()
+            .filter(|item| {
+                !ContextMenuPreviewScenario::ALL
+                    .iter()
+                    .copied()
+                    .any(|scenario| {
+                        !matches!(
+                            context_menu_layout_preview(scenario, &layout).state(*item),
+                            ContextMenuPreviewItemState::Unavailable
+                        )
+                    })
+            })
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "uncovered stable leaves: {uncovered:?}"
+        );
+    }
+
+    #[test]
+    fn preview_distinguishes_file_background_search_history_and_dynamic_app_conditions() {
+        let layout = ContextMenuLayoutSettings::default();
+        let image_preview =
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &layout);
+        assert_eq!(
+            image_preview.state(ContextMenuItemId::NewFolder),
+            ContextMenuPreviewItemState::Unavailable
+        );
+        assert_eq!(
+            image_preview.available_scenarios(ContextMenuItemId::NewFolder),
+            &[ContextMenuPreviewScenario::GridFolderBackground],
+            "an unavailable row names the exact production-builder scene where it appears"
+        );
+        assert!(!matches!(
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridFolderBackground, &layout)
+                .state(ContextMenuItemId::NewFolder),
+            ContextMenuPreviewItemState::Unavailable
+        ));
+        assert!(!matches!(
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridSearchImage, &layout)
+                .state(ContextMenuItemId::JumpToFolder),
+            ContextMenuPreviewItemState::Unavailable
+        ));
+        assert!(!matches!(
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridZipReadingHistory, &layout)
+                .state(ContextMenuItemId::RemoveReadingHistory),
+            ContextMenuPreviewItemState::Unavailable
+        ));
+        assert_eq!(
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &layout)
+                .state(ContextMenuItemId::OpenExternalToolSettings),
+            ContextMenuPreviewItemState::First
+        );
+        assert_eq!(
+            context_menu_layout_preview(
+                ContextMenuPreviewScenario::GridImageWithDynamicApps,
+                &layout
+            )
+            .state(ContextMenuItemId::OpenExternalToolSettings),
+            ContextMenuPreviewItemState::Available {
+                separator_before: true
+            }
+        );
+    }
+
+    #[test]
+    fn preview_marks_hidden_and_normalized_leading_items_without_mutating_settings() {
+        let mut layout = ContextMenuLayoutSettings::default();
+        layout.set_separator_before(
+            ContextMenuItemId::CutFiles,
+            ContextMenuSeparatorBefore::Present,
+        );
+        let before = layout.clone();
+        assert_eq!(
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &layout)
+                .state(ContextMenuItemId::CutFiles),
+            ContextMenuPreviewItemState::First,
+            "a requested leading separator is normalized away"
+        );
+        assert_eq!(layout, before, "preview must be read-only");
+
+        layout.set_visible(ContextMenuItemId::CopyFiles, false);
+        let preview = context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &layout);
+        assert_eq!(
+            preview.state(ContextMenuItemId::CopyFiles),
+            ContextMenuPreviewItemState::Hidden
+        );
+        assert!(
+            preview
+                .available_scenarios(ContextMenuItemId::CopyFiles)
+                .contains(&ContextMenuPreviewScenario::GridImage),
+            "hidden rows keep capability-derived scene guidance"
+        );
     }
 
     /// キー併記は snapshot が渡した**実際の割り当て**をそのまま出す。

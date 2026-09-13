@@ -145,6 +145,7 @@ pub(crate) enum PreferencesPage {
     /// 静止画・動画で共用する Creative 3D LUT (.cube) の登録
     CreativeLut,
     MenuLayout,
+    ContextMenuLayout,
     Parallelism,
     Prefetch,
     GpuMemory,
@@ -231,6 +232,7 @@ impl PreferencesPage {
         Self::BakeStage,
         Self::CreativeLut,
         Self::MenuLayout,
+        Self::ContextMenuLayout,
         Self::Parallelism,
         Self::Prefetch,
         Self::GpuMemory,
@@ -265,7 +267,8 @@ impl PreferencesPage {
             Self::Capture => "キャプチャ保存",
             Self::BakeStage => "書き出しの焼き込み",
             Self::CreativeLut => "LUT",
-            Self::MenuLayout => "メニュー構成",
+            Self::MenuLayout => "通常メニュー",
+            Self::ContextMenuLayout => "右クリックメニュー",
             Self::Parallelism => "並列読み込み",
             Self::Prefetch => "先読み",
             Self::GpuMemory => "GPUメモリ",
@@ -501,6 +504,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::BakeStage,
             PreferencesPage::CreativeLut,
             PreferencesPage::MenuLayout,
+            PreferencesPage::ContextMenuLayout,
         ],
     },
     TreeCategory {
@@ -700,6 +704,8 @@ pub(crate) struct PreferencesState {
     initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
     /// 現在選択中のページ
     pub selected: PreferencesPage,
+    /// 右クリックメニュー設定に表示する固定の確認場面。保存対象ではない。
+    pub context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
     /// 同じページの再描画では維持し、別ページへ移ったときだけ増やす。
     pub right_panel_scroll_generation: u64,
@@ -1242,6 +1248,8 @@ impl PreferencesState {
             settings: s.preferences_snapshot(),
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
+            context_menu_preview_scenario:
+                crate::context_menu_model::ContextMenuPreviewScenario::default(),
             right_panel_scroll_generation: 0,
             search_query: String::new(),
             showing_results: false,
@@ -3312,6 +3320,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::BakeStage => page_bake_stage(ui, state),
         PreferencesPage::CreativeLut => page_creative_lut(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
+        PreferencesPage::ContextMenuLayout => page_context_menu_layout(ui, state),
         PreferencesPage::Parallelism => page_parallelism(ui, state),
         PreferencesPage::Prefetch => page_prefetch(ui, state),
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
@@ -3821,6 +3830,8 @@ mod tests {
             crate::context_menu_model::ContextMenuItemId::CopyFiles,
             crate::context_menu_model::ContextMenuSeparatorBefore::Present,
         );
+        let mut scenario =
+            crate::context_menu_model::ContextMenuPreviewScenario::GridImageWithDynamicApps;
         let mut fonts_ready = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(620.0, 700.0))
@@ -3835,7 +3846,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        draw_context_menu_layout_settings(ui, &mut layout);
+                        draw_context_menu_layout_settings(ui, &mut layout, &mut scenario);
                     });
                 });
             });
@@ -3852,6 +3863,63 @@ mod tests {
         harness.get_by_label("外部ツールの設定…").scroll_to_me();
         harness.run();
         harness.snapshot("preferences_context_menu_layout_open_with");
+    }
+
+    #[test]
+    fn opening_context_menu_page_and_switching_preview_scene_do_not_edit_settings() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut state = preferences_state_for_test(&crate::settings::Settings::default());
+        state.selected = PreferencesPage::ContextMenuLayout;
+        let expected = serde_json::to_value(&state.settings).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 520.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            page_context_menu_layout(ui, state);
+                        });
+                    });
+                },
+                state,
+            );
+
+        harness.run();
+        assert_eq!(
+            serde_json::to_value(&harness.state().settings).unwrap(),
+            expected
+        );
+        assert!(
+            harness
+                .query_by_label("新しいフォルダ…はこの場面で対象外")
+                .is_some(),
+            "file preview must explain why folder-background commands do not appear"
+        );
+        harness.get_by_label("確認する表示場面").click();
+        harness.run();
+        harness.get_by_label("一覧：通常フォルダの余白").click();
+        harness.run();
+        assert_eq!(
+            harness.state().context_menu_preview_scenario,
+            crate::context_menu_model::ContextMenuPreviewScenario::GridFolderBackground
+        );
+        assert!(
+            harness
+                .query_by_label("新しいフォルダ…はこの場面で先頭")
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_by_label("新しいフォルダ…の前の区切り線（先頭のため非表示）")
+                .is_some()
+        );
+        assert_eq!(
+            serde_json::to_value(&harness.state().settings).unwrap(),
+            expected,
+            "preview browsing must not make the preferences session dirty"
+        );
     }
 
     #[test]

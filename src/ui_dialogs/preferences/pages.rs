@@ -1,6 +1,7 @@
 use super::*;
 use crate::context_menu_model::{
-    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId, ContextMenuSeparatorBefore,
+    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId, ContextMenuPreviewItemState,
+    ContextMenuPreviewScenario, ContextMenuSeparatorBefore, context_menu_layout_preview,
 };
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
@@ -4643,29 +4644,50 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
         if let Some(edit) = edit {
             apply_menu_layout_edit(&mut state.settings.menu_layout, edit);
         }
+    });
+}
 
-        draw_context_menu_layout_settings(ui, &mut state.settings.context_menu_layout);
+pub(super) fn page_context_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "context-menu/layout", |ui, state| {
+        draw_context_menu_layout_settings(
+            ui,
+            &mut state.settings.context_menu_layout,
+            &mut state.context_menu_preview_scenario,
+        );
     });
 }
 
 pub(super) fn draw_context_menu_layout_settings(
     ui: &mut egui::Ui,
     layout: &mut ContextMenuLayoutSettings,
+    scenario: &mut ContextMenuPreviewScenario,
 ) {
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
+    const ITEM_STATE_WIDTH: f32 = 62.0;
     const ARROW_COLUMN_WIDTH: f32 = 32.0;
-    ui.add_space(16.0);
-    ui.separator();
-    ui.label(egui::RichText::new("右クリックメニュー").strong());
     ui.small(
         "一覧とフルスクリーンで共用する mImageViewer 項目の表示と順序です。\
          その場面で利用できない項目は従来どおり省きます。",
     );
-    ui.small("各項目の前の区切り線は、標準では表示場面に応じた既定の区切りを使います。");
+    ui.small("表示場面は確認用です。項目や区切り線の変更は、一覧とフルスクリーンの全場面へ共通に適用します。");
+    ui.add_space(6.0);
+
+    egui::ComboBox::from_label("確認する表示場面")
+        .selected_text(scenario.label())
+        .show_ui(ui, |ui| {
+            for value in ContextMenuPreviewScenario::ALL {
+                ui.selectable_value(scenario, *value, value.label());
+            }
+        });
+    ui.small(scenario.condition_note());
+    ui.small(
+        "検索結果や閲覧履歴など、場面ごとに使える項目だけが実際の右クリックメニューへ出ます。",
+    );
     ui.add_space(6.0);
 
     let snapshot = layout.clone();
+    let preview = context_menu_layout_preview(*scenario, &snapshot);
     let mut edit = None;
     let item_font = egui::TextStyle::Body.resolve(ui.style());
     let max_item_label_width = ContextMenuItemId::ALL.iter().fold(0.0_f32, |width, item| {
@@ -4685,14 +4707,18 @@ pub(super) fn draw_context_menu_layout_settings(
             + ui.spacing().item_spacing.x
             + ui.spacing().icon_width
             + ui.spacing().icon_spacing
-            + max_item_label_width,
+            + max_item_label_width
+            + ITEM_STATE_WIDTH,
     );
-    ui.horizontal(|ui| {
-        if ui.button("右クリック項目を既定に戻す").clicked() {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("右クリック設定をすべて既定に戻す").clicked() {
             edit = Some(ContextMenuLayoutEdit::Reset);
         }
         if ui.button("右クリック項目をすべて表示").clicked() {
             edit = Some(ContextMenuLayoutEdit::ShowAll);
+        }
+        if ui.button("区切り線だけ既定に戻す").clicked() {
+            edit = Some(ContextMenuLayoutEdit::ResetSeparators);
         }
     });
 
@@ -4724,6 +4750,13 @@ pub(super) fn draw_context_menu_layout_settings(
                         for (index, &item) in order.iter().enumerate() {
                             let mut visible = snapshot.is_visible(item);
                             let separator = snapshot.separator_before(item);
+                            let preview_state = preview.state(item);
+                            let available_scenario_labels = preview
+                                .available_scenarios(item)
+                                .iter()
+                                .map(|candidate| candidate.label())
+                                .collect::<Vec<_>>()
+                                .join("、");
                             let changed = ui
                                 .allocate_ui_with_layout(
                                     egui::vec2(item_column_width, row_height),
@@ -4734,14 +4767,80 @@ pub(super) fn draw_context_menu_layout_settings(
                                             egui::vec2(ITEM_PREVIEW_WIDTH, row_height),
                                             egui::Sense::hover(),
                                         );
-                                        if separator == ContextMenuSeparatorBefore::Present {
+                                        if matches!(
+                                            preview_state,
+                                            ContextMenuPreviewItemState::Available {
+                                                separator_before: true
+                                            }
+                                        ) {
                                             ui.painter().hline(
                                                 preview_rect.x_range(),
                                                 preview_rect.center().y,
                                                 ui.visuals().widgets.noninteractive.fg_stroke,
                                             );
                                         }
-                                        ui.checkbox(&mut visible, item.label()).changed()
+                                        let changed =
+                                            ui.checkbox(&mut visible, item.label()).changed();
+                                        match preview_state {
+                                            ContextMenuPreviewItemState::Unavailable => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("対象外")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!(
+                                                            "{}はこの場面で対象外",
+                                                            item.label()
+                                                        ),
+                                                    )
+                                                });
+                                                status.on_hover_text(format!(
+                                                    "「{}」では使わない項目です。順序を変えても、この場面には追加されません。\n表示される確認場面：{}",
+                                                    scenario.label(), available_scenario_labels
+                                                ));
+                                            }
+                                            ContextMenuPreviewItemState::Hidden => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("非表示中")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!("{}は項目非表示中", item.label()),
+                                                    )
+                                                });
+                                                status.on_hover_text(format!(
+                                                    "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                                    available_scenario_labels
+                                                ));
+                                            }
+                                            ContextMenuPreviewItemState::First => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("先頭")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!("{}はこの場面で先頭", item.label()),
+                                                    )
+                                                });
+                                                status.on_hover_text(
+                                                    "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。",
+                                                );
+                                            }
+                                            ContextMenuPreviewItemState::Available { .. } => {}
+                                        }
+                                        changed
                                     },
                                 )
                                 .inner;
@@ -4791,39 +4890,137 @@ pub(super) fn draw_context_menu_layout_settings(
                                 ui.label("\u{00a0}");
                                 ui.label("\u{00a0}");
                             }
-                            let mut next_separator = separator;
-                            let combo = egui::ComboBox::from_id_salt((
-                                "context_menu_separator_before",
-                                parent,
-                                item,
-                            ))
-                            .selected_text(context_menu_separator_label(separator))
-                            .show_ui(ui, |ui| {
-                                for value in [
-                                    ContextMenuSeparatorBefore::Inherit,
-                                    ContextMenuSeparatorBefore::Present,
-                                    ContextMenuSeparatorBefore::Absent,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut next_separator,
-                                        value,
-                                        context_menu_separator_label(value),
-                                    );
+                            ui.horizontal(|ui| {
+                                let explicit = separator != ContextMenuSeparatorBefore::Inherit;
+                                match preview_state {
+                                    ContextMenuPreviewItemState::Available { separator_before } => {
+                                        let selected = if explicit {
+                                            context_menu_separator_bool_label(separator_before)
+                                                .to_string()
+                                        } else {
+                                            format!(
+                                                "{}（既定）",
+                                                context_menu_separator_bool_label(separator_before)
+                                            )
+                                        };
+                                        let mut chosen = None;
+                                        let combo = egui::ComboBox::from_id_salt((
+                                            "context_menu_separator_before",
+                                            parent,
+                                            item,
+                                        ))
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(!separator_before, "非表示")
+                                                .clicked()
+                                            {
+                                                chosen = Some(ContextMenuSeparatorBefore::Absent);
+                                            }
+                                            if ui
+                                                .selectable_label(separator_before, "表示")
+                                                .clicked()
+                                            {
+                                                chosen = Some(ContextMenuSeparatorBefore::Present);
+                                            }
+                                        });
+                                        combo.response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::ComboBox,
+                                                true,
+                                                format!("{}の前の区切り線", item.label()),
+                                            )
+                                        });
+                                        combo.response.on_hover_text(
+                                            "主表示は選択した場面で実際に描かれる線です。変更は全場面へ共通に適用します。",
+                                        );
+                                        if let Some(chosen) = chosen {
+                                            edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                                item, chosen,
+                                            ));
+                                        }
+                                    }
+                                    ContextMenuPreviewItemState::First => {
+                                        let response = ui
+                                            .add_enabled(
+                                                false,
+                                                egui::Button::new("非表示（先頭）"),
+                                            );
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（先頭のため非表示）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(
+                                                "この場面では先頭項目なので、前に線を表示できません。",
+                                            );
+                                    }
+                                    ContextMenuPreviewItemState::Hidden => {
+                                        let response = ui.add_enabled(
+                                            false,
+                                            egui::Button::new("項目が非表示"),
+                                        );
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（項目が非表示）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(format!(
+                                            "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                            available_scenario_labels
+                                        ));
+                                    }
+                                    ContextMenuPreviewItemState::Unavailable => {
+                                        let response =
+                                            ui.add_enabled(false, egui::Button::new("対象外"));
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（この場面では対象外）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(format!(
+                                                "「{}」では使わない項目です。\n表示される確認場面：{}",
+                                                scenario.label(), available_scenario_labels
+                                            ));
+                                    }
+                                }
+                                if explicit {
+                                    let reset = ui
+                                        .small_button("↶")
+                                        .on_hover_text("この項目の区切り線を既定に戻す");
+                                    reset.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!(
+                                                "{}の区切り線を既定に戻す",
+                                                item.label()
+                                            ),
+                                        )
+                                    });
+                                    if reset.clicked() {
+                                        edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                            item,
+                                            ContextMenuSeparatorBefore::Inherit,
+                                        ));
+                                    }
                                 }
                             });
-                            combo.response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::ComboBox,
-                                    true,
-                                    format!("{}の前の区切り線", item.label()),
-                                )
-                            });
-                            if next_separator != separator {
-                                edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
-                                    item,
-                                    next_separator,
-                                ));
-                            }
                             ui.end_row();
                         }
                     });
@@ -4839,12 +5036,8 @@ pub(super) fn draw_context_menu_layout_settings(
     }
 }
 
-fn context_menu_separator_label(value: ContextMenuSeparatorBefore) -> &'static str {
-    match value {
-        ContextMenuSeparatorBefore::Inherit => "標準",
-        ContextMenuSeparatorBefore::Present => "表示",
-        ContextMenuSeparatorBefore::Absent => "非表示",
-    }
+fn context_menu_separator_bool_label(present: bool) -> &'static str {
+    if present { "表示" } else { "非表示" }
 }
 
 enum MenuLayoutEdit {
@@ -9258,6 +9451,7 @@ pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut b
 enum ContextMenuLayoutEdit {
     Reset,
     ShowAll,
+    ResetSeparators,
     Move(ContextMenuParentId, usize, i32),
     SetVisible(ContextMenuItemId, bool),
     SetSeparatorBefore(ContextMenuItemId, ContextMenuSeparatorBefore),
@@ -9270,6 +9464,7 @@ fn apply_context_menu_layout_edit(
     match edit {
         ContextMenuLayoutEdit::Reset => *layout = ContextMenuLayoutSettings::default(),
         ContextMenuLayoutEdit::ShowAll => layout.show_all(),
+        ContextMenuLayoutEdit::ResetSeparators => layout.reset_separators(),
         ContextMenuLayoutEdit::Move(parent, index, delta) => {
             let mut order = layout.resolved_order(parent);
             if move_index(&mut order, index, delta) {
@@ -9325,6 +9520,16 @@ mod context_menu_layout_settings_tests {
             ContextMenuSeparatorBefore::Present,
             "show all changes visibility only"
         );
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::ResetSeparators);
+        assert_eq!(
+            layout.separator_before(ContextMenuItemId::CopyPath),
+            ContextMenuSeparatorBefore::Inherit
+        );
+        assert_eq!(
+            &layout.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles],
+            "separator reset must preserve ordering"
+        );
         apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
         assert_eq!(layout, ContextMenuLayoutSettings::default());
     }
@@ -9333,11 +9538,15 @@ mod context_menu_layout_settings_tests {
     fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
         use egui_kittest::{Harness, kittest::Queryable};
 
-        let state = (ContextMenuLayoutSettings::default(), false);
+        let state = (
+            ContextMenuLayoutSettings::default(),
+            ContextMenuPreviewScenario::GridImageWithDynamicApps,
+            false,
+        );
         let mut harness = Harness::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
-                |ctx, (layout, fonts_ready)| {
+                |ctx, (layout, scenario, fonts_ready)| {
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
@@ -9347,19 +9556,12 @@ mod context_menu_layout_settings_tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(ui, layout);
+                            draw_context_menu_layout_settings(ui, layout, scenario);
                         });
                     });
                 },
                 state,
             );
-
-        harness.get_by_label("切り取りを下へ").click();
-        harness.run();
-        assert_eq!(
-            &harness.state().0.resolved_order(ContextMenuParentId::Root)[..2],
-            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
-        );
 
         harness.get_by_label("コピーの前の区切り線").click();
         harness.run();
@@ -9373,6 +9575,22 @@ mod context_menu_layout_settings_tests {
             ContextMenuSeparatorBefore::Present
         );
         let root_separator_column_x = harness.get_by_label("コピーの前の区切り線").rect().left();
+        harness.get_by_label("コピーの区切り線を既定に戻す").click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .separator_before(ContextMenuItemId::CopyFiles),
+            ContextMenuSeparatorBefore::Inherit
+        );
+
+        harness.get_by_label("切り取りを下へ").click();
+        harness.run();
+        assert_eq!(
+            &harness.state().0.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
+        );
 
         harness.get_by_label("コピー").click();
         harness.run();
@@ -9383,7 +9601,9 @@ mod context_menu_layout_settings_tests {
 
         harness.get_by_label("コピー").click();
         harness.run();
-        harness.get_by_label("右クリック項目を既定に戻す").click();
+        harness
+            .get_by_label("右クリック設定をすべて既定に戻す")
+            .click();
         harness.run();
         assert_eq!(harness.state().0, ContextMenuLayoutSettings::default());
 

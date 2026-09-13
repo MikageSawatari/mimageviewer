@@ -18,7 +18,7 @@
 | [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時の変更がないZIP/PDFの再列挙を省略する条件。Initial限定の再利用、その他の再確認・差分更新の維持と検証記録 |
 | [section223-compare-wipe-guidance.md](section223-compare-wipe-guidance.md) | §1.223 比較ワイプ境界の常時表示とCtrl中の非表示。既存の比較セッションへの操作状態統合、準備中と終了時の契約 |
 | [section164-force-new-crop-frame.md](section164-force-new-crop-frame.md) | §1.164 修飾キーによる切り取り枠の新規作成。開始時の操作決定、Spaceパン優先、キー割り当てと入力所有の維持 |
-| [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック項目の表示・並べ替え・区切り線設定。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
+| [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック専用設定ページ、表示場面の確認と項目・区切り線の編集。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
 | [section220-cut-item-appearance.md](section220-cut-item-appearance.md) | §1.220 切り取り中の実項目表示。クリップボードの所有・通知・貼り付け結果、Explorer形式の読取と、半透明の一覧内容・ハサミ表示の描画境界 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
