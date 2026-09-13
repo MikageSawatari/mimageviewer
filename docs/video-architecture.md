@@ -72,7 +72,8 @@ no-repeat で action を consume した同じ pass から直ちに戻るため�
 音声モード / VST / sibling index は no-op であり、still の V / Shift+V の既存処理は変えない。
 
 通常動画拡大の wheel は presenter が確定した video target rect 内のポインタ座標を App へ渡し、
-`pointer_region_owns_wheel` が示すシークストリップ、端パネル、モーダルの領域では取得しない。
+`pointer_region_owns_wheel` が示すシークストリップ、上下 HUD、モーダルの実表示領域では取得しない。
+通常動画拡大 / 360 中は左右パネル系を表示・入力 region から外すため、左右端は動画側が取得する。
 左押下は `ZoomPan` がドラッグ終了まで所有する。
 
 通常表示での `Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
@@ -309,6 +310,9 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 
 左右パネルの召喚方法は Settings の `FsSidePanelMode` を presenter overlay へ同期する。`Hover` は
 左右それぞれの edge-hover 二段ラッチ、`ClickToShow` は最端の細い callout bar のクリックを使う。
+360 または通常動画拡大が active の間は、この両パネル本体、callout、touch handle と scroll / text / Escape
+入力 owner を同じ派生判定で一時抑止する。保存済みの open / lock / tag picker state は変更せず、mode 終了後に
+同じ状態へ戻す。上部・下部 HUD はこの抑止に含めない。
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
 左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
 ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
@@ -328,7 +332,7 @@ un-hide して映像が出ている間は発火させる。新しい動画への
 同じ順で除外する (compact は残りの領域に対して 1/4 を取る)。`video_content_rect_points` にも
 同じ量を渡し、切替中のプレビューだけがパネルの下へ潜らないようにする。**場所を占めるかは
 `right_panel_reserves_space` (= 固定中かつ `right_panel_visible`) が唯一の答えを出す** —
-ヘルプ / 360 / 外部ドラッグ / VST / メタデータ無し / 速度ポップアップでは占めない
+ヘルプ / 360 / 通常動画拡大 / 外部ドラッグ / VST / メタデータ無し / 速度ポップアップでは占めない
 (占めると右に空白の帯だけが残る)。固定の lifecycle (ファイル移動で維持、フルスクリーン退出で
 解除、window ごとに独立) は静止画と共通で、
 [fullscreen-side-panel-mode-plan.md §6.6](fullscreen-side-panel-mode-plan.md) を正本とする。
@@ -410,12 +414,14 @@ Phase 3 Step 3h では、native touch の session-only chrome latch 中だけ左
 パネルハンドルを追加した。ハンドルの描画 rect をそのまま `compute_hud_regions()` の interactive
 region に含めるため、OS hit-test が HUD HWND を選び、HUD-source stream は Phase 3 Step 1 の規約どおり
 幾何を再判定せず `WidgetPassthrough` になる。presenter tap zone や最寄り widget を探す resolver は
-追加していない。ラッチ OFF、VST / 中央モーダル / tile / navigation preview 中は region も出さない。
+追加していない。ラッチ OFF、360 / 通常動画拡大 / VST / 中央モーダル / tile / navigation preview 中は
+region も出さない。
 左パネルの presenter-local open は既存 bool から `MetadataPanelOpenState` へ置き換え、App-owned の
 右パネルと同じく pointer / touch owner を区別する。開いた側のハンドルだけを消し、反対側は残す。
-touch owner がある状態で presenter 面のタップが確定した場合は左右の touch-owned state を閉じ、
-その `SeekRelative` / `ToggleChrome` command を破棄する。既存 mouse hover latch と ClickToShow
-callout の可視判定・描画・region は変更しない。
+touch owner がある状態で通常表示の presenter 面をタップした場合は左右の touch-owned state を閉じ、
+その `SeekRelative` / `ToggleChrome` command を破棄する。360 / 通常動画拡大中は hidden owner を閉じず、
+同じ command を動画操作へ通す。mouse hover latch は保持するが、motion view 中は panel / callout の
+可視判定と region に反映しない。
 
 **Region 計算とアクティベーション検出**:
 

@@ -34947,7 +34947,7 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     #[cfg(windows)]
-    fn parking_ends_the_single_foreground_wipe_session_and_reentry_gets_guidance() {
+    fn parking_ends_the_single_foreground_wipe_session_and_reentry_is_ready() {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/compare-wipe-park.jpg");
         app.fullscreen_idx = Some(idx);
@@ -34959,13 +34959,11 @@ mod pipeline_cache_refactor_tests {
         app.reset_detached_pause_foreground_modes(idx);
 
         assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
-        app.compare_view_mode = CompareViewMode::wipe_with_guidance(0.5);
+        app.compare_view_mode = CompareViewMode::wipe(0.5);
         assert!(matches!(
             app.compare_view_mode,
             CompareViewMode::Wipe {
-                interaction: CompareWipeInteraction::Guidance(
-                    CompareWipeGuidancePhase::Unclassified
-                ),
+                interaction: CompareWipeInteraction::Ready,
                 ..
             }
         ));
@@ -40630,17 +40628,19 @@ mod native_video_display_mode_input_tests {
         let _ = app.handle_fs_key_input(&ctx, idx, false);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
         let _ = ctx.end_pass();
-        assert!(
-            app.video_zoom_state.is_some(),
-            "the generic fallback must consume one V press exactly once"
+        assert_eq!(
+            app.video_zoom_state.map(|state| state.scale()),
+            Some(crate::video::zoom_view::VIDEO_ZOOM_FIT_SCALE),
+            "the generic fallback must consume one V press exactly once and enter at fit"
         );
 
         app.video_zoom_state = None;
         app.handle_native_video_key_event(&ctx, idx, native_v(false, 401));
         app.handle_native_video_key_event(&ctx, idx, native_v(true, 402));
-        assert!(
-            app.video_zoom_state.is_some(),
-            "the native first press toggles zoom and its repeat must not toggle back"
+        assert_eq!(
+            app.video_zoom_state.map(|state| state.scale()),
+            Some(crate::video::zoom_view::VIDEO_ZOOM_FIT_SCALE),
+            "the native first press re-enters at fit and its repeat must not toggle back"
         );
     }
 

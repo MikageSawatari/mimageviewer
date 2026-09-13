@@ -1277,18 +1277,13 @@ pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed texture�
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
 パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
 Wipe は `CompareViewMode::Wipe` の中に fraction と `CompareWipeInteraction` を一体で所有する。
-セッション開始時は `Guidance` とし、準備済み比較を同じ frame に描画できるようになってから、
-初期 pointer 位置を分類する。開始時に pointer が偶然 grab band 上にあった場合は、一度 band 外へ
-出て再び入るまで案内を消費しない。band 外から始まった場合も、最初に意図して band へ入るまで
-案内を保つ。案内中は明暗二重 stroke の境界線と中央 handle を常時表示する。
-
-案内を一度消費した後は従来どおり、ドラッグ中、または pointer が
-`compare_wipe_grab_hit` と同じ grab band 内にある間だけ白線を描く。画像上のそれ以外の場所では
-隠し、touch chrome latch は表示条件に使わない。タッチ由来の primary drag も同じ typed
-interaction を `Dragging` にするため、指でドラッグしている間は表示する。Ctrl によるドラッグ中の
-線の抑止、grab band、境界 fraction の `0.0..=1.0`、CPU の線 / clip と GPU uniform の対応は
-変更しない。比較準備の失効は `Dragging` だけを `Ready` へ戻し、まだ表示・消費されていない
-`Guidance` は保持する。
+interaction は `Ready / Dragging` のどちらかで、セッション開始時は `Ready` とする。準備済み比較を
+描画できる main / navigator の CPU / GPU 4経路は、pointer hoverやdrag状態にかかわらず明暗二重
+stroke の境界線と中央handleを常時表示する。focused viewportで既存のCtrl非表示入力が押されている
+間だけ、`Ready / Dragging`の双方で境界とhandleを隠し、解除したframeで再表示する。drag reducerは
+実合成境界と同じrectのpress / releaseだけを所有し、描画はinteractionを変更しない。grab band、
+境界fractionの`0.0..=1.0`、CPUのclipとGPU uniform、画像合成は変更しない。比較準備の失効は
+`Dragging`だけを`Ready`へ戻す。
 
 比較は現行どおり App 全体で同時に一つの foreground セッションである。detached viewer を park
 すると比較を終了し、次に foreground で Shift+C を押したときは新しい案内セッションを開始する。

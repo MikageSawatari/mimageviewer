@@ -1473,16 +1473,18 @@ A2bはallowlist無効時にも再検出し、A4はfeature cfgまたは可視性�
 成功し、`--no-allowlist`では既登録5件のA2bすべて（このresumeを含む）が再露出した。A4はfocused
 mutationでfeature cfg削除と可視性拡大の双方を拒否した。
 
-**2026-09-12 §1.223 比較ワイプ境界の初回案内（親Codex／独立Sol合意）**
+**2026-09-12 §1.223 比較ワイプ境界表示（2026-09-13利用者確認後に仕様更新、親Codex／独立Sol合意）**
 
-比較ワイプの初回案内を別のApp boolやcontext mapへ追加せず、既存の
-`CompareViewMode::Wipe`へfractionとtyped interaction（Guidance / Ready / Dragging）を一体で
-所有させる。入力stateは実合成境界と同じrectを使う既存drag reducerだけが更新し、main / navigatorの
-CPU・GPU描画は同じstateを読む。準備済みpairを実際に描ける前のhoverでは案内を消費しない。
+比較ワイプの境界表示を別のApp boolやcontext mapへ追加せず、既存の
+`CompareViewMode::Wipe`へfractionとtyped interaction（Ready / Dragging）を一体で所有させる。
+入力stateは実合成境界と同じrectを使う既存drag reducerだけが更新し、main / navigatorのCPU・GPU
+描画は、準備済みpairを描画できる間、境界とhandleを常時表示する。既存のfocused viewport Ctrl入力が
+押されている間だけ両interactionで非表示にする。初回だけのGuidance phaseとhoverによる消費は、
+利用者確認後の仕様更新で撤去した。
 
 detachedは現行のsingle-foreground比較契約を維持し、park前に既存`deactivate_compare_view`で比較を
-終了する。passive snapshotや入力のない一時mountへ比較stateを複製せず、次のforeground entryで新しい
-Guidanceを作る。viewport predicate、host identity、placement、focus、geometry、registryのmount/swap/
+終了する。passive snapshotや入力のない一時mountへ比較stateを複製せず、次のforeground entryは
+`Ready`から始める。viewport predicate、host identity、placement、focus、geometry、registryのmount/swap/
 retire規則は変更しない。これは既存mode/fraction/dragの分裂を解消する入力所有の統合であり、§2が
 禁じるdetached向けの症状guardではない。
 

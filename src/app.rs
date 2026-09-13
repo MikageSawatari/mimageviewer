@@ -3365,20 +3365,7 @@ pub(crate) enum CompareViewMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompareWipeGuidancePhase {
-    /// The first drawable frame has not classified whether the pointer already overlaps the line.
-    Unclassified,
-    /// The pointer overlapped the line on the first drawable frame. It must leave before a later
-    /// hover can count as an intentional interaction.
-    AwaitingExit,
-    /// The pointer has been observed outside the line after entry and a later re-entry may consume
-    /// the guidance.
-    Armed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompareWipeInteraction {
-    Guidance(CompareWipeGuidancePhase),
     Ready,
     Dragging,
 }
@@ -3394,15 +3381,14 @@ impl CompareViewMode {
         matches!(self, Self::Wipe { .. } | Self::Diff)
     }
 
-    pub(crate) fn wipe_with_guidance(fraction: f32) -> Self {
+    pub(crate) fn wipe(fraction: f32) -> Self {
         Self::Wipe {
             fraction,
-            interaction: CompareWipeInteraction::Guidance(CompareWipeGuidancePhase::Unclassified),
+            interaction: CompareWipeInteraction::Ready,
         }
     }
 
-    /// End only an active pointer drag. Guidance belongs to the Wipe session and survives source
-    /// preparation invalidation until it has actually been shown and intentionally approached.
+    /// End only an active pointer drag. The boundary remains visible for the whole Wipe session.
     pub(crate) fn cancel_wipe_drag(&mut self) {
         if let Self::Wipe { interaction, .. } = self
             && matches!(interaction, CompareWipeInteraction::Dragging)

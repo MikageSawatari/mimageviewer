@@ -2,7 +2,7 @@
 
 作成: 2026-09-04  
 対象: backlog §1.167  
-状態: 実装済み、Windows 実機表示の確認待ち。本書を本機能の設計・実装状況の正本とする。
+状態: 実装済み、2026-09-13利用者によるWindows実機確認済み。本書を本機能の設計・実装状況の正本とする。
 
 ## 1. 目的と不変条件
 
@@ -11,14 +11,15 @@
 360 モード、付かない通常動画では本モードを切り替える。`ini_name()` の `FsPanorama` は
 出荷済み keymap との互換のため変更しない。
 
-- モードは動画キャンバスのホイールと左ドラッグを所有する。シークストリップ、端パネル、
-  モーダルなど `pointer_region_owns_wheel` が所有する領域からはホイールを奪わない。
-- 再生、上下バー、シークストリップ、情報パネル、動画補正は継続する。静止画 360 の
-  機能制限モードとは扱いを分ける。
+- モードは動画キャンバスと左右端のホイール / 左ドラッグを所有する。シークストリップ、
+  モーダルなど `pointer_region_owns_wheel` が所有する実表示領域からはホイールを奪わない。
+- 再生、上下バー、シークストリップ、動画補正は継続する。左右パネル本体、端 callout、touch handle
+  は 360 と同じく一時的に隠し、保存済みの開閉 / 固定状態は変更せず終了後に復帰させる。
 - 360 と通常動画ズームは素材判定で排他にし、同時に active にしない。
 - モードへ入った時だけ表示領域全体の surface へ切り替える。倍率・中心の変更は定数更新だけで
   表し、ホイールごとに swap chain / buffer を resize しない。
-- fit（100%）では従来と同じ縦横比で中央表示し、レターボックス部分は黒にする。
+- fit（100%）では従来と同じ縦横比で中央表示し、レターボックス部分は設定した動画背景色
+  （既定は黒）にする。
 - 項目変更、フルスクリーン終了、動画の音声モードへの遷移、音楽 VST シェルへの遷移で
   state を破棄する。360 の `panorama_intent` に相当するセッション越しの意図は持たない。
 - タッチ pinch とリセット専用 `KeyAction` は初回対象外。`accepts_pinch` は変更しない。
@@ -27,27 +28,31 @@
 
 GPU、`App`、Win32 に依存しない `src/video/zoom_view.rs` を置く。
 
-- `VideoZoomState`: fit を 1.0 とする `scale`（1.0〜16.0）と、向き補正後 source 上の
-  正規化中心を所有する。初期値と `reset()` は 100% / 中央。
+- `VideoZoomState`: fit を 1.0 とする `scale`（0.1〜16.0）と、向き補正後 source 上の
+  正規化中心を所有する。操作下限と fit 初期値を別定数で所有し、初期値と `reset()` は
+  100% / 中央、ホイール縮小の下限は fit 比 10%。
 - `VideoZoomSourceRect`: 向き補正後 source pixel 座標の `origin` / `extent`。
 - source geometry は raw 寸法、orientation、SAR から向き補正後の pixel 寸法と pixel aspect
   を作る。90/270 度では SAR の効く軸も入れ替える。
 - fit 矩形は、表示領域を source の display aspect で割った範囲を source pixel 座標へ戻す。
   一方の extent は source と一致し、他方はレターボックス分だけ source より大きくなるため、
   origin が負になり得る。拡大・パンも同じ矩形で表す。
-- wheel は `new_scale = old_scale * 1.2^(delta / 120)` を上下限へ丸め、pointer の表示領域内
-  比率に対応する source 座標を更新前後で一致させて中心を更新する。無効値と zero delta は
-  state を変えない。
+- wheel は `new_scale = old_scale * 1.2^(delta / 120)` を上下限へ丸める。全倍率でpointerの
+  表示領域内比率に対応するsource座標を更新前後で一致させて中心を更新し、後述の範囲制約に
+  当たる場合だけ固定点を補正する。無効値とzero deltaはstateを変えない。
 - drag は表示領域上の point 差を現在の source extent 比へ変換し、画像を掴んで動かす向きに
   中心を移す。
-- extent が source 以上の軸は常に中央へ戻す。拡大軸は source 矩形が画像から完全に外れない
-  （少なくとも source の 1 pixel 幅が残る）範囲へ中心を clamp する。
+- extentがsource以上の軸は、source全体を表示領域内に保つ中心範囲
+  `[source - extent / 2, extent / 2]`へclampする。exact fitでは両端がsource中央で一致し、
+  letterbox / sub-fitでは余白の範囲内をpanできる。extentがsource未満の拡大軸は従来どおり、
+  source矩形が画像から完全に外れず少なくともsourceの1 pixel幅が残る範囲へclampする。
 - clamp の正本は `source_rect()` とする。入力時にも同じ resolver の結果を state へ戻して端での
   反転ヒステリシスを防ぐが、保存済み中心を信用せず、表示領域が変わるたびに矩形生成時点の extent で
   再度 clamp する。
 
-単体テストは、wheel の固定点不変、pan clamp の両端、横・縦レターボックスの fit 矩形、
-SAR / 軸入替、scale 上下限を固定する。
+単体テストは、wheelの固定点不変、pan clampの両端、横・縦レターボックスのfit矩形、
+SAR / 軸入替、scale上下限を固定する。letterbox / sub-fitではdrag可能で、source全体が表示領域内に
+残ること、resize後の再clamp、拡大からsub-fitへ跨ぐ遷移の有限性と決定性を確認する。
 
 ## 3. App と入力の所有境界
 
@@ -73,6 +78,10 @@ pointer の領域内位置・領域寸法を作り、zoom 専用 command/event �
 `NativeVideoPointerDown::PanoramaDrag` と兄弟の `ZoomPan` を使い、再生クリックへ落とさない。
 App は state 更新ごとに値 snapshot を `set_native_video_zoom_state` setter へ同期し、render thread が
 現在 frame の geometry と表示領域から source rect を導出する。
+native overlay は `panorama_pose || video_zoom_scale` から左右端の motion-view owner を毎回導出する。
+active 中は左右パネル、callout、touch handle、scroll / text-input / Escape owner を公開しない。
+固定右パネルの予約幅は mode setter 内で同時に再計算し、表示の一時抑止と復帰を次の present より前に
+映像 geometry へ反映する。パネルの open / lock / tag picker 状態そのものは消去しない。
 
 ## 4. native presenter と描画
 
@@ -97,14 +106,14 @@ resample は全方式で同じ向き補正後 source rect を使う。
 - `select_video_resample_mode` へ渡す source 軸寸法は rect の実効 extent にし、zoom 中に
   拡大用 filter が縮小用 Lanczos へ誤分類されないようにする。
 
-### 範囲外の黒
+### 範囲外の背景色
 
 調査の結果、resample / NIS / Anime4K resolve は fullscreen triangle で最終 target の全 pixel を
-上書きする。`create_swap_chain_backbuffer` やテスト helper の黒 clear、および背後の
-`NativeBlackBackground` は、resolver が clamp した edge pixel を書いた後には見えない。
-したがって clear 任せにはせず、各 resolver が source 中心座標を範囲判定して範囲外へ不透明黒を
-返す。Lanczos / nearest HLSL、NIS WGSL、全 Anime4K variant の共通 resolve 生成元を同じ規則で
-更新し、edge clamp は範囲内 pixel の filter tap にだけ残す。
+上書きする。swap-chain backbuffer の clear や背後の `NativeVideoCanvasBackground` は、resolver が
+clamp した edge pixel を書いた後には見えない。したがって clear 任せにはせず、各 resolver が
+source 中心座標を範囲判定し、範囲外へ `native_video_canvas_clear_color` 由来の不透明な設定色を
+返す。Lanczos / nearest HLSL、NIS WGSL、全 Anime4K variant の共通 resolve 生成元が同じ規則を
+使い、edge clamp は範囲内 pixel の filter tap にだけ残す。
 
 ### surface 上限
 
@@ -146,13 +155,69 @@ Anime4K は生成スクリプトの共通 resolve template を正本として全
 成功した。通常 feature set の `scripts/build-dev.ps1` も完了し、`target/dev-runtime/` に
 実機確認用 core / remote service と FFmpeg DLL を配置した。
 
+2026-09-13 の §1.212 では、利用者の最新判断により通常動画も静止画と同じ fit 比 10% まで
+縮小できるようにした。`VIDEO_ZOOM_FIT_SCALE = 1.0` と操作下限
+`VIDEO_ZOOM_MIN_SCALE = 0.1` を分離し、モード開始、reset、項目切替後の再入場は従来どおり
+100% / 中央を維持する。sub-fit は既存の source rect と範囲外 canvas color を使い、surface は
+表示領域寸法、Lanczos 中間 texture は従来の source / target 寸法のままなので、倍率低下による
+追加 allocation や swap-chain resize は発生しない。入力、SAR / rotation、filter 選択、
+context lifecycle は変更していない。
+
+利用者確認後の同日追補で、100%未満も左dragで移動できるようにした。fitのletterbox軸とsub-fit軸は
+source全体を表示領域内に保ち、拡大軸は既存の1 pixel overlapを維持する。同じsource rect clampを
+wheel / drag / resizeが共有し、全倍率のwheelはpointer固定点を先に解決してからその範囲へclampする。
+初期表示、reset、再入場は100% / 中央のままである。
+
 ## 7. 実機で確認する項目
 
-- 通常動画で V → 100% 表示、ホイール固定点 zoom、左ドラッグ pan、上バー reset、V で終了。
-- 縦長 / 横長、回転 metadata、非正方 SAR で fit の黒帯と pointer 固定点が一致する。
-- `OS に任せる` を含む各 scale filter で同じ rect を表示し、edge が黒へ滲まず、zoom 時に
+- 通常動画で V → 100%表示、10%までの縮小、全倍率のホイール固定点zoom、左drag pan、
+  上バーreset、Vで終了。100%未満は画像全体を表示領域内に保った範囲で移動できる。
+- 縦長 / 横長、回転 metadata、非正方 SAR で fit の背景帯と pointer 固定点が一致する。
+- `OS に任せる` を含む各 scale filter で同じ rect を表示し、edge が背景色へ滲まず、zoom 時に
   拡大用 filter が選ばれる。
-- シークストリップ / 端パネル / モーダル上の wheel が zoom に奪われない。
-- 再生・パネルを保ったまま操作でき、項目切替・fullscreen 終了・音声モード・音楽 VST
+- シークストリップ / モーダル上の wheel が zoom に奪われない。V / 360 中は左右パネル、callout、
+  touch handle が表示も入力領域も持たず、左右端の wheel / drag は motion view が受け取る。
+- 再生・上下 HUD を保ったまま操作でき、左右パネルの保存 open / lock は V 終了後に復帰する。
+  項目切替・fullscreen 終了・音声モード・音楽 VST
   シェル遷移後に次動画へ倍率が残らない。
 - 360 動画では V が従来の 360 だけを切り替え、通常 zoom が同時に active にならない。
+
+## 8. §1.212 の自動検証（2026-09-13）
+
+- 初回変更時の `video::zoom_view::tests` 11 / 11では、fitから通常の1ノッチで縮小し、下限10% /
+  上限1600%、当時仕様のsub-fit中央固定、回転+非正方SAR、reset=100%を確認した。
+- native/App 狭域は `video_zoom` 9 / 9、表示モード入口3 / 3、stale/current wheel 1 / 1、
+  全filterのsub-fit Lanczos、canvas色とAnime4K `outside_color` の既存回帰が成功した。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --all -- --check`、UI glyph、
+  `git diff --check` が成功。製品差分は純倍率状態だけなので、直前§1.218のfull gate
+  （main 8323 / 0、45 ignored、workspace / integration / doc / vendor全成功）を再利用した。
+- 同じ製品freezeで `scripts/build-dev.ps1 -PreserveRuntime` がexit 0。core SHA-256は
+  `92132FFBE1DD6A903B35E7239E1629732F6E373CD07513BBB7E5943EAD1C355D`、remote serviceは
+  `A03CE402A7137613E063867C9F8338BEDC5C338FE8897325007BB35110935C64`。agentはアプリを
+  起動・停止しておらず、Windows native表示は利用者確認待ち。
+
+利用者確認後のpan追補では、`video::zoom_view::tests` 15 / 15でsub-fit / letterboxの包含pan、
+全倍率のpointer anchor、SAR + 90度回転、resize後の初回small drag、reset=100%中央を確認した。
+native/Appは`video_zoom` 9 / 9、通常動画V入口1 / 1が成功し、cargo check、viewer-context audit、
+fmt、UI glyph、対象diff checkも成功した。直前§1.218のfull gate（main 8323 / 0、45 ignored、
+workspace / integration / doc / vendor全成功）は共通の未変更範囲へ再利用した。
+`scripts/build-dev.ps1 -PreserveRuntime` はexit 0で、core SHA-256は
+`A8E9C67FE9F0AD4DD463A33A402D97C158413B5845D718D4B039C5E48D038E43`、remote serviceは
+`A03CE402A7137613E063867C9F8338BEDC5C338FE8897325007BB35110935C64`。agentはアプリを起動・停止して
+おらず、追補後のWindows native表示は利用者確認待ちである。
+
+同日、pan 中に左右端パネルが現れる利用者確認を受け、通常動画拡大と360を共通のmotion-view ownerへ
+揃えた。active中は左右パネル、callout、touch handleと、それらのscroll / Escape / text入力ownerを
+一時的に外す。open / lock / tag picker stateは保持し、mode終了後に復帰する。上下HUD、seek、再生操作、
+モーダルは従来どおり独立して動作する。
+
+同一freezeのfocused回帰はmotion view 2 / 2、native touch 38 / 38、side panel 27 / 27、Escape 34 / 34、
+panorama 81 / 81、video zoom 9 / 9、reservation 5 / 5、wheel 46 / 46が成功した。core check、fmt、
+UI glyph、viewer-context audit、対象diff checkも成功し、共通型とcontext所有を変えていない範囲は
+§1.218のfull gate（main 8323 / 0、45 ignored、workspace / integration / doc / vendor全成功）を再利用した。
+`scripts/build-dev.ps1 -PreserveRuntime` はexit 0で、core SHA-256は
+`B98B65D1C774A1C149AB0E8F1823517AB95BE2BD4C5352FE1A020412ED3AE45A`、remote serviceは
+`A03CE402A7137613E063867C9F8338BEDC5C338FE8897325007BB35110935C64`。agentはアプリを起動・停止して
+おらず、この左右端抑止追補のWindows native表示は利用者確認待ちである。
+
+2026-09-13: core B98B65D1C774A1C149AB0E8F1823517AB95BE2BD4C5352FE1A020412ED3AE45A の引き渡し後、利用者から『動作大丈夫そうです』との確認を受けた。利用者自身によるハッシュ照合は行っていない。左右パネル抑止を含む追補を実機確認済みとする。
