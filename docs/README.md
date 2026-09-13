@@ -30,6 +30,8 @@
 | [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
 | [next-version-development.md](next-version-development.md) | v3.7.0 後の開発台帳。延期した動画マウスシークと画像・本の余白背景色の範囲、担当、検証条件 |
 | [post-v3.8.0-priority-work.md](post-v3.8.0-priority-work.md) | v3.8.0公開後の優先修正。§1.208動画音声モード、§1.209サイドカー取り込み、類似索引改善、CIの担当・不変条件・検収判断 |
+| [post-v3.10.0-development.md](post-v3.10.0-development.md) | v3.10.0後の修正・sort・コレクション開発順と、不在中の隔離検証 |
+| [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 手動コレクションの仕様案。並び・閲覧範囲・入出力・Remoteの未決事項 |
 | [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [dependency-update-20260912.md](dependency-update-20260912.md) | PDFium 8044更新とFFmpeg現行維持の理由、ライセンス、非対話試験、確認buildの内包照合 |
 | [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
