@@ -307,25 +307,61 @@ UI は「要確認」を出して**ボタンを有効のまま残す**
 実ファイルを開くのは [`validate_backup`](../src/settings_restore.rs:617) が最初なので、
 新版ガードに当たるのは押した後になる。
 
-#### 構造的な要点
+#### 実ファイルを読んで確定したこと (2026-09-13)
 
-**`app_version` という 1 つのフィールドが、別々の問いに使われている。**
+再現した data フォルダの 5 ファイルを read-only で開き `schema_meta` を読んだ。
+**`preupgrade-vunknown` を含む全ファイルが `app_version = 3.9.1`**
+(`settings_kv` 390 行、`favorites` 0 行も全ファイル一致)。
 
-- **来歴 (いつの版の設定か)** → **ファイル名が正しい。** 上のコメントどおり、旧実装は snapshot
-  前に `schema_meta` を実行中バイナリの版で上書きしていたので、中身は当てにならない
-- **このビルドで開けるか** → **中身が正しい。** 新版ガードは `schema_meta` と比較するので、
-  来歴として不正確でも、開けるかどうかの答えとしては正確
+**つまりこの「アップグレード前」は、アップグレード前の状態ではない。3.9.1 の DB そのもの。**
 
-**互換性判定は後者の問いなのに、前者の値を使っている。**
+#### 上流の原因 — clean install が偽の preupgrade を作る
+
+[settings.rs:7957](../src/settings.rs:7957):
+
+```rust
+let prev_version = settings.last_seen_version.clone();
+let version_changed = prev_version.as_deref() != Some(current_version);
+if version_changed && db_loaded {
+    let prev_label = prev_version.as_deref().unwrap_or("unknown");
+```
+
+**`"unknown"` が出るのは `last_seen_version` が `None` のときだけ**、つまり
+**過去の版が存在しない clean install** のとき。それでも `version_changed` が真になるので
+(`None != Some("3.9.1")`)、**作られたばかりの DB を `VACUUM INTO` で複製し、
+「アップグレード前」と名乗らせる**。
+
+**「前の版が無い」と「版が変わった」を同じ述語で表している**のが原因。
+なお通常のアップグレードでは問題ない。`app_version` は open 時ではなく
+**保存時**に書かれる設計で ([settings_db.rs:949](../src/settings_db.rs:949) のコメントと
+テスト `opening_db_preserves_saved_app_version_until_successful_save`)、
+実際の版跨ぎなら snapshot は旧版の値を保ったまま取れる。**壊れているのは clean install 経路だけ。**
+
+#### 下流の原因 — 一覧が中身の版を捨てる
+
+そのうえで [`read_summary`](../src/settings_restore.rs:281) が、`schema_meta` から読んだ版を
+**ファイル名の文字列で無条件に上書きする**ため、`"unknown"` が
+[`backup_compatibility`](../src/settings_restore.rs:298) の semver parse に失敗して
+`Unknown` になり、UI は「要確認」を出して**ボタンを有効のまま残す**
+([ui_dialogs/settings_restore.rs:615](../src/ui_dialogs/settings_restore.rs:615))。
+実ファイルを開くのは [`validate_backup`](../src/settings_restore.rs:617) が最初なので、
+新版ガードに当たるのは押した後。
+
+**この 2 つが重なって「押せるのに必ず失敗する行」ができている。**
+画面を見るかぎり「新しい版は無効、前の版だけ有効」で正しく見えるが、**その「前の版」が
+偽物**なので、有効/無効の判断は結果として誤っている。
 
 #### 対応
 
-- 最小修正: 上書きを「**ファイル名の version が semver として読めたときだけ**」にする。
-  読めなければ `schema_meta` の値を残す。`vunknown` はこれで「利用不可（新しい版）」になり、
-  ボタンも無効化される。
-- できれば**来歴と「開けるか」を別フィールドに分ける**。同じ綴りで 2 つの問いに答えない。
-- 併せて見る: ダウングレード後は全世代が利用不可になり得る。**その状態で「戻せる世代が無い」と
-  読み取れるか。** 今回は下部の初期化導線が誤りダイアログに隠れていた。
+1. **clean install で preupgrade を作らない。** 条件を「`last_seen_version` が `Some` で、
+   かつ現版と違う」に変える。**これが根本**で、直せば偽の行はそもそも現れない。
+2. **一覧の上書きを、ファイル名が semver として読めたときだけにする。** 読めなければ
+   `schema_meta` の値を残す。1 を直しても**既存の利用者の手元には偽ファイルが残る**ので、
+   両方要る。
+3. できれば**来歴 (ファイル名) と「開けるか」(中身) を別フィールドに分ける**。
+   いまは `app_version` 1 つが 2 つの問いに使われている。
+4. 併せて見る: ダウングレード後は全世代が利用不可になり得る。**その状態で「戻せる世代が
+   無い」と読み取れるか。** 今回は下部の初期化導線が誤りダイアログに隠れていた。
 
 #### 別件として切り離すもの
 
@@ -334,8 +370,9 @@ UI は「要確認」を出して**ボタンを有効のまま残す**
 
 #### 回帰確認
 
-- `preupgrade-vunknown` が「利用不可（新しい版）」で無効になる (中身が新版のとき)
-- 中身が旧版の `preupgrade-vunknown` は従来どおり復元候補として押せる
+- **clean install の初回起動で `preupgrade-v*` が作られない**
+- 既存の `preupgrade-vunknown` (中身が新版) は「利用不可（新しい版）」で無効になる
+- **実際の版跨ぎで作られた `preupgrade-v<旧版>` は、従来どおり復元候補として押せて復元できる**
 - ファイル名に正しい semver を持つ `preupgrade-v3.8.0` 等の来歴表示が変わらない
 - 全世代が利用不可のときに、初期化導線が誤りダイアログに隠れず読める
 - 規模 / 優先度: Small / P2。
