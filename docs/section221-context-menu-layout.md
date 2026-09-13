@@ -152,3 +152,7 @@ Stack、複数実ファイル選択、フルスクリーン画像・動画を持
   `build-dev.stderr.log`（`862992F17444A35A3AE82E3CF2D837A619C31AE3C180A224F38E3F84F2E3C689`）、
   `build-dev.exit.txt`（`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`、内容0）。
 - この追補のexact source / golden hashは同directoryの`source-freeze.sha256.txt`を正本とする。
+
+### 利用者確認（2026-09-13、表示場面追補）
+
+確認build後、利用者から「動作は大丈夫」との確認を受けた。表示場面の多さによる設定の複雑さについて相談があり、設計担当は場面別に設定を分割せず、共通設定と表示場面プレビューを維持することを推奨した。追加のUI変更は行っていない。
