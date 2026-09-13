@@ -42,8 +42,18 @@
 
 [設定復旧の設計](settings-recovery-234-231-plan.md)を親・実装者・独立レビューで合意し実装へ進める。設計レビュー対象SHAは `EB0920A4222532D955BCDFB8BABE2536CBFB918F9F6DABB9C1E948EEDB11FC4`、重大指摘なし。常設Remote readerに加え、全`with_db`処理の終了確認、Remote部分起動失敗時の解放、設定writeの適用前Busyを含める。復元を始めていないことが証明できる失敗後は通常の設定アクセスを再開し、Favorites readerだけ再接続に失敗した場合は依存要求だけを明示的な再試行対象にする。
 
+### §1.234 実装の独立検収（03:10 JST時点）
+
+Remoteの常設readerを含むsettings-family接続の停止・解放と、復元workerのApp所有を実装。独立Sol/xhighレビューの指摘により、Archive/AIの復旧中Busyの伝達（IPC v55）、AI完了公開の短期lease、処理中の終了要求の保留と再送、トレイ非表示時の既存wake経路への接続まで修正した。最終限定再検収は重大指摘なし。
+
+対象: `app.rs` SHA256 `3F781D6ED77F4AC7442EB4AA0FE9C3D331C5E5FF36AC7BF809E630363F261FE4`、`settings_restore.rs` `655B00E498315761EEBA7DEEAB8776E748F39C5705A40E419D0D751443FC7998`、復元UI `7D72C14823F5FA80FBAB07F93C8358A5BF82ECA9694137387F45FF23C8D2775A`。UI lifecycle 6件、AI/Archive 5件、family 9件とcheck・fmt・glyph・audit・diffの成功証拠を独立担当が照合した。途中の`app.rs`編集事故は着手前cleanのHEADから意図した14追加/2削除だけに復旧し、その後の検証対象に含めた。
+
+最終full gate・確認用build・使い捨てportable実機はこの時点では未完了。実装者がCargoとfixture検証、親が実機操作と記録を担当し、同じ検証を重複実行しない。
+
 ### 次段の調査メモ（§2.25 → §2.24、未実装）
 
 `ui_folder_pane.rs` の同期・再読込・キー操作・ドライブ選択は一覧用の `settings.sort_order` を直接渡している。`folder_pane.rs` のscan workerと、`folder_tree.rs::FolderTreeOptions` を通るフォルダ間移動の双方を、ツリー専用の保存値へ揃える必要がある。お気に入りの表示状態の復元は一覧側だけに留める。ツリーの初期値は利用者要望どおりファイル名順とし、並べ直しの間も展開・現在位置を維持する。
 
 サイズ順の追加前に、一覧以外で `SortOrder` を使う代表サムネイル選定・Remote・本の固定ページ順を棚卸しする。サイズを持たない項目とサイズ0の実ファイルを区別し、同値の名前順、カテゴリ別配置、保存・復元を検収条件にする。ソートのためのUIスレッドでのファイル照会は追加しない。詳細設計と製品編集は§1.234の検収後に直列で行う。
+
+追加照合: 現在の `SortOrder` は名前・番号が昇順のみ、日付が昇降順の4候補。§2.25のツリー候補は名前・番号・日付それぞれの昇降順が要件であり、既存4候補の転用だけでは不足する。また `FolderPaneState::sync_to_active` はソート変更時にnodesと手動展開状態をともに消す。単に展開キーのclearを削ると既存コメントが警告する未ロードの展開行を作るため、子の再列挙と既存展開・cursorの維持を一体で設計・回帰する。
