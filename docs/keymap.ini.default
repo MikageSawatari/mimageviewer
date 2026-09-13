@@ -577,6 +577,7 @@
 # ConcealSpacePan = Space ; 押している間だけ画像をパン操作する
 
 [Crop] ; 切り取りモード
+# CropForceCreateHold = Ctrl ; 押している間、ドラッグで新しい切り取り枠を作る
 # CropSpacePan = Space ; 押している間だけ画像をパン操作する
 # CropExecute = Ctrl+E ; 切り取りを実行する
 

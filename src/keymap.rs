@@ -192,6 +192,49 @@ impl ModKind {
     }
 }
 
+/// Current physical modifier groups used by the crop-only Space-pan exception.
+///
+/// Broad Ctrl / Shift / Alt remain the group truth. Right-side fields refine a
+/// right-only binding without changing the generic ModifierHold contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModifierLevelSnapshot {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    right_ctrl: bool,
+    right_shift: bool,
+    right_alt: bool,
+}
+
+impl ModifierLevelSnapshot {
+    const fn matches_only(self, kind: ModKind) -> bool {
+        match kind {
+            ModKind::Ctrl => self.ctrl && !self.shift && !self.alt,
+            ModKind::Shift => self.shift && !self.ctrl && !self.alt,
+            ModKind::Alt => self.alt && !self.ctrl && !self.shift,
+            ModKind::RightCtrl => self.right_ctrl && !self.shift && !self.alt,
+            ModKind::RightShift => self.right_shift && !self.ctrl && !self.alt,
+            ModKind::RightAlt => self.right_alt && !self.ctrl && !self.shift,
+        }
+    }
+}
+
+fn crop_pan_with_force_binding_held(
+    pan_chords: &[Chord],
+    force_chords: &[Chord],
+    modifiers: ModifierLevelSnapshot,
+    mut key_held: impl FnMut(KeyName) -> bool,
+) -> bool {
+    force_chords
+        .iter()
+        .filter_map(|chord| chord.modifier_kind())
+        .any(|kind| modifiers.matches_only(kind))
+        && pan_chords
+            .iter()
+            .filter_map(|chord| chord.key_name())
+            .any(&mut key_held)
+}
+
 // 左側限定は現在の利用要望がなく、右側だけを選べれば「よく触る側を避ける」用途を
 // 満たせるため追加しない。Ctrl / Shift / Alt は従来どおり左右不問を表す。
 
@@ -1798,6 +1841,7 @@ pub enum KeyAction {
     ConcealToolRect,
     ConcealToolEllipse,
     ConcealSpacePan,
+    CropForceCreateHold,
     CropSpacePan,
     CropExecute,
     SnsSplitExecute,
@@ -2288,6 +2332,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolRect,
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
+    KeyAction::CropForceCreateHold,
     KeyAction::CropSpacePan,
     KeyAction::CropExecute,
     KeyAction::SnsSplitExecute,
@@ -3885,6 +3930,7 @@ impl KeyAction {
             ConcealToolRect => "ConcealToolRect",
             ConcealToolEllipse => "ConcealToolEllipse",
             ConcealSpacePan => "ConcealSpacePan",
+            CropForceCreateHold => "CropForceCreateHold",
             CropSpacePan => "CropSpacePan",
             CropExecute => "CropExecute",
             SnsSplitExecute => "SnsSplitExecute",
@@ -4494,6 +4540,7 @@ impl KeyAction {
             ConcealToolRect => "矩形ツールに切り替える",
             ConcealToolEllipse => "楕円ツールに切り替える",
             ConcealSpacePan => "押している間だけ画像をパン操作する",
+            CropForceCreateHold => "押している間、ドラッグで新しい切り取り枠を作る",
             CropSpacePan => "押している間だけ画像をパン操作する",
             CropExecute => "切り取りを実行する",
             SnsSplitExecute => "SNS 分割を実行する",
@@ -4931,7 +4978,7 @@ impl KeyAction {
             | ConcealToolRect
             | ConcealToolEllipse
             | ConcealSpacePan => KeyContext::Conceal,
-            CropExecute | CropSpacePan => KeyContext::Crop,
+            CropExecute | CropForceCreateHold | CropSpacePan => KeyContext::Crop,
             SnsSplitExecute => KeyContext::SnsSplit,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush | LaToolBucket
@@ -4944,7 +4991,9 @@ impl KeyAction {
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
-            FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold => KeyTrigger::ModifierHold,
+            FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
+                KeyTrigger::ModifierHold
+            }
             EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
             | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
@@ -5860,6 +5909,7 @@ impl KeyAction {
             ConcealToolRect => ChordList::one(Chord::key(R)),
             ConcealToolEllipse => ChordList::one(Chord::key(O)),
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
+            CropForceCreateHold => ChordList::one(Chord::modifier(ModKind::Ctrl)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
             SnsSplitExecute => ChordList::EMPTY,
@@ -7095,6 +7145,69 @@ impl Keymap {
             .default_chords()
             .iter()
             .any(|chord| self.key_held_chord(ctx, permit, chord))
+    }
+
+    /// Resolve the crop mode's temporary pan without weakening the generic
+    /// `KeyHold` exact-modifier contract.
+    ///
+    /// A normal unmodified `CropSpacePan` remains valid even when force-create
+    /// is disabled. The only added combination is that same effective plain-key
+    /// binding plus the sole active modifier group selected by the effective
+    /// `CropForceCreateHold` binding. This lets Space-pan win at pointer-down
+    /// while keeping unrelated modifier groups and other contexts excluded.
+    pub(crate) fn crop_space_pan_held(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+    ) -> bool {
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return false;
+        }
+
+        let pan_chords = self.effective_chords(KeyAction::CropSpacePan);
+        if pan_chords
+            .iter()
+            .copied()
+            .any(|chord| self.key_held_chord(ctx, permit, chord))
+        {
+            return true;
+        }
+        let force_chords = self.effective_chords(KeyAction::CropForceCreateHold);
+        if pan_chords.is_empty() || force_chords.is_empty() {
+            return false;
+        }
+
+        #[cfg(windows)]
+        {
+            let modifiers = ModifierLevelSnapshot {
+                ctrl: modifier_held_via_os(permit, ModKind::Ctrl),
+                shift: modifier_held_via_os(permit, ModKind::Shift),
+                alt: modifier_held_via_os(permit, ModKind::Alt),
+                right_ctrl: modifier_held_via_os(permit, ModKind::RightCtrl),
+                right_shift: modifier_held_via_os(permit, ModKind::RightShift),
+                right_alt: modifier_held_via_os(permit, ModKind::RightAlt),
+            };
+            crop_pan_with_force_binding_held(&pan_chords, &force_chords, modifiers, |key| {
+                key_held_via_os(permit.viewport(), key)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let modifiers = ctx.input(|input| ModifierLevelSnapshot {
+                ctrl: input.modifiers.ctrl,
+                shift: input.modifiers.shift,
+                alt: input.modifiers.alt,
+                // The non-Windows keymap already projects right-only modifier
+                // bindings onto their broad egui group.
+                right_ctrl: input.modifiers.ctrl,
+                right_shift: input.modifiers.shift,
+                right_alt: input.modifiers.alt,
+            });
+            crop_pan_with_force_binding_held(&pan_chords, &force_chords, modifiers, |key| {
+                key.to_egui()
+                    .is_some_and(|key| ctx.input(|i| i.key_down(key)))
+            })
+        }
     }
 
     /// KeyHold アクションに割り当てられたキーについて、このフレームの egui Key イベント
@@ -11027,6 +11140,155 @@ mod tests {
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
         );
+    }
+
+    #[test]
+    fn crop_force_create_is_a_customizable_ctrl_modifier_hold() {
+        let action = KeyAction::CropForceCreateHold;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Crop);
+        assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
+        assert_eq!(
+            action.default_chords().iter().next(),
+            Some(Chord::modifier(ModKind::Ctrl))
+        );
+        assert_eq!(
+            BindingPolicy::for_trigger(action.trigger()),
+            BindingPolicy::SingleModifier
+        );
+
+        let keymap = Keymap::default();
+        let rows = keymap.command_display_rows_for_active_scopes(&[CommandScope::Crop], false);
+        let row = rows
+            .iter()
+            .find(|row| row.spec.action == action)
+            .expect("the crop shortcut help must include force-create");
+        assert_eq!(row.shortcut_labels, vec!["Ctrl".to_owned()]);
+        assert_eq!(row.spec.scope, CommandScope::Crop);
+
+        let customized = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = RightCtrl\n");
+        assert!(customized.warnings().is_empty());
+        let customized_row = customized
+            .command_display_rows_for_active_scopes(&[CommandScope::Crop], false)
+            .into_iter()
+            .find(|row| row.spec.action == action)
+            .expect("a customized force-create remains visible in crop help");
+        assert_eq!(customized_row.shortcut_labels, vec!["右Ctrl".to_owned()]);
+
+        let disabled = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = none\n");
+        assert!(
+            disabled
+                .command_display_rows_for_active_scopes(&[CommandScope::Crop], false)
+                .iter()
+                .all(|row| row.spec.action != action)
+        );
+        let disabled_row = disabled
+            .command_display_rows_for_active_scopes(&[CommandScope::Crop], true)
+            .into_iter()
+            .find(|row| row.spec.action == action)
+            .expect("settings inventory must retain a disabled force-create action");
+        assert!(disabled_row.shortcut_labels.is_empty());
+    }
+
+    #[test]
+    fn crop_pan_force_combination_uses_effective_bindings_and_rejects_extra_groups() {
+        let keymap =
+            Keymap::from_ini_str("[Crop]\nCropSpacePan = P\nCropForceCreateHold = Shift\n");
+        assert!(keymap.warnings().is_empty());
+        let pan = keymap.effective_chords(KeyAction::CropSpacePan);
+        let force = keymap.effective_chords(KeyAction::CropForceCreateHold);
+        let p_is_held = |key| key == KeyName::P;
+
+        assert!(crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            &[],
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            &[],
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+
+        let force_disabled = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = none\n");
+        assert!(force_disabled.warnings().is_empty());
+        assert_eq!(
+            force_disabled.effective_chords(KeyAction::CropSpacePan),
+            vec![Chord::key(KeyName::Space)],
+            "disabling force-create must not disable ordinary unmodified Space-pan"
+        );
+        assert!(
+            force_disabled
+                .effective_chords(KeyAction::CropForceCreateHold)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn crop_pan_force_combination_respects_right_only_modifier_scope() {
+        let pan = [Chord::key(KeyName::Space)];
+        let force = [Chord::modifier(ModKind::RightCtrl)];
+        let space_is_held = |key| key == KeyName::Space;
+
+        assert!(!crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                right_ctrl: false,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
+        assert!(crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                right_ctrl: true,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                alt: true,
+                right_ctrl: true,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
     }
 
     #[test]

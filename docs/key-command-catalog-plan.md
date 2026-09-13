@@ -175,6 +175,12 @@
 > ホイールなどの固定扱い入力は補助行へ分ける。補正レイヤー、動画フルスクリーン、
 > テキスト注釈は後続スライスで対応済み。
 >
+> **§1.164 更新 (2026-09-13)**: 新しい枠の作成を既存枠の hit より優先する hold を
+> `CropForceCreateHold` として同じ `Crop` scope に追加した。既定 Ctrl、ModifierHold /
+> SingleModifier で、切り取りヘルプと操作カスタマイズは実効割当と無効化を共通 catalog
+> から表示する。Space pan との同時押しだけは crop の pointer-down classifier が実効
+> binding を比較して Pan を優先し、汎用 KeyHold の完全一致規則は変更しない。
+>
 > **Phase 7 補正レイヤーヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > 補正レイヤーパネル中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は
 > `LocalAdjust` scope の KeyAction に限定し、通常フルスクリーンの `Global` / `FsCommon`

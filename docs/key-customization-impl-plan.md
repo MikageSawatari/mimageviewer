@@ -612,7 +612,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - ConcealSpacePan `Space` (KH, Ph6) / ConcealNudge 矢印 (固定候補)
 
 ### Crop (Ph3) ★
-- CropExit `Esc`(予約) / CropExecute `Ctrl+E` / CropSpacePan `Space` (KH)
+- CropExit `Esc`(予約) / CropExecute `Ctrl+E` /
+  CropForceCreateHold `Ctrl` (MH) / CropSpacePan `Space` (KH)
+- Crop の pointer-down 分類だけは、実効 `CropSpacePan` と実効
+  `CropForceCreateHold` の組合せを解決し、両方が押されていれば Pan を優先する。
+  汎用 KeyHold の完全一致規則は変更せず、余分な modifier group は拒否する。
+  pointer-down 後は既存の Pan / Create / Edit owner に保持し、修飾キー変化で再分類しない。
 
 ### SnsSplit ★
 - FsSnsSplitMode (既定未割り当て) / SnsSplitExecute (既定未割り当て)

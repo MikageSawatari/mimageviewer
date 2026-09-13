@@ -1614,8 +1614,10 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   `default_chords()` / `ALL_ACTIONS` / [docs/keymap.ini.default](keymap.ini.default) /
   context shortcuts help ([context_shortcuts.rs:189](../src/ui_dialogs/context_shortcuts.rs:189))
   を揃える。既定は Ctrl + ドラッグ。
-- **決めること**: Space パンと同時に押されたときの優先順位。ドラッグ開始後に修飾キーを
-  離した場合の扱い (開始時の判定を保つ)。
+- **2026-09-13設計合意**: Spaceパンを優先し、開始時に選んだ操作を同じドラッグの終わりまで維持する。
+  実効キー割り当てとfocus/IMEの規則は維持し、共通KeyHoldの修飾キー完全一致は緩めない。
+  [設計と検証記録](section164-force-new-crop-frame.md)に沿って実装完了。全体gate main8337/0/45、
+  独立レビュー・確認build完了。実機は未確認。
 - 規模 / 優先度: Small / P2。
 
 ### 1.165 切り取り済みの編集プレビューを代役に使うと、寸法の説明と絵が食い違う

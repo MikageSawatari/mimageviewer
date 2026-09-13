@@ -29,6 +29,41 @@ fn crop_overlay_keeps_the_pointer(
     pointer_allowed || (drag_in_progress && primary_down)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportCropPointerStart {
+    None,
+    Pan,
+    ForceCreate,
+    Edit(CropHandle),
+    Create,
+}
+
+fn classify_export_crop_pointer_start(
+    primary_pressed: bool,
+    space_pan_held: bool,
+    force_create_held: bool,
+    inside_image: bool,
+    target: Option<CropHandle>,
+) -> ExportCropPointerStart {
+    if !primary_pressed {
+        return ExportCropPointerStart::None;
+    }
+    if space_pan_held && inside_image {
+        return ExportCropPointerStart::Pan;
+    }
+    if force_create_held && inside_image {
+        return ExportCropPointerStart::ForceCreate;
+    }
+    if let Some(handle) = target {
+        return ExportCropPointerStart::Edit(handle);
+    }
+    if inside_image {
+        ExportCropPointerStart::Create
+    } else {
+        ExportCropPointerStart::None
+    }
+}
+
 fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
     egui::pos2(
         pos.x.clamp(rect.left(), rect.right()),
@@ -540,6 +575,40 @@ impl App {
         settings: CropSettings,
         handles: [(CropHandle, egui::Pos2); 8],
     ) -> bool {
+        let (space_pan_held, force_create_held) = crate::keyboard_input::focused_key_state_permit(
+            ui.ctx(),
+        )
+        .map_or((false, false), |permit| {
+            (
+                self.keymap.crop_space_pan_held(ui.ctx(), permit),
+                self.keymap
+                    .modifier_held_action(ui.ctx(), permit, KeyAction::CropForceCreateHold),
+            )
+        });
+        self.handle_export_crop_pointer_with_holds(
+            ui,
+            transform,
+            fs_idx,
+            image_size,
+            settings,
+            handles,
+            space_pan_held,
+            force_create_held,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_export_crop_pointer_with_holds(
+        &mut self,
+        ui: &mut egui::Ui,
+        transform: &DisplayedImageTransform,
+        fs_idx: usize,
+        image_size: [usize; 2],
+        settings: CropSettings,
+        handles: [(CropHandle, egui::Pos2); 8],
+        space_pan_held: bool,
+        force_create_held: bool,
+    ) -> bool {
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
             ui.input(|i| {
                 (
@@ -556,24 +625,6 @@ impl App {
         let pointer_pos = hover_pos.or(press_origin);
         let crop_drag_in_progress =
             self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
-        let space_pan_held =
-            crate::keyboard_input::focused_key_state_permit(ui.ctx()).is_some_and(|permit| {
-                self.keymap
-                    .key_held_action(ui.ctx(), permit, KeyAction::CropSpacePan)
-            });
-        if !crop_drag_in_progress
-            && self.handle_overlay_space_pan_drag(
-                ui.ctx(),
-                space_pan_held,
-                pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
-                primary_pressed,
-                primary_down,
-                primary_released,
-                pointer_pos,
-            )
-        {
-            return true;
-        }
 
         let target_at = |pos: egui::Pos2| -> Option<CropHandle> {
             for (handle, center) in handles {
@@ -593,19 +644,45 @@ impl App {
                 None
             }
         };
+        let pointer_start = press_origin.map_or(ExportCropPointerStart::None, |origin| {
+            classify_export_crop_pointer_start(
+                primary_pressed,
+                space_pan_held,
+                force_create_held,
+                transform.contains_screen(origin),
+                target_at(origin),
+            )
+        });
+        if !crop_drag_in_progress
+            && self.handle_overlay_space_pan_drag(
+                ui.ctx(),
+                space_pan_held,
+                pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            )
+        {
+            return true;
+        }
 
-        if primary_pressed && let Some(origin) = press_origin {
-            if let Some(handle) = target_at(origin) {
-                self.export_crop_drag = Some(ExportCropDrag {
-                    handle,
-                    base: settings.rect,
-                });
-                self.export_crop_create_drag = None;
-            } else if transform.contains_screen(origin) {
-                self.export_crop_drag = None;
-                self.export_crop_create_drag = Some(ExportCropCreateDrag {
-                    start: screen_to_image(transform, image_size, origin),
-                });
+        if !crop_drag_in_progress && let Some(origin) = press_origin {
+            match pointer_start {
+                ExportCropPointerStart::Edit(handle) => {
+                    self.export_crop_drag = Some(ExportCropDrag {
+                        handle,
+                        base: settings.rect,
+                    });
+                    self.export_crop_create_drag = None;
+                }
+                ExportCropPointerStart::ForceCreate | ExportCropPointerStart::Create => {
+                    self.export_crop_drag = None;
+                    self.export_crop_create_drag = Some(ExportCropCreateDrag {
+                        start: screen_to_image(transform, image_size, origin),
+                    });
+                }
+                ExportCropPointerStart::None | ExportCropPointerStart::Pan => {}
             }
         }
 
@@ -673,7 +750,10 @@ impl App {
         }
 
         if !used && let Some(pos) = hover_pos {
-            if let Some(handle) = target_at(pos) {
+            if force_create_held && transform.contains_screen(pos) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                used = true;
+            } else if let Some(handle) = target_at(pos) {
                 ui.ctx().set_cursor_icon(crop_handle_cursor(handle));
                 used = true;
             } else if transform.contains_screen(pos) {
@@ -703,6 +783,65 @@ fn centered_default_crop(image_size: [usize; 2]) -> CropRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_transform(rect: egui::Rect, image_size: [usize; 2]) -> DisplayedImageTransform {
+        DisplayedImageTransform::resolve(
+            crate::displayed_image_transform::DisplayedImageTransformInput {
+                pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: rect,
+                source_size: egui::vec2(image_size[0] as f32, image_size[1] as f32),
+                texture_size: egui::vec2(image_size[0] as f32, image_size[1] as f32),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                    zoom_pan: None,
+                },
+            },
+        )
+        .expect("test crop transform")
+    }
+
+    fn run_crop_pointer_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        image_size: [usize; 2],
+        settings: CropSettings,
+        handles: [(CropHandle, egui::Pos2); 8],
+        events: Vec<egui::Event>,
+        space_pan_held: bool,
+        force_create_held: bool,
+    ) -> bool {
+        let mut used = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(transform.viewport_rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    used = app.handle_export_crop_pointer_with_holds(
+                        ui,
+                        transform,
+                        0,
+                        image_size,
+                        settings,
+                        handles,
+                        space_pan_held,
+                        force_create_held,
+                    );
+                });
+            },
+        );
+        used
+    }
 
     /// A drag that is already running survives the pointer wandering onto the tool panel.
     ///
@@ -734,6 +873,224 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn crop_pointer_start_priority_is_pan_then_force_then_existing_target() {
+        for target in [
+            CropHandle::Body,
+            CropHandle::NorthWest,
+            CropHandle::North,
+            CropHandle::NorthEast,
+            CropHandle::East,
+            CropHandle::SouthEast,
+            CropHandle::South,
+            CropHandle::SouthWest,
+            CropHandle::West,
+        ] {
+            assert_eq!(
+                classify_export_crop_pointer_start(true, true, true, true, Some(target)),
+                ExportCropPointerStart::Pan
+            );
+            assert_eq!(
+                classify_export_crop_pointer_start(true, false, true, true, Some(target)),
+                ExportCropPointerStart::ForceCreate
+            );
+            assert_eq!(
+                classify_export_crop_pointer_start(true, false, false, true, Some(target)),
+                ExportCropPointerStart::Edit(target)
+            );
+        }
+    }
+
+    #[test]
+    fn force_create_never_starts_outside_the_image() {
+        assert_eq!(
+            classify_export_crop_pointer_start(true, false, true, false, None),
+            ExportCropPointerStart::None
+        );
+        assert_eq!(
+            classify_export_crop_pointer_start(true, false, true, false, Some(CropHandle::East),),
+            ExportCropPointerStart::Edit(CropHandle::East),
+            "an existing handle outside the image keeps its normal edit behavior"
+        );
+        assert_eq!(
+            classify_export_crop_pointer_start(true, false, true, true, None),
+            ExportCropPointerStart::ForceCreate
+        );
+    }
+
+    #[test]
+    fn crop_pointer_start_requires_the_initial_primary_press() {
+        assert_eq!(
+            classify_export_crop_pointer_start(false, true, true, true, Some(CropHandle::Body),),
+            ExportCropPointerStart::None,
+            "releasing Space or changing the force modifier during the same primary hold must not reclassify the owner"
+        );
+        assert_eq!(
+            classify_export_crop_pointer_start(true, false, false, true, None),
+            ExportCropPointerStart::Create,
+            "the existing empty-area create path remains available"
+        );
+    }
+
+    #[test]
+    fn production_crop_pointer_path_latches_force_create_until_release() {
+        let mut app = crate::app::setup_app_for_test();
+        let image_path = app.tmp.path().join("crop-pointer.jpg");
+        std::fs::write(&image_path, b"test").unwrap();
+        app.items
+            .push(crate::grid_item::GridItem::Image(image_path.clone()));
+        app.fullscreen_idx = Some(0);
+
+        let ctx = egui::Context::default();
+        let image_size = [100, 100];
+        let transform = test_transform(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0)),
+            image_size,
+        );
+        let initial = CropSettings::authored(
+            CropRect::full(image_size[0], image_size[1]),
+            CropAspectMode::Free,
+            image_size,
+        );
+        let handles = handle_points(&transform, image_size, initial.rect);
+        let start = transform.viewport_rect.center();
+        let end = start + egui::vec2(80.0, 60.0);
+        let pointer_button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert!(run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            initial,
+            handles,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true)
+            ],
+            false,
+            true,
+        ));
+        assert!(app.export_crop_drag.is_none());
+        assert!(app.export_crop_create_drag.is_some());
+
+        assert!(run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            initial,
+            handles,
+            vec![egui::Event::PointerMoved(end)],
+            false,
+            false,
+        ));
+        assert!(
+            app.export_crop_create_drag.is_some(),
+            "releasing the force modifier during the same primary hold must keep the create owner"
+        );
+        let authored = app
+            .export_crop_for_idx(0, image_size)
+            .expect("the held production drag must author a new crop");
+        assert!(!authored.is_full(image_size[0], image_size[1]));
+
+        assert!(run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            authored,
+            handle_points(&transform, image_size, authored.rect),
+            vec![egui::Event::PointerMoved(end), pointer_button(end, false)],
+            false,
+            false,
+        ));
+        assert!(app.export_crop_drag.is_none());
+        assert!(app.export_crop_create_drag.is_none());
+        assert_eq!(app.export_crop_for_idx(0, image_size), Some(authored));
+    }
+
+    #[test]
+    fn production_crop_pointer_path_does_not_reclassify_after_space_pan_ends() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let image_size = [100, 100];
+        let transform = test_transform(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0)),
+            image_size,
+        );
+        let settings = CropSettings::authored(
+            CropRect::full(image_size[0], image_size[1]),
+            CropAspectMode::Free,
+            image_size,
+        );
+        let handles = handle_points(&transform, image_size, settings.rect);
+        let start = transform.viewport_rect.center();
+        let moved = start + egui::vec2(40.0, 20.0);
+        let pointer_button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            settings,
+            handles,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+            true,
+            true,
+        );
+        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.export_crop_drag.is_none());
+        assert!(app.export_crop_create_drag.is_none());
+
+        run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            settings,
+            handles,
+            vec![egui::Event::PointerMoved(moved)],
+            false,
+            true,
+        );
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.export_crop_drag.is_none());
+        assert!(
+            app.export_crop_create_drag.is_none(),
+            "the same primary hold must not turn into force-create after Space is released"
+        );
+
+        run_crop_pointer_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            image_size,
+            settings,
+            handles,
+            vec![pointer_button(moved, false)],
+            false,
+            true,
+        );
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.export_crop_drag.is_none());
+        assert!(app.export_crop_create_drag.is_none());
     }
 
     fn white(w: usize, h: usize) -> egui::ColorImage {
