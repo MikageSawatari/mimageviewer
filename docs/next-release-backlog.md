@@ -128,12 +128,30 @@ UI は「要確認」を出して**ボタンを有効のまま残す**
 
 #### 別件として切り離すもの
 
-利用者報告にあった「**別のプロセスが使用中です (os error 32)**」は、**今回の再現とは別**。
+利用者報告にあった「**別のプロセスが使用中です (os error 32)**」は、**上とは別の失敗**。
 検証段階ではファイルに触れないので共有違反は出ない
 ([`snapshot_current_family`](../src/settings_restore.rs:654) は `fs::copy`、共有違反が出るのは
-後段 [`replace_file_atomic_with_retry`](../src/settings_restore.rs:675) の rename)。
-**3.9.1 のプロセス (トレイ常駐含む) が残っていた可能性が高いが未確認。** ポータブル版は
-mutex が分かれるので同時起動できる。混ぜて扱わない。
+後段 [`replace_file_atomic_with_retry`](../src/settings_restore.rs:675) の rename か、
+`full_reset` の `remove_file`)。**2026-09-13 に利用者が手元で再現済み**。
+
+**「旧版のプロセスが残っていた」という説明は誤りなので採らない。** 復元は
+ダイアログから行う以上、**動作中のプロセス自身が自分の `settings.db` を差し替える**のが
+正規の流れで、それは設計どおり (ダイアログにも「復元すると現在の設定は上書きされ、
+アプリは自動で終了します」と出る)。利用者の再現時、旧版は起動していない。
+
+静的読みで**排除できたもの**:
+
+- `App` は `Arc<SettingsDb>` を保持しない。長命な参照は `GLOBAL_DB` だけで
+  ([settings_db.rs:3749](../src/settings_db.rs:3749))、本番の呼び出し元
+  ([settings.rs:7848](../src/settings.rs:7848)) は `outcome.db` を `is_some()` で見るだけで
+  関数末尾に drop する
+- `restore_from` は step 5 で `set_global_db(data_dir, None)` してから file 操作へ進む
+  ([settings_restore.rs:403](../src/settings_restore.rs:403))。`full_reset` も削除前に同じことをする
+- rename / remove はどちらも retry_io (50ms x 10) を通っている
+
+**つまり「誰がハンドルを握っているか」がコード読みでは出ない。** 次にやるのは推測ではなく
+観測で、**まず失敗した操作と対象パスをエラーメッセージへ出す**
+(`RestoreError::Io(e)` が今はどのファイルの話か言わない)。どの段で落ちたかが確定してから直す。
 
 #### 回帰確認
 
