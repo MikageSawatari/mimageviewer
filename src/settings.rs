@@ -11923,7 +11923,7 @@ mod tests {
     fn context_menu_layout_defaults_when_missing_and_roundtrips_stable_ids() {
         use crate::context_menu_model::{
             ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuOrderSettings,
-            ContextMenuParentId,
+            ContextMenuParentId, ContextMenuSeparatorBefore, ContextMenuSeparatorSettings,
         };
 
         let loaded: Settings = serde_json::from_str("{}").unwrap();
@@ -11942,6 +11942,10 @@ mod tests {
                 ],
             }],
             hidden_items: vec![ContextMenuItemId::CopyPath.stable_name().to_string()],
+            separators: vec![ContextMenuSeparatorSettings {
+                item: ContextMenuItemId::Rename.stable_name().to_string(),
+                before: ContextMenuSeparatorBefore::Present,
+            }],
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("Rename"));

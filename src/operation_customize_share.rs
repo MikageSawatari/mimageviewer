@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context_menu_model::{
     ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuOrderSettings, ContextMenuParentId,
+    ContextMenuSeparatorBefore, ContextMenuSeparatorSettings,
 };
 use crate::keymap::{
     KeyAction, Keymap, KeymapSettings, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings,
@@ -404,10 +405,41 @@ fn sanitize_context_menu_layout(
         })
         .collect();
 
+    let mut seen_separators = HashSet::new();
+    let separators = input
+        .separators
+        .iter()
+        .filter_map(|entry| {
+            let Some(item) = ContextMenuItemId::parse_stable_name(&entry.item) else {
+                ignored += 1;
+                warnings.push(format!(
+                    "未知の区切り線右クリックメニュー項目 '{}' を無視しました。",
+                    entry.item
+                ));
+                return None;
+            };
+            if !seen_separators.insert(item) {
+                ignored += 1;
+                warnings.push(format!(
+                    "重複した区切り線右クリックメニュー項目 '{}' を無視しました。",
+                    entry.item
+                ));
+                return None;
+            }
+            (entry.before != ContextMenuSeparatorBefore::Inherit).then(|| {
+                ContextMenuSeparatorSettings {
+                    item: item.stable_name().to_string(),
+                    before: entry.before,
+                }
+            })
+        })
+        .collect();
+
     (
         ContextMenuLayoutSettings {
             order,
             hidden_items,
+            separators,
         },
         warnings,
         ignored,
@@ -658,6 +690,10 @@ mod tests {
         settings
             .context_menu_layout
             .set_order(ContextMenuParentId::Root, &context_order);
+        settings.context_menu_layout.set_separator_before(
+            ContextMenuItemId::CopyFiles,
+            ContextMenuSeparatorBefore::Present,
+        );
         settings.ring_shortcuts.grid.slots[0] = RingActionId::CloseMainWindow;
         settings.ring_shortcuts.grid.slots[1] = RingActionId::GridScrollBottom;
         settings.ring_shortcuts.mouse_buttons_grid.middle = RingActionId::QuitApplication;
@@ -755,6 +791,24 @@ mod tests {
                 "CopyPath".to_string(),
                 "FutureHidden".to_string(),
             ],
+            separators: vec![
+                ContextMenuSeparatorSettings {
+                    item: "Rename".to_string(),
+                    before: ContextMenuSeparatorBefore::Present,
+                },
+                ContextMenuSeparatorSettings {
+                    item: "Rename".to_string(),
+                    before: ContextMenuSeparatorBefore::Absent,
+                },
+                ContextMenuSeparatorSettings {
+                    item: "FutureSeparator".to_string(),
+                    before: ContextMenuSeparatorBefore::Present,
+                },
+                ContextMenuSeparatorSettings {
+                    item: "CopyFiles".to_string(),
+                    before: ContextMenuSeparatorBefore::Inherit,
+                },
+            ],
         };
 
         let parsed = parse_json(&to_json(&bundle).unwrap()).unwrap();
@@ -766,14 +820,30 @@ mod tests {
                     items: vec!["CopyFiles".to_string()],
                 }],
                 hidden_items: vec!["CopyPath".to_string()],
+                separators: vec![ContextMenuSeparatorSettings {
+                    item: "Rename".to_string(),
+                    before: ContextMenuSeparatorBefore::Present,
+                }],
             }
         );
-        assert_eq!(parsed.ignored_items, 8);
+        assert_eq!(parsed.ignored_items, 10);
         assert!(
             parsed
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("FutureItem"))
+        );
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("FutureSeparator"))
+        );
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("重複した区切り線"))
         );
         assert!(
             parsed

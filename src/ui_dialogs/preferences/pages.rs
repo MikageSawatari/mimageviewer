@@ -1,6 +1,6 @@
 use super::*;
 use crate::context_menu_model::{
-    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId,
+    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId, ContextMenuSeparatorBefore,
 };
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
@@ -4652,6 +4652,9 @@ pub(super) fn draw_context_menu_layout_settings(
     ui: &mut egui::Ui,
     layout: &mut ContextMenuLayoutSettings,
 ) {
+    const ITEM_PREVIEW_WIDTH: f32 = 18.0;
+    const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
+    const ARROW_COLUMN_WIDTH: f32 = 32.0;
     ui.add_space(16.0);
     ui.separator();
     ui.label(egui::RichText::new("右クリックメニュー").strong());
@@ -4659,10 +4662,31 @@ pub(super) fn draw_context_menu_layout_settings(
         "一覧とフルスクリーンで共用する mImageViewer 項目の表示と順序です。\
          その場面で利用できない項目は従来どおり省きます。",
     );
+    ui.small("各項目の前の区切り線は、標準では表示場面に応じた既定の区切りを使います。");
     ui.add_space(6.0);
 
     let snapshot = layout.clone();
     let mut edit = None;
+    let item_font = egui::TextStyle::Body.resolve(ui.style());
+    let max_item_label_width = ContextMenuItemId::ALL.iter().fold(0.0_f32, |width, item| {
+        width.max(
+            ui.painter()
+                .layout_no_wrap(
+                    item.label().to_owned(),
+                    item_font.clone(),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x,
+        )
+    });
+    let item_column_width = ITEM_COLUMN_MIN_WIDTH.max(
+        ITEM_PREVIEW_WIDTH
+            + ui.spacing().item_spacing.x
+            + ui.spacing().icon_width
+            + ui.spacing().icon_spacing
+            + max_item_label_width,
+    );
     ui.horizontal(|ui| {
         if ui.button("右クリック項目を既定に戻す").clicked() {
             edit = Some(ContextMenuLayoutEdit::Reset);
@@ -4680,42 +4704,125 @@ pub(super) fn draw_context_menu_layout_settings(
             .default_open(parent == ContextMenuParentId::Root)
             .show(ui, |ui| {
                 egui::Grid::new(("context_menu_layout_items", parent))
-                    .num_columns(3)
+                    .num_columns(4)
                     .spacing([8.0, 4.0])
                     .striped(true)
                     .show(ui, |ui| {
+                        let row_height = ui.spacing().interact_size.y;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(item_column_width, row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_width(item_column_width);
+                                ui.strong("表示・項目");
+                            },
+                        );
+                        ui.label("\u{00a0}");
+                        ui.label("\u{00a0}");
+                        ui.strong("前の区切り線");
+                        ui.end_row();
                         for (index, &item) in order.iter().enumerate() {
                             let mut visible = snapshot.is_visible(item);
-                            if ui.checkbox(&mut visible, item.label()).changed() {
+                            let separator = snapshot.separator_before(item);
+                            let changed = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(item_column_width, row_height),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_width(item_column_width);
+                                        let (preview_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(ITEM_PREVIEW_WIDTH, row_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        if separator == ContextMenuSeparatorBefore::Present {
+                                            ui.painter().hline(
+                                                preview_rect.x_range(),
+                                                preview_rect.center().y,
+                                                ui.visuals().widgets.noninteractive.fg_stroke,
+                                            );
+                                        }
+                                        ui.checkbox(&mut visible, item.label()).changed()
+                                    },
+                                )
+                                .inner;
+                            if changed {
                                 edit = Some(ContextMenuLayoutEdit::SetVisible(item, visible));
                             }
-                            let up_enabled = index > 0;
-                            let up = ui
-                                .add_enabled(index > 0, egui::Button::new("↑").small())
-                                .on_hover_text("上へ");
-                            up.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    up_enabled,
-                                    format!("{}を上へ", item.label()),
-                                )
-                            });
-                            if up.clicked() {
-                                edit = Some(ContextMenuLayoutEdit::Move(parent, index, -1));
+                            if order.len() > 1 {
+                                let up_enabled = index > 0;
+                                let up = ui
+                                    .add_enabled(
+                                        up_enabled,
+                                        egui::Button::new("↑")
+                                            .small()
+                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
+                                    )
+                                    .on_hover_text("上へ");
+                                up.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        up_enabled,
+                                        format!("{}を上へ", item.label()),
+                                    )
+                                });
+                                if up.clicked() {
+                                    edit = Some(ContextMenuLayoutEdit::Move(parent, index, -1));
+                                }
+                                let down_enabled = index + 1 < order.len();
+                                let down = ui
+                                    .add_enabled(
+                                        down_enabled,
+                                        egui::Button::new("↓")
+                                            .small()
+                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
+                                    )
+                                    .on_hover_text("下へ");
+                                down.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        down_enabled,
+                                        format!("{}を下へ", item.label()),
+                                    )
+                                });
+                                if down.clicked() {
+                                    edit = Some(ContextMenuLayoutEdit::Move(parent, index, 1));
+                                }
+                            } else {
+                                ui.label("\u{00a0}");
+                                ui.label("\u{00a0}");
                             }
-                            let down_enabled = index + 1 < order.len();
-                            let down = ui
-                                .add_enabled(down_enabled, egui::Button::new("↓").small())
-                                .on_hover_text("下へ");
-                            down.widget_info(|| {
+                            let mut next_separator = separator;
+                            let combo = egui::ComboBox::from_id_salt((
+                                "context_menu_separator_before",
+                                parent,
+                                item,
+                            ))
+                            .selected_text(context_menu_separator_label(separator))
+                            .show_ui(ui, |ui| {
+                                for value in [
+                                    ContextMenuSeparatorBefore::Inherit,
+                                    ContextMenuSeparatorBefore::Present,
+                                    ContextMenuSeparatorBefore::Absent,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut next_separator,
+                                        value,
+                                        context_menu_separator_label(value),
+                                    );
+                                }
+                            });
+                            combo.response.widget_info(|| {
                                 egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    down_enabled,
-                                    format!("{}を下へ", item.label()),
+                                    egui::WidgetType::ComboBox,
+                                    true,
+                                    format!("{}の前の区切り線", item.label()),
                                 )
                             });
-                            if down.clicked() {
-                                edit = Some(ContextMenuLayoutEdit::Move(parent, index, 1));
+                            if next_separator != separator {
+                                edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                    item,
+                                    next_separator,
+                                ));
                             }
                             ui.end_row();
                         }
@@ -4729,6 +4836,14 @@ pub(super) fn draw_context_menu_layout_settings(
 
     if let Some(edit) = edit {
         apply_context_menu_layout_edit(layout, edit);
+    }
+}
+
+fn context_menu_separator_label(value: ContextMenuSeparatorBefore) -> &'static str {
+    match value {
+        ContextMenuSeparatorBefore::Inherit => "標準",
+        ContextMenuSeparatorBefore::Present => "表示",
+        ContextMenuSeparatorBefore::Absent => "非表示",
     }
 }
 
@@ -9145,6 +9260,7 @@ enum ContextMenuLayoutEdit {
     ShowAll,
     Move(ContextMenuParentId, usize, i32),
     SetVisible(ContextMenuItemId, bool),
+    SetSeparatorBefore(ContextMenuItemId, ContextMenuSeparatorBefore),
 }
 
 fn apply_context_menu_layout_edit(
@@ -9161,6 +9277,9 @@ fn apply_context_menu_layout_edit(
             }
         }
         ContextMenuLayoutEdit::SetVisible(item, visible) => layout.set_visible(item, visible),
+        ContextMenuLayoutEdit::SetSeparatorBefore(item, before) => {
+            layout.set_separator_before(item, before)
+        }
     }
 }
 
@@ -9191,9 +9310,21 @@ mod context_menu_layout_settings_tests {
             &mut layout,
             ContextMenuLayoutEdit::SetVisible(ContextMenuItemId::CopyPath, false),
         );
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::SetSeparatorBefore(
+                ContextMenuItemId::CopyPath,
+                ContextMenuSeparatorBefore::Present,
+            ),
+        );
         assert!(!layout.is_visible(ContextMenuItemId::CopyPath));
         apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::ShowAll);
         assert!(layout.is_visible(ContextMenuItemId::CopyPath));
+        assert_eq!(
+            layout.separator_before(ContextMenuItemId::CopyPath),
+            ContextMenuSeparatorBefore::Present,
+            "show all changes visibility only"
+        );
         apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
         assert_eq!(layout, ContextMenuLayoutSettings::default());
     }
@@ -9230,6 +9361,19 @@ mod context_menu_layout_settings_tests {
             &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
         );
 
+        harness.get_by_label("コピーの前の区切り線").click();
+        harness.run();
+        harness.get_by_label("表示").click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .separator_before(ContextMenuItemId::CopyFiles),
+            ContextMenuSeparatorBefore::Present
+        );
+        let root_separator_column_x = harness.get_by_label("コピーの前の区切り線").rect().left();
+
         harness.get_by_label("コピー").click();
         harness.run();
         assert!(!harness.state().0.is_visible(ContextMenuItemId::CopyFiles));
@@ -9251,7 +9395,31 @@ mod context_menu_layout_settings_tests {
             .get_by_label("「アプリケーションで開く…」内の項目")
             .click();
         harness.run();
+        // A newly opened egui Grid records its measured columns on the first frame and
+        // presents the shared widths on the requested follow-up repaint.
+        harness.run();
+        harness.get_by_label("外部ツールの設定…").scroll_to_me();
+        harness.run();
         assert!(harness.query_by_label("外部ツールの設定…").is_some());
+        assert!(
+            harness.query_by_label("外部ツールの設定…を上へ").is_none(),
+            "a one-item hierarchy must not expose meaningless arrow buttons"
+        );
+        assert!(harness.query_by_label("外部ツールの設定…を下へ").is_none());
+        assert!(
+            harness
+                .query_by_label("外部ツールの設定…の前の区切り線")
+                .is_some(),
+            "the stable leaf still exposes its separator setting"
+        );
+        let open_with_separator_column_x = harness
+            .get_by_label("外部ツールの設定…の前の区切り線")
+            .rect()
+            .left();
+        assert!(
+            (root_separator_column_x - open_with_separator_column_x).abs() <= 1.0,
+            "both hierarchy grids must share the separator column: root={root_separator_column_x}, open_with={open_with_separator_column_x}"
+        );
     }
 }
 

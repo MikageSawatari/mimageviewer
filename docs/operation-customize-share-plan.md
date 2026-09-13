@@ -52,7 +52,7 @@
 | `keymap` | `KeymapSettings` | キー割り当ての上書き (`overrides: Vec<KeyBindingOverride>`) |
 | `ring_shortcuts` | `RingShortcutSettings` | 右ドラッグ mode / リング / マウスジェスチャ / マウス戻る進む / ゲームパッド X リング |
 | `menu_layout` | `MenuLayoutSettings` | top menu 順序 / メニュー内コマンド順序 / 非表示コマンド |
-| `context_menu_layout` | `ContextMenuLayoutSettings` | Grid / Fullscreen 共通の右クリック静的項目の階層別順序 / 非表示項目 |
+| `context_menu_layout` | `ContextMenuLayoutSettings` | Grid / Fullscreen 共通の右クリック静的項目の階層別順序 / 非表示項目 / 項目に追従する直前separator指定 |
 | `gamepad_enabled` | `bool` | ゲームパッド入力の有効 / 無効 |
 
 - エクスポート / インポート / 差分は常にこの一式が対象。「キーだけ」の部分入出力は

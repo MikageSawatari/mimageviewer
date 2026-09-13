@@ -3817,6 +3817,10 @@ mod tests {
         use egui_kittest::{Harness, kittest::Queryable};
 
         let mut layout = crate::context_menu_model::ContextMenuLayoutSettings::default();
+        layout.set_separator_before(
+            crate::context_menu_model::ContextMenuItemId::CopyFiles,
+            crate::context_menu_model::ContextMenuSeparatorBefore::Present,
+        );
         let mut fonts_ready = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(620.0, 700.0))
@@ -3844,6 +3848,8 @@ mod tests {
         harness
             .get_by_label("「アプリケーションで開く…」内の項目")
             .click();
+        harness.run();
+        harness.get_by_label("外部ツールの設定…").scroll_to_me();
         harness.run();
         harness.snapshot("preferences_context_menu_layout_open_with");
     }

@@ -411,3 +411,7 @@ sub-menu / inline 設定を保って末尾へ置く。静的項目を非表示�
 利用不能項目は capability-filtered tree に存在しないため復活しない。最後に既存 `normalize_menu` で
 空 submenu、leading / trailing / 連続 separator を除く。詳細と受入条件は
 [§1.221 設計記録](section221-context-menu-layout.md) を参照する。
+
+同日の追補で、static leaf ごとに直前の separator を「標準 / 表示 / 非表示」から選べるようにした。
+明示指定は actual stable ID と一緒に並べ替え、標準指定は移動先の既存 section 境界を使う。動的固定枠
+と Windows Shell 境界は設定対象外のままで、最後の `normalize_menu` 契約も変えない。

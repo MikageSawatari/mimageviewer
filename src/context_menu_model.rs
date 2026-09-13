@@ -224,12 +224,29 @@ pub struct ContextMenuOrderSettings {
     pub items: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextMenuSeparatorBefore {
+    #[default]
+    Inherit,
+    Present,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMenuSeparatorSettings {
+    pub item: String,
+    #[serde(default)]
+    pub before: ContextMenuSeparatorBefore,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextMenuLayoutSettings {
     #[serde(default)]
     pub order: Vec<ContextMenuOrderSettings>,
     #[serde(default)]
     pub hidden_items: Vec<String>,
+    #[serde(default)]
+    pub separators: Vec<ContextMenuSeparatorSettings>,
 }
 
 impl ContextMenuLayoutSettings {
@@ -312,6 +329,32 @@ impl ContextMenuLayoutSettings {
         });
         if !visible {
             self.hidden_items.push(item.stable_name().to_string());
+        }
+    }
+
+    pub fn separator_before(&self, item: ContextMenuItemId) -> ContextMenuSeparatorBefore {
+        self.separators
+            .iter()
+            .find_map(|entry| {
+                (ContextMenuItemId::parse_stable_name(&entry.item) == Some(item))
+                    .then_some(entry.before)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_separator_before(
+        &mut self,
+        item: ContextMenuItemId,
+        before: ContextMenuSeparatorBefore,
+    ) {
+        self.separators.retain(|entry| {
+            ContextMenuItemId::parse_stable_name(&entry.item).is_none_or(|saved| saved != item)
+        });
+        if before != ContextMenuSeparatorBefore::Inherit {
+            self.separators.push(ContextMenuSeparatorSettings {
+                item: item.stable_name().to_string(),
+                before,
+            });
         }
     }
 
@@ -709,16 +752,21 @@ fn apply_context_menu_layout(
                         .iter()
                         .position(|candidate| *candidate == item)
                         .unwrap_or(usize::MAX),
+                    item,
                     unit.nodes.clone(),
                 )),
                 LayoutUnitId::Fixed(_) => None,
             })
             .collect();
-        configurable.sort_by_key(|(rank, _)| *rank);
-        let mut configurable = configurable.into_iter().map(|(_, nodes)| nodes);
+        configurable.sort_by_key(|(rank, _, _)| *rank);
+        let mut configurable = configurable
+            .into_iter()
+            .map(|(_, item, nodes)| (item, nodes));
         for unit in &mut units {
             if matches!(unit.id, LayoutUnitId::Configurable(_)) {
-                unit.nodes = configurable.next().expect("same configurable unit count");
+                let (item, nodes) = configurable.next().expect("same configurable unit count");
+                unit.id = LayoutUnitId::Configurable(item);
+                unit.nodes = nodes;
             }
         }
     }
@@ -726,7 +774,16 @@ fn apply_context_menu_layout(
     let mut resolved = Vec::new();
     let mut previous_section = None;
     for unit in units {
-        if previous_section.is_some_and(|previous| previous != unit.section) {
+        let inherited_separator = previous_section.is_some_and(|previous| previous != unit.section);
+        let separator_before = match unit.id {
+            LayoutUnitId::Configurable(item) => match settings.separator_before(item) {
+                ContextMenuSeparatorBefore::Inherit => inherited_separator,
+                ContextMenuSeparatorBefore::Present => true,
+                ContextMenuSeparatorBefore::Absent => false,
+            },
+            LayoutUnitId::Fixed(_) => inherited_separator,
+        };
+        if separator_before {
             resolved.push(MenuNode::Separator);
         }
         previous_section = Some(unit.section);
@@ -1805,6 +1862,17 @@ mod tests {
     }
 
     #[test]
+    fn separator_settings_missing_from_older_json_default_to_inherit() {
+        let layout: ContextMenuLayoutSettings =
+            serde_json::from_str(r#"{"order":[],"hidden_items":[]}"#).unwrap();
+        assert!(layout.separators.is_empty());
+        assert_eq!(
+            layout.separator_before(ContextMenuItemId::CopyFiles),
+            ContextMenuSeparatorBefore::Inherit
+        );
+    }
+
+    #[test]
     fn default_layout_preserves_representative_menu_sections_exactly() {
         let grid_image =
             build_context_menu(&input(ContextMenuItemKind::Image, ContextMenuSurface::Grid));
@@ -1903,6 +1971,7 @@ mod tests {
                     .collect(),
             }],
             hidden_items: Vec::new(),
+            separators: Vec::new(),
         };
 
         let resolved = settings.resolved_order(ContextMenuParentId::Root);
@@ -1943,6 +2012,66 @@ mod tests {
                 "layout must not resurrect an unavailable capability: {ids:?}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_separator_override_follows_the_actual_item_through_reordering() {
+        let raw = vec![
+            item(MenuCommand::CutFiles, "cut"),
+            item(MenuCommand::CopyFiles, "copy"),
+            MenuNode::Separator,
+            item(MenuCommand::Rename, "rename"),
+        ];
+        let mut layout = ContextMenuLayoutSettings::default();
+        let mut order = layout.resolved_order(ContextMenuParentId::Root);
+        let rename = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::Rename)
+            .unwrap();
+        let rename = order.remove(rename);
+        order.insert(0, rename);
+        layout.set_order(ContextMenuParentId::Root, &order);
+        layout.set_separator_before(
+            ContextMenuItemId::CutFiles,
+            ContextMenuSeparatorBefore::Present,
+        );
+        layout.set_separator_before(
+            ContextMenuItemId::CopyFiles,
+            ContextMenuSeparatorBefore::Absent,
+        );
+
+        assert_eq!(
+            menu_shape(&apply_context_menu_layout(
+                raw,
+                ContextMenuParentId::Root,
+                &layout,
+            )),
+            ["Rename", "|", "CutFiles", "CopyFiles"],
+            "the explicit boundary belongs to the moved item while the inherited boundary belongs to the destination slot"
+        );
+    }
+
+    #[test]
+    fn unavailable_or_hidden_separator_targets_do_not_create_bad_boundaries() {
+        let raw = vec![
+            item(MenuCommand::CutFiles, "cut"),
+            MenuNode::Separator,
+            item(MenuCommand::Rename, "rename"),
+        ];
+        let mut layout = ContextMenuLayoutSettings::default();
+        layout.set_separator_before(
+            ContextMenuItemId::CopyFiles,
+            ContextMenuSeparatorBefore::Present,
+        );
+        layout.set_separator_before(
+            ContextMenuItemId::CutFiles,
+            ContextMenuSeparatorBefore::Present,
+        );
+        layout.set_visible(ContextMenuItemId::CutFiles, false);
+
+        let nodes = apply_context_menu_layout(raw, ContextMenuParentId::Root, &layout);
+        assert_eq!(menu_shape(&nodes), ["Rename"]);
+        assert_eq!(nodes, normalize_menu(nodes.clone()));
     }
 
     #[test]
@@ -1989,6 +2118,10 @@ mod tests {
         let rotate = order.remove(rotate);
         order.insert(0, rotate);
         case.layout.set_order(ContextMenuParentId::Root, &order);
+        case.layout.set_separator_before(
+            ContextMenuItemId::RotateRight,
+            ContextMenuSeparatorBefore::Present,
+        );
 
         let nodes = build_context_menu(&case);
         let shown = labels(&nodes);
