@@ -10834,8 +10834,22 @@ impl App {
     }
 
     pub(crate) fn fs_nav_deferred_reopen_wait_active(&self) -> bool {
+        let sidecar_navigation_owner = match self.fs_holdover_tex.as_ref() {
+            Some(FsHoldover::NavigationSequence(sequence)) => matches!(
+                sequence.target,
+                FsNavigationSequenceTarget::FolderItems {
+                    accepted_generation
+                } if self.items_generation > accepted_generation
+            ),
+            Some(FsHoldover::FolderNavigation(_)) => self
+                .fs_nav_locked_gen
+                .is_some_and(|locked_generation| self.items_generation > locked_generation),
+            Some(FsHoldover::PresentationSwitch(_) | FsHoldover::FinalEffectSourceReload(_))
+            | None => false,
+        };
         self.fs_nav_after_pdf_enumerate.is_some()
             || self.archive_convert_deferred_fullscreen_active()
+            || (sidecar_navigation_owner && self.sidecar_restore_deferred_fullscreen_wait_active())
     }
 
     /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
@@ -11224,7 +11238,8 @@ impl App {
         let Some(idx) = self.fullscreen_idx else {
             // 通常は `apply_folder_nav_result` 内で close_fullscreen → open_fullscreen が
             // 同フレームで連続実行されるので fs_idx は Some に戻る。例外は **PDF/ZIP の
-            // async enumerate 待ち**: PDF メタキャッシュ hit で `try_apply_pdf_meta_cache`
+            // async enumerate待ち、またはsidecar復元後の再open待ち**。PDFメタキャッシュ
+            // hitで `try_apply_pdf_meta_cache`
             // が placeholder grid を install (= items_generation++) するが、
             // `reopen_fullscreen_after_folder_nav_load` は `pdf_enumerate_pending` が
             // 残っているため "enumerate_defer" で抜け、fullscreen_idx は None のまま
@@ -11232,8 +11247,9 @@ impl App {
             // `keep_fullscreen_viewport_alive` (viewport mode) と
             // `render_embedded_fs_nav_holdover` (in-window mode) の defer 描画から
             // 直前ページ画像が消えて真っ黒のフラッシュになる。
-            // `fs_nav_deferred_reopen_wait_active` の間はユーザーがフルスクリーン
-            // 継続を意図しているので、解除を保留して deferred reopen 完了まで待つ。
+            // sidecar側はcurrent context/generation/itemに属するtyped reopen intentだけを
+            // 同じ述語へ投影する。`fs_nav_deferred_reopen_wait_active` の間はユーザーが
+            // フルスクリーン継続を意図しているので、解除を保留してdeferred reopen完了まで待つ。
             if self.fs_nav_deferred_reopen_wait_active() {
                 return;
             }
@@ -20402,7 +20418,8 @@ impl App {
         #[cfg(not(windows))]
         let detached_transition_hold = false;
 
-        // Ctrl+↑↓ の deferred reopen、または active detached の PDF/ZIP 列挙・scan・password
+        // Ctrl+↑↓ の deferred reopen (PDF/ZIP列挙またはsidecar復元)、またはactive detachedの
+        // scan・password
         // 待ちでは fullscreen_idx が None のまま内部遷移の完了を待つ。この間ビューポートを
         // 隠すとその下のグリッドが見えてちらつくので維持しつつ、ナビロックの holdover
         // (= 直前の単ページ / 見開き unit) があればそれを表示して「空の canvas で待たされる」
@@ -52627,6 +52644,158 @@ mod tests {
              normally retire it never runs for a natively presented item, so leaving it open \
              drops every later Ctrl+Up/Down"
         );
+    }
+
+    #[test]
+    fn sidecar_deferred_folder_reopen_keeps_navigation_unit_until_display_binding() {
+        let ctx = egui::Context::default();
+        let old_texture = ctx.load_texture(
+            "sidecar-folder-nav-old",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let new_texture = ctx.load_texture(
+            "sidecar-folder-nav-new",
+            egui::ColorImage::filled([2, 2], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("next-book");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::Image(folder.join("page-001.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.items_generation = 24;
+        app.fullscreen_idx = None;
+        app.fs_nav_locked_gen = Some(23);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: Some(FsDisplayUnitHoldover {
+                pages: vec![navigation_holdover_page(0, old_texture.clone())],
+                singleton_placement:
+                    crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+            }),
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: 23,
+            },
+        }));
+        app.activate_sidecar_restore_modal_for_test(folder);
+        assert!(app.defer_sidecar_restore_fullscreen(
+            0,
+            crate::app::HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+        ));
+
+        assert!(app.fs_nav_deferred_reopen_wait_active());
+        app.poll_fs_nav_lock(&ctx);
+        assert_eq!(app.fs_nav_locked_gen, Some(23));
+        assert_eq!(
+            app.fs_holdover_tex.as_ref().unwrap().primary_texture_id(),
+            old_texture.id()
+        );
+        assert!(app.fs_nav_holdover_for_draw().is_some());
+
+        // The sidecar terminal opens the exact item. From that point the existing Display owner,
+        // rather than the sidecar wait, retains the old unit until the new page is drawable and
+        // its presentation trace retires the sequence.
+        app.sidecar_restore = None;
+        app.fullscreen_idx = Some(0);
+        app.poll_fs_nav_lock(&ctx);
+        assert!(!app.fs_nav_deferred_reopen_wait_active());
+        assert!(matches!(
+            app.fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .map(|sequence| &sequence.target),
+            Some(FsNavigationSequenceTarget::Display(_))
+        ));
+        assert!(app.fs_nav_holdover_for_draw().is_some());
+
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: new_texture.clone(),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: None,
+            layout_dims: None,
+        };
+        app.poll_fs_nav_lock(&ctx);
+        assert!(app.fs_nav_holdover_for_draw().is_none());
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        app.observe_fs_navigation_sequence_presented(&[FsDisplayUnitTracePage {
+            occurrence: SpreadPageOccurrence::navigation(0, 0),
+            texture_id: new_texture.id(),
+            provenance: FsDisplayUnitPageProvenance::Live,
+            source: stringify!(thumbnail),
+        }]);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    #[test]
+    fn sidecar_restore_without_exact_navigation_reopen_does_not_extend_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("grid-only");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.items_generation = 8;
+        app.fullscreen_idx = None;
+        app.fs_nav_locked_gen = Some(7);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: 7,
+            },
+        }));
+        app.activate_sidecar_restore_modal_for_test(folder);
+
+        assert!(!app.fs_nav_deferred_reopen_wait_active());
+        app.poll_fs_nav_lock(&ctx);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    #[test]
+    fn sidecar_deferred_reopen_keeps_legacy_capture_none_owner_for_detached_routes() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("detached-next-book");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.items_generation = 31;
+        app.fullscreen_idx = None;
+        app.fs_nav_locked_gen = Some(30);
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+        app.activate_sidecar_restore_modal_for_test(folder);
+        assert!(app.defer_sidecar_restore_fullscreen(
+            0,
+            crate::app::HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+        ));
+
+        assert!(app.fs_nav_deferred_reopen_wait_active());
+        app.poll_fs_nav_lock(&ctx);
+        assert_eq!(app.fs_nav_locked_gen, Some(30));
+        assert!(matches!(
+            app.fs_holdover_tex,
+            Some(FsHoldover::FolderNavigation(None))
+        ));
+
+        app.items_generation = 32;
+        assert!(!app.fs_nav_deferred_reopen_wait_active());
+        app.poll_fs_nav_lock(&ctx);
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     /// A `Display` target names a unit the page renderer will draw, and the page renderer's trace

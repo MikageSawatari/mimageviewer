@@ -70,6 +70,14 @@ struct DeferredFullscreen {
     load_contract: FsPageLoadContract,
 }
 
+impl DeferredFullscreen {
+    fn matches_item(&self, items: &[GridItem]) -> bool {
+        items
+            .get(self.idx)
+            .is_some_and(|item| item.perf_key() == self.item_key)
+    }
+}
+
 enum ContinuationOwner {
     Live(SidecarLoadContinuation),
     Discarded { cancel: Arc<AtomicBool> },
@@ -423,6 +431,24 @@ impl App {
     pub(crate) fn sidecar_restore_blocks_projected_context(&self) -> bool {
         self.sidecar_restore.as_ref().is_some_and(|state| {
             state.common.target_context == self.sidecar_restore_projected_context()
+        })
+    }
+
+    /// Whether the mounted viewer owns an exact fullscreen reopen that is paused behind its
+    /// sidecar restore continuation.
+    ///
+    /// This is deliberately narrower than `sidecar_restore_active`: an unrelated grid restore or
+    /// sibling viewer must not keep a fullscreen navigation holdover alive. The generation and
+    /// item identity checks also prevent a deferred request from surviving a replacement mount
+    /// that happens to reuse the same numeric index.
+    pub(crate) fn sidecar_restore_deferred_fullscreen_wait_active(&self) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            self.sidecar_restore_context_current(&state.common)
+                && state
+                    .common
+                    .deferred_fullscreen
+                    .as_ref()
+                    .is_some_and(|deferred| deferred.matches_item(&self.items))
         })
     }
 
@@ -2561,6 +2587,49 @@ mod tests {
             FsOpenMaterialization::DeferredPageTurn
         );
         assert_eq!(deferred.load_contract, FsPageLoadContract::LatestSeek);
+    }
+
+    #[test]
+    fn deferred_fullscreen_wait_requires_exact_context_generation_folder_and_item() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("next-book");
+        let page = folder.join("page-001.jpg");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::Image(page.clone())];
+        app.items_generation = 17;
+        app.activate_sidecar_restore_modal_for_test(folder.clone());
+
+        assert!(
+            !app.sidecar_restore_deferred_fullscreen_wait_active(),
+            "an ordinary grid restore has no fullscreen continuation"
+        );
+        assert!(app.defer_sidecar_restore_fullscreen(
+            0,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential,
+        ));
+        assert!(app.sidecar_restore_deferred_fullscreen_wait_active());
+
+        app.items[0] = GridItem::Image(folder.join("replacement.jpg"));
+        assert!(!app.sidecar_restore_deferred_fullscreen_wait_active());
+        app.items[0] = GridItem::Image(page);
+        assert!(app.sidecar_restore_deferred_fullscreen_wait_active());
+
+        app.items_generation += 1;
+        assert!(!app.sidecar_restore_deferred_fullscreen_wait_active());
+        app.items_generation -= 1;
+        app.current_folder = Some(app.tmp.path().join("sibling-book"));
+        assert!(!app.sidecar_restore_deferred_fullscreen_wait_active());
+        app.current_folder = Some(folder);
+        assert!(app.sidecar_restore_deferred_fullscreen_wait_active());
+
+        app.sidecar_restore
+            .as_mut()
+            .unwrap()
+            .common
+            .discard_target();
+        assert!(!app.sidecar_restore_deferred_fullscreen_wait_active());
     }
 
     #[test]

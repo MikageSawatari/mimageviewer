@@ -602,6 +602,14 @@ overlay し、全 DB key scan を UI thread へ戻さない。Running worker が
 7. deferred fullscreen intent を exact materialization/load contract で通常入口へ戻す
 8. favorite の保留失敗 command を通常 owner へ戻し、その frame の入力処理後に modal を解除する
 
+2026-09-13 の §1.233 では、手順 7 がフォルダ移動の close と別 frame になる場合も表示継続 owner を
+失わないよう補正した。sidecar owner の deferred intent が projected context、items generation、
+folder/source、stable item identity に exact 一致し、既存 fullscreen navigation owner が旧世代からの
+移動を所有している間だけ `fs_nav_deferred_reopen_wait_active` へ投影する。terminal の通常 open 後は
+既存 `Display` target と presentation trace が新画像への引継ぎと旧 unit の退役を所有する。通常一覧の
+restore、別 context、discard/cancel/retire/mismatch は待機を延長しない。新しい bool、delay、復元 gate の
+解除、補正前画像の先出しは追加していない。
+
 preview DB clear の enqueue/DELETE/ACK failure は import を開始せず、中央 DB と旧 preview を整合した
 まま cache refresh へ進む。DB row DELETE 成功後の cache file 削除失敗は stale read を生まないため、
 orphan cleanup warning として扱う。
