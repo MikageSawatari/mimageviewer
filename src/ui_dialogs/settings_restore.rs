@@ -594,7 +594,12 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
                     for backup in &app.settings_restore_state.backups {
                         // 世代
                         ui.label(backup.source.label());
-                        ui.label(backup.app_version.as_deref().unwrap_or("不明"));
+                        ui.label(
+                            backup
+                                .content_app_version
+                                .as_deref()
+                                .unwrap_or("不明"),
+                        );
                         let boot_incompatible_current = matches!(
                             app.settings_boot_problem_source,
                             Some(crate::settings_db::BootSource::IncompatibleSettings)

@@ -601,9 +601,9 @@ VACUUM INTO は SQLite が**新規 .db ファイルに consistent な snapshot �
 ### 6.4 設定の復元 UI とダウングレード
 
 「設定の復元」は main / bak1..bak10 に加えて `settings.db.preupgrade-v<old>` も一覧化し、
-各行に保存元版と現バイナリとの版互換性を表示する。通常世代は `schema_meta.app_version`、
-preupgrade は旧実装で metadata が open 時に上書きされていた可能性があるためファイル名の
-`v<old>` を正とする。現バイナリより新しい版の行は復元不可とし、同版・旧版・版不明の候補も、実際の置換前に一時コピーを
+各行に保存元版と現バイナリとの版互換性を表示する。復元可否と「保存した版」は全世代で
+DB 内容の `schema_meta.app_version` を正本とする。preupgrade ファイル名の `v<old>` は
+snapshot を作った経緯を示す世代ラベルであり、内容の版を上書きしない。現バイナリより新しい版の行は復元不可とし、同版・旧版・版不明の候補も、実際の置換前に一時コピーを
 `SettingsDb::open + load_into_settings` して最終検証する。
 
 互換性ガードを備えた版で、それより新しい版が保存した設定を起動した場合は main / WAL /

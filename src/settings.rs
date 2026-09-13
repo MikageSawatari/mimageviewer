@@ -7954,9 +7954,12 @@ impl Settings {
             current_version,
         );
         let prev_version = settings.last_seen_version.clone();
-        let version_changed = prev_version.as_deref() != Some(current_version);
-        if version_changed && db_loaded {
-            let prev_label = prev_version.as_deref().unwrap_or("unknown");
+        let version_marker_changed = prev_version.as_deref() != Some(current_version);
+        let actual_version_change = prev_version
+            .as_deref()
+            .is_some_and(|previous| previous != current_version);
+        if actual_version_change && db_loaded {
+            let prev_label = prev_version.as_deref().expect("checked Some above");
             let pre_path = data_dir.join(format!(
                 "settings.db.preupgrade-v{}",
                 safe_version_label(prev_label)
@@ -7987,6 +7990,10 @@ impl Settings {
                     )),
                 }
             }
+        }
+        if version_marker_changed && db_loaded {
+            // Clean install has no previous version to snapshot. Record the current marker through
+            // the bootstrap save so later launches can distinguish a real version transition.
             settings.last_seen_version = Some(current_version.to_string());
         }
 
@@ -8016,7 +8023,7 @@ impl Settings {
             || grid_click_selection_mode_migrated
             || ai_prefetch_forward_migrated
             || legacy_keymap_import.changed
-            || version_changed;
+            || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
@@ -15878,6 +15885,49 @@ mod tests {
             let _ = env;
         }
 
+        /// A clean install has no previous version, so recording the initial version marker must
+        /// not manufacture an "upgrade from unknown" snapshot. The bootstrap writeback still
+        /// persists the marker for a later, genuine version transition.
+        #[test]
+        fn clean_install_records_version_without_preupgrade_snapshot() {
+            let env = setup_backup_env();
+            let initial_version = "3.10.0-clean-install-test";
+            let loaded = Settings::load_with_meta_for_version(initial_version);
+
+            assert_eq!(
+                loaded.settings.last_seen_version.as_deref(),
+                Some(initial_version)
+            );
+            assert_eq!(
+                loaded.meta.boot_source,
+                crate::settings_db::BootSource::CleanInstall
+            );
+            assert!(
+                std::fs::read_dir(crate::data_dir::get())
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("settings.db.preupgrade-v")),
+                "clean install must not create a false preupgrade snapshot"
+            );
+
+            reset_backup_state_for_test();
+            let reloaded = Settings::load_with_meta_for_version(initial_version);
+            assert_eq!(
+                reloaded.settings.last_seen_version.as_deref(),
+                Some(initial_version)
+            );
+            assert!(
+                !crate::data_dir::get()
+                    .join("settings.db.preupgrade-vunknown")
+                    .exists(),
+                "later launches must not inherit a false unknown provenance"
+            );
+            let _ = env;
+        }
+
         /// 真の初回起動 (= 何もない dir) では SQLite 経路でも save 抑止は立たず、
         /// CleanInstall として settings.db が作られる。
         #[test]
@@ -15977,7 +16027,7 @@ mod tests {
         fn load_writeback_does_not_consume_rotation() {
             let env = setup_backup_env();
             // 初回 boot で clean install → settings.db 作成。load() 内部で
-            // version_changed=true なので save_internal_no_rotation が走る。
+            // initial version marker のため save_internal_no_rotation が走る。
             // ここで rotation が走ってしまっていないか確認する。
             let _ = Settings::load();
             // bak1 はまだ無いはず (= load() 内 writeback が rotation を発火させていない)。

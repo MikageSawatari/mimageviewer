@@ -88,9 +88,9 @@ pub struct BackupSummary {
     pub video_resume: usize,
     pub vst3_plugins: usize,
     /// 当該 DB を最後に書いた mImageViewer のバージョン。
-    /// `schema_meta.app_version` を読むだけなので空も許容する。
-    pub app_version: Option<String>,
-    /// app_version による事前判定。実データの最終検証は restore_from でも必ず行う。
+    /// `schema_meta.app_version` だけを正本とし、ファイル名に含まれる来歴とは混ぜない。
+    pub content_app_version: Option<String>,
+    /// content_app_version による事前判定。実データの最終検証は restore_from でも必ず行う。
     pub compatibility: BackupCompatibility,
     /// open / SELECT で出た非致命のエラー (= スキーマが古い / 表が無い等)。
     /// UI 側で「壊れている可能性」として表示する。
@@ -236,7 +236,7 @@ fn read_summary(source: BackupSource, path: &Path) -> BackupSummary {
         tags: 0,
         video_resume: 0,
         vst3_plugins: 0,
-        app_version: None,
+        content_app_version: None,
         compatibility: BackupCompatibility::Unknown,
         partial_error: None,
     };
@@ -278,20 +278,16 @@ fn read_summary(source: BackupSource, path: &Path) -> BackupSummary {
             .push_str(&format!("vst3_plugins: {e}; "));
         0
     });
-    summary.app_version = conn
+    summary.content_app_version = conn
         .query_row(
             "SELECT value FROM schema_meta WHERE key = 'app_version'",
             [],
             |r| r.get::<_, String>(0),
         )
         .ok();
-    // preupgrade 名の version は snapshot 作成時の last_seen_version から付けたもの。
-    // 旧実装は DB open 時に app_version を現バイナリへ上書きしてから snapshot していたため、
-    // 既存 preupgrade の schema_meta よりファイル名の方が正確。新実装では両者が一致する。
-    if let BackupSource::PreUpgrade(version) = &summary.source {
-        summary.app_version = Some(version.clone());
-    }
-    summary.compatibility = backup_compatibility(summary.app_version.as_deref());
+    // `BackupSource::PreUpgrade(version)` はファイル名由来の来歴表示だけを所有する。
+    // 復元可否は、名前が unknown や別の有効 semver でも DB 内容の保存元版で判定する。
+    summary.compatibility = backup_compatibility(summary.content_app_version.as_deref());
     summary
 }
 
@@ -813,7 +809,7 @@ mod tests {
         assert!(matches!(summaries[0].source, BackupSource::Current));
         assert!(matches!(summaries[1].source, BackupSource::Bak(3)));
         assert_eq!(
-            summaries[1].app_version.as_deref(),
+            summaries[1].content_app_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(
@@ -843,7 +839,11 @@ mod tests {
                 )
             })
             .expect("preupgrade snapshot must be listed");
-        assert_eq!(preupgrade.app_version.as_deref(), Some("2.4.1"));
+        assert_eq!(
+            preupgrade.content_app_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(preupgrade.source.label(), "アップグレード前 (v2.4.1)");
     }
 
     #[test]
@@ -868,9 +868,51 @@ mod tests {
             .iter()
             .find(|summary| summary.source == BackupSource::Bak(1))
             .unwrap();
-        assert_eq!(newer.app_version.as_deref(), Some("999.0.0"));
+        assert_eq!(newer.content_app_version.as_deref(), Some("999.0.0"));
         assert_eq!(newer.compatibility, BackupCompatibility::NewerVersion);
         assert!(!newer.compatibility.can_attempt_restore());
+    }
+
+    #[test]
+    fn preupgrade_provenance_never_overrides_content_compatibility() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            for provenance in ["unknown", "2.4.1"] {
+                let path = dir.join(format!("settings.db.preupgrade-v{provenance}"));
+                db.backup_to(&path).unwrap();
+            }
+        }
+        for provenance in ["unknown", "2.4.1"] {
+            let path = dir.join(format!("settings.db.preupgrade-v{provenance}"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE schema_meta SET value = '999.0.0' WHERE key = 'app_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let summaries = list_backups(dir);
+        for provenance in ["unknown", "2.4.1"] {
+            let summary = summaries
+                .iter()
+                .find(|summary| {
+                    matches!(
+                        &summary.source,
+                        BackupSource::PreUpgrade(value) if value == provenance
+                    )
+                })
+                .unwrap();
+            assert_eq!(summary.content_app_version.as_deref(), Some("999.0.0"));
+            assert_eq!(summary.compatibility, BackupCompatibility::NewerVersion);
+            assert_eq!(
+                summary.source.label(),
+                format!("アップグレード前 (v{provenance})")
+            );
+        }
     }
 
     /// `restore_from(Bak(n))` は `settings.db` を bak の内容で上書きし、
