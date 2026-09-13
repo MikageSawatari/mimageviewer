@@ -50,6 +50,14 @@ Remoteの常設readerを含むsettings-family接続の停止・解放と、復�
 
 最終full gate・確認用build・使い捨てportable実機はこの時点では未完了。実装者がCargoとfixture検証、親が実機操作と記録を担当し、同じ検証を重複実行しない。
 
+### 朝の区切り（実機未実施）
+
+2026-09-14 08:00区切り: §1.234の最終全体gateはmain 8410 pass / 0 fail / 45 ignored、snapshot 50を含め成功。core/Remote双方の確認用buildとportable buildも成功した。詳細ログ・hashは[設定復旧plan](settings-recovery-234-231-plan.md)を参照。独立レビューは重大指摘なし。
+
+使い捨てportableの`sky.launch_app`は`Computer Use app approval timed out`となり、07:59 JSTのprocess確認もresidentなしだった。実機suiteは全件未実施で、通常profile・既存portableへの起動/操作はない。許可時間帯終了のため再試行せず、fixtureと`target/settings-recovery-20260914/live-checks.md`を保存した。native終了経路の実機確認待ちとして§1.234の製品差分はまだ未コミット。実機で検収済みとは扱わない。
+
+§2.25は[独立検収済みの設計](folder-tree-sort-plan.md)まで。既存のprivate Receiver破棄で旧結果を隔離できるため、追加の数値世代は不要とした。§2.24とコレクションを含め、次項の製品実装はまだ開始していない。
+
 ### 次段の調査メモ（§2.25 → §2.24、未実装）
 
 `ui_folder_pane.rs` の同期・再読込・キー操作・ドライブ選択は一覧用の `settings.sort_order` を直接渡している。`folder_pane.rs` のscan workerと、`folder_tree.rs::FolderTreeOptions` を通るフォルダ間移動の双方を、ツリー専用の保存値へ揃える必要がある。お気に入りの表示状態の復元は一覧側だけに留める。ツリーの初期値は利用者要望どおりファイル名順とし、並べ直しの間も展開・現在位置を維持する。

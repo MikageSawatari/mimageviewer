@@ -16,8 +16,9 @@ UIスレッドに列挙・metadata照会・待機を追加しない。ソート�
 
 現実装はsort/hidden変更時にnodesと展開状態を全消去する。展開キーのclearだけを除くと、子が未ロードのまま展開済みになるため、変更受付から結果反映までを同じpane ownerで扱う。
 
-- `FolderPaneListingOptions`（tree sort、hidden）とrefresh generationをpaneの正本とする。drive/reload/expand/key各経路はそのoptionを使う。
-- sort/hidden変更では古いpendingをcancelし、選択rootと既にmaterializeされた展開parentを既存workerで再列挙する。pendingはgenerationとoptionを持ち、古い完了を反映しない。
+- `FolderPaneListingOptions`（tree sort、hidden）をpaneの正本とする。drive/reload/expand/key各経路はそのoptionを使う。
+- sort/hidden変更では全旧pendingをcancelし、private Receiverごとdropしてから新scanを作る。channel identityをrequestの所有境界とし、重複する世代counterは追加しない。
+- 保持するnodesではcancel対象keyの`loading`を解除する。`loaded=true`でも再列挙できるforce-refresh入口から、選択rootと既にmaterializeされた展開parentを新optionsの既存workerへ載せる。
 - 各parentの現在のchildren、3種の展開集合、cursor pathを、新しい結果が来るまで保持する。全treeを一括でstagingする必要はない。
 - 現世代の結果だけをpath identityで差し替える。sort変更だけでcursorをactiveへ戻さない。再列挙失敗時は旧childrenとerrorを保持する。
 - 現世代の成功結果でcursorの消失が確定した場合だけactive/rootへ戻す。これに伴うフォルダopenは発生させない。
@@ -31,4 +32,4 @@ UIスレッドに列挙・metadata照会・待機を追加しない。ソート�
 
 ## 設計レビュー記録
 
-Sol/xhigh独立担当がread-onlyで既存consumerとpaneのcancel/refresh経路を照合。上記方針に重大な矛盾なし。実装・自動テスト・実機確認はまだ未実施。
+Sol/xhigh独立担当がread-onlyで既存consumerとpaneのcancel/refresh経路を照合。上記方針に重大な矛盾なし。追加照合で、既存のscanごとのprivate Receiverをdropすれば旧完了が混入せず、numeric generationは不要と確認した。旧nodesを保持するためのloading解除とforce-refreshは必要。実装・自動テスト・実機確認はまだ未実施。
