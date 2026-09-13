@@ -1,4 +1,7 @@
 use super::*;
+use crate::context_menu_model::{
+    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId,
+};
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
     Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind, TopMenuId,
@@ -4640,7 +4643,93 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
         if let Some(edit) = edit {
             apply_menu_layout_edit(&mut state.settings.menu_layout, edit);
         }
+
+        draw_context_menu_layout_settings(ui, &mut state.settings.context_menu_layout);
     });
+}
+
+pub(super) fn draw_context_menu_layout_settings(
+    ui: &mut egui::Ui,
+    layout: &mut ContextMenuLayoutSettings,
+) {
+    ui.add_space(16.0);
+    ui.separator();
+    ui.label(egui::RichText::new("右クリックメニュー").strong());
+    ui.small(
+        "一覧とフルスクリーンで共用する mImageViewer 項目の表示と順序です。\
+         その場面で利用できない項目は従来どおり省きます。",
+    );
+    ui.add_space(6.0);
+
+    let snapshot = layout.clone();
+    let mut edit = None;
+    ui.horizontal(|ui| {
+        if ui.button("右クリック項目を既定に戻す").clicked() {
+            edit = Some(ContextMenuLayoutEdit::Reset);
+        }
+        if ui.button("右クリック項目をすべて表示").clicked() {
+            edit = Some(ContextMenuLayoutEdit::ShowAll);
+        }
+    });
+
+    for &parent in ContextMenuParentId::ALL {
+        let order = snapshot.resolved_order(parent);
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(parent.label())
+            .id_salt(("context_menu_layout_parent", parent))
+            .default_open(parent == ContextMenuParentId::Root)
+            .show(ui, |ui| {
+                egui::Grid::new(("context_menu_layout_items", parent))
+                    .num_columns(3)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (index, &item) in order.iter().enumerate() {
+                            let mut visible = snapshot.is_visible(item);
+                            if ui.checkbox(&mut visible, item.label()).changed() {
+                                edit = Some(ContextMenuLayoutEdit::SetVisible(item, visible));
+                            }
+                            let up_enabled = index > 0;
+                            let up = ui
+                                .add_enabled(index > 0, egui::Button::new("↑").small())
+                                .on_hover_text("上へ");
+                            up.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    up_enabled,
+                                    format!("{}を上へ", item.label()),
+                                )
+                            });
+                            if up.clicked() {
+                                edit = Some(ContextMenuLayoutEdit::Move(parent, index, -1));
+                            }
+                            let down_enabled = index + 1 < order.len();
+                            let down = ui
+                                .add_enabled(down_enabled, egui::Button::new("↓").small())
+                                .on_hover_text("下へ");
+                            down.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    down_enabled,
+                                    format!("{}を下へ", item.label()),
+                                )
+                            });
+                            if down.clicked() {
+                                edit = Some(ContextMenuLayoutEdit::Move(parent, index, 1));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    ui.small(
+        "外部ツール、関連付けアプリ、そのサブメニューと Windows のメニューは固定枠です。\
+         表示位置と内部の並び順は変更しません。",
+    );
+
+    if let Some(edit) = edit {
+        apply_context_menu_layout_edit(layout, edit);
+    }
 }
 
 enum MenuLayoutEdit {
@@ -9049,6 +9138,121 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
     ui.checkbox(enabled, "末尾に表紙を添える");
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+enum ContextMenuLayoutEdit {
+    Reset,
+    ShowAll,
+    Move(ContextMenuParentId, usize, i32),
+    SetVisible(ContextMenuItemId, bool),
+}
+
+fn apply_context_menu_layout_edit(
+    layout: &mut ContextMenuLayoutSettings,
+    edit: ContextMenuLayoutEdit,
+) {
+    match edit {
+        ContextMenuLayoutEdit::Reset => *layout = ContextMenuLayoutSettings::default(),
+        ContextMenuLayoutEdit::ShowAll => layout.show_all(),
+        ContextMenuLayoutEdit::Move(parent, index, delta) => {
+            let mut order = layout.resolved_order(parent);
+            if move_index(&mut order, index, delta) {
+                layout.set_order(parent, &order);
+            }
+        }
+        ContextMenuLayoutEdit::SetVisible(item, visible) => layout.set_visible(item, visible),
+    }
+}
+
+#[cfg(test)]
+mod context_menu_layout_settings_tests {
+    use super::*;
+
+    #[test]
+    fn edits_each_hierarchy_without_flattening_and_reset_restores_defaults() {
+        let mut layout = ContextMenuLayoutSettings::default();
+        let open_with_before = layout.resolved_order(ContextMenuParentId::OpenWith);
+
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::Move(ContextMenuParentId::Root, 1, -1),
+        );
+        assert_eq!(
+            &layout.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
+        );
+        assert_eq!(
+            layout.resolved_order(ContextMenuParentId::OpenWith),
+            open_with_before,
+            "root ordering must not flatten or reorder submenu children"
+        );
+
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::SetVisible(ContextMenuItemId::CopyPath, false),
+        );
+        assert!(!layout.is_visible(ContextMenuItemId::CopyPath));
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::ShowAll);
+        assert!(layout.is_visible(ContextMenuItemId::CopyPath));
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
+        assert_eq!(layout, ContextMenuLayoutSettings::default());
+    }
+
+    #[test]
+    fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let state = (ContextMenuLayoutSettings::default(), false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 420.0))
+            .build_state(
+                |ctx, (layout, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            draw_context_menu_layout_settings(ui, layout);
+                        });
+                    });
+                },
+                state,
+            );
+
+        harness.get_by_label("切り取りを下へ").click();
+        harness.run();
+        assert_eq!(
+            &harness.state().0.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
+        );
+
+        harness.get_by_label("コピー").click();
+        harness.run();
+        assert!(!harness.state().0.is_visible(ContextMenuItemId::CopyFiles));
+        harness.get_by_label("右クリック項目をすべて表示").click();
+        harness.run();
+        assert!(harness.state().0.is_visible(ContextMenuItemId::CopyFiles));
+
+        harness.get_by_label("コピー").click();
+        harness.run();
+        harness.get_by_label("右クリック項目を既定に戻す").click();
+        harness.run();
+        assert_eq!(harness.state().0, ContextMenuLayoutSettings::default());
+
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .click();
+        harness.run();
+        assert!(harness.query_by_label("外部ツールの設定…").is_some());
+    }
 }
 
 pub(super) fn draw_singleton_spread_placement_setting(ui: &mut egui::Ui, enabled: &mut bool) {

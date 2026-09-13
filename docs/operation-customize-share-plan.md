@@ -19,9 +19,9 @@
 
 ### 現状 (調査結果)
 
-- 操作カスタマイズは独立ファイルではなく `settings.db` の中の 3 フィールドに保存される
-  (`Settings.keymap: KeymapSettings` / `Settings.ring_shortcuts: RingShortcutSettings` /
-  `Settings.menu_layout: MenuLayoutSettings`)。3 つとも `serde` + `PartialEq/Eq` 対応。
+- 操作カスタマイズは独立ファイルではなく `settings.db` の `keymap` / `ring_shortcuts` /
+  `menu_layout` / `context_menu_layout` / `gamepad_enabled` に保存される。構造設定は
+  `serde` + `PartialEq/Eq` 対応。
 - 操作カスタマイズダイアログの「保存」は `apply_operation_customize_state()`
   (`src/ui_dialogs/preferences.rs`) → `settings.save()` で、他設定と同じ経路。
 - `settings.db` には世代バックアップ `settings.db.bak1..bak10` があり、
@@ -45,15 +45,17 @@
 
 ## 1. スコープ (共有・差分・取り込みの単位)
 
-操作カスタマイズダイアログが編集する 3 点セットを 1 単位として扱う:
+操作カスタマイズダイアログが編集する次の設定を 1 単位として扱う:
 
 | フィールド | 型 | 内容 |
 | --- | --- | --- |
 | `keymap` | `KeymapSettings` | キー割り当ての上書き (`overrides: Vec<KeyBindingOverride>`) |
 | `ring_shortcuts` | `RingShortcutSettings` | 右ドラッグ mode / リング / マウスジェスチャ / マウス戻る進む / ゲームパッド X リング |
 | `menu_layout` | `MenuLayoutSettings` | top menu 順序 / メニュー内コマンド順序 / 非表示コマンド |
+| `context_menu_layout` | `ContextMenuLayoutSettings` | Grid / Fullscreen 共通の右クリック静的項目の階層別順序 / 非表示項目 |
+| `gamepad_enabled` | `bool` | ゲームパッド入力の有効 / 無効 |
 
-- エクスポート / インポート / 差分は常にこの 3 点まとめが対象。「キーだけ」の部分入出力は
+- エクスポート / インポート / 差分は常にこの一式が対象。「キーだけ」の部分入出力は
   初版では作らない。
 - 初版で差分表示の主役はキー割り当て。リング / メニューは要約セクション扱い (§4)。
 
@@ -71,7 +73,9 @@
   "label": "○○ブラウザ風",          // 任意。取り込み画面のタイトルに出す
   "keymap": { ... },               // KeymapSettings をそのまま serialize
   "ring_shortcuts": { ... },
-  "menu_layout": { ... }
+  "menu_layout": { ... },
+  "context_menu_layout": { ... },
+  "gamepad_enabled": true
 }
 ```
 
@@ -87,7 +91,7 @@
 **取り込み元は「ファイル」でも「settings.db の世代」でも良い**。どちらも
 `OperationCustomizeBundle` (§5) に正規化してから同じ経路に流す。
 
-- **置換方式 (replace)**: 取り込んだ 3 点セットで現在の操作カスタマイズを丸ごと差し替える。
+- **置換方式 (replace)**: 取り込んだ一式で現在の操作カスタマイズを丸ごと差し替える。
   マージはしない。`overrides` は「標準からの差分」なので、置換 = 「このファイル/世代の
   overrides を採用し、それ以外は標準に戻す」という予測しやすい結果になる。
 - **適用前に差分プレビュー**: 「取り込み元 vs 現在の設定」を §4 の差分ビューで見せてから確定。
@@ -147,7 +151,8 @@
 ### 新規: 純ロジック (`src/operation_customize_share.rs` 想定)
 
 - `OperationCustomizeBundle { keymap: KeymapSettings, ring_shortcuts: RingShortcutSettings,
-  menu_layout: MenuLayoutSettings }` + ヘッダ meta。`serde`。
+  menu_layout: MenuLayoutSettings, context_menu_layout: ContextMenuLayoutSettings,
+  gamepad_enabled: bool }` + ヘッダ meta。`serde`。
   - `Bundle::from_settings(&Settings) -> Bundle`
   - `Bundle::apply_to(&self, &mut Settings)` (置換)
   - `Bundle::defaults() -> Bundle`
@@ -160,7 +165,7 @@
 
 - `load_operation_customize(data_dir, source: &BackupSource) -> Result<Bundle, RestoreError>`
   を追加。既存 `validate_in_dir` と同じ「bak を temp コピー → `SettingsDb::open` →
-  `load_into_settings` → 3 フィールド抽出」パターンを流用 (world 状態を汚さず read-only)。
+  `load_into_settings` → 操作カスタマイズのフィールド抽出」パターンを流用 (world 状態を汚さず read-only)。
 - `Current` は稼働中の `Settings` から直接 `Bundle::from_settings` で取れる (App 側で対応)。
 
 ### 変更: `src/ui_dialogs/settings_restore.rs`
@@ -249,7 +254,7 @@
   warnings に載り、既知分だけ適用される。
 - **置換セマンティクス**: 取り込み後の `Settings.keymap` が「元の overrides を捨てて
   取り込み元の overrides に置き換わる」こと。他フィールド (お気に入り等) が無傷なこと。
-- **世代抽出**: `load_operation_customize(Bak(n))` が bak から 3 フィールドを取り出せる。
+- **世代抽出**: `load_operation_customize(Bak(n))` が bak から操作カスタマイズ一式を取り出せる。
   壊れた bak は `RestoreError` で失敗し、稼働中の状態を汚さない。
 - **自動退避**: 取り込み前に `before-import-*` が作られる。再取り込みで元に戻せる。
 - **リング/メニュー要約**: 変更あり/なしと件数が正しい。

@@ -373,7 +373,9 @@ fn render_egui_menu_nodes(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Option<MenuC
                     break;
                 }
             }
-            MenuNode::Submenu { label, children } => {
+            MenuNode::Submenu {
+                label, children, ..
+            } => {
                 egui::CollapsingHeader::new(label).show(ui, |ui| {
                     if selected.is_none() {
                         selected = render_egui_menu_nodes(ui, children);
@@ -1287,6 +1289,7 @@ impl crate::app::App {
                     deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
                 }
             },
+            layout: self.settings.context_menu_layout.clone(),
         };
         crate::context_menu_model::build_context_menu(&input)
     }
@@ -2617,7 +2620,9 @@ mod delete_confirm_tests {
             for node in nodes {
                 match node {
                     MenuNode::Item { label, .. } => labels.push(label.clone()),
-                    MenuNode::Submenu { label, children } => {
+                    MenuNode::Submenu {
+                        label, children, ..
+                    } => {
                         labels.push(label.clone());
                         visit(children, labels);
                     }
@@ -3140,6 +3145,51 @@ mod delete_confirm_tests {
         assert!(fullscreen_image.contains(&MenuCommand::RotateRight));
         assert!(!fullscreen_image.contains(&MenuCommand::SetCurrentVideoFrameThumbnail));
         assert!(fullscreen_image.contains(&MenuCommand::OpenFolderInExplorer));
+    }
+
+    #[test]
+    fn grid_and_fullscreen_consume_the_same_resolved_static_layout() {
+        use crate::context_menu_model::{ContextMenuItemId, ContextMenuParentId};
+
+        let mut app = crate::app::setup_app_for_test();
+        let mut order = app
+            .settings
+            .context_menu_layout
+            .resolved_order(ContextMenuParentId::Root);
+        let rotate_right = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateRight)
+            .map(|index| order.remove(index))
+            .unwrap();
+        let rotate_left = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateLeft)
+            .unwrap();
+        order.insert(rotate_left, rotate_right);
+        app.settings
+            .context_menu_layout
+            .set_order(ContextMenuParentId::Root, &order);
+        app.settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
+
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            let commands = menu_commands(
+                &mut app,
+                GridItem::Image(PathBuf::from("image.png")),
+                surface,
+            );
+            assert!(!commands.contains(&MenuCommand::CopyPath));
+            let right = commands
+                .iter()
+                .position(|command| *command == MenuCommand::RotateRight)
+                .unwrap();
+            let left = commands
+                .iter()
+                .position(|command| *command == MenuCommand::RotateLeft)
+                .unwrap();
+            assert!(right < left, "surface={surface:?}, commands={commands:?}");
+        }
     }
 
     #[test]

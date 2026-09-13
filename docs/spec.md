@@ -2000,6 +2000,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,smart_folders,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |
+| `context_menu_layout` | ContextMenuLayoutSettings | 空 (=既定順) | Grid / Fullscreen 共通の mIV 右クリック静的 leaf を stable ID で表示・同一階層内並べ替えする。利用不能項目は復活させず、未知 / 重複 / 親違い ID は無視し、欠落した新項目は canonical 位置へ補完する。外部ツール群、Open With submenu、関連付けアプリ群、Windows Shell 群は表示と位置を変えない固定枠。欠落時や空設定は従来の内容・section・順序を保つ |
 | `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。設定メニュー「操作カスタマイズ…」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | 通常ウィンドウの位置・サイズ（自動保存）。最大化中は更新しないので、最大化を解いたときに戻る矩形として残る |

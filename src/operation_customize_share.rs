@@ -1,4 +1,4 @@
-//! 操作カスタマイズ 3 点セットの共有形式と差分計算。
+//! 操作カスタマイズ設定の共有形式と差分計算。
 //!
 //! ファイル I/O や App 状態に依存せず、JSON 文字列と `Settings` の間の変換、
 //! 取り込み値の正規化、実効キー割り当ての差分だけを扱う。
@@ -8,6 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_menu_model::{
+    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuOrderSettings, ContextMenuParentId,
+};
 use crate::keymap::{
     KeyAction, Keymap, KeymapSettings, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings,
     TopMenuId, menu_command_can_be_hidden, menu_command_spec,
@@ -34,6 +37,8 @@ pub struct OperationCustomizeBundle {
     pub ring_shortcuts: RingShortcutSettings,
     #[serde(default)]
     pub menu_layout: MenuLayoutSettings,
+    #[serde(default)]
+    pub context_menu_layout: ContextMenuLayoutSettings,
     /// ゲームパッドからの操作を受け付けるか。
     ///
     /// **既定を `true` にする関数を明示する。**`#[serde(default)]` だと bool の
@@ -58,6 +63,7 @@ impl OperationCustomizeBundle {
             keymap: settings.keymap.clone(),
             ring_shortcuts: settings.ring_shortcuts.clone(),
             menu_layout: settings.menu_layout.clone(),
+            context_menu_layout: settings.context_menu_layout.clone(),
             gamepad_enabled: settings.gamepad_enabled,
         }
     }
@@ -72,6 +78,7 @@ impl OperationCustomizeBundle {
             keymap: KeymapSettings::default(),
             ring_shortcuts: RingShortcutSettings::default(),
             menu_layout: MenuLayoutSettings::default(),
+            context_menu_layout: ContextMenuLayoutSettings::default(),
             gamepad_enabled: default_gamepad_enabled(),
         }
     }
@@ -86,6 +93,7 @@ impl OperationCustomizeBundle {
         settings.keymap = self.keymap.clone();
         settings.ring_shortcuts = self.ring_shortcuts.clone();
         settings.menu_layout = self.menu_layout.clone();
+        settings.context_menu_layout = self.context_menu_layout.clone();
         settings.gamepad_enabled = self.gamepad_enabled;
     }
 }
@@ -192,6 +200,12 @@ pub fn parse_json(json: &str) -> Result<ParsedImport, ImportError> {
     bundle.menu_layout = menu_layout;
     warnings.extend(menu_warnings);
     ignored_items += ignored_menu_items;
+
+    let (context_menu_layout, context_menu_warnings, ignored_context_menu_items) =
+        sanitize_context_menu_layout(&bundle.context_menu_layout);
+    bundle.context_menu_layout = context_menu_layout;
+    warnings.extend(context_menu_warnings);
+    ignored_items += ignored_context_menu_items;
 
     Ok(ParsedImport {
         bundle,
@@ -308,6 +322,98 @@ fn sanitize_menu_layout(input: &MenuLayoutSettings) -> (MenuLayoutSettings, Vec<
     )
 }
 
+fn sanitize_context_menu_layout(
+    input: &ContextMenuLayoutSettings,
+) -> (ContextMenuLayoutSettings, Vec<String>, usize) {
+    let mut warnings = Vec::new();
+    let mut ignored = 0;
+    let mut seen_parents = HashSet::new();
+    let mut order = Vec::new();
+    for group in &input.order {
+        let Some(parent) = ContextMenuParentId::parse_stable_name(&group.parent) else {
+            ignored += 1;
+            warnings.push(format!(
+                "未知の右クリックメニュー階層 '{}' を無視しました。",
+                group.parent
+            ));
+            continue;
+        };
+        if !seen_parents.insert(parent) {
+            ignored += 1;
+            warnings.push(format!(
+                "重複した右クリックメニュー順序 '{}' を無視しました。",
+                group.parent
+            ));
+            continue;
+        }
+        let mut seen_items = HashSet::new();
+        let items = group
+            .items
+            .iter()
+            .filter_map(|name| {
+                let Some(item) = ContextMenuItemId::parse_stable_name(name) else {
+                    ignored += 1;
+                    warnings.push(format!(
+                        "未知の右クリックメニュー項目 '{name}' を無視しました。"
+                    ));
+                    return None;
+                };
+                if item.parent() != parent {
+                    ignored += 1;
+                    warnings.push(format!(
+                        "別の階層に属する右クリックメニュー項目 '{name}' を無視しました。"
+                    ));
+                    return None;
+                }
+                if !seen_items.insert(item) {
+                    ignored += 1;
+                    warnings.push(format!(
+                        "重複した右クリックメニュー項目 '{name}' を無視しました。"
+                    ));
+                    return None;
+                }
+                Some(item.stable_name().to_string())
+            })
+            .collect();
+        order.push(ContextMenuOrderSettings {
+            parent: parent.stable_name().to_string(),
+            items,
+        });
+    }
+
+    let mut seen_hidden = HashSet::new();
+    let hidden_items = input
+        .hidden_items
+        .iter()
+        .filter_map(|name| {
+            let Some(item) = ContextMenuItemId::parse_stable_name(name) else {
+                ignored += 1;
+                warnings.push(format!(
+                    "未知の非表示右クリックメニュー項目 '{name}' を無視しました。"
+                ));
+                return None;
+            };
+            if !seen_hidden.insert(item) {
+                ignored += 1;
+                warnings.push(format!(
+                    "重複した非表示右クリックメニュー項目 '{name}' を無視しました。"
+                ));
+                return None;
+            }
+            Some(item.stable_name().to_string())
+        })
+        .collect();
+
+    (
+        ContextMenuLayoutSettings {
+            order,
+            hidden_items,
+        },
+        warnings,
+        ignored,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyDiffKind {
     Added,
@@ -370,7 +476,8 @@ pub fn diff(a: &OperationCustomizeBundle, b: &OperationCustomizeBundle) -> Opera
     OperationDiff {
         key_changes,
         ring_change_count: structured_change_count(&a.ring_shortcuts, &b.ring_shortcuts),
-        menu_change_count: structured_change_count(&a.menu_layout, &b.menu_layout),
+        menu_change_count: structured_change_count(&a.menu_layout, &b.menu_layout)
+            + structured_change_count(&a.context_menu_layout, &b.context_menu_layout),
     }
 }
 
@@ -485,11 +592,23 @@ mod tests {
             bundle.gamepad_enabled,
             "項目を持たない bundle は「有効のまま」と読む"
         );
+        assert_eq!(
+            bundle.context_menu_layout,
+            ContextMenuLayoutSettings::default(),
+            "旧 bundle に無い右クリック設定は置換契約どおり標準値として読む"
+        );
 
         let mut settings = Settings::default();
         settings.gamepad_enabled = true;
+        settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
         bundle.apply_to(&mut settings);
         assert!(settings.gamepad_enabled, "取り込みで無効へ倒れない");
+        assert_eq!(
+            settings.context_menu_layout,
+            ContextMenuLayoutSettings::default()
+        );
     }
 
     /// 有効/無効は共有 bundle を往復しても保たれる。
@@ -517,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_json_roundtrip_preserves_three_field_set_and_ignores_future_fields() {
+    fn bundle_json_roundtrip_preserves_all_customization_groups_and_ignores_future_fields() {
         let mut settings = Settings::default();
         settings.keymap.legacy_ini_migration_done = true;
         settings.keymap.overrides = vec![
@@ -529,6 +648,16 @@ mod tests {
                 .stable_name()
                 .to_string(),
         ];
+        settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
+        let mut context_order = settings
+            .context_menu_layout
+            .resolved_order(ContextMenuParentId::Root);
+        context_order.swap(0, 1);
+        settings
+            .context_menu_layout
+            .set_order(ContextMenuParentId::Root, &context_order);
         settings.ring_shortcuts.grid.slots[0] = RingActionId::CloseMainWindow;
         settings.ring_shortcuts.grid.slots[1] = RingActionId::GridScrollBottom;
         settings.ring_shortcuts.mouse_buttons_grid.middle = RingActionId::QuitApplication;
@@ -598,6 +727,64 @@ mod tests {
     }
 
     #[test]
+    fn import_sanitizes_unknown_duplicate_and_wrong_parent_context_menu_ids() {
+        let mut bundle = OperationCustomizeBundle::defaults();
+        bundle.context_menu_layout = ContextMenuLayoutSettings {
+            order: vec![
+                ContextMenuOrderSettings {
+                    parent: "Root".to_string(),
+                    items: vec![
+                        "CopyFiles".to_string(),
+                        "FutureItem".to_string(),
+                        "CopyFiles".to_string(),
+                        "OpenWithAssociations".to_string(),
+                        "OpenExternalToolSettings".to_string(),
+                    ],
+                },
+                ContextMenuOrderSettings {
+                    parent: "Root".to_string(),
+                    items: vec!["CutFiles".to_string()],
+                },
+                ContextMenuOrderSettings {
+                    parent: "FutureParent".to_string(),
+                    items: Vec::new(),
+                },
+            ],
+            hidden_items: vec![
+                "CopyPath".to_string(),
+                "CopyPath".to_string(),
+                "FutureHidden".to_string(),
+            ],
+        };
+
+        let parsed = parse_json(&to_json(&bundle).unwrap()).unwrap();
+        assert_eq!(
+            parsed.bundle.context_menu_layout,
+            ContextMenuLayoutSettings {
+                order: vec![ContextMenuOrderSettings {
+                    parent: "Root".to_string(),
+                    items: vec!["CopyFiles".to_string()],
+                }],
+                hidden_items: vec!["CopyPath".to_string()],
+            }
+        );
+        assert_eq!(parsed.ignored_items, 8);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("FutureItem"))
+        );
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("OpenWithAssociations")),
+            "fixed dynamic slots are not importable as configurable item ids"
+        );
+    }
+
+    #[test]
     fn effective_chord_diff_classifies_added_removed_changed_and_order_changes() {
         let defaults = OperationCustomizeBundle::defaults();
         let mut current = defaults.clone();
@@ -639,8 +826,12 @@ mod tests {
         settings.keymap.overrides = vec![binding("GridPin", &["Q"])];
         let mut imported = OperationCustomizeBundle::defaults();
         imported.keymap.overrides = vec![binding("FsSlideshow", &["W"])];
+        imported
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::Rename, false);
         imported.apply_to(&mut settings);
         assert_eq!(settings.keymap.overrides, imported.keymap.overrides);
+        assert_eq!(settings.context_menu_layout, imported.context_menu_layout);
         assert_eq!(settings.favorites.len(), 1);
     }
 
@@ -655,11 +846,18 @@ mod tests {
                 .stable_name()
                 .to_string(),
         ];
+        settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
 
         OperationCustomizeBundle::defaults().apply_to(&mut settings);
 
         assert_eq!(settings.keymap, KeymapSettings::default());
         assert_eq!(settings.ring_shortcuts, RingShortcutSettings::default());
         assert_eq!(settings.menu_layout, MenuLayoutSettings::default());
+        assert_eq!(
+            settings.context_menu_layout,
+            ContextMenuLayoutSettings::default()
+        );
     }
 }

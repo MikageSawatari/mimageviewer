@@ -6,6 +6,319 @@
 
 use crate::external_tool::ExternalToolId;
 use crate::grid_item::{GridItem, checked_virtual_selection_message};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContextMenuParentId {
+    Root,
+    OpenWith,
+}
+
+impl ContextMenuParentId {
+    pub const ALL: &'static [Self] = &[Self::Root, Self::OpenWith];
+
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::Root => "Root",
+            Self::OpenWith => "OpenWith",
+        }
+    }
+
+    pub fn parse_stable_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|parent| parent.stable_name() == name)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Root => "最上位の項目",
+            Self::OpenWith => "「アプリケーションで開く…」内の項目",
+        }
+    }
+}
+
+/// 右クリックメニューで利用者が表示・順序を設定できる静的項目の永続 ID。
+///
+/// 表示名や実行時 payload には依存しない。外部ツール、関連付けアプリ、
+/// Open With サブメニュー、Windows Shell は固定枠であり、この catalog へ含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContextMenuItemId {
+    CutFiles,
+    CopyFiles,
+    NewFolder,
+    Paste,
+    Rename,
+    CopyRepresentativePath,
+    CopyPath,
+    CopyFileName,
+    CopyPageName,
+    CopyImageToClipboard,
+    CopyEditBundle,
+    PasteEditBundle,
+    BulkPasteEditBundle,
+    ResetPageEdits,
+    OpenContainerAsPage,
+    OpenContainerAsList,
+    JumpToFolder,
+    JumpToBookFolder,
+    RotateLeft,
+    RotateRight,
+    SetCurrentVideoFrameThumbnail,
+    ToggleRepresentativeThumb,
+    OpenFolderInExplorer,
+    OpenExternalToolSettings,
+    MoveToRecycleBin,
+    RemoveReadingHistory,
+    Deselect,
+}
+
+impl ContextMenuItemId {
+    pub const ALL: &'static [Self] = &[
+        Self::CutFiles,
+        Self::CopyFiles,
+        Self::NewFolder,
+        Self::Paste,
+        Self::Rename,
+        Self::CopyRepresentativePath,
+        Self::CopyPath,
+        Self::CopyFileName,
+        Self::CopyPageName,
+        Self::CopyImageToClipboard,
+        Self::CopyEditBundle,
+        Self::PasteEditBundle,
+        Self::BulkPasteEditBundle,
+        Self::ResetPageEdits,
+        Self::OpenContainerAsPage,
+        Self::OpenContainerAsList,
+        Self::JumpToFolder,
+        Self::JumpToBookFolder,
+        Self::RotateLeft,
+        Self::RotateRight,
+        Self::SetCurrentVideoFrameThumbnail,
+        Self::ToggleRepresentativeThumb,
+        Self::OpenFolderInExplorer,
+        Self::OpenExternalToolSettings,
+        Self::MoveToRecycleBin,
+        Self::RemoveReadingHistory,
+        Self::Deselect,
+    ];
+
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::CutFiles => "CutFiles",
+            Self::CopyFiles => "CopyFiles",
+            Self::NewFolder => "NewFolder",
+            Self::Paste => "Paste",
+            Self::Rename => "Rename",
+            Self::CopyRepresentativePath => "CopyRepresentativePath",
+            Self::CopyPath => "CopyPath",
+            Self::CopyFileName => "CopyFileName",
+            Self::CopyPageName => "CopyPageName",
+            Self::CopyImageToClipboard => "CopyImageToClipboard",
+            Self::CopyEditBundle => "CopyEditBundle",
+            Self::PasteEditBundle => "PasteEditBundle",
+            Self::BulkPasteEditBundle => "BulkPasteEditBundle",
+            Self::ResetPageEdits => "ResetPageEdits",
+            Self::OpenContainerAsPage => "OpenContainerAsPage",
+            Self::OpenContainerAsList => "OpenContainerAsList",
+            Self::JumpToFolder => "JumpToFolder",
+            Self::JumpToBookFolder => "JumpToBookFolder",
+            Self::RotateLeft => "RotateLeft",
+            Self::RotateRight => "RotateRight",
+            Self::SetCurrentVideoFrameThumbnail => "SetCurrentVideoFrameThumbnail",
+            Self::ToggleRepresentativeThumb => "ToggleRepresentativeThumb",
+            Self::OpenFolderInExplorer => "OpenFolderInExplorer",
+            Self::OpenExternalToolSettings => "OpenExternalToolSettings",
+            Self::MoveToRecycleBin => "MoveToRecycleBin",
+            Self::RemoveReadingHistory => "RemoveReadingHistory",
+            Self::Deselect => "Deselect",
+        }
+    }
+
+    pub fn parse_stable_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|item| item.stable_name() == name)
+    }
+
+    pub const fn parent(self) -> ContextMenuParentId {
+        match self {
+            Self::OpenExternalToolSettings => ContextMenuParentId::OpenWith,
+            _ => ContextMenuParentId::Root,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CutFiles => "切り取り",
+            Self::CopyFiles => "コピー",
+            Self::NewFolder => "新しいフォルダ…",
+            Self::Paste => "貼り付け",
+            Self::Rename => "名前の変更…",
+            Self::CopyRepresentativePath => "代表画像のパスをコピー",
+            Self::CopyPath => "パスをコピー",
+            Self::CopyFileName => "ファイル名をコピー",
+            Self::CopyPageName => "ページ名をコピー",
+            Self::CopyImageToClipboard => "画像をクリップボードにコピー",
+            Self::CopyEditBundle => "編集内容をコピー",
+            Self::PasteEditBundle => "編集内容を貼り付け",
+            Self::BulkPasteEditBundle => "編集内容をまとめて貼り付け",
+            Self::ResetPageEdits => "編集内容をリセット…",
+            Self::OpenContainerAsPage => "ページを開く",
+            Self::OpenContainerAsList => "一覧を開く",
+            Self::JumpToFolder => "フォルダに移動",
+            Self::JumpToBookFolder => "この本のフォルダに移動",
+            Self::RotateLeft => "左に回転",
+            Self::RotateRight => "右に回転",
+            Self::SetCurrentVideoFrameThumbnail => "現在のフレームを動画サムネに設定",
+            Self::ToggleRepresentativeThumb => "代表サムネに固定 / 解除",
+            Self::OpenFolderInExplorer => "このフォルダをエクスプローラで開く",
+            Self::OpenExternalToolSettings => "外部ツールの設定…",
+            Self::MoveToRecycleBin => "ゴミ箱へ移動 (タグ・評価も整理)",
+            Self::RemoveReadingHistory => "履歴から削除",
+            Self::Deselect => "選択解除",
+        }
+    }
+
+    fn from_command(command: &MenuCommand) -> Option<Self> {
+        Some(match command {
+            MenuCommand::NewFolder => Self::NewFolder,
+            MenuCommand::Paste => Self::Paste,
+            MenuCommand::Rename => Self::Rename,
+            MenuCommand::CutFiles => Self::CutFiles,
+            MenuCommand::CopyFiles => Self::CopyFiles,
+            MenuCommand::CopyPath => Self::CopyPath,
+            MenuCommand::CopyFileName => Self::CopyFileName,
+            MenuCommand::CopyPageName => Self::CopyPageName,
+            MenuCommand::CopyRepresentativePath => Self::CopyRepresentativePath,
+            MenuCommand::CopyImageToClipboard => Self::CopyImageToClipboard,
+            MenuCommand::CopyEditBundle => Self::CopyEditBundle,
+            MenuCommand::PasteEditBundle => Self::PasteEditBundle,
+            MenuCommand::BulkPasteEditBundle => Self::BulkPasteEditBundle,
+            MenuCommand::ResetPageEdits => Self::ResetPageEdits,
+            MenuCommand::JumpToFolder => Self::JumpToFolder,
+            MenuCommand::JumpToBookFolder => Self::JumpToBookFolder,
+            MenuCommand::OpenContainerAsPage => Self::OpenContainerAsPage,
+            MenuCommand::OpenContainerAsList => Self::OpenContainerAsList,
+            MenuCommand::RotateLeft => Self::RotateLeft,
+            MenuCommand::RotateRight => Self::RotateRight,
+            MenuCommand::ToggleRepresentativeThumb => Self::ToggleRepresentativeThumb,
+            MenuCommand::SetCurrentVideoFrameThumbnail => Self::SetCurrentVideoFrameThumbnail,
+            MenuCommand::OpenFolderInExplorer => Self::OpenFolderInExplorer,
+            MenuCommand::OpenExternalToolSettings => Self::OpenExternalToolSettings,
+            MenuCommand::MoveToRecycleBin => Self::MoveToRecycleBin,
+            MenuCommand::Deselect => Self::Deselect,
+            MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
+            MenuCommand::ExternalTool(_) | MenuCommand::OpenWithAssociation { .. } => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMenuOrderSettings {
+    pub parent: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMenuLayoutSettings {
+    #[serde(default)]
+    pub order: Vec<ContextMenuOrderSettings>,
+    #[serde(default)]
+    pub hidden_items: Vec<String>,
+}
+
+impl ContextMenuLayoutSettings {
+    pub fn canonical_order(parent: ContextMenuParentId) -> Vec<ContextMenuItemId> {
+        ContextMenuItemId::ALL
+            .iter()
+            .copied()
+            .filter(|item| item.parent() == parent)
+            .collect()
+    }
+
+    pub fn resolved_order(&self, parent: ContextMenuParentId) -> Vec<ContextMenuItemId> {
+        let mut resolved = Self::canonical_order(parent);
+        let Some(saved) = self
+            .order
+            .iter()
+            .find(|order| ContextMenuParentId::parse_stable_name(&order.parent) == Some(parent))
+        else {
+            return resolved;
+        };
+        let mut explicit = Vec::new();
+        for name in &saved.items {
+            let Some(item) = ContextMenuItemId::parse_stable_name(name) else {
+                continue;
+            };
+            if item.parent() == parent && !explicit.contains(&item) {
+                explicit.push(item);
+            }
+        }
+        if explicit.is_empty() {
+            return resolved;
+        }
+
+        // 既知 ID が canonical 配列で占める slot だけを、保存済み順で置き換える。
+        // これなら既存 ID の相対順を維持しつつ、将来追加された ID は既定位置に残る。
+        let explicit_slots: Vec<_> = resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| explicit.contains(item).then_some(index))
+            .collect();
+        for (slot, item) in explicit_slots.into_iter().zip(explicit) {
+            resolved[slot] = item;
+        }
+        resolved
+    }
+
+    pub fn has_explicit_order(&self, parent: ContextMenuParentId) -> bool {
+        self.order.iter().any(|order| {
+            ContextMenuParentId::parse_stable_name(&order.parent) == Some(parent)
+                && order.items.iter().any(|name| {
+                    ContextMenuItemId::parse_stable_name(name)
+                        .is_some_and(|item| item.parent() == parent)
+                })
+        })
+    }
+
+    pub fn is_visible(&self, item: ContextMenuItemId) -> bool {
+        !self.hidden_items.iter().any(|name| {
+            ContextMenuItemId::parse_stable_name(name).is_some_and(|hidden| hidden == item)
+        })
+    }
+
+    pub fn set_order(&mut self, parent: ContextMenuParentId, items: &[ContextMenuItemId]) {
+        self.order
+            .retain(|entry| ContextMenuParentId::parse_stable_name(&entry.parent) != Some(parent));
+        self.order.push(ContextMenuOrderSettings {
+            parent: parent.stable_name().to_string(),
+            items: items
+                .iter()
+                .copied()
+                .filter(|item| item.parent() == parent)
+                .map(|item| item.stable_name().to_string())
+                .collect(),
+        });
+    }
+
+    pub fn set_visible(&mut self, item: ContextMenuItemId, visible: bool) {
+        self.hidden_items.retain(|name| {
+            ContextMenuItemId::parse_stable_name(name).is_none_or(|hidden| hidden != item)
+        });
+        if !visible {
+            self.hidden_items.push(item.stable_name().to_string());
+        }
+    }
+
+    pub fn show_all(&mut self) {
+        self.hidden_items.clear();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuNode {
@@ -204,6 +517,7 @@ pub struct ContextMenuInput {
     pub external_tools: Vec<ExternalToolMenuEntry>,
     pub associated_apps: Vec<AssociatedAppMenuEntry>,
     pub shortcuts: ContextMenuShortcutLabels,
+    pub layout: ContextMenuLayoutSettings,
 }
 
 /// メニューに併記するキーの表示。**実際の割り当てから作った文字列**を呼び出し側が入れる。
@@ -302,8 +616,123 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     );
     Some(MenuNode::Submenu {
         label: "アプリケーションで開く…".to_string(),
-        children,
+        children: apply_context_menu_layout(children, ContextMenuParentId::OpenWith, &input.layout),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuFixedSlotId {
+    ExternalTools,
+    OpenWithSubmenu,
+    OpenWithAssociations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutUnitId {
+    Configurable(ContextMenuItemId),
+    Fixed(ContextMenuFixedSlotId),
+}
+
+#[derive(Debug)]
+struct LayoutUnit {
+    id: LayoutUnitId,
+    section: usize,
+    last_section: usize,
+    nodes: Vec<MenuNode>,
+}
+
+fn menu_node_layout_id(node: &MenuNode) -> LayoutUnitId {
+    match node {
+        MenuNode::Item {
+            command: MenuCommand::ExternalTool(_),
+            ..
+        } => LayoutUnitId::Fixed(ContextMenuFixedSlotId::ExternalTools),
+        MenuNode::Item {
+            command: MenuCommand::OpenWithAssociation { .. },
+            ..
+        } => LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithAssociations),
+        MenuNode::Item { command, .. } => LayoutUnitId::Configurable(
+            ContextMenuItemId::from_command(command).expect("static context-menu command"),
+        ),
+        MenuNode::Submenu { .. } => LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithSubmenu),
+        MenuNode::Separator => unreachable!("separators are handled before unit classification"),
+    }
+}
+
+/// Capability-filtered tree と保存済み layout の積を、renderer 共通の MenuNode 列へ解決する。
+fn apply_context_menu_layout(
+    nodes: Vec<MenuNode>,
+    parent: ContextMenuParentId,
+    settings: &ContextMenuLayoutSettings,
+) -> Vec<MenuNode> {
+    let nodes = normalize_menu(nodes);
+    let mut units: Vec<LayoutUnit> = Vec::new();
+    let mut section = 0usize;
+    for node in nodes {
+        if matches!(node, MenuNode::Separator) {
+            section += 1;
+            continue;
+        }
+        let id = menu_node_layout_id(&node);
+        if let LayoutUnitId::Configurable(item) = id {
+            debug_assert_eq!(item.parent(), parent);
+        }
+        if let Some(existing) = units.iter_mut().find(|unit| unit.id == id) {
+            // Fixed dynamic groups can contain their own separators (associated apps:
+            // recommended / others). Keep that internal structure inside the fixed slot.
+            if existing.last_section != section {
+                existing.nodes.push(MenuNode::Separator);
+            }
+            existing.nodes.push(node);
+            existing.last_section = section;
+        } else {
+            units.push(LayoutUnit {
+                id,
+                section,
+                last_section: section,
+                nodes: vec![node],
+            });
+        }
+    }
+
+    units.retain(|unit| match unit.id {
+        LayoutUnitId::Configurable(item) => settings.is_visible(item),
+        LayoutUnitId::Fixed(_) => true,
+    });
+    if settings.has_explicit_order(parent) {
+        let order = settings.resolved_order(parent);
+        let mut configurable: Vec<_> = units
+            .iter()
+            .filter_map(|unit| match unit.id {
+                LayoutUnitId::Configurable(item) => Some((
+                    order
+                        .iter()
+                        .position(|candidate| *candidate == item)
+                        .unwrap_or(usize::MAX),
+                    unit.nodes.clone(),
+                )),
+                LayoutUnitId::Fixed(_) => None,
+            })
+            .collect();
+        configurable.sort_by_key(|(rank, _)| *rank);
+        let mut configurable = configurable.into_iter().map(|(_, nodes)| nodes);
+        for unit in &mut units {
+            if matches!(unit.id, LayoutUnitId::Configurable(_)) {
+                unit.nodes = configurable.next().expect("same configurable unit count");
+            }
+        }
+    }
+
+    let mut resolved = Vec::new();
+    let mut previous_section = None;
+    for unit in units {
+        if previous_section.is_some_and(|previous| previous != unit.section) {
+            resolved.push(MenuNode::Separator);
+        }
+        previous_section = Some(unit.section);
+        resolved.extend(unit.nodes);
+    }
+    normalize_menu(resolved)
 }
 
 /// Build the complete mIV context-menu tree from an immutable snapshot.
@@ -414,7 +843,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 )],
             );
         }
-        return normalize_menu(nodes);
+        return apply_context_menu_layout(nodes, ContextMenuParentId::Root, &input.layout);
     }
 
     if !input.is_folder_context && input.kind.is_real_item() {
@@ -632,7 +1061,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         );
     }
 
-    normalize_menu(nodes)
+    apply_context_menu_layout(nodes, ContextMenuParentId::Root, &input.layout)
 }
 
 /// Remove empty submenus and collapse leading, trailing, and repeated separators.
@@ -689,6 +1118,7 @@ mod tests {
                 rotate_right: Some("R".to_string()),
                 deselect: Some("Ctrl+D".to_string()),
             },
+            layout: ContextMenuLayoutSettings::default(),
         }
     }
 
@@ -698,7 +1128,9 @@ mod tests {
             for node in nodes {
                 match node {
                     MenuNode::Item { label, .. } => out.push(label.clone()),
-                    MenuNode::Submenu { label, children } => {
+                    MenuNode::Submenu {
+                        label, children, ..
+                    } => {
                         out.push(label.clone());
                         visit(children, out);
                     }
@@ -733,6 +1165,38 @@ mod tests {
             }
         }
         None
+    }
+
+    fn root_layout_ids(nodes: &[MenuNode]) -> Vec<ContextMenuItemId> {
+        nodes
+            .iter()
+            .filter_map(|node| match node {
+                MenuNode::Separator => None,
+                _ => match menu_node_layout_id(node) {
+                    LayoutUnitId::Configurable(item) => Some(item),
+                    LayoutUnitId::Fixed(_) => None,
+                },
+            })
+            .collect()
+    }
+
+    fn menu_shape(nodes: &[MenuNode]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|node| match node {
+                MenuNode::Separator => "|".to_string(),
+                MenuNode::Item { command, .. } => ContextMenuItemId::from_command(command)
+                    .map(|id| id.stable_name().to_string())
+                    .unwrap_or_else(|| match command {
+                        MenuCommand::ExternalTool(_) => "<external-tools>".to_string(),
+                        MenuCommand::OpenWithAssociation { .. } => "<associated-apps>".to_string(),
+                        _ => unreachable!(),
+                    }),
+                MenuNode::Submenu { children, .. } => {
+                    format!("<open-with>[{}]", menu_shape(children).join(","))
+                }
+            })
+            .collect()
     }
 
     /// キー併記は snapshot が渡した**実際の割り当て**をそのまま出す。
@@ -1320,5 +1784,268 @@ mod tests {
             MenuNode::Separator,
         ]);
         assert_eq!(nodes, vec![item(MenuCommand::CopyPath, "copy")]);
+    }
+
+    #[test]
+    fn default_layout_preserves_the_capability_filtered_tree_exactly() {
+        let raw = vec![
+            item(MenuCommand::CutFiles, "cut"),
+            item(MenuCommand::CopyFiles, "copy"),
+            MenuNode::Separator,
+            item(MenuCommand::Rename, "rename"),
+        ];
+        assert_eq!(
+            apply_context_menu_layout(
+                raw.clone(),
+                ContextMenuParentId::Root,
+                &ContextMenuLayoutSettings::default()
+            ),
+            raw
+        );
+    }
+
+    #[test]
+    fn default_layout_preserves_representative_menu_sections_exactly() {
+        let grid_image =
+            build_context_menu(&input(ContextMenuItemKind::Image, ContextMenuSurface::Grid));
+        let fullscreen_video = build_context_menu(&input(
+            ContextMenuItemKind::Video,
+            ContextMenuSurface::Fullscreen,
+        ));
+        let mut checked = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        checked.has_checked = true;
+        checked.checked_count = 2;
+        checked.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
+
+        assert_eq!(
+            menu_shape(&grid_image),
+            [
+                "CutFiles",
+                "CopyFiles",
+                "|",
+                "Rename",
+                "|",
+                "CopyPath",
+                "CopyFileName",
+                "CopyImageToClipboard",
+                "CopyEditBundle",
+                "PasteEditBundle",
+                "|",
+                "ResetPageEdits",
+                "|",
+                "RotateLeft",
+                "RotateRight",
+                "|",
+                "<open-with>[OpenExternalToolSettings]",
+                "|",
+                "MoveToRecycleBin",
+            ]
+        );
+        assert_eq!(
+            menu_shape(&fullscreen_video),
+            [
+                "CutFiles",
+                "CopyFiles",
+                "|",
+                "Rename",
+                "|",
+                "CopyPath",
+                "CopyFileName",
+                "|",
+                "SetCurrentVideoFrameThumbnail",
+                "|",
+                "<open-with>[OpenExternalToolSettings]",
+            ]
+        );
+        assert_eq!(
+            menu_shape(&build_context_menu(&checked)),
+            [
+                "CutFiles",
+                "CopyFiles",
+                "|",
+                "CopyPath",
+                "|",
+                "RotateLeft",
+                "RotateRight",
+                "|",
+                "BulkPasteEditBundle",
+                "ResetPageEdits",
+                "|",
+                "<open-with>[OpenExternalToolSettings]",
+                "|",
+                "MoveToRecycleBin",
+                "|",
+                "Deselect",
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_catalog_items_keep_their_canonical_slots_without_reordering_known_ids() {
+        let canonical = ContextMenuLayoutSettings::canonical_order(ContextMenuParentId::Root);
+        let mut saved: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|item| *item != ContextMenuItemId::NewFolder)
+            .collect();
+        saved.swap(0, 1);
+        let settings = ContextMenuLayoutSettings {
+            order: vec![ContextMenuOrderSettings {
+                parent: "Root".to_string(),
+                items: saved
+                    .iter()
+                    .map(|item| item.stable_name().to_string())
+                    .chain([
+                        "FutureItem".to_string(),
+                        ContextMenuItemId::CopyFiles.stable_name().to_string(),
+                        "OpenWithAssociations".to_string(),
+                    ])
+                    .collect(),
+            }],
+            hidden_items: Vec::new(),
+        };
+
+        let resolved = settings.resolved_order(ContextMenuParentId::Root);
+        assert_eq!(resolved[0], ContextMenuItemId::CopyFiles);
+        assert_eq!(resolved[1], ContextMenuItemId::CutFiles);
+        assert_eq!(resolved[2], ContextMenuItemId::NewFolder);
+        let known_without_new: Vec<_> = resolved
+            .iter()
+            .copied()
+            .filter(|item| *item != ContextMenuItemId::NewFolder)
+            .collect();
+        assert_eq!(known_without_new, saved);
+    }
+
+    #[test]
+    fn custom_layout_reorders_only_available_items_on_grid_and_fullscreen() {
+        let mut layout = ContextMenuLayoutSettings::default();
+        let mut order = layout.resolved_order(ContextMenuParentId::Root);
+        let right = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateRight)
+            .unwrap();
+        let rotate_right = order.remove(right);
+        order.insert(0, rotate_right);
+        layout.set_order(ContextMenuParentId::Root, &order);
+        layout.set_visible(ContextMenuItemId::CopyPath, false);
+
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            let mut case = input(ContextMenuItemKind::Image, surface);
+            case.layout = layout.clone();
+            let nodes = build_context_menu(&case);
+            let ids = root_layout_ids(&nodes);
+            assert_eq!(ids.first(), Some(&ContextMenuItemId::RotateRight));
+            assert!(!ids.contains(&ContextMenuItemId::CopyPath));
+            assert!(ids.contains(&ContextMenuItemId::RotateLeft));
+            assert!(
+                !ids.contains(&ContextMenuItemId::NewFolder),
+                "layout must not resurrect an unavailable capability: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_groups_keep_their_fixed_slots_and_internal_order() {
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        case.external_tools = vec![
+            ExternalToolMenuEntry {
+                tool_id: ExternalToolId(10),
+                label: "tool-a".to_string(),
+                enabled: true,
+                disabled_reason: None,
+            },
+            ExternalToolMenuEntry {
+                tool_id: ExternalToolId(11),
+                label: "tool-b".to_string(),
+                enabled: true,
+                disabled_reason: None,
+            },
+        ];
+        case.associated_apps = vec![
+            AssociatedAppMenuEntry {
+                display_name: "recommended".to_string(),
+                handler_id: "recommended.app".to_string(),
+                is_recommended: true,
+            },
+            AssociatedAppMenuEntry {
+                display_name: "other".to_string(),
+                handler_id: "other.app".to_string(),
+                is_recommended: false,
+            },
+        ];
+        let default_nodes = build_context_menu(&case);
+        let default_labels = labels(&default_nodes);
+        let fixed_positions = |labels: &[String]| {
+            ["tool-a", "tool-b", "アプリケーションで開く…"]
+                .map(|needle| labels.iter().position(|label| label == needle).unwrap())
+        };
+
+        let mut order = case.layout.resolved_order(ContextMenuParentId::Root);
+        let rotate = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateRight)
+            .unwrap();
+        let rotate = order.remove(rotate);
+        order.insert(0, rotate);
+        case.layout.set_order(ContextMenuParentId::Root, &order);
+
+        let nodes = build_context_menu(&case);
+        let shown = labels(&nodes);
+        assert_eq!(fixed_positions(&shown), fixed_positions(&default_labels));
+        assert!(
+            shown.windows(2).any(|pair| pair == ["tool-a", "tool-b"]),
+            "external tools keep runtime order: {shown:?}"
+        );
+        let MenuNode::Submenu { children, .. } = nodes
+            .iter()
+            .find(|node| matches!(node, MenuNode::Submenu { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            labels(children),
+            ["recommended", "other", "外部ツールの設定…"]
+        );
+        assert_eq!(
+            children
+                .iter()
+                .filter(|node| matches!(node, MenuNode::Separator))
+                .count(),
+            2,
+            "recommended/other/settings boundaries stay inside the fixed submenu"
+        );
+    }
+
+    #[test]
+    fn fixed_dynamic_groups_are_not_configurable_or_hidden_by_old_or_unknown_ids() {
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        case.associated_apps = vec![AssociatedAppMenuEntry {
+            display_name: "viewer".to_string(),
+            handler_id: "viewer.app".to_string(),
+            is_recommended: true,
+        }];
+        case.layout.hidden_items.extend([
+            "ExternalTools".to_string(),
+            "OpenWithAssociations".to_string(),
+            "OpenWithSubmenu".to_string(),
+        ]);
+        case.layout
+            .set_visible(ContextMenuItemId::OpenExternalToolSettings, false);
+
+        let nodes = build_context_menu(&case);
+        let MenuNode::Submenu { children, .. } = nodes
+            .iter()
+            .find(|node| matches!(node, MenuNode::Submenu { .. }))
+            .expect("fixed Open With slot remains while an association is available")
+        else {
+            unreachable!()
+        };
+        assert!(
+            labels(children).contains(&"viewer".to_string()),
+            "dynamic association cannot be hidden by settings: {nodes:?}"
+        );
+        assert_eq!(nodes, normalize_menu(nodes.clone()));
     }
 }

@@ -3813,6 +3813,42 @@ mod tests {
     }
 
     #[test]
+    fn preferences_context_menu_layout_snapshot() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut layout = crate::context_menu_model::ContextMenuLayoutSettings::default();
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 700.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_context_menu_layout_settings(ui, &mut layout);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_context_menu_layout");
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .click();
+        harness.run();
+        harness.snapshot("preferences_context_menu_layout_open_with");
+    }
+
+    #[test]
     fn preferences_parallelism_pdf_count_snapshot() {
         use egui_kittest::Harness;
 

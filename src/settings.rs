@@ -4639,6 +4639,10 @@ pub struct Settings {
     /// 空設定は catalog 既定順として解決する。描画への反映は menu layout resolver 経由。
     #[serde(default)]
     pub menu_layout: crate::keymap::MenuLayoutSettings,
+    /// Grid / fullscreen で共用する mIV 右クリック項目の表示順 / 表示 ON/OFF。
+    /// Windows Shell 項目はこの設定に含めず、従来どおり末尾へ置く。
+    #[serde(default)]
+    pub context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings,
 
     // ── コマンド / キーボード割り当て ───────────────────────────
     /// GUI で編集するキー割り当ての正本。旧 `keymap.ini` は初回ロード時にここへ
@@ -6664,6 +6668,7 @@ impl Default for Settings {
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
+            context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings::default(),
             keymap: crate::keymap::KeymapSettings::default(),
             stack_separator: default_stack_separator(),
             stack_script_enabled: false,
@@ -11912,6 +11917,37 @@ mod tests {
         assert!(!json.contains("ヘルプ"));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.menu_layout, s.menu_layout);
+    }
+
+    #[test]
+    fn context_menu_layout_defaults_when_missing_and_roundtrips_stable_ids() {
+        use crate::context_menu_model::{
+            ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuOrderSettings,
+            ContextMenuParentId,
+        };
+
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.context_menu_layout,
+            ContextMenuLayoutSettings::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.context_menu_layout = ContextMenuLayoutSettings {
+            order: vec![ContextMenuOrderSettings {
+                parent: ContextMenuParentId::Root.stable_name().to_string(),
+                items: vec![
+                    ContextMenuItemId::Rename.stable_name().to_string(),
+                    ContextMenuItemId::CutFiles.stable_name().to_string(),
+                ],
+            }],
+            hidden_items: vec![ContextMenuItemId::CopyPath.stable_name().to_string()],
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("Rename"));
+        assert!(!json.contains("名前の変更"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context_menu_layout, settings.context_menu_layout);
     }
 
     // -- Settings defaults --

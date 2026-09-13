@@ -1003,7 +1003,9 @@ mod windows_impl {
                     );
                     *leaf_index += 1;
                 }
-                MenuNode::Submenu { label, children } => {
+                MenuNode::Submenu {
+                    label, children, ..
+                } => {
                     let mut child =
                         MenuGuard::new(unsafe { CreatePopupMenu() }.map_err(|error| {
                             format!("CreatePopupMenu(submenu) failed: {error}")

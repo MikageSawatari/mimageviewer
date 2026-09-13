@@ -395,3 +395,19 @@ A-only のうち、仮想 item で失われている / いないを分ける。
 「アプリケーションで開く…」直下の先頭 section にする。システム関連付けアプリも同 submenu に
 入れ、追加 / 設定は separator 後の管理項目にする。この構造なら A の現在の quick action を
 深くせず、B の open-with 群だけを一か所へ収められる。
+
+### 5.7 静的 mIV 項目の表示・順序設定（2026-09-13 §1.221）
+
+§1.221 では、統一済み `MenuNode` tree を capability filter 後に一度だけ解決し、native Win32 と
+egui fallback が同じ結果を描く。設定対象は `ContextMenuItemId` catalog にある静的 leaf だけで、
+Root と Open With の階層を分ける。表示名、外部ツール ID、関連付け handler ID は永続 ID に使わない。
+
+登録済み外部ツール群、Open With submenu、関連付けアプリ群は元 tree 内の位置と内部順を保つ
+固定 slot とする。設定 UI や共有 payload へ固定 slot ID を公開しない。Windows Shell 群も従来の
+sub-menu / inline 設定を保って末尾へ置く。静的項目を非表示・並べ替えても、固定 slot の位置を
+設定操作で動かさない。
+
+未知 / 重複 / 親違いの保存 ID は無視し、欠落した新規 static ID は canonical 位置へ補完する。
+利用不能項目は capability-filtered tree に存在しないため復活しない。最後に既存 `normalize_menu` で
+空 submenu、leading / trailing / 連続 separator を除く。詳細と受入条件は
+[§1.221 設計記録](section221-context-menu-layout.md) を参照する。
