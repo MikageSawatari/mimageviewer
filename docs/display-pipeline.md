@@ -36,6 +36,21 @@ per-context の `PageDimsCache` の別 map に記録する。`source_dims` は�
 `invalidate_idx_state_and_queues` で clear し、cache 自身の generation 不一致も `None` へ
 fail-closed する。
 
+### 1.1.1 Windows の切り取り中表示
+
+App-global な `CutClipboardObserver` が、現在の Windows file clipboard に
+`CF_HDROP + Preferred DropEffect=MOVE` がある場合だけ、正規化済み実パス集合を公開する。
+描画時は `GridItem::drag_source_path` が返す 1 パスをこの集合へ照合する。ファイル走査や
+`canonicalize`、同期 clipboard I/O は描画経路へ入れず、ZIP / PDF 内ページ、Stack、
+SearchContainer など実パスを持たない仮想項目は対象外とする。
+
+サムネイルではセル背景を通常 alpha で描いた後、画像 / placeholder / 名前 / 評価 / 編集・タグ・
+形式・再生等の内容 badge だけを opacity 0.5 の painter へ描く。選択枠、チェック、見開きカーソル、
+hover と pointer owner は通常 alpha のまま後段で描く。詳細一覧も行背景、選択 accent、separator、
+カーソルを通常 alpha にし、preview icon と列文字だけを 0.5 にする。詳細行 helper を共有する
+下部情報バーは表示専用 caller なので opacity 1.0 を維持する。fullscreen 本体はこの projection を
+参照しない。
+
 ### 1.2 2 フェーズ優先ロード
 
 `App::update()` 毎フレーム:

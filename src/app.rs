@@ -222,8 +222,8 @@ pub(crate) use folder_scan::{
 #[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
-    draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
-    primary_grid_tag_for_badge, tq_draw_preview,
+    draw_cell, draw_cut_badge, draw_spread_pair_cursor, grid_tag_badge_hit_rect,
+    layout_cell_overlays, primary_grid_tag_for_badge, tq_draw_preview,
 };
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
@@ -15192,6 +15192,9 @@ pub struct App {
     /// 要求を拾うためのリスナースレッドハンドル。最初のフレームで HWND が取れた
     /// タイミングで spawn し、Drop で join する。
     pub(crate) activation_listener: Option<crate::single_instance::ActivationListener>,
+    /// Process-global Windows file clipboard observation. Viewer contexts only read the
+    /// normalized path snapshot; OS listener/reader ownership stays outside every bundle.
+    pub(crate) cut_clipboard: crate::cut_clipboard::CutClipboardObserver,
     /// 2 重起動されたプロセスが Named Pipe で送ってきた「開くパス」を UI スレッドへ
     /// 渡すための channel。listener thread は App を直接触らず、ここへ積むだけにする。
     #[cfg(windows)]
@@ -15313,6 +15316,15 @@ impl Default for App {
 }
 
 impl App {
+    pub(crate) fn install_cut_clipboard_observer(
+        &mut self,
+        repaint: impl Fn() + Send + Sync + 'static,
+    ) {
+        if let Err(error) = self.cut_clipboard.install_production(repaint) {
+            crate::logger::log(format!("cut_clipboard: observer startup failed: {error}"));
+        }
+    }
+
     /// 設定メニューで選ばれた UI 表示倍率を main Context へ適用する。
     ///
     /// active viewer / native presenter は、別ウィンドウ表示モード変更と同じ teardown 経路で
@@ -16984,6 +16996,7 @@ impl App {
             last_ui_frame_started: None,
             placement_slot: None,
             activation_listener: None,
+            cut_clipboard: crate::cut_clipboard::CutClipboardObserver::default(),
             #[cfg(windows)]
             activation_open_path_tx,
             #[cfg(windows)]
@@ -39950,10 +39963,26 @@ impl App {
             crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         }
 
-        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb);
+        let intent = match verb {
+            crate::native_context_menu::ShellClipboardVerb::Copy => {
+                crate::cut_clipboard::LocalClipboardWriteIntent::Copy
+            }
+            crate::native_context_menu::ShellClipboardVerb::Cut => {
+                crate::cut_clipboard::LocalClipboardWriteIntent::Cut
+            }
+            crate::native_context_menu::ShellClipboardVerb::Paste => return,
+        };
+        let local_write = self.cut_clipboard.begin_local_write(intent, paths);
+        let cut_data_object = local_write.cut_data_object();
+        let result =
+            crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb, cut_data_object);
         Self::resync_egui_modifiers_from_os(ctx);
         match result {
-            Ok(()) => ctx.request_repaint(),
+            Ok(os_sequence) => {
+                self.cut_clipboard
+                    .commit_local_write(local_write, os_sequence);
+                ctx.request_repaint();
+            }
             Err(err) => {
                 crate::logger::log(format!("shell_clipboard: {verb:?} failed: {err}"));
                 self.show_feedback_toast("OSクリップボード操作に失敗しました".to_string());
@@ -73615,6 +73644,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
+        // Process-global clipboard events must be visible before fullscreen/native early
+        // returns so every viewer observes the same cut snapshot in the first repaint.
+        self.cut_clipboard.poll();
         #[cfg(windows)]
         self.poll_similar_preview_workers_in_all_contexts(ctx);
         #[cfg(not(windows))]

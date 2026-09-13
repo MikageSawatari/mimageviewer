@@ -368,6 +368,7 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        self.cut_clipboard.shutdown();
         // 最後の UI 差分と debounce 中の書き込みを、settings の終了保存より先に確定する。
         self.flush_favorite_view_writes_for_exit();
         // 一括編集が中央DBへcommit済みなら、成功 outcome をsidecarへ反映してから

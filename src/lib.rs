@@ -61,6 +61,7 @@ pub mod conceal_db;
 mod content_identity;
 pub mod context_menu_model;
 pub mod creative_lut;
+mod cut_clipboard;
 pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;
@@ -272,6 +273,8 @@ pub use ui_fullscreen::{
 };
 pub mod ui_helpers;
 mod ui_main;
+#[doc(hidden)]
+pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
@@ -1368,6 +1371,13 @@ pub fn run() -> eframe::Result {
                 settings_load_meta.clone(),
                 move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
             );
+            #[cfg(windows)]
+            {
+                let clipboard_repaint_ctx = cc.egui_ctx.clone();
+                app.install_cut_clipboard_observer(move || {
+                    clipboard_repaint_ctx.request_repaint_of(egui::ViewportId::ROOT)
+                });
+            }
             if let Some(handle) = remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
             }

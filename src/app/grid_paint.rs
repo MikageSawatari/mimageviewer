@@ -379,12 +379,21 @@ pub(crate) fn draw_cell(
     filter_match_count: Option<u32>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
+    is_cut: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
     }
 
-    let painter = ui.painter();
+    let base_painter = ui.painter();
+    let mut content_painter = base_painter.clone();
+    let content_opacity = if is_cut {
+        crate::cut_clipboard::CUT_CONTENT_OPACITY
+    } else {
+        1.0
+    };
+    content_painter.multiply_opacity(content_opacity.clamp(0.0, 1.0));
+    let painter = &content_painter;
     let padding = 4.0;
     let inner = rect.shrink(padding);
 
@@ -413,7 +422,7 @@ pub(crate) fn draw_cell(
     } else {
         egui::Color32::WHITE
     };
-    painter.rect_filled(rect, 2.0, bg);
+    base_painter.rect_filled(rect, 2.0, bg);
 
     match item {
         GridItem::Folder(_) => match thumb {
@@ -458,7 +467,7 @@ pub(crate) fn draw_cell(
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                 }
             }
-            if video_thumbnail_indicator_parts(item, video_indicator).play_icon {
+            if !is_cut && video_thumbnail_indicator_parts(item, video_indicator).play_icon {
                 let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
                 draw_play_icon(painter, inner.center(), r);
             }
@@ -696,6 +705,10 @@ pub(crate) fn draw_cell(
         }
     }
 
+    let painter = base_painter;
+    if is_cut {
+        draw_cut_badge(painter, inner);
+    }
     let border = if is_selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 120, 220))
     } else {
@@ -737,6 +750,8 @@ pub(crate) fn draw_cell(
         );
     }
 
+    let painter = &content_painter;
+
     if let Some(placement) = overlay_layout.top_left.upscaled_video.as_ref() {
         crate::ui_helpers::draw_overlay_upscaled_video_badge(painter, placement);
     }
@@ -777,6 +792,47 @@ pub(crate) fn draw_cell(
             draw_filter_match_badge(painter, rect, count);
         }
     }
+}
+
+/// Draw the cut-state marker independently from faded item content and interaction overlays.
+///
+/// Painter primitives keep the scissors recognizable without relying on an installed glyph.
+pub(crate) fn draw_cut_badge(painter: &egui::Painter, rect: egui::Rect) {
+    let side = rect.width().min(rect.height());
+    if !side.is_finite() || side < 8.0 {
+        return;
+    }
+    let radius = (side * 0.18).clamp(7.0, 26.0).min(side * 0.46);
+    let center = rect.center();
+    painter.circle_filled(
+        center,
+        radius,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+    );
+
+    let stroke_width = (radius * 0.13).clamp(1.2, 2.4);
+    let stroke = egui::Stroke::new(stroke_width, egui::Color32::WHITE);
+    let upper_handle = center + egui::vec2(-radius * 0.36, -radius * 0.28);
+    let lower_handle = center + egui::vec2(-radius * 0.36, radius * 0.28);
+    let handle_radius = (radius * 0.19).max(1.5);
+    painter.circle_stroke(upper_handle, handle_radius, stroke);
+    painter.circle_stroke(lower_handle, handle_radius, stroke);
+    let pivot = center + egui::vec2(-radius * 0.06, 0.0);
+    painter.line_segment(
+        [
+            upper_handle + egui::vec2(handle_radius * 0.75, handle_radius * 0.65),
+            center + egui::vec2(radius * 0.56, radius * 0.40),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            lower_handle + egui::vec2(handle_radius * 0.75, -handle_radius * 0.65),
+            center + egui::vec2(radius * 0.56, -radius * 0.40),
+        ],
+        stroke,
+    );
+    painter.circle_filled(pivot, (stroke_width * 0.78).max(1.0), egui::Color32::WHITE);
 }
 
 pub(crate) fn draw_spread_pair_cursor(
@@ -852,6 +908,180 @@ pub(crate) fn primary_grid_tag_for_badge(tags: &[String]) -> Option<&str> {
 
 pub(crate) fn grid_tag_badge_hit_rect(layout: &ThumbnailOverlayLayout) -> Option<egui::Rect> {
     layout.top_left.tag.as_ref().map(|placement| placement.rect)
+}
+
+#[cfg(test)]
+mod cut_content_paint_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn collect_shapes<'a>(shape: &'a egui::epaint::Shape, out: &mut Vec<&'a egui::epaint::Shape>) {
+        out.push(shape);
+        if let egui::epaint::Shape::Vec(children) = shape {
+            for child in children {
+                collect_shapes(child, out);
+            }
+        }
+    }
+
+    #[test]
+    fn cut_opacity_fades_cell_content_but_keeps_selection_and_check_opaque() {
+        let ctx = egui::Context::default();
+        let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 90.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(180.0, 140.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        draw_cell(
+                            ui,
+                            cell,
+                            true,
+                            true,
+                            false,
+                            &ThumbnailOverlayLayout::default(),
+                            &GridItem::Image(PathBuf::from(r"C:\cut.jpg")),
+                            &ThumbnailState::Pending,
+                            crate::rotation_db::Rotation::None,
+                            None,
+                            None,
+                            false,
+                            VideoThumbnailIndicator::default(),
+                            true,
+                        );
+                    });
+            },
+        );
+        let mut shapes = Vec::new();
+        for clipped in &output.shapes {
+            collect_shapes(&clipped.shape, &mut shapes);
+        }
+
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.rect == cell && rect.fill.a() == 255
+            )),
+            "selected cell background must stay opaque"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.rect == cell && rect.stroke.color.a() == 255
+            )),
+            "selection border must stay opaque"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.rect == cell.shrink(4.0) && (127..=128).contains(&rect.fill.a())
+            )),
+            "thumbnail placeholder must use the faded content painter"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::epaint::Shape::Circle(circle) if circle.fill.a() == 255
+            )),
+            "check circle must stay opaque"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(
+                shape,
+                egui::epaint::Shape::Circle(circle)
+                    if circle.fill == egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190)
+            )),
+            "cut badge background must be painted at normal alpha"
+        );
+    }
+
+    #[test]
+    fn cut_badge_is_vector_at_small_size_and_replaces_video_play_indicator() {
+        fn paint_video(is_cut: bool) -> Vec<egui::epaint::Shape> {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(80.0, 80.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            draw_cell(
+                                ui,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(10.0, 10.0),
+                                    egui::vec2(48.0, 36.0),
+                                ),
+                                false,
+                                false,
+                                false,
+                                &ThumbnailOverlayLayout::default(),
+                                &GridItem::Video(PathBuf::from(r"C:\cut.mp4")),
+                                &ThumbnailState::Pending,
+                                crate::rotation_db::Rotation::None,
+                                None,
+                                None,
+                                false,
+                                VideoThumbnailIndicator::PlayIcon,
+                                is_cut,
+                            );
+                        });
+                },
+            );
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect_shapes(&clipped.shape, &mut shapes);
+            }
+            shapes.into_iter().cloned().collect()
+        }
+
+        let normal = paint_video(false);
+        assert!(normal.iter().any(|shape| matches!(
+            shape,
+            egui::epaint::Shape::Circle(circle)
+                if circle.fill == egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
+        )));
+
+        let cut = paint_video(true);
+        assert!(!cut.iter().any(|shape| matches!(
+            shape,
+            egui::epaint::Shape::Circle(circle)
+                if circle.fill == egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
+        )));
+        assert!(cut.iter().any(|shape| matches!(
+            shape,
+            egui::epaint::Shape::Circle(circle)
+                if circle.fill == egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190)
+        )));
+        let opaque_handle_rings = cut
+            .iter()
+            .filter(|shape| {
+                matches!(
+                    shape,
+                    egui::epaint::Shape::Circle(circle)
+                        if circle.fill == egui::Color32::TRANSPARENT
+                            && circle.stroke.color == egui::Color32::WHITE
+                            && circle.stroke.width >= 1.2
+                )
+            })
+            .count();
+        assert_eq!(opaque_handle_rings, 2, "two vector scissors handle rings");
+    }
 }
 
 /// サムネイル画質プレビュー用: 実グリッドと同じ `cell_w × cell_h` のセルを描画する。
@@ -949,6 +1179,7 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         indicator,
+        false,
     );
     if let Some(tag_rect) = grid_tag_badge_hit_rect(&layout)
         && response.hovered()

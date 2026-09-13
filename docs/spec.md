@@ -1444,7 +1444,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + A | 現在のフィルタで表示中の `is_checkable` アイテムを全てチェック（画像/動画/ZIP・PDF 本体/ZIP 内画像/PDF ページ/変換前アーカイブが対象）。Space はサブフォルダ展開可能な通常一覧で実フォルダもチェックできるが、Ctrl+A は現状フォルダを含めない |
 | Delete | 選択/チェック済みの実ファイル / 実フォルダを削除（確認あり。実項目と ZIP/PDF 内ページなど仮想項目が混在する場合は実項目だけを削除せず、理由とページ選択を外す対処をトーストで示して全体を中止する。確認中は背景を暗くして背面 UI の操作を遮断し、背景クリックは何もせず吸収する。確認ダイアログは対象名を先頭 10 件まで列挙し、超過分を「他 M 件」で示す。削除対象に実フォルダを含む場合は「フォルダの中には一覧に表示していないファイルも含まれます」を常に表示する。この判定は既存の一覧項目だけを使い、確認表示のためにフォルダを走査しない。本文は固定幅で折り返し、画面高に収まる縦スクロール領域に置く。Y = 削除、N / Esc = キャンセル、Enter = 無効の固定操作。通常はゴミ箱に移動。リムーバブル / ネットワーク / ゴミ箱を使わない設定のドライブ / ゴミ箱容量を超える対象では確認文言で警告） |
 | Ctrl + C | `GridCopyFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のコピー verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルコピーを実行せずトーストで通知する |
-| Ctrl + X | `GridCutFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のカット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルカットを実行せずトーストで通知する |
+| Ctrl + X | `GridCutFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のカット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルカットを実行せずトーストで通知する。現在の Windows file clipboard が cut として保持する実項目はサムネイル / 詳細一覧の内容だけを半透明にし、選択・チェック・hoverは通常表示のままにする。copy、別clipboard内容、確定したmove完了で表示を更新し、paste verbの受付だけでは解除しない |
 | Ctrl + V | Windows Shell の背景ペースト verb で、クリップボードのファイル / フォルダを現在の実フォルダにペーストする |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイルをドラッグ＆ドロップでコピー送出。複数チェック選択中はその実パス群をまとめて送出。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外。操作はコピーのみ (移動はしない) |
 | エクスプローラ等からのドロップ | mIV ウィンドウへファイルをドロップすると、現在表示中のフォルダへコピー (**フォルダは v1.1.0 で一旦無効化・skip**)。ZIP / PDF / 検索結果グリッドなど実フォルダ以外を表示中はトーストで拒否。操作はコピーのみ |
@@ -2000,7 +2000,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,smart_folders,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |
-| `context_menu_layout` | ContextMenuLayoutSettings | 空 (=既定順) | Grid / Fullscreen 共通の mIV 右クリック静的 leaf を stable ID で表示・同一階層内並べ替えする。利用不能項目は復活させず、未知 / 重複 / 親違い ID は無視し、欠落した新項目は canonical 位置へ補完する。外部ツール群、Open With submenu、関連付けアプリ群、Windows Shell 群は表示と位置を変えない固定枠。欠落時や空設定は従来の内容・section・順序を保つ |
+| `context_menu_layout` | ContextMenuLayoutSettings | 空 (=既定順) | Grid / Fullscreen 共通の mIV 右クリック静的 leaf を stable ID で表示・同一階層内並べ替えし、各leaf直前のseparatorを標準 / 表示 / 非表示から選ぶ。標準は移動先slotのsection、明示値はactual itemへ追従する。利用不能項目は復活させず、未知 / 重複 / 親違い ID は無視し、欠落した新項目は canonical 位置へ補完する。外部ツール群、Open With submenu、関連付けアプリ群、Windows Shell 群は表示と位置を変えない固定枠。欠落時や空設定は従来の内容・section・順序を保つ |
 | `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。設定メニュー「操作カスタマイズ…」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | 通常ウィンドウの位置・サイズ（自動保存）。最大化中は更新しないので、最大化を解いたときに戻る矩形として残る |

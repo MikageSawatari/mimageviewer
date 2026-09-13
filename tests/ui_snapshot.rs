@@ -368,6 +368,28 @@ fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
 }
 
 #[test]
+fn cut_item_appearance_dark() {
+    snapshot_with_theme_at_size(
+        "cut_item_appearance_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(500.0, 350.0),
+        None,
+        mimageviewer::draw_cut_item_appearance_snapshot_fixture,
+    );
+}
+
+#[test]
+fn cut_item_appearance_light() {
+    snapshot_with_theme_at_size(
+        "cut_item_appearance_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(500.0, 350.0),
+        None,
+        mimageviewer::draw_cut_item_appearance_snapshot_fixture,
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_latched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_latched_dark",

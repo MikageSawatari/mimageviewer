@@ -4038,6 +4038,19 @@ fn draw_details_text(
     color: egui::Color32,
     strong: bool,
 ) {
+    let painter = ui.painter().clone();
+    draw_details_text_with_painter(ui, &painter, rect, text, align, color, strong);
+}
+
+fn draw_details_text_with_painter(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    align: egui::Align2,
+    color: egui::Color32,
+    strong: bool,
+) {
     if text.is_empty() || rect.width() <= 4.0 {
         return;
     }
@@ -4055,7 +4068,7 @@ fn draw_details_text(
     } else {
         egui::TextStyle::Body.resolve(ui.style())
     };
-    ui.painter().with_clip_rect(text_clip).text(
+    painter.with_clip_rect(text_clip).text(
         egui::pos2(x, clip.center().y),
         align,
         text,
@@ -4064,9 +4077,31 @@ fn draw_details_text(
     );
 }
 
+fn details_item_content_opacity(display_only: bool, is_cut: bool) -> f32 {
+    if !display_only && is_cut {
+        crate::cut_clipboard::CUT_CONTENT_OPACITY
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod details_text_clip_tests {
     use super::*;
+
+    fn collect_text_alpha(shape: &egui::epaint::Shape, alpha: &mut Vec<u8>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                alpha.push(text.override_text_color.unwrap_or(text.fallback_color).a());
+            }
+            egui::epaint::Shape::Vec(children) => {
+                for child in children {
+                    collect_text_alpha(child, alpha);
+                }
+            }
+            _ => {}
+        }
+    }
 
     #[test]
     fn right_aligned_clip_adds_one_physical_pixel() {
@@ -4098,6 +4133,52 @@ mod details_text_clip_tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn cut_details_text_uses_content_opacity_but_selection_bar_stays_opaque() {
+        assert_eq!(details_item_content_opacity(false, true), 0.5);
+        assert_eq!(details_item_content_opacity(true, true), 1.0);
+        assert_eq!(details_item_content_opacity(false, false), 1.0);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 80.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut painter = ui.painter().clone();
+                        painter.multiply_opacity(details_item_content_opacity(false, true));
+                        draw_details_text_with_painter(
+                            ui,
+                            &painter,
+                            egui::Rect::from_min_size(
+                                egui::pos2(10.0, 10.0),
+                                egui::vec2(200.0, 36.0),
+                            ),
+                            "cut.jpg",
+                            egui::Align2::LEFT_CENTER,
+                            egui::Color32::WHITE,
+                            false,
+                        );
+                    });
+            },
+        );
+        let mut alpha = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_alpha(&clipped.shape, &mut alpha);
+        }
+        assert!(
+            alpha.iter().any(|alpha| (127..=128).contains(alpha)),
+            "details content text must be painted at 0.5 opacity: {alpha:?}"
+        );
     }
 }
 
@@ -4150,6 +4231,151 @@ fn draw_details_preview_icon(
         ),
     ];
     painter.add(egui::Shape::line(mountain, stroke));
+}
+
+/// Snapshot fixture for the cut-item content/interaction paint split.
+///
+/// The thumbnail cells use the production grid layout and painter. The details rows use
+/// the same preview/text helpers and painter-opacity boundary as the production details list.
+#[doc(hidden)]
+pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
+    use crate::settings::VideoThumbnailIndicator;
+    use crate::thumb_overlay_layout::EditBadgeFlags;
+
+    fn thumbnail(ctx: &egui::Context) -> ThumbnailState {
+        let size = [64, 40];
+        let mut pixels = Vec::with_capacity(size[0] * size[1]);
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let color = if x < size[0] / 2 {
+                    egui::Color32::from_rgb(44 + y as u8 * 3, 104, 172)
+                } else {
+                    egui::Color32::from_rgb(186, 72 + y as u8 * 2, 82)
+                };
+                pixels.push(color);
+            }
+        }
+        ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                "cut-item-appearance-snapshot",
+                egui::ColorImage::new(size, pixels),
+                Default::default(),
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: 160,
+            source_dims: Some((1920, 1200)),
+            layout_dims: None,
+        }
+    }
+
+    fn draw_thumbnail_sample(
+        ui: &mut egui::Ui,
+        label: &str,
+        item: &GridItem,
+        thumbnail: &ThumbnailState,
+        is_cut: bool,
+    ) {
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(label).strong());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(210.0, 128.0), egui::Sense::hover());
+            let layout = crate::app::layout_cell_overlays(
+                ui.painter(),
+                rect,
+                EditBadgeFlags::default(),
+                4,
+                item,
+                thumbnail,
+                &["切り取り".to_owned()],
+                None,
+                false,
+                VideoThumbnailIndicator::PlayIcon,
+            );
+            crate::app::draw_cell(
+                ui,
+                rect,
+                true,
+                true,
+                false,
+                &layout,
+                item,
+                thumbnail,
+                crate::rotation_db::Rotation::None,
+                None,
+                None,
+                false,
+                VideoThumbnailIndicator::PlayIcon,
+                is_cut,
+            );
+        });
+    }
+
+    fn draw_details_sample(ui: &mut egui::Ui, label: &str, is_cut: bool) {
+        ui.label(egui::RichText::new(label).strong());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(442.0, 42.0), egui::Sense::hover());
+        let selection_fill = ui.visuals().selection.bg_fill;
+        let selection_stroke = ui.visuals().selection.stroke.color;
+        let strong_text = ui.visuals().strong_text_color();
+        let text = ui.visuals().text_color();
+        ui.painter().rect_filled(rect, 0.0, selection_fill);
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(2.0, selection_stroke),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().circle_filled(
+            egui::pos2(rect.right() - 18.0, rect.center().y),
+            7.0,
+            selection_stroke,
+        );
+
+        let mut content_painter = ui.painter().clone();
+        content_painter.multiply_opacity(details_item_content_opacity(false, is_cut));
+        let icon_rect =
+            egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 4.0), egui::vec2(34.0, 34.0));
+        draw_details_preview_icon(&content_painter, icon_rect, strong_text, false);
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(
+                egui::pos2(icon_rect.right() + 4.0, rect.top()),
+                egui::pos2(rect.left() + 282.0, rect.bottom()),
+            ),
+            "holiday-photo.jpg",
+            egui::Align2::LEFT_CENTER,
+            strong_text,
+            true,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 286.0, rect.top()),
+                egui::pos2(rect.right() - 32.0, rect.bottom()),
+            ),
+            "★★★★★  #旅行",
+            egui::Align2::LEFT_CENTER,
+            text,
+            false,
+        );
+        if is_cut {
+            crate::app::draw_cut_badge(ui.painter(), icon_rect);
+        }
+    }
+
+    ui.set_width(458.0);
+    ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
+    ui.heading("切り取り中の一覧表示");
+    let thumbnail = thumbnail(ui.ctx());
+    let item = GridItem::Video(PathBuf::from("holiday-video.mp4"));
+    ui.horizontal(|ui| {
+        draw_thumbnail_sample(ui, "通常", &item, &thumbnail, false);
+        draw_thumbnail_sample(ui, "切り取り中", &item, &thumbnail, true);
+    });
+    ui.separator();
+    draw_details_sample(ui, "詳細一覧・通常", false);
+    draw_details_sample(ui, "詳細一覧・切り取り中", true);
 }
 
 fn archive_container_format_label(
@@ -14233,13 +14459,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         rect: egui::Rect,
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
+        content_opacity: f32,
     ) {
         let Some(row) = self.bookmark_view_row(idx) else {
             return;
         };
+        let mut content_painter = ui.painter().clone();
+        content_painter.multiply_opacity(content_opacity);
         if let Some(placement) = overlay_layout.top_left.bookmark_time.as_ref() {
             crate::ui_helpers::draw_overlay_bookmark_time_badge(
-                ui.painter(),
+                &content_painter,
                 placement,
                 row.missing,
             );
@@ -14281,12 +14510,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         (min_title_y - centered_rect.min.y).max(0.0),
                     ));
                     if plate_rect.max.y <= rect.max.y - 4.0 {
-                        ui.painter().rect_filled(
+                        content_painter.rect_filled(
                             plate_rect,
                             4.0,
                             egui::Color32::from_black_alpha(190),
                         );
-                        ui.painter().galley(
+                        content_painter.galley(
                             plate_rect.center() - galley.size() * 0.5,
                             galley,
                             egui::Color32::WHITE,
@@ -15287,9 +15516,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         display_only: bool,
         show_tooltip: bool,
     ) -> Option<egui::Rect> {
-        if self.items.get(idx).is_none() {
+        let Some(item) = self.items.get(idx) else {
             return None;
-        }
+        };
+        let is_cut = !display_only
+            && item
+                .drag_source_path()
+                .is_some_and(|path| self.cut_clipboard.contains(path));
+        let content_opacity = details_item_content_opacity(display_only, is_cut);
         let column_rects = details_column_rects_for_columns(
             rect,
             &self.settings,
@@ -15344,6 +15578,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if is_spread_pair_cursor && !selected {
             crate::app::draw_spread_pair_cursor(painter, rect, visuals);
         }
+        let mut content_painter = painter.clone();
+        content_painter.multiply_opacity(content_opacity);
 
         let name = row_data.text(DetailsColumn::Name);
         let rating_text = row_data.text(DetailsColumn::Rating);
@@ -15353,6 +15589,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let modified_text = row_data.text(DetailsColumn::Modified);
         let state_text = row_data.text(DetailsColumn::State);
         let mut hovered_preview_rect = None;
+        let mut cut_badge_rect = None;
 
         for (col, col_rect) in column_rects {
             match col {
@@ -15366,126 +15603,144 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         hovered_preview_rect = Some(col_rect);
                     }
                     draw_details_preview_icon(
-                        ui.painter(),
+                        &content_painter,
                         col_rect.shrink2(egui::vec2(6.0, 5.0)),
                         text_color,
                         false,
                     );
+                    if is_cut {
+                        cut_badge_rect = Some(col_rect.shrink2(egui::vec2(6.0, 5.0)));
+                    }
                 }
-                DetailsColumn::Name => draw_details_text(
+                DetailsColumn::Name => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &name,
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Rating => draw_details_text(
+                DetailsColumn::Rating => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &rating_text,
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::RatedAt => draw_details_text(
+                DetailsColumn::RatedAt => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::RatedAt),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Tags => draw_details_text(
+                DetailsColumn::Tags => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &tags_text,
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Kind => draw_details_text(
+                DetailsColumn::Kind => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &kind_text,
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::PageCount => draw_details_text(
+                DetailsColumn::PageCount => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::PageCount),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Place => draw_details_text(
+                DetailsColumn::Place => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::Place),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Size => draw_details_text(
+                DetailsColumn::Size => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &size_text,
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Modified => draw_details_text(
+                DetailsColumn::Modified => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &modified_text,
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::Created => draw_details_text(
+                DetailsColumn::Created => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::Created),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::ImageDimensions => draw_details_text(
+                DetailsColumn::ImageDimensions => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::ImageDimensions),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::VideoDuration => draw_details_text(
+                DetailsColumn::VideoDuration => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::VideoDuration),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::VideoDimensions => draw_details_text(
+                DetailsColumn::VideoDimensions => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::VideoDimensions),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::VideoCodec => draw_details_text(
+                DetailsColumn::VideoCodec => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::VideoCodec),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
                 ),
-                DetailsColumn::State => draw_details_text(
+                DetailsColumn::State => draw_details_text_with_painter(
                     ui,
+                    &content_painter,
                     col_rect,
                     &state_text,
                     egui::Align2::LEFT_CENTER,
@@ -15493,6 +15748,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     false,
                 ),
             }
+        }
+        if let Some(badge_rect) = cut_badge_rect {
+            crate::app::draw_cut_badge(ui.painter(), badge_rect);
         }
         if show_tooltip {
             self.draw_reading_history_tooltip(ui, rect, idx);
@@ -16237,6 +16495,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 // で対応させる)。
                                 // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                 // (ルート = zip_path / 本の中 = 実効 prefix)。
+                                let is_cut = self.items[idx]
+                                    .drag_source_path()
+                                    .is_some_and(|path| self.cut_clipboard.contains(path));
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
@@ -16251,6 +16512,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     filter_match_count,
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    is_cut,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
@@ -16283,6 +16545,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     cell_rect,
                                     idx,
                                     &overlay_layout,
+                                    if is_cut {
+                                        crate::cut_clipboard::CUT_CONTENT_OPACITY
+                                    } else {
+                                        1.0
+                                    },
                                 );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
