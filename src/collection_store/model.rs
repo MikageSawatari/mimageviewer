@@ -256,6 +256,14 @@ pub struct CollectionSourceMigration {
     pub scope: CollectionSourceMigrationScope,
 }
 
+/// One durable filesystem operation may move several sources (book page moves/reorders). The
+/// collection actor applies the complete mapping set in one SQLite transaction so cycles and
+/// duplicate destinations can never leak a partially migrated catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionSourceMigrationBatch {
+    pub(super) migrations: Vec<CollectionSourceMigration>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionRevisionNotice {
     pub catalog_revision: u64,

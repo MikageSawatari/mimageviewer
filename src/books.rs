@@ -77,6 +77,10 @@ pub enum BookOpResult {
     Renamed {
         old_name: String,
         new_name: String,
+        /// Exact filesystem roots captured by the worker before the rename. App must not rebuild
+        /// these from mutable settings when publishing the collection Tree migration.
+        source_folder: PathBuf,
+        target_folder: PathBuf,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
     },
@@ -674,9 +678,12 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     let old_name = normalize_book_name(old_name);
     let new_name = normalize_book_name(new_name);
     if old_name == new_name {
+        let folder = book_folder(root, &old_name);
         return Ok(BookOpResult::Renamed {
             old_name,
             new_name,
+            source_folder: folder.clone(),
+            target_folder: folder,
             edit_moves: Vec::new(),
             bookmark_migration_journal_id: None,
         });
@@ -707,6 +714,8 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
+        source_folder: from,
+        target_folder: to,
         edit_moves,
         bookmark_migration_journal_id,
     })

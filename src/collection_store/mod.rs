@@ -14,8 +14,9 @@ mod text;
 pub use model::*;
 pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
 pub(crate) use prepare::{
-    CollectionPrepareError, CollectionPreparedRegistration, prepare_collection_export,
-    prepare_collection_registrations, write_collection_export_atomic,
+    CollectionPrepareError, CollectionPreparedRegistration, CollectionPreparedSnapshot,
+    prepare_collection_export, prepare_collection_registrations, prepare_collection_snapshot,
+    write_collection_export_atomic,
 };
 pub use runtime::{
     CollectionRevisionWatch, CollectionRuntimeEvent, CollectionStoreClient, CollectionStoreRuntime,

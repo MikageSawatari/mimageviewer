@@ -156,7 +156,8 @@ impl ContentIdentitySource {
             | GridItem::Video(_)
             | GridItem::Audio(_)
             | GridItem::Stack { .. }
-            | GridItem::SearchContainer { .. } => None,
+            | GridItem::SearchContainer { .. }
+            | GridItem::CollectionPlaceholder { .. } => None,
         }
     }
 }

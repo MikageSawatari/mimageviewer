@@ -3764,6 +3764,7 @@ impl App {
             GridItem::PdfPage { .. } => "pdf-page",
             GridItem::Stack { .. } => "stack",
             GridItem::SearchContainer { .. } => "search-container",
+            GridItem::CollectionPlaceholder { .. } => "collection-placeholder",
         }
     }
 

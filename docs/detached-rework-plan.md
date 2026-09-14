@@ -1454,6 +1454,30 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-14 §1.118 Phase 3 collection Grid / return origin（親Codex／独立Sol構造合意、実装・自動検証）**
+
+collection一覧とその非同期prepareはApp-globalなcurrent flagへ置かず、既存`ViewerContextBundle`内の
+`TopLevelGridView`へ`Collection` surface / session / typed restoreを追加する。request / resultは
+viewer context ID、surface generation、collection ID、wantedまたはexact revisionを段階別に照合し、
+park / mount / retireで別contextの結果を採用しない。collectionのfolder / book / archiveを開く時は
+entry IDとsource keyのviewport anchorを同じbundleのreturn ownerへ保存し、最新一覧へ戻した後に
+`selected`と既存`scroll_to_selected`へ接続する。
+
+detached physical contextの既存factoryには、collection cell由来の場合だけこのtyped restoreを入力として
+渡す。mainのcollection sessionはmain bundleに残り、detachedは自身のcontext ID / generationで戻り先を
+所有する。viewer context registryのmount / swap / retireを唯一の投影境界とし、viewport生成、host identity、
+placement、focus、geometry、window predicate、時間guardは変更しない。これは最上位一覧の既存context ownerを
+collection originへ拡張する構造変更であり、detached固有の症状guardではない。詳細と回帰条件は
+[collection実装計画 §16](collection-implementation-plan.md#16-phase-3-実装設計-collection-grid--context--source-migration)
+に記録する。実装は同じtyped restoreをmain / detached双方のviewer bundleへ接続し、collection sessionの
+receiver / revision watchはcontext clone時に共有せず、mount後に各contextが再購読する。parked contextを含む
+source invalidationと、別collection / sibling contextへ結果を適用しない回帰を追加した。viewport生成、host identity、
+placement、focus、geometry、window predicateは変更していない。folder candidate / cache hit / mixed-folder scan /
+ZIP / PDF / convertible archiveの全open ownerがrequest時のcollection restoreを運び、新しいdetached contextだけへ
+installする。convertible completionはcontext ID、surface generation、collection ID、accepted+wanted revision、entry ID、
+source keyのexact ownerを再照合し、処理中に切り替わった別contextへ旧originを書かない。GUIでのdetached実機確認は
+後続確認に残す。
+
 **2026-09-13 §1.222 viewer context監査の現行所有境界への追随（親Codex／独立Sol合意）**
 
 `viewer_context_audit` A2bへ`App::resume_loading_items_after_sidecar`をexact登録する。この7件の

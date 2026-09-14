@@ -129,6 +129,11 @@ impl App {
         };
         match rx.try_recv() {
             Ok(Ok(outcome)) => {
+                let collection_scope = if self.rename_target_is_file {
+                    crate::collection_store::CollectionSourceMigrationScope::Exact
+                } else {
+                    crate::collection_store::CollectionSourceMigrationScope::Tree
+                };
                 self.clear_rename_dialog_state();
                 if outcome.aborted {
                     self.show_feedback_toast("名前の変更をキャンセルしました".to_owned());
@@ -149,7 +154,11 @@ impl App {
                 self.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(
                     &outcome.target,
                 ));
-                self.spawn_rename_key_migration(outcome.target.clone(), outcome.new_path.clone());
+                self.spawn_rename_key_migration(
+                    outcome.target.clone(),
+                    outcome.new_path.clone(),
+                    collection_scope,
+                );
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
                     self.current_folder
                         .as_ref()

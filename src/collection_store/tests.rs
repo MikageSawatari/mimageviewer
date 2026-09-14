@@ -469,6 +469,74 @@ fn migration_is_atomic_across_collections_and_preserves_entry_ids() {
 }
 
 #[test]
+fn migration_batch_swaps_sources_in_one_transaction_and_rolls_back_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Swap").unwrap();
+    let snapshot = db
+        .add_batch(
+            created.collection_id(),
+            created.revision(),
+            vec![
+                registration(r"C:\Book\001.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\Book\002.jpg", CollectionResolvedKind::Image),
+            ],
+        )
+        .unwrap()
+        .snapshot;
+    let ids = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    let batch = CollectionSourceMigrationBatch::from_trusted_paths([
+        (
+            r"C:\Book\001.jpg",
+            r"C:\Book\002.jpg",
+            CollectionSourceMigrationScope::Exact,
+        ),
+        (
+            r"C:\Book\002.jpg",
+            r"C:\Book\001.jpg",
+            CollectionSourceMigrationScope::Exact,
+        ),
+    ])
+    .unwrap();
+    let outcome = db.migrate_source_batch(batch).unwrap();
+    assert_eq!(outcome.updated_entries, 2);
+    let swapped = db.snapshot(created.collection_id()).unwrap();
+    assert_eq!(swapped.entries[0].id, ids[0]);
+    assert_eq!(
+        swapped.entries[0].source_path,
+        PathBuf::from(r"C:\Book\002.jpg")
+    );
+    assert_eq!(swapped.entries[1].id, ids[1]);
+    assert_eq!(
+        swapped.entries[1].source_path,
+        PathBuf::from(r"C:\Book\001.jpg")
+    );
+
+    let duplicate = CollectionSourceMigrationBatch::from_trusted_paths([
+        (
+            r"C:\Book\001.jpg",
+            r"C:\Book\same.jpg",
+            CollectionSourceMigrationScope::Exact,
+        ),
+        (
+            r"C:\Book\002.jpg",
+            r"C:\Book\same.jpg",
+            CollectionSourceMigrationScope::Exact,
+        ),
+    ])
+    .unwrap();
+    assert!(matches!(
+        db.migrate_source_batch(duplicate),
+        Err(CollectionStoreError::DuplicateSource(_))
+    ));
+    assert_eq!(db.snapshot(created.collection_id()).unwrap(), swapped);
+}
+
+#[test]
 fn standard_order_uses_aligned_facts_while_manual_ignores_them() {
     let temp = tempfile::tempdir().unwrap();
     let mut db = open_db(&temp);

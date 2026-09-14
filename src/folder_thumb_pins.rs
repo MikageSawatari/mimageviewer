@@ -204,6 +204,7 @@ pub fn source_from_grid_item(
         GridItem::Audio(_)
         | GridItem::SearchContainer { .. }
         | GridItem::ZipDir { .. }
+        | GridItem::CollectionPlaceholder { .. }
         | GridItem::Stack { .. } => None,
     }
 }

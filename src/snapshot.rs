@@ -313,7 +313,7 @@ pub fn snapshot_key_from_grid_item(item: &GridItem) -> Option<SnapshotKey> {
             inner: pdf_page_inner_key(*page_num),
         }),
         // MVP では SearchContainer は §4.5 で disable 扱い (= 取り込まない)
-        GridItem::SearchContainer { .. } => None,
+        GridItem::SearchContainer { .. } | GridItem::CollectionPlaceholder { .. } => None,
         // ZipDir はネスト ZIP ツリーの仮想ナビコンテナ。snapshot は leaf 画像 (ZipImage)
         // を entry_name で復元するので、コンテナ自体は取り込まない (= ナビ状態側で再構築)。
         GridItem::ZipDir { .. } => None,
@@ -335,7 +335,10 @@ pub fn snapshot_entry_kind(item: &GridItem) -> Option<SnapshotEntryKind> {
         GridItem::ConvertibleArchive { .. } => Some(SnapshotEntryKind::ConvertibleArchive),
         GridItem::ZipImage { .. } => Some(SnapshotEntryKind::ZipImage),
         GridItem::PdfPage { .. } => Some(SnapshotEntryKind::PdfPage),
-        GridItem::SearchContainer { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::SearchContainer { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::Stack { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -381,6 +384,7 @@ pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget>
             page_num: *page_num,
         }),
         GridItem::SearchContainer { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 

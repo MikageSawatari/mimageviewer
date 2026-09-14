@@ -61,6 +61,15 @@ pub struct DeletePending {
     pub failed: Vec<(PathBuf, String)>,
     pub purged_pdf_password_paths: Vec<PathBuf>,
     pub purge_deferred: bool,
+    /// Captured from the typed GridItem before deletion starts; never inferred from a path after
+    /// the filesystem operation has removed it.
+    pub source_scopes: Vec<DeleteSourceScope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteSourceScope {
+    Exact(PathBuf),
+    Tree(PathBuf),
 }
 
 impl DeletePending {
@@ -75,7 +84,11 @@ impl DeletePending {
 }
 
 /// 削除ワーカーを spawn する。`paths` のファイル / フォルダをゴミ箱に移動し、進捗を返す。
-pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
+pub fn spawn(
+    paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
+    hwnd: Option<isize>,
+) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -115,6 +128,7 @@ pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
         failed: Vec::new(),
         purged_pdf_password_paths: Vec::new(),
         purge_deferred: false,
+        source_scopes,
     }
 }
 

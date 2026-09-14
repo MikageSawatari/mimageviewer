@@ -8,7 +8,8 @@ use super::db::CollectionStoreDb;
 use super::{
     CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntryId, CollectionId,
     CollectionMigrationOutcome, CollectionOrderMode, CollectionRegistration,
-    CollectionRevisionNotice, CollectionSourceMigration, CollectionStoreError,
+    CollectionRevisionNotice, CollectionSourceMigration, CollectionSourceMigrationBatch,
+    CollectionStoreError,
 };
 use crate::settings::SortOrder;
 
@@ -370,6 +371,16 @@ impl CollectionStoreClient {
         self.request(|reply| Command::MigrateSources { migration, reply })
     }
 
+    pub fn migrate_source_batch(
+        &self,
+        batch: CollectionSourceMigrationBatch,
+    ) -> Result<
+        Receiver<Result<CollectionMigrationOutcome, CollectionStoreError>>,
+        CollectionStoreError,
+    > {
+        self.request(|reply| Command::MigrateSourceBatch { batch, reply })
+    }
+
     #[cfg(test)]
     pub(super) fn test_barrier(
         &self,
@@ -496,6 +507,10 @@ enum Command {
         migration: CollectionSourceMigration,
         reply: Sender<Result<CollectionMigrationOutcome, CollectionStoreError>>,
     },
+    MigrateSourceBatch {
+        batch: CollectionSourceMigrationBatch,
+        reply: Sender<Result<CollectionMigrationOutcome, CollectionStoreError>>,
+    },
     #[cfg(test)]
     TestBarrier {
         entered: Sender<()>,
@@ -524,7 +539,7 @@ impl Command {
             Self::AddBatch { reply, .. } => {
                 let _ = reply.send(Err(CollectionStoreError::Unavailable));
             }
-            Self::MigrateSources { reply, .. } => {
+            Self::MigrateSources { reply, .. } | Self::MigrateSourceBatch { reply, .. } => {
                 let _ = reply.send(Err(CollectionStoreError::Unavailable));
             }
             #[cfg(test)]
@@ -712,6 +727,13 @@ fn process_command(
         }
         Command::MigrateSources { migration, reply } => {
             let result = db.migrate_sources(migration);
+            mutated = result
+                .as_ref()
+                .is_ok_and(|outcome| outcome.updated_entries != 0);
+            let _ = reply.send(result);
+        }
+        Command::MigrateSourceBatch { batch, reply } => {
+            let result = db.migrate_source_batch(batch);
             mutated = result
                 .as_ref()
                 .is_ok_and(|outcome| outcome.updated_entries != 0);

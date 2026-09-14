@@ -70,6 +70,7 @@ pub enum ContextMenuItemId {
     OpenFolderInExplorer,
     OpenExternalToolSettings,
     MoveToRecycleBin,
+    RemoveFromCollection,
     RemoveReadingHistory,
     Deselect,
 }
@@ -101,6 +102,7 @@ impl ContextMenuItemId {
         Self::OpenFolderInExplorer,
         Self::OpenExternalToolSettings,
         Self::MoveToRecycleBin,
+        Self::RemoveFromCollection,
         Self::RemoveReadingHistory,
         Self::Deselect,
     ];
@@ -132,6 +134,7 @@ impl ContextMenuItemId {
             Self::OpenFolderInExplorer => "OpenFolderInExplorer",
             Self::OpenExternalToolSettings => "OpenExternalToolSettings",
             Self::MoveToRecycleBin => "MoveToRecycleBin",
+            Self::RemoveFromCollection => "RemoveFromCollection",
             Self::RemoveReadingHistory => "RemoveReadingHistory",
             Self::Deselect => "Deselect",
         }
@@ -178,6 +181,7 @@ impl ContextMenuItemId {
             Self::OpenFolderInExplorer => "このフォルダをエクスプローラで開く",
             Self::OpenExternalToolSettings => "外部ツールの設定…",
             Self::MoveToRecycleBin => "ゴミ箱へ移動 (タグ・評価も整理)",
+            Self::RemoveFromCollection => "コレクションから外す",
             Self::RemoveReadingHistory => "履歴から削除",
             Self::Deselect => "選択解除",
         }
@@ -210,6 +214,7 @@ impl ContextMenuItemId {
             MenuCommand::OpenFolderInExplorer => Self::OpenFolderInExplorer,
             MenuCommand::OpenExternalToolSettings => Self::OpenExternalToolSettings,
             MenuCommand::MoveToRecycleBin => Self::MoveToRecycleBin,
+            MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
             MenuCommand::ExternalTool(_) | MenuCommand::OpenWithAssociation { .. } => return None,
@@ -383,6 +388,7 @@ pub(crate) enum ContextMenuPreviewScenario {
     GridPdfPage,
     GridStack,
     GridCheckedRealFiles,
+    GridCollectionItem,
     FullscreenImage,
     FullscreenVideo,
 }
@@ -397,6 +403,7 @@ impl ContextMenuPreviewScenario {
         Self::GridPdfPage,
         Self::GridStack,
         Self::GridCheckedRealFiles,
+        Self::GridCollectionItem,
         Self::FullscreenImage,
         Self::FullscreenVideo,
     ];
@@ -413,6 +420,7 @@ impl ContextMenuPreviewScenario {
             Self::GridPdfPage => "一覧：PDF内ページ",
             Self::GridStack => "一覧：スタック",
             Self::GridCheckedRealFiles => "一覧：複数の実ファイルを選択",
+            Self::GridCollectionItem => "一覧：コレクションの項目",
             Self::FullscreenImage => "フルスクリーン：画像",
             Self::FullscreenVideo => "フルスクリーン：動画",
         }
@@ -436,12 +444,15 @@ impl ContextMenuPreviewScenario {
             Self::GridZipReadingHistory => (ContextMenuItemKind::ZipFile, ContextMenuSurface::Grid),
             Self::GridPdfPage => (ContextMenuItemKind::PdfPage, ContextMenuSurface::Grid),
             Self::GridStack => (ContextMenuItemKind::Stack, ContextMenuSurface::Grid),
-            Self::GridCheckedRealFiles => (ContextMenuItemKind::Image, ContextMenuSurface::Grid),
+            Self::GridCheckedRealFiles | Self::GridCollectionItem => {
+                (ContextMenuItemKind::Image, ContextMenuSurface::Grid)
+            }
             Self::FullscreenImage => (ContextMenuItemKind::Image, ContextMenuSurface::Fullscreen),
             Self::FullscreenVideo => (ContextMenuItemKind::Video, ContextMenuSurface::Fullscreen),
         };
         let is_folder_context = self == Self::GridFolderBackground;
         let has_checked = self == Self::GridCheckedRealFiles;
+        let collection_reference = self == Self::GridCollectionItem;
         let in_search = self == Self::GridSearchImage;
         let reading_history = self == Self::GridZipReadingHistory;
         let normal_pin = matches!(
@@ -463,6 +474,7 @@ impl ContextMenuPreviewScenario {
             can_use_folder_commands: is_folder_context,
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
+            collection_reference,
             view: ContextMenuViewFlags {
                 in_search,
                 search: in_search,
@@ -705,6 +717,7 @@ pub enum MenuCommand {
     },
     OpenExternalToolSettings,
     MoveToRecycleBin,
+    RemoveFromCollection,
     Deselect,
     RemoveReadingHistory,
 }
@@ -738,6 +751,7 @@ pub enum ContextMenuItemKind {
     Stack,
     ZipDir,
     SearchContainer,
+    CollectionPlaceholder,
 }
 
 impl ContextMenuItemKind {
@@ -755,6 +769,7 @@ impl ContextMenuItemKind {
             GridItem::Stack { .. } => Self::Stack,
             GridItem::ZipDir { .. } => Self::ZipDir,
             GridItem::SearchContainer { .. } => Self::SearchContainer,
+            GridItem::CollectionPlaceholder { .. } => Self::CollectionPlaceholder,
         }
     }
 
@@ -772,7 +787,7 @@ impl ContextMenuItemKind {
     }
 
     fn has_file_name(self) -> bool {
-        self.is_real_item() || matches!(self, Self::ZipImage)
+        self.is_real_item() || matches!(self, Self::ZipImage | Self::CollectionPlaceholder)
     }
 
     fn supports_page_edits(self) -> bool {
@@ -850,6 +865,8 @@ pub struct ContextMenuInput {
     pub can_use_folder_commands: bool,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
+    /// 現在のcellまたはchecked集合が同じcollection bindingに属する参照か。
+    pub collection_reference: bool,
     pub view: ContextMenuViewFlags,
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
@@ -1126,6 +1143,15 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             )],
         );
         if input.surface == ContextMenuSurface::Grid {
+            if input.collection_reference {
+                push_group(
+                    &mut nodes,
+                    [item(
+                        MenuCommand::RemoveFromCollection,
+                        format!("コレクションから外す [{}件]", input.checked_count),
+                    )],
+                );
+            }
             push_group(
                 &mut nodes,
                 [
@@ -1404,6 +1430,19 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     }
 
     if input.surface == ContextMenuSurface::Grid
+        && !input.is_folder_context
+        && input.collection_reference
+    {
+        push_group(
+            &mut nodes,
+            [item(
+                MenuCommand::RemoveFromCollection,
+                "コレクションから外す",
+            )],
+        );
+    }
+
+    if input.surface == ContextMenuSurface::Grid
         && input.view.reading_history
         && !input.is_folder_context
     {
@@ -1458,6 +1497,7 @@ mod tests {
             can_use_folder_commands: false,
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
+            collection_reference: false,
             view: ContextMenuViewFlags::default(),
             pin: None,
             external_tools: Vec::new(),

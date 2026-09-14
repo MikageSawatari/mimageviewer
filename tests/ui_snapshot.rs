@@ -390,6 +390,28 @@ fn cut_item_appearance_light() {
 }
 
 #[test]
+fn collection_placeholder_dark() {
+    snapshot_with_theme_at_size(
+        "collection_placeholder_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(500.0, 180.0),
+        None,
+        mimageviewer::draw_collection_placeholder_snapshot_fixture,
+    );
+}
+
+#[test]
+fn collection_placeholder_light() {
+    snapshot_with_theme_at_size(
+        "collection_placeholder_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(500.0, 180.0),
+        None,
+        mimageviewer::draw_collection_placeholder_snapshot_fixture,
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_latched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_latched_dark",

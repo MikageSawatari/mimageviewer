@@ -243,6 +243,190 @@ pub(crate) enum TopLevelGridRestore {
     Rating { stars: u8 },
     SubfolderExpansion(SubfolderExpansionRestoreState),
     SmartFolder(SmartFolderViewState),
+    Collection(CollectionGridRestore),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridIdentity {
+    pub(crate) collection_id: crate::collection_store::CollectionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridViewportAnchor {
+    pub(crate) entry_id: crate::collection_store::CollectionEntryId,
+    pub(crate) source_key: crate::collection_store::CollectionSourcePathKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridRestore {
+    pub(crate) identity: CollectionGridIdentity,
+    /// Minimum revision hint. The actor may return any newer revision.
+    pub(crate) revision_at_open: u64,
+    pub(crate) viewport_anchor: Option<CollectionGridViewportAnchor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPosition {
+    Root,
+    PhysicalSource {
+        entry_id: crate::collection_store::CollectionEntryId,
+        source_key: crate::collection_store::CollectionSourcePathKey,
+        path: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridRequestStamp {
+    pub(crate) context_id: super::viewer_context_registry::ViewerContextId,
+    pub(crate) surface_generation: u64,
+    pub(crate) collection_id: crate::collection_store::CollectionId,
+}
+
+/// Exact collection-grid owner captured before an asynchronous physical source open starts.
+///
+/// The surface stamp prevents a completion from crossing viewer contexts or collection
+/// replacements. Both revisions are kept because a notice may advance `wanted_revision` while
+/// the currently installed immutable binding still has `accepted_revision`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridSourceOpenOwner {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) anchor: CollectionGridViewportAnchor,
+}
+
+pub(crate) enum CollectionGridLoadState {
+    RequestNeeded {
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    },
+    Snapshot {
+        stamp: CollectionGridRequestStamp,
+        minimum_revision: u64,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        receiver: crossbeam_channel::Receiver<
+            Result<
+                crate::collection_store::CollectionSnapshot,
+                crate::collection_store::CollectionStoreError,
+            >,
+        >,
+    },
+    Preparing {
+        stamp: CollectionGridRequestStamp,
+        exact_revision: u64,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        receiver: std::sync::mpsc::Receiver<
+            Result<
+                crate::collection_store::CollectionPreparedSnapshot,
+                crate::collection_store::CollectionPrepareError,
+            >,
+        >,
+    },
+    Ready(std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>),
+    Empty(std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>),
+    Failed {
+        message: String,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    },
+    Deleted,
+}
+
+impl CollectionGridLoadState {
+    pub(crate) fn installed(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
+        match self {
+            Self::RequestNeeded { installed }
+            | Self::Snapshot { installed, .. }
+            | Self::Preparing { installed, .. }
+            | Self::Failed { installed, .. } => installed.as_ref(),
+            Self::Ready(prepared) | Self::Empty(prepared) => Some(prepared),
+            Self::Deleted => None,
+        }
+    }
+}
+
+pub(crate) struct CollectionGridSession {
+    pub(crate) identity: CollectionGridIdentity,
+    pub(crate) position: CollectionGridPosition,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) observed_catalog_revision: u64,
+    pub(crate) load: CollectionGridLoadState,
+    pub(crate) watch: Option<crate::collection_store::CollectionRevisionWatch>,
+    pub(crate) restore_anchor: Option<CollectionGridViewportAnchor>,
+    pub(crate) installed_items_generation: Option<u64>,
+}
+
+impl CollectionGridSession {
+    fn new(identity: CollectionGridIdentity) -> Self {
+        Self {
+            identity,
+            position: CollectionGridPosition::Root,
+            accepted_revision: 0,
+            wanted_revision: 0,
+            observed_catalog_revision: 0,
+            load: CollectionGridLoadState::RequestNeeded { installed: None },
+            watch: None,
+            restore_anchor: None,
+            installed_items_generation: None,
+        }
+    }
+
+    pub(crate) fn cancel_pending(&mut self) {
+        let previous = std::mem::replace(
+            &mut self.load,
+            CollectionGridLoadState::RequestNeeded { installed: None },
+        );
+        let installed = match previous {
+            CollectionGridLoadState::RequestNeeded { installed }
+            | CollectionGridLoadState::Snapshot { installed, .. }
+            | CollectionGridLoadState::Failed { installed, .. } => installed,
+            CollectionGridLoadState::Preparing {
+                installed, cancel, ..
+            } => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                installed
+            }
+            CollectionGridLoadState::Ready(prepared) | CollectionGridLoadState::Empty(prepared) => {
+                Some(prepared)
+            }
+            CollectionGridLoadState::Deleted => None,
+        };
+        self.load = CollectionGridLoadState::RequestNeeded { installed };
+    }
+
+    pub(crate) fn prepared(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
+        self.load.installed()
+    }
+}
+
+impl Drop for CollectionGridSession {
+    fn drop(&mut self) {
+        if let CollectionGridLoadState::Preparing { cancel, .. } = &self.load {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl Clone for CollectionGridSession {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity,
+            position: self.position.clone(),
+            accepted_revision: self.accepted_revision,
+            wanted_revision: self.wanted_revision,
+            observed_catalog_revision: self.observed_catalog_revision,
+            load: CollectionGridLoadState::RequestNeeded {
+                installed: self.load.installed().cloned(),
+            },
+            watch: None,
+            restore_anchor: self.restore_anchor.clone(),
+            installed_items_generation: self.installed_items_generation,
+        }
+    }
 }
 
 impl TopLevelGridRestore {
@@ -293,6 +477,7 @@ impl TopLevelGridRestore {
             Self::SmartFolder(state) => Some(super::smart_folder::smart_folder_synthetic_path(
                 state.definition_id,
             )),
+            Self::Collection(_) => None,
         }
     }
 
@@ -322,6 +507,7 @@ pub(crate) enum TopLevelGridSurface {
     ReadingHistory,
     Bookmarks,
     Rating { stars: u8 },
+    Collection(CollectionGridIdentity),
 }
 
 impl super::App {
@@ -377,6 +563,9 @@ impl super::App {
                 self.enter_drive_list(origin);
             }
             TopLevelGridSurface::Snapshot => {}
+            TopLevelGridSurface::Collection(identity) => {
+                self.open_collection_grid(identity.collection_id, None);
+            }
         }
 
         if self.settings.folder_tree_pane_visible {
@@ -397,6 +586,7 @@ pub(crate) struct TopLevelGridView {
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
     /// owns the navigation scope.
     smart_folder_session: Option<super::smart_folder::SmartFolderSession>,
+    collection_session: Option<CollectionGridSession>,
 }
 
 impl Clone for TopLevelGridView {
@@ -408,6 +598,7 @@ impl Clone for TopLevelGridView {
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
+            collection_session: self.collection_session.clone(),
         }
     }
 }
@@ -434,6 +625,7 @@ impl Default for TopLevelGridView {
             return_to: None,
             generation: 0,
             smart_folder_session: None,
+            collection_session: None,
         }
     }
 }
@@ -443,6 +635,10 @@ impl TopLevelGridView {
         &self.surface
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn begin(
         &mut self,
         surface: TopLevelGridSurface,
@@ -450,6 +646,12 @@ impl TopLevelGridView {
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.smart_folder_session = None;
+        self.collection_session = match &surface {
+            TopLevelGridSurface::Collection(identity) => {
+                Some(CollectionGridSession::new(*identity))
+            }
+            _ => None,
+        };
         self.surface = surface;
         self.return_to = return_to;
         self.generation
@@ -467,6 +669,12 @@ impl TopLevelGridView {
         if !keeps_smart_folder_session {
             self.smart_folder_session = None;
         }
+        self.collection_session = match &surface {
+            TopLevelGridSurface::Collection(identity) => {
+                Some(CollectionGridSession::new(*identity))
+            }
+            _ => None,
+        };
         self.surface = surface;
         self.return_to = None;
         self.generation
@@ -475,12 +683,27 @@ impl TopLevelGridView {
     pub(crate) fn take_return_to(&mut self) -> Option<TopLevelGridRestore> {
         self.generation = self.generation.wrapping_add(1);
         self.smart_folder_session = None;
+        self.collection_session = None;
         self.surface = TopLevelGridSurface::Folder;
         self.return_to.take()
     }
 
     pub(crate) fn return_to(&self) -> Option<&TopLevelGridRestore> {
         self.return_to.as_ref()
+    }
+
+    /// Installs a return owner captured by the source context into a newly-built physical viewer.
+    /// This does not change the new context's current surface or generation.
+    pub(crate) fn install_return_to(&mut self, return_to: TopLevelGridRestore) {
+        self.return_to = Some(return_to);
+    }
+
+    pub(crate) fn collection_session(&self) -> Option<&CollectionGridSession> {
+        self.collection_session.as_ref()
+    }
+
+    pub(crate) fn collection_session_mut(&mut self) -> Option<&mut CollectionGridSession> {
+        self.collection_session.as_mut()
     }
 
     pub(crate) fn smart_folder(&self) -> Option<&SmartFolderViewState> {
@@ -629,6 +852,55 @@ mod tests {
             view.return_to(),
             Some(TopLevelGridRestore::Folder(path)) if path == Path::new(r"D:\origin")
         ));
+    }
+
+    #[test]
+    fn retiring_collection_surface_cancels_only_its_preparing_worker() {
+        let first_id = crate::collection_store::CollectionId::new();
+        let sibling_id = crate::collection_store::CollectionId::new();
+        let first_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (_sibling_tx, sibling_rx) = std::sync::mpsc::sync_channel(1);
+        let stamp = |collection_id| CollectionGridRequestStamp {
+            context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+            surface_generation: 1,
+            collection_id,
+        };
+
+        let mut first = TopLevelGridView::default();
+        first.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: first_id,
+            }),
+            None,
+        );
+        first.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
+            stamp: stamp(first_id),
+            exact_revision: 1,
+            installed: None,
+            cancel: Arc::clone(&first_cancel),
+            receiver: first_rx,
+        };
+
+        let mut sibling = TopLevelGridView::default();
+        sibling.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: sibling_id,
+            }),
+            None,
+        );
+        sibling.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
+            stamp: stamp(sibling_id),
+            exact_revision: 1,
+            installed: None,
+            cancel: Arc::clone(&sibling_cancel),
+            receiver: sibling_rx,
+        };
+
+        first.replace_surface(TopLevelGridSurface::Folder);
+        assert!(first_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!sibling_cancel.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

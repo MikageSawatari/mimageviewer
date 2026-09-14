@@ -10,7 +10,8 @@ use super::{
     CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionDefinition, CollectionEntry,
     CollectionEntryId, CollectionId, CollectionMigrationOutcome, CollectionOrderMode,
     CollectionRegistration, CollectionResolvedKind, CollectionSourceMigration,
-    CollectionSourceNamespace, CollectionSourcePathKey, CollectionStoreError,
+    CollectionSourceMigrationBatch, CollectionSourceNamespace, CollectionSourcePathKey,
+    CollectionStoreError,
 };
 use crate::settings::SortOrder;
 
@@ -353,6 +354,15 @@ impl CollectionStoreDb {
         &mut self,
         migration: CollectionSourceMigration,
     ) -> Result<CollectionMigrationOutcome, CollectionStoreError> {
+        self.migrate_source_batch(CollectionSourceMigrationBatch {
+            migrations: vec![migration],
+        })
+    }
+
+    pub(super) fn migrate_source_batch(
+        &mut self,
+        batch: CollectionSourceMigrationBatch,
+    ) -> Result<CollectionMigrationOutcome, CollectionStoreError> {
         let tx = self.conn.transaction()?;
         let entries = load_all_entries(&tx)?;
         let mut replacements = Vec::new();
@@ -360,7 +370,18 @@ impl CollectionStoreDb {
             HashMap::new();
 
         for entry in &entries {
-            let replacement = migration.replacement_for(&entry.source_path, &entry.source_key)?;
+            let mut replacement = None;
+            for migration in &batch.migrations {
+                let candidate = migration.replacement_for(&entry.source_path, &entry.source_key)?;
+                if candidate.is_some() && replacement.is_some() {
+                    return Err(CollectionStoreError::InvalidPath(
+                        "collection source migration mappings overlap".into(),
+                    ));
+                }
+                if candidate.is_some() {
+                    replacement = candidate;
+                }
+            }
             let key = replacement
                 .as_ref()
                 .map_or_else(|| entry.source_key.clone(), |source| source.key().clone());
@@ -386,6 +407,18 @@ impl CollectionStoreDb {
             });
         }
         let mut affected = HashSet::new();
+        // A batch may exchange two keys in the same collection. Validation above proves that the
+        // final key set is unique, but updating rows directly would still collide with the other
+        // row's old UNIQUE key. Move every affected row into a transaction-local namespace first;
+        // these values can never commit because every following error rolls the transaction back.
+        for (entry_id, _, _) in &replacements {
+            tx.execute(
+                "UPDATE collection_entries
+                 SET source_namespace = '_migration', normalized_path = ?1
+                 WHERE id = ?2",
+                params![entry_id.to_string(), entry_id.to_string()],
+            )?;
+        }
         for (entry_id, collection_id, replacement) in &replacements {
             tx.execute(
                 "UPDATE collection_entries

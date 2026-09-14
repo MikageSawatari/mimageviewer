@@ -111,6 +111,32 @@ pub enum GridItem {
         /// アイコンの代わりにサムネイルとして描画する。None ならアイコン表示のみ。
         representative: Option<ContainerRepresentative>,
     },
+    /// A physical source reference retained by a collection even though it cannot currently be
+    /// opened. The collection-owned aligned binding carries the stable entry identity and typed
+    /// reason; this value exists only so the ordinary Grid can paint the row without pretending
+    /// that the source is an Image/Folder and accidentally enabling physical operations.
+    CollectionPlaceholder {
+        path: PathBuf,
+        last_known_kind: crate::collection_store::CollectionResolvedKind,
+        reason: CollectionPlaceholderReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionPlaceholderReason {
+    Missing,
+    Unsupported,
+    AccessError,
+}
+
+impl CollectionPlaceholderReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "見つかりません",
+            Self::Unsupported => "未対応の形式",
+            Self::AccessError => "読み取れません",
+        }
+    }
 }
 
 /// `GridItem::SearchContainer` のコンテナ種別 (v0.8.0)。
@@ -150,6 +176,8 @@ pub enum FileOperationRefusal {
     Stack,
     /// 検索結果の集約コンテナ。
     SearchContainer,
+    /// A collection reference whose physical source is currently missing or unavailable.
+    CollectionSourceUnavailable,
 }
 
 impl FileOperationRefusal {
@@ -165,6 +193,9 @@ impl FileOperationRefusal {
                 "スタックのセルは{action}できません。スタック表示をオフにすると個別に選べます"
             ),
             Self::SearchContainer => format!("検索結果のまとまりは{action}できません"),
+            Self::CollectionSourceUnavailable => {
+                format!("見つからないコレクション項目は{action}できません")
+            }
         }
     }
 }
@@ -277,6 +308,7 @@ impl GridItem {
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => path_display_name(path),
             GridItem::Stack { key, .. } => Cow::Borrowed(key),
+            GridItem::CollectionPlaceholder { path, .. } => path_display_name(path),
         }
     }
 
@@ -308,6 +340,7 @@ impl GridItem {
                 ..
             } => format!("{}:{}", zip_path.display(), dir_prefix),
             GridItem::Stack { representative, .. } => representative.display().to_string(),
+            GridItem::CollectionPlaceholder { path, .. } => path.display().to_string(),
         }
     }
 
@@ -372,6 +405,9 @@ impl GridItem {
             Self::ZipDir { .. } => Some(FileOperationRefusal::ArchiveDirectory),
             Self::Stack { .. } => Some(FileOperationRefusal::Stack),
             Self::SearchContainer { .. } => Some(FileOperationRefusal::SearchContainer),
+            Self::CollectionPlaceholder { .. } => {
+                Some(FileOperationRefusal::CollectionSourceUnavailable)
+            }
         }
     }
 
@@ -424,6 +460,9 @@ impl GridItem {
             }
             GridItem::Stack { representative, .. } => {
                 format!("stack::{}", representative.display())
+            }
+            GridItem::CollectionPlaceholder { path, .. } => {
+                format!("collection-missing::{}", path.display())
             }
         }
     }
@@ -731,7 +770,7 @@ fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind>
         | GridItem::PdfPage { .. }
         | GridItem::Stack { .. } => Some(GridItemDisplayKind::Image),
         GridItem::Video(_) | GridItem::Audio(_) => Some(GridItemDisplayKind::VideoAudio),
-        GridItem::SearchContainer { .. } => None,
+        GridItem::SearchContainer { .. } | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 

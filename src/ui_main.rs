@@ -123,6 +123,7 @@ pub(crate) enum AddressBarNav {
     BooksRoot,
     HistoryBack,
     HistoryForward,
+    Collection(crate::app::top_level_grid_view::CollectionGridRestore),
 }
 
 /// Owns the primary-button sequence spent cancelling a grid right-drag.
@@ -4492,6 +4493,7 @@ fn details_kind_label(
             crate::grid_item::SearchContainerKind::Zip => "検索ZIP".to_string(),
         },
         GridItem::Stack { count, .. } => format!("スタック ({count})"),
+        GridItem::CollectionPlaceholder { reason, .. } => reason.label().to_string(),
     }
 }
 
@@ -4565,6 +4567,7 @@ fn selection_info_parent_location_label(item: &GridItem) -> Option<String> {
         GridItem::Stack { representative, .. } => {
             short_path_name(representative.parent()?).map(|name| format!("親フォルダ名 {name}"))
         }
+        GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -4771,6 +4774,7 @@ fn grid_item_diagnostic_kind(item: &GridItem) -> &'static str {
         GridItem::PdfPage { .. } => "pdf_page",
         GridItem::SearchContainer { .. } => "search_container",
         GridItem::Stack { .. } => "stack",
+        GridItem::CollectionPlaceholder { .. } => "collection_placeholder",
     }
 }
 
@@ -6871,6 +6875,7 @@ impl App {
                             self.apply_book_page_edit_moves_with_journal(
                                 &edit_moves,
                                 bookmark_migration_journal_id.as_deref(),
+                                None,
                             );
                             self.book_reorder = None;
                             if self.current_folder.as_ref().is_some_and(|current| {
@@ -6911,6 +6916,7 @@ impl App {
                             self.apply_book_page_edit_moves_with_journal(
                                 &summary.edit_moves,
                                 summary.bookmark_migration_journal_id.as_deref(),
+                                None,
                             );
                             self.apply_book_page_edit_copies(&summary.edit_copies);
                             self.book_list_cache = None;
@@ -7853,6 +7859,29 @@ impl App {
         // pending 中は毎フレーム再描画 (受信ポーリングのため request_repaint は既に
         // 別経路でも走っているが、念のためここでも要求)
         ctx.request_repaint();
+    }
+
+    /// Keeps a refresh failure visible while the last accepted collection binding remains
+    /// usable. A later collection notice/reopen owns retry; drawing this badge schedules no I/O.
+    pub(crate) fn render_collection_grid_error_overlay(&self, ctx: &egui::Context) {
+        let Some(message) = self.collection_grid_stale_error_message() else {
+            return;
+        };
+        egui::Area::new("collection_grid_error_overlay".into())
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(PROGRESS_BG_COLOR)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(message)
+                                .monospace()
+                                .color(PROGRESS_LABEL_COLOR),
+                        );
+                    });
+            });
     }
 
     // ── ツールバー ───────────────────────────────────────────────────
@@ -9170,7 +9199,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.add_grid_selection_to_named_book(ctx, name);
         }
         if let Some(id) = toolbar_collection_target {
-            self.select_collection_management_target(id);
+            self.open_collection_grid(id, None);
         }
         if toolbar_collection_manage {
             self.open_collection_manager(active_collection_id);
@@ -12105,6 +12134,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(AddressBarNav::BooksRoot) => {
                                         "本棚フォルダへ".to_string()
                                     }
+                                    Some(AddressBarNav::Collection(_)) => {
+                                        "コレクションへ戻る [BS]".to_string()
+                                    }
                                     Some(
                                         AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
                                     )
@@ -13823,6 +13855,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // で処理済み (フラットフルスクリーンへ)。非スタックモードでは Stack セルは存在
                 // しないので網羅性のため no-op。
                 Some(GridItem::Stack { .. }) => {}
+                Some(GridItem::CollectionPlaceholder { .. }) => {
+                    self.show_feedback_toast("この参照は現在見つからないため開けません".into());
+                }
                 None => {}
             }
         }
@@ -15982,6 +16017,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let global_searching =
                     self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {
+                    let collection_message = self.collection_grid_empty_message();
                     self.pending_grid_scroll = None;
                     // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
                     // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
@@ -15991,7 +16027,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // 空になった理由が付いていればそれを出す (§1.68)。理由の無い空だけが
                     // 「本当に 0 件」で、読み込みの失敗と同じ文言にはしない。
                     let failure = self.empty_items_reason().map(|reason| reason.message());
-                    let msg = if self.items_are_bookmark_view
+                    let msg = if let Some(message) = collection_message.as_deref() {
+                        message
+                    } else if self.items_are_bookmark_view
                         && self.bookmark_browser_pending.is_some()
                     {
                         "ブックマークを読み込み中…"

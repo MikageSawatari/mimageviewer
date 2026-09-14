@@ -1131,7 +1131,9 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         // ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
         // 検索 rebuild の reuse 対象外 (スタックの drill/back は install_new_items 経由で
         // この関数を通らない)。
-        GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::ZipDir { .. }
+        | GridItem::Stack { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 

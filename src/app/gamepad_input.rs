@@ -7095,6 +7095,7 @@ impl App {
                 self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 None
             }
+            Some(GridItem::CollectionPlaceholder { .. }) => None,
             Some(GridItem::ConvertibleArchive { path, format }) => {
                 let owner = self.main_grid_archive_open_owner(idx, &path);
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();

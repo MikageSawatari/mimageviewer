@@ -1327,6 +1327,9 @@ fn candidate_from_grid_item(
                 crate::grid_item::SearchContainerKind::Zip => RemoteEntryKind::Zip,
             },
         ),
+        // Collection Grid is connected to Remote in Phase 5. Never expose an unavailable
+        // local placeholder through the existing folder aggregate in the meantime.
+        GridItem::CollectionPlaceholder { .. } => return None,
     };
     Some(CandidateEntry {
         path,

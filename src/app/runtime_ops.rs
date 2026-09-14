@@ -407,6 +407,10 @@ impl App {
         self.persist_window_state_and_flush(crate::app::PersistScope::ProcessIsStopping);
         // Normal frames only enqueue latest-value journal snapshots. Exit is the one boundary
         // that waits for the writer so the next startup can recover every unfinished rename.
-        self.flush_rename_migration_journal();
+        if let Err(error) = self.flush_rename_migration_journal() {
+            crate::logger::log(format!(
+                "[RENAME-MIG] exit journal flush remained unsaved: {error}"
+            ));
+        }
     }
 }

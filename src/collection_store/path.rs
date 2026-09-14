@@ -132,6 +132,34 @@ impl CollectionSourceMigration {
     }
 }
 
+impl super::CollectionSourceMigrationBatch {
+    pub fn from_trusted_paths<I, O, N>(mappings: I) -> Result<Self, CollectionStoreError>
+    where
+        I: IntoIterator<Item = (O, N, CollectionSourceMigrationScope)>,
+        O: AsRef<Path>,
+        N: AsRef<Path>,
+    {
+        let migrations = mappings
+            .into_iter()
+            .map(|(old, new, scope)| CollectionSourceMigration::from_trusted_paths(old, new, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        if migrations.is_empty() {
+            return Err(CollectionStoreError::InvalidPath(
+                "collection source migration batch is empty".into(),
+            ));
+        }
+        Ok(Self { migrations })
+    }
+
+    pub fn len(&self) -> usize {
+        self.migrations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.migrations.is_empty()
+    }
+}
+
 fn normalize_collection_path(
     path: &Path,
     policy: CollectionImportPathPolicy,

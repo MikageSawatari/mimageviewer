@@ -316,6 +316,7 @@ struct NativeGridContextMenuTarget {
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
+    collection_remove: Option<crate::app::collection_grid::CollectionGridRemoveTarget>,
 }
 
 impl NativeGridContextMenuTarget {
@@ -494,7 +495,8 @@ fn context_item_path_text(item: &GridItem) -> String {
         | GridItem::Stack {
             representative: path,
             ..
-        } => native_path_text(path),
+        }
+        | GridItem::CollectionPlaceholder { path, .. } => native_path_text(path),
         GridItem::ZipImage {
             zip_path,
             entry_name,
@@ -919,6 +921,7 @@ impl crate::app::App {
             } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
             // ファイル名スタック: 代表画像の実パスをコピー。
             GridItem::Stack { representative, .. } => native_path_text(&representative),
+            GridItem::CollectionPlaceholder { path, .. } => native_path_text(&path),
         };
         ctx.copy_text(text);
         true
@@ -979,6 +982,7 @@ impl crate::app::App {
             GridItem::PdfPage { pdf_path, .. } => pdf_path,
             // ファイル名スタック: 代表画像を含むフォルダを開く。
             GridItem::Stack { representative, .. } => representative,
+            GridItem::CollectionPlaceholder { .. } => return false,
         };
         open_folder_in_explorer(&path);
         true
@@ -1191,6 +1195,8 @@ impl crate::app::App {
                 source,
             )
         };
+        let collection_remove =
+            self.collection_grid_remove_target((!is_folder_context).then_some(idx), has_checked);
         NativeGridContextMenuTarget {
             shell_paths,
             real_paths,
@@ -1205,6 +1211,7 @@ impl crate::app::App {
             surface,
             explorer_folder,
             folder_command_target,
+            collection_remove,
         }
     }
 
@@ -1257,6 +1264,7 @@ impl crate::app::App {
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
+            collection_reference: target.collection_remove.is_some(),
             view,
             pin: self.context_menu_pin_state(target, view),
             external_tools,
@@ -1672,6 +1680,12 @@ impl crate::app::App {
                 }
                 if !target.delete_targets.is_empty() {
                     self.request_delete_confirm(target.delete_targets.clone());
+                }
+                None
+            }
+            MenuCommand::RemoveFromCollection => {
+                if let Some(request) = target.collection_remove.clone() {
+                    self.request_collection_grid_remove(request);
                 }
                 None
             }
@@ -2519,6 +2533,7 @@ fn context_explorer_folder(
         }
         GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
         GridItem::Stack { representative, .. } => representative.parent().map(Path::to_path_buf),
+        GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -2592,6 +2607,7 @@ mod delete_confirm_tests {
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
+            collection_remove: None,
         }
     }
 
@@ -3005,6 +3021,7 @@ mod delete_confirm_tests {
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
+            collection_remove: None,
         };
 
         let items = app.context_menu_nodes(&target, false);

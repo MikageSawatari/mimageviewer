@@ -51,6 +51,28 @@ pub(crate) struct CollectionExportPreparation {
     pub(crate) source_states: Arc<[(CollectionEntryId, CollectionSourcePreparation)]>,
 }
 
+/// Immutable, fully classified collection listing shared by the Grid and text export. Every
+/// source remains present even when it cannot currently be opened.
+#[derive(Clone)]
+pub(crate) struct CollectionPreparedSnapshot {
+    pub(crate) collection_id: super::CollectionId,
+    pub(crate) collection_revision: u64,
+    pub(crate) collection_name: String,
+    pub(crate) entries: Arc<[PreparedCollectionEntry]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedCollectionEntry {
+    pub(crate) entry_id: CollectionEntryId,
+    pub(crate) source_key: super::CollectionSourcePathKey,
+    pub(crate) source_path: PathBuf,
+    pub(crate) availability: CollectionSourcePreparation,
+    pub(crate) item: crate::grid_item::GridItem,
+    /// Existing Grid display metadata. Availability is owned by `availability`, never inferred
+    /// from the zero values used by legacy thumbnail/detail paths.
+    pub(crate) display_meta: Option<(i64, i64)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CollectionPrepareError {
     Cancelled,
@@ -133,11 +155,40 @@ pub(crate) fn prepare_collection_export(
     snapshot: &CollectionSnapshot,
     display_order: &GridDisplayOrder,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(usize, usize),
+    progress: impl FnMut(usize, usize),
 ) -> Result<CollectionExportPreparation, CollectionPrepareError> {
+    let prepared = prepare_collection_snapshot(snapshot, display_order, cancel, progress)?;
+    Ok(CollectionExportPreparation {
+        collection_id: prepared.collection_id,
+        collection_revision: prepared.collection_revision,
+        ordered_paths: Arc::from(
+            prepared
+                .entries
+                .iter()
+                .map(|entry| entry.source_path.clone())
+                .collect::<Vec<_>>(),
+        ),
+        source_states: Arc::from(
+            prepared
+                .entries
+                .iter()
+                .map(|entry| (entry.entry_id, entry.availability.clone()))
+                .collect::<Vec<_>>(),
+        ),
+    })
+}
+
+/// Inspect and order one actor snapshot without consulting UI state. This is the single
+/// filesystem classification/order owner used by both the Phase 3 Grid and export.
+pub(crate) fn prepare_collection_snapshot(
+    snapshot: &CollectionSnapshot,
+    display_order: &GridDisplayOrder,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<CollectionPreparedSnapshot, CollectionPrepareError> {
     let total = snapshot.entries.len();
     let mut facts = Vec::with_capacity(total);
-    let mut states = Vec::with_capacity(total);
+    let mut prepared_by_id = std::collections::HashMap::with_capacity(total);
     for (index, entry) in snapshot.entries.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return Err(CollectionPrepareError::Cancelled);
@@ -167,30 +218,101 @@ pub(crate) fn prepare_collection_export(
             mtime,
             file_size,
         });
-        states.push((entry.id, state));
+        let item = grid_item_for_prepared_source(&entry.source_path, entry.resolved_kind, &state);
+        let display_meta = match &state {
+            CollectionSourcePreparation::Available {
+                kind: CollectionResolvedKind::Folder,
+                mtime,
+                ..
+            } => Some((*mtime, 0)),
+            CollectionSourcePreparation::Available {
+                mtime, file_size, ..
+            } => Some((*mtime, file_size.unwrap_or(0))),
+            CollectionSourcePreparation::Missing
+            | CollectionSourcePreparation::Unsupported
+            | CollectionSourcePreparation::AccessError(_) => Some((0, 0)),
+        };
+        prepared_by_id.insert(
+            entry.id,
+            PreparedCollectionEntry {
+                entry_id: entry.id,
+                source_key: entry.source_key.clone(),
+                source_path: entry.source_path.clone(),
+                availability: state,
+                item,
+                display_meta,
+            },
+        );
         progress(index + 1, total);
     }
     let order = effective_collection_order(snapshot, &facts)?;
-    let by_id = snapshot
-        .entries
-        .iter()
-        .map(|entry| (entry.id, entry.source_path.clone()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let ordered_paths = order
+    let entries = order
         .into_iter()
         .map(|id| {
-            by_id
-                .get(&id)
-                .cloned()
+            prepared_by_id
+                .remove(&id)
                 .ok_or(CollectionStoreError::InvalidOrder)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CollectionExportPreparation {
+    if !prepared_by_id.is_empty() {
+        return Err(CollectionStoreError::InvalidOrder.into());
+    }
+    Ok(CollectionPreparedSnapshot {
         collection_id: snapshot.collection_id(),
         collection_revision: snapshot.revision(),
-        ordered_paths: Arc::from(ordered_paths),
-        source_states: Arc::from(states),
+        collection_name: snapshot.definition.name.clone(),
+        entries: Arc::from(entries),
     })
+}
+
+fn grid_item_for_prepared_source(
+    path: &Path,
+    last_known_kind: CollectionResolvedKind,
+    state: &CollectionSourcePreparation,
+) -> crate::grid_item::GridItem {
+    use crate::grid_item::GridItem;
+    let CollectionSourcePreparation::Available { kind, .. } = state else {
+        return GridItem::CollectionPlaceholder {
+            path: path.to_path_buf(),
+            last_known_kind,
+            reason: match state {
+                CollectionSourcePreparation::Missing => {
+                    crate::grid_item::CollectionPlaceholderReason::Missing
+                }
+                CollectionSourcePreparation::Unsupported => {
+                    crate::grid_item::CollectionPlaceholderReason::Unsupported
+                }
+                CollectionSourcePreparation::AccessError(_) => {
+                    crate::grid_item::CollectionPlaceholderReason::AccessError
+                }
+                CollectionSourcePreparation::Available { .. } => unreachable!(),
+            },
+        };
+    };
+    match kind {
+        CollectionResolvedKind::Image => GridItem::Image(path.to_path_buf()),
+        CollectionResolvedKind::Video => GridItem::Video(path.to_path_buf()),
+        CollectionResolvedKind::Audio => GridItem::Audio(path.to_path_buf()),
+        CollectionResolvedKind::Folder => GridItem::Folder(path.to_path_buf()),
+        CollectionResolvedKind::Zip => GridItem::ZipFile(path.to_path_buf()),
+        CollectionResolvedKind::Pdf => GridItem::PdfFile(path.to_path_buf()),
+        CollectionResolvedKind::ConvertibleArchive => {
+            let format = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+                .expect("available convertible source was classified from its extension");
+            GridItem::ConvertibleArchive {
+                path: path.to_path_buf(),
+                format,
+            }
+        }
+        CollectionResolvedKind::Unresolved => GridItem::CollectionPlaceholder {
+            path: path.to_path_buf(),
+            last_known_kind,
+            reason: crate::grid_item::CollectionPlaceholderReason::Unsupported,
+        },
+    }
 }
 
 pub(crate) fn write_collection_export_atomic(
@@ -452,6 +574,31 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_grid_projection_keeps_the_typed_display_reason() {
+        let path = Path::new(r"C:\missing\source.dat");
+        for (state, expected) in [
+            (
+                CollectionSourcePreparation::Missing,
+                crate::grid_item::CollectionPlaceholderReason::Missing,
+            ),
+            (
+                CollectionSourcePreparation::Unsupported,
+                crate::grid_item::CollectionPlaceholderReason::Unsupported,
+            ),
+            (
+                CollectionSourcePreparation::AccessError("denied".into()),
+                crate::grid_item::CollectionPlaceholderReason::AccessError,
+            ),
+        ] {
+            assert!(matches!(
+                grid_item_for_prepared_source(path, CollectionResolvedKind::Unresolved, &state),
+                crate::grid_item::GridItem::CollectionPlaceholder { reason, .. }
+                    if reason == expected
+            ));
+        }
+    }
+
+    #[test]
     fn standard_export_keeps_all_missing_and_uses_last_known_category_then_unresolved_tail() {
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("folder");
@@ -486,7 +633,7 @@ mod tests {
         assert_eq!(prepared.ordered_paths[2], image);
         assert_eq!(prepared.ordered_paths[3], unresolved);
         assert!(matches!(
-            prepared.source_states[0].1,
+            prepared.source_states[1].1,
             CollectionSourcePreparation::Missing
         ));
 

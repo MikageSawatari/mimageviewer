@@ -8249,6 +8249,7 @@ mod startup_open_path_resolve_tests {
         let detached_owner = crate::app::DetachedGridArchiveOpenRequestOwner {
             request_id: app.detached_grid_archive_open_request_seq,
             source_path: source.clone(),
+            collection_restore: None,
         };
 
         assert!(app.claim_open_request_owner(
@@ -14534,12 +14535,16 @@ mod phase_c_drill_nav_tests {
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
-                purpose: FolderOpenScanPurpose::GridFolderCandidate,
+                purpose: FolderOpenScanPurpose::GridFolderCandidate {
+                    collection_restore: None,
+                },
             });
             let ready = app
                 .poll_folder_pane_open(&egui::Context::default())
                 .expect("the deterministic mixed-folder scan must complete");
-            let (adopted_path, _) = app
+            let crate::app::ResolvedMainFolderOpen {
+                path: adopted_path, ..
+            } = app
                 .resolve_main_folder_open_ready(&egui::Context::default(), ready)
                 .expect("a mixed folder must fall back to ordinary main navigation");
 
@@ -22743,6 +22748,191 @@ mod favorite_adjustment_defaults_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("book operation did not finish");
+    }
+
+    #[test]
+    fn completed_book_rename_migrates_root_and_pages_as_one_collection_tree() {
+        use crate::collection_store::{
+            CollectionRegistration, CollectionResolvedKind, CollectionRuntimeEvent,
+            CollectionSourceMigrationBatch, CollectionSourceMigrationScope, CollectionStoreRuntime,
+        };
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let books_root = temp.path().join("books");
+        let old_root = books_root.join("Old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_page = old_root.join("0001.jpg");
+        std::fs::write(&old_page, b"page").unwrap();
+
+        let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db"))
+            .expect("collection runtime");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match runtime.try_recv_event() {
+                Some(CollectionRuntimeEvent::Ready(_)) => break,
+                Some(CollectionRuntimeEvent::Failed(error)) => panic!("runtime failed: {error}"),
+                Some(CollectionRuntimeEvent::Closed) => panic!("runtime closed before ready"),
+                None if Instant::now() < deadline => std::thread::yield_now(),
+                None => panic!("collection runtime did not become ready"),
+            }
+        }
+        let client = runtime.client();
+        let created = client
+            .create_collection("Book roots".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let before = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &old_root,
+                        CollectionResolvedKind::Folder,
+                    )
+                    .unwrap(),
+                    CollectionRegistration::from_trusted_path(
+                        &old_page,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+
+        let result = crate::books::rename_book(&books_root, "Old", "New").unwrap();
+        let crate::books::BookOpResult::Renamed {
+            source_folder,
+            target_folder,
+            edit_moves,
+            ..
+        } = result
+        else {
+            panic!("rename result");
+        };
+        let mappings =
+            book_collection_source_mappings(&edit_moves, Some((&source_folder, &target_folder)));
+        assert_eq!(mappings.len(), 1);
+        assert!(mappings[0].tree);
+        assert_eq!(mappings[0].old_path, old_root);
+        assert_eq!(mappings[0].new_path, books_root.join("New"));
+        let batch =
+            CollectionSourceMigrationBatch::from_trusted_paths(mappings.iter().map(|mapping| {
+                (
+                    mapping.old_path.as_path(),
+                    mapping.new_path.as_path(),
+                    CollectionSourceMigrationScope::Tree,
+                )
+            }))
+            .unwrap();
+        client
+            .migrate_source_batch(batch)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let after = client
+            .load_collection(before.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.entries[0].id, before.entries[0].id);
+        assert_eq!(after.entries[0].source_path, books_root.join("New"));
+        assert_eq!(after.entries[1].id, before.entries[1].id);
+        assert_eq!(
+            after.entries[1].source_path,
+            books_root.join("New").join("0001.jpg")
+        );
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn unsaved_rename_journal_never_admits_collection_migration_stage() {
+        let mut app = setup_app();
+        let blocked_parent = app.tmp.path().join("journal-parent-is-a-file");
+        std::fs::write(&blocked_parent, b"file").unwrap();
+        app.rename_migration_data_dir_override = Some(blocked_parent.clone());
+        app.enqueue_collection_source_migration_batch(vec![
+            crate::rename_key_migration::PathMigrationMapping {
+                old_path: PathBuf::from(r"C:\Books\Old"),
+                new_path: PathBuf::from(r"C:\Books\New"),
+                tree: true,
+            },
+        ]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Failed { .. }
+        ) && std::time::Instant::now() < deadline
+        {
+            app.try_start_next_rename_migration();
+            std::thread::yield_now();
+        }
+        app.try_start_next_rename_migration();
+
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Failed { reported: true, .. }
+        ));
+        assert_eq!(app.rename_migration_queue.len(), 1);
+        assert!(app.rename_migration_in_flight.is_none());
+
+        // A transient failure keeps the complete job in the App and writer owners. Once the
+        // destination becomes writable, the bounded asynchronous retry persists that latest
+        // snapshot before admitting the collection stage.
+        std::fs::remove_file(&blocked_parent).unwrap();
+        std::fs::create_dir(&blocked_parent).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut admitted = false;
+        while !admitted && std::time::Instant::now() < deadline {
+            admitted = app.rename_migration_journal_allows_start();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(admitted, "the bounded retry should observe a saved ACK");
+        assert!(app.rename_migration_in_flight.is_none());
+        assert_eq!(app.rename_migration_queue.len(), 1);
+        assert_eq!(
+            crate::rename_key_migration::journal_load(&blocked_parent).len(),
+            1,
+            "the migration stage is admitted only after the retry saved the full snapshot"
+        );
+    }
+
+    #[test]
+    fn immediate_exit_merges_an_unloaded_recovery_journal_before_persisting() {
+        let mut app = setup_app();
+        let data_dir = app.tmp.path().join("rename-journal-recovery");
+        let prior = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from(r"C:\Books\Old"),
+            PathBuf::from(r"C:\Books\New"),
+            true,
+        );
+        crate::rename_key_migration::journal_save(&data_dir, std::slice::from_ref(&prior)).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir.clone());
+        app.rename_migration_journal_loaded = false;
+        app.rename_migration_queue.clear();
+
+        app.resolve_collection_migration_for_exit();
+
+        assert!(app.rename_migration_journal_loaded);
+        assert_eq!(
+            app.rename_migration_queue,
+            std::collections::VecDeque::from([prior.clone()])
+        );
+        assert_eq!(
+            crate::rename_key_migration::journal_load(&data_dir),
+            vec![prior],
+            "an immediate close must not replace an unread crash-recovery journal with empty"
+        );
     }
 
     #[test]
@@ -31315,6 +31505,7 @@ mod favorite_adjustment_defaults_tests {
             failed: vec![],
             purged_pdf_password_paths: vec![],
             purge_deferred: false,
+            source_scopes: Vec::new(),
         });
 
         // 実 ファイルも消しておかないと metadata() が古いまま (実機では worker が消す)。
@@ -31927,6 +32118,7 @@ mod thumbnail_progress_tests {
             failed: Vec::new(),
             purged_pdf_password_paths: Vec::new(),
             purge_deferred: false,
+            source_scopes: Vec::new(),
         });
 
         app.update_thumbnail_frame_bookkeeping(
@@ -38791,6 +38983,7 @@ mod pipeline_cache_refactor_tests {
             failed: vec![],
             purged_pdf_password_paths: vec![],
             purge_deferred: false,
+            source_scopes: Vec::new(),
         });
 
         phase_c_support::wait_for_external_rescan(&mut app);
@@ -41537,6 +41730,78 @@ mod fullscreen_main_focus_guard_tests {
         assert!(!should_cancel_video_audio_handoff_for_external_foreground(
             0, false,
         ));
+    }
+}
+
+#[cfg(windows)]
+fn install_collection_item_for_detached_plan(
+    app: &mut App,
+    path: &Path,
+    kind: crate::collection_store::CollectionResolvedKind,
+) -> crate::app::top_level_grid_view::CollectionGridRestore {
+    use crate::app::top_level_grid_view::{
+        CollectionGridIdentity, CollectionGridLoadState, CollectionGridViewportAnchor,
+        TopLevelGridSurface,
+    };
+    use crate::collection_store::{
+        CollectionDefinition, CollectionEntry, CollectionEntryId, CollectionOrderMode,
+        CollectionSnapshot, CollectionSourcePath, prepare_collection_snapshot,
+    };
+    let collection_id = crate::collection_store::CollectionId::new();
+    let entry_id = CollectionEntryId::new();
+    let source = CollectionSourcePath::from_trusted(path).unwrap();
+    let source_key = source.key().clone();
+    let snapshot = CollectionSnapshot {
+        catalog_revision: 1,
+        definition: CollectionDefinition {
+            id: collection_id,
+            name: "Detached origin".into(),
+            order_mode: CollectionOrderMode::Manual,
+            standard_sort: crate::settings::SortOrder::FileName,
+            revision: 7,
+        },
+        entries: std::sync::Arc::from(vec![CollectionEntry {
+            id: entry_id,
+            collection_id,
+            source_path: source.path().to_path_buf(),
+            source_key: source_key.clone(),
+            resolved_kind: kind,
+            manual_position: 0,
+        }]),
+    };
+    let prepared = std::sync::Arc::new(
+        prepare_collection_snapshot(
+            &snapshot,
+            &app.settings.grid_display_order,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap(),
+    );
+    let item = prepared.entries[0].item.clone();
+    app.top_level_grid_view.begin(
+        TopLevelGridSurface::Collection(CollectionGridIdentity { collection_id }),
+        None,
+    );
+    app.items = vec![item];
+    app.image_metas = vec![Some((0, 0))];
+    app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.items_generation = app.items_generation.wrapping_add(1);
+    app.selected = Some(0);
+    let generation = app.items_generation;
+    let session = app.top_level_grid_view.collection_session_mut().unwrap();
+    session.accepted_revision = 7;
+    session.wanted_revision = 7;
+    session.load = CollectionGridLoadState::Ready(prepared);
+    session.installed_items_generation = Some(generation);
+    crate::app::top_level_grid_view::CollectionGridRestore {
+        identity: CollectionGridIdentity { collection_id },
+        revision_at_open: 7,
+        viewport_anchor: Some(CollectionGridViewportAnchor {
+            entry_id,
+            source_key,
+        }),
     }
 }
 
@@ -46590,6 +46855,7 @@ mod still_window_mode_key_tests {
         let owner = crate::app::DetachedGridArchiveOpenRequestOwner {
             request_id: app.detached_grid_archive_open_request_seq,
             source_path: source.clone(),
+            collection_restore: None,
         };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -46748,7 +47014,7 @@ mod still_window_mode_key_tests {
 
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path })
+            Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path, .. })
                 if path == source
         ));
         assert!(
@@ -47177,20 +47443,166 @@ mod still_window_mode_key_tests {
         app.items = vec![GridItem::ZipFile(zip.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor(ViewerContextDescriptor::Zip {
-                path,
-                entry_name: None,
-                archive_source_override: None,
-            })) if path == zip
+            Some(DetachedGridItemOpenPlan::Descriptor {
+                descriptor: ViewerContextDescriptor::Zip {
+                    path,
+                    entry_name: None,
+                    archive_source_override: None,
+                },
+                ..
+            }) if path == zip
         ));
 
         app.items = vec![GridItem::PdfFile(pdf.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor(ViewerContextDescriptor::Pdf {
-                path,
-                page_num: None,
-            })) if path == pdf
+            Some(DetachedGridItemOpenPlan::Descriptor {
+                descriptor: ViewerContextDescriptor::Pdf {
+                    path,
+                    page_num: None,
+                },
+                ..
+            }) if path == pdf
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_collection_plans_carry_origin_for_folder_zip_pdf_and_convertible() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        let cases = [
+            (
+                app.tmp.path().join("folder"),
+                crate::collection_store::CollectionResolvedKind::Folder,
+                0_u8,
+            ),
+            (
+                app.tmp.path().join("book.zip"),
+                crate::collection_store::CollectionResolvedKind::Zip,
+                1,
+            ),
+            (
+                app.tmp.path().join("book.pdf"),
+                crate::collection_store::CollectionResolvedKind::Pdf,
+                2,
+            ),
+            (
+                app.tmp.path().join("book.7z"),
+                crate::collection_store::CollectionResolvedKind::ConvertibleArchive,
+                3,
+            ),
+        ];
+        for (path, kind, case) in cases {
+            if case == 0 {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"fixture").unwrap();
+            }
+            let expected = install_collection_item_for_detached_plan(&mut app, &path, kind);
+            let actual = match app
+                .detached_grid_item_open_plan(0, case != 3)
+                .expect("detached collection plan")
+            {
+                DetachedGridItemOpenPlan::FolderCandidate {
+                    collection_restore, ..
+                }
+                | DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                    collection_restore,
+                    ..
+                }
+                | DetachedGridItemOpenPlan::Descriptor {
+                    collection_restore, ..
+                } => collection_restore.expect("collection origin"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_scanned_folder_factory_installs_origin_only_in_the_new_context() {
+        use crate::app::top_level_grid_view::{
+            CollectionGridIdentity, CollectionGridRestore, CollectionGridViewportAnchor,
+            TopLevelGridRestore,
+        };
+        use crate::collection_store::{CollectionEntryId, CollectionId, CollectionSourcePath};
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("detached-collection-book");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+        let source = CollectionSourcePath::from_trusted(&folder).unwrap();
+        let restore = CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: CollectionId::new(),
+            },
+            revision_at_open: 9,
+            viewport_anchor: Some(CollectionGridViewportAnchor {
+                entry_id: CollectionEntryId::new(),
+                source_key: source.key().clone(),
+            }),
+        };
+        assert!(
+            app.start_active_detached_book_context_from_scanned_folder_with_restore(
+                folder.clone(),
+                scan_directory(&folder),
+                &egui::Context::default(),
+                None,
+                Some(restore.clone()),
+            )
+        );
+        assert!(app.top_level_grid_view.return_to().is_none());
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(
+                detached.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Collection(actual)) if actual == &restore
+            ));
+        })
+        .expect("new detached context");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mixed_folder_completion_uses_request_collection_anchor_after_selection_moves() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        let folder = app.tmp.path().join("mixed-collection-folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("image.jpg"), b"image").unwrap();
+        std::fs::create_dir(folder.join("nested-folder")).unwrap();
+        let restore = install_collection_item_for_detached_plan(
+            &mut app,
+            &folder,
+            crate::collection_store::CollectionResolvedKind::Folder,
+        );
+        app.selected = None;
+        let ready = FolderPaneOpenReady {
+            path: folder.clone(),
+            scan: Ok(scan_directory(&folder)),
+            purpose: FolderOpenScanPurpose::GridFolderCandidate {
+                collection_restore: Some(restore.clone()),
+            },
+        };
+        let resolved = app
+            .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+            .expect("mixed folder returns to main navigation");
+        assert_eq!(
+            resolved.collection_anchor, restore.viewport_anchor,
+            "selection changes cannot replace the request-owned collection anchor"
+        );
+        assert!(matches!(
+            app.load_folder_nav_target(resolved.path.clone(), Some(resolved.scan)),
+            FolderOpenOutcome::Loaded
+        ));
+        app.commit_collection_grid_source_open(resolved.collection_anchor.unwrap(), resolved.path);
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            crate::app::top_level_grid_view::CollectionGridPosition::PhysicalSource { .. }
         ));
     }
 
@@ -47243,7 +47655,7 @@ mod still_window_mode_key_tests {
             app.folder_pane_open_pending
                 .as_ref()
                 .map(|pending| &pending.purpose),
-            Some(FolderOpenScanPurpose::GridFolderCandidate)
+            Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
         ));
 
         let (scan_tx, scan_rx) = mpsc::channel();
@@ -47257,7 +47669,9 @@ mod still_window_mode_key_tests {
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             rx: scan_rx,
-            purpose: FolderOpenScanPurpose::GridFolderCandidate,
+            purpose: FolderOpenScanPurpose::GridFolderCandidate {
+                collection_restore: None,
+            },
         });
         let ready = app
             .poll_folder_pane_open(&ctx)
@@ -47334,9 +47748,15 @@ mod still_window_mode_key_tests {
         let ready = FolderPaneOpenReady {
             path: child.clone(),
             scan: Ok(scan_directory(&child)),
-            purpose: FolderOpenScanPurpose::GridFolderCandidate,
+            purpose: FolderOpenScanPurpose::GridFolderCandidate {
+                collection_restore: None,
+            },
         };
-        let (navigate_path, scan) = app
+        let crate::app::ResolvedMainFolderOpen {
+            path: navigate_path,
+            scan,
+            ..
+        } = app
             .resolve_main_folder_open_ready(&ctx, ready)
             .expect("mixed folders must return to ordinary main navigation");
         assert_eq!(navigate_path, child);
@@ -51314,19 +51734,30 @@ mod still_window_mode_key_tests {
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
         app.rename_migration_journal_loaded = true;
         let (_tx, rx) = std::sync::mpsc::channel();
-        let in_flight = (PathBuf::from("a"), PathBuf::from("b"));
-        let queued = (PathBuf::from("b"), PathBuf::from("c"));
-        let retry = (PathBuf::from("x"), PathBuf::from("y"));
-        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
-            old_path: in_flight.0.clone(),
-            new_path: in_flight.1.clone(),
+        let in_flight = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            false,
+        );
+        let queued = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("b"),
+            PathBuf::from("c"),
+            false,
+        );
+        let retry = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            false,
+        );
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: in_flight.clone(),
             rx,
         });
         app.rename_migration_queue.push_back(queued.clone());
         app.rename_migration_boot_retry.push(retry.clone());
 
         app.persist_rename_migration_journal();
-        app.flush_rename_migration_journal();
+        app.flush_rename_migration_journal().unwrap();
 
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()),
@@ -51359,23 +51790,37 @@ mod still_window_mode_key_tests {
             .unwrap();
         }
 
-        app.spawn_rename_key_migration(a.clone(), b.clone());
-        app.spawn_rename_key_migration(b.clone(), c.clone());
+        app.spawn_rename_key_migration(
+            a.clone(),
+            b.clone(),
+            crate::collection_store::CollectionSourceMigrationScope::Exact,
+        );
+        app.spawn_rename_key_migration(
+            b.clone(),
+            c.clone(),
+            crate::collection_store::CollectionSourceMigrationScope::Exact,
+        );
         assert!(
-            app.rename_migration_in_flight.is_some(),
-            "1 本目は即時開始される"
+            app.rename_migration_in_flight.is_none(),
+            "保存ACKより前に1本目を開始しない"
         );
         assert_eq!(
             app.rename_migration_queue.len(),
-            1,
-            "2 本目は直列キューで待機する"
+            2,
+            "2本とも最新full snapshotの保存を待つ"
         );
-        app.flush_rename_migration_journal();
+        app.flush_rename_migration_journal().unwrap();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()).len(),
             2,
             "未完了ジョブがジャーナルに永続化される (終了 / クラッシュ回復用)"
         );
+        app.try_start_next_rename_migration();
+        assert!(
+            app.rename_migration_in_flight.is_some(),
+            "保存成功ACK後に1本目だけを開始する"
+        );
+        assert_eq!(app.rename_migration_queue.len(), 1);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.rename_migration_in_flight.is_some() || !app.rename_migration_queue.is_empty())
@@ -51398,7 +51843,7 @@ mod still_window_mode_key_tests {
             )
             .unwrap();
         assert_eq!(angle, 90, "FIFO 直列実行で最終 path に集約される");
-        app.flush_rename_migration_journal();
+        app.flush_rename_migration_journal().unwrap();
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),
             "完了したジョブはジャーナルから消し込まれる"
@@ -51406,9 +51851,10 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn delete_invalidates_queued_rename_migrations() {
+    fn delete_skips_generic_rename_stage_but_keeps_collection_reference_migration() {
         // 角度⑦ P1: 「A→B 改名 → 移行が待機中に B を削除」で、後から走る移行が削除済み
-        // B のメタデータ行を作り直さないよう、削除成功時にキューから該当ジョブを落とす。
+        // B のメタデータ行を作り直さない。一方、collection は rename 後の B を missing
+        // reference として保つ必要があるため、同じ job の collection 段は消さない。
         let mut app = setup_app();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
@@ -51418,24 +51864,37 @@ mod still_window_mode_key_tests {
         let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
         let x = std::path::PathBuf::from(r"D:\other\x.jpg");
         let y = std::path::PathBuf::from(r"D:\other\y.jpg");
-        app.rename_migration_queue.push_back((a.clone(), b.clone()));
-        app.rename_migration_queue.push_back((x.clone(), y.clone()));
+        let keep_job = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            x.clone(),
+            y.clone(),
+            false,
+        );
+        app.rename_migration_queue.push_back(
+            crate::rename_key_migration::PathMigrationJob::shell_rename(
+                a.clone(),
+                b.clone(),
+                false,
+            ),
+        );
+        app.rename_migration_queue.push_back(keep_job.clone());
         app.persist_rename_migration_journal();
 
         app.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&b));
+        let retained = app
+            .rename_migration_queue
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert!(!retained[0].generic_pending);
+        assert_eq!(retained[0].mappings[0].old_path, a);
+        assert_eq!(retained[0].mappings[0].new_path, b);
+        assert_eq!(retained[1], keep_job);
+        app.flush_rename_migration_journal().unwrap();
+        let journal = crate::rename_key_migration::journal_load(dir.path());
         assert_eq!(
-            app.rename_migration_queue
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![(x, y)],
-            "削除された B を新側に持つジョブだけが落ちる"
-        );
-        app.flush_rename_migration_journal();
-        assert_eq!(
-            crate::rename_key_migration::journal_load(dir.path()).len(),
-            1,
-            "worker flush 後のジャーナルも同じ未完了集合になる"
+            journal, retained,
+            "worker flush 後も同じ typed stage が残る"
         );
     }
 
@@ -51454,9 +51913,12 @@ mod still_window_mode_key_tests {
         app.mask_pages.insert(3);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
-            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
-            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: crate::rename_key_migration::PathMigrationJob::shell_rename(
+                std::path::PathBuf::from(r"D:\pics\a.jpg"),
+                std::path::PathBuf::from(r"D:\pics\b.jpg"),
+                false,
+            ),
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
@@ -51493,9 +51955,12 @@ mod still_window_mode_key_tests {
         app.mask_pages.insert(idx); // 移行前 DB 由来の stale presence
 
         let (tx, rx) = std::sync::mpsc::channel();
-        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
-            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
-            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: crate::rename_key_migration::PathMigrationJob::shell_rename(
+                std::path::PathBuf::from(r"D:\pics\a.jpg"),
+                std::path::PathBuf::from(r"D:\pics\b.jpg"),
+                false,
+            ),
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
@@ -51560,9 +52025,12 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(91, DetachedWindowState::Parked, "test_setup");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
-            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
-            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: crate::rename_key_migration::PathMigrationJob::shell_rename(
+                std::path::PathBuf::from(r"D:\pics\a.jpg"),
+                std::path::PathBuf::from(r"D:\pics\b.jpg"),
+                false,
+            ),
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
@@ -51596,9 +52064,13 @@ mod still_window_mode_key_tests {
         let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
         let (tx, rx) = std::sync::mpsc::channel();
         app.rename_migration_journal_loaded = true;
-        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
-            old_path: a.clone(),
-            new_path: b.clone(),
+        let panic_job = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            a.clone(),
+            b.clone(),
+            false,
+        );
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: panic_job.clone(),
             rx,
         });
         app.persist_rename_migration_journal();
@@ -51612,15 +52084,15 @@ mod still_window_mode_key_tests {
 
         app.poll_rename_migration_pending(&ctx);
         assert!(app.rename_migration_in_flight.is_none());
-        app.flush_rename_migration_journal();
+        app.flush_rename_migration_journal().unwrap();
         assert_eq!(
             crate::rename_key_migration::journal_load(dir.path()),
-            vec![(a.clone(), b.clone())],
+            vec![panic_job.clone()],
             "panic した移行はジャーナルに残る (次回起動で再実行)"
         );
         assert_eq!(
             app.rename_migration_boot_retry,
-            vec![(a, b)],
+            vec![panic_job],
             "セッション内では再試行せず boot_retry に退避する"
         );
     }
@@ -51637,7 +52109,15 @@ mod still_window_mode_key_tests {
         let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
         let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
         // 前セッションのクラッシュを模擬: ジャーナルに未完了ジョブ + 未移行の DB。
-        crate::rename_key_migration::journal_save(dir.path(), &[(a.clone(), b.clone())]);
+        crate::rename_key_migration::journal_save(
+            dir.path(),
+            &[crate::rename_key_migration::PathMigrationJob::shell_rename(
+                a.clone(),
+                b.clone(),
+                false,
+            )],
+        )
+        .unwrap();
         {
             let conn = rusqlite::Connection::open(dir.path().join("rotation.db")).unwrap();
             conn.execute_batch(
@@ -51669,7 +52149,7 @@ mod still_window_mode_key_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        app.flush_rename_migration_journal();
+        app.flush_rename_migration_journal().unwrap();
         assert_eq!(angle, 270, "回復ジョブが移行を完走させる");
         assert!(
             crate::rename_key_migration::journal_load(dir.path()).is_empty(),
@@ -64781,6 +65261,7 @@ mod smart_folder_transition_tests {
                     suppress_rating_filter: false,
                     suppress_facet_filter: false,
                     smart_folder_drill: false,
+                    collection_grid_owner: None,
                 },
             ),
             None,
@@ -65007,6 +65488,75 @@ mod smart_folder_transition_tests {
         // Mutation `omit_success_completion_commit`: remove commit_main_grid_archive_transition
         // from the loaded pending_nav branch. The reservation/suppression/smart-scope assertions
         // all fail.
+    }
+
+    #[test]
+    fn stale_collection_convert_completion_cannot_navigate_or_reparent_a_new_collection() {
+        use crate::app::top_level_grid_view::{
+            CollectionGridIdentity, CollectionGridPosition, TopLevelGridSurface,
+        };
+        use crate::collection_store::{CollectionId, CollectionResolvedKind};
+
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let source = app.tmp.path().join("collection-owned.7z");
+        let cached = app.tmp.path().join("collection-owned-cache.zip");
+        std::fs::write(&source, b"archive source").unwrap();
+        write_convert_completion_zip(&cached);
+        let _restore = install_collection_item_for_detached_plan(
+            &mut app,
+            &source,
+            CollectionResolvedKind::ConvertibleArchive,
+        );
+        let owner = app.main_grid_archive_open_owner(0, &source);
+        assert!(app.request_archive_convert_owned(
+            source.clone(),
+            ArchiveFormat::SevenZ,
+            false,
+            owner,
+        ));
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.completion),
+            Some(
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    intent
+                )
+            ) if intent.collection_grid_owner.is_some()
+        ));
+
+        let replacement = CollectionId::new();
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: replacement,
+            }),
+            None,
+        );
+        let sentinel = app.tmp.path().join("new-collection-sentinel.jpg");
+        app.current_folder = Some(app.tmp.path().join("before-stale-completion"));
+        let before_folder = app.current_folder.clone();
+        app.items = vec![GridItem::Image(sentinel.clone())];
+        app.image_metas = vec![Some((0, 1))];
+        app.items_generation = app.items_generation.wrapping_add(1);
+
+        publish_convert_done_and_open(&mut app, &cached);
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder, before_folder);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity) if identity.collection_id == replacement
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::Root
+        ));
+        assert!(matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &sentinel));
     }
 
     #[test]

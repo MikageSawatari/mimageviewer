@@ -703,6 +703,42 @@ pub(crate) fn draw_cell(
             draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
             draw_stack_count_badge(painter, inner, *count);
         }
+        GridItem::CollectionPlaceholder { path, reason, .. } => {
+            let bg = if dark {
+                egui::Color32::from_rgb(52, 45, 45)
+            } else {
+                egui::Color32::from_rgb(244, 235, 235)
+            };
+            let fg = if dark {
+                egui::Color32::from_rgb(235, 165, 165)
+            } else {
+                egui::Color32::from_rgb(145, 55, 55)
+            };
+            painter.rect_filled(inner, 3.0, bg);
+            painter.text(
+                inner.center() - egui::vec2(0.0, 10.0),
+                egui::Align2::CENTER_CENTER,
+                "?",
+                egui::FontId::proportional((inner.height() * 0.24).clamp(22.0, 46.0)),
+                fg,
+            );
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 18.0),
+                egui::Align2::CENTER_BOTTOM,
+                path.file_name()
+                    .unwrap_or_else(|| path.as_os_str())
+                    .to_string_lossy(),
+                egui::FontId::proportional(12.0),
+                fg,
+            );
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 3.0),
+                egui::Align2::CENTER_BOTTOM,
+                reason.label(),
+                egui::FontId::proportional(11.0),
+                fg,
+            );
+        }
     }
 
     let painter = base_painter;
@@ -1137,6 +1173,44 @@ pub(crate) fn tq_draw_preview(
     }
 
     response
+}
+
+/// Snapshot fixture for the three typed unavailable projections used by a collection Grid.
+pub fn draw_collection_placeholder_snapshot_fixture(ui: &mut egui::Ui) {
+    use crate::grid_item::CollectionPlaceholderReason;
+    let cases = [
+        ("missing.png", CollectionPlaceholderReason::Missing),
+        ("unsupported.bin", CollectionPlaceholderReason::Unsupported),
+        (
+            "access-denied.jpg",
+            CollectionPlaceholderReason::AccessError,
+        ),
+    ];
+    ui.horizontal(|ui| {
+        for (index, (name, reason)) in cases.into_iter().enumerate() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(145.0, 118.0), egui::Sense::hover());
+            draw_cell(
+                ui,
+                rect,
+                index == 0,
+                index == 1,
+                false,
+                &ThumbnailOverlayLayout::default(),
+                &GridItem::CollectionPlaceholder {
+                    path: std::path::PathBuf::from(name),
+                    last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                    reason,
+                },
+                &ThumbnailState::Failed,
+                crate::rotation_db::Rotation::None,
+                None,
+                None,
+                false,
+                VideoThumbnailIndicator::default(),
+                false,
+            );
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

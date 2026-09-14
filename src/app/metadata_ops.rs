@@ -152,6 +152,20 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
         GridItem::ZipDir { .. } => FacetItemKind::Folder,
         // ファイル名スタックの集約セルは画像の集まりなので Image バケツ (= 画像絞り込みで残る)。
         GridItem::Stack { .. } => FacetItemKind::Image,
+        GridItem::CollectionPlaceholder {
+            last_known_kind, ..
+        } => match last_known_kind {
+            crate::collection_store::CollectionResolvedKind::Folder => FacetItemKind::Folder,
+            crate::collection_store::CollectionResolvedKind::Image
+            | crate::collection_store::CollectionResolvedKind::Unresolved => FacetItemKind::Image,
+            crate::collection_store::CollectionResolvedKind::Video => FacetItemKind::Video,
+            crate::collection_store::CollectionResolvedKind::Audio => FacetItemKind::Audio,
+            crate::collection_store::CollectionResolvedKind::Zip => FacetItemKind::Zip,
+            crate::collection_store::CollectionResolvedKind::Pdf => FacetItemKind::Pdf,
+            crate::collection_store::CollectionResolvedKind::ConvertibleArchive => {
+                FacetItemKind::Archive
+            }
+        },
     }
 }
 
@@ -173,6 +187,7 @@ pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
             .unwrap_or("")
             .to_ascii_lowercase(),
         GridItem::PdfPage { .. } => "pdf".to_string(),
+        GridItem::CollectionPlaceholder { path, .. } => path_extension_lower(path),
     }
 }
 
@@ -1542,7 +1557,10 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         }
         // ファイル名スタック: 代表画像の作成日時を使う (実ファイル)。
         GridItem::Stack { representative, .. } => Some(representative.as_path()),
-        GridItem::ZipImage { .. } | GridItem::ZipDir { .. } | GridItem::PdfPage { .. } => None,
+        GridItem::ZipImage { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::PdfPage { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -1863,6 +1881,12 @@ pub(super) fn run_metadata_search(
                 // フォルダ / ZIP / 変換対象アーカイブ / ネスト ZIP 子コンテナ / スタック集約セル:
                 // ファイル名 (basename = ZipDir は最後のセグメント、Stack は prefix キー) で照合。
                 // これらの子/メンバーは現 items に含まれないので名前照合のみ (plan §3.6 MVP)。
+                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                    matches.insert(idx);
+                }
+                true
+            }
+            GridItem::CollectionPlaceholder { .. } => {
                 if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }

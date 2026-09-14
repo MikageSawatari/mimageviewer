@@ -11,6 +11,10 @@
 //!   busy_timeout 付きなので本体側の接続と共存できる。
 //! - **worker スレッドで実行する** (UI スレッド禁止 — cold open は 1 DB で 100ms を
 //!   超えることがある)。呼び出しは `App::spawn_rename_key_migration` 経由。
+//! - **永続 2 段階 commit**: 通常の path-keyed store と collection actor を同じ journal entry が
+//!   追跡する。generic store が完了しても collection actor の exact batch ACK 前には journal を
+//!   消さず、Busy / unavailable / crash は次回起動へ残す。複数 mapping は collection 側の一つの
+//!   SQLite transaction で移行する。
 //! - **冪等 + 新キー優先**: 一意キー列は `UPDATE OR IGNORE` → 旧行 `DELETE`。新キー側に
 //!   既に行がある (= リネーム後に先へ操作した) 場合は新データを優先して旧行を捨てる。
 //! - **exact + prefix の 3 面**: リネーム対象そのもの (`old` = `new`)、フォルダ配下
@@ -37,24 +41,74 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathMigrationMapping {
+    pub(crate) old_path: PathBuf,
+    pub(crate) new_path: PathBuf,
+    pub(crate) tree: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathMigrationJob {
+    /// The legacy path-keyed stores have not completed yet. Collection-only book moves start
+    /// with this false; normal Shell rename starts true.
+    pub(crate) generic_pending: bool,
+    pub(crate) mappings: Vec<PathMigrationMapping>,
+}
+
+impl PathMigrationJob {
+    pub(crate) fn shell_rename(old_path: PathBuf, new_path: PathBuf, tree: bool) -> Self {
+        Self {
+            generic_pending: true,
+            mappings: vec![PathMigrationMapping {
+                old_path,
+                new_path,
+                tree,
+            }],
+        }
+    }
+
+    pub(crate) fn collection_only(mappings: Vec<PathMigrationMapping>) -> Option<Self> {
+        (!mappings.is_empty()).then_some(Self {
+            generic_pending: false,
+            mappings,
+        })
+    }
+
+    pub(crate) fn generic_pair(&self) -> Option<(&Path, &Path)> {
+        if !self.generic_pending || self.mappings.len() != 1 {
+            return None;
+        }
+        let mapping = &self.mappings[0];
+        Some((&mapping.old_path, &mapping.new_path))
+    }
+}
+
 #[derive(Debug)]
 struct JournalWriteSnapshot {
     revision: u64,
     data_dir: PathBuf,
-    entries: Vec<(PathBuf, PathBuf)>,
+    entries: Vec<PathMigrationJob>,
 }
 
 #[derive(Default)]
 struct JournalWriteState {
     next_revision: u64,
     latest: Option<JournalWriteSnapshot>,
-    completed_revision: u64,
+    /// Exact full snapshot whose last persistence attempt failed. It remains owned until a
+    /// newer App snapshot supersedes it, so a failed write is never mistaken for completion.
+    failed: Option<JournalWriteSnapshot>,
+    saved_revision: u64,
+    attempted_revision: u64,
+    last_error: Option<(u64, String)>,
     shutdown: bool,
     worker_stopped: bool,
 }
 
 impl JournalWriteState {
-    fn enqueue(&mut self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) -> u64 {
+    fn enqueue(&mut self, data_dir: PathBuf, entries: Vec<PathMigrationJob>) -> u64 {
         self.next_revision = self.next_revision.wrapping_add(1).max(1);
         let revision = self.next_revision;
         // App owns the contents. Keep only the newest waiting snapshot while an older write runs.
@@ -63,6 +117,7 @@ impl JournalWriteState {
             data_dir,
             entries,
         });
+        self.failed = None;
         revision
     }
 
@@ -70,16 +125,48 @@ impl JournalWriteState {
         self.latest.take()
     }
 
-    fn complete(&mut self, revision: u64) {
-        self.completed_revision = self.completed_revision.max(revision);
+    fn complete_saved(&mut self, revision: u64) {
+        self.attempted_revision = self.attempted_revision.max(revision);
+        self.saved_revision = self.saved_revision.max(revision);
+        if self
+            .last_error
+            .as_ref()
+            .is_some_and(|(failed, _)| *failed <= revision)
+        {
+            self.last_error = None;
+        }
     }
 
-    fn is_flushed(&self, revision: u64) -> bool {
-        self.completed_revision >= revision
+    fn complete_failed(&mut self, snapshot: JournalWriteSnapshot, error: String) {
+        let revision = snapshot.revision;
+        self.attempted_revision = self.attempted_revision.max(revision);
+        self.failed = Some(snapshot);
+        self.last_error = Some((revision, error));
+    }
+
+    fn status(&self, revision: u64) -> JournalPersistStatus {
+        if self.saved_revision >= revision {
+            JournalPersistStatus::Saved
+        } else if let Some((failed_revision, error)) = &self.last_error
+            && *failed_revision >= revision
+        {
+            JournalPersistStatus::Failed(error.clone())
+        } else if self.worker_stopped {
+            JournalPersistStatus::Failed("journal writer stopped".into())
+        } else {
+            JournalPersistStatus::Pending
+        }
     }
 }
 
 type JournalWriterShared = Arc<(Mutex<JournalWriteState>, Condvar)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JournalPersistStatus {
+    Pending,
+    Saved,
+    Failed(String),
+}
 
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
@@ -144,13 +231,21 @@ impl StoreMutationEffects {
 pub const JOURNAL_FILE: &str = "rename_migration_journal.json";
 
 /// ジャーナルを読み込む (無い / 壊れている場合は空)。
-pub fn journal_load(data_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+pub(crate) fn journal_load(data_dir: &Path) -> Vec<PathMigrationJob> {
     let path = data_dir.join(JOURNAL_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
         return Vec::new();
     };
+    if let Ok(entries) = serde_json::from_slice::<Vec<PathMigrationJob>>(&bytes) {
+        return entries;
+    }
+    // v3.10 and earlier stored a bare list of pairs. A recovered legacy entry is treated as Tree:
+    // exact sources still match, while a folder rename cannot strand collection descendants.
     match serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(&bytes) {
-        Ok(entries) => entries,
+        Ok(entries) => entries
+            .into_iter()
+            .map(|(old_path, new_path)| PathMigrationJob::shell_rename(old_path, new_path, true))
+            .collect(),
         Err(e) => {
             crate::logger::log(format!("[RENAME-MIG] journal parse failed (discard): {e}"));
             Vec::new()
@@ -158,24 +253,52 @@ pub fn journal_load(data_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     }
 }
 
-/// ジャーナルを書き出す (temp + rename の atomic 置換、空なら削除)。best-effort:
-/// 失敗はログのみ (移行自体は続行する。ジャーナルはクラッシュ回復の追加保険)。
-pub fn journal_save(data_dir: &Path, entries: &[(PathBuf, PathBuf)]) {
+/// ジャーナルを書き出す (temp + rename の atomic 置換、空なら削除)。
+///
+/// 呼び出し側の writer は結果を ownership gate へ返す。該当 snapshot の保存成功 ACK
+/// より前に path-key / collection migration を始めてはならない。
+pub(crate) fn journal_save(data_dir: &Path, entries: &[PathMigrationJob]) -> std::io::Result<()> {
     let path = data_dir.join(JOURNAL_FILE);
     if entries.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return;
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
     }
-    let result = (|| -> std::io::Result<()> {
-        let json = serde_json::to_vec(entries)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        crate::logger::log(format!("[RENAME-MIG] journal save failed: {e}"));
+    std::fs::create_dir_all(data_dir)?;
+    let json = serde_json::to_vec(entries)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    replace_journal_file_atomic(&tmp, &path).or_else(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        Err(error)
+    })
+}
+
+#[cfg(windows)]
+fn replace_journal_file_atomic(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let temp: Vec<u16> = temp.as_os_str().encode_wide().chain([0]).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_journal_file_atomic(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, destination)
 }
 
 /// Single background owner for rename-migration journal writes. The UI publishes complete
@@ -201,35 +324,45 @@ impl RenameMigrationJournalWriter {
         Self { shared, handle }
     }
 
-    pub(crate) fn enqueue(&self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) {
+    pub(crate) fn enqueue(
+        &self,
+        data_dir: PathBuf,
+        entries: Vec<PathMigrationJob>,
+    ) -> Result<u64, String> {
         let (state, cv) = self.shared.as_ref();
         let mut state = state.lock().unwrap();
         if state.worker_stopped || state.shutdown {
-            crate::logger::log("[RENAME-MIG] journal writer unavailable; snapshot not saved");
-            return;
+            return Err("journal writer unavailable; snapshot not saved".into());
         }
-        state.enqueue(data_dir, entries);
+        let revision = state.enqueue(data_dir, entries);
         cv.notify_one();
+        Ok(revision)
     }
 
-    pub(crate) fn flush(&self) {
+    pub(crate) fn status(&self, revision: u64) -> JournalPersistStatus {
+        self.shared.as_ref().0.lock().unwrap().status(revision)
+    }
+
+    pub(crate) fn flush(&self) -> Result<(), String> {
         let (state, cv) = self.shared.as_ref();
         let mut state = state.lock().unwrap();
         let target = state.next_revision;
-        while !state.is_flushed(target) && !state.worker_stopped {
+        while matches!(state.status(target), JournalPersistStatus::Pending) {
             state = cv.wait(state).unwrap();
         }
-        if !state.is_flushed(target) {
-            crate::logger::log(format!(
-                "[RENAME-MIG] journal writer stopped before flush revision {target}"
-            ));
+        match state.status(target) {
+            JournalPersistStatus::Saved => Ok(()),
+            JournalPersistStatus::Failed(error) => Err(error),
+            JournalPersistStatus::Pending => unreachable!("flush loop exits only at terminal"),
         }
     }
 }
 
 impl Drop for RenameMigrationJournalWriter {
     fn drop(&mut self) {
-        self.flush();
+        if let Err(error) = self.flush() {
+            crate::logger::log(format!("[RENAME-MIG] final journal flush failed: {error}"));
+        }
         {
             let (state, cv) = self.shared.as_ref();
             state.lock().unwrap().shutdown = true;
@@ -270,9 +403,20 @@ fn run_journal_writer(shared: JournalWriterShared) {
                 None => continue,
             }
         };
-        journal_save(&snapshot.data_dir, &snapshot.entries);
         let (state, cv) = shared.as_ref();
-        state.lock().unwrap().complete(snapshot.revision);
+        match journal_save(&snapshot.data_dir, &snapshot.entries) {
+            Ok(()) => state.lock().unwrap().complete_saved(snapshot.revision),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] journal save failed revision={}: {error}",
+                    snapshot.revision
+                ));
+                state
+                    .lock()
+                    .unwrap()
+                    .complete_failed(snapshot, error.to_string());
+            }
+        }
         cv.notify_all();
     }
 }
@@ -2126,27 +2270,36 @@ mod tests {
     fn journal_writer_state_keeps_only_newest_waiting_snapshot() {
         let mut state = JournalWriteState::default();
         let dir = PathBuf::from("data");
-        let rev1 = state.enqueue(dir.clone(), vec![("a".into(), "b".into())]);
+        let job = |old: &str, new: &str| {
+            PathMigrationJob::shell_rename(PathBuf::from(old), PathBuf::from(new), false)
+        };
+        let rev1 = state.enqueue(dir.clone(), vec![job("a", "b")]);
         let first = state.take_latest().unwrap();
-        let _rev2 = state.enqueue(dir.clone(), vec![("b".into(), "c".into())]);
-        let rev3 = state.enqueue(dir, vec![("c".into(), "d".into())]);
+        let _rev2 = state.enqueue(dir.clone(), vec![job("b", "c")]);
+        let rev3 = state.enqueue(dir, vec![job("c", "d")]);
 
-        state.complete(first.revision);
+        state.complete_saved(first.revision);
         assert_eq!(first.revision, rev1);
-        assert!(!state.is_flushed(rev3));
+        assert_eq!(state.status(rev3), JournalPersistStatus::Pending);
         let newest = state.take_latest().unwrap();
         assert_eq!(newest.revision, rev3);
-        assert_eq!(newest.entries, vec![("c".into(), "d".into())]);
-        state.complete(newest.revision);
-        assert!(state.is_flushed(rev3));
+        assert_eq!(newest.entries, vec![job("c", "d")]);
+        state.complete_saved(newest.revision);
+        assert_eq!(state.status(rev3), JournalPersistStatus::Saved);
     }
 
     #[test]
     fn journal_writer_drop_flushes_latest_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let entries = vec![(PathBuf::from("old"), PathBuf::from("new"))];
+        let entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
         let writer = RenameMigrationJournalWriter::spawn();
-        writer.enqueue(dir.path().to_path_buf(), entries.clone());
+        writer
+            .enqueue(dir.path().to_path_buf(), entries.clone())
+            .unwrap();
         drop(writer);
         assert_eq!(journal_load(dir.path()), entries);
     }
@@ -2157,21 +2310,124 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(journal_load(dir.path()).is_empty(), "無ければ空");
         let entries = vec![
-            (PathBuf::from(r"D:\a.jpg"), PathBuf::from(r"D:\b.jpg")),
-            (
+            PathMigrationJob::shell_rename(
+                PathBuf::from(r"D:\a.jpg"),
+                PathBuf::from(r"D:\b.jpg"),
+                false,
+            ),
+            PathMigrationJob::shell_rename(
                 PathBuf::from(r"D:\フォルダ"),
                 PathBuf::from(r"D:\新フォルダ"),
+                true,
             ),
         ];
-        journal_save(dir.path(), &entries);
+        journal_save(dir.path(), &entries).unwrap();
         assert_eq!(journal_load(dir.path()), entries, "往復で一致");
-        journal_save(dir.path(), &[]);
+        journal_save(dir.path(), &[]).unwrap();
         assert!(
             !dir.path().join(JOURNAL_FILE).exists(),
             "空になったらファイルごと削除"
         );
         std::fs::write(dir.path().join(JOURNAL_FILE), b"broken json").unwrap();
         assert!(journal_load(dir.path()).is_empty(), "壊れていたら空で続行");
+    }
+
+    #[test]
+    fn journal_save_failure_is_reported_without_claiming_durable_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("blocked-parent");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
+
+        assert!(journal_save(&not_a_directory, &entries).is_err());
+        assert!(
+            !not_a_directory.join(JOURNAL_FILE).exists(),
+            "a failed write must not be represented as a durable journal"
+        );
+    }
+
+    #[test]
+    fn journal_writer_failure_is_a_terminal_unsaved_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("blocked-parent");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let writer = RenameMigrationJournalWriter::spawn();
+        let revision = writer
+            .enqueue(
+                not_a_directory,
+                vec![PathMigrationJob::shell_rename(
+                    PathBuf::from("old"),
+                    PathBuf::from("new"),
+                    false,
+                )],
+            )
+            .unwrap();
+
+        assert!(writer.flush().is_err());
+        assert!(matches!(
+            writer.status(revision),
+            JournalPersistStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn journal_writer_retry_supersedes_the_exact_failed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked-parent");
+        std::fs::write(&blocked, b"file").unwrap();
+        let failed_entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
+        let writer = RenameMigrationJournalWriter::spawn();
+        let failed_revision = writer.enqueue(blocked.clone(), failed_entries).unwrap();
+        assert!(writer.flush().is_err());
+        assert!(matches!(
+            writer.status(failed_revision),
+            JournalPersistStatus::Failed(_)
+        ));
+
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let latest_entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("newer-old"),
+            PathBuf::from("newer-new"),
+            true,
+        )];
+        let retry_revision = writer
+            .enqueue(blocked.clone(), latest_entries.clone())
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.status(retry_revision), JournalPersistStatus::Saved);
+        assert_eq!(
+            journal_load(&blocked),
+            latest_entries,
+            "retry writes the App's newest full snapshot, not the retained older failure"
+        );
+    }
+
+    #[test]
+    fn journal_atomic_replacement_overwrites_an_existing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            false,
+        )];
+        let second = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("b"),
+            PathBuf::from("c"),
+            false,
+        )];
+        journal_save(dir.path(), &first).unwrap();
+        journal_save(dir.path(), &second).unwrap();
+        assert_eq!(journal_load(dir.path()), second);
     }
 
     /// 連続リネーム A→B→C は **実行順どおり**なら C に集約される。逆順で実行すると

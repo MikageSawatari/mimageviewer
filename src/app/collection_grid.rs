@@ -1,0 +1,1758 @@
+//! Context-owned collection Grid lifecycle.
+//!
+//! The collection actor supplies an immutable logical snapshot. Filesystem classification runs on
+//! a separate worker, and only the exact viewer-context/surface/revision owner may install it.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::top_level_grid_view::{
+    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition,
+    CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
+    CollectionGridSourceOpenOwner, CollectionGridViewportAnchor, TopLevelGridRestore,
+    TopLevelGridSurface,
+};
+use super::{App, GridItem, ViewerContextId};
+use crate::collection_store::{
+    CollectionEntryId, CollectionId, CollectionPrepareError, CollectionPreparedSnapshot,
+    CollectionStoreError, prepare_collection_snapshot,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct CollectionGridRemoveTarget {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) expected_revision: u64,
+    pub(crate) entry_ids: Vec<CollectionEntryId>,
+}
+
+impl App {
+    fn collection_grid_context_id(&self) -> ViewerContextId {
+        #[cfg(windows)]
+        {
+            self.projected_viewer_context_id()
+        }
+        #[cfg(not(windows))]
+        {
+            ViewerContextId::single_context()
+        }
+    }
+
+    fn collection_grid_stamp(&self) -> Option<CollectionGridRequestStamp> {
+        let TopLevelGridSurface::Collection(identity) = self.top_level_grid_view.surface() else {
+            return None;
+        };
+        Some(CollectionGridRequestStamp {
+            context_id: self.collection_grid_context_id(),
+            surface_generation: self.top_level_grid_view.generation(),
+            collection_id: identity.collection_id,
+        })
+    }
+
+    fn collection_grid_stamp_is_current(&self, stamp: CollectionGridRequestStamp) -> bool {
+        self.collection_grid_stamp() == Some(stamp)
+    }
+
+    pub(crate) fn apply_collection_grid_remove_success(
+        &mut self,
+        stamp: CollectionGridRequestStamp,
+        removed: &[CollectionEntryId],
+    ) {
+        #[cfg(windows)]
+        if stamp.context_id != self.projected_viewer_context_id() {
+            let _ = self.with_viewer_context(stamp.context_id, |owner| {
+                owner.apply_collection_grid_remove_success_in_current_context(stamp, removed);
+            });
+            return;
+        }
+        self.apply_collection_grid_remove_success_in_current_context(stamp, removed);
+    }
+
+    fn apply_collection_grid_remove_success_in_current_context(
+        &mut self,
+        stamp: CollectionGridRequestStamp,
+        removed: &[CollectionEntryId],
+    ) {
+        if !self.collection_grid_stamp_is_current(stamp) {
+            return;
+        }
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return;
+        };
+        if !matches!(session.position, CollectionGridPosition::Root)
+            || session.installed_items_generation != Some(self.items_generation)
+        {
+            return;
+        }
+        let Some(prepared) = session.prepared() else {
+            return;
+        };
+        let removed_indices = prepared
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| removed.contains(&entry.entry_id).then_some(index))
+            .collect::<std::collections::HashSet<_>>();
+        self.checked
+            .retain(|index| !removed_indices.contains(index));
+        if self
+            .selected
+            .is_some_and(|index| removed_indices.contains(&index))
+        {
+            self.selected = None;
+        }
+    }
+
+    fn invalidate_current_collection_grid_sources(
+        &mut self,
+        scopes: &[crate::delete_worker::DeleteSourceScope],
+    ) {
+        let Some(session) = self.top_level_grid_view.collection_session_mut() else {
+            return;
+        };
+        let affected = session.prepared().is_some_and(|prepared| {
+            prepared.entries.iter().any(|entry| {
+                scopes
+                    .iter()
+                    .any(|scope| source_scope_contains(scope, &entry.source_path))
+            })
+        });
+        if affected {
+            // accepted_revision remains the actor revision. Clearing the filesystem preparation
+            // makes the next mounted poll request the same logical snapshot and reclassify it.
+            session.cancel_pending();
+            session.installed_items_generation = None;
+        }
+    }
+
+    pub(crate) fn invalidate_collection_grid_sources(
+        &mut self,
+        scopes: &[crate::delete_worker::DeleteSourceScope],
+    ) {
+        if scopes.is_empty() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let ids = self.viewer_context_ids();
+            for id in ids {
+                let _ = self.with_viewer_context(id, |app| {
+                    app.invalidate_current_collection_grid_sources(scopes);
+                });
+            }
+        }
+        #[cfg(not(windows))]
+        self.invalidate_current_collection_grid_sources(scopes);
+    }
+
+    /// Resolves a context-menu cell/checked selection through the currently installed immutable
+    /// binding. A stale generation or a child physical view yields no target rather than mapping
+    /// indices through another surface's items.
+    pub(crate) fn collection_grid_remove_target(
+        &self,
+        item_index: Option<usize>,
+        has_checked: bool,
+    ) -> Option<CollectionGridRemoveTarget> {
+        let stamp = self.collection_grid_stamp()?;
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(session.position, CollectionGridPosition::Root)
+            || session.installed_items_generation != Some(self.items_generation)
+        {
+            return None;
+        }
+        let prepared = session.prepared()?;
+        if prepared.collection_revision != session.accepted_revision
+            || prepared.entries.len() != self.items.len()
+        {
+            return None;
+        }
+        let mut indices: Vec<usize> = if has_checked {
+            self.checked.iter().copied().collect()
+        } else {
+            vec![item_index?]
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            return None;
+        }
+        let entry_ids = indices
+            .into_iter()
+            .map(|index| prepared.entries.get(index).map(|entry| entry.entry_id))
+            .collect::<Option<Vec<_>>>()?;
+        Some(CollectionGridRemoveTarget {
+            stamp,
+            expected_revision: prepared.collection_revision,
+            entry_ids,
+        })
+    }
+
+    pub(crate) fn collection_grid_restore_snapshot(&self) -> Option<TopLevelGridRestore> {
+        let session = self.top_level_grid_view.collection_session()?;
+        let viewport_anchor = session
+            .installed_items_generation
+            .filter(|generation| *generation == self.items_generation)
+            .and_then(|_| self.selected)
+            .and_then(|index| session.prepared()?.entries.get(index))
+            .map(|entry| CollectionGridViewportAnchor {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key.clone(),
+            })
+            .or_else(|| session.restore_anchor.clone());
+        Some(TopLevelGridRestore::Collection(CollectionGridRestore {
+            identity: session.identity,
+            revision_at_open: session.accepted_revision.max(session.wanted_revision),
+            viewport_anchor,
+        }))
+    }
+
+    pub(crate) fn collection_grid_parent_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
+        let session = self.top_level_grid_view.collection_session()?;
+        let CollectionGridPosition::PhysicalSource {
+            entry_id,
+            source_key,
+            ..
+        } = &session.position
+        else {
+            return None;
+        };
+        Some(crate::ui_main::AddressBarNav::Collection(
+            CollectionGridRestore {
+                identity: session.identity,
+                revision_at_open: session.accepted_revision.max(session.wanted_revision),
+                viewport_anchor: Some(CollectionGridViewportAnchor {
+                    entry_id: *entry_id,
+                    source_key: source_key.clone(),
+                }),
+            },
+        ))
+    }
+
+    /// Captures the stable collection origin before a physical container begins loading. Leaf
+    /// media remain at the collection root and use the same immutable item binding in fullscreen.
+    pub(crate) fn collection_grid_source_anchor(
+        &self,
+        index: usize,
+        path: &std::path::Path,
+    ) -> Option<CollectionGridViewportAnchor> {
+        let generation = self.items_generation;
+        self.top_level_grid_view
+            .collection_session()
+            .filter(|session| {
+                matches!(session.position, CollectionGridPosition::Root)
+                    && session.installed_items_generation == Some(generation)
+            })
+            .and_then(CollectionGridSession::prepared)
+            .and_then(|prepared| prepared.entries.get(index))
+            .filter(|entry| crate::folder_tree::path_eq(&entry.source_path, path))
+            .map(|entry| CollectionGridViewportAnchor {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key.clone(),
+            })
+    }
+
+    /// Captures the complete owner for an asynchronous archive probe/conversion initiated by a
+    /// collection cell. A later completion may mutate the collection position only while this
+    /// exact context, surface generation, collection, and revision pair is still current.
+    pub(crate) fn collection_grid_source_open_owner(
+        &self,
+        index: usize,
+        path: &std::path::Path,
+    ) -> Option<CollectionGridSourceOpenOwner> {
+        let stamp = self.collection_grid_stamp()?;
+        let session = self.top_level_grid_view.collection_session()?;
+        let anchor = self.collection_grid_source_anchor(index, path)?;
+        Some(CollectionGridSourceOpenOwner {
+            stamp,
+            accepted_revision: session.accepted_revision,
+            wanted_revision: session.wanted_revision,
+            anchor,
+        })
+    }
+
+    pub(crate) fn collection_grid_source_open_owner_is_current(
+        &self,
+        owner: &CollectionGridSourceOpenOwner,
+        path: &std::path::Path,
+    ) -> bool {
+        if !self.collection_grid_stamp_is_current(owner.stamp) {
+            return false;
+        }
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return false;
+        };
+        if !matches!(session.position, CollectionGridPosition::Root)
+            || session.accepted_revision != owner.accepted_revision
+            || session.wanted_revision != owner.wanted_revision
+            || session.installed_items_generation != Some(self.items_generation)
+        {
+            return false;
+        }
+        session.prepared().is_some_and(|prepared| {
+            prepared.collection_revision == owner.accepted_revision
+                && prepared.entries.iter().any(|entry| {
+                    entry.entry_id == owner.anchor.entry_id
+                        && entry.source_key == owner.anchor.source_key
+                        && crate::folder_tree::path_eq(&entry.source_path, path)
+                })
+        })
+    }
+
+    pub(crate) fn commit_collection_grid_source_open_owned(
+        &mut self,
+        owner: &CollectionGridSourceOpenOwner,
+        path: std::path::PathBuf,
+    ) -> bool {
+        if !self.collection_grid_source_open_owner_is_current(owner, &path) {
+            return false;
+        }
+        self.commit_collection_grid_source_open(owner.anchor.clone(), path);
+        true
+    }
+
+    pub(crate) fn commit_collection_grid_source_open(
+        &mut self,
+        anchor: CollectionGridViewportAnchor,
+        path: std::path::PathBuf,
+    ) {
+        if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+            session.restore_anchor = Some(anchor.clone());
+            session.position = CollectionGridPosition::PhysicalSource {
+                entry_id: anchor.entry_id,
+                source_key: anchor.source_key,
+                path,
+            };
+        }
+    }
+
+    /// Captures a collection return owner for a new physical viewer context without mutating the
+    /// still-mounted collection root. Detached folder/archive classification may finish later, so
+    /// the complete owner must travel with that request rather than be reconstructed from App.
+    pub(crate) fn collection_grid_restore_for_source(
+        &self,
+        index: usize,
+        path: &std::path::Path,
+    ) -> Option<CollectionGridRestore> {
+        let anchor = self.collection_grid_source_anchor(index, path)?;
+        let session = self.top_level_grid_view.collection_session()?;
+        Some(CollectionGridRestore {
+            identity: session.identity,
+            revision_at_open: session.accepted_revision.max(session.wanted_revision),
+            viewport_anchor: Some(anchor),
+        })
+    }
+
+    fn retire_transient_views_for_collection(&mut self) -> Option<TopLevelGridRestore> {
+        let current = self.current_top_level_restore_snapshot();
+        let mut origin = self.dismiss_snapshot_without_restore();
+        if self.favsearch.active {
+            origin = Some(self.dismiss_favsearch_without_restore());
+        }
+        if self.global_search.active {
+            origin = Some(self.dismiss_global_search_without_restore());
+        }
+        if self.tag_view.active {
+            origin = Some(self.dismiss_tag_view_without_restore());
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+        self.cancel_pending_folder_nav();
+        origin.or(current)
+    }
+
+    /// Opens the collection root. `restore` carries a minimum revision hint and a stable entry
+    /// anchor; neither value is treated as an exact actor reply revision.
+    pub(crate) fn open_collection_grid(
+        &mut self,
+        collection_id: CollectionId,
+        restore: Option<CollectionGridRestore>,
+    ) {
+        let return_to = if restore.is_some() {
+            None
+        } else if matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity) if identity.collection_id == collection_id
+        ) {
+            self.top_level_grid_view.return_to().cloned()
+        } else {
+            self.retire_transient_views_for_collection()
+        };
+        let identity = CollectionGridIdentity { collection_id };
+        self.top_level_grid_view
+            .begin(TopLevelGridSurface::Collection(identity), return_to);
+        let watch = self
+            .collection_store_client()
+            .and_then(|client| client.subscribe().ok());
+        if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+            session.wanted_revision = restore.as_ref().map_or(0, |state| state.revision_at_open);
+            session.restore_anchor = restore.and_then(|state| state.viewport_anchor);
+            session.watch = watch;
+        }
+
+        // Do not leave a prior physical/search grid interactive while the actor and classifier are
+        // resolving this collection. The empty install performs no filesystem/database access.
+        self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+        self.address = "コレクションを読み込み中…".into();
+        self.schedule_collection_grid_snapshot();
+    }
+
+    fn schedule_collection_grid_snapshot(&mut self) {
+        if !self.collection_grid_root_materialize_active() {
+            return;
+        }
+        let Some(stamp) = self.collection_grid_stamp() else {
+            return;
+        };
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return;
+        };
+        if !matches!(session.load, CollectionGridLoadState::RequestNeeded { .. }) {
+            return;
+        }
+        let minimum_revision = session.wanted_revision.max(session.accepted_revision);
+        let installed = session.load.installed().cloned();
+        let Some(client) = self.collection_store_client() else {
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.load = CollectionGridLoadState::Failed {
+                    message: "コレクションを利用できません".into(),
+                    installed,
+                };
+            }
+            return;
+        };
+        match client.load_collection(stamp.collection_id) {
+            Ok(receiver) => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::Snapshot {
+                        stamp,
+                        minimum_revision,
+                        installed,
+                        receiver,
+                    };
+                }
+            }
+            Err(error) => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::Failed {
+                        message: collection_grid_error(&error),
+                        installed,
+                    };
+                }
+            }
+        }
+    }
+
+    fn spawn_collection_grid_prepare(
+        &mut self,
+        stamp: CollectionGridRequestStamp,
+        snapshot: crate::collection_store::CollectionSnapshot,
+        installed: Option<Arc<CollectionPreparedSnapshot>>,
+    ) {
+        let exact_revision = snapshot.revision();
+        let display_order = self.settings.grid_display_order.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let spawn = std::thread::Builder::new()
+            .name("collection-grid-prepare".into())
+            .spawn(move || {
+                let result = prepare_collection_snapshot(
+                    &snapshot,
+                    &display_order,
+                    &worker_cancel,
+                    |_, _| {},
+                );
+                let _ = sender.send(result);
+            });
+        match spawn {
+            Ok(_) => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::Preparing {
+                        stamp,
+                        exact_revision,
+                        installed,
+                        cancel,
+                        receiver,
+                    };
+                }
+            }
+            Err(error) => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::Failed {
+                        message: format!("コレクション一覧を準備できません: {error}"),
+                        installed,
+                    };
+                }
+            }
+        }
+    }
+
+    fn collection_grid_root_materialize_active(&self) -> bool {
+        self.fullscreen_idx.is_none()
+            && self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| matches!(session.position, CollectionGridPosition::Root))
+    }
+
+    pub(crate) fn collection_grid_empty_message(&self) -> Option<String> {
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(session.position, CollectionGridPosition::Root) {
+            return None;
+        }
+        match &session.load {
+            CollectionGridLoadState::RequestNeeded { installed: None }
+            | CollectionGridLoadState::Snapshot { .. }
+            | CollectionGridLoadState::Preparing { .. } => Some("コレクションを読み込み中…".into()),
+            CollectionGridLoadState::RequestNeeded { installed: Some(_) } => None,
+            CollectionGridLoadState::Empty(_) => Some("コレクションに項目はありません".into()),
+            CollectionGridLoadState::Failed {
+                message,
+                installed: None,
+            } => Some(message.clone()),
+            CollectionGridLoadState::Failed {
+                installed: Some(_), ..
+            } => None,
+            CollectionGridLoadState::Deleted => Some("コレクションは削除されました".into()),
+            CollectionGridLoadState::Ready(_) => None,
+        }
+    }
+
+    pub(crate) fn collection_grid_stale_error_message(&self) -> Option<&str> {
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(session.position, CollectionGridPosition::Root) {
+            return None;
+        }
+        match &session.load {
+            CollectionGridLoadState::Failed {
+                message,
+                installed: Some(_),
+            } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Drained before viewport/fullscreen early returns. No branch blocks the UI thread.
+    pub(crate) fn poll_collection_grid(&mut self, ctx: &egui::Context) {
+        // A duplicated/parked viewer context carries the immutable prepared result, but each
+        // context needs its own fan-out receiver. Reattach lazily after the context becomes
+        // current instead of copying a single-consumer receiver across viewports.
+        let needs_watch = self
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| session.watch.is_none());
+        if needs_watch
+            && let Some(watch) = self
+                .collection_store_client()
+                .and_then(|client| client.subscribe().ok())
+            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+        {
+            session.watch = Some(watch);
+        }
+        let notice = self
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.watch.as_ref())
+            .and_then(crate::collection_store::CollectionRevisionWatch::take_latest);
+        let mut deleted_current_root = false;
+        if let Some(notice) = notice
+            && let Some(stamp) = self.collection_grid_stamp()
+            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+            && notice.catalog_revision > session.observed_catalog_revision
+        {
+            session.observed_catalog_revision = notice.catalog_revision;
+            if let Some((_, revision)) = notice
+                .collection_revisions
+                .iter()
+                .find(|(id, _)| *id == stamp.collection_id)
+            {
+                if *revision > session.wanted_revision {
+                    session.wanted_revision = *revision;
+                    if matches!(session.position, CollectionGridPosition::Root) {
+                        session.cancel_pending();
+                    }
+                }
+            } else {
+                session.cancel_pending();
+                session.load = CollectionGridLoadState::Deleted;
+                deleted_current_root = matches!(session.position, CollectionGridPosition::Root)
+                    && self.fullscreen_idx.is_none();
+            }
+        }
+        if deleted_current_root {
+            self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.installed_items_generation = None;
+            }
+            self.address = "コレクションは削除されました".into();
+            ctx.request_repaint();
+        }
+
+        // A physical child and a fullscreen leaf retain the exact installed binding. Revision
+        // notices only advance wanted_revision until the owning context returns to its root Grid.
+        if !self.collection_grid_root_materialize_active() {
+            return;
+        }
+
+        // A delete notice may have arrived while a leaf was fullscreen. The notice owns the
+        // terminal state immediately, while presentation replacement waits until the root Grid
+        // can be changed without rebinding the fullscreen index.
+        let presents_deleted_rows =
+            self.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(session.load, CollectionGridLoadState::Deleted)
+                        && session.installed_items_generation == Some(self.items_generation)
+                });
+        if presents_deleted_rows {
+            self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.installed_items_generation = None;
+            }
+            self.address = "コレクションは削除されました".into();
+            ctx.request_repaint();
+        }
+
+        let pending = self
+            .top_level_grid_view
+            .collection_session_mut()
+            .and_then(|session| {
+                if matches!(
+                    session.load,
+                    CollectionGridLoadState::Snapshot { .. }
+                        | CollectionGridLoadState::Preparing { .. }
+                ) {
+                    Some(std::mem::replace(
+                        &mut session.load,
+                        CollectionGridLoadState::RequestNeeded { installed: None },
+                    ))
+                } else {
+                    None
+                }
+            });
+        match pending {
+            Some(CollectionGridLoadState::Snapshot {
+                stamp,
+                minimum_revision,
+                installed,
+                receiver,
+            }) => match receiver.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    if self.collection_grid_stamp_is_current(stamp) {
+                        let wanted = self
+                            .top_level_grid_view
+                            .collection_session()
+                            .map_or(minimum_revision, |session| session.wanted_revision);
+                        if snapshot.collection_id() == stamp.collection_id
+                            && snapshot.revision() >= minimum_revision
+                            && snapshot.revision() >= wanted
+                        {
+                            if let Some(session) = self.top_level_grid_view.collection_session_mut()
+                            {
+                                session.observed_catalog_revision = session
+                                    .observed_catalog_revision
+                                    .max(snapshot.catalog_revision);
+                            }
+                            self.spawn_collection_grid_prepare(stamp, snapshot, installed);
+                        } else if let Some(session) =
+                            self.top_level_grid_view.collection_session_mut()
+                        {
+                            session.load = CollectionGridLoadState::RequestNeeded { installed };
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = if matches!(error, CollectionStoreError::NotFound) {
+                            CollectionGridLoadState::Deleted
+                        } else {
+                            CollectionGridLoadState::Failed {
+                                message: collection_grid_error(&error),
+                                installed,
+                            }
+                        };
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::Snapshot {
+                            stamp,
+                            minimum_revision,
+                            installed,
+                            receiver,
+                        };
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::Failed {
+                            message: "コレクション一覧の応答が失われました".into(),
+                            installed,
+                        };
+                    }
+                }
+            },
+            Some(CollectionGridLoadState::Preparing {
+                stamp,
+                exact_revision,
+                installed,
+                cancel,
+                receiver,
+            }) => match receiver.try_recv() {
+                Ok(Ok(prepared)) => {
+                    let accepts = self.collection_grid_stamp_is_current(stamp)
+                        && prepared.collection_id == stamp.collection_id
+                        && prepared.collection_revision == exact_revision
+                        && self
+                            .top_level_grid_view
+                            .collection_session()
+                            .is_some_and(|session| session.wanted_revision <= exact_revision);
+                    if accepts {
+                        self.apply_collection_grid_prepared(Arc::new(prepared), installed);
+                        ctx.request_repaint();
+                    }
+                }
+                Ok(Err(CollectionPrepareError::Cancelled)) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::RequestNeeded { installed };
+                    }
+                }
+                Ok(Err(error)) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::Failed {
+                            message: error.to_string(),
+                            installed,
+                        };
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if self.collection_grid_stamp_is_current(stamp) {
+                        if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                            session.load = CollectionGridLoadState::Preparing {
+                                stamp,
+                                exact_revision,
+                                installed,
+                                cancel,
+                                receiver,
+                            };
+                        }
+                    } else {
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::Failed {
+                            message: "コレクション準備workerが終了しました".into(),
+                            installed,
+                        };
+                    }
+                }
+            },
+            Some(
+                CollectionGridLoadState::RequestNeeded { .. }
+                | CollectionGridLoadState::Ready(_)
+                | CollectionGridLoadState::Empty(_)
+                | CollectionGridLoadState::Failed { .. }
+                | CollectionGridLoadState::Deleted,
+            )
+            | None => {}
+        }
+        self.schedule_collection_grid_snapshot();
+    }
+
+    fn apply_collection_grid_prepared(
+        &mut self,
+        prepared: Arc<CollectionPreparedSnapshot>,
+        previous: Option<Arc<CollectionPreparedSnapshot>>,
+    ) {
+        let old_binding_is_current =
+            self.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.installed_items_generation == Some(self.items_generation)
+                });
+        let old_selected = old_binding_is_current
+            .then_some(self.selected)
+            .flatten()
+            .and_then(|index| previous.as_ref()?.entries.get(index))
+            .map(|entry| CollectionGridViewportAnchor {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key.clone(),
+            });
+        let old_checked = if old_binding_is_current {
+            self.checked
+                .iter()
+                .filter_map(|index| previous.as_ref()?.entries.get(*index))
+                .map(|entry| CollectionGridViewportAnchor {
+                    entry_id: entry.entry_id,
+                    source_key: entry.source_key.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let restore_anchor = self
+            .top_level_grid_view
+            .collection_session_mut()
+            .and_then(|session| session.restore_anchor.take());
+        let items = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect();
+        let image_metas = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.display_meta)
+            .collect();
+        let selected = restore_anchor
+            .as_ref()
+            .or(old_selected.as_ref())
+            .and_then(|anchor| {
+                prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == anchor.entry_id)
+                    .or_else(|| {
+                        prepared
+                            .entries
+                            .iter()
+                            .position(|entry| entry.source_key == anchor.source_key)
+                    })
+            });
+        let checked = old_checked
+            .iter()
+            .filter_map(|anchor| {
+                prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == anchor.entry_id)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        self.install_collection_grid_items(items, image_metas, selected);
+        self.checked = checked;
+        self.address = format!("コレクション: {}", prepared.collection_name);
+        let installed_generation = self.items_generation;
+        if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+            session.position = CollectionGridPosition::Root;
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
+            session.installed_items_generation = Some(installed_generation);
+            session.load = if prepared.entries.is_empty() {
+                CollectionGridLoadState::Empty(prepared)
+            } else {
+                CollectionGridLoadState::Ready(prepared)
+            };
+        }
+    }
+
+    fn install_collection_grid_items(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        selected: Option<usize>,
+    ) {
+        self.current_folder = None;
+        self.archive_source_override = None;
+        self.zip_nav = None;
+        self.stack_view = None;
+        self.stack_mode_requested = false;
+        self.cancel_stack_script_pending();
+        self.install_prepared_aggregate_items(items, image_metas);
+        self.invalidate_idx_state_and_queues();
+        self.clear_page_edit_state();
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.xmp_cache.clear();
+        self.clear_tags_cache();
+        self.search_filter = None;
+        self.search_query.clear();
+
+        self.selected = selected;
+        self.scroll_to_selected = selected.is_some();
+        if selected.is_none() {
+            self.scroll_offset_y = 0.0;
+        }
+        self.rebuild_visible_indices();
+        self.prewarm_grid_tags();
+    }
+}
+
+fn source_scope_contains(
+    scope: &crate::delete_worker::DeleteSourceScope,
+    source: &std::path::Path,
+) -> bool {
+    let source_key = crate::path_key::normalize_keep_drive(source);
+    let (root, tree) = match scope {
+        crate::delete_worker::DeleteSourceScope::Exact(path) => {
+            (crate::path_key::normalize_keep_drive(path), false)
+        }
+        crate::delete_worker::DeleteSourceScope::Tree(path) => {
+            (crate::path_key::normalize_keep_drive(path), true)
+        }
+    };
+    source_key == root
+        || tree
+            && source_key
+                .strip_prefix(root.trim_end_matches('/'))
+                .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn collection_grid_error(error: &CollectionStoreError) -> String {
+    match error {
+        CollectionStoreError::Starting => "コレクションを準備しています".into(),
+        CollectionStoreError::Busy => "コレクション処理が混み合っています".into(),
+        CollectionStoreError::Unavailable => "コレクションを利用できません".into(),
+        CollectionStoreError::NotFound => "コレクションが見つかりません".into(),
+        _ => format!("コレクションを読み込めません: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::collection_store::{
+        CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+    };
+    use crate::settings::Settings;
+
+    fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("collection actor reply")
+            .expect("collection actor operation")
+    }
+
+    fn start_ready_app(db_path: &Path) -> (App, crate::collection_store::CollectionStoreClient) {
+        let runtime =
+            CollectionStoreRuntime::start_at(db_path.to_path_buf()).expect("collection runtime");
+        let client = runtime.client();
+        let mut app = App::new_from_settings(Settings::default());
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.collection_store_client().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "collection runtime did not become ready"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (app, client)
+    }
+
+    fn wait_for_grid(app: &mut App, collection_id: CollectionId) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            let ready = app
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.identity.collection_id == collection_id
+                        && matches!(
+                            session.load,
+                            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+                        )
+                        && session.installed_items_generation == Some(app.items_generation)
+                });
+            if ready {
+                return;
+            }
+            assert!(Instant::now() < deadline, "collection Grid did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn poll_until(app: &mut App, message: &str, mut condition: impl FnMut(&App) -> bool) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition(app) {
+            assert!(Instant::now() < deadline, "{message}");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn collection_with_sources(
+        client: &crate::collection_store::CollectionStoreClient,
+        sources: &[(PathBuf, CollectionResolvedKind)],
+    ) -> crate::collection_store::CollectionSnapshot {
+        let created = recv(
+            client
+                .create_collection("Grid integration".into())
+                .expect("create request"),
+        );
+        let registrations = sources
+            .iter()
+            .map(|(path, kind)| {
+                CollectionRegistration::from_trusted_path(path, *kind).expect("registration")
+            })
+            .collect();
+        recv(
+            client
+                .add_batch(created.collection_id(), created.revision(), registrations)
+                .expect("add request"),
+        )
+        .snapshot
+    }
+
+    #[test]
+    fn prepared_grid_keeps_missing_and_restores_entry_by_source_when_entry_id_is_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.png");
+        let folder = temp.path().join("book");
+        let missing = temp.path().join("missing.png");
+        std::fs::write(&image, b"not decoded by collection preparation").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (image.clone(), CollectionResolvedKind::Image),
+                (folder.clone(), CollectionResolvedKind::Folder),
+                (missing.clone(), CollectionResolvedKind::Image),
+            ],
+        );
+
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let missing_index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::CollectionPlaceholder { path, .. } if path == &missing))
+            .expect("missing reference remains visible");
+        let folder_index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Folder(path) if path == &folder))
+            .expect("physical folder remains openable");
+        assert_ne!(missing_index, folder_index);
+
+        let anchor = app
+            .collection_grid_source_anchor(folder_index, &folder)
+            .expect("stable physical-source anchor");
+        app.commit_collection_grid_source_open(anchor.clone(), folder.clone());
+        let mut restore = match app.collection_grid_parent_nav().expect("collection parent") {
+            crate::ui_main::AddressBarNav::Collection(restore) => restore,
+            _ => panic!("physical source must return to its collection"),
+        };
+        restore
+            .viewport_anchor
+            .as_mut()
+            .expect("source anchor")
+            .entry_id = CollectionEntryId::new();
+        app.open_collection_grid(snapshot.collection_id(), Some(restore));
+        wait_for_grid(&mut app, snapshot.collection_id());
+
+        let selected = app.selected.expect("opened entry selection restored");
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .expect("prepared collection");
+        assert_eq!(prepared.entries[selected].source_key, anchor.source_key);
+        assert!(
+            app.scroll_to_selected,
+            "restored entry must be scrolled into view"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_grid_loading_empty_failure_and_deleted_are_terminal_presentations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let empty = recv(
+            client
+                .create_collection("Empty".into())
+                .expect("create request"),
+        );
+        app.open_collection_grid(empty.collection_id(), None);
+        assert_eq!(
+            app.collection_grid_empty_message().as_deref(),
+            Some("コレクションを読み込み中…")
+        );
+        wait_for_grid(&mut app, empty.collection_id());
+        assert_eq!(
+            app.collection_grid_empty_message().as_deref(),
+            Some("コレクションに項目はありません")
+        );
+
+        app.shutdown_collection_runtime_for_exit();
+        app.open_collection_grid(empty.collection_id(), None);
+        let failure = app
+            .collection_grid_empty_message()
+            .expect("terminal unavailable message");
+        assert_eq!(failure, "コレクションを利用できません");
+        let generation = app.top_level_grid_view.generation();
+        for _ in 0..4 {
+            app.poll_collection_grid(&egui::Context::default());
+            assert_eq!(app.top_level_grid_view.generation(), generation);
+            assert!(matches!(
+                app.top_level_grid_view.collection_session().unwrap().load,
+                CollectionGridLoadState::Failed {
+                    installed: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn revision_refresh_remaps_selected_and_checked_entry_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (first.clone(), CollectionResolvedKind::Image),
+                (second, CollectionResolvedKind::Image),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let selected_id = snapshot.entries[0].id;
+        let selected_index = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == selected_id)
+            .unwrap();
+        app.selected = Some(selected_index);
+        app.checked.insert(selected_index);
+
+        let reordered = recv(
+            client
+                .reorder_manual(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    snapshot
+                        .entries
+                        .iter()
+                        .rev()
+                        .map(|entry| entry.id)
+                        .collect(),
+                )
+                .expect("reorder request"),
+        );
+        poll_until(&mut app, "collection reorder did not refresh", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.accepted_revision == reordered.revision())
+        });
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap();
+        let remapped = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == selected_id)
+            .unwrap();
+        assert_eq!(app.selected, Some(remapped));
+        assert_eq!(app.checked, std::collections::HashSet::from([remapped]));
+        assert!(app.scroll_to_selected);
+
+        let removed = recv(
+            client
+                .remove_entries(
+                    snapshot.collection_id(),
+                    reordered.revision(),
+                    vec![selected_id],
+                )
+                .expect("remove request"),
+        );
+        let readded = recv(
+            client
+                .add_batch(
+                    snapshot.collection_id(),
+                    removed.revision(),
+                    vec![
+                        CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .expect("re-add request"),
+        )
+        .snapshot;
+        poll_until(&mut app, "re-added source did not refresh", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.accepted_revision == readded.revision())
+        });
+        let new_entry = readded
+            .entries
+            .iter()
+            .find(|entry| entry.source_path == first)
+            .unwrap();
+        assert_ne!(new_entry.id, selected_id);
+        assert!(
+            app.checked.is_empty(),
+            "checks never transfer to a new entry ID"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn physical_child_defers_revision_install_until_typed_collection_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let child = folder.join("child.png");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let anchor = app
+            .collection_grid_source_anchor(0, &folder)
+            .expect("collection source anchor");
+        app.commit_collection_grid_source_open(anchor.clone(), folder.clone());
+        app.items = vec![GridItem::Image(child.clone())];
+        app.image_metas = vec![Some((0, 5))];
+        app.items_generation = app.items_generation.wrapping_add(1);
+        let child_generation = app.items_generation;
+
+        let renamed = recv(
+            client
+                .rename_collection(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    "Renamed while in child".into(),
+                )
+                .expect("rename request"),
+        );
+        poll_until(&mut app, "child did not observe latest revision", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.wanted_revision >= renamed.revision())
+        });
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::PhysicalSource { .. }
+        ));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::Image(path)] if path == &child
+        ));
+        assert_eq!(app.items_generation, child_generation);
+
+        let restore = match app.collection_grid_parent_nav().expect("collection return") {
+            crate::ui_main::AddressBarNav::Collection(restore) => restore,
+            _ => panic!("physical source must return to collection"),
+        };
+        app.open_collection_grid(snapshot.collection_id(), Some(restore));
+        poll_until(
+            &mut app,
+            "returned root did not reach latest revision",
+            |app| {
+                app.top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| session.accepted_revision == renamed.revision())
+            },
+        );
+        let selected = app.selected.expect("opened source restored");
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap();
+        assert_eq!(prepared.entries[selected].entry_id, anchor.entry_id);
+        assert_eq!(app.address, "コレクション: Renamed while in child");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn fullscreen_leaf_defers_refresh_and_delete_presentation_until_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        app.fullscreen_idx = Some(0);
+        let held_source = app.items[0].drag_source_path().unwrap().to_path_buf();
+        let held_generation = app.items_generation;
+
+        let deleted = recv(
+            client
+                .delete_collection(snapshot.collection_id(), snapshot.revision())
+                .expect("delete request"),
+        );
+        poll_until(
+            &mut app,
+            "fullscreen did not observe delete notice",
+            |app| {
+                app.top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| {
+                        session.observed_catalog_revision >= deleted.catalog_revision
+                            && matches!(session.load, CollectionGridLoadState::Deleted)
+                    })
+            },
+        );
+        assert!(matches!(
+            app.items.as_slice(),
+            [item] if item.drag_source_path().is_some_and(|path| path == held_source)
+        ));
+        assert_eq!(app.items_generation, held_generation);
+        assert_eq!(app.fullscreen_idx, Some(0));
+
+        app.fullscreen_idx = None;
+        app.poll_collection_grid(&egui::Context::default());
+        assert!(app.items.is_empty());
+        assert_eq!(
+            app.collection_grid_empty_message().as_deref(),
+            Some("コレクションは削除されました")
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn deleting_another_collection_does_not_retire_current_grid() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_path = temp.path().join("current.png");
+        let other_path = temp.path().join("other.png");
+        std::fs::write(&current_path, b"current").unwrap();
+        std::fs::write(&other_path, b"other").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let current =
+            collection_with_sources(&client, &[(current_path, CollectionResolvedKind::Image)]);
+        let other =
+            collection_with_sources(&client, &[(other_path, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(current.collection_id(), None);
+        wait_for_grid(&mut app, current.collection_id());
+        let held_source = app.items[0].drag_source_path().unwrap().to_path_buf();
+        let deleted = recv(
+            client
+                .delete_collection(other.collection_id(), other.revision())
+                .expect("delete request"),
+        );
+        poll_until(&mut app, "catalog notice was not observed", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.observed_catalog_revision >= deleted.catalog_revision
+                })
+        });
+        assert!(matches!(
+            app.items.as_slice(),
+            [item] if item.drag_source_path().is_some_and(|path| path == held_source)
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Ready(_)
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn source_delete_during_prepare_cancels_and_keeps_installed_binding_for_reclassification() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared().cloned())
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let stamp = app.collection_grid_stamp().unwrap();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: snapshot.revision(),
+            installed: Some(Arc::clone(&installed)),
+            cancel: Arc::clone(&cancel),
+            receiver: rx,
+        };
+
+        app.invalidate_current_collection_grid_sources(&[
+            crate::delete_worker::DeleteSourceScope::Exact(image),
+        ]);
+        assert!(cancel.load(Ordering::Acquire));
+        let session = app.top_level_grid_view.collection_session().unwrap();
+        assert!(matches!(
+            session.load,
+            CollectionGridLoadState::RequestNeeded { installed: Some(_) }
+        ));
+        assert_eq!(
+            session.prepared().unwrap().collection_revision,
+            snapshot.revision()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn cloned_collection_session_reattaches_an_independent_revision_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        app.fullscreen_idx = Some(0);
+        let renamed = recv(
+            client
+                .rename_collection(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    "Renamed while copied".into(),
+                )
+                .expect("rename request"),
+        );
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .collection_session()
+            .is_none_or(|session| session.wanted_revision != renamed.revision())
+        {
+            assert!(Instant::now() < deadline, "source context missed revision");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .accepted_revision,
+            snapshot.revision(),
+            "fullscreen source keeps its accepted binding"
+        );
+
+        app.top_level_grid_view = app.top_level_grid_view.clone();
+        let copied = app.top_level_grid_view.collection_session().unwrap();
+        assert!(
+            copied.watch.is_none(),
+            "a copied context owns no source receiver"
+        );
+        assert_eq!(copied.wanted_revision, renamed.revision());
+        assert!(copied.observed_catalog_revision >= renamed.catalog_revision);
+        app.fullscreen_idx = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .collection_session()
+            .is_none_or(|session| session.accepted_revision != renamed.revision())
+        {
+            assert!(Instant::now() < deadline, "copied context stayed stale");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let session = app
+            .top_level_grid_view
+            .collection_session()
+            .expect("collection session");
+        assert_eq!(session.accepted_revision, renamed.revision());
+        assert_eq!(app.address, "コレクション: Renamed while copied");
+        assert!(
+            session.watch.is_some(),
+            "copied context must own a new watch"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn stamped_remove_and_delete_invalidation_stay_with_the_owning_collection_surface() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        let child = folder.join("child.png");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(child.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        app.selected = Some(0);
+        app.checked.insert(0);
+        let target = app
+            .collection_grid_remove_target(Some(0), true)
+            .expect("context-owned remove target");
+        assert_eq!(target.entry_ids.len(), 1);
+
+        // A new surface generation must not let an old successful response clear its selection.
+        app.open_collection_grid(snapshot.collection_id(), None);
+        app.selected = Some(0);
+        app.checked.insert(0);
+        app.apply_collection_grid_remove_success(target.stamp, &target.entry_ids);
+        assert_eq!(app.selected, Some(0));
+        assert!(app.checked.contains(&0));
+        wait_for_grid(&mut app, snapshot.collection_id());
+
+        app.invalidate_current_collection_grid_sources(&[
+            crate::delete_worker::DeleteSourceScope::Exact(temp.path().join("other.png")),
+        ]);
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.prepared().is_some()),
+            "unrelated exact delete must not invalidate the collection"
+        );
+        app.invalidate_current_collection_grid_sources(&[
+            crate::delete_worker::DeleteSourceScope::Tree(folder.clone()),
+        ]);
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| matches!(
+                    session.load,
+                    CollectionGridLoadState::RequestNeeded { .. }
+                )),
+            "tree delete must schedule fresh classification without post-delete stat"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_completion_routes_to_its_parked_viewer_context_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("shared.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        app.selected = Some(0);
+        app.checked.insert(0);
+
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared().cloned())
+            .unwrap();
+        let items = app.items.clone();
+        let image_metas = app.image_metas.clone();
+        let identity = CollectionGridIdentity {
+            collection_id: snapshot.collection_id(),
+        };
+        let parked = app.build_window_context_for_test(707, move |context| {
+            context
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Collection(identity), None);
+            context.items = items;
+            context.image_metas = image_metas;
+            context.selected = Some(0);
+            context.checked.insert(0);
+            let generation = context.items_generation;
+            let session = context
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap();
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = prepared.collection_revision;
+            session.load = CollectionGridLoadState::Ready(prepared);
+            session.installed_items_generation = Some(generation);
+        });
+        let target = app
+            .with_viewer_context(parked, |context| {
+                context.collection_grid_remove_target(Some(0), true)
+            })
+            .unwrap()
+            .expect("parked context target");
+
+        app.apply_collection_grid_remove_success(target.stamp, &target.entry_ids);
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "main selection belongs to another context"
+        );
+        assert!(app.checked.contains(&0));
+        app.with_viewer_context(parked, |context| {
+            assert_eq!(context.selected, None);
+            assert!(context.checked.is_empty());
+        })
+        .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn source_invalidation_reaches_matching_parked_context_and_skips_sibling_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        let parked_image = temp.path().join("parked.png");
+        let sibling_image = temp.path().join("sibling.png");
+        std::fs::write(&parked_image, b"parked").unwrap();
+        std::fs::write(&sibling_image, b"sibling").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let parked_snapshot = collection_with_sources(
+            &client,
+            &[(parked_image.clone(), CollectionResolvedKind::Image)],
+        );
+        app.open_collection_grid(parked_snapshot.collection_id(), None);
+        wait_for_grid(&mut app, parked_snapshot.collection_id());
+        let parked_prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared().cloned())
+            .unwrap();
+        let parked_items = app.items.clone();
+        let parked_metas = app.image_metas.clone();
+
+        let sibling_snapshot =
+            collection_with_sources(&client, &[(sibling_image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(sibling_snapshot.collection_id(), None);
+        wait_for_grid(&mut app, sibling_snapshot.collection_id());
+
+        let identity = CollectionGridIdentity {
+            collection_id: parked_snapshot.collection_id(),
+        };
+        let parked = app.build_window_context_for_test(708, move |context| {
+            context
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Collection(identity), None);
+            context.items = parked_items;
+            context.image_metas = parked_metas;
+            let generation = context.items_generation;
+            let session = context
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap();
+            session.accepted_revision = parked_prepared.collection_revision;
+            session.wanted_revision = parked_prepared.collection_revision;
+            session.load = CollectionGridLoadState::Ready(parked_prepared);
+            session.installed_items_generation = Some(generation);
+        });
+
+        app.invalidate_collection_grid_sources(&[crate::delete_worker::DeleteSourceScope::Exact(
+            parked_image,
+        )]);
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.prepared().is_some()),
+            "unrelated mounted collection must keep its prepared binding"
+        );
+        app.with_viewer_context(parked, |context| {
+            assert!(
+                context
+                    .top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| matches!(
+                        session.load,
+                        CollectionGridLoadState::RequestNeeded { .. }
+                    )),
+                "matching parked collection must request reclassification"
+            );
+        })
+        .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn source_scope_exact_and_tree_use_component_boundaries() {
+        let exact = crate::delete_worker::DeleteSourceScope::Exact(PathBuf::from(r"C:\A\B"));
+        assert!(source_scope_contains(&exact, Path::new(r"c:/a/b")));
+        assert!(!source_scope_contains(&exact, Path::new(r"c:/a/b/c.png")));
+        let tree = crate::delete_worker::DeleteSourceScope::Tree(PathBuf::from(r"C:\A\B"));
+        assert!(source_scope_contains(&tree, Path::new(r"c:/a/b/c.png")));
+        assert!(!source_scope_contains(&tree, Path::new(r"c:/a/b2/c.png")));
+    }
+
+    #[test]
+    fn durable_source_migration_is_retired_only_after_actor_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("before.png");
+        let new = temp.path().join("after.png");
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(old.clone(), CollectionResolvedKind::Image)]);
+        app.rename_migration_data_dir_override = Some(temp.path().to_path_buf());
+
+        app.enqueue_collection_source_migration_batch(vec![
+            crate::rename_key_migration::PathMigrationMapping {
+                old_path: old,
+                new_path: new.clone(),
+                tree: false,
+            },
+        ]);
+        app.flush_rename_migration_journal().unwrap();
+        assert_eq!(
+            crate::rename_key_migration::journal_load(temp.path()).len(),
+            1,
+            "admitted actor command remains durable until its result is consumed"
+        );
+
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.rename_migration_in_flight.is_some() || !app.rename_migration_queue.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "collection migration did not settle"
+            );
+            app.poll_rename_migration_pending(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.flush_rename_migration_journal().unwrap();
+        assert!(app.rename_migration_boot_retry.is_empty());
+        assert!(
+            crate::rename_key_migration::journal_load(temp.path()).is_empty(),
+            "exact actor acknowledgement retires the durable stage"
+        );
+        let migrated = recv(
+            client
+                .load_collection(snapshot.collection_id())
+                .expect("load migrated collection"),
+        );
+        assert_eq!(migrated.entries[0].source_path, new);
+        assert_eq!(migrated.entries[0].id, snapshot.entries[0].id);
+        app.shutdown_collection_runtime_for_exit();
+    }
+}

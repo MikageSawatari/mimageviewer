@@ -175,6 +175,12 @@ enum ActorTask {
         collection_id: CollectionId,
         receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
     },
+    ContextRemove {
+        origin: crate::app::top_level_grid_view::CollectionGridRequestStamp,
+        collection_id: CollectionId,
+        entry_ids: Vec<CollectionEntryId>,
+        receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+    },
     Delete {
         deleted: CollectionId,
         receiver: Receiver<Result<CollectionCatalogSnapshot, CollectionStoreError>>,
@@ -201,6 +207,7 @@ enum CollectionDialogOperation {
         collection_id: CollectionId,
         expected_revision: u64,
         entry_ids: Vec<CollectionEntryId>,
+        origin: Option<crate::app::top_level_grid_view::CollectionGridRequestStamp>,
     },
     ReadingImport {
         collection_id: CollectionId,
@@ -529,6 +536,33 @@ impl App {
                 | CollectionRuntimePhase::Closed => CollectionToolbarStatus::Unavailable,
             },
         )
+    }
+
+    pub(crate) fn collection_store_client(&self) -> Option<CollectionStoreClient> {
+        self.collection_ui
+            .can_edit()
+            .then(|| self.collection_ui.client.clone())
+            .flatten()
+    }
+
+    pub(crate) fn collection_store_client_for_migration(
+        &self,
+    ) -> Result<Option<CollectionStoreClient>, CollectionStoreError> {
+        match &self.collection_ui.phase {
+            CollectionRuntimePhase::Ready => self
+                .collection_ui
+                .client
+                .clone()
+                .map(Some)
+                .ok_or(CollectionStoreError::Unavailable),
+            CollectionRuntimePhase::Starting => Err(CollectionStoreError::Starting),
+            // Inert is the explicit headless/test configuration: no collection database was
+            // installed, hence there is no durable collection owner to migrate.
+            CollectionRuntimePhase::Inert => Ok(None),
+            CollectionRuntimePhase::Failed(_) | CollectionRuntimePhase::Closed => {
+                Err(CollectionStoreError::Unavailable)
+            }
+        }
     }
 
     pub(crate) fn select_collection_management_target(&mut self, id: CollectionId) {
@@ -912,6 +946,43 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     CollectionDialogOperation::Submitting(ActorTask::SnapshotMutation {
                         collection_id,
+                        receiver,
+                    })
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.finish_actor_disconnect()
+                }
+            },
+            ActorTask::ContextRemove {
+                origin,
+                collection_id,
+                entry_ids,
+                receiver,
+            } => match receiver.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    if self.collection_ui.selected_id == Some(collection_id) {
+                        self.collection_ui.install_snapshot(snapshot);
+                    }
+                    self.collection_ui
+                        .request_catalog(self.collection_ui.wanted_catalog_revision);
+                    self.collection_ui.message = Some((
+                        false,
+                        format!(
+                            "{} 件をコレクションから外しました。元ファイルは変更していません。",
+                            entry_ids.len()
+                        ),
+                    ));
+                    // The actor commit is global. The origin stamp is deliberately consumed only
+                    // as response provenance; Grid convergence comes from the revision watch.
+                    self.apply_collection_grid_remove_success(origin, &entry_ids);
+                    CollectionDialogOperation::Idle
+                }
+                Ok(Err(error)) => self.finish_actor_error(error),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    CollectionDialogOperation::Submitting(ActorTask::ContextRemove {
+                        origin,
+                        collection_id,
+                        entry_ids,
                         receiver,
                     })
                 }
@@ -1340,6 +1411,7 @@ impl App {
                     collection_id: snapshot.collection_id(),
                     expected_revision: snapshot.revision(),
                     entry_ids: self.collection_ui.checked_entries.iter().copied().collect(),
+                    origin: None,
                 };
             }
             CollectionUiAction::SetOrder { mode, sort } => {
@@ -1635,6 +1707,7 @@ impl App {
                 collection_id,
                 expected_revision,
                 entry_ids,
+                origin,
             } => {
                 let mut decision = None;
                 egui::Modal::new(egui::Id::new("collection_remove_modal")).show(ctx, |ui| {
@@ -1654,14 +1727,18 @@ impl App {
                     });
                 });
                 match decision {
-                    Some(true) => {
-                        self.submit_collection_remove(collection_id, expected_revision, entry_ids)
-                    }
+                    Some(true) => self.submit_collection_remove(
+                        collection_id,
+                        expected_revision,
+                        entry_ids,
+                        origin,
+                    ),
                     Some(false) => CollectionDialogOperation::Idle,
                     None => CollectionDialogOperation::ConfirmRemove {
                         collection_id,
                         expected_revision,
                         entry_ids,
+                        origin,
                     },
                 }
             }
@@ -1787,20 +1864,50 @@ impl App {
         collection_id: CollectionId,
         expected_revision: u64,
         entry_ids: Vec<CollectionEntryId>,
+        origin: Option<crate::app::top_level_grid_view::CollectionGridRequestStamp>,
     ) -> CollectionDialogOperation {
         let Some(client) = &self.collection_ui.client else {
             return CollectionDialogOperation::Idle;
         };
-        match client.remove_entries(collection_id, expected_revision, entry_ids) {
-            Ok(receiver) => CollectionDialogOperation::Submitting(ActorTask::SnapshotMutation {
-                collection_id,
-                receiver,
+        match client.remove_entries(collection_id, expected_revision, entry_ids.clone()) {
+            Ok(receiver) => CollectionDialogOperation::Submitting(match origin {
+                Some(origin) => ActorTask::ContextRemove {
+                    origin,
+                    collection_id,
+                    entry_ids,
+                    receiver,
+                },
+                None => ActorTask::SnapshotMutation {
+                    collection_id,
+                    receiver,
+                },
             }),
             Err(error) => {
                 self.collection_ui.message = Some((true, collection_error_message(&error)));
                 CollectionDialogOperation::Idle
             }
         }
+    }
+
+    pub(crate) fn request_collection_grid_remove(
+        &mut self,
+        request: crate::app::collection_grid::CollectionGridRemoveTarget,
+    ) {
+        if !self.collection_ui.can_edit() || !self.collection_ui.operation.is_idle() {
+            self.show_feedback_toast("コレクションを現在編集できません。".to_string());
+            return;
+        }
+        self.collection_ui.show_manager = true;
+        // The stamped Grid origin owns this mutation even when the manager last displayed another
+        // collection. Conflict reload/retry must therefore target the origin collection.
+        self.collection_ui
+            .select_collection(Some(request.stamp.collection_id));
+        self.collection_ui.operation = CollectionDialogOperation::ConfirmRemove {
+            collection_id: request.stamp.collection_id,
+            expected_revision: request.expected_revision,
+            entry_ids: request.entry_ids,
+            origin: Some(request.stamp),
+        };
     }
 }
 
@@ -1911,7 +2018,8 @@ mod tests {
 
     use super::*;
     use crate::collection_store::{
-        CollectionDefinition, CollectionEntry, CollectionResolvedKind, CollectionSourcePath,
+        CollectionDefinition, CollectionEntry, CollectionRegistration, CollectionResolvedKind,
+        CollectionSourcePath,
     };
     use crate::settings::{Settings, SortOrder};
 
@@ -2118,6 +2226,106 @@ mod tests {
     }
 
     #[test]
+    fn context_remove_conflict_reloads_the_origin_collection_not_manager_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("origin.png");
+        std::fs::write(&source, b"source").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let manager_a = create_collection(&mut app, "Manager A");
+        let surface_b = create_collection(&mut app, "Surface B");
+        let added_b = client
+            .add_batch(
+                surface_b.collection_id(),
+                surface_b.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &source,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+
+        app.collection_ui
+            .select_collection(Some(manager_a.collection_id()));
+        wait_for(&mut app, |app| {
+            app.collection_ui
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.collection_id() == manager_a.collection_id())
+        });
+        app.open_collection_grid(surface_b.collection_id(), None);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .collection_session()
+            .is_none_or(|session| session.prepared().is_none())
+        {
+            assert!(Instant::now() < deadline, "collection Grid did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let target = app
+            .collection_grid_remove_target(Some(0), false)
+            .expect("context remove target");
+        let external = client
+            .rename_collection(
+                surface_b.collection_id(),
+                added_b.revision(),
+                "Surface B changed".into(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+
+        app.request_collection_grid_remove(target);
+        assert_eq!(
+            app.collection_ui.selected_id,
+            Some(surface_b.collection_id())
+        );
+        let (collection_id, expected_revision, entry_ids, origin) = match std::mem::replace(
+            &mut app.collection_ui.operation,
+            CollectionDialogOperation::Idle,
+        ) {
+            CollectionDialogOperation::ConfirmRemove {
+                collection_id,
+                expected_revision,
+                entry_ids,
+                origin,
+            } => (collection_id, expected_revision, entry_ids, origin),
+            _ => panic!("context remove confirmation"),
+        };
+        app.collection_ui.operation =
+            app.submit_collection_remove(collection_id, expected_revision, entry_ids, origin);
+        wait_for(&mut app, |app| {
+            app.collection_ui.operation.is_idle()
+                && app.collection_ui.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.collection_id() == surface_b.collection_id()
+                        && snapshot.revision() == external.revision()
+                })
+        });
+        assert_eq!(
+            app.collection_ui.selected_id,
+            Some(surface_b.collection_id())
+        );
+        assert!(
+            app.collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(error, text)| { *error && text.contains("更新") })
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn actual_handlers_commit_crud_relink_remove_and_import_only_after_confirmation() {
         let temp = tempfile::tempdir().unwrap();
         let (mut app, _client) = start_ready_app(&temp);
@@ -2203,7 +2411,7 @@ mod tests {
 
         let relinked = app.collection_ui.snapshot.clone().unwrap();
         app.collection_ui.operation =
-            app.submit_collection_remove(collection_id, relinked.revision(), vec![second_id]);
+            app.submit_collection_remove(collection_id, relinked.revision(), vec![second_id], None);
         wait_for(&mut app, |app| {
             app.collection_ui.operation.is_idle()
                 && app
