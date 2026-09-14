@@ -695,7 +695,7 @@ mod tests {
         let b = Uuid::new_v4();
         let mut a_state = FavoriteViewState::from_settings(&crate::settings::Settings::default());
         a_state.grid_cols = 4;
-        a_state.sort_order = crate::settings::SortOrder::DateDesc;
+        a_state.sort_order = crate::settings::SortOrder::SizeDesc;
         let mut b_state = a_state.clone();
         b_state.grid_cols = 8;
 

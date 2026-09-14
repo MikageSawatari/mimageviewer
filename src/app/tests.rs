@@ -4209,8 +4209,10 @@ fn scan_media_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = scan_directory(dir)
         .all_media
         .into_iter()
-        .filter_map(|(path, _, _, _)| {
-            path.file_name()
+        .filter_map(|entry| {
+            entry
+                .path
+                .file_name()
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
         })
@@ -4223,8 +4225,8 @@ fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = scan_directory(dir)
         .folders
         .into_iter()
-        .filter_map(|(item, _)| {
-            if let GridItem::Folder(path) = item {
+        .filter_map(|entry| {
+            if let GridItem::Folder(path) = entry.item {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .map(str::to_owned)
@@ -4241,7 +4243,7 @@ fn scan_convertible_archive_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = scan_directory(dir)
         .folders
         .into_iter()
-        .filter_map(|(item, _)| match item {
+        .filter_map(|entry| match entry.item {
             GridItem::ConvertibleArchive { path, .. } => path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -4264,8 +4266,8 @@ fn scan_directory_never_lists_portable_metadata_bundle() {
     .unwrap();
     assert_eq!(scan_folder_names(temp.path()), vec!["visible"]);
     let shown_hidden = scan_directory_with_convertible_archives(temp.path(), true, true).unwrap();
-    assert!(shown_hidden.folders.iter().all(|(item, _)| {
-        item.container_path().map_or(true, |path| {
+    assert!(shown_hidden.folders.iter().all(|entry| {
+        entry.item.container_path().map_or(true, |path| {
             !crate::fs_entry::is_internal_app_entry_name(path.file_name().unwrap_or_default())
         })
     }));
@@ -4482,12 +4484,12 @@ fn folder_scan_can_ignore_convertible_archives() {
     settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
     let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
-    assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
+    assert!(scan.folders.iter().any(|entry| matches!(&entry.item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
         !scan
             .folders
             .iter()
-            .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
+            .any(|entry| matches!(entry.item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
     );
     assert_eq!(
@@ -4522,7 +4524,7 @@ fn folder_scan_lists_convertible_archives_for_ask_and_convert() {
         let archive_count = scan
             .folders
             .iter()
-            .filter(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. }))
+            .filter(|entry| matches!(entry.item, GridItem::ConvertibleArchive { .. }))
             .count();
 
         assert_eq!(
@@ -11592,6 +11594,7 @@ mod phase_c_drill_nav_tests {
             path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // コンテナへ drill-in (SearchContainer を Enter 相当)
@@ -11641,6 +11644,7 @@ mod phase_c_drill_nav_tests {
             path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
@@ -11675,12 +11679,14 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/2025-11-30/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/2025-11-30/b.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // コンテナ B: deep ヒット 1 件。parent_container = "c:/root/output/2025-12-30-1"
@@ -11689,6 +11695,7 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/output/2025-12-30-1/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
@@ -11742,18 +11749,21 @@ mod phase_c_drill_nav_tests {
             path: "c:/x/root/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/x/root/b.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/x/root/sub/c.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
@@ -11793,6 +11803,7 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/sub_unrated/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
@@ -12947,12 +12958,14 @@ mod phase_c_drill_nav_tests {
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/folder_b/y.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // 集約ビューに固定する (集約トグルを ON にした状態 = aggregate_auto も倒す)。
@@ -13003,6 +13016,7 @@ mod phase_c_drill_nav_tests {
             path: "c:/books/vol1/sub/p1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // SearchContainer を開く (path-based suppression を起動)
@@ -14670,6 +14684,7 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         // items に直接置く (drill_into_container は load_folder を呼ばないテスト用簡易セットアップ)
@@ -14704,24 +14719,28 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/b.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/c.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 2,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/d.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 4,
         });
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
@@ -14771,6 +14790,7 @@ mod phase_c_drill_nav_tests {
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // 存在しないパスを restore target に設定して rebuild
@@ -14889,12 +14909,14 @@ mod phase_c_drill_nav_tests {
             path: "c:/root/sub1/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub2/y.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // /root に drill-in
@@ -16161,6 +16183,7 @@ mod phase_c_drill_address_tests {
             .to_lowercase(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
@@ -16236,6 +16259,7 @@ mod phase_c_drill_address_tests {
             path: "d:/scansnap/a.pdf".to_string(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // Aggregated のまま update_global_search_address
@@ -21955,6 +21979,11 @@ mod favorite_adjustment_defaults_tests {
             BOOK_READING_PAGE_ORDER,
             "画像のみの本もお気に入りの一覧ソートよりページ順を優先する"
         );
+        assert_eq!(
+            folder_media_sort_order(SortOrder::SizeDesc, false, true, true, true),
+            BOOK_READING_PAGE_ORDER,
+            "一覧のサイズ順を画像本のページ順へ流さない"
+        );
 
         let mut normal_pages: Vec<GridItem> = names_and_mtimes
             .iter()
@@ -22854,13 +22883,13 @@ mod favorite_adjustment_defaults_tests {
             StackMember {
                 path: p0.clone(),
                 mtime: 0,
-                size: 8,
+                size: Some(8),
                 is_video: false,
             },
             StackMember {
                 path: p1.clone(),
                 mtime: 0,
-                size: 8,
+                size: Some(8),
                 is_video: false,
             },
         ];
@@ -22937,13 +22966,13 @@ mod favorite_adjustment_defaults_tests {
             StackMember {
                 path: p0.clone(),
                 mtime: 0,
-                size: 8,
+                size: Some(8),
                 is_video: false,
             },
             StackMember {
                 path: p1.clone(),
                 mtime: 0,
-                size: 8,
+                size: Some(8),
                 is_video: false,
             },
         ];
@@ -29138,19 +29167,19 @@ mod favorite_adjustment_defaults_tests {
                 StackMember {
                     path: dir.join("post_0.jpg"),
                     mtime: 0,
-                    size: 1,
+                    size: Some(1),
                     is_video: false,
                 },
                 StackMember {
                     path: dir.join("post_1.jpg"),
                     mtime: 0,
-                    size: 1,
+                    size: Some(1),
                     is_video: false,
                 },
                 StackMember {
                     path: dir.join("solo.jpg"),
                     mtime: 0,
-                    size: 1,
+                    size: Some(1),
                     is_video: false,
                 },
             ],
@@ -62424,19 +62453,19 @@ mod still_window_mode_key_tests {
             StackMember {
                 path: dir.join("post_0.jpg"),
                 mtime: 0,
-                size: 1,
+                size: Some(1),
                 is_video: false,
             },
             StackMember {
                 path: dir.join("post_1.jpg"),
                 mtime: 0,
-                size: 1,
+                size: Some(1),
                 is_video: false,
             },
             StackMember {
                 path: dir.join("solo.jpg"),
                 mtime: 0,
-                size: 1,
+                size: Some(1),
                 is_video: false,
             },
         ];
@@ -66840,7 +66869,7 @@ mod smart_folder_transition_tests {
             path: source.join(name),
             kind: SmartFolderEntryKind::Image,
             mtime,
-            file_size: 1,
+            file_size: Some(1),
             matching_rule_indices: vec![0],
         };
         let entries = vec![entry("b.jpg", 2), entry("a.jpg", 1)];
@@ -66911,7 +66940,7 @@ mod smart_folder_transition_tests {
                 path: source.join("page.jpg"),
                 kind: SmartFolderEntryKind::Image,
                 mtime: 1,
-                file_size: 1,
+                file_size: Some(1),
                 matching_rule_indices: vec![0],
             }]),
             video_thumb_overrides: std::collections::HashMap::new(),

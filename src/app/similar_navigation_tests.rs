@@ -47,7 +47,13 @@ fn image_scan(paths: &[PathBuf]) -> ScannedDir {
         all_media: paths
             .iter()
             .cloned()
-            .map(|path| (path, ScanMediaKind::Image, 0, 0))
+            .map(|path| super::folder_scan::ScannedMediaEntry {
+                path,
+                kind: ScanMediaKind::Image,
+                mtime: 0,
+                file_size: 0,
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+            })
             .collect(),
         omitted: OmittedFolderEntryCounts::default(),
     }

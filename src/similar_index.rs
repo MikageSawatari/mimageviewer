@@ -5647,7 +5647,13 @@ impl ScanContext<'_> {
                 }
             };
             if let Some(kind) = media_kind {
-                all_media.push((path.clone(), kind, mtime, file_size));
+                all_media.push(crate::app::folder_scan::ScannedMediaEntry {
+                    path: path.clone(),
+                    kind,
+                    mtime,
+                    file_size,
+                    sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
+                });
             }
             let candidate = FileCandidate {
                 path,

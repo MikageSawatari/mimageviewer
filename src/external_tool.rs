@@ -3403,7 +3403,7 @@ mod tests {
         let member = |path: &str, is_video| StackMember {
             path: PathBuf::from(path),
             mtime: 0,
-            size: 1,
+            size: Some(1),
             is_video,
         };
         let view = StackView::from_groups(

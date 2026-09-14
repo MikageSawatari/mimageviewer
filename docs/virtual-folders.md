@@ -40,8 +40,11 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 `ZipDir`) / 画像 (`Image` / `ZipImage` / `PdfPage` / `Stack`) / 動画・音声 (`Video` / `Audio`)。
 同じ行へ割り当てたカテゴリは共通の `sort_order` で混在ソートし、空行は読み飛ばす。既定は
 1 行目が実フォルダ + アーカイブ類、2 行目が画像 + 動画・音声。組み立ては
-`grid_item::arrange_grid_items` を通常フォルダ、ZIP materialize、ファイル名スタック、
+`grid_item::arrange_grid_items` 系を通常フォルダ、ZIP materialize、ファイル名スタック、
 レーティング一覧、サブフォルダ展開から共有する。全文検索の flat result は対象外。
+一覧のサイズ順は実ファイルだけを既知サイズとして扱う。実フォルダ、ZIP/PDF内ページ、
+検索用コンテナ、複数項目を畳んだStackなどの合成セルは不明とし、昇順・降順とも同じ割当行の
+既知項目より後ろへ置く。実在する0バイトファイルは既知の0として並べる。
 
 サブフォルダ展開では、再帰走査で見つけた ZIP/CBZ と PDF の**本体だけ**をそれぞれ
 `ZipFile` / `PdfFile` 1 項目として同じ外側リストへ入れ、内部の `ZipImage` / `PdfPage` は

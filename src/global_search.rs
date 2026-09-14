@@ -92,6 +92,9 @@ pub struct GlobalHit {
     /// 取り出す。Ctrl+G 一覧 (Flat) / ドリルインビューの日付ソート
     /// (docs/search-container-item-redesign.md §4.3.3) に使う。
     pub mtime: i64,
+    /// ファイルサイズ (byte)。現行 FTS producer の STORED 値は metadata 取得済みなので
+    /// 0-byte を `Some(0)` として保持する。旧/合成 doc に field が無い場合だけ `None`。
+    pub file_size: Option<i64>,
 }
 
 /// Ctrl+G 検索ワーカーに渡すフィルタ (§19 ドロップダウン UI と対応)。
@@ -226,12 +229,15 @@ pub fn run(
             if search_query::matches_with_mode(&tokens, &text, scope.mode) {
                 // STORED mtime を取り出す (日付ソート用 §5.2)。post-filter を通った
                 // ヒットだけに対して呼ぶので、走査候補全件への doc fetch は発生しない。
-                let mtime = fts_index::doc_mtime(&searcher, fts.fields(), addr).unwrap_or(0);
+                let (mtime, file_size) =
+                    fts_index::doc_listing_metadata(&searcher, fts.fields(), addr)
+                        .unwrap_or((0, None));
                 batch.push(GlobalHit {
                     path,
                     score,
                     stars: 0,
                     mtime,
+                    file_size,
                 });
                 valid += 1;
                 if valid >= HARD_MAX {
@@ -517,6 +523,11 @@ mod tests {
         let (hits, reason, _) = collect_events("夕焼", &[fav], &fts);
         assert_eq!(reason, DoneReason::Complete);
         assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].file_size,
+            Some(0),
+            "STORED zero is a known zero-byte size, not Unknown"
+        );
     }
 
     #[test]

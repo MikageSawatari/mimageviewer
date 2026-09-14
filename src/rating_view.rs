@@ -163,9 +163,21 @@ fn compare_row_names(
     let name_b = b.item.name();
     let key_a = order.name_key(name_a.as_ref());
     let key_b = order.name_key(name_b.as_ref());
-    let mtime_a = a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
-    let mtime_b = b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
-    order.compare_name_keys(&key_a, mtime_a, &key_b, mtime_b)
+    let meta_a = crate::grid_item::listing_sort_metadata_for_item(
+        &a.item,
+        crate::settings::ListingSortMetadata::new(
+            a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+            a.image_meta.map(|(_, size)| size),
+        ),
+    );
+    let meta_b = crate::grid_item::listing_sort_metadata_for_item(
+        &b.item,
+        crate::settings::ListingSortMetadata::new(
+            b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+            b.image_meta.map(|(_, size)| size),
+        ),
+    );
+    order.compare_listing_keys(&key_a, meta_a, &key_b, meta_b)
 }
 
 fn cmp_optional_i64_none_last(
@@ -568,6 +580,39 @@ mod tests {
         );
         // 行も再配置後の順序へ揃っている (idx が items と 1 対 1 で対応する)。
         assert_eq!(keys(&rows), item_keys(&items, &rows));
+    }
+
+    #[test]
+    fn normal_size_sort_distinguishes_real_zero_and_virtual_unknown() {
+        let mut rows = vec![
+            RatingViewRow {
+                key: "virtual".into(),
+                item: GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\x\book.pdf"),
+                    page_num: 1,
+                    content_type: None,
+                },
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "ten".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\ten.jpg")),
+                image_meta: Some((1, 10)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "zero".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\zero.jpg")),
+                image_meta: Some((1, 0)),
+                rated_at_ms: Some(1),
+            },
+        ];
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::SizeAsc),
+        );
+        assert_eq!(keys(&rows), ["zero", "ten", "virtual"]);
     }
 
     fn write_zip_entries(zip_path: &Path, entries: &[&str]) {

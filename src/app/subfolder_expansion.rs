@@ -347,6 +347,37 @@ pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) diag: SubfolderExpansionDiag,
 }
 
+/// 現在 materialize 済みのサブ展開 items と、走査時に確定した size availability を
+/// path で再結合する。スタック表示を後から有効化する経路専用で、filesystem I/O は行わない。
+pub(crate) fn listing_sort_metas_for_items(
+    snapshot: &SubfolderExpansionSnapshot,
+    items: &[GridItem],
+) -> Vec<crate::settings::ListingSortMetadata> {
+    let by_path: HashMap<String, crate::settings::ListingSortMetadata> = snapshot
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                crate::adjustment_db::normalize_path(&entry.path),
+                crate::settings::ListingSortMetadata::new(
+                    entry.mtime,
+                    (entry.kind != SubfolderExpansionEntryKind::Folder).then_some(entry.file_size),
+                ),
+            )
+        })
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            item.drag_source_path()
+                .and_then(|path| by_path.get(&crate::adjustment_db::normalize_path(path)))
+                .copied()
+                .map(|metadata| crate::grid_item::listing_sort_metadata_for_item(item, metadata))
+                .unwrap_or_else(|| crate::settings::ListingSortMetadata::new(0, None))
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SubfolderExpansionRestoreState {
     pub(crate) root: Option<PathBuf>,
@@ -631,7 +662,7 @@ fn scan_one_directory(
     result: &mut SubfolderExpansionResult,
     subdirs: &mut Vec<PathBuf>,
 ) {
-    let mut media: Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)> = Vec::new();
+    let mut media: Vec<super::folder_scan::ScannedMediaEntry> = Vec::new();
     let mut containers: Vec<SubfolderExpansionEntry> = Vec::new();
     let mut real_folder_names = HashSet::new();
     let mut has_book_container = false;
@@ -721,7 +752,13 @@ fn scan_one_directory(
         let mtime = crate::ui_helpers::mtime_secs(&metadata);
         let file_size = metadata.len() as i64;
         if let Some(kind) = media_kind {
-            media.push((path, kind, mtime, file_size));
+            media.push(super::folder_scan::ScannedMediaEntry {
+                path,
+                kind,
+                mtime,
+                file_size,
+                sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
+            });
         } else if let Some(kind) = entry_kind {
             containers.push(SubfolderExpansionEntry {
                 path,
@@ -767,45 +804,37 @@ fn scan_one_directory(
             .entry_matches(entry.kind, entry.mtime, entry.file_size, filter_now)
     });
     apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
-    media.retain(|(_, kind, _, _)| *kind != super::folder_scan::ScanMediaKind::Audio);
-    media.retain(|(_, kind, mtime, file_size)| {
-        let entry_kind = match kind {
+    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
+    media.retain(|entry| {
+        let entry_kind = match entry.kind {
             super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
             super::folder_scan::ScanMediaKind::Video => SubfolderExpansionEntryKind::Video,
             super::folder_scan::ScanMediaKind::Audio => return false,
         };
         options
             .scan_filter
-            .entry_matches(entry_kind, *mtime, *file_size, filter_now)
+            .entry_matches(entry_kind, entry.mtime, entry.file_size, filter_now)
     });
     result.diag.items_found += media.len() + containers.len();
     result.entries.extend(containers);
     result
         .entries
-        .extend(
-            media
-                .into_iter()
-                .map(|(path, kind, mtime, file_size)| SubfolderExpansionEntry {
-                    path,
-                    kind: match kind {
-                        super::folder_scan::ScanMediaKind::Image => {
-                            SubfolderExpansionEntryKind::Image
-                        }
-                        super::folder_scan::ScanMediaKind::Video => {
-                            SubfolderExpansionEntryKind::Video
-                        }
-                        super::folder_scan::ScanMediaKind::Audio => unreachable!(
-                            "audio entries are excluded from subfolder expansion output"
-                        ),
-                    },
-                    mtime,
-                    file_size,
-                }),
-        );
+        .extend(media.into_iter().map(|entry| SubfolderExpansionEntry {
+            path: entry.path,
+            kind: match entry.kind {
+                super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
+                super::folder_scan::ScanMediaKind::Video => SubfolderExpansionEntryKind::Video,
+                super::folder_scan::ScanMediaKind::Audio => {
+                    unreachable!("audio entries are excluded from subfolder expansion output")
+                }
+            },
+            mtime: entry.mtime,
+            file_size: entry.file_size,
+        }));
 }
 
 fn apply_duplicate_filters_to_media(
-    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
+    media: &mut Vec<super::folder_scan::ScannedMediaEntry>,
     options: &SubfolderExpansionOptions,
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
@@ -844,9 +873,17 @@ fn compare_subfolder_entry_indices(
     let ak = &keys[ai];
     let bk = &keys[bi];
     let within_folder = || {
+        let a_meta = crate::settings::ListingSortMetadata::new(
+            a.mtime,
+            (a.kind != SubfolderExpansionEntryKind::Folder).then_some(a.file_size),
+        );
+        let b_meta = crate::settings::ListingSortMetadata::new(
+            b.mtime,
+            (b.kind != SubfolderExpansionEntryKind::Folder).then_some(b.file_size),
+        );
         ak.row
             .cmp(&bk.row)
-            .then_with(|| sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime))
+            .then_with(|| sort.compare_listing_keys(&ak.name, a_meta, &bk.name, b_meta))
             .then_with(|| a.path.cmp(&b.path))
     };
     match order {
@@ -3035,10 +3072,15 @@ mod tests {
         use crate::app::folder_scan::ScanMediaKind;
         let a = PathBuf::from(r"C:\root\a\same.jpg");
         let b = PathBuf::from(r"C:\root\b\same.png");
-        let mut media = vec![
-            (a.clone(), ScanMediaKind::Image, 1, 10),
-            (b.clone(), ScanMediaKind::Image, 2, 20),
-        ];
+        let entry =
+            |path: PathBuf, mtime: i64, file_size: i64| super::folder_scan::ScannedMediaEntry {
+                path,
+                kind: ScanMediaKind::Image,
+                mtime,
+                file_size,
+                sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
+            };
+        let mut media = vec![entry(a.clone(), 1, 10), entry(b.clone(), 2, 20)];
         let options = SubfolderExpansionOptions {
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
@@ -3054,14 +3096,14 @@ mod tests {
         apply_duplicate_filters_to_media(&mut media, &options, &mut overrides);
 
         assert_eq!(media.len(), 1);
-        assert_eq!(media[0].0, a);
+        assert_eq!(media[0].path, a);
 
-        let mut parent_a = vec![(a.clone(), ScanMediaKind::Image, 1, 10)];
-        let mut parent_b = vec![(b.clone(), ScanMediaKind::Image, 2, 20)];
+        let mut parent_a = vec![entry(a.clone(), 1, 10)];
+        let mut parent_b = vec![entry(b.clone(), 2, 20)];
         apply_duplicate_filters_to_media(&mut parent_a, &options, &mut overrides);
         apply_duplicate_filters_to_media(&mut parent_b, &options, &mut overrides);
-        assert_eq!(parent_a[0].0, a);
-        assert_eq!(parent_b[0].0, b);
+        assert_eq!(parent_a[0].path, a);
+        assert_eq!(parent_b[0].path, b);
     }
 
     #[test]
@@ -3084,6 +3126,54 @@ mod tests {
         let sorted = sort_entries_for_view(entries, crate::settings::SortOrder::FileName, &root);
         assert!(sorted[0].path.ends_with(Path::new("a").join("same.jpg")));
         assert!(sorted[1].path.ends_with(Path::new("b").join("same.jpg")));
+    }
+
+    #[test]
+    fn subfolder_size_sort_uses_physical_sizes_and_keeps_synthetic_folders_separate() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = vec![
+            SubfolderExpansionEntry {
+                path: root.join("unknown-container"),
+                kind: SubfolderExpansionEntryKind::Folder,
+                mtime: 1,
+                file_size: 0,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("ten.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 10,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("zero.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 0,
+            },
+        ];
+        let sorted = sort_entries_for_view(entries, crate::settings::SortOrder::SizeAsc, &root);
+        let media = sorted
+            .iter()
+            .filter(|entry| entry.kind == SubfolderExpansionEntryKind::Image)
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(media, ["zero.jpg", "ten.jpg"]);
+        assert_eq!(
+            sorted
+                .iter()
+                .find(|entry| entry.kind == SubfolderExpansionEntryKind::Folder)
+                .unwrap()
+                .file_size,
+            0,
+            "synthetic folder keeps its display placeholder; its sort size is Unknown"
+        );
     }
 
     #[test]

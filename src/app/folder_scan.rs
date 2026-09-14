@@ -12,6 +12,22 @@ pub(crate) enum ScanMediaKind {
     Audio,
 }
 
+#[derive(Clone)]
+pub(crate) struct ScannedFolderEntry {
+    pub(crate) item: GridItem,
+    pub(crate) display_meta: Option<(i64, i64)>,
+    pub(crate) sort_meta: crate::settings::ListingSortMetadata,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScannedMediaEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ScanMediaKind,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
+    pub(crate) sort_meta: crate::settings::ListingSortMetadata,
+}
+
 /// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
 ///
 /// `hidden` / `ignored_archive` / `unsupported` / `system` は既存の `read_dir` ループ内で
@@ -61,12 +77,12 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
 pub(crate) struct ScannedDir {
-    /// (GridItem, (mtime, file_size)) の対。GridItem は Folder / ZipFile /
-    /// PdfFile / ConvertibleArchive のいずれか。load_folder 内でソートされる。
-    pub folders: Vec<(GridItem, Option<(i64, i64)>)>,
-    /// (path, kind, mtime, file_size) のタプル。load_folder 内で sort_order
-    /// 設定に基づいてソートされる。
-    pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    /// Folder / ZipFile / PdfFile / ConvertibleArchive と、表示用metadata・一覧sort用metadata。
+    /// load_folder 内で3本を同じ順序へ並べ替える。
+    pub folders: Vec<ScannedFolderEntry>,
+    /// 物理mediaのpath / kind / 表示用mtime・size / 一覧sort用metadata。
+    /// load_folder 内で sort_order 設定に基づいてソートされる。
+    pub all_media: Vec<ScannedMediaEntry>,
     /// 走査時点で一覧へ出さなかった項目。`same_name` は後段の同名 filter 適用時に入る。
     pub omitted: OmittedFolderEntryCounts,
 }
@@ -79,6 +95,8 @@ pub(crate) struct ScannedDir {
 pub(crate) struct MaterializedFolderListing {
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,
+    /// `items` とalignedな一覧sort metadata。表示/cache metadataとは別owner。
+    pub(crate) sort_metas: Vec<crate::settings::ListingSortMetadata>,
     /// 走査時の除外に、ここで適用した同名 filter の件数を足した最終内訳。
     /// 走査側と filter 側の両方を見られるのはこの関数だけなので、集計者もここに置く。
     /// 呼び出し側で数え直すと本体一覧と remote 一覧で違う数が出る。
@@ -97,13 +115,21 @@ pub(crate) fn materialize_local_folder_listing(
     settings: &crate::settings::Settings,
 ) -> MaterializedFolderListing {
     let mut omitted = scan.omitted;
-    let (mut folders, mut metas): (Vec<_>, Vec<_>) = scan.folders.into_iter().unzip();
+    let mut folders = Vec::with_capacity(scan.folders.len());
+    let mut metas = Vec::with_capacity(scan.folders.len());
+    let mut sort_metas = Vec::with_capacity(scan.folders.len() + scan.all_media.len());
+    for entry in scan.folders {
+        folders.push(entry.item);
+        metas.push(entry.display_meta);
+        sort_metas.push(entry.sort_meta);
+    }
     let mut all_media = scan.all_media;
     let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
     if compiled {
         folders.clear();
         metas.clear();
-        all_media.retain(|(_, kind, _, _)| *kind == ScanMediaKind::Image);
+        sort_metas.clear();
+        all_media.retain(|entry| entry.kind == ScanMediaKind::Image);
     }
     let folder_count = folders.len();
     let media_count = all_media.len();
@@ -120,15 +146,20 @@ pub(crate) fn materialize_local_folder_listing(
         folders.is_empty(),
         all_media
             .iter()
-            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image),
+            .all(|entry| entry.kind == ScanMediaKind::Image),
         settings.auto_fullscreen_image_folders_enabled(),
     );
-    crate::grid_item::sort_folder_block(&mut folders, &mut metas, folder_sort);
+    crate::grid_item::sort_folder_block_with_metadata(
+        &mut folders,
+        &mut metas,
+        &mut sort_metas,
+        folder_sort,
+    );
     let mut keyed_media = all_media
         .into_iter()
         .map(|entry| {
             let name = entry
-                .0
+                .path
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
@@ -137,7 +168,7 @@ pub(crate) fn materialize_local_folder_listing(
         })
         .collect::<Vec<_>>();
     keyed_media.sort_by(|(left, left_key), (right, right_key)| {
-        media_sort.compare_name_keys(left_key, left.2, right_key, right.2)
+        media_sort.compare_listing_keys(left_key, left.sort_meta, right_key, right.sort_meta)
     });
     let mut all_media = keyed_media
         .into_iter()
@@ -148,14 +179,19 @@ pub(crate) fn materialize_local_folder_listing(
     let duplicate_started = std::time::Instant::now();
     let mut same_name = 0usize;
     if settings.skip_zip_if_folder_exists {
-        same_name =
-            same_name.saturating_add(filter_virtual_folder_duplicates(&mut folders, &mut metas));
-    }
-    if settings.skip_archive_if_zip_exists {
-        same_name = same_name.saturating_add(filter_convertible_archive_duplicates(
+        same_name = same_name.saturating_add(filter_virtual_folder_duplicates_with_sort_metadata(
             &mut folders,
             &mut metas,
+            &mut sort_metas,
         ));
+    }
+    if settings.skip_archive_if_zip_exists {
+        same_name =
+            same_name.saturating_add(filter_convertible_archive_duplicates_with_sort_metadata(
+                &mut folders,
+                &mut metas,
+                &mut sort_metas,
+            ));
     }
     let video_thumb_overrides = if settings.skip_image_if_video_exists {
         let filtered =
@@ -175,17 +211,19 @@ pub(crate) fn materialize_local_folder_listing(
     let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut items = folders;
-    for (path, kind, mtime, file_size) in all_media {
-        items.push(match kind {
-            ScanMediaKind::Image => GridItem::Image(path),
-            ScanMediaKind::Video => GridItem::Video(path),
-            ScanMediaKind::Audio => GridItem::Audio(path),
+    for entry in all_media {
+        items.push(match entry.kind {
+            ScanMediaKind::Image => GridItem::Image(entry.path),
+            ScanMediaKind::Video => GridItem::Video(entry.path),
+            ScanMediaKind::Audio => GridItem::Audio(entry.path),
         });
-        metas.push(Some((mtime, file_size)));
+        metas.push(Some((entry.mtime, entry.file_size)));
+        sort_metas.push(entry.sort_meta);
     }
-    crate::grid_item::arrange_grid_items(
+    crate::grid_item::arrange_grid_items_with_sort_metadata(
         &mut items,
         &mut metas,
+        &mut sort_metas,
         &settings.grid_display_order,
         Some(media_sort),
     );
@@ -193,6 +231,7 @@ pub(crate) fn materialize_local_folder_listing(
     MaterializedFolderListing {
         items,
         metas,
+        sort_metas,
         omitted,
         video_thumb_overrides,
         folder_count,
@@ -291,13 +330,13 @@ pub(crate) fn image_folder_page_count(
 /// 1 件でもあれば true。テキスト等の非対応ファイルは従来どおり判定に影響しない。
 pub(crate) fn is_image_only_book_contents(
     has_container: bool,
-    all_media: &[(PathBuf, ScanMediaKind, i64, i64)],
+    all_media: &[ScannedMediaEntry],
 ) -> bool {
     !has_container
         && !all_media.is_empty()
         && all_media
             .iter()
-            .all(|(_, kind, _, _)| *kind == ScanMediaKind::Image)
+            .all(|entry| entry.kind == ScanMediaKind::Image)
 }
 
 /// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。
@@ -345,8 +384,8 @@ fn scan_directory_entries<I>(
 where
     I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
 {
-    let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
-    let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
+    let mut folders: Vec<ScannedFolderEntry> = Vec::new();
+    let mut all_media: Vec<ScannedMediaEntry> = Vec::new();
     let mut omitted = OmittedFolderEntryCounts::default();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -387,7 +426,11 @@ where
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-            folders.push((GridItem::Folder(p), Some((mtime, 0))));
+            folders.push(ScannedFolderEntry {
+                item: GridItem::Folder(p),
+                display_meta: Some((mtime, 0)),
+                sort_meta: crate::settings::ListingSortMetadata::new(mtime, None),
+            });
         } else if crate::folder_tree::is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ - スキップ
             omitted.system = omitted.system.saturating_add(1);
@@ -400,27 +443,58 @@ where
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
             let file_size = meta.as_ref().map_or(0, |m| m.len() as i64);
+            let sort_meta = crate::settings::ListingSortMetadata::new(
+                mtime,
+                meta.as_ref().map(|m| m.len() as i64),
+            );
             if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
-                all_media.push((p, ScanMediaKind::Image, mtime, file_size));
+                all_media.push(ScannedMediaEntry {
+                    path: p,
+                    kind: ScanMediaKind::Image,
+                    mtime,
+                    file_size,
+                    sort_meta,
+                });
             } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
-                all_media.push((p, ScanMediaKind::Video, mtime, file_size));
+                all_media.push(ScannedMediaEntry {
+                    path: p,
+                    kind: ScanMediaKind::Video,
+                    mtime,
+                    file_size,
+                    sort_meta,
+                });
             } else if crate::folder_tree::is_audio_ext(&ext_lower) {
-                all_media.push((p, ScanMediaKind::Audio, mtime, file_size));
+                all_media.push(ScannedMediaEntry {
+                    path: p,
+                    kind: ScanMediaKind::Audio,
+                    mtime,
+                    file_size,
+                    sort_meta,
+                });
             } else if crate::folder_tree::is_zip_extension(&ext_lower) {
-                folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
+                folders.push(ScannedFolderEntry {
+                    item: GridItem::ZipFile(p),
+                    display_meta: Some((mtime, file_size)),
+                    sort_meta,
+                });
             } else if ext_lower == "pdf" {
-                folders.push((GridItem::PdfFile(p), Some((mtime, file_size))));
+                folders.push(ScannedFolderEntry {
+                    item: GridItem::PdfFile(p),
+                    display_meta: Some((mtime, file_size)),
+                    sort_meta,
+                });
             } else if let Some(fmt) =
                 crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
                 if include_convertible_archives {
-                    folders.push((
-                        GridItem::ConvertibleArchive {
+                    folders.push(ScannedFolderEntry {
+                        item: GridItem::ConvertibleArchive {
                             path: p,
                             format: fmt,
                         },
-                        Some((mtime, file_size)),
-                    ));
+                        display_meta: Some((mtime, file_size)),
+                        sort_meta,
+                    });
                 } else {
                     omitted.ignored_archive = omitted.ignored_archive.saturating_add(1);
                 }
@@ -453,25 +527,25 @@ pub(crate) struct VideoImageDuplicateFilterResult {
 }
 
 pub(super) fn filter_upscaled_video_pairs_fast(
-    all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    all_media: &mut Vec<ScannedMediaEntry>,
     entry_file_names_ci: &std::collections::HashSet<String>,
 ) {
     let mut source_stem_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for (path, kind, _, _) in all_media.iter() {
-        if *kind != ScanMediaKind::Video || is_miv_upscaled_derivative(path) {
+    for entry in all_media.iter() {
+        if entry.kind != ScanMediaKind::Video || is_miv_upscaled_derivative(&entry.path) {
             continue;
         }
-        if let Some(stem) = file_stem_ci(path) {
+        if let Some(stem) = file_stem_ci(&entry.path) {
             *source_stem_counts.entry(stem).or_insert(0) += 1;
         }
     }
 
     let derivative_source_stems: std::collections::HashSet<String> = all_media
         .iter()
-        .filter(|(_, kind, _, _)| *kind == ScanMediaKind::Video)
-        .filter_map(|(path, _, _, _)| {
-            source_stem_for_miv_upscaled_derivative(path, entry_file_names_ci)
+        .filter(|entry| entry.kind == ScanMediaKind::Video)
+        .filter_map(|entry| {
+            source_stem_for_miv_upscaled_derivative(&entry.path, entry_file_names_ci)
         })
         .filter(|source_stem| source_stem_counts.get(source_stem).copied() == Some(1))
         .collect();
@@ -480,17 +554,17 @@ pub(super) fn filter_upscaled_video_pairs_fast(
         return;
     }
 
-    all_media.retain(|(path, kind, _, _)| {
-        if is_miv_upscaled_derivative(path) {
+    all_media.retain(|entry| {
+        if is_miv_upscaled_derivative(&entry.path) {
             return true;
         }
         // 音声はアップスケール動画の companion ではない (例: song.mp3 と song.miv.mkv は
         // 別メディア) ので、同一 stem でも常に残す (Codex P2)。元動画と companion 画像
         // (sidecar サムネ等) は従来どおり同一 stem のとき隠す。
-        if *kind == ScanMediaKind::Audio {
+        if entry.kind == ScanMediaKind::Audio {
             return true;
         }
-        file_stem_ci(path).is_none_or(|stem| !derivative_source_stems.contains(&stem))
+        file_stem_ci(&entry.path).is_none_or(|stem| !derivative_source_stems.contains(&stem))
     });
 }
 
@@ -500,17 +574,17 @@ pub(super) fn filter_upscaled_video_pairs_fast(
 /// 同名ファイルまで衝突する。`use_sidecar` が有効なら、除外画像を動画サムネイルへ
 /// 引き継ぐため `(video_path, image_path)` を返す。画像の除外自体は設定に関係なく行う。
 pub(crate) fn filter_video_image_duplicates(
-    media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    media: &mut Vec<ScannedMediaEntry>,
     use_sidecar: bool,
 ) -> VideoImageDuplicateFilterResult {
     let mut videos_by_stem: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
-    for (path, kind, _, _) in media.iter() {
-        if *kind == ScanMediaKind::Video {
+    for entry in media.iter() {
+        if entry.kind == ScanMediaKind::Video {
             videos_by_stem
-                .entry(super::stem_lower(path))
+                .entry(super::stem_lower(&entry.path))
                 .or_default()
-                .push(path.clone());
+                .push(entry.path.clone());
         }
     }
     if videos_by_stem.is_empty() {
@@ -519,19 +593,25 @@ pub(crate) fn filter_video_image_duplicates(
 
     let mut sidecars = Vec::new();
     if use_sidecar {
-        for (path, kind, _, _) in media.iter() {
-            if *kind != ScanMediaKind::Image {
+        for entry in media.iter() {
+            if entry.kind != ScanMediaKind::Image {
                 continue;
             }
-            if let Some(videos) = videos_by_stem.get(&super::stem_lower(path)) {
-                sidecars.extend(videos.iter().cloned().map(|video| (video, path.clone())));
+            if let Some(videos) = videos_by_stem.get(&super::stem_lower(&entry.path)) {
+                sidecars.extend(
+                    videos
+                        .iter()
+                        .cloned()
+                        .map(|video| (video, entry.path.clone())),
+                );
             }
         }
     }
 
     let before = media.len();
-    media.retain(|(path, kind, _, _)| {
-        *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&super::stem_lower(path))
+    media.retain(|entry| {
+        entry.kind != ScanMediaKind::Image
+            || !videos_by_stem.contains_key(&super::stem_lower(&entry.path))
     });
     VideoImageDuplicateFilterResult {
         sidecars,
@@ -572,6 +652,43 @@ pub(crate) fn filter_virtual_folder_duplicates(
     keep.iter().filter(|keep| !**keep).count()
 }
 
+fn filter_virtual_folder_duplicates_with_sort_metadata(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+    sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+) -> usize {
+    assert_eq!(folders.len(), folder_metas.len());
+    assert_eq!(folders.len(), sort_metas.len());
+    let real_folder_names: std::collections::HashSet<String> = folders
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Folder(path) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_lowercase),
+            _ => None,
+        })
+        .collect();
+    let keep: Vec<bool> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => {
+                !real_folder_names.contains(&super::stem_lower(path))
+            }
+            _ => true,
+        })
+        .collect();
+    let mut iter = keep.iter();
+    folders.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    folder_metas.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    sort_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
+}
+
 /// 同名の ZIP/CBZ があれば、変換元になる RAR/7z/LZH 等を一覧から除外する。
 pub(crate) fn filter_convertible_archive_duplicates(
     folders: &mut Vec<GridItem>,
@@ -603,19 +720,55 @@ pub(crate) fn filter_convertible_archive_duplicates(
     keep.iter().filter(|keep| !**keep).count()
 }
 
+fn filter_convertible_archive_duplicates_with_sort_metadata(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+    sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+) -> usize {
+    assert_eq!(folders.len(), folder_metas.len());
+    assert_eq!(folders.len(), sort_metas.len());
+    let zip_stems: std::collections::HashSet<String> = folders
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::ZipFile(path) => Some(super::stem_lower(path)),
+            _ => None,
+        })
+        .collect();
+    if zip_stems.is_empty() {
+        return 0;
+    }
+    let keep: Vec<bool> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::ConvertibleArchive { path, .. } => {
+                !zip_stems.contains(&super::stem_lower(path))
+            }
+            _ => true,
+        })
+        .collect();
+    let mut iter = keep.iter();
+    folders.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    folder_metas.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    sort_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
+}
+
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
 pub(crate) fn filter_image_ext_duplicates(
-    all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
+    all_media: &mut Vec<ScannedMediaEntry>,
     priority: &[String],
 ) -> usize {
     let mut best: std::collections::HashMap<String, (usize, usize)> =
         std::collections::HashMap::new();
-    for (index, (path, kind, _, _)) in all_media.iter().enumerate() {
-        if *kind != ScanMediaKind::Image {
+    for (index, entry) in all_media.iter().enumerate() {
+        if entry.kind != ScanMediaKind::Image {
             continue;
         }
-        let stem = super::stem_lower(path);
-        let extension = path
+        let stem = super::stem_lower(&entry.path);
+        let extension = entry
+            .path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
@@ -634,9 +787,11 @@ pub(crate) fn filter_image_ext_duplicates(
 
     let mut stem_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for (path, kind, _, _) in all_media.iter() {
-        if *kind == ScanMediaKind::Image {
-            *stem_counts.entry(super::stem_lower(path)).or_insert(0) += 1;
+    for entry in all_media.iter() {
+        if entry.kind == ScanMediaKind::Image {
+            *stem_counts
+                .entry(super::stem_lower(&entry.path))
+                .or_insert(0) += 1;
         }
     }
     let keep_indices: std::collections::HashSet<usize> = best
@@ -649,13 +804,13 @@ pub(crate) fn filter_image_ext_duplicates(
     }
     let before = all_media.len();
     let mut index = 0usize;
-    all_media.retain(|(path, kind, _, _)| {
+    all_media.retain(|entry| {
         let current = index;
         index += 1;
-        if *kind != ScanMediaKind::Image {
+        if entry.kind != ScanMediaKind::Image {
             return true;
         }
-        let stem = super::stem_lower(path);
+        let stem = super::stem_lower(&entry.path);
         stem_counts.get(&stem).copied().unwrap_or(0) <= 1 || keep_indices.contains(&current)
     });
     before.saturating_sub(all_media.len())
@@ -704,24 +859,24 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut entries: Vec<(&std::ffi::OsStr, i64, i64, &'static str)> =
         Vec::with_capacity(scan.folders.len() + scan.all_media.len());
-    for (item, meta) in &scan.folders {
-        let (path, kind) = match item {
+    for entry in &scan.folders {
+        let (path, kind) = match &entry.item {
             GridItem::Folder(p) => (p.as_os_str(), "folder"),
             GridItem::ZipFile(p) => (p.as_os_str(), "zip"),
             GridItem::PdfFile(p) => (p.as_os_str(), "pdf"),
             GridItem::ConvertibleArchive { path, .. } => (path.as_os_str(), "archive"),
             _ => continue,
         };
-        let (mtime, size) = meta.unwrap_or((0, 0));
+        let (mtime, size) = entry.display_meta.unwrap_or((0, 0));
         entries.push((path, mtime, size, kind));
     }
-    for (p, media_kind, mtime, size) in &scan.all_media {
-        let kind = match media_kind {
+    for entry in &scan.all_media {
+        let kind = match entry.kind {
             ScanMediaKind::Image => "image",
             ScanMediaKind::Video => "video",
             ScanMediaKind::Audio => "audio",
         };
-        entries.push((p.as_os_str(), *mtime, *size, kind));
+        entries.push((entry.path.as_os_str(), entry.mtime, entry.file_size, kind));
     }
     entries.sort();
     let mut hasher = DefaultHasher::new();
@@ -906,6 +1061,62 @@ mod page_count_tests {
     }
 
     #[test]
+    fn materialized_size_sort_keeps_real_zero_known_and_display_unknown_legacy_meta() {
+        let media = |name: &str, file_size: i64, known: bool| ScannedMediaEntry {
+            path: PathBuf::from(format!(r"C:\sizes\{name}")),
+            kind: ScanMediaKind::Image,
+            mtime: 7,
+            file_size,
+            sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
+        };
+        let scan = || ScannedDir {
+            folders: vec![ScannedFolderEntry {
+                item: GridItem::Folder(PathBuf::from(r"C:\sizes\child")),
+                display_meta: Some((7, 0)),
+                sort_meta: crate::settings::ListingSortMetadata::new(7, None),
+            }],
+            all_media: vec![
+                media("unknown.jpg", 0, false),
+                media("ten.jpg", 10, true),
+                media("zero.jpg", 0, true),
+            ],
+            omitted: OmittedFolderEntryCounts::default(),
+        };
+        let mut settings = crate::settings::Settings::default();
+        settings.sort_order = crate::settings::SortOrder::SizeAsc;
+        let listing =
+            materialize_local_folder_listing(std::path::Path::new(r"C:\sizes"), scan(), &settings);
+        let image_names = listing
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => path.file_name()?.to_str().map(str::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, ["zero.jpg", "ten.jpg", "unknown.jpg"]);
+        let unknown_index = listing
+            .items
+            .iter()
+            .position(|item| item.name().as_ref() == "unknown.jpg")
+            .unwrap();
+        assert_eq!(listing.metas[unknown_index], Some((7, 0)));
+
+        settings.sort_order = crate::settings::SortOrder::SizeDesc;
+        let listing =
+            materialize_local_folder_listing(std::path::Path::new(r"C:\sizes"), scan(), &settings);
+        let image_names = listing
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => path.file_name()?.to_str().map(str::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, ["ten.jpg", "zero.jpg", "unknown.jpg"]);
+    }
+
+    #[test]
     fn ignored_archive_reclassification_preserves_the_primary_total() {
         let counts = OmittedFolderEntryCounts {
             same_name: 3,
@@ -959,24 +1170,27 @@ mod page_count_tests {
     #[test]
     fn video_image_filter_returns_the_actual_folded_difference() {
         let mut media = vec![
-            (
-                PathBuf::from(r"C:\media\clip.mp4"),
-                ScanMediaKind::Video,
-                0,
-                0,
-            ),
-            (
-                PathBuf::from(r"C:\media\clip.jpg"),
-                ScanMediaKind::Image,
-                0,
-                0,
-            ),
-            (
-                PathBuf::from(r"C:\media\other.jpg"),
-                ScanMediaKind::Image,
-                0,
-                0,
-            ),
+            ScannedMediaEntry {
+                path: PathBuf::from(r"C:\media\clip.mp4"),
+                kind: ScanMediaKind::Video,
+                mtime: 0,
+                file_size: 0,
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+            },
+            ScannedMediaEntry {
+                path: PathBuf::from(r"C:\media\clip.jpg"),
+                kind: ScanMediaKind::Image,
+                mtime: 0,
+                file_size: 0,
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+            },
+            ScannedMediaEntry {
+                path: PathBuf::from(r"C:\media\other.jpg"),
+                kind: ScanMediaKind::Image,
+                mtime: 0,
+                file_size: 0,
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+            },
         ];
 
         let filtered = filter_video_image_duplicates(&mut media, false);

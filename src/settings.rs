@@ -1893,13 +1893,31 @@ impl FacetNameFilterWidth {
 // SortOrder
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SortOrder {
     #[default]
     FileName, // ファイル名順（辞書順）
     Numeric,  // 番号順（自然順: 1, 2, 9, 10, 11）
     DateAsc,  // 日付順（昇順）
     DateDesc, // 日付順（降順）
+    SizeAsc,  // サイズ順（昇順、不明は末尾）
+    SizeDesc, // サイズ順（降順、不明は末尾）
+}
+
+/// 一覧の並び替えだけが使うmetadata snapshot。
+///
+/// 表示・cache鮮度用の `(mtime, file_size)` は歴史的に0を取得失敗にも使うため、
+/// size availabilityをそこから推測しない。producerがmetadata成功時だけSomeを入れる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListingSortMetadata {
+    pub(crate) mtime: i64,
+    pub(crate) file_size: Option<i64>,
+}
+
+impl ListingSortMetadata {
+    pub(crate) const fn new(mtime: i64, file_size: Option<i64>) -> Self {
+        Self { mtime, file_size }
+    }
 }
 
 impl SortOrder {
@@ -1909,6 +1927,8 @@ impl SortOrder {
             Self::Numeric => "番号順（区切り無視）",
             Self::DateAsc => "日付順（古い順）",
             Self::DateDesc => "日付順（新しい順）",
+            Self::SizeAsc => "サイズ順（小さい順）",
+            Self::SizeDesc => "サイズ順（大きい順）",
         }
     }
 
@@ -1918,6 +1938,8 @@ impl SortOrder {
             Self::Numeric => "番号*",
             Self::DateAsc => "日付↑",
             Self::DateDesc => "日付↓",
+            Self::SizeAsc => "サイズ↑",
+            Self::SizeDesc => "サイズ↓",
         }
     }
 
@@ -1927,11 +1949,30 @@ impl SortOrder {
             Self::Numeric => "記号・空白などを無視して連番を優先して並び替えます",
             Self::DateAsc => "更新日時が古いものから並び替えます",
             Self::DateDesc => "更新日時が新しいものから並び替えます",
+            Self::SizeAsc => "ファイルサイズが小さいものから並び替えます（不明は末尾）",
+            Self::SizeDesc => "ファイルサイズが大きいものから並び替えます（不明は末尾）",
         }
     }
 
     pub fn all() -> &'static [Self] {
+        &[
+            Self::FileName,
+            Self::Numeric,
+            Self::DateAsc,
+            Self::DateDesc,
+            Self::SizeAsc,
+            Self::SizeDesc,
+        ]
+    }
+
+    /// フォルダ代表サムネイルの探索に使える既存4候補。
+    /// 一覧のサイズ順を代表画像選択へ波及させない。
+    pub fn folder_thumb_options() -> &'static [Self] {
         &[Self::FileName, Self::Numeric, Self::DateAsc, Self::DateDesc]
+    }
+
+    pub(crate) const fn is_size(self) -> bool {
+        matches!(self, Self::SizeAsc | Self::SizeDesc)
     }
 
     /// 2 つのメディア項目をこのソート順で比較する。
@@ -1988,6 +2029,42 @@ impl SortOrder {
             Self::DateDesc => mtime_b
                 .cmp(&mtime_a)
                 .then_with(|| name_a.compare_file_name(name_b)),
+            Self::SizeAsc | Self::SizeDesc => {
+                debug_assert!(
+                    false,
+                    "size list sort requires compare_listing_keys and typed availability"
+                );
+                name_a.compare_file_name(name_b)
+            }
+        }
+    }
+
+    /// 事前に作った名前keyとtyped metadataで一覧項目を比較する。
+    pub(crate) fn compare_listing_keys(
+        self,
+        name_a: &crate::filename_sort::SortNameKey,
+        meta_a: ListingSortMetadata,
+        name_b: &crate::filename_sort::SortNameKey,
+        meta_b: ListingSortMetadata,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        let name_tie = || name_a.compare_file_name(name_b);
+        match self {
+            Self::FileName => name_tie(),
+            Self::Numeric => name_a.compare_natural(name_b).then_with(name_tie),
+            Self::DateAsc => meta_a.mtime.cmp(&meta_b.mtime).then_with(name_tie),
+            Self::DateDesc => meta_b.mtime.cmp(&meta_a.mtime).then_with(name_tie),
+            Self::SizeAsc | Self::SizeDesc => {
+                let size_order = match (meta_a.file_size, meta_b.file_size) {
+                    (Some(a), Some(b)) if self == Self::SizeAsc => a.cmp(&b),
+                    (Some(a), Some(b)) => b.cmp(&a),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                size_order.then_with(name_tie)
+            }
         }
     }
 }
@@ -4684,6 +4761,13 @@ pub struct Settings {
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
+    /// v3.10以後の一覧サイズ順候補を旧既定4項目へ一度だけ補完したmarker。
+    ///
+    /// `#[serde(default)] = false` で旧保存を識別する。現行版の新規値は最初からtrueで、
+    /// 旧保存だけを初回loadでtrueへbootstrap保存する。以後利用者がサイズ2候補だけを
+    /// 非表示にしたcanonical4を維持する。
+    #[serde(default)]
+    pub(crate) toolbar_sort_size_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
@@ -6749,6 +6833,7 @@ impl Default for Settings {
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
+            toolbar_sort_size_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_facet_name_filter_index_stash: None,
             facet_name_filter_width: FacetNameFilterWidth::default(),
@@ -7330,11 +7415,14 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// `Settings::load()` の中身と同じ migrations を呼ぶ:
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
-/// 3. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+/// 3. `migrate_legacy_archive_file_handling`
+/// 4. `migrate_toolbar_sort_size_options`
+/// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
+    settings.migrate_toolbar_sort_size_options();
     settings.sanitize();
 }
 
@@ -7923,6 +8011,26 @@ impl Settings {
         true
     }
 
+    /// 一覧サイズ順を追加する前の既定4候補を、保存世代ごとに一度だけ6候補へ補完する。
+    /// markerを別に持つことで、移行後に利用者がサイズ2候補だけを非表示にした同じ4値を
+    /// 次回loadで再び既定扱いしない。
+    fn migrate_toolbar_sort_size_options(&mut self) -> bool {
+        if self.toolbar_sort_size_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_SORT_ITEMS: [SortOrder; 4] = [
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+        ];
+        if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_size_options_migrated = true;
+        true
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
@@ -7972,6 +8080,7 @@ impl Settings {
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
+        let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
@@ -8113,6 +8222,7 @@ impl Settings {
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || ai_prefetch_forward_migrated
+            || toolbar_sort_size_options_migrated
             || legacy_keymap_import.changed
             || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -8483,6 +8593,9 @@ impl Settings {
     fn sanitize(&mut self) {
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
+        if self.folder_thumb_sort.is_size() {
+            self.folder_thumb_sort = default_folder_thumb_sort();
+        }
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
@@ -8966,6 +9079,7 @@ impl Settings {
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
+        self.toolbar_sort_size_options_migrated = src.toolbar_sort_size_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
             src.toolbar_facet_name_filter_index_stash.take();
@@ -14337,6 +14451,81 @@ mod tests {
             SortOrder::DateDesc.compare("Bbb", 100, "aaa", 100, key),
             std::cmp::Ordering::Greater,
             "DateDesc 同 mtime でも名前昇順 (= 新しいもの優先で揃え、同 mtime は名前順)"
+        );
+    }
+
+    #[test]
+    fn size_sort_keeps_unknown_last_in_both_directions_and_ties_by_name() {
+        let rows = [
+            ("unknown-b", ListingSortMetadata::new(0, None)),
+            ("ten", ListingSortMetadata::new(0, Some(10))),
+            ("zero-b", ListingSortMetadata::new(0, Some(0))),
+            ("zero-a", ListingSortMetadata::new(0, Some(0))),
+            ("unknown-a", ListingSortMetadata::new(0, None)),
+        ];
+        let sorted = |order: SortOrder| {
+            let mut rows = rows;
+            rows.sort_by(|(a_name, a_meta), (b_name, b_meta)| {
+                let a_key = order.name_key(a_name);
+                let b_key = order.name_key(b_name);
+                order.compare_listing_keys(&a_key, *a_meta, &b_key, *b_meta)
+            });
+            rows.map(|(name, _)| name)
+        };
+        assert_eq!(
+            sorted(SortOrder::SizeAsc),
+            ["zero-a", "zero-b", "ten", "unknown-a", "unknown-b"]
+        );
+        assert_eq!(
+            sorted(SortOrder::SizeDesc),
+            ["ten", "zero-a", "zero-b", "unknown-a", "unknown-b"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "size list sort requires compare_listing_keys")]
+    fn legacy_name_comparator_rejects_size_sort_in_debug_tests() {
+        let a = SortOrder::SizeAsc.name_key("a.jpg");
+        let b = SortOrder::SizeAsc.name_key("b.jpg");
+        let _ = SortOrder::SizeAsc.compare_name_keys(&a, 0, &b, 0);
+    }
+
+    #[test]
+    fn legacy_toolbar_defaults_gain_size_once_without_rewriting_current_custom_choice() {
+        let mut defaults: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": ["FileName", "Numeric", "DateAsc", "DateDesc"],
+            "folder_thumb_sort": "SizeDesc"
+        }))
+        .unwrap();
+        assert!(defaults.migrate_toolbar_sort_size_options());
+        defaults.sanitize();
+        assert_eq!(defaults.toolbar_sort_items, SortOrder::all());
+        assert!(defaults.toolbar_sort_size_options_migrated);
+        assert_eq!(defaults.folder_thumb_sort, SortOrder::FileName);
+        assert_eq!(SortOrder::folder_thumb_options().len(), 4);
+
+        // 現行版で利用者がサイズ2候補だけを非表示にすると値は旧canonical4と同じになる。
+        // 保存済みmarkerにより、次回loadでそれらを勝手に復活させない。
+        defaults.toolbar_sort_items = vec![
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+        ];
+        let mut reloaded: Settings =
+            serde_json::from_value(serde_json::to_value(&defaults).unwrap()).unwrap();
+        assert!(!reloaded.migrate_toolbar_sort_size_options());
+        assert_eq!(reloaded.toolbar_sort_items, defaults.toolbar_sort_items);
+
+        let mut custom: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": ["DateDesc", "FileName"]
+        }))
+        .unwrap();
+        assert!(custom.migrate_toolbar_sort_size_options());
+        custom.sanitize();
+        assert_eq!(
+            custom.toolbar_sort_items,
+            [SortOrder::DateDesc, SortOrder::FileName]
         );
     }
 

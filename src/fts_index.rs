@@ -739,20 +739,32 @@ pub fn doc_text_for_target(
     Ok(out)
 }
 
+/// 指定 doc の一覧ソート用 STORED metadata を 1 回の doc fetch で取り出す。
+/// `file_size` が欠ける旧/合成 test doc は Unknown (`None`) とし、保存済み 0 は実在する
+/// 0-byte file (`Some(0)`) と区別する。現行 producer は metadata 取得成功後だけ文書を
+/// 作るため、production の STORED 0 は既知値である。
+pub fn doc_listing_metadata(
+    searcher: &tantivy::Searcher,
+    fields: &Fields,
+    addr: DocAddress,
+) -> tantivy::Result<(i64, Option<i64>)> {
+    let doc: TantivyDocument = searcher.doc(addr)?;
+    let mtime = doc
+        .get_first(fields.mtime)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let file_size = doc.get_first(fields.file_size).and_then(|v| v.as_i64());
+    Ok((mtime, file_size))
+}
+
 /// 指定 doc の STORED `mtime` (UNIX 秒) を取り出す。
 /// Ctrl+G 一覧ビューの日付ソート用 (docs/search-container-item-redesign.md §5.2)。
-/// schema には既に `mtime` が `INDEXED | STORED` で入っているため、取り出し経路の
-/// 追加のみで足りる (スキーマ変更・INDEX_VERSION bump は不要)。
 pub fn doc_mtime(
     searcher: &tantivy::Searcher,
     fields: &Fields,
     addr: DocAddress,
 ) -> tantivy::Result<i64> {
-    let doc: TantivyDocument = searcher.doc(addr)?;
-    Ok(doc
-        .get_first(fields.mtime)
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0))
+    doc_listing_metadata(searcher, fields, addr).map(|(mtime, _)| mtime)
 }
 
 // -----------------------------------------------------------------------

@@ -3402,7 +3402,7 @@ impl ContainerEngine {
         let image_only = if compiled {
             scan.all_media
                 .iter()
-                .any(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image)
+                .any(|entry| entry.kind == crate::app::folder_scan::ScanMediaKind::Image)
         } else {
             crate::app::folder_scan::is_image_only_book_contents(
                 !scan.folders.is_empty(),
@@ -10343,6 +10343,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn remote_physical_folder_reuses_local_size_sort_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let sizes = root.join("sizes");
+        std::fs::create_dir_all(sizes.join("child")).unwrap();
+        std::fs::write(sizes.join("ten.jpg"), [0_u8; 10]).unwrap();
+        std::fs::write(sizes.join("zero.jpg"), []).unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            sort_order: crate::settings::SortOrder::SizeAsc,
+            auto_fullscreen_image_folders: false,
+            ..Default::default()
+        });
+
+        let remote = assert_local_remote_folder_listing_match(&engine, &favorite, "sizes");
+        let image_names = remote
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::Image)
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, ["zero.jpg", "ten.jpg"]);
+        assert_eq!(
+            remote.sort_state.selected,
+            super::super::sort_order_wire_value(crate::settings::SortOrder::SizeAsc)
+        );
+        assert!(remote.sort_state.locked_reason.is_none());
     }
 
     #[test]

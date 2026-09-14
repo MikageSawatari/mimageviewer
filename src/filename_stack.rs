@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::grid_item::GridItem;
-use crate::settings::SortOrder;
+use crate::settings::{ListingSortMetadata, SortOrder};
 
 /// サブ展開ビューなど複数フォルダのメディアを 1 本の一覧に混ぜるとき、同じ prefix が
 /// 別フォルダ間で衝突しないようにする内部区切り。
@@ -35,7 +35,7 @@ pub struct StackMember {
     /// 更新日時 (秒)。日付ソート用。
     pub mtime: i64,
     /// ファイルサイズ (バイト)。
-    pub size: i64,
+    pub size: Option<i64>,
     /// 動画か (動画は単独グループに固定する)。
     pub is_video: bool,
 }
@@ -193,12 +193,14 @@ pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) 
         .map(|group| {
             let rep = group.representative();
             let key = sort.name_key(name_of(&rep.path));
-            let mtime = rep.mtime;
-            (group, key, mtime)
+            let metadata =
+                ListingSortMetadata::new(rep.mtime, if group.is_stack() { None } else { rep.size });
+            (group, key, metadata)
         })
         .collect();
-    keyed_groups
-        .sort_by(|(_, ak, a_mt), (_, bk, b_mt)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    keyed_groups.sort_by(|(_, ak, a_meta), (_, bk, b_meta)| {
+        sort.compare_listing_keys(ak, *a_meta, bk, *b_meta)
+    });
     keyed_groups
         .into_iter()
         .map(|(group, _, _)| group)
@@ -231,6 +233,7 @@ pub struct StackView {
     pub passthrough: Vec<GridItem>,
     /// `passthrough` と同インデックスの `(mtime, size)`。
     pub passthrough_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) passthrough_sort_metas: Vec<ListingSortMetadata>,
     /// メディアグループ (表示順)。
     pub groups: Vec<StackGroup>,
     /// カテゴリ並べ替え後の index 写像。構築時に 1 回だけ計算し、ナビ操作では再ソートしない。
@@ -250,14 +253,20 @@ impl StackView {
         separator: char,
         sort: SortOrder,
     ) -> Self {
+        let passthrough_sort_metas = passthrough_metas
+            .iter()
+            .map(|meta| ListingSortMetadata::new(meta.map(|(mtime, _)| mtime).unwrap_or(0), None))
+            .collect();
         let groups = group_media(media, separator, sort);
-        Self::from_groups(
+        Self::from_groups_with_display_order(
             folder,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             groups,
+            crate::settings::GridDisplayOrder::default(),
         )
     }
 
@@ -272,10 +281,15 @@ impl StackView {
         sort: SortOrder,
         groups: Vec<StackGroup>,
     ) -> Self {
+        let passthrough_sort_metas = passthrough_metas
+            .iter()
+            .map(|meta| ListingSortMetadata::new(meta.map(|(mtime, _)| mtime).unwrap_or(0), None))
+            .collect();
         Self::from_groups_with_display_order(
             folder,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             groups,
@@ -283,10 +297,11 @@ impl StackView {
         )
     }
 
-    pub fn from_groups_with_display_order(
+    pub(crate) fn from_groups_with_display_order(
         folder: PathBuf,
         passthrough: Vec<GridItem>,
         passthrough_metas: Vec<Option<(i64, i64)>>,
+        passthrough_sort_metas: Vec<ListingSortMetadata>,
         separator: char,
         sort: SortOrder,
         groups: Vec<StackGroup>,
@@ -299,6 +314,7 @@ impl StackView {
             display_order,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             groups,
             flat_group_by_index: Vec::new(),
             flat_group_starts: Vec::new(),
@@ -321,6 +337,7 @@ impl StackView {
     pub fn materialize_aggregated(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         let mut items = self.passthrough.clone();
         let mut metas = self.passthrough_metas.clone();
+        let mut sort_metas = self.passthrough_sort_metas.clone();
         for g in &self.groups {
             let rep = g.representative();
             if g.is_stack() {
@@ -334,11 +351,16 @@ impl StackView {
             } else {
                 items.push(GridItem::Image(rep.path.clone()));
             }
-            metas.push(Some((rep.mtime, rep.size)));
+            metas.push(Some((rep.mtime, rep.size.unwrap_or(0))));
+            sort_metas.push(ListingSortMetadata::new(
+                rep.mtime,
+                if g.is_stack() { None } else { rep.size },
+            ));
         }
-        crate::grid_item::arrange_grid_items(
+        crate::grid_item::arrange_grid_items_with_sort_metadata(
             &mut items,
             &mut metas,
+            &mut sort_metas,
             &self.display_order,
             Some(self.sort),
         );
@@ -351,6 +373,7 @@ impl StackView {
     pub fn materialize_flat(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         let mut items = self.passthrough.clone();
         let mut metas = self.passthrough_metas.clone();
+        let mut sort_metas = self.passthrough_sort_metas.clone();
         for g in &self.groups {
             for m in &g.members {
                 items.push(if m.is_video {
@@ -358,12 +381,14 @@ impl StackView {
                 } else {
                     GridItem::Image(m.path.clone())
                 });
-                metas.push(Some((m.mtime, m.size)));
+                metas.push(Some((m.mtime, m.size.unwrap_or(0))));
+                sort_metas.push(ListingSortMetadata::new(m.mtime, m.size));
             }
         }
-        crate::grid_item::arrange_grid_items(
+        crate::grid_item::arrange_grid_items_with_sort_metadata(
             &mut items,
             &mut metas,
+            &mut sort_metas,
             &self.display_order,
             Some(self.sort),
         );
@@ -515,7 +540,14 @@ fn sort_members(members: &mut [StackMember], sort: SortOrder) {
             (member, key)
         })
         .collect();
-    keyed.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
+    keyed.sort_by(|(a, ak), (b, bk)| {
+        sort.compare_listing_keys(
+            ak,
+            ListingSortMetadata::new(a.mtime, a.size),
+            bk,
+            ListingSortMetadata::new(b.mtime, b.size),
+        )
+    });
     for (slot, (member, _)) in members.iter_mut().zip(keyed) {
         *slot = member;
     }
@@ -529,7 +561,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -538,7 +570,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{folder}\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -547,7 +579,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -556,7 +588,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: true,
         }
     }
@@ -725,6 +757,34 @@ mod tests {
         // 各グループ内も DateDesc (新しい順)。
         assert_eq!(groups[0].representative().mtime, 201);
         assert_eq!(keys(&groups), vec!["new", "old"]);
+    }
+
+    #[test]
+    fn size_sort_uses_member_sizes_but_treats_collapsed_stack_as_unknown() {
+        let sized = |name: &str, size: Option<i64>| StackMember {
+            path: PathBuf::from(format!(r"C:\dl\{name}")),
+            mtime: 0,
+            size,
+            is_video: false,
+        };
+        let media = vec![
+            sized("post_p1.jpg", Some(10)),
+            sized("post_p0.jpg", Some(1)),
+            sized("large.jpg", Some(20)),
+            sized("zero.jpg", Some(0)),
+            sized("unknown.jpg", None),
+        ];
+        let asc = group_media(media.clone(), '_', SortOrder::SizeAsc);
+        assert_eq!(keys(&asc), ["zero", "large", "post", "unknown"]);
+        let post = asc.iter().find(|group| group.key == "post").unwrap();
+        assert_eq!(
+            member_names(post),
+            ["post_p0.jpg", "post_p1.jpg"],
+            "member size remains available inside the stack"
+        );
+
+        let desc = group_media(media, '_', SortOrder::SizeDesc);
+        assert_eq!(keys(&desc), ["large", "zero", "post", "unknown"]);
     }
 
     #[test]

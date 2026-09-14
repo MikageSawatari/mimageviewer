@@ -451,10 +451,22 @@ pub fn sort_rows(rows: &mut [BookmarkBrowserRow], sort: BookmarkViewSort) {
             let name_b = b.display_name();
             let key_a = order.name_key(&name_a);
             let key_b = order.name_key(&name_b);
-            let mtime_a = a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
-            let mtime_b = b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
+            let meta_a = crate::grid_item::listing_sort_metadata_for_item(
+                &a.item,
+                crate::settings::ListingSortMetadata::new(
+                    a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                    a.image_meta.map(|(_, size)| size),
+                ),
+            );
+            let meta_b = crate::grid_item::listing_sort_metadata_for_item(
+                &b.item,
+                crate::settings::ListingSortMetadata::new(
+                    b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                    b.image_meta.map(|(_, size)| size),
+                ),
+            );
             order
-                .compare_name_keys(&key_a, mtime_a, &key_b, mtime_b)
+                .compare_listing_keys(&key_a, meta_a, &key_b, meta_b)
                 .then_with(|| a.stable_key().cmp(&b.stable_key()))
         }),
     }
@@ -1155,6 +1167,26 @@ mod tests {
         assert_eq!(item_ids(&items, &rows), vec![2, 3, 5, 1, 4]);
         // 行も再配置後の順序へ揃っている (idx が items と 1 対 1 で対応する)。
         assert_eq!(ids(&rows), item_ids(&items, &rows));
+    }
+
+    #[test]
+    fn normal_size_sort_keeps_virtual_page_unknown() {
+        let mut zero = media_row(1, 1, "zero");
+        zero.image_meta = Some((1, 0));
+        let mut ten = media_row(2, 1, "ten");
+        ten.image_meta = Some((1, 10));
+        let mut virtual_page = media_row(3, 1, "virtual");
+        virtual_page.item = GridItem::ZipImage {
+            zip_path: PathBuf::from(r"C:\x\book.zip"),
+            entry_name: "virtual.jpg".into(),
+        };
+        virtual_page.image_meta = Some((1, 1));
+        let mut rows = vec![virtual_page, ten, zero];
+        sort_rows(
+            &mut rows,
+            BookmarkViewSort::Normal(crate::settings::SortOrder::SizeAsc),
+        );
+        assert_eq!(ids(&rows), [1, 2, 3]);
     }
 
     #[test]

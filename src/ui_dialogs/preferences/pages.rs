@@ -8441,7 +8441,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         egui::ComboBox::from_label("代表画像の選択基準")
             .selected_text(s.folder_thumb_sort.label())
             .show_ui(ui, |ui| {
-                for &order in SortOrder::all() {
+                for &order in SortOrder::folder_thumb_options() {
                     ui.selectable_value(&mut s.folder_thumb_sort, order, order.label());
                 }
             });

@@ -791,8 +791,9 @@ pub(crate) fn build_flat_items(
     rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let rf_active = !rating_filter.iter().all(|&b| b);
-    // (GridItem, basename, mtime) を集めてからまとめてソートする。
-    let mut rows: Vec<(GridItem, String, i64)> = Vec::with_capacity(state.all_hits.len());
+    // (GridItem, basename, sort metadata) を集めてからまとめてソートする。
+    let mut rows: Vec<(GridItem, String, crate::settings::ListingSortMetadata)> =
+        Vec::with_capacity(state.all_hits.len());
     for h in &state.all_hits {
         // ZIP 内エントリはアイテム索引対象外 (§3.2)。stale index 対策で防御的にスキップ。
         if is_zip_hit_path(&h.path) {
@@ -818,7 +819,11 @@ pub(crate) fn build_flat_items(
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        rows.push((item, basename, h.mtime));
+        rows.push((
+            item,
+            basename,
+            crate::settings::ListingSortMetadata::new(h.mtime, h.file_size),
+        ));
     }
     let mut keyed_rows: Vec<_> = rows
         .into_iter()
@@ -827,7 +832,7 @@ pub(crate) fn build_flat_items(
             (row, key)
         })
         .collect();
-    keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_name_keys(ak, a.2, bk, b.2));
+    keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_listing_keys(ak, a.2, bk, b.2));
     rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
     let placeholder = Some((0_i64, 0_i64));
     let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
@@ -841,14 +846,13 @@ pub(crate) fn build_flat_items(
 /// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
 /// 枝刈りされる。
 ///
-/// image_metas は UI スレッドでの `fs::metadata` 同期呼び出しで埋める。ヒット件数は
-/// 通常数 〜 数百件で、1 ディレクトリあたり 10ms オーダー以内に収まる想定。
-/// 大量ヒット環境でのボトルネック化が観測されたら、GlobalHit に mtime/file_size を
-/// 持たせて Tantivy の STORED フィールドから取り出す方式に切り替える (v0.8.x 課題)。
+/// image_metas は従来どおり placeholder。並べ替えには worker が STORED field から得た
+/// `GlobalHit::{mtime,file_size}` を使い、UI thread の `fs::metadata` は増やさない。
 pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
     current_path: &Path,
     is_zip: bool,
+    sort_order: crate::settings::SortOrder,
     rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     if is_zip {
@@ -859,7 +863,7 @@ pub(crate) fn build_drilled_items(
     // App::rating_filter_active と同じ判定式を使う (固定 [bool; 6] へのアクセスなので
     // 自動ベクトル化された ~1ns、ヘルパー化するメリットなし)。
     let rf_active = !rating_filter.iter().all(|&b| b);
-    let mut direct_files: Vec<PathBuf> = Vec::new();
+    let mut direct_files: Vec<(PathBuf, crate::settings::ListingSortMetadata)> = Vec::new();
     // 直下子フォルダ → その配下のヒット件数 (rating_filter 通過後)
     let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
 
@@ -882,7 +886,10 @@ pub(crate) fn build_drilled_items(
             continue;
         }
         if hp_parent == current_path {
-            direct_files.push(hp);
+            direct_files.push((
+                hp,
+                crate::settings::ListingSortMetadata::new(h.mtime, h.file_size),
+            ));
         } else {
             // current_path の直下の子フォルダ名を拾う
             let rel = match hp_parent.strip_prefix(current_path) {
@@ -898,8 +905,38 @@ pub(crate) fn build_drilled_items(
 
     // サブフォルダ (Folder) を名前昇順 → 続いて直下ファイル (Image) を名前昇順
     let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_iter().collect();
-    sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
-    direct_files.sort();
+    if sort_order.is_size() {
+        sub_vec.sort_by(|a, b| {
+            let a_name = a.0.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let b_name = b.0.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let a_key = sort_order.name_key(a_name);
+            let b_key = sort_order.name_key(b_name);
+            sort_order
+                .compare_listing_keys(
+                    &a_key,
+                    crate::settings::ListingSortMetadata::new(0, None),
+                    &b_key,
+                    crate::settings::ListingSortMetadata::new(0, None),
+                )
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    } else {
+        // 非サイズ順は従来のPathBuf順をexact維持する。
+        sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    direct_files.sort_by(|(a_path, a_meta), (b_path, b_meta)| {
+        let a_name = a_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let b_name = b_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let a_key = sort_order.name_key(a_name);
+        let b_key = sort_order.name_key(b_name);
+        sort_order.compare_listing_keys(&a_key, *a_meta, &b_key, *b_meta)
+    });
 
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
@@ -912,7 +949,7 @@ pub(crate) fn build_drilled_items(
         items.push(GridItem::Folder(sub_path.clone()));
         image_metas.push(placeholder);
     }
-    for f in &direct_files {
+    for (f, _) in &direct_files {
         // 拡張子で GridItem の種類を分岐する。旧実装は無条件に
         // `GridItem::Image` を入れていたため、ScanSnap のような PDF だらけの
         // favorite に drill-in すると全サムネが「画像フォーマット判定不可」で
@@ -1856,7 +1893,13 @@ impl App {
                 // バッジ件数表示には raw 集計が必要 (なし含む 6 バケット)。
                 self.search_drilled_folder_counts =
                     compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip);
-                build_drilled_items(&self.global_search, current_path, is_zip, &rating_filter)
+                build_drilled_items(
+                    &self.global_search,
+                    current_path,
+                    is_zip,
+                    sort_order,
+                    &rating_filter,
+                )
             }
         };
         self.replace_search_view_items(items, image_metas);
@@ -2686,18 +2729,21 @@ mod tests {
             path: "c:/a/b/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/2.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/c/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         assert_eq!(state.containers.len(), 2);
@@ -2814,6 +2860,7 @@ mod tests {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.drill = Some(DrillState {
@@ -2863,18 +2910,21 @@ mod tests {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/2.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/b/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // containers は 2 つに集約されているが、all_hits は 3 つ保持
@@ -2889,18 +2939,21 @@ mod tests {
             path: zip_hit("c:/album.zip", "0001.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: zip_hit("c:/album.zip", "0002.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         let zip = state
@@ -2923,18 +2976,21 @@ mod tests {
                 path: "C:/root/a.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/b.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/deeper/c.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
         ];
@@ -2956,6 +3012,7 @@ mod tests {
             path: "C:/root/yes/found.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         }];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
@@ -2981,10 +3038,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (items, metas) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(items.len(), metas.len());
         // 期待: Folder("C:/root/sub") + Image("C:/root/a.jpg") + Image("C:/root/b.jpg")
         let paths: Vec<_> = items
@@ -3023,10 +3087,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items, _) = build_drilled_items(&state, Path::new("C:/mix"), false, &[true; 6]);
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/mix"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         // 期待: 名前昇順で a.pdf → b.zip → c.png → d.jpg
         let kinds: Vec<&'static str> = items
             .iter()
@@ -3051,6 +3122,7 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
@@ -3059,12 +3131,14 @@ mod tests {
             path: zip_hit("c:/e/album.zip", "x.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/f/plain.zip".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         let (items, metas) =
@@ -3092,12 +3166,14 @@ mod tests {
             path: "c:/a/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/drop.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         let mut rf = [false; 6];
@@ -3116,18 +3192,21 @@ mod tests {
             path: "c:/a/mid.jpg".into(),
             score: 1.0,
             mtime: 200,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/new.jpg".into(),
             score: 1.0,
             mtime: 300,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/old.jpg".into(),
             score: 1.0,
             mtime: 100,
+            file_size: None,
             stars: 0,
         });
         let names = |items: &[GridItem]| -> Vec<String> {
@@ -3150,19 +3229,95 @@ mod tests {
     }
 
     #[test]
+    fn global_fs_hits_sort_real_zero_before_known_and_unknown_last_in_both_directions() {
+        let mut state = GlobalSearchState::default();
+        for (name, file_size) in [
+            ("unknown.jpg", None),
+            ("ten.jpg", Some(10)),
+            ("zero.jpg", Some(0)),
+        ] {
+            state.accumulate_hit(&GlobalHit {
+                path: format!("c:/sizes/{name}"),
+                score: 1.0,
+                mtime: 1,
+                file_size,
+                stars: 0,
+            });
+        }
+        let names = |items: &[GridItem]| {
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let (flat_asc, _) =
+            build_flat_items(&state, crate::settings::SortOrder::SizeAsc, &[true; 6]);
+        let (flat_desc, _) =
+            build_flat_items(&state, crate::settings::SortOrder::SizeDesc, &[true; 6]);
+        assert_eq!(names(&flat_asc), ["zero.jpg", "ten.jpg", "unknown.jpg"]);
+        assert_eq!(names(&flat_desc), ["ten.jpg", "zero.jpg", "unknown.jpg"]);
+
+        let (drill_asc, _) = build_drilled_items(
+            &state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeAsc,
+            &[true; 6],
+        );
+        let (drill_desc, _) = build_drilled_items(
+            &state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeDesc,
+            &[true; 6],
+        );
+        assert_eq!(names(&drill_asc), names(&flat_asc));
+        assert_eq!(names(&drill_desc), names(&flat_desc));
+
+        // Sizeでは合成Folderが全てUnknownなので、同値tieも一覧と同じWindows名比較にする。
+        // PathBufのordinal順なら大文字Zが先になる入力で差を直接固定する。
+        let mut folder_state = GlobalSearchState::default();
+        for path in ["c:/sizes/Zebra/z.jpg", "c:/sizes/alpha/a.jpg"] {
+            folder_state.accumulate_hit(&GlobalHit {
+                path: path.into(),
+                score: 1.0,
+                mtime: 1,
+                file_size: Some(1),
+                stars: 0,
+            });
+        }
+        let (folders, _) = build_drilled_items(
+            &folder_state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeAsc,
+            &[true; 6],
+        );
+        assert_eq!(names(&folders), ["alpha", "Zebra"]);
+    }
+
+    #[test]
     fn audio_hit_materializes_as_audio_in_flat_and_drilled_views() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
             path: "c:/music/MixedCase.FLAC".into(),
             score: 1.0,
             mtime: 100,
+            file_size: None,
             stars: 0,
         });
 
         let (flat, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
         assert!(matches!(&flat[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
 
-        let (drilled, _) = build_drilled_items(&state, Path::new("c:/music"), false, &[true; 6]);
+        let (drilled, _) = build_drilled_items(
+            &state,
+            Path::new("c:/music"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert!(matches!(&drilled[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
         assert!(is_fullscreen_target(drilled.first()));
     }
@@ -3190,6 +3345,7 @@ mod tests {
             path: "C:/root/year2024/jan/matches/X.png".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
@@ -3197,24 +3353,42 @@ mod tests {
             path: "C:/root/year2024/jan/matches/Y.png".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
         // Level 1: /root でドリル → year2024 のみ
-        let (l1, _) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (l1, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l1.len(), 1, "level1 item count");
         assert!(matches!(&l1[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024")));
 
         // Level 2: /root/year2024 → jan のみ (feb は枝刈り)
-        let (l2, _) = build_drilled_items(&state, Path::new("C:/root/year2024"), false, &[true; 6]);
+        let (l2, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root/year2024"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l2.len(), 1, "level2 item count");
         assert!(
             matches!(&l2[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan"))
         );
 
         // Level 3: /root/year2024/jan → matches のみ
-        let (l3, _) =
-            build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false, &[true; 6]);
+        let (l3, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root/year2024/jan"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l3.len(), 1, "level3 item count");
         assert!(matches!(&l3[0],
                 GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan/matches")));
@@ -3224,6 +3398,7 @@ mod tests {
             &state,
             Path::new("C:/root/year2024/jan/matches"),
             false,
+            crate::settings::SortOrder::FileName,
             &[true; 6],
         );
         assert_eq!(l4.len(), 2, "level4 item count");
@@ -3251,6 +3426,7 @@ mod tests {
                 path: p,
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
@@ -3258,6 +3434,7 @@ mod tests {
             &state,
             Path::new("C:/archives/target.zip"),
             /*is_zip=*/ true,
+            crate::settings::SortOrder::FileName,
             &[true; 6],
         );
         assert_eq!(items.len(), 2, "target.zip のエントリ数");
@@ -3287,18 +3464,21 @@ mod tests {
             path: "C:/root/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_low.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_unrated.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // sub_keep: ★3 が 1 件含まれる → バッジ 1
@@ -3306,12 +3486,14 @@ mod tests {
             path: "C:/root/sub_keep/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/sub_keep/b.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         // sub_drop: ★3 ヒットなし → 枝刈り
@@ -3319,6 +3501,7 @@ mod tests {
             path: "C:/root/sub_drop/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
@@ -3326,7 +3509,13 @@ mod tests {
         let mut rf = [false; 6];
         rf[3] = true;
 
-        let (items, _) = build_drilled_items(&state, Path::new("C:/root"), false, &rf);
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &rf,
+        );
         // 期待: Folder("sub_keep") + Image("keep.jpg") のみ
         assert_eq!(items.len(), 2, "items 数");
         assert!(
@@ -3344,11 +3533,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items_all_on, _) =
-            build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (items_all_on, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         // sub フォルダ + 直下 2 件 = 3
         assert_eq!(items_all_on.len(), 3);
     }
@@ -3362,12 +3557,14 @@ mod tests {
             path: format!("c:/archives/target.zip{sep}keep.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: format!("c:/archives/target.zip{sep}drop.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         let mut rf = [false; 6];
@@ -3376,6 +3573,7 @@ mod tests {
             &state,
             Path::new("C:/archives/target.zip"),
             /*is_zip=*/ true,
+            crate::settings::SortOrder::FileName,
             &rf,
         );
         assert_eq!(items.len(), 1);

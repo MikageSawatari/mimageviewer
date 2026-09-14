@@ -180,6 +180,7 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
+pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
 #[cfg(all(windows, feature = "test-script"))]
 mod test_script_support;
 pub(crate) use subfolder_expansion::{
@@ -21567,6 +21568,7 @@ impl App {
         }
         let items = materialized.items;
         let image_metas = materialized.metas;
+        let listing_sort_metas = materialized.sort_metas;
         let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
             self.settings.auto_fullscreen_image_folders_enabled() && scanned_folder_is_image_book
@@ -21634,13 +21636,18 @@ impl App {
             // スクリプト本文の読み込み (ファイル I/O) はワーカー側で行うので、ここでは
             // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
             let script_enabled = self.settings.stack_script_enabled;
-            let (passthrough, passthrough_metas, media) =
-                crate::filename_stack_ui::extract_stack_parts(&items, &image_metas);
+            let (passthrough, passthrough_metas, passthrough_sort_metas, media) =
+                crate::filename_stack_ui::extract_stack_parts(
+                    &items,
+                    &image_metas,
+                    &listing_sort_metas,
+                );
             Some((
                 script_enabled,
                 self.settings.stack_separator,
                 passthrough,
                 passthrough_metas,
+                passthrough_sort_metas,
                 media,
                 existing_keys.clone(),
                 path.clone(),
@@ -21665,6 +21672,7 @@ impl App {
             separator,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             media,
             stack_existing,
             stack_folder,
@@ -21677,6 +21685,7 @@ impl App {
                 stack_folder,
                 passthrough,
                 passthrough_metas,
+                passthrough_sort_metas,
                 media,
                 separator,
                 folder_sort,
@@ -38980,7 +38989,7 @@ impl App {
             return scan
                 .all_media
                 .iter()
-                .any(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
+                .any(|entry| entry.kind == crate::app::folder_scan::ScanMediaKind::Image);
         }
         crate::app::folder_scan::is_image_only_book_contents(
             !scan.folders.is_empty(),

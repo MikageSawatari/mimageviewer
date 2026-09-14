@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::filename_stack::{StackMember, StackView};
 use crate::grid_item::GridItem;
-use crate::settings::SortOrder;
+use crate::settings::{ListingSortMetadata, SortOrder};
 
 /// ユーザー定義スクリプトによるグループ分けを **ワーカーで** 実行する際の保留状態
 /// (`docs/filename-stack-scripting-plan.md`)。スクリプトは任意に重くなり得る (10 万件で
@@ -41,6 +41,7 @@ pub(crate) struct StackScriptPending {
     /// 画像以外のコンテナ先頭 (集約ビューの passthrough)。
     passthrough: Vec<GridItem>,
     passthrough_metas: Vec<Option<(i64, i64)>>,
+    passthrough_sort_metas: Vec<ListingSortMetadata>,
     separator: char,
     sort: SortOrder,
     /// `media` 内で画像 (= スクリプトへ渡した対象) の index。戻りキーを media 順へ戻すのに使う。
@@ -60,33 +61,52 @@ pub(crate) struct StackScriptPending {
 pub(crate) fn extract_stack_parts(
     items: &[GridItem],
     image_metas: &[Option<(i64, i64)>],
-) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>, Vec<StackMember>) {
+    listing_sort_metas: &[ListingSortMetadata],
+) -> (
+    Vec<GridItem>,
+    Vec<Option<(i64, i64)>>,
+    Vec<ListingSortMetadata>,
+    Vec<StackMember>,
+) {
+    assert_eq!(items.len(), image_metas.len());
+    assert_eq!(items.len(), listing_sort_metas.len());
     let mut passthrough: Vec<GridItem> = Vec::new();
     let mut passthrough_metas: Vec<Option<(i64, i64)>> = Vec::new();
+    let mut passthrough_sort_metas: Vec<ListingSortMetadata> = Vec::new();
     let mut media: Vec<StackMember> = Vec::new();
-    for (it, meta) in items.iter().zip(image_metas) {
-        let (mtime, size) = meta.unwrap_or((0, 0));
+    for index in 0..items.len() {
+        let it = &items[index];
+        let meta = &image_metas[index];
+        let (mtime, _) = meta.unwrap_or((0, 0));
+        let sort_meta = listing_sort_metas[index];
+        let sort_meta = crate::grid_item::listing_sort_metadata_for_item(it, sort_meta);
         match it {
             GridItem::Image(path) => media.push(StackMember {
                 path: path.clone(),
                 mtime,
-                size,
+                size: sort_meta.file_size,
                 is_video: false,
             }),
             GridItem::Video(path) => media.push(StackMember {
                 path: path.clone(),
                 mtime,
-                size,
+                size: sort_meta.file_size,
                 is_video: true,
             }),
             // 想定外種別は素通し (build_stack_aggregated と同じ防御)。
             other => {
                 passthrough.push(other.clone());
                 passthrough_metas.push(*meta);
+                passthrough_sort_metas.push(sort_meta);
             }
         }
     }
-    (passthrough, passthrough_metas, media)
+    (
+        passthrough,
+        passthrough_metas,
+        passthrough_sort_metas,
+        media,
+    )
 }
 
 /// 集約 / メンバービューの items から動画セルの `(idx, path, size)` を集める
@@ -199,6 +219,7 @@ impl crate::app::App {
         folder: PathBuf,
         passthrough: Vec<GridItem>,
         passthrough_metas: Vec<Option<(i64, i64)>>,
+        passthrough_sort_metas: Vec<ListingSortMetadata>,
         media: Vec<StackMember>,
         separator: char,
         sort: SortOrder,
@@ -246,6 +267,7 @@ impl crate::app::App {
             media,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             image_indices,
@@ -322,6 +344,7 @@ impl crate::app::App {
             media,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             image_indices,
@@ -365,6 +388,7 @@ impl crate::app::App {
             folder.clone(),
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             groups,
@@ -565,8 +589,25 @@ impl crate::app::App {
             return;
         }
 
-        let (passthrough, passthrough_metas, media) =
-            extract_stack_parts(&self.items, &self.image_metas);
+        let listing_sort_metas = self
+            .subfolder_expansion_snapshot
+            .as_ref()
+            .map(|snapshot| crate::app::listing_sort_metas_for_items(snapshot, &self.items))
+            .unwrap_or_else(|| {
+                self.items
+                    .iter()
+                    .zip(&self.image_metas)
+                    .map(|(item, meta)| {
+                        let mtime = meta.map(|(mtime, _)| mtime).unwrap_or(0);
+                        crate::grid_item::listing_sort_metadata_for_item(
+                            item,
+                            ListingSortMetadata::new(mtime, None),
+                        )
+                    })
+                    .collect()
+            });
+        let (passthrough, passthrough_metas, passthrough_sort_metas, media) =
+            extract_stack_parts(&self.items, &self.image_metas, &listing_sort_metas);
         self.stack_mode_requested = true;
         self.stack_toggle_select_path = target;
         self.stack_showing_flat = false;
@@ -582,6 +623,7 @@ impl crate::app::App {
             crate::app::subfolder_expansion_synthetic_path(),
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             media,
             self.settings.stack_separator,
             sort,
@@ -760,9 +802,18 @@ mod tests {
         StackMember {
             path: PathBuf::from(path),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
+    }
+
+    #[test]
+    #[should_panic]
+    fn extract_stack_parts_rejects_misaligned_sort_metadata() {
+        let items = vec![GridItem::Image(PathBuf::from(r"C:\root\a.jpg"))];
+        let image_metas = vec![Some((1, 1))];
+        let listing_sort_metas = Vec::new();
+        let _ = extract_stack_parts(&items, &image_metas, &listing_sort_metas);
     }
 
     #[test]

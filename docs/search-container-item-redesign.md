@@ -379,7 +379,7 @@ aggregate_auto == false のとき:
 
 | ビュー | ソート | UI |
 | --- | --- | --- |
-| 一覧 | メインの `settings.sort_order` (ファイル名/番号/日付↑/日付↓) | メインツールバーの既存ソートボタンを流用。Ctrl+G バーにソート UI は出さない |
+| 一覧 | メインの `settings.sort_order` (ファイル名/番号/日付↑/日付↓/サイズ↑/サイズ↓) | メインツールバーの既存ソートボタンを流用。Ctrl+G バーにソート UI は出さない |
 | 集約 | 既存 `ContainerSortMode` (件数/名前/新旧) | Ctrl+G バーのソートドロップダウン (現状どおり、集約時のみ表示) |
 | ドリルイン | メインの `settings.sort_order` | メインツールバーのソートボタン |
 
@@ -388,8 +388,10 @@ aggregate_auto == false のとき:
 - 一覧ビューは全アイテムを `settings.sort_order` で一律ソートする。ドリルインは
   通常グリッド慣習 (サブフォルダを名前順で先頭 → ファイルを `settings.sort_order`) に
   合わせる。
-- 日付順 (`DateAsc` / `DateDesc`) には各ヒットの mtime が必要 → §5.2 で `GlobalHit` に
-  mtime を追加する。ファイル名順 / 番号順は path から導出できるので mtime 追加前でも動く。
+- 日付順 (`DateAsc` / `DateDesc`) には各ヒットのmtime、サイズ順 (`SizeAsc` / `SizeDesc`) には
+  file_sizeが必要で、どちらも既存Tantivy文書のSTORED fieldから同じdoc fetchで取得する。
+  実在する0バイトは既知の0、fieldのない旧・合成docだけは不明として両方向とも末尾に置く。
+  ファイル名順 / 番号順はpathから導出する。
 
 ---
 
@@ -401,20 +403,20 @@ aggregate_auto == false のとき:
 `IndexKind::VideoFile` を外す。`search_index.db` のスキーマ変更は不要 (kind 列はそのまま)。
 既存の動画行は自然 prune で消えるため移行コード不要。
 
-### 5.2 GlobalHit に mtime を追加
+### 5.2 GlobalHit に mtime / file_size を追加
 
-一覧 / ドリルインビューの日付ソート (§4.3.3) のために、各ヒットが mtime を持つ必要がある。
+一覧 / ドリルインビューの日付・サイズソート (§4.3.3) のために、各ヒットがmtimeと
+size availabilityを持つ。
 
-**現状確認**: `fts_index/` は既に `INDEX_VERSION=7`。Tantivy schema には `mtime` が
-`INDEXED | STORED` で入っており (`fts_index.rs` の `IndexDoc.mtime` / `Fields.mtime`、
-スキーマ定義 `add_i64_field("mtime", INDEXED | STORED)`)、ingest 時に格納済み。
-つまり mtime は **既に索引・STORED されている**。
+**現状確認**: Tantivy schemaにはmtimeとfile_sizeが既にSTOREDで入り、ingestはfilesystem
+metadata取得に成功した実ファイルだけを文書化する。従って保存済み0は実0バイトである。
 
 **必要なのは取り出し経路の追加だけ** — schema 変更も INDEX_VERSION bump も不要:
 
-- `GlobalHit` 構造体に `mtime: i64` フィールドを追加 (現状は path / score / stars のみ)。
-- `global_search::run` が候補ごとに STORED 原文を引くのと同じ経路で、既存の STORED
-  `mtime` フィールドも読み、`GlobalHit.mtime` に詰める。
+- `GlobalHit` は `mtime: i64` と `file_size: Option<i64>` を持つ。
+- `global_search::run` はpost-filter通過docから既存のSTORED mtime / file_sizeを1回で読む。
+- 通常フォルダのFS drillでは直下の実hitだけサイズを使い、件数表示用に合成した子Folderは
+  サイズ不明とする。ZIP drill/pageの固定順は変えない。
 
 本再設計は検索索引のスキーマを一切変更しない (`search_index.db` 側も変更なし)。
 

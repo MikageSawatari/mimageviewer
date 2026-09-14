@@ -51,7 +51,7 @@ pub(crate) struct SmartFolderEntry {
     pub(crate) path: PathBuf,
     pub(crate) kind: SmartFolderEntryKind,
     pub(crate) mtime: i64,
-    pub(crate) file_size: i64,
+    pub(crate) file_size: Option<i64>,
     /// 安価な条件を通過したルールの definition.rules 上の index。prepare の ★ / タグ /
     /// 編集状態条件はこの集合を OR 評価する。
     pub(crate) matching_rule_indices: Vec<usize>,
@@ -627,7 +627,7 @@ struct SmartFolderCandidate {
     path: PathBuf,
     kind: SmartFolderEntryKind,
     mtime: i64,
-    file_size: i64,
+    file_size: Option<i64>,
 }
 
 fn smart_folder_root() -> PathBuf {
@@ -702,7 +702,7 @@ fn passes_cheap_filter_values(
     path: &Path,
     name_lower: &str,
     mtime: i64,
-    file_size: i64,
+    file_size: Option<i64>,
     filter: &crate::settings::SmartFolderFilter,
     name_contains_lower: &str,
     now: i64,
@@ -735,11 +735,11 @@ fn passes_cheap_filter_values(
         // The normal size facet treats an unavailable/zero size as unknown and excludes it.
         // A captured smart-folder rule must produce the same set rather than admitting folders
         // and metadata failures into the "under 1 MB" bucket.
-        if file_size <= 0 {
+        let Some(file_size) = file_size.filter(|size| *size > 0) else {
             return false;
-        }
+        };
         let (min, max) = preset.range_bytes();
-        let size = file_size.max(0) as u64;
+        let size = file_size as u64;
         if size < min || max.is_some_and(|max| size >= max) {
             return false;
         }
@@ -806,12 +806,16 @@ fn normalize_smart_folder_candidates(
                 SmartFolderEntryKind::Audio => ScanMediaKind::Audio,
                 _ => return None,
             };
-            Some((
-                candidate.path.clone(),
+            Some(super::folder_scan::ScannedMediaEntry {
+                path: candidate.path.clone(),
                 kind,
-                candidate.mtime,
-                candidate.file_size,
-            ))
+                mtime: candidate.mtime,
+                file_size: candidate.file_size.unwrap_or(0),
+                sort_meta: crate::settings::ListingSortMetadata::new(
+                    candidate.mtime,
+                    candidate.file_size,
+                ),
+            })
         })
         .collect::<Vec<_>>();
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, entry_file_names_ci);
@@ -852,7 +856,7 @@ fn normalize_smart_folder_candidates(
         };
         if let Some(item) = item {
             containers.push(item);
-            container_metas.push(Some((candidate.mtime, candidate.file_size)));
+            container_metas.push(Some((candidate.mtime, candidate.file_size.unwrap_or(0))));
         }
     }
     if options.skip_zip_if_folder_exists {
@@ -867,7 +871,7 @@ fn normalize_smart_folder_candidates(
 
     let keep_paths = media
         .iter()
-        .map(|(path, _, _, _)| crate::path_key::normalize_keep_drive(path))
+        .map(|entry| crate::path_key::normalize_keep_drive(&entry.path))
         .chain(containers.iter().filter_map(|item| {
             item.container_path()
                 .map(crate::path_key::normalize_keep_drive)
@@ -956,10 +960,9 @@ fn scan_one_directory(
             .as_ref()
             .map(crate::ui_helpers::mtime_secs)
             .unwrap_or(0);
-        let file_size = metadata
-            .as_ref()
-            .map(|metadata| metadata.len() as i64)
-            .unwrap_or(0);
+        let file_size = (kind != SmartFolderEntryKind::Folder)
+            .then(|| metadata.as_ref().map(|metadata| metadata.len() as i64))
+            .flatten();
         if metadata.is_none() {
             diag.metadata_errors += 1;
         }
@@ -1526,6 +1529,22 @@ fn build_smart_entry_sort_keys(
         .collect()
 }
 
+fn compare_smart_entries_within_group(
+    sort: crate::settings::SortOrder,
+    a: &SmartFolderEntry,
+    ak: &SmartEntrySortKey,
+    b: &SmartFolderEntry,
+    bk: &SmartEntrySortKey,
+) -> std::cmp::Ordering {
+    sort.compare_listing_keys(
+        &ak.name,
+        crate::settings::ListingSortMetadata::new(a.mtime, a.file_size),
+        &bk.name,
+        crate::settings::ListingSortMetadata::new(b.mtime, b.file_size),
+    )
+    .then_with(|| a.path.cmp(&b.path))
+}
+
 #[derive(Clone, Default)]
 struct SmartFolderPrepareResources {
     prepare_catalog: bool,
@@ -1813,7 +1832,7 @@ fn evaluate_smart_folder_membership(
             let state = prepared_converted_archive_path(
                 &entry.path,
                 entry.mtime,
-                entry.file_size,
+                entry.file_size.unwrap_or(0),
                 archive_cache_db,
             );
             converted_archive_paths
@@ -2064,10 +2083,7 @@ fn prepare_smart_folder(
             let b = &snapshot.entries[b_index];
             let ak = &sort_keys[a_position];
             let bk = &sort_keys[b_position];
-            let within = || {
-                sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime)
-                    .then_with(|| a.path.cmp(&b.path))
-            };
+            let within = || compare_smart_entries_within_group(sort, a, ak, b, bk);
             ak.display_row
                 .cmp(&bk.display_row)
                 .then_with(|| match grouping {
@@ -2135,7 +2151,7 @@ fn prepare_smart_folder(
         };
         let key = &keys[entry_index];
         items.push(item);
-        image_metas.push(Some((entry.mtime, entry.file_size)));
+        image_metas.push(Some((entry.mtime, entry.file_size.unwrap_or(0))));
         let rating = reused_metadata
             .as_ref()
             .and_then(|metadata| metadata.ratings_by_path.get(key))
@@ -2779,10 +2795,7 @@ pub(crate) fn build_remote_smart_folder_entries(
             let b = &snapshot.entries[membership.included[b_position]];
             let ak = &sort_keys[a_position];
             let bk = &sort_keys[b_position];
-            let within = || {
-                sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime)
-                    .then_with(|| a.path.cmp(&b.path))
-            };
+            let within = || compare_smart_entries_within_group(sort, a, ak, b, bk);
             ak.display_row
                 .cmp(&bk.display_row)
                 .then_with(|| match grouping {
@@ -4893,7 +4906,7 @@ mod tests {
             path: PathBuf::from(path),
             kind: SmartFolderEntryKind::Zip,
             mtime: 0,
-            file_size: 1,
+            file_size: Some(1),
             matching_rule_indices: vec![0],
         }
     }
@@ -5243,7 +5256,7 @@ mod tests {
             &path,
             "sample.cbz",
             now,
-            2 * 1024 * 1024,
+            Some(2 * 1024 * 1024),
             &filter,
             "sample",
             now,
@@ -5255,7 +5268,7 @@ mod tests {
             &path,
             "sample.cbz",
             now,
-            2 * 1024 * 1024,
+            Some(2 * 1024 * 1024),
             &filter,
             "sample",
             now,
@@ -5273,7 +5286,17 @@ mod tests {
             Path::new(r"C:\Books\unknown"),
             "unknown",
             now_unix_secs(),
-            0,
+            None,
+            &filter,
+            "",
+            now_unix_secs(),
+        ));
+        assert!(!passes_cheap_filter_values(
+            SmartFolderEntryKind::Image,
+            Path::new(r"C:\Books\empty.jpg"),
+            "empty.jpg",
+            now_unix_secs(),
+            Some(0),
             &filter,
             "",
             now_unix_secs(),
@@ -5284,7 +5307,7 @@ mod tests {
             Path::new(r"C:\Books\unknown"),
             "unknown",
             now_unix_secs(),
-            0,
+            None,
             &filter,
             "",
             now_unix_secs(),
@@ -5929,6 +5952,56 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["m.zip", "z.zip", "a.zip"]);
+    }
+
+    #[test]
+    fn smart_size_sort_keeps_real_zero_known_and_unknown_last_for_local_and_remote_comparator() {
+        let mut entries = vec![
+            smart_entry(r"C:\Smart\unknown.jpg", 0, ""),
+            smart_entry(r"C:\Smart\ten.jpg", 0, ""),
+            smart_entry(r"C:\Smart\zero.jpg", 0, ""),
+        ];
+        for entry in &mut entries {
+            entry.kind = SmartFolderEntryKind::Image;
+        }
+        entries[0].file_size = None;
+        entries[1].file_size = Some(10);
+        entries[2].file_size = Some(0);
+        let included = [0, 1, 2];
+        let names = |sort| {
+            let keys = build_smart_entry_sort_keys(
+                &entries,
+                &included,
+                sort,
+                &crate::settings::GridDisplayOrder::default(),
+            );
+            let mut positions = [0, 1, 2];
+            positions.sort_by(|&a, &b| {
+                compare_smart_entries_within_group(
+                    sort,
+                    &entries[included[a]],
+                    &keys[a],
+                    &entries[included[b]],
+                    &keys[b],
+                )
+            });
+            positions.map(|position| {
+                entries[included[position]]
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        };
+        assert_eq!(
+            names(crate::settings::SortOrder::SizeAsc),
+            ["zero.jpg", "ten.jpg", "unknown.jpg"]
+        );
+        assert_eq!(
+            names(crate::settings::SortOrder::SizeDesc),
+            ["ten.jpg", "zero.jpg", "unknown.jpg"]
+        );
     }
 
     /// Manual release-gate benchmark. Run each size in a fresh test process so the external
