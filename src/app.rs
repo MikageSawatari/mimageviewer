@@ -37976,18 +37976,18 @@ impl App {
         None
     }
 
-    /// 進行中 / 累積中のフォルダナビゲーションを破棄する。
+    /// Cancel only navigation whose destination depends on the current folder-tree order.
     ///
-    /// Ctrl+↑↓ DFS と folder pane open pre-scan はどちらも「あとからフォルダを開く」
-    /// 入力なので、検索モードやフルスクリーン状態などの scope が変わったら
-    /// 古い入力を新しい表示状態へ適用しないよう明示的に流す。
-    pub(crate) fn cancel_inflight_folder_nav_for_required_fullscreen_open(&mut self) {
+    /// Exact-path pane opens are independent of sort order and remain owned by
+    /// `folder_pane_open_pending`. Fullscreen callers own any current display holdover and
+    /// resolve it through their replacement/finish sequence.
+    pub(crate) fn cancel_inflight_order_dependent_folder_nav(&mut self) {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.clear_pending_folder_nav_steps();
-        // Keep the current navigation holdover. The explicit replacement has been accepted, but
-        // its physical scan has not succeeded yet and must not tear down the current viewer.
+        // Do not release the current navigation holdover here. Its owning fullscreen sequence
+        // decides whether a replacement request or a terminal finish releases it.
     }
 
     pub(crate) fn cancel_pending_folder_nav(&mut self) {

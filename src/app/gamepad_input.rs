@@ -6617,9 +6617,7 @@ impl App {
             PadDir::Left => FolderPaneTreeKey::Left,
             PadDir::Right => FolderPaneTreeKey::Right,
         };
-        let _ = self
-            .folder_pane
-            .handle_tree_key(key, self.settings.sort_order);
+        let _ = self.folder_pane.handle_tree_key(key);
         true
     }
 
@@ -7038,9 +7036,8 @@ impl App {
         ctx: &egui::Context,
     ) -> Option<AddressBarNav> {
         if self.folder_pane_blocks_grid_keyboard() {
-            if let Some(FolderPaneCommand::Open(path)) = self
-                .folder_pane
-                .handle_tree_key(FolderPaneTreeKey::Enter, self.settings.sort_order)
+            if let Some(FolderPaneCommand::Open(path)) =
+                self.folder_pane.handle_tree_key(FolderPaneTreeKey::Enter)
             {
                 self.settings.folder_tree_pane_visible = false;
                 self.folder_pane.set_focus_grid();

@@ -1993,6 +1993,93 @@ impl SortOrder {
 }
 
 // -----------------------------------------------------------------------
+// FolderTreeSortOrder
+// -----------------------------------------------------------------------
+
+/// 左フォルダツリーと Ctrl+上下のフォルダ巡回だけに使う並び順。
+///
+/// 一覧の [`SortOrder`] から独立させ、一覧用の表示状態やお気に入り別表示状態を
+/// 切り替えてもフォルダツリーの順序が変わらないようにする。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderTreeSortOrder {
+    #[default]
+    NameAsc,
+    NameDesc,
+    NumericAsc,
+    NumericDesc,
+    DateAsc,
+    DateDesc,
+}
+
+impl FolderTreeSortOrder {
+    pub const ALL: [Self; 6] = [
+        Self::NameAsc,
+        Self::NameDesc,
+        Self::NumericAsc,
+        Self::NumericDesc,
+        Self::DateAsc,
+        Self::DateDesc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "名前（昇順）",
+            Self::NameDesc => "名前（降順）",
+            Self::NumericAsc => "番号（昇順）",
+            Self::NumericDesc => "番号（降順）",
+            Self::DateAsc => "日付（古い順）",
+            Self::DateDesc => "日付（新しい順）",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "名前↑",
+            Self::NameDesc => "名前↓",
+            Self::NumericAsc => "番号↑",
+            Self::NumericDesc => "番号↓",
+            Self::DateAsc => "日付↑",
+            Self::DateDesc => "日付↓",
+        }
+    }
+
+    pub fn uses_mtime(self) -> bool {
+        matches!(self, Self::DateAsc | Self::DateDesc)
+    }
+
+    pub fn name_key(self, name: &str) -> crate::filename_sort::SortNameKey {
+        match self {
+            Self::NumericAsc | Self::NumericDesc => {
+                crate::filename_sort::SortNameKey::with_natural(name)
+            }
+            _ => crate::filename_sort::SortNameKey::file_name(name),
+        }
+    }
+
+    pub fn compare_name_keys(
+        self,
+        name_a: &crate::filename_sort::SortNameKey,
+        mtime_a: i64,
+        name_b: &crate::filename_sort::SortNameKey,
+        mtime_b: i64,
+    ) -> std::cmp::Ordering {
+        match self {
+            Self::NameAsc => name_a.compare_file_name(name_b),
+            Self::NameDesc => name_b.compare_file_name(name_a),
+            Self::NumericAsc => name_a.compare_natural(name_b),
+            Self::NumericDesc => name_b.compare_natural(name_a),
+            Self::DateAsc => mtime_a
+                .cmp(&mtime_b)
+                .then_with(|| name_a.compare_file_name(name_b)),
+            Self::DateDesc => mtime_b
+                .cmp(&mtime_a)
+                .then_with(|| name_a.compare_file_name(name_b)),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // SubfolderExpansionOrder
 // -----------------------------------------------------------------------
 
@@ -4068,6 +4155,9 @@ pub struct Settings {
     /// 左側の実フォルダツリーペインを表示する
     #[serde(default)]
     pub folder_tree_pane_visible: bool,
+    /// 左フォルダツリーと Ctrl+上下 / Ctrl+PageUp/PageDown の並び順。
+    #[serde(default)]
+    pub folder_tree_sort_order: FolderTreeSortOrder,
     /// フォルダツリー左右境界位置 (ウィンドウ幅に対する比率)。
     #[serde(default = "default_folder_tree_pane_width_ratio")]
     pub folder_tree_pane_width_ratio: f32,
@@ -6606,6 +6696,7 @@ impl Default for Settings {
             show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
             folder_tree_pane_visible: false,
+            folder_tree_sort_order: FolderTreeSortOrder::default(),
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
@@ -8840,6 +8931,7 @@ impl Settings {
         self.subfolder_expansion_filter_size_preset = src.subfolder_expansion_filter_size_preset;
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
+        self.folder_tree_sort_order = src.folder_tree_sort_order;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
@@ -12299,6 +12391,7 @@ mod tests {
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_tags);
         assert!(!s.folder_tree_pane_visible);
+        assert_eq!(s.folder_tree_sort_order, FolderTreeSortOrder::NameAsc);
         assert_eq!(
             s.folder_tree_pane_width_ratio,
             default_folder_tree_pane_width_ratio()
@@ -15006,6 +15099,39 @@ mod tests {
             assert_eq!(FavoriteViewState::from_settings(&loaded), common);
             assert!(loaded.remember_favorite_view_state);
             assert!(loaded.favorite_view_overlay.is_none());
+        }
+
+        #[test]
+        fn folder_tree_sort_defaults_roundtrips_and_stays_outside_favorite_view_state() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(missing.folder_tree_sort_order, FolderTreeSortOrder::NameAsc);
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.sort_order = SortOrder::DateDesc;
+            settings.folder_tree_sort_order = FolderTreeSortOrder::NumericDesc;
+            let favorite = FavoriteViewState::from_settings(&settings);
+            let mut applied = Settings::default();
+            applied.folder_tree_sort_order = FolderTreeSortOrder::DateAsc;
+            favorite.apply_to_settings(&mut applied);
+            assert_eq!(applied.sort_order, SortOrder::DateDesc);
+            assert_eq!(
+                applied.folder_tree_sort_order,
+                FolderTreeSortOrder::DateAsc,
+                "お気に入り表示状態はツリーの並びを上書きしない"
+            );
+
+            settings.save();
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+            assert_eq!(
+                loaded.folder_tree_sort_order,
+                FolderTreeSortOrder::NumericDesc
+            );
         }
 
         #[test]

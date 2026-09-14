@@ -25,8 +25,8 @@ pub struct FolderTreeOptions {
     pub skip_archive_if_zip_exists: bool,
     /// RAR/7z/LZH などの変換アーカイブをフォルダ移動候補に含める。
     pub include_convertible_archives: bool,
-    /// サブフォルダ / ZIP のソート順 (= `Settings.sort_order`)。
-    pub sort_order: crate::settings::SortOrder,
+    /// サブフォルダ / ZIP のツリー専用ソート順。
+    pub sort_order: crate::settings::FolderTreeSortOrder,
 }
 
 impl FolderTreeOptions {
@@ -36,7 +36,7 @@ impl FolderTreeOptions {
             skip_zip: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
-            sort_order: settings.sort_order,
+            sort_order: settings.folder_tree_sort_order,
         }
     }
 }
@@ -47,7 +47,7 @@ impl Default for FolderTreeOptions {
             skip_zip: true,
             skip_archive_if_zip_exists: true,
             include_convertible_archives: true,
-            sort_order: crate::settings::SortOrder::default(),
+            sort_order: crate::settings::FolderTreeSortOrder::default(),
         }
     }
 }
@@ -677,10 +677,7 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
             let p = e.path();
             // mtime は DateAsc/Desc のソートでだけ意味を持つので、それ以外なら
             // 0 でも構わない。`metadata()` が追加 syscall になるので、必要なときだけ取る。
-            let mtime: i64 = if matches!(
-                sort_order,
-                crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc
-            ) {
+            let mtime: i64 = if sort_order.uses_mtime() {
                 e.metadata()
                     .and_then(|m| m.modified())
                     .ok()
@@ -741,7 +738,7 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
         dirs.push((zp, mtime));
     }
 
-    // グリッドと同じソート規則を使う。名前キーは候補ごとに 1 回だけ作る。
+    // 左paneと同じツリー専用比較規則を使う。名前キーは候補ごとに 1 回だけ作る。
     let mut keyed_dirs: Vec<_> = dirs
         .into_iter()
         .map(|(path, mtime)| {
@@ -836,6 +833,89 @@ pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(paths: Vec<PathBuf>) -> Vec<String> {
+        paths
+            .into_iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn folder_tree_sort_order_covers_all_six_modes_and_date_ties() {
+        use crate::settings::FolderTreeSortOrder as Order;
+
+        let sort = |order: Order, entries: &[(&str, i64)]| {
+            let mut keyed = entries
+                .iter()
+                .map(|(name, mtime)| (name.to_string(), *mtime, order.name_key(name)))
+                .collect::<Vec<_>>();
+            keyed.sort_by(|(_, a_time, a), (_, b_time, b)| {
+                order.compare_name_keys(a, *a_time, b, *b_time)
+            });
+            keyed
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>()
+        };
+
+        let alphabetic = [("beta", 0), ("alpha", 0)];
+        assert_eq!(sort(Order::NameAsc, &alphabetic), ["alpha", "beta"]);
+        assert_eq!(sort(Order::NameDesc, &alphabetic), ["beta", "alpha"]);
+
+        let numbered = [("chapter10", 0), ("chapter2", 0), ("chapter1", 0)];
+        assert_eq!(
+            sort(Order::NumericAsc, &numbered),
+            ["chapter1", "chapter2", "chapter10"]
+        );
+        assert_eq!(
+            sort(Order::NumericDesc, &numbered),
+            ["chapter10", "chapter2", "chapter1"]
+        );
+
+        let dated = [("beta", 20), ("alpha", 20), ("old", 10)];
+        assert_eq!(sort(Order::DateAsc, &dated), ["old", "alpha", "beta"]);
+        assert_eq!(sort(Order::DateDesc, &dated), ["alpha", "beta", "old"]);
+        assert_eq!(Order::ALL.len(), 6);
+    }
+
+    #[test]
+    fn folder_tree_options_ignore_list_sort_and_use_the_independent_tree_setting() {
+        let mut settings = crate::settings::Settings::default();
+        settings.sort_order = crate::settings::SortOrder::DateDesc;
+        settings.folder_tree_sort_order = crate::settings::FolderTreeSortOrder::NumericDesc;
+
+        let options = FolderTreeOptions::from_settings(&settings);
+
+        assert_eq!(
+            options.sort_order,
+            crate::settings::FolderTreeSortOrder::NumericDesc
+        );
+    }
+
+    #[test]
+    fn tree_sort_drives_dfs_and_sibling_navigation_in_the_same_order() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        for name in ["chapter1", "chapter2", "chapter10"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let options = FolderTreeOptions {
+            sort_order: crate::settings::FolderTreeSortOrder::NumericDesc,
+            ..FolderTreeOptions::default()
+        };
+
+        assert_eq!(
+            labels(sorted_subdirs(&root, options)),
+            ["chapter10", "chapter2", "chapter1"]
+        );
+        let first = next_folder_dfs(&root, options).expect("first DFS child");
+        assert_eq!(first.file_name().unwrap(), "chapter10");
+        let second = next_sibling_folder(&first, options).expect("second sibling");
+        assert_eq!(second.file_name().unwrap(), "chapter2");
+        let previous = prev_sibling_folder(&second, options).expect("previous sibling");
+        assert!(path_eq(&previous, &first));
+    }
 
     #[test]
     fn sorted_subdirs_excludes_portable_metadata_bundle() {

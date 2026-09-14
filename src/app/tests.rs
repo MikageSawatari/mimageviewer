@@ -9582,6 +9582,48 @@ mod folder_pane_open_nav_tests {
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.folder_pane_open_pending.is_none());
     }
+
+    #[test]
+    fn tree_sort_change_cancellation_rejects_old_order_result_but_keeps_exact_pane_open() {
+        let mut app = setup_app();
+        let (nav_tx, nav_rx) = mpsc::channel();
+        let nav_cancel = Arc::new(AtomicBool::new(false));
+        app.folder_nav_pending = Some(FolderNavPending {
+            cancel: Arc::clone(&nav_cancel),
+            rx: nav_rx,
+            forward: true,
+            mode: FolderNavMode::Grid,
+        });
+        app.pending_folder_nav_steps = 3;
+
+        let (pane_tx, pane_rx) = mpsc::channel();
+        let pane_cancel = Arc::new(AtomicBool::new(false));
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: app.tmp.path().join("exact-pane-target"),
+            cancel: Arc::clone(&pane_cancel),
+            rx: pane_rx,
+            purpose: FolderOpenScanPurpose::PaneNavigation,
+        });
+
+        app.cancel_inflight_order_dependent_folder_nav();
+
+        assert!(nav_cancel.load(Ordering::Relaxed));
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(!pane_cancel.load(Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_some());
+        assert!(
+            nav_tx
+                .send(FolderNavThreadResult {
+                    outcome: None,
+                    scanned: FolderNavScanResult::NotNeeded,
+                })
+                .is_err(),
+            "the previous tree-order worker must no longer have an apply receiver"
+        );
+        assert!(pane_tx.send(Ok(empty_scan())).is_ok());
+        app.cancel_folder_pane_open();
+    }
 }
 
 #[cfg(test)]
@@ -65954,19 +65996,24 @@ mod smart_folder_transition_tests {
 
     #[test]
     fn smart_folder_ctrl_nav_stays_in_entry_then_uses_root_display_order() {
-        let app = setup_app();
+        let mut app = setup_app();
         let first = app.tmp.path().join("smart-nav-first");
-        let first_child = first.join("child");
+        let first_child = first.join("child-10");
+        let later_child = first.join("child-2");
         let second = app.tmp.path().join("smart-nav-second");
         std::fs::create_dir_all(&first_child).unwrap();
+        std::fs::create_dir_all(&later_child).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(first_child.join("page.jpg"), []).unwrap();
+        std::fs::write(later_child.join("page.jpg"), []).unwrap();
         std::fs::write(second.join("page.jpg"), []).unwrap();
         let id = uuid::Uuid::new_v4();
         let mut state = super::top_level_grid_view::SmartFolderViewState::root(
             id,
             vec![first.clone(), second.clone()],
         );
+        app.settings.folder_tree_sort_order = crate::settings::FolderTreeSortOrder::NumericDesc;
+        app.settings.sort_order = crate::settings::SortOrder::DateAsc;
         let opts = crate::folder_tree::FolderTreeOptions::from_settings(&app.settings);
         let cancel = std::sync::atomic::AtomicBool::new(false);
 
@@ -65990,12 +66037,23 @@ mod smart_folder_transition_tests {
             app.settings.folder_skip_limit,
             &cancel,
         )
-        .expect("child in first entry");
+        .expect("first child in tree sort order");
         assert_eq!(child_target.path, first_child);
         assert!(state.move_to(&first_child));
-        let next_entry = super::navigate_smart_folder_scope(
+        let later_child_target = super::navigate_smart_folder_scope(
             &state,
             &first_child,
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("second child in tree sort order");
+        assert_eq!(later_child_target.path, later_child);
+        assert!(state.move_to(&later_child));
+        let next_entry = super::navigate_smart_folder_scope(
+            &state,
+            &later_child,
             true,
             opts,
             app.settings.folder_skip_limit,

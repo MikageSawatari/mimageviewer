@@ -382,8 +382,7 @@ impl super::App {
         if self.settings.folder_tree_pane_visible {
             self.folder_pane.reload_for_active(
                 folder_pane_active.as_deref(),
-                self.settings.sort_order,
-                self.settings.show_hidden_files,
+                crate::folder_pane::FolderPaneListingOptions::from_settings(&self.settings),
             );
         }
     }

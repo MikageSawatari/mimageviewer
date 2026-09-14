@@ -1587,7 +1587,7 @@ impl App {
     }
 
     fn retire_superseded_required_fullscreen_async_request(&mut self) {
-        self.cancel_inflight_folder_nav_for_required_fullscreen_open();
+        self.cancel_inflight_order_dependent_folder_nav();
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         self.pdf_password_request = None;
@@ -1612,7 +1612,7 @@ impl App {
 
     pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
         self.cancel_required_fullscreen_folder_open();
-        self.cancel_inflight_folder_nav_for_required_fullscreen_open();
+        self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
             self.pdf_enumerate_pending = None;
             self.zip_enumerate_pending = None;
