@@ -1,0 +1,468 @@
+# コレクション機能 実装計画（§1.118）
+
+## 1. 目的と正本
+
+本書は [`collection-spec-proposal.md`](collection-spec-proposal.md) の合意済み仕様を、
+現在のコード所有へ接続する実装計画である。仕様を狭めず、複数の名前付きコレクション、
+手動順と通常ソート、PC の編集 UI、登録元を開く表示、ナビゲーション・スライドショー・
+再生との統合、Remote の一覧・閲覧、テキスト import/export を一つの型付き所有モデルで実現する。
+
+段階はレビューと回帰を小さくするための内部開発順であり、途中段階を完成機能として公開しない。
+初段の永続型・DB・worker・snapshot・import parser は、後段で捨てたり別モデルへ置き換えたりせず、
+PC、複数 viewer context、Remote が共通利用する正本とする。
+
+## 2. 現コードの前提照合
+
+### 2.1 表示面と項目型
+
+- `src/app/top_level_grid_view.rs` の `TopLevelGridSurface` は Folder / DriveList /
+  Search / Snapshot / SubfolderExpansion / SmartFolder / ReadingHistory / Bookmarks /
+  Rating を明示的に所有する。コレクションも独立した `Collection` surface として加え、
+  Folder や既存 Remote の aggregate collection へ擬装しない。
+- `src/grid_item.rs` の `GridItem::drag_source_path()` は Folder / Image / Video /
+  Audio / ZipFile / PdfFile / ConvertibleArchive の実体 path だけを返し、ZipImage /
+  ZipDir / PdfPage / Stack / SearchContainer を除外する。登録可否はこの物理項目境界と
+  typed kind を組み合わせ、path の有無だけから仮想項目を再推定しない。
+- 通常一覧は 4 行カテゴリへ materialize する。通常ソート時は既存カテゴリ割当と
+  `SortOrder` comparator を再利用する。手動順ではカテゴリ再配置を行わず、保存した
+  entry の順序をそのまま一列の有効順として描画する。
+- Folder / ZIP / PDF / convertible archive を開いた後の内部項目順は、既存の Folder、
+  archive、book viewer の所有を維持する。collection entry の手動順や通常ソートを
+  book 内部へ伝搬しない。
+
+### 2.2 path identity と metadata
+
+- `src/path_key.rs::normalize_keep_drive` は drive 保持、separator、ASCII case の既存規則を提供するが、
+  `.` / `..`、trailing separator、verbatim/device prefix、relative base を単独では扱わない。
+  新しい純粋な `CollectionSourcePathKey` builder が Windows component を lexical に解決し、
+  許可した absolute drive / UNC path だけを同じ規則へ正規化する。direct registration、import、
+  UNIQUE、rename、latest fallback は必ずこの一つの builder を使う。UI thread の
+  `canonicalize` / `stat`、表示文字列を key に使わない。
+- stable source kind は現在の全 entry に共通する `FileSystemPath` namespace とする。
+  Image / Video / Audio / Folder / Zip / Pdf / ConvertibleArchive / Unresolved は、DB に保持する
+  last-known kind および prepare 後の resolved kind であり、stable key の一部にしない。
+  正本の「source kind を key に含む」は namespace を typed key に含める意味で満たす。
+- direct registration は `GridItem` が既に持つ resolved kind を渡す。text import で存在しない
+  path は `Unresolved` として保持し、missing entry を捨てない。source が後で見つかった場合の
+  kind 更新または relink は entry ID を維持する明示 mutation とする。
+- 同一コレクション内の「同じ参照を一度だけ」は
+  `(FileSystemPath, normalized_path)` の unique 制約で守る。resolved kind が時間差で変わっても、
+  missing → present、削除後の同 path 再登録、latest fallback の identity が分裂しない。
+
+### 2.3 既存 DB / worker / Remote
+
+- `rating_db.rs` は専用 SQLite と migration、`reading_history_db.rs` は App 所有の
+  sender / `JoinHandle` を持つ writer の参考になる。ただしコレクションは read、write、
+  revision snapshot、Remote を一つの直列 owner で扱うため、単一 actor が writable
+  connection を所有する。
+- `src/remote_ipc/collections.rs::CollectionEngine` と `crates/remote-ipc` の
+  `CollectionKind` は、DriveList / ReadingHistory / Rating / Bookshelf / Bookmarks /
+  SmartFolder をまとめる既存 aggregate read model である。永続コレクションをこの
+  storage とみなさず、protocol には stable `collection_id` を持つ別の typed variant /
+  payload を追加する。
+- `rename_key_migration.rs` はファイル操作成功後に rating、history 等の key を移す。
+  コレクションも同じ成功境界から actor command を受けるが、worker 所有中の DB を別接続で
+  書き換えない。ファイル操作失敗時は参照を先に動かさず、DB migration 失敗時は旧参照と
+  missing 表示を保って再試行可能な error とする。
+
+### 2.4 Toolbar と Settings
+
+- `ToolbarSectionId` と `ordered_with_fallback` に `Collections` を追加し、新規 profile の
+  default order では Bookshelf に隣接させる。既存の利用者順は維持し、新 section は既存
+  fallback 規則で補完する。
+- Settings が持つのは toolbar の表示・折り畳みなど UI preference だけである。
+  collection 定義・entry・revision を Settings JSON / settings.db に複製しない。
+- FavoriteSortOrder、通常一覧 SortOrder、folder tree sort、代表サムネイル sort は独立のまま。
+  collection の標準ソートは通常一覧の `SortOrder` 値を明示保存するが、他設定を更新しない。
+
+## 3. 永続 model と DB family
+
+### 3.1 型
+
+初段から次の型を正本とする（名称は Rust 実装時に既存命名へ合わせられるが、意味は変えない）。
+
+```text
+CollectionId(UUID)
+CollectionEntryId(UUID)
+CollectionSourceNamespace = FileSystemPath
+CollectionSourcePathKey { namespace, normalized_path }
+CollectionResolvedKind = Image | Video | Audio | Folder | Zip | Pdf |
+                         ConvertibleArchive | Unresolved
+CollectionOrderMode = Manual | Standard
+CollectionDefinition { id, name, order_mode, standard_sort, revision, ... }
+CollectionEntry { id, collection_id, source_path, source_key, manual_position, ... }
+CollectionCatalogSnapshot { catalog_revision, definitions: Arc<[...] > }
+CollectionSnapshot { collection_id, revision, definition, entries: Arc<[...] > }
+CollectionSortFacts { entry_id, name_key, mtime, size, resolved_category }
+```
+
+- ID は表示名、path、配列 index、SQLite `rowid` から作らない。作成時に UUID を一度発行し、
+  rename / reorder / relink / 再起動後も維持する。
+- `source_path` は利用者へ表示・open する path、`CollectionSourcePathKey` は比較専用である。
+  last-known resolved kind も別列に永続化し、unknown を size 0 や空文字などの sentinel で表さない。
+- `CollectionSortFacts` は prepare worker が既存 metadata/classifier から作る aligned な一時値で、
+  DB snapshot や UI が filesystem 値を再取得しない。標準 sort helper は snapshot とこの facts を
+  明示入力に取り、DB entry の path だけから date/size/category を推測しない。
+- snapshot は immutable `Arc` とし、DB actor が transaction commit 後だけ新 revision を公開する。
+  no-op、duplicate 拒否、rollback では revision を進めない。
+
+### 3.2 schema と transaction
+
+専用 `collection.db` を data directory に置く。概念 schema は次のとおりである。
+
+```text
+collection_meta(schema_version, catalog_revision)
+collections(id PK, name, order_mode, sort_order, revision, created_at, updated_at)
+collection_entries(
+  id PK, collection_id FK, source_namespace, source_path, normalized_path, resolved_kind,
+  manual_position, created_at,
+  UNIQUE(collection_id, source_namespace, normalized_path),
+  UNIQUE(collection_id, manual_position)
+)
+```
+
+- create / rename / delete、batch add、remove、manual reorder、order mode 変更、relink は
+  一 collection 単位の SQLite transaction とする。
+- source migration は同じ file/folder を登録する**全 collection**を一 command / 一 transaction で
+  更新する。affected collection の各 revision と catalog revision を同じ commit で進め、process crash、
+  conflict、constraint error で一部 collection だけ新 path にならない。
+- mutation ごとに対象 collection revision と catalog revision を commit 内で進める。
+  crash 後に定義と entry、順序と revision が半端に見えない。
+- manual position は常に保存し、Standard へ切り替えても書き換えない。Standard 中の追加も
+  manual tail へ追加するため、Manual へ戻したとき元の順序と追加 tail が復元する。
+- migration は schema version で直列化し、未知の新 schema は read/write せず typed
+  incompatible とする。DB corruption や open failure を空コレクションへ黙って置換しない。
+
+### 3.3 settings family との関係
+
+`collection.db` は `settings.db` family へ含めない。コレクションは rating、bookmark、
+reading history と同じ利用者データであり、Settings の「復元」「完全リセット」で定義や entry を
+巻き戻したり削除したりしない。従って §234 settings-family lease、settings backup rotation、
+settings reset の close/drain 対象にも追加しない。
+
+collection DB は自身の単一 actor、transaction、WAL lifecycle を持つ。text export は利用者が実行した
+時点の参照一覧を移す手動 portability であり、自動 backup や未export変更の保護とは記述しない。
+将来「全ユーザーデータ削除」へ統合する場合は、collection actor を
+先に drain / close して DB family 一式を扱う別 operation とし、settings reset に便乗しない。
+
+## 4. actor と終了所有
+
+### 4.1 単一 owner
+
+`CollectionStoreRuntime` は App process が一つだけ所有し、actor thread は writable SQLite
+connection と in-memory immutable snapshot cache を所有する。UI、各 viewer context、Remote は
+clone 可能な `CollectionStoreClient` だけを受け取る。
+
+- UI の request は bounded nonblocking enqueue と one-shot response で、満杯時は typed Busy。
+  UI thread は DB response を待たず、frame ごとに private receiver を poll する。
+- actor は短い DB read / transaction と snapshot publish だけを行う。filesystem existence、
+  archive classification、thumbnail、export file write を actor 上で行わない。
+- startup は thread spawn 後すぐ UI へ戻り、Ready / Failed を非同期通知する。open failure 中も
+  他の viewer 機能を止めず、collection surface だけに recovery error を表示する。
+- client sender の clone 数を actor lifetime に使わない。runtime と全 client clone は shared typed
+  admission (`Starting | Running | Closing | Closed`) を参照し、Closing 以後の enqueue を即座に
+  Unavailable とする。App owner は独立 Shutdown を送り、actor が current short transaction を終えて
+  connection / WAL を drop した ACK を受けてから `JoinHandle` を回収する。
+- revision 通知は client clone 間で一つの receiver を奪い合わない。`subscribe()` ごとに private
+  latest-watch mailbox と wake receiver を発行し、actor は全 subscriber へ同じ最新 revision notice を
+  fan-out する。coalescing 中も newest notice を slot に上書きし、遅い context は中間通知を省略して
+  最新 catalog/collection revision へ収束する。drop 済み subscriber は weak owner から掃除する。
+
+### 4.2 起動・終了順
+
+後段統合時の順序を次に固定する。
+
+1. App が collection actor を開始し、client を UI に保持する。
+2. Remote server はその client を注入される。Remote が DB connection を別所有しない。
+3. 通常終了は collection request admission を閉じ、Remote の collection request producer を止める。
+4. App が actor へ Shutdown を送り、ACK 後に join する。
+5. actor connection が drop した後に process が終了する。
+
+通常 frame、dialog close、viewer closeでは join しない。App final exit の drain だけが待機可能な境界である。
+Remote startup partial failure は注入 client を破棄するだけで actor owner を失わず、App が通常どおり
+shutdown する。actor panic / disconnect は collection unavailable とし、古い snapshot を編集可能として
+公開し続けない。
+
+## 5. request、revision、複数 viewer context
+
+DB actor の command は stable ID と期待 revision を持つ。
+
+```text
+ListCatalog
+LoadCollection { collection_id }
+Create / Rename / Delete
+AddBatch / Remove / ReorderManual / SetOrderMode / Relink
+MigrateSources
+Shutdown
+```
+
+- mutation は必要に応じ `expected_revision` を検査し、競合を Last Writer Wins にせず
+  typed Conflict と最新 snapshot を返す。UI は最新を再表示して利用者の操作を再適用できる。
+- App の pending owner は DB request ID に加え `ViewerContextId`、top-level surface generation、
+  `CollectionId`、requested collection revision を一つの stamp として保持する。
+- result は同じ context が同じ Collection surface / collection ID / generation を所有するときだけ
+  apply する。別 window、同 window の folder switch、surface close、collection delete、再要求後の
+  stale result は捨てる。DB actor は viewer context を global state として持たず、request stamp を
+  opaque に往復させる。
+- collection の編集 commit は各 context の private latest-watch へ catalog/collection revision event を
+  fan-out する。
+  各 context は自身の表示準備を非同期で再要求し、別 context の texture、cursor、open/close owner を
+  reset しない。
+
+## 6. materialize、表示、編集
+
+### 6.1 prepared snapshot
+
+DB snapshot と表示用 `GridItem` は分離する。prepare worker は snapshot の entry 全件を現在の
+filesystem / archive classifier と既存 metadata cache で解決し、次を返す。
+
+```text
+CollectionPreparedSnapshot {
+  collection_id,
+  collection_revision,
+  effective_order,
+  entries: Arc<[PreparedCollectionEntry]>,
+  context_stamp
+}
+```
+
+`PreparedCollectionEntry` は `entry_id` と `source_key` を常に保ち、missing / unsupported /
+resolved GridItem を typed に持つ。UI は表示時に `stat` / canonicalize / folder scan をしない。
+missing は一覧から消さず、欠損表示と remove / relink action を出す。
+
+- Manual は DB の manual position 順をそのまま effective order とする。
+- Standard は既存の通常一覧 4 カテゴリ割当と選択した `SortOrder` を worker 内で適用する。
+  source metadata unknown の比較規則も通常一覧の typed comparator を使う。
+- collapsed Stack や archive page を新しい collection entry として合成しない。登録 entry と
+  描画 cell の対応は `entry_id` で保持する。
+
+### 6.2 UI と toolbar
+
+- toolbar に専用 Collections section を追加し、collection 選択、作成、rename、delete、
+  order mode、import/export へ到達させる。
+- list は既存 thumbnail/details painter、選択、hover、context menu を再利用するが、surface は
+  `TopLevelGridSurface::Collection` とする。toolbar 自体へ DB 内容を同期 copy しない。
+- collection entry の remove と物理 source delete は別 command / confirmation とする。
+  remove は DB 参照だけ、source delete は既存 filesystem operation 成功後に collection migration /
+  removal を行う。
+- collection 編集中も現在再生を中断しない。編集結果は revision event として次の navigation
+  decision にだけ使う。
+
+## 7. navigation、book、再生
+
+### 7.1 parent / child
+
+Folder / archive / book entry を開くと既存 child surface / viewer を使い、戻り先として
+`{ collection_id, collection_revision_at_open, entry_id, source_key }` を typed に保持する。
+戻るときは最新 snapshot で entry ID、次に source key を引き直し、同じ collection の root 選択へ戻す。
+book 内部のページ順、archive 列挙、通常の前後ページ操作は既存 owner のままである。
+
+### 7.2 Ctrl+上下と slideshow NextFolder
+
+Collection surface / child origin が有効なときだけ、外側の folder/book traversal を最新
+prepared snapshot の effective order から作る。登録された Folder / Zip / Pdf /
+ConvertibleArchive の root entry を順に使い、Folder の子を outer sequence へ再帰追加しない。
+collection 外、通常 Folder、Search、SmartFolder の sibling navigation は既存経路のまま。
+
+### 7.3 再生中編集
+
+次項目を決める直前に最新 revision snapshot と、同じ entry ID 集合へ prepare worker が付けた現在の
+resolved kind / availability を非同期で取得し、次の純 reducer を使う。DB の last-known kind は候補判定へ
+使わず、effective order と prepared facts の ID 集合が snapshot と一致しなければ stale として拒否する。
+
+1. 現在の `CollectionEntryId` が残っていればその index。
+2. 無ければ同じ `CollectionSourcePathKey` の entry。
+3. それも無ければ現在 effective order の先頭。
+4. 現在項目が残り末尾なら既存 stop / loop 設定に従う。
+
+別 collection の revision event は current session を動かさない。next request の応答前にさらに revision が
+進んだ場合は stale target を開かず、最新 snapshot を再要求する。target media kind の選択、動画・音声・
+画像の既存 playback owner は変えない。
+
+## 8. import / export
+
+### 8.1 純 parser と preview
+
+`parse_collection_text(text, source_text_path)` は文字列と base path だけを受ける純関数とする。
+この段階で filesystem、shortcut、archive、thumbnail、DB、network へアクセスしない。
+
+- UTF-8 BOM 有無、CRLF / LF、一行一 path、blank 無視、whole-line quote を扱う。
+- `#` は comment にせず通常文字として扱う。
+- relative path は text file の parent に lexical join し、`CollectionSourcePathKey` builder で
+  `.` / `..` と trailing separator を整理する。
+- URL、verbatim/device path、wildcard、環境変数・command expansion を reject し、入力を実行しない。
+  absolute drive / UNC の判定も同じ builder が行う。
+- typed source key で最初の行だけを採用し、後続 duplicate を line result として表示する。
+- preview は parsed / invalid / duplicate の line result だけを表示する。exists、kind、missing、
+  link 解決、thumbnail を preview の事実として表示しない。
+
+### 8.2 confirm 後の登録
+
+Confirm 後に cancel token 付き prepare worker が exists / supported physical kind / network access error を
+分類する。既存 path は exact kind、存在しない path は `Unresolved` として missing entry を作る。
+worker は進捗を UI へ送り、cancel 済みの未登録 batch を actor へ送らない。
+
+actor の `AddBatch` transaction が同 collection の typed source-key uniqueness と revision を最終決定する。
+preview 後に別入口で追加された duplicate は actor result で表示し、上書きしない。network error と
+invalid は区別し、読み取り失敗を「存在しない」と偽らない。
+
+### 8.3 export
+
+export は開始時の immutable latest collection snapshot を使い、現在の full effective order を一度固定する。
+検索・selection・viewport の local filter を適用せず、missing / unresolved も含める。pure serializer が
+quoted path を生成し、別 worker が選択先へ書く。UI thread で file write しない。export 中の編集は開始時
+snapshot の出力を変えず、完了時に使用 revision を表示できる。
+
+## 9. Remote 境界
+
+- protocol に persistent collection catalog / snapshot 用の別 typed request を追加し、
+  `CollectionId`、collection revision、entry ID、source key、missing state を運ぶ。
+- 初回 Remote は list / view / open の read-only。create / rename / reorder / import / remove を
+  command として公開しない。これは PC 編集機能を制限するものではなく、合意済み Remote 初回範囲である。
+- Remote request は UI を経由せず同じ actor client / immutable snapshot を読む。actor Busy、Conflict、
+  Incompatible、Unavailable を既存 protocol の generic failure に潰さない。
+- Remote viewer session も collection ID / entry ID / source key / revision を持ち、PC と同じ latest-next
+  reducer を使う。既存 aggregate `CollectionKind` の意味と wire compatibility は維持する。
+
+## 10. rename、cleanup、data protection
+
+- filesystem rename / move の成功後だけ、App の既存 migration owner が collection actor へ typed
+  path mapping を送る。App は mapping と request ID を全 affected collections の commit ACK まで一つの
+  `PendingCollectionSourceMigration` に保持し、viewer close や context switch で捨てない。actor error 時は
+  旧参照を全 collection に残し、同じ mapping の明示 retryとerror表示を所有する。
+  file は exact key、folder は既存 path-prefix 規則と同じ境界で登録 source を更新する。
+- actor の一 transaction は該当する全 collection entry の raw path、typed key、必要なら resolved kind を更新し、
+  stable entry ID と manual position を保つ。unique conflict は勝手に merge / delete せず報告する。
+- metadata cleanup や missing-file pruning で collection entry を削除しない。missing 保持が正本である。
+- Settings import/export、settings recovery、sidecar cleanup に collection DB を混ぜない。
+  collection text import/export は参照 list の明示操作で、rating や adjustment DB を転送しない。
+
+## 11. 段階実装
+
+### Phase 1: 永続基盤（最初の実装 chunk）
+
+想定所有:
+
+- 新規 `src/collection_store.rs` または `src/collection_store/{model,db,worker,import}.rs`
+- `src/lib.rs` の module 登録
+- module 内 unit / TempDir integration tests
+- 本書の実装・検証記録
+
+実装するもの:
+
+1. stable IDs、source kind/key、definition/entry/snapshot、order/revision/error 型。
+2. versioned SQLite schema と transaction API。
+3. App 統合に依存しない単一 actor runtime/client、async startup、explicit shutdown。
+4. pure import parser / export serializer と、confirm 後workerが渡す登録値のtyped境界。
+5. pure manual/standard effective-order helper と latest-entry resolver。
+6. rename/relink/batch registration command 境界。
+
+この phase では App startup から actor を起動せず、実 profile に `collection.db` を作らない。
+基盤を headless TempDir で検証してから、同じ API を Phase 2 以降へ接続する。
+
+### Phase 2: PC catalog / toolbar / import-export UI
+
+- App-global runtime lifecycle、Settings の toolbar UI flags、Collections toolbar section。
+- create / rename / delete / order / reorder / add / remove / relink UI。
+- pure preview → confirm 後 worker → actor batch の import と、snapshot → worker write の export。
+- error / progress / cancel / Conflict 表示。UI thread の I/O は増やさない。
+
+### Phase 3: collection grid / context / source migration
+
+- `TopLevelGridSurface::Collection`、prepared snapshot、thumbnail/details、missing cell。
+- physical source open と parent return、remove と source delete の分離。
+- existing rename/move pipeline から actor migration へ接続。
+- multi-window / detached context stamp と stale result 拒否。
+
+### Phase 4: navigation / slideshow / playback
+
+- Ctrl+上下、slideshow NextFolder の collection outer sequence。
+- entry ID → source key → head の latest resolver と stop/loop。
+- book 内部順、通常 folder/search/smart route、別 collection の不変回帰。
+
+### Phase 5: Remote read-only
+
+- `remote-ipc` protocol、core service、web UI の persistent collection list/view/open。
+- PC と同じ immutable snapshot / resolver、既存 aggregate collection との識別。
+- protocol version、old/new client error、Remote session revision 回帰。
+
+## 12. 検証計画
+
+### 12.1 Phase 1 focused
+
+- DB create / reopen で collection/entry ID、manual position、revision が不変。
+- create/rename/delete、duplicate path、batch rollback、no-op revision、expected revision conflict。
+- Manual → Standard → Manual で手動順不変、Standard 中の追加が manual tail。
+- pure source-key builder の namespace / case / separator / drive / UNC / `.` / `..` / trailing、
+  device/verbatim拒否、同 path unique、Unresolved → resolved/relink後もstable key。
+- actor async Ready/Failed、FIFO transaction、queue Busy、client clone 残存中の explicit Shutdown /
+  post-Closing admission拒否、connection drop / join、panic/disconnect unavailable。複数subscriberが
+  同revisionを独立受信し、wake満杯時もlatestへ収束する。headless test が通常 data directory を開かない。
+- import: BOM、有/無 quote、CRLF/LF、blank、`#`、relative、duplicate、URL/device/wildcard/env reject。
+  存在しない path を多数渡しても parser が access しない fake/no-access backend 回帰。
+- export full effective order、missing 含有、filter 非依存、parse/serialize roundtrip。
+- latest resolver: ID 維持、ID 削除+same source、両方なし→head、tail stop/loop、別 collection revision 無視。
+
+### 12.2 統合 phase
+
+- production builder/handler-level で create/edit/import/remove/relink と actual grid materialize。
+- confirm 後classifierのexists/missing/network/error/cancel、progressとactor batch競合。Phase 1は
+  targetへ触れないpreview/parserとregistration command境界までで、filesystem workerはPhase 2で接続する。
+- context A の遅延 result が context B、再open 後 generation、別 collection へ apply されない。
+- Manual はカテゴリ regroup なし、Standard は通常 4 行カテゴリ、book 内部順不変。
+- rename 成功/失敗/DB conflict、missing 保持、cleanup 非削除。
+- settings restore/resetの実行中・成功・recoverable error後もcollection actor / DB / revision /
+  snapshotが不変で、settings backup一覧にcollection DBが入らない。
+- Ctrl+上下 / slideshow / playback の編集競合両順序を barrier 回帰。
+- Remote と PC の同 revision preorder、protocol old/new、read-only admission。
+- visible UI は dark/light snapshot、長い名前、空、missing、progress/error、scroll 到達性。
+
+### 12.3 最終 gate
+
+各 phase は narrow unit / integration → `cargo check` → `cargo fmt --check` を行う。共有 App、
+Grid、navigation、Remote を接続した phase では repository の full gate、glyph、viewer-context audit、
+diff check を同一 source freeze で実行する。user-runnable behavior が揃った時点で
+`scripts/build-dev.ps1 -PreserveRuntime` を実行するが、agent は GUI を起動しない。
+
+## 13. 不変条件
+
+- UI thread に SQLite、stat、canonicalize、folder scan、archive classify、file read/write、join を追加しない。
+- entry ID と collection ID は rename / reorder / relink / restart で変えない。
+- commit していない state や stale context result を表示・navigation の正本にしない。
+- manual order を通常 sort で破壊せず、book 内部順へ collection order を流さない。
+- missing を cleanup や open failure で黙って削除せず、同名 path を推測 relink しない。
+- collection DB を Settings family の復元/resetへ混ぜず、DB actor 外から書き換えない。
+- collection integration が Favorite、Rating、ReadingHistory、Bookshelf、SmartFolder、通常 Folder、
+  Search、Remote aggregate collection の既存所有・可否・順序を変えない。
+- detached / linked viewer は context stamp と既存 lifecycle を使い、App-global current collection bool や
+  delay、polling、症状 reset を追加しない。
+
+## 14. Phase 1 実装記録（2026-09-14）
+
+Phase 1 の永続基盤を `src/collection_store/` に実装した。App startup、通常 data directory、toolbar、
+collection grid、confirm 後の filesystem worker、Remote にはまだ接続していないため、module load や test だけで
+実 profile に `collection.db` は作られない。
+
+- `CollectionId` / `CollectionEntryId`、filesystem namespace の `CollectionSourcePathKey`、resolved kind、
+  manual / standard order、catalog / collection revision、latest resolver を共通型にした。
+- SQLite v1 schema と単一 actor を実装した。request admission と enqueue、Closing 遷移と Shutdown publish は
+  同じ owner で線形化し、actor は Shutdown 後の queued command を実行しない。client clone ごとの latest-watch は
+  receiver を奪い合わず、explicit shutdown 後に新規 request を受け付けない。
+- create / rename / delete / order / batch add / remove / manual reorder / relink / source migration を transaction にした。
+  tree migration は全 collection を単一 transaction で更新し、affected revision と catalog revision を同じ commit で進める。
+- trusted physical source と external text admission を分離した。合法な drive / UNC / extended 表記は同じ key へ畳み、
+  external text の device namespace、DOS device component、ADS、control character、URL、wildcard、展開式を拒否する。
+  parser / serializer は filesystem access を行わない。
+- 既存 DB の `user_version` は read-only probe で先に確認し、未知 schema には WAL 設定や schema write を行わない。
+  thread spawn failure は typed error、actor panic / unexpected exit は `Closed` と `Failed` event へ収束する。
+- Phase 1 は pure import preview/parser と登録 command 境界までである。exists / supported kind / network error の
+  classifier、progress、cancel、confirm 後の target access は Phase 2 の worker と handler-level 回帰で実装する。
+
+Focused verification:
+
+- `cargo test -p mimageviewer --lib collection_store::tests -- --nocapture`: 15 passed, 0 failed。
+- covered: path normalization/admission、pure import/export、DB reopen/revision/manual order、atomic migration、
+  delete cascade/catalog compact、relink/remove/invalid reorder、aligned standard order、prepared-facts latest resolver、
+  subscriber fanout、Shutdown races、startup failure、actor panic、unknown schema no-write。
+- GUI、通常 profile、real data、verification build は未使用。Phase 1 は user-runnable surface 未接続なので、
+  build handoff は toolbar/grid を接続する Phase 2 以降で行う。
