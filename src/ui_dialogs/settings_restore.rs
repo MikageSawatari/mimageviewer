@@ -37,6 +37,7 @@ pub(crate) struct SettingsRestoreState {
     operation_modal: Option<OperationModal>,
     operation_message: Option<(bool, String)>,
     operation_task_rx: Option<std::sync::mpsc::Receiver<OperationTaskResult>>,
+    family_operation: SettingsFamilyOperationState,
 }
 
 impl Default for SettingsRestoreState {
@@ -49,7 +50,133 @@ impl Default for SettingsRestoreState {
             operation_modal: None,
             operation_message: None,
             operation_task_rx: None,
+            family_operation: SettingsFamilyOperationState::Idle,
         }
+    }
+}
+
+enum SettingsFamilyOperationState {
+    Idle,
+    Running {
+        action: PendingAction,
+        task: settings_restore::SettingsFamilyOperationTask,
+        deferred_close: Option<DeferredRootClose>,
+    },
+    RemoteUnavailable {
+        retry: settings_restore::RemoteFavoritesRetry,
+        error: String,
+        retry_task: Option<UiWorkerTask<Result<(), String>>>,
+        deferred_close: Option<DeferredRootClose>,
+    },
+}
+
+impl SettingsFamilyOperationState {
+    fn blocks_close(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn defer_root_close(&mut self, requested: DeferredRootClose) -> bool {
+        let deferred_close = match self {
+            Self::Running { deferred_close, .. }
+            | Self::RemoteUnavailable {
+                retry_task: Some(_),
+                deferred_close,
+                ..
+            } => deferred_close,
+            Self::Idle
+            | Self::RemoteUnavailable {
+                retry_task: None, ..
+            } => return false,
+        };
+        *deferred_close = Some(deferred_close.unwrap_or(requested).merge(requested));
+        true
+    }
+
+    fn needs_hidden_root_wake(&self) -> bool {
+        matches!(
+            self,
+            Self::Running {
+                deferred_close: Some(_),
+                ..
+            } | Self::RemoteUnavailable {
+                retry_task: Some(_),
+                deferred_close: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredRootClose {
+    WindowClose,
+    ApplicationQuit,
+}
+
+impl DeferredRootClose {
+    fn merge(self, newer: Self) -> Self {
+        if matches!(self, Self::ApplicationQuit) || matches!(newer, Self::ApplicationQuit) {
+            Self::ApplicationQuit
+        } else {
+            Self::WindowClose
+        }
+    }
+}
+
+fn settings_family_deferred_root_close(
+    application_quit: bool,
+    plain_close_hides_to_tray: bool,
+) -> Option<DeferredRootClose> {
+    if application_quit {
+        Some(DeferredRootClose::ApplicationQuit)
+    } else if plain_close_hides_to_tray {
+        None
+    } else {
+        Some(DeferredRootClose::WindowClose)
+    }
+}
+
+struct UiWorkerTask<T> {
+    receiver: std::sync::mpsc::Receiver<T>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+enum UiWorkerPoll<T> {
+    Running,
+    Completed(T),
+    Failed(String),
+}
+
+impl<T> UiWorkerTask<T> {
+    fn poll_finished(&mut self) -> UiWorkerPoll<T> {
+        let Some(handle) = self.handle.as_ref() else {
+            return UiWorkerPoll::Failed("worker の所有権が失われました".to_owned());
+        };
+        if !handle.is_finished() {
+            return UiWorkerPoll::Running;
+        }
+        let handle = self.handle.take().expect("checked above");
+        if handle.join().is_err() {
+            return UiWorkerPoll::Failed("worker が予期せず終了しました".to_owned());
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => UiWorkerPoll::Completed(result),
+            Err(error) => {
+                UiWorkerPoll::Failed(format!("worker の結果を確認できませんでした: {error}"))
+            }
+        }
+    }
+
+    fn finish_for_exit(mut self) -> Result<T, String> {
+        let Some(handle) = self.handle.take() else {
+            return Err("worker の所有権が失われました".to_owned());
+        };
+        handle
+            .join()
+            .map_err(|_| "worker が終了処理中に予期せず終了しました".to_owned())?;
+        self.receiver
+            .recv()
+            .map_err(|error| format!("worker の終了結果を確認できませんでした: {error}"))
     }
 }
 
@@ -186,6 +313,82 @@ pub(crate) enum ActionResult {
 }
 
 impl App {
+    pub(crate) fn settings_family_deferred_close_needs_hidden_wake(&self) -> bool {
+        self.settings_restore_state
+            .family_operation
+            .needs_hidden_root_wake()
+    }
+
+    /// Keep a destructive settings-family worker owned by the live App when a root-window close
+    /// would otherwise end the process. A plain close handled by the existing tray-hide path
+    /// remains a hide; process-exit close is replayed after the worker reaches terminal.
+    pub(crate) fn defer_settings_family_root_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        let application_quit = self.sidecar_restore_root_lifecycle_close_requested();
+        let plain_close_hides_to_tray = !application_quit
+            && self.settings.minimize_to_tray_on_close
+            && self.tray_controller.is_some();
+        let Some(requested) =
+            settings_family_deferred_root_close(application_quit, plain_close_hides_to_tray)
+        else {
+            return;
+        };
+        if self
+            .settings_restore_state
+            .family_operation
+            .defer_root_close(requested)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Final process-exit fence for the destructive settings-family worker and its retry task.
+    /// This is the only blocking App-side join; normal UI polls call `is_finished` first.
+    pub(crate) fn resolve_settings_family_operation_for_exit(&mut self) {
+        let state = std::mem::replace(
+            &mut self.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Idle,
+        );
+        match state {
+            SettingsFamilyOperationState::Running { action, task, .. } => {
+                crate::logger::log(format!(
+                    "[settings_restore] draining action worker for exit: {}",
+                    describe_pending(&action)
+                ));
+                match task.finish_for_exit() {
+                    Ok(completed) => crate::logger::log(format!(
+                        "[settings_restore] exit drain completed: {} reader_release={:?} mutation={:?}",
+                        describe_pending(&action),
+                        completed.reader_release,
+                        completed.mutation,
+                    )),
+                    Err(error) => crate::logger::log(format!(
+                        "[settings_restore] exit drain failed: {}: {error}",
+                        describe_pending(&action)
+                    )),
+                }
+            }
+            SettingsFamilyOperationState::RemoteUnavailable {
+                retry_task: Some(task),
+                ..
+            } => match task.finish_for_exit() {
+                Ok(Ok(())) => {
+                    crate::logger::log("[settings_restore] remote reader retry drained for exit")
+                }
+                Ok(Err(error)) | Err(error) => crate::logger::log(format!(
+                    "[settings_restore] remote reader retry exit drain failed: {error}"
+                )),
+            },
+            SettingsFamilyOperationState::Idle
+            | SettingsFamilyOperationState::RemoteUnavailable {
+                retry_task: None, ..
+            } => {}
+        }
+    }
+
     /// メニューから呼ぶ起動エントリ。
     pub(crate) fn open_settings_restore_dialog(&mut self) {
         let dir = crate::data_dir::get();
@@ -203,6 +406,7 @@ impl App {
         }
 
         self.poll_operation_share_task(ctx);
+        self.poll_settings_family_operation(ctx);
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -215,6 +419,7 @@ impl App {
         let confirm_open = self.settings_restore_state.pending.is_some();
         let result_open = self.settings_restore_state.result.is_some();
         let operation_modal_open = self.settings_restore_state.operation_modal.is_some();
+        let family_operation_open = self.settings_restore_state.family_operation.blocks_close();
 
         egui::Window::new("設定の復元")
             .open(&mut open)
@@ -226,7 +431,9 @@ impl App {
                 draw_body(self, ui);
             });
 
-        if !open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open) {
+        if (!open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open))
+            && !family_operation_open
+        {
             self.show_settings_restore = false;
             self.settings_restore_state = SettingsRestoreState::default();
             if self.settings_boot_problem_source.is_some() {
@@ -237,6 +444,7 @@ impl App {
         // 確認 / 完了の各ダイアログ。結果ダイアログは `egui::Modal` で背景全部を
         // ブロックするので、Terminal でも Recoverable でも背景 UI 操作は不可能。
         self.show_settings_restore_confirm_dialog(ctx);
+        self.show_settings_family_running_dialog(ctx);
         self.show_settings_restore_result_dialog(ctx);
         self.show_operation_share_modal(ctx);
     }
@@ -297,41 +505,252 @@ impl App {
         if cancel {
             self.settings_restore_state.pending = None;
         } else if execute {
-            self.execute_pending_settings_restore(pending);
+            self.execute_pending_settings_restore(pending, ctx);
         }
     }
 
-    fn execute_pending_settings_restore(&mut self, pending: PendingAction) {
+    fn execute_pending_settings_restore(&mut self, pending: PendingAction, ctx: &egui::Context) {
         let dir = crate::data_dir::get();
-        let result = match &pending {
-            PendingAction::Restore(source) => match settings_restore::restore_from(&dir, source) {
-                Ok(report) => ActionResult::RestoreOk {
-                    source: source.clone(),
-                    report,
-                },
-                Err(failure) => {
-                    failure_to_action_result(failure, format!("「{}」からの復元", source.label()))
+        let action = match &pending {
+            PendingAction::Restore(source) => {
+                settings_restore::SettingsFamilyAction::Restore(source.clone())
+            }
+            PendingAction::FullReset => settings_restore::SettingsFamilyAction::FullReset,
+        };
+        self.settings_restore_state.pending = None;
+        let repaint_ctx = ctx.clone();
+        match settings_restore::start_settings_family_operation(
+            dir,
+            action,
+            self.remote_settings_reader_control(),
+            std::sync::Arc::new(move || repaint_ctx.request_repaint()),
+        ) {
+            Ok(task) => {
+                crate::logger::log(format!(
+                    "[settings_restore] action worker started: {}",
+                    describe_pending(&pending)
+                ));
+                self.settings_restore_state.family_operation =
+                    SettingsFamilyOperationState::Running {
+                        action: pending,
+                        task,
+                        deferred_close: None,
+                    };
+            }
+            Err(error) => {
+                self.settings_restore_state.result = Some(ActionResult::FailedRecoverable {
+                    action_label: describe_pending(&pending).to_owned(),
+                    error,
+                });
+            }
+        }
+    }
+
+    fn poll_settings_family_operation(&mut self, ctx: &egui::Context) {
+        let mut deferred_close = None;
+        let state = std::mem::replace(
+            &mut self.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Idle,
+        );
+        self.settings_restore_state.family_operation = match state {
+            SettingsFamilyOperationState::Idle => SettingsFamilyOperationState::Idle,
+            SettingsFamilyOperationState::Running {
+                action,
+                mut task,
+                deferred_close: close_intent,
+            } => match task.poll_finished() {
+                settings_restore::SettingsFamilyOperationPoll::Running => {
+                    SettingsFamilyOperationState::Running {
+                        action,
+                        task,
+                        deferred_close: close_intent,
+                    }
+                }
+                settings_restore::SettingsFamilyOperationPoll::Completed(completed) => {
+                    deferred_close = close_intent;
+                    let action_label = describe_pending(&action).to_owned();
+                    let result = match completed.outcome {
+                        Ok(settings_restore::SettingsFamilySuccess::Restore { source, report }) => {
+                            ActionResult::RestoreOk { source, report }
+                        }
+                        Ok(settings_restore::SettingsFamilySuccess::FullReset(report)) => {
+                            ActionResult::ResetOk { report }
+                        }
+                        Err(failure) => failure_to_action_result(failure, action_label),
+                    };
+                    crate::logger::log(format!(
+                        "[settings_restore] action executed: {} -> {} reader_release={:?} mutation={:?}",
+                        describe_pending(&action),
+                        describe_result(&result),
+                        completed.reader_release,
+                        completed.mutation,
+                    ));
+                    self.settings_restore_state.result = Some(result);
+                    if let (Some(retry), Some(error)) =
+                        (completed.remote_retry, completed.remote_resume_error)
+                    {
+                        SettingsFamilyOperationState::RemoteUnavailable {
+                            retry,
+                            error,
+                            retry_task: None,
+                            deferred_close: None,
+                        }
+                    } else {
+                        SettingsFamilyOperationState::Idle
+                    }
+                }
+                settings_restore::SettingsFamilyOperationPoll::WorkerFailed(error) => {
+                    deferred_close = close_intent;
+                    let action_label = describe_pending(&action).to_owned();
+                    self.settings_restore_state.result = Some(ActionResult::FailedTerminal {
+                        action_label,
+                        error,
+                    });
+                    SettingsFamilyOperationState::Idle
                 }
             },
-            PendingAction::FullReset => match settings_restore::full_reset(&dir) {
-                Ok(report) => ActionResult::ResetOk { report },
-                Err(failure) => failure_to_action_result(failure, "完全リセット".to_string()),
+            SettingsFamilyOperationState::RemoteUnavailable {
+                retry,
+                mut error,
+                retry_task,
+                deferred_close: close_intent,
+            } => match retry_task {
+                Some(mut task) => match task.poll_finished() {
+                    UiWorkerPoll::Completed(Ok(())) => {
+                        deferred_close = close_intent;
+                        SettingsFamilyOperationState::Idle
+                    }
+                    UiWorkerPoll::Completed(Err(retry_error)) => {
+                        deferred_close = close_intent;
+                        error = retry_error;
+                        SettingsFamilyOperationState::RemoteUnavailable {
+                            retry,
+                            error,
+                            retry_task: None,
+                            deferred_close: None,
+                        }
+                    }
+                    UiWorkerPoll::Running => SettingsFamilyOperationState::RemoteUnavailable {
+                        retry,
+                        error,
+                        retry_task: Some(task),
+                        deferred_close: close_intent,
+                    },
+                    UiWorkerPoll::Failed(task_error) => {
+                        deferred_close = close_intent;
+                        error = task_error;
+                        SettingsFamilyOperationState::RemoteUnavailable {
+                            retry,
+                            error,
+                            retry_task: None,
+                            deferred_close: None,
+                        }
+                    }
+                },
+                None => SettingsFamilyOperationState::RemoteUnavailable {
+                    retry,
+                    error,
+                    retry_task: None,
+                    deferred_close: close_intent,
+                },
             },
         };
-        crate::logger::log(format!(
-            "[settings_restore] action executed: {} -> {}",
-            describe_pending(&pending),
-            describe_result(&result)
-        ));
-        self.settings_restore_state.pending = None;
-        self.settings_restore_state.result = Some(result);
+        if let Some(close) = deferred_close {
+            match close {
+                DeferredRootClose::WindowClose => self.request_main_window_close(ctx),
+                DeferredRootClose::ApplicationQuit => self.request_application_quit(ctx),
+            }
+        }
+    }
+
+    fn show_settings_family_running_dialog(&mut self, ctx: &egui::Context) {
+        let message = match &self.settings_restore_state.family_operation {
+            SettingsFamilyOperationState::Running { .. } => Some("設定ファイルを準備しています…"),
+            SettingsFamilyOperationState::RemoteUnavailable {
+                retry_task: Some(_),
+                ..
+            } => Some("リモート設定readerを再接続しています…"),
+            _ => None,
+        };
+        if let Some(message) = message {
+            egui::Modal::new(egui::Id::new("settings_family_operation_modal")).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(message);
+                });
+            });
+        }
+    }
+
+    fn start_remote_favorites_retry(&mut self, ctx: &egui::Context) {
+        let SettingsFamilyOperationState::RemoteUnavailable {
+            retry,
+            error,
+            retry_task: None,
+            deferred_close: None,
+        } = std::mem::replace(
+            &mut self.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Idle,
+        )
+        else {
+            return;
+        };
+        let worker_retry = retry.clone();
+        let repaint_ctx = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("settings-favorites-resume".to_owned())
+            .spawn(move || {
+                let result = worker_retry.retry();
+                let _ = tx.send(result);
+                repaint_ctx.request_repaint();
+            }) {
+            Ok(handle) => {
+                self.settings_restore_state.family_operation =
+                    SettingsFamilyOperationState::RemoteUnavailable {
+                        retry,
+                        error,
+                        retry_task: Some(UiWorkerTask {
+                            receiver: rx,
+                            handle: Some(handle),
+                        }),
+                        deferred_close: None,
+                    };
+            }
+            Err(spawn_error) => {
+                self.settings_restore_state.family_operation =
+                    SettingsFamilyOperationState::RemoteUnavailable {
+                        retry,
+                        error: format!(
+                            "リモート設定reader再接続 worker を開始できません: {spawn_error}"
+                        ),
+                        retry_task: None,
+                        deferred_close: None,
+                    };
+            }
+        }
     }
 
     fn show_settings_restore_result_dialog(&mut self, ctx: &egui::Context) {
         if self.settings_restore_state.result.is_none() {
             return;
         }
+        if matches!(
+            &self.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::RemoteUnavailable {
+                retry_task: Some(_),
+                ..
+            }
+        ) {
+            return;
+        }
         let mut closing = false;
+        let mut retry_remote = false;
+        let mut exit_for_remote = false;
+        let remote_resume_error = match &self.settings_restore_state.family_operation {
+            SettingsFamilyOperationState::RemoteUnavailable { error, .. } => Some(error.clone()),
+            _ => None,
+        };
 
         // self の借用を避けるため、必要情報を先に取り出してから描画する。
         let result_ref = self
@@ -359,25 +778,60 @@ impl App {
                         ui.label(line);
                     }
                 }
+                if let Some(error) = remote_resume_error.as_deref() {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                        format!(
+                            "リモートのお気に入り検索用readerを再接続できませんでした: {error}"
+                        ),
+                    );
+                    ui.label(
+                        "通常の設定アクセスは再開済みです。再試行するか、アプリを終了してください。",
+                    );
+                }
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
-                let button_label = match kind {
-                    ResultKind::Success => "アプリを終了",
-                    ResultKind::FailedRecoverable => "閉じる",
-                    ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
-                };
                 ui.horizontal(|ui| {
-                    if ui.button(button_label).clicked() {
-                        closing = true;
+                    if remote_resume_error.is_some() {
+                        if ui.button("リモート設定readerを再接続").clicked() {
+                            retry_remote = true;
+                        }
+                        if ui.button("アプリを終了").clicked() {
+                            exit_for_remote = true;
+                        }
+                    } else {
+                        let button_label = match kind {
+                            ResultKind::Success => "アプリを終了",
+                            ResultKind::FailedRecoverable => "閉じる",
+                            ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
+                        };
+                        if ui.button(button_label).clicked() {
+                            closing = true;
+                        }
                     }
                 });
             });
 
         // Recoverable のみ backdrop クリック / Esc を「閉じる」として受け付ける。
         // Terminal は backdrop / Esc も無効 (= ボタンクリックでしか抜けられない)。
-        if kind == ResultKind::FailedRecoverable && response.should_close() {
+        if kind == ResultKind::FailedRecoverable
+            && remote_resume_error.is_none()
+            && response.should_close()
+        {
             closing = true;
+        }
+
+        if retry_remote {
+            self.start_remote_favorites_retry(ctx);
+            return;
+        }
+        if exit_for_remote {
+            self.show_settings_restore = false;
+            self.settings_restore_state = SettingsRestoreState::default();
+            self.request_application_quit(ctx);
+            return;
         }
 
         if closing {
@@ -1539,6 +1993,153 @@ mod tests {
     use super::*;
     use crate::keymap::KeyBindingOverride;
     use egui_kittest::Harness;
+
+    #[test]
+    fn settings_family_close_policy_preserves_tray_hide_and_latches_process_exit() {
+        assert_eq!(
+            settings_family_deferred_root_close(false, true),
+            None,
+            "plain close remains owned by the existing tray-hide path"
+        );
+        assert_eq!(
+            settings_family_deferred_root_close(false, false),
+            Some(DeferredRootClose::WindowClose)
+        );
+        assert_eq!(
+            settings_family_deferred_root_close(true, true),
+            Some(DeferredRootClose::ApplicationQuit),
+            "explicit/tray quit takes precedence over tray hide"
+        );
+        assert_eq!(
+            DeferredRootClose::WindowClose.merge(DeferredRootClose::ApplicationQuit),
+            DeferredRootClose::ApplicationQuit,
+            "a later explicit quit upgrades an already deferred plain close"
+        );
+    }
+
+    #[test]
+    fn hidden_explicit_quit_keeps_the_wake_until_the_exact_task_reissues_close() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.minimize_to_tray_on_close = false;
+        app.window_visible = false;
+        app.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = settings_restore::SettingsFamilyOperationTask::waiting_for_release_for_test(
+            release_rx,
+            std::sync::Arc::clone(&worker_finished),
+        );
+        app.settings_restore_state.family_operation = SettingsFamilyOperationState::Running {
+            action: PendingAction::Restore(BackupSource::Bak(1)),
+            task,
+            deferred_close: None,
+        };
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+
+        let blocked = ctx.run(raw, |ctx| app.defer_settings_family_root_close(ctx));
+        assert!(
+            blocked
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport
+                    .commands
+                    .contains(&egui::ViewportCommand::CancelClose))
+        );
+        assert!(matches!(
+            app.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Running {
+                deferred_close: Some(DeferredRootClose::ApplicationQuit),
+                ..
+            }
+        ));
+        assert!(app.tray_resident_media_updates_needed());
+        let app_source = include_str!("../app.rs");
+        let update = app_source
+            .find("fn update(&mut self, ctx: &egui::Context")
+            .expect("eframe update wrapper");
+        let update_source = &app_source[update..];
+        assert!(
+            update_source
+                .find("defer_settings_family_root_close(ctx)")
+                .expect("close latch")
+                < update_source
+                    .find("self.update_frame(ctx, frame)")
+                    .expect("tray wake publication pass"),
+            "the hidden-root close latch must precede update_frame's tray wake publication"
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.poll_settings_family_operation(ctx)
+            });
+            if output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            app.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Idle
+        ));
+        assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!app.tray_resident_media_updates_needed());
+    }
+
+    #[test]
+    fn exit_fence_joins_the_mutation_worker_before_settings_persistence() {
+        let mut app = crate::app::setup_app_for_test();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = settings_restore::SettingsFamilyOperationTask::waiting_for_release_for_test(
+            release_rx,
+            std::sync::Arc::clone(&worker_finished),
+        );
+        app.settings_restore_state.family_operation = SettingsFamilyOperationState::Running {
+            action: PendingAction::Restore(BackupSource::Bak(1)),
+            task,
+            deferred_close: None,
+        };
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            release_tx.send(()).unwrap();
+        });
+
+        app.resolve_settings_family_operation_for_exit();
+
+        release.join().unwrap();
+        assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            app.settings_restore_state.family_operation,
+            SettingsFamilyOperationState::Idle
+        ));
+        let app_source = include_str!("../app.rs");
+        let on_exit = app_source
+            .find("fn on_exit(&mut self")
+            .expect("eframe on_exit owner");
+        let exit_source = &app_source[on_exit..];
+        assert!(
+            exit_source
+                .find("self.resolve_settings_family_operation_for_exit()")
+                .expect("settings-family exit fence")
+                < exit_source
+                    .find("self.on_exit_inner()")
+                    .expect("settings persistence boundary")
+        );
+    }
 
     #[test]
     fn operation_modal_size_is_clamped_to_the_viewport() {

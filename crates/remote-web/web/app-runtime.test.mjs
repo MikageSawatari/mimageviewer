@@ -172,6 +172,7 @@ const {
   reportContainerSpreadRefreshError,
   renderResolvedMediaOpen,
   remoteArchiveProgressText,
+  remoteArchiveTerminalMessage,
   remoteAiCompletionMessage,
   remoteAiProgressText,
   remoteAiPollingDelay,
@@ -3260,6 +3261,41 @@ test("spread waits for both pages and atomically replaces the page layer", async
   viewer.hideBoundaryMessage();
   assert.equal(viewer.boundaryMessage.hidden, true);
   viewer.destroy();
+});
+
+test("archive settings recovery terminal keeps the retry instruction visible", () => {
+  const message = "設定の復元またはリセット中です。完了後にもう一度開いてください";
+  assert.equal(remoteArchiveTerminalMessage({
+    state: "failed",
+    terminal: {
+      code: "settings_recovery_in_progress",
+      message,
+    },
+  }), message);
+});
+
+test("AI settings recovery terminal tells the user to retry without hiding the typed message", async () => {
+  const controller = new RemoteAiController(
+    { root: new FakeElement("section") },
+    new FakeElement("div"),
+    () => () => {}
+  );
+  const message = "設定の復元またはリセット中です。完了後にもう一度 AI 処理を実行してください";
+
+  await controller.handleSnapshot({
+    job_id: "settings-recovery-job",
+    request_id: "settings-recovery-request",
+    state: "failed",
+    terminal: {
+      code: "settings_recovery_in_progress",
+      message,
+    },
+  }, controller.generation);
+
+  assert.equal(controller.root.classList.contains("is-error"), true);
+  assert.equal(controller.message.textContent, message);
+  assert.equal(controller.shortLabel.textContent, "AI 完了");
+  controller.destroy();
 });
 
 test("singleton spread loadGroup keeps one DOM page and its virtual side through refit", async () => {

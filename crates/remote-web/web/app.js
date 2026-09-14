@@ -11774,6 +11774,14 @@ export function remoteArchiveProgressText(snapshot) {
   return parts.join(" · ");
 }
 
+export function remoteArchiveTerminalMessage(snapshot) {
+  return snapshot?.terminal?.message || (
+    snapshot?.state === "declined_by_user"
+      ? "変換しませんでした。"
+      : "アーカイブ操作を完了できませんでした。"
+  );
+}
+
 export function selectRecoverableRemoteArchiveJob(jobs, requestId) {
   if (!requestId) return null;
   return (Array.isArray(jobs) ? jobs : [])
@@ -12094,11 +12102,7 @@ export class RemoteArchiveOpenController {
   showTerminal(snapshot) {
     this.cancelOnDestroy = false;
     this.progress.hidden = true;
-    this.message.textContent = snapshot.terminal?.message || (
-      snapshot.state === "declined_by_user"
-        ? "変換しませんでした。"
-        : "アーカイブ操作を完了できませんでした。"
-    );
+    this.message.textContent = remoteArchiveTerminalMessage(snapshot);
     this.detail.textContent = "";
     this.root.classList.toggle("is-error", snapshot.state === "failed");
     const close = textElement("button", "閉じる", "archive-open-primary");

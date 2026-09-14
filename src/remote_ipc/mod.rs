@@ -15,6 +15,7 @@ mod video_stream;
 #[cfg(windows)]
 mod pipe;
 pub(crate) mod session;
+pub(crate) use live_favorites::RemoteSettingsReaderControl;
 pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
 
 #[cfg(test)]
@@ -359,10 +360,11 @@ pub(super) enum RemoteSortSettingsSource {
 }
 
 impl RemoteSortSettingsSource {
-    pub(super) fn load(&self) -> Result<crate::settings::SortOrder, String> {
+    pub(super) fn load(
+        &self,
+    ) -> Result<crate::settings::SortOrder, crate::settings_db::SettingsDbError> {
         match self {
-            Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order())
-                .map_err(|error| error.to_string()),
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order()),
             #[cfg(test)]
             Self::Snapshot(order) => Ok(*order),
         }
@@ -829,6 +831,17 @@ impl RemoteIpcServer {
         #[cfg(windows)]
         {
             self._guard.session_handle()
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("remote IPC server is Windows-only")
+        }
+    }
+
+    pub(crate) fn settings_reader_control(&self) -> RemoteSettingsReaderControl {
+        #[cfg(windows)]
+        {
+            self._guard.settings_reader_control()
         }
         #[cfg(not(windows))]
         {

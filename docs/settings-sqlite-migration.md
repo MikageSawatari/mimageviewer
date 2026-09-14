@@ -617,6 +617,26 @@ SHM / backup chain を変更せず、セッション全体の設定保存を抑�
 このガードは v2.6.0 からのため、既公開の v2.5.0 以前へ戻す場合は下記 10.5 の
 保存形式互換も併用する。
 
+#### 6.4.1 復元・完全リセット時の設定 family 排他所有
+
+`settings.db` の復元と完全リセットは、UI threadではなく専用workerでprocess-wideの
+settings-family lease domainをquiesceする。全`with_db*` closureとRemoteの常設
+`SettingsFavoritesReader`が同じdomainへ参加し、既存readの終了と常設readerのDropを確認した
+世代付きpermitだけがcheckpoint、`GLOBAL_DB`解放、WAL/SHM削除、main置換へ進める。
+`settings.db-shm`の共有違反だけを無視したり、固定delayで削除を再試行したりはしない。
+
+quiesce中に始まったRemoteの設定readと`SetSortOrder`は、in-memory設定を変える前に既存protocolの
+Busyを返す。画像decode、stream、別DBのwriteは止めない。ファイルを変更する前のrecoverable失敗は
+常設readerとlocal accessを再開し、再openだけが失敗した場合はFavorites依存requestだけを
+再試行可能なBusyに保つ。置換開始後の成功・terminal失敗ではdomainを閉じたままアプリ終了を要求し、
+古いin-memory設定が復元後のDBへ保存されることを防ぐ。所有境界と検証条件の正本は
+[`settings-recovery-234-231-plan.md`](settings-recovery-234-231-plan.md)に置く。
+
+Remote AIのReady公開は、最終設定再検証からregistry公開までの間にもquiesceが入り得るため、
+公開直前から完了までだけ短期leaseで囲む。設定family workerと再開retryはAppがJoinHandleごと所有し、
+通常frameでは完了済みだけを回収する。process終了closeはworker terminalまで保留して再発行し、
+tray-hidden中は既存wake bridgeでterminal観測を継続する。`on_exit`もsettings保存前に残taskをjoinする。
+
 ### 6.5 失敗 bootstrap の orphan cleanup
 
 `SettingsDb::create_new` または `save_full` が **bootstrap_complete マーカーを書く前**に

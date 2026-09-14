@@ -565,6 +565,39 @@ mod tests {
     }
 
     #[test]
+    fn settings_recovery_stops_archive_before_scan_with_retryable_terminal_detail() {
+        let _data_dir = crate::settings_db::DataDirOverrideGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("settings-recovery.7z");
+        std::fs::write(&source_path, b"must not be scanned").unwrap();
+        let session = SessionHandle::new();
+        let engine = Arc::new(super::super::container::ContainerEngine::new_with_session(
+            crate::settings::Settings::default(),
+            session.clone(),
+        ));
+        let executor = ContainerRemoteArchiveExecutor::new(engine, session);
+        let permit = crate::settings_db::quiesce_settings_family().unwrap();
+
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "settings-recovery".to_owned(),
+                source: RemoteAddress::file(source_path.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        permit.resume_local().unwrap();
+        assert!(matches!(
+            outcome,
+            RemoteArchiveExecutionOutcome::Failed(
+                RemoteArchiveTerminalCode::SettingsRecoveryInProgress,
+                message
+            ) if message.contains("もう一度")
+        ));
+    }
+
+    #[test]
     fn conversion_progress_high_water_never_moves_backwards() {
         let previous = RemoteArchiveProgress {
             files_done: 8,
@@ -1679,12 +1712,7 @@ impl ContainerRemoteArchiveExecutor {
         };
         let settings = match self.engine.settings_for_listing() {
             Ok(settings) => settings,
-            Err(_) => {
-                return failed(
-                    RemoteArchiveTerminalCode::ExecutionFailed,
-                    "最新のアーカイブ設定を読み込めませんでした",
-                );
-            }
+            Err(error) => return archive_settings_read_failed(error),
         };
         if settings.archive_file_handling_ignores_convertible() {
             return failed(
@@ -2012,5 +2040,21 @@ impl ContainerRemoteArchiveExecutor {
             drop(convert_guard);
             return cached_outcome(public_source, &resolved.canonical, fingerprint, destination);
         }
+    }
+}
+
+fn archive_settings_read_failed(
+    error: mimageviewer_ipc::RemoteWriteError,
+) -> RemoteArchiveExecutionOutcome {
+    if error.code == mimageviewer_ipc::RemoteWriteErrorCode::Busy {
+        failed(
+            RemoteArchiveTerminalCode::SettingsRecoveryInProgress,
+            "設定の復元またはリセット中です。完了後にもう一度開いてください",
+        )
+    } else {
+        failed(
+            RemoteArchiveTerminalCode::ExecutionFailed,
+            "最新のアーカイブ設定を読み込めませんでした",
+        )
     }
 }

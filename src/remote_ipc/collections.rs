@@ -34,10 +34,9 @@ enum CollectionSettingsSource {
 }
 
 impl CollectionSettingsSource {
-    fn load(&self) -> Result<Settings, String> {
+    fn load(&self) -> Result<Settings, crate::settings_db::SettingsDbError> {
         match self {
-            Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings())
-                .map_err(|error| error.to_string()),
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings()),
             #[cfg(test)]
             Self::Snapshot(settings) => Ok(settings.clone()),
         }
@@ -126,9 +125,9 @@ impl CollectionEngine {
         let sort_order = match self.sort_settings.load() {
             Ok(sort_order) => sort_order,
             Err(error) => {
-                return CollectionResponse::Error(internal_error(
+                return CollectionResponse::Error(collection_settings_error(
                     "最新の並び順を読み込めませんでした",
-                    error,
+                    &error,
                 ));
             }
         };
@@ -158,9 +157,9 @@ impl CollectionEngine {
     }
 
     fn load_settings(&self) -> Result<Settings, CollectionError> {
-        self.settings
-            .load()
-            .map_err(|error| internal_error("最新の一覧設定を読み込めませんでした", error))
+        self.settings.load().map_err(|error| {
+            collection_settings_error("最新の一覧設定を読み込めませんでした", &error)
+        })
     }
 
     /// Favorite search stays in CollectionEngine because it shares the response bound,
@@ -189,15 +188,22 @@ impl CollectionEngine {
             ));
         }
         let settings = self.load_settings()?;
-        let sort_order = self
-            .sort_settings
-            .load()
-            .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
+        let sort_order = self.sort_settings.load().map_err(|error| {
+            collection_settings_error("最新の並び順を読み込めませんでした", &error)
+        })?;
         let favorites = self.favorites.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
-                CollectionErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
+                if error.is_busy() {
+                    CollectionErrorCode::Busy
+                } else {
+                    CollectionErrorCode::Internal
+                },
+                if error.is_busy() {
+                    "設定の復旧中です。少し待ってから再試行してください"
+                } else {
+                    "最新の閲覧起点を読み込めませんでした"
+                },
             )
         })?;
         if !favorites
@@ -1431,10 +1437,39 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> CollectionErr
     CollectionError::new(CollectionErrorCode::Internal, context)
 }
 
+fn collection_settings_error(
+    context: &str,
+    error: &crate::settings_db::SettingsDbError,
+) -> CollectionError {
+    crate::logger::log(format!(
+        "remote_ipc: collection settings error context={context} error={error}"
+    ));
+    if matches!(
+        error,
+        crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+    ) {
+        CollectionError::new(
+            CollectionErrorCode::Busy,
+            "設定の復旧中です。少し待ってから再試行してください",
+        )
+    } else {
+        CollectionError::new(CollectionErrorCode::Internal, context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn settings_family_quiescing_maps_to_collection_busy() {
+        let error = collection_settings_error(
+            "最新の一覧設定を読み込めませんでした",
+            &crate::settings_db::SettingsDbError::SettingsFamilyQuiescing,
+        );
+        assert_eq!(error.code, CollectionErrorCode::Busy);
+    }
 
     fn test_remote_entry(path: impl Into<String>, name: impl Into<String>) -> RemoteEntry {
         RemoteEntry {

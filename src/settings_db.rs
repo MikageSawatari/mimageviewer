@@ -27,8 +27,10 @@
 //! - 複合テーブルは hash skip (VST3) や hot-path upsert (video_resume_positions)
 //!   などの最適化を別個に適用できる
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
@@ -120,6 +122,9 @@ pub enum SettingsDbError {
     /// `boot_settings_db` が FailedFallbackDefault を返したあとなど。`with_db` が
     /// この variant を返すと、Phase 3 caller は `save_full` を呼ばずに skip する。
     SaveSuppressed,
+    /// 設定の復元・完全リセットが settings.db family の排他的所有を取得中。
+    /// 呼び出し側は stale settings へ fallback せず、操作完了後に再試行する。
+    SettingsFamilyQuiescing,
     /// その他の rusqlite エラー。
     Rusqlite(rusqlite::Error),
     /// JSON ラウンドトリップ失敗。
@@ -144,6 +149,9 @@ impl std::fmt::Display for SettingsDbError {
                  refusing to bootstrap to avoid clobbering existing user data"
             ),
             Self::SaveSuppressed => write!(f, "save suppressed this session"),
+            Self::SettingsFamilyQuiescing => {
+                write!(f, "settings.db family is quiescing for recovery")
+            }
             Self::Rusqlite(e) => write!(f, "sqlite error: {e}"),
             Self::Serde(e) => write!(f, "serde_json error: {e}"),
             Self::Poisoned => write!(f, "settings db mutex poisoned"),
@@ -161,7 +169,8 @@ impl std::error::Error for SettingsDbError {
             | Self::Poisoned
             | Self::AlreadyBootstrapped
             | Self::AmbiguousFamilyPresence
-            | Self::SaveSuppressed => None,
+            | Self::SaveSuppressed
+            | Self::SettingsFamilyQuiescing => None,
         }
     }
 }
@@ -2013,6 +2022,10 @@ impl SettingsFavoritesReader {
         }
         Ok(Arc::clone(&self.favorites))
     }
+
+    pub(crate) fn cached(&self) -> Arc<Vec<FavoriteEntry>> {
+        Arc::clone(&self.favorites)
+    }
 }
 
 fn read_stable_favorites(conn: &Connection) -> Result<(i64, Vec<FavoriteEntry>), SettingsDbError> {
@@ -3748,6 +3761,178 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
 
 static GLOBAL_DB: Mutex<Option<(PathBuf, Arc<SettingsDb>)>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFamilyAccessPhase {
+    Active,
+    Quiescing(u64),
+    Quiesced(u64),
+}
+
+#[derive(Debug)]
+struct SettingsFamilyAccessState {
+    phase: SettingsFamilyAccessPhase,
+    active_outer_leases: usize,
+    next_generation: u64,
+}
+
+impl Default for SettingsFamilyAccessState {
+    fn default() -> Self {
+        Self {
+            phase: SettingsFamilyAccessPhase::Active,
+            active_outer_leases: 0,
+            next_generation: 1,
+        }
+    }
+}
+
+static SETTINGS_FAMILY_ACCESS: OnceLock<(Mutex<SettingsFamilyAccessState>, Condvar)> =
+    OnceLock::new();
+
+fn settings_family_access() -> &'static (Mutex<SettingsFamilyAccessState>, Condvar) {
+    SETTINGS_FAMILY_ACCESS.get_or_init(|| {
+        (
+            Mutex::new(SettingsFamilyAccessState::default()),
+            Condvar::new(),
+        )
+    })
+}
+
+thread_local! {
+    /// Nested `with_db` calls belong to the already admitted outer operation. Counting them as
+    /// separate process leases would deadlock the outer closure when quiescing starts midway.
+    static SETTINGS_FAMILY_READ_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII admission for one logical settings-family read/write operation.
+///
+/// The outermost lease contributes to the process-wide active count. Nested calls on the same
+/// thread only increment the thread-local depth and remain admitted even if quiescing begins after
+/// the outer call started.
+pub(crate) struct SettingsFamilyReadLease {
+    /// TLS depth must be released on the acquiring thread.
+    _not_send: PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for SettingsFamilyReadLease {
+    fn drop(&mut self) {
+        let became_zero = SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "settings-family lease depth underflow");
+            let next = current.saturating_sub(1);
+            depth.set(next);
+            next == 0
+        });
+        if !became_zero {
+            return;
+        }
+        let (state, changed) = settings_family_access();
+        let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        debug_assert!(state.active_outer_leases > 0);
+        state.active_outer_leases = state.active_outer_leases.saturating_sub(1);
+        if state.active_outer_leases == 0 {
+            changed.notify_all();
+        }
+    }
+}
+
+/// Admit one settings-family access without waiting. Remote's persistent favorites reader and the
+/// AI registry's final Ready-publication fence call this directly; ordinary DB callers are covered
+/// by `with_db` below.
+pub(crate) fn acquire_settings_family_read_lease()
+-> Result<SettingsFamilyReadLease, SettingsDbError> {
+    let nested = SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current == 0 {
+            false
+        } else {
+            depth.set(current.saturating_add(1));
+            true
+        }
+    });
+    if nested {
+        return Ok(SettingsFamilyReadLease {
+            _not_send: PhantomData,
+        });
+    }
+
+    let (state, _) = settings_family_access();
+    let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+    if state.phase != SettingsFamilyAccessPhase::Active {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    state.active_outer_leases = state.active_outer_leases.saturating_add(1);
+    drop(state);
+    SETTINGS_FAMILY_READ_DEPTH.with(|depth| depth.set(1));
+    Ok(SettingsFamilyReadLease {
+        _not_send: PhantomData,
+    })
+}
+
+/// Exclusive proof that every admitted settings-family access completed before a restore/reset.
+/// It is deliberately non-Clone and is validated by generation at each destructive boundary.
+pub(crate) struct SettingsFamilyMutationPermit {
+    generation: u64,
+}
+
+impl SettingsFamilyMutationPermit {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), SettingsDbError> {
+        let (state, _) = settings_family_access();
+        let state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if state.phase == SettingsFamilyAccessPhase::Quiesced(self.generation)
+            && state.active_outer_leases == 0
+        {
+            Ok(())
+        } else {
+            Err(SettingsDbError::SettingsFamilyQuiescing)
+        }
+    }
+
+    /// Reopen ordinary settings access after a family-unchanged/recoverable result.
+    pub(crate) fn resume_local(self) -> Result<(), SettingsDbError> {
+        let (state, changed) = settings_family_access();
+        let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if state.phase != SettingsFamilyAccessPhase::Quiesced(self.generation)
+            || state.active_outer_leases != 0
+        {
+            return Err(SettingsDbError::SettingsFamilyQuiescing);
+        }
+        state.phase = SettingsFamilyAccessPhase::Active;
+        changed.notify_all();
+        Ok(())
+    }
+}
+
+/// Block only the calling worker until all process-wide settings-family leases drain. The UI must
+/// never invoke this directly.
+pub(crate) fn quiesce_settings_family() -> Result<SettingsFamilyMutationPermit, SettingsDbError> {
+    if SETTINGS_FAMILY_READ_DEPTH.with(|depth| depth.get() != 0) {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    let (state, changed) = settings_family_access();
+    let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+    if state.phase != SettingsFamilyAccessPhase::Active {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    let generation = state.next_generation;
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    state.phase = SettingsFamilyAccessPhase::Quiescing(generation);
+    changed.notify_all();
+    while state.active_outer_leases != 0 {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.phase != SettingsFamilyAccessPhase::Quiescing(generation) {
+            return Err(SettingsDbError::SettingsFamilyQuiescing);
+        }
+    }
+    state.phase = SettingsFamilyAccessPhase::Quiesced(generation);
+    Ok(SettingsFamilyMutationPermit { generation })
+}
+
 /// 本セッションの save を完全に抑止するフラグ (Codex P2 v8b-3 2026-05-14)。
 ///
 /// `boot_settings_db` が `BootOutcome.db == None` を返すとき (= 全復旧経路が失敗)
@@ -3810,6 +3995,10 @@ pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
 /// - 内部 lock は `Arc<SettingsDb>` を clone する間だけ。closure 実行中は
 ///   global lock を持たない (= 並列 `with_db` がブロックしない)
 pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError> {
+    // Family ownership takes precedence over save suppression. Restore/reset intentionally turns
+    // suppression on after quiescing; Remote callers must continue to receive the retryable Busy
+    // classification throughout that mutation instead of an unrelated persistence failure.
+    let _family_lease = acquire_settings_family_read_lease()?;
     if save_suppressed() {
         return Err(SettingsDbError::SaveSuppressed);
     }
@@ -3873,7 +4062,7 @@ pub fn with_db_result<X>(
 ///
 /// `with_db` は通らず GLOBAL_DB から直接 Arc を取り出すので、`SAVE_SUPPRESSED` の
 /// 影響を受けない。`GLOBAL_DB` が None (= まだ boot していない) なら no-op。
-pub fn checkpoint_global_db() -> Result<(), SettingsDbError> {
+fn checkpoint_global_db() -> Result<(), SettingsDbError> {
     let arc: Option<Arc<SettingsDb>> = {
         let guard = GLOBAL_DB.lock().unwrap_or_else(|p| p.into_inner());
         guard.as_ref().map(|(_, a)| Arc::clone(a))
@@ -3881,6 +4070,26 @@ pub fn checkpoint_global_db() -> Result<(), SettingsDbError> {
     if let Some(arc) = arc {
         arc.checkpoint_truncate()?;
     }
+    Ok(())
+}
+
+/// Restore/reset-only checkpoint. The exclusive permit proves that no ordinary `with_db` closure
+/// or Remote favorites read can retain a concurrent settings-family handle.
+pub(crate) fn checkpoint_global_db_for_mutation(
+    permit: &SettingsFamilyMutationPermit,
+) -> Result<(), SettingsDbError> {
+    permit.validate()?;
+    checkpoint_global_db()
+}
+
+/// Restore/reset-only global handle release. Boot and test setup continue to use `set_global_db`;
+/// destructive family mutation must come through this generation-checked boundary.
+pub(crate) fn take_global_db_for_mutation(
+    data_dir: &Path,
+    permit: &SettingsFamilyMutationPermit,
+) -> Result<(), SettingsDbError> {
+    permit.validate()?;
+    set_global_db(data_dir, None);
     Ok(())
 }
 
@@ -3893,6 +4102,22 @@ pub fn reset_global_for_test() {
     if let Ok(mut guard) = GLOBAL_DB.lock() {
         *guard = None;
     }
+    SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+        assert_eq!(
+            depth.get(),
+            0,
+            "settings-family lease leaked on the test thread"
+        );
+    });
+    let (state, changed) = settings_family_access();
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    assert_eq!(
+        state.active_outer_leases, 0,
+        "settings-family lease leaked across test isolation"
+    );
+    state.phase = SettingsFamilyAccessPhase::Active;
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    changed.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -7161,6 +7386,80 @@ mod tests {
         assert_eq!(outcome.source, BootSource::CleanInstall);
         assert!(!save_suppressed());
         with_db(|_db| ()).expect("with_db should succeed after a fresh boot");
+    }
+
+    #[test]
+    fn settings_family_nested_leases_release_on_last_drop_even_out_of_order() {
+        let _guard = DataDirOverrideGuard::new();
+        let outer = acquire_settings_family_read_lease().expect("outer lease");
+        let inner = acquire_settings_family_read_lease().expect("nested lease");
+        drop(outer);
+        SETTINGS_FAMILY_READ_DEPTH.with(|depth| assert_eq!(depth.get(), 1));
+        {
+            let (state, _) = settings_family_access();
+            let state = state.lock().unwrap();
+            assert_eq!(state.active_outer_leases, 1);
+            assert_eq!(state.phase, SettingsFamilyAccessPhase::Active);
+        }
+        drop(inner);
+        SETTINGS_FAMILY_READ_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+        let (state, _) = settings_family_access();
+        assert_eq!(state.lock().unwrap().active_outer_leases, 0);
+    }
+
+    #[test]
+    fn settings_family_quiesce_drains_existing_outer_and_rejects_new_thread() {
+        let _guard = DataDirOverrideGuard::new();
+        let active = acquire_settings_family_read_lease().expect("active lease");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            tx.send(quiesce_settings_family()).unwrap();
+        });
+        {
+            let (state, changed) = settings_family_access();
+            let mut state = state.lock().unwrap();
+            while matches!(state.phase, SettingsFamilyAccessPhase::Active) {
+                state = changed.wait(state).unwrap();
+            }
+            assert!(matches!(
+                state.phase,
+                SettingsFamilyAccessPhase::Quiescing(_)
+            ));
+        }
+        let rejected = std::thread::spawn(|| {
+            matches!(
+                acquire_settings_family_read_lease(),
+                Err(SettingsDbError::SettingsFamilyQuiescing)
+            )
+        })
+        .join()
+        .expect("admission thread");
+        assert!(rejected, "new thread must be rejected while quiescing");
+        assert!(
+            rx.try_recv().is_err(),
+            "quiesce must wait for the active lease"
+        );
+        drop(active);
+        let permit = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("quiesce completion")
+            .expect("mutation permit");
+        permit.validate().expect("current generation");
+        permit.resume_local().expect("resume active domain");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn settings_family_busy_precedes_save_suppression_during_mutation() {
+        let _guard = DataDirOverrideGuard::new();
+        let permit = quiesce_settings_family().expect("mutation permit");
+        set_save_suppressed(true);
+        assert!(matches!(
+            with_db(|_| ()),
+            Err(SettingsDbError::SettingsFamilyQuiescing)
+        ));
+        set_save_suppressed(false);
+        permit.resume_local().expect("resume active domain");
     }
 
     /// 2026-05-17 事故ガード回帰テスト: `with_db` は `GLOBAL_DB` の dir と

@@ -36,6 +36,9 @@ const REMOTE_KEY_EXPIRY_WARNING_DAYS: i64 = 30;
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
     handle: Option<SessionHandle>,
+    /// Process-global settings-family reader owner. It belongs to the Remote server lifetime,
+    /// not to any mounted/detached viewer context.
+    settings_reader_control: Option<super::RemoteSettingsReaderControl>,
     remote_service_status: Option<super::RemoteServiceStatus>,
     remote_service_control: Option<super::RemoteServiceControl>,
     last_acquisition_sequence: u64,
@@ -652,6 +655,19 @@ impl crate::app::App {
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
         self.remote_session_ui.handle = Some(handle);
+    }
+
+    pub(crate) fn set_remote_settings_reader_control(
+        &mut self,
+        control: super::RemoteSettingsReaderControl,
+    ) {
+        self.remote_session_ui.settings_reader_control = Some(control);
+    }
+
+    pub(crate) fn remote_settings_reader_control(
+        &self,
+    ) -> Option<super::RemoteSettingsReaderControl> {
+        self.remote_session_ui.settings_reader_control.clone()
     }
 
     pub(crate) fn set_remote_service_control(
@@ -1811,6 +1827,32 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        let _settings_family_lease = if remote_write_uses_settings_family(pending.request()) {
+            match crate::settings_db::acquire_settings_family_read_lease() {
+                Ok(lease) => Some(lease),
+                Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing) => {
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::Busy,
+                        "設定の復旧中です。少し待ってから再試行してください",
+                    )));
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: settings-family write admission failed: {error}"
+                    ));
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "設定の保存準備に失敗しました",
+                    )));
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if matches!(
             pending.request(),
             RemoteWriteRequest::SetBookmark { .. }
@@ -3481,6 +3523,29 @@ impl crate::app::App {
     }
 }
 
+/// Exhaustive admission classifier for Remote UI writes. Only `SetSortOrder` mutates
+/// settings.db through the in-memory `Settings` mirror; the remaining variants belong to other
+/// databases or read-only response paths and stay available during settings recovery.
+fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
+    match request {
+        RemoteWriteRequest::SetSortOrder { .. } => true,
+        RemoteWriteRequest::SetSpread { .. }
+        | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
+        | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+        | RemoteWriteRequest::RecordReadingProgress { .. }
+        | RemoteWriteRequest::SetRating { .. }
+        | RemoteWriteRequest::SetBookmark { .. }
+        | RemoteWriteRequest::GetItemState { .. }
+        | RemoteWriteRequest::ListBookBookmarks { .. }
+        | RemoteWriteRequest::SetBookBookmarkTitle { .. }
+        | RemoteWriteRequest::RemoveBookBookmark { .. }
+        | RemoteWriteRequest::SetAdjustment { .. }
+        | RemoteWriteRequest::GetAdjustmentState { .. }
+        | RemoteWriteRequest::SetViewTrim { .. }
+        | RemoteWriteRequest::GetViewTrimState { .. } => false,
+    }
+}
+
 fn remote_spread_key(
     address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<crate::spread_db::SpreadContainerKey, RemoteWriteError> {
@@ -4048,6 +4113,25 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_remote_sort_write_uses_settings_family() {
+        assert!(remote_write_uses_settings_family(
+            &RemoteWriteRequest::SetSortOrder {
+                scope: mimageviewer_ipc::RemoteGridScope::Address {
+                    address: mimageviewer_ipc::RemoteAddress::file("C:/Books"),
+                },
+                sort_order: "FileName".to_owned(),
+            }
+        ));
+        assert!(!remote_write_uses_settings_family(
+            &RemoteWriteRequest::SetSpread {
+                address: mimageviewer_ipc::RemoteAddress::file("C:/Books/book.pdf"),
+                spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+            }
+        ));
+    }
 
     const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
         "リモート閲覧を有効にすると、",

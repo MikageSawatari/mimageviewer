@@ -47,11 +47,14 @@ active count が 0 になった後、action worker が唯一の production `Live
 同じ thread で `with_db` closure から別の `with_db` へ再入する場合は、thread-local な depth
 で外側の同一 lease へ束ねる。外側 lease が Active 中に取得済みなら nested access を完了でき、
 process-wide の active count は 1 のままなので自己 deadlock しない。外側 lease がない thread
-から Quiescing 中に来た新規 access だけを待たずに拒否する。
+から Quiescing 中に来た新規 access だけを待たずに拒否する。read lease は取得 thread から
+移動できない型とし、同一 thread 内で guard が取得順と逆でない順序で Drop されても、TLS depth が
+0 になった最後の guard だけが process-wide count を減らす。`SAVE_SUPPRESSED` と quiesce が同時に
+有効な mutation 中は family Busy を優先して返し、Remote の再試行可能性を失わない。
 
 lock 順は固定する。request は domain mutex から lease を得て mutex を解放してから
 `LiveFavorites` mutex または `GLOBAL_DB` / SQLite へ入る。lease Drop 時には SQLite と
-source mutex を先に解放してから domain active count を減らす。control worker は domain
+source mutex を先に解放してから domain active count を減らす。action worker は domain
 mutex を解放して active=0 を待ち、最後に source mutex を取って persistent reader を落とす。
 settings mutation worker は ACK 後に発行された非Cloneの `SettingsFamilyMutationPermit` を
 要求され、permit無しでは production の restore/reset family mutationを呼べない。mutation
@@ -65,12 +68,12 @@ reader を落とした後は、既存の checkpoint、WAL の strict 除去、ma
 sharing violation が出た場合は、別 process や短期の別 owner による通常の I/O failure として
 扱い、「内部 Remote reader を閉じられなかった」とは断定しない。
 
-quiesce は UI thread で mutex、condvar、worker join を待たない。復元ダイアログの操作を
-`Idle -> Quiescing -> Mutating -> Resuming -> Result` の一つの状態所有へまとめ、control と
-mutation worker の event を poll する。世代が違う ACK/result は破棄する。server 不在は
-`NoRemoteOwner` として直ちに mutation へ進み、server startup failureも同じく DB owner が
-存在しないことを表す。quiesce command の送信失敗や control worker failure は family 未変更の
-`Recoverable` として表示する。
+quiesce は UI thread で mutex、condvar、worker join を待たない。復元ダイアログは
+`Idle / Running / RemoteUnavailable` の一つの型付きstateを持ち、`Running` が所有するworker内で
+`Quiescing -> reader drop -> Mutating -> Resuming -> Result` を直列化する。worker完了はchannelと
+repaint requestでUIへ返し、UIは結果だけをpollする。server不在はpersistent ownerなしとして
+process-wide leaseだけをdrainしてmutationへ進む。server startup failureも、下記rollback完了後だけ
+同じ扱いにできる。worker起動失敗はfamily未変更の`Recoverable`として表示する。
 
 mutation worker は既存 `RestoreFailure` の「family を触る前なら Recoverable、触った後なら
 Terminal」を保つ。operation owner は `ReaderRelease::{NotStarted, ConfirmedDropped}` と
@@ -90,8 +93,8 @@ process-wide domain再開後に通常の`with_db`で現DBを読み、個別I/O�
 settings responseを再試行でき、resume後は同じsessionの次requestから通常応答へ戻る。
 
 process-wide domain は `settings_db`、persistent reader controlは `ServerGuard` が所有し、Appは
-opaque control handleだけをoperation workerへ渡す。Appはsettings restore UIのconfirm後にだけ
-世代を払い出す。閉じる/cancelはaction開始前だけ従来どおりで、Quiescing以後はstate ownerが
+opaque control handleだけをoperation workerへ渡す。settings restore UIのconfirm後にworkerが
+domain世代を払い出す。閉じる/cancelはaction開始前だけ従来どおりで、Quiescing以後はstate ownerが
 最終 Result までactionを保持する。server shutdownはreader ownerを通常dropし、stale世代の
 pause/resumeは拒否する。server不在時もprocess-wide domainは必ずdrainし、local短期accessを
 残したままmutation permitを発行しない。
@@ -109,6 +112,19 @@ home / favorite search / tag browse とsortは`CollectionErrorCode::Busy`、read
 従来のInternal/PersistenceFailedへ写す。`LiveFavorites`も同じtyped Busyを返す。各protocolの
 直接回帰で、quiesce中にstartup snapshotへfallbackしないことを固定する。
 
+短期readを長いjobの準備段階から使う2経路も、一時的Busyを通常の実行失敗へ潰さない。
+Remote archiveはlisting設定を読む前に変換・列挙を始めず、Remote AIは補正設定を読む
+composite準備で止める。job自体を待機・自動再試行したり、長い処理中にfamily leaseを保持したり
+せず、IPC protocol v55の`settings_recovery_in_progress` terminal detailで終了し、Web側へ
+「復元またはリセット完了後にもう一度実行」のmessageをそのまま表示する。通常の
+`MediaErrorCode::Busy`（取消・supersede等）とはcore内部のtyped composite errorで区別し、
+archive/AIの各job registryまで専用terminal codeが届くことを直接回帰する。
+
+Remote AI は最終 composite 再検証だけでなく、`Completed` を registry の Ready として公開する
+直前にも短い settings-family read lease を取得し、`registry.complete` が終わるまで保持する。
+再検証後に quiesce が先行した場合は `settings_recovery_in_progress` で終了し、公開leaseが先行した
+場合はmutation側が Ready 公開完了まで待つ。AI計算全体やarchive job全体へleaseを広げない。
+
 UI threadへ届くRemote writeでは、settings familyを変更する`SetSortOrder`だけをproductionの
 exhaustive classifierで識別する。Quiescing以後は`apply_remote_write`を呼ぶ前に
 `RemoteWriteErrorCode::Busy`を返し、in-memory `self.settings.sort_order`もdiskも変えない。
@@ -116,10 +132,10 @@ Spread、Bookmark、Rating、ViewTrimなど別DB ownerのwriteとVideoStream req
 処理する。全`RemoteWriteRequest` variantのclassifier回帰で、将来settings-family variantが
 無分類で追加されることを検出する。
 
-quiesce を操作側で cancel する場合は family 未変更の間だけ許し、同 generation の persistent
-reader を resume してから domain を Active へ戻す。古い ACK、timeout 扱い、channel 切断では
-mutation へ進まない。元の save-suppression 値も family 未変更の Recoverable 経路で復元する。
-worker 待機は UI thread 外で condvar/event を使い、UI 側へ固定 delay や polling I/O を
+action開始後の取消は追加せず、既存どおり完了結果までmodal ownerが保持する。reader dropを
+確認できない場合、worker panic、結果channel切断ではmutationへ進めず、または
+`MayHaveTouched`として終了を要求する。元のsave-suppression値はfamily未変更のRecoverable経路で
+復元する。worker待機はUI thread外でcondvar/eventを使い、UI側へ固定delayやpolling I/Oを
 追加しない。
 
 回帰は TempDir の WAL DB と fake lease backend で行う。少なくとも、上表の全 consumer が
@@ -138,6 +154,42 @@ test の `DataDirOverrideGuard` / `reset_global_for_test` は global DB だけ�
 active count も隔離する。guard 取得下で active=0 を確認して Active へ戻し、Quiesced 世代や
 thread-local depth を後続 test へ漏らさない。nested read、Quiescing 中の別 thread 拒否、外側
 取得済み nested 完了、stale permit 拒否を pure / TempDir 回帰に含める。
+
+2026-09-14 実装 checkpoint: `settings_db` に process-wide lease domain と非 `Send` の
+read guard、世代付き non-Clone mutation permit を実装した。`with_db*` は save 抑止判定や
+`GLOBAL_DB` clone より前に lease を取得し、nested guard は Drop 順に依存せず同threadで最後に
+残った guard が process active count を 1 回だけ減らす。Remote の短期 read 6 系統は既存の
+protocol別 Busyへ写し、UI write は `SetSortOrder` だけを apply 前に拒否する。
+
+`LiveFavorites` は production の常設 readerを `Live / Paused / ResumeFailed` で所有し、
+同じ世代の mutation permitだけがtake/dropと再openを実行できる。再open失敗時はlocal domainと
+短期readを戻し、Favoritesだけを明示再試行までBusyにする。`RemoteIpcServer::start` はreader生成後の
+全workerをstartup rollback ownerへ載せ、途中のspawn失敗でも停止・join・clone解放を終えてから
+Errを返す。復元ダイアログはworkerを起動して即returnし、UIはchannelをpollするだけである。
+
+mutation worker とFavorites再開retryは、結果receiverだけでなく`JoinHandle`も同じtyped App stateが
+所有する。通常frameは`is_finished`確認後だけjoinするため待機しない。worker実行中にprocess終了へ
+至るroot closeを受けた場合は、通常の「閉じてtrayへ格納」は従来どおり処理し、実際にprocessを
+終了するwindow close / tray Exitだけをtyped intentとして保持して`CancelClose`する。tray-hidden時は
+このdeferred closeを既存のhidden-root wake projectionへ同じframeで反映し、terminal観測後に元の
+close intentを再発行する。`on_exit`先頭にも最終fenceを置き、通常close frameを迂回した終了でも
+worker/retryをjoinしてからsettings save/flushへ進む。結果channelの受信だけをthread完了とは扱わず、
+panic・切断時はsave抑止を解除しない。
+
+production caller scanでは、`restore_from_with_permit` / `full_reset_with_permit` は
+`run_settings_family_operation`だけから呼ばれ、`checkpoint_global_db_for_mutation` /
+`take_global_db_for_mutation`もこの2関数内だけにある。`settings_restore::read_summary`のlocal
+`Connection`は同期`list_backups`のprivate helperであり、各反復の末尾でDropされてから
+`open_settings_restore_dialog`が戻る。action workerが始まるのは後続のconfirm後なので、この一覧用
+接続はmutationと重ならない。settings familyを直接開く残りのproduction経路は起動時boot、
+permit内の復元候補scratch検証、またはpermit内のfamily mutationに限定される。
+
+TempDir回帰では、実 `SettingsFavoritesReader` のread-only接続を保持したまま開始した復元と
+完全リセットが、lease drainとreader drop後にWAL/SHMを含むfamily操作を完了することを確認した。
+recoverable結果、resume失敗と明示retry、成功後の閉鎖、nested/out-of-order Drop、Busy変換、
+startup rollbackもheadlessで固定した。AI Ready公開とquiesceの両順序、process終了closeの保留と
+再発行、tray-hidden wake、`on_exit`のjoin-before-persistenceもbarrier / synthetic workerで固定した。
+通常プロファイルと既存portableの設定は使用しない。
 
 ## §1.231 の修正境界
 
@@ -163,3 +215,39 @@ version 不一致、通常の版跨ぎ、同版再起動を固定する。
 最終の手動確認が必要な場合も `scripts/prepare-portable-smoke.ps1` で作る
 `target/portable-smoke/data` だけを使用し、通常 `%APPDATA%\mimageviewer` と既存 portable は
 使わない。portable の実行は別途承認された時間帯・操作範囲に限る。
+
+2026-09-14 最終自動検証では、settings-family 9件、終了lifecycle 6件、Remote jobの
+settings-recovery境界 5件のfocused回帰がpassした。`cargo check -p mimageviewer --bin
+mimageviewer-core`、fmt、UI glyph、viewer-context audit、diff-checkもpassした。最終
+`scripts/test-full.ps1`はmain 8410 pass / 0 fail / 45 ignored、snapshot 50、workspace・
+integration・doc・vendorを含めてexit 0だった。完全ログは
+`target/section234-settings-recovery-20260914/test-full-final.{stdout.log,stderr.log,exit.txt}`へ
+保存した。
+
+resident不在を確認して`scripts/build-dev.ps1 -PreserveRuntime`を実行し、同じprotocol v55
+sourceからcoreとRemote serviceをともに生成した。exit 0、core SHA-256は
+`51C2694DA2DC24AE4670E03354DD9206BB8916BAC96934EF5FE8CEE69C8B257C`、Remoteは
+`192E2F800704A833C46831C2A42C47F24558B17A19C80F3DC23BEC21CE7D057D`である。agentは
+通常profileのアプリを起動・停止していない。承認済みの実機確認には別途current sourceの
+`portable,test-script`成果物を`target/portable-smoke`へ作り、通常profileと既存portableを
+使わないfixtureを配置した。
+
+2026-09-14朝の実機検証: 利用者の18:30までのPC操作了承のもと、本人が起動した上記portableを
+skyで操作した。新版内容999.0.0の`preupgrade-vunknown`候補は利用不可表示で、無効ボタンを押しても
+確認画面へ進まないことを確認した。起動時の世代回転後、読み取り専用で期待markerを照合したbak2を
+復元し、成功表示と終了を確認。`portable-verify-restore.*`は1/1 passで、期待favorite、旧favorite不在、
+操作前の退避、WAL/SHM不在を検査した。続く完全リセットも成功表示・終了し、
+`portable-verify-reset.*`は1/1 passでactive db/WAL/SHM/bak1..10不在と退避を確認した。
+リセットの退避名も製品の既存規則どおり`before-restore-*`であり、fixture側の誤った
+`before-reset`期待だけを修正した。製品変更・全体テストの再実行はしていない。
+
+初回markerのliveは安全なDrives+last_seen=Noneをseedした状態で保留。利用者が外出済みのため
+最後の起動は後にすると回答した。追加起動は行わず、復元・完全リセットの成功とは分けて残す。
+起動前に検証担当が誤って実行した`VerifyClean`のNone判定失敗は、未起動のseed状態を見たもので
+製品不具合・実機結果として採用しない。clean DB不在からの初期化はheadless証拠と区別する。
+
+ツール境界の記録: 最初のsky裸の絶対pathによるlaunch要求は、インストール済み通常版へ誤解決し、
+意図せずAPPDATA runtimeのプロセスが起動した。直ちにUI操作を停止して利用者へ報告し、本人が通常版を
+終了して正しいportableを手動起動した。通常版での復元・リセット操作はしていないが、起動による
+通常設定の自動保存は否定しない。以後の操作対象はprocess pathとfixture markerを照合したportableのみ。
+Web Remote serviceの別プロセス起動は観測しておらず、core内常設IPC readerの検証と区別する。

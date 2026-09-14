@@ -9,8 +9,9 @@
 //! UI 側 ([`crate::ui_dialogs::settings_restore`]) は復元後に
 //! `ViewportCommand::Close` でアプリを終了する前提で組み立てる (= 復元直後に in-memory
 //! settings が古いまま `save_full` が走ると、せっかく上書きした `settings.db` を
-//! 二次的に踏み潰す事故が起きる)。本モジュールはファイル操作だけで完結させ、
-//! `with_db` / `GLOBAL_DB` の状態を直接いじらない。
+//! 二次的に踏み潰す事故が起きる)。本モジュールは worker 上で process-wide の
+//! settings-family permit を取得し、全 `with_db` access と Remote の永続 reader が
+//! 解放されたことを確認してから `GLOBAL_DB` とファイルを一体で切り替える。
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -181,6 +182,272 @@ impl std::fmt::Display for RestoreFailure {
 
 impl std::error::Error for RestoreFailure {}
 
+#[derive(Clone, Debug)]
+pub(crate) enum SettingsFamilyAction {
+    Restore(BackupSource),
+    FullReset,
+}
+
+#[derive(Debug)]
+pub(crate) enum SettingsFamilySuccess {
+    Restore {
+        source: BackupSource,
+        report: RestoreReport,
+    },
+    FullReset(ResetReport),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderRelease {
+    NotStarted,
+    ConfirmedDropped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationProof {
+    NotEntered,
+    RecoverableProven,
+    MayHaveTouched,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteFavoritesRetry {
+    control: crate::remote_ipc::RemoteSettingsReaderControl,
+    generation: u64,
+}
+
+impl RemoteFavoritesRetry {
+    pub(crate) fn retry(&self) -> Result<(), String> {
+        self.control.retry_resume(self.generation)
+    }
+}
+
+pub(crate) struct SettingsFamilyOperationResult {
+    pub(crate) outcome: Result<SettingsFamilySuccess, RestoreFailure>,
+    pub(crate) reader_release: ReaderRelease,
+    pub(crate) mutation: MutationProof,
+    pub(crate) remote_retry: Option<RemoteFavoritesRetry>,
+    pub(crate) remote_resume_error: Option<String>,
+}
+
+pub(crate) enum SettingsFamilyOperationPoll {
+    Running,
+    Completed(SettingsFamilyOperationResult),
+    WorkerFailed(String),
+}
+
+/// Owns the settings-family mutation worker until either a nonblocking UI poll observes that the
+/// thread has finished or the process-exit boundary explicitly drains it. Receiving the result is
+/// not itself proof that the worker returned, so the join handle remains part of this one owner.
+pub(crate) struct SettingsFamilyOperationTask {
+    receiver: std::sync::mpsc::Receiver<SettingsFamilyOperationResult>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SettingsFamilyOperationTask {
+    #[cfg(test)]
+    pub(crate) fn waiting_for_release_for_test(
+        release: std::sync::mpsc::Receiver<()>,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (tx, receiver) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            release.recv().expect("test releases operation task");
+            tx.send(SettingsFamilyOperationResult {
+                outcome: Err(RestoreFailure::Recoverable(RestoreError::SourceMissing(
+                    PathBuf::from("settings.db.bak1"),
+                ))),
+                reader_release: ReaderRelease::NotStarted,
+                mutation: MutationProof::NotEntered,
+                remote_retry: None,
+                remote_resume_error: None,
+            })
+            .expect("test operation owner receives result");
+            finished.store(true, std::sync::atomic::Ordering::Release);
+        });
+        Self {
+            receiver,
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) fn poll_finished(&mut self) -> SettingsFamilyOperationPoll {
+        let Some(handle) = self.handle.as_ref() else {
+            return SettingsFamilyOperationPoll::WorkerFailed(
+                "設定復旧 worker の所有権が失われました".to_owned(),
+            );
+        };
+        if !handle.is_finished() {
+            return SettingsFamilyOperationPoll::Running;
+        }
+        let handle = self.handle.take().expect("checked above");
+        if handle.join().is_err() {
+            crate::settings_db::set_save_suppressed(true);
+            return SettingsFamilyOperationPoll::WorkerFailed(
+                "設定復旧 worker が予期せず終了しました".to_owned(),
+            );
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => SettingsFamilyOperationPoll::Completed(result),
+            Err(error) => {
+                crate::settings_db::set_save_suppressed(true);
+                SettingsFamilyOperationPoll::WorkerFailed(format!(
+                    "設定復旧 worker の結果を確認できませんでした: {error}"
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn finish_for_exit(mut self) -> Result<SettingsFamilyOperationResult, String> {
+        let Some(handle) = self.handle.take() else {
+            crate::settings_db::set_save_suppressed(true);
+            return Err("設定復旧 worker の所有権が失われました".to_owned());
+        };
+        if handle.join().is_err() {
+            crate::settings_db::set_save_suppressed(true);
+            return Err("設定復旧 worker が終了処理中に予期せず終了しました".to_owned());
+        }
+        self.receiver.recv().map_err(|error| {
+            crate::settings_db::set_save_suppressed(true);
+            format!("設定復旧 worker の終了結果を確認できませんでした: {error}")
+        })
+    }
+}
+
+fn operation_error(message: impl Into<String>) -> RestoreError {
+    RestoreError::ValidationFailed(message.into())
+}
+
+/// Start the complete settings-family ownership transition on a worker. The UI only polls the
+/// returned channel; quiesce, SQLite checkpoint/replacement and persistent-reader reopen never
+/// run on the UI thread.
+pub(crate) fn start_settings_family_operation(
+    data_dir: PathBuf,
+    action: SettingsFamilyAction,
+    remote_control: Option<crate::remote_ipc::RemoteSettingsReaderControl>,
+    request_repaint: std::sync::Arc<dyn Fn() + Send + Sync + 'static>,
+) -> Result<SettingsFamilyOperationTask, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name("settings-family-mutation".to_owned())
+        .spawn(move || {
+            let result = run_settings_family_operation(&data_dir, action, remote_control);
+            let _ = tx.send(result);
+            request_repaint();
+        })
+        .map_err(|error| format!("設定復旧 worker を開始できません: {error}"))?;
+    Ok(SettingsFamilyOperationTask {
+        receiver: rx,
+        handle: Some(handle),
+    })
+}
+
+fn run_settings_family_operation(
+    data_dir: &Path,
+    action: SettingsFamilyAction,
+    remote_control: Option<crate::remote_ipc::RemoteSettingsReaderControl>,
+) -> SettingsFamilyOperationResult {
+    let permit = match crate::settings_db::quiesce_settings_family() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return SettingsFamilyOperationResult {
+                outcome: Err(RestoreFailure::Recoverable(operation_error(format!(
+                    "設定DBの排他的所有を開始できませんでした: {error}"
+                )))),
+                reader_release: ReaderRelease::NotStarted,
+                mutation: MutationProof::NotEntered,
+                remote_retry: None,
+                remote_resume_error: None,
+            };
+        }
+    };
+
+    if let Some(control) = remote_control.as_ref()
+        && let Err(error) = control.pause(&permit)
+    {
+        // The persistent reader's drop acknowledgement is unknown. Keep the family closed and
+        // require restart; mutating or reopening ordinary access here would reintroduce the race.
+        return SettingsFamilyOperationResult {
+            outcome: Err(RestoreFailure::Terminal(operation_error(format!(
+                "リモート設定readerの解放を確認できませんでした: {error}"
+            )))),
+            reader_release: ReaderRelease::NotStarted,
+            mutation: MutationProof::NotEntered,
+            remote_retry: None,
+            remote_resume_error: None,
+        };
+    }
+    let reader_release = ReaderRelease::ConfirmedDropped;
+
+    let mutation_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match action {
+        SettingsFamilyAction::Restore(source) => {
+            restore_from_with_permit(data_dir, &source, &permit)
+                .map(|report| SettingsFamilySuccess::Restore { source, report })
+        }
+        SettingsFamilyAction::FullReset => {
+            full_reset_with_permit(data_dir, &permit).map(SettingsFamilySuccess::FullReset)
+        }
+    }));
+
+    let outcome = match mutation_result {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return SettingsFamilyOperationResult {
+                outcome: Err(RestoreFailure::Terminal(operation_error(
+                    "設定ファイルの変更中に予期しないエラーが発生しました",
+                ))),
+                reader_release,
+                mutation: MutationProof::MayHaveTouched,
+                remote_retry: None,
+                remote_resume_error: None,
+            };
+        }
+    };
+
+    if !matches!(&outcome, Err(RestoreFailure::Recoverable(_))) {
+        return SettingsFamilyOperationResult {
+            outcome,
+            reader_release,
+            mutation: MutationProof::MayHaveTouched,
+            remote_retry: None,
+            remote_resume_error: None,
+        };
+    }
+
+    let (remote_retry, remote_resume_error) = match remote_control {
+        Some(control) => match control.resume_after_mutation(&permit) {
+            Ok(()) => (None, None),
+            Err(error) => (
+                Some(RemoteFavoritesRetry {
+                    control,
+                    generation: permit.generation(),
+                }),
+                Some(error),
+            ),
+        },
+        None => (None, None),
+    };
+    if let Err(error) = permit.resume_local() {
+        return SettingsFamilyOperationResult {
+            outcome: Err(RestoreFailure::Terminal(operation_error(format!(
+                "設定DBの通常アクセスを再開できませんでした: {error}"
+            )))),
+            reader_release,
+            mutation: MutationProof::MayHaveTouched,
+            remote_retry: None,
+            remote_resume_error,
+        };
+    }
+
+    SettingsFamilyOperationResult {
+        outcome,
+        reader_release,
+        mutation: MutationProof::RecoverableProven,
+        remote_retry,
+        remote_resume_error,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 一覧
 // ──────────────────────────────────────────────────────────────────────
@@ -343,9 +610,10 @@ fn count_table(conn: &Connection, table: &str) -> Result<usize, String> {
 /// 状態で失敗 return → アプリが続行 → 次回起動時に SQLite が salt mismatch で
 /// confused になる可能性がある。WAL/SHM 削除が失敗した場合は **main 未変更** なので
 /// 退路がある (= 次回起動で同じ settings.db を再 open するだけ)。
-pub fn restore_from(
+pub(crate) fn restore_from_with_permit(
     data_dir: &Path,
     source: &BackupSource,
+    permit: &crate::settings_db::SettingsFamilyMutationPermit,
 ) -> Result<RestoreReport, RestoreFailure> {
     // 設定ブート保護モーダルから呼ばれた場合は既に true。Recoverable 失敗時に
     // false へ固定すると、読み込めなかった設定 DB に既定値を書き戻せる状態へ
@@ -386,7 +654,7 @@ pub fn restore_from(
     //    (旧版は best-effort + log だったが、checkpoint 不完全のまま WAL を削除すると
     //    user の直近設定が永久に失われる。)
     if !source.is_current() {
-        if let Err(e) = crate::settings_db::checkpoint_global_db() {
+        if let Err(e) = crate::settings_db::checkpoint_global_db_for_mutation(permit) {
             crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
             return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
                 format!("復元前の WAL チェックポイント (PRAGMA wal_checkpoint) に失敗: {e}"),
@@ -394,13 +662,16 @@ pub fn restore_from(
         }
     }
 
-    // 5. GLOBAL_DB を None にして、生きている SQLite ハンドルを drop する。
-    //    SettingsDb の Arc が他 (= 別スレッドの with_db closure 内) に
-    //    クローンされている可能性があるが、SAVE_SUPPRESSED が立っているので
-    //    新規の with_db は走らず、in-flight のは数 ms で終わる前提
-    //    (本アプリの save は user 操作起点で長時間 hold しない)。万一残っていても
-    //    後段の retry で吸収する。
-    crate::settings_db::set_global_db(data_dir, None);
+    // 5. GLOBAL_DB を None にして、最後の通常 SQLite handle を drop する。
+    //    mutation permit は全 `with_db` closure の lease drain と Remote 永続 reader の
+    //    drop ACK 後にだけここへ届くため、時間見積もりや rename retry を排他証明として
+    //    使わない。
+    if let Err(error) = crate::settings_db::take_global_db_for_mutation(data_dir, permit) {
+        crate::settings_db::set_save_suppressed(save_suppressed_before_restore);
+        return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
+            format!("設定DBの排他的所有を確認できませんでした: {error}"),
+        )));
+    }
 
     // 6. **WAL/SHM を strict に削除** (Codex P1 round 3): 旧版は bak 復元時 best-effort
     //    だったが、`VACUUM INTO` で作った bak と旧 WAL の組み合わせでは salt mismatch
@@ -451,7 +722,10 @@ pub fn restore_from(
 /// 後は `Terminal`。
 ///
 /// 削除後、次回起動は `boot_settings_db_inner` で clean install 経路に入る。
-pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
+pub(crate) fn full_reset_with_permit(
+    data_dir: &Path,
+    permit: &crate::settings_db::SettingsFamilyMutationPermit,
+) -> Result<ResetReport, RestoreFailure> {
     let save_suppressed_before_reset = crate::settings_db::save_suppressed();
     crate::settings_db::set_save_suppressed(true);
 
@@ -466,7 +740,12 @@ pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
 
     // GLOBAL_DB を落として SQLite ハンドルを閉じる (= remove_file がロック失敗
     // するのを避ける)。⚠️ ここから先の失敗はすべて Terminal。
-    crate::settings_db::set_global_db(data_dir, None);
+    if let Err(error) = crate::settings_db::take_global_db_for_mutation(data_dir, permit) {
+        crate::settings_db::set_save_suppressed(save_suppressed_before_reset);
+        return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
+            format!("設定DBの排他的所有を確認できませんでした: {error}"),
+        )));
+    }
 
     let mut deleted: Vec<PathBuf> = Vec::new();
     for name in family_deletion_order_main_last() {
@@ -491,6 +770,26 @@ pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
         snapshot_paths,
         deleted,
     })
+}
+
+#[cfg(test)]
+fn restore_from(data_dir: &Path, source: &BackupSource) -> Result<RestoreReport, RestoreFailure> {
+    let permit = crate::settings_db::quiesce_settings_family().expect("test mutation permit");
+    let result = restore_from_with_permit(data_dir, source, &permit);
+    permit
+        .resume_local()
+        .expect("test restores settings-family access");
+    result
+}
+
+#[cfg(test)]
+fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
+    let permit = crate::settings_db::quiesce_settings_family().expect("test mutation permit");
+    let result = full_reset_with_permit(data_dir, &permit);
+    permit
+        .resume_local()
+        .expect("test restores settings-family access");
+    result
 }
 
 /// `full_reset` 用の削除順。`settings.db` を **最後** にして、途中失敗時の
@@ -1291,6 +1590,163 @@ mod tests {
             })
             .count();
         assert_eq!(count, OPERATION_IMPORT_BACKUP_LIMIT);
+    }
+
+    #[test]
+    fn operation_recoverable_failure_reopens_process_settings_access() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let db = SettingsDb::create_new(dir).unwrap();
+        db.save_full(&sample_settings()).unwrap();
+        drop(db);
+
+        let completed = run_settings_family_operation(
+            dir,
+            SettingsFamilyAction::Restore(BackupSource::Bak(1)),
+            None,
+        );
+        assert!(matches!(
+            completed.outcome,
+            Err(RestoreFailure::Recoverable(_))
+        ));
+        assert_eq!(completed.reader_release, ReaderRelease::ConfirmedDropped);
+        assert_eq!(completed.mutation, MutationProof::RecoverableProven);
+        assert!(completed.remote_retry.is_none());
+        crate::settings_db::with_db_result(|db| db.load_sort_order())
+            .expect("ordinary settings access resumes after a recoverable result");
+    }
+
+    #[test]
+    fn operation_start_returns_while_worker_waits_for_an_existing_reader() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let db = SettingsDb::create_new(dir).unwrap();
+        db.save_full(&sample_settings()).unwrap();
+        drop(db);
+        let active = crate::settings_db::acquire_settings_family_read_lease().unwrap();
+        let repainted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let repaint_flag = std::sync::Arc::clone(&repainted);
+
+        let mut task = start_settings_family_operation(
+            dir.to_path_buf(),
+            SettingsFamilyAction::Restore(BackupSource::Bak(1)),
+            None,
+            std::sync::Arc::new(move || {
+                repaint_flag.store(true, std::sync::atomic::Ordering::Release)
+            }),
+        )
+        .expect("spawn mutation worker without waiting for the active read");
+        assert!(matches!(
+            task.poll_finished(),
+            SettingsFamilyOperationPoll::Running
+        ));
+        drop(active);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let completed = loop {
+            match task.poll_finished() {
+                SettingsFamilyOperationPoll::Running => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                SettingsFamilyOperationPoll::Completed(completed) => break completed,
+                SettingsFamilyOperationPoll::WorkerFailed(error) => {
+                    panic!("worker failed: {error}")
+                }
+            }
+        };
+        assert!(matches!(
+            completed.outcome,
+            Err(RestoreFailure::Recoverable(_))
+        ));
+        assert!(repainted.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn operation_success_keeps_family_quiesced_for_required_application_exit() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let db = SettingsDb::create_new(dir).unwrap();
+        db.save_full(&sample_settings()).unwrap();
+        drop(db);
+
+        let completed = run_settings_family_operation(dir, SettingsFamilyAction::FullReset, None);
+        assert!(matches!(
+            completed.outcome,
+            Ok(SettingsFamilySuccess::FullReset(_))
+        ));
+        assert_eq!(completed.reader_release, ReaderRelease::ConfirmedDropped);
+        assert_eq!(completed.mutation, MutationProof::MayHaveTouched);
+        assert!(!dir.join("settings.db").exists());
+        // Full reset also leaves save suppression enabled. Family admission nevertheless has
+        // precedence, so the closed ownership boundary remains observable as typed Busy.
+        assert!(matches!(
+            crate::settings_db::acquire_settings_family_read_lease(),
+            Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing)
+        ));
+    }
+
+    #[test]
+    fn operation_restore_closes_real_remote_reader_before_replacing_settings_family() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let mut old = sample_settings();
+        old.favorites.truncate(1);
+        let mut current = sample_settings();
+        current.add_favorite("current-only".into(), PathBuf::from(r"C:\current"));
+        let db = std::sync::Arc::new(SettingsDb::create_new(dir).unwrap());
+        db.save_full(&old).unwrap();
+        db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        db.save_full(&current).unwrap();
+        crate::settings_db::set_global_db(dir, Some(std::sync::Arc::clone(&db)));
+        drop(db);
+        let control = crate::remote_ipc::RemoteSettingsReaderControl::open_for_test(
+            current.favorites.clone(),
+        )
+        .unwrap();
+
+        let completed = run_settings_family_operation(
+            dir,
+            SettingsFamilyAction::Restore(BackupSource::Bak(1)),
+            Some(control),
+        );
+        assert!(matches!(
+            completed.outcome,
+            Ok(SettingsFamilySuccess::Restore { .. })
+        ));
+        assert_eq!(completed.reader_release, ReaderRelease::ConfirmedDropped);
+        assert_eq!(completed.mutation, MutationProof::MayHaveTouched);
+        let restored = SettingsDb::open(dir).unwrap().load_into_settings().unwrap();
+        assert_eq!(restored.favorites.len(), old.favorites.len());
+        assert_eq!(restored.favorites[0].id, old.favorites[0].id);
+        assert_eq!(restored.favorites[0].name, old.favorites[0].name);
+        assert_eq!(restored.favorites[0].path, old.favorites[0].path);
+    }
+
+    #[test]
+    fn operation_full_reset_closes_real_remote_reader_before_deleting_settings_family() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let settings = sample_settings();
+        let db = std::sync::Arc::new(SettingsDb::create_new(dir).unwrap());
+        db.save_full(&settings).unwrap();
+        crate::settings_db::set_global_db(dir, Some(std::sync::Arc::clone(&db)));
+        drop(db);
+        let control = crate::remote_ipc::RemoteSettingsReaderControl::open_for_test(
+            settings.favorites.clone(),
+        )
+        .unwrap();
+
+        let completed =
+            run_settings_family_operation(dir, SettingsFamilyAction::FullReset, Some(control));
+        assert!(matches!(
+            completed.outcome,
+            Ok(SettingsFamilySuccess::FullReset(_))
+        ));
+        assert_eq!(completed.reader_release, ReaderRelease::ConfirmedDropped);
+        assert_eq!(completed.mutation, MutationProof::MayHaveTouched);
+        for name in family_deletion_order_main_last() {
+            assert!(!dir.join(name).exists());
+        }
     }
 
     fn sample_settings() -> Settings {

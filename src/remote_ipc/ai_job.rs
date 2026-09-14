@@ -62,6 +62,7 @@ pub(crate) enum RemoteAiPageExecutionOutcome {
 pub(crate) enum RemoteAiExecutionOutcome {
     Completed(Vec<RemoteAiPageExecutionOutcome>),
     Superseded(String),
+    SettingsRecoveryInProgress(String),
     Failed(String),
 }
 
@@ -134,6 +135,22 @@ pub(crate) struct RemoteAiJobRegistry {
     inner: Mutex<RegistryState>,
     executor: Arc<dyn RemoteAiExecutor>,
     origin: Instant,
+    #[cfg(test)]
+    completion_publication_hooks: Mutex<CompletionPublicationTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CompletionPublicationTestBarrier {
+    arrived: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CompletionPublicationTestHooks {
+    before_admission: Option<CompletionPublicationTestBarrier>,
+    after_admission: Option<CompletionPublicationTestBarrier>,
 }
 
 impl RemoteAiJobRegistry {
@@ -142,7 +159,26 @@ impl RemoteAiJobRegistry {
             inner: Mutex::new(RegistryState::default()),
             executor,
             origin: Instant::now(),
+            #[cfg(test)]
+            completion_publication_hooks: Mutex::new(CompletionPublicationTestHooks::default()),
         })
+    }
+
+    #[cfg(test)]
+    fn wait_at_completion_publication_test_barrier(
+        &self,
+        select: impl FnOnce(&CompletionPublicationTestHooks) -> Option<CompletionPublicationTestBarrier>,
+    ) {
+        let barrier = select(
+            &self
+                .completion_publication_hooks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        if let Some(barrier) = barrier {
+            barrier.arrived.wait();
+            barrier.release.wait();
+        }
     }
 
     fn now(&self) -> Duration {
@@ -321,11 +357,50 @@ impl RemoteAiJobRegistry {
                         RemoteAiExecutionOutcome::Failed("AI 処理を開始できませんでした".to_owned())
                     }
                 };
-                let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
                 if let Some(cause) = lease.drain_cause() {
                     registry.on_session_drain_inner(cause);
                 }
+                #[cfg(test)]
+                if matches!(outcome, RemoteAiExecutionOutcome::Completed(_)) {
+                    registry.wait_at_completion_publication_test_barrier(|hooks| {
+                        hooks.before_admission.clone()
+                    });
+                }
+                let (outcome, publication_lease) =
+                    if matches!(outcome, RemoteAiExecutionOutcome::Completed(_)) {
+                        match crate::settings_db::acquire_settings_family_read_lease() {
+                        Ok(publication_lease) => {
+                            #[cfg(test)]
+                            registry.wait_at_completion_publication_test_barrier(|hooks| {
+                                hooks.after_admission.clone()
+                            });
+                            (outcome, Some(publication_lease))
+                        }
+                        Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing) => (
+                            RemoteAiExecutionOutcome::SettingsRecoveryInProgress(
+                                "設定の復元またはリセット中です。完了後にもう一度実行してください"
+                                    .to_owned(),
+                            ),
+                            None,
+                        ),
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "remote_ipc: remote AI completion publication failed: {error}"
+                            ));
+                            (
+                                RemoteAiExecutionOutcome::Failed(
+                                    "AI 処理結果を公開できませんでした".to_owned(),
+                                ),
+                                None,
+                            )
+                        }
+                    }
+                    } else {
+                        (outcome, None)
+                    };
+                let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
                 registry.complete(&thread_job_id, outcome);
+                drop(publication_lease);
                 lease.finish(success);
             });
         if let Err(error) = spawn {
@@ -428,6 +503,16 @@ impl RemoteAiJobRegistry {
                 job,
                 RemoteAiJobState::Superseded,
                 terminal_detail(RemoteAiTerminalCode::SourceChanged, message, None),
+                now,
+            ),
+            RemoteAiExecutionOutcome::SettingsRecoveryInProgress(message) => set_terminal(
+                job,
+                RemoteAiJobState::Failed,
+                terminal_detail(
+                    RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                    message,
+                    None,
+                ),
                 now,
             ),
             RemoteAiExecutionOutcome::Failed(message) => set_terminal(
@@ -774,6 +859,7 @@ fn missing_job_error(state: &RegistryState, owner: &str, job_id: &str) -> Remote
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::sync::mpsc;
 
     struct FakeCall {
@@ -785,6 +871,7 @@ mod tests {
     enum FakeCompletion {
         Ready,
         Failed(&'static str),
+        SettingsRecoveryInProgress,
         NotApplicable(RemoteAiTerminalCode),
         Mixed(RemoteAiTerminalCode),
     }
@@ -818,6 +905,11 @@ mod tests {
                 ),
                 FakeCompletion::Failed(message) => {
                     RemoteAiExecutionOutcome::Failed(message.to_owned())
+                }
+                FakeCompletion::SettingsRecoveryInProgress => {
+                    RemoteAiExecutionOutcome::SettingsRecoveryInProgress(
+                        "settings recovery; retry this operation".to_owned(),
+                    )
                 }
                 FakeCompletion::NotApplicable(code) => RemoteAiExecutionOutcome::Completed(
                     request
@@ -978,6 +1070,130 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn settings_recovery_failure_keeps_a_distinct_retry_terminal_code() {
+        let (session, registry, calls) = fixture();
+        let job = start(&session, &registry, "settings-recovery");
+        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        call.complete
+            .send(FakeCompletion::SettingsRecoveryInProgress)
+            .unwrap();
+
+        let snapshot = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Failed);
+        assert!(matches!(
+            snapshot.terminal,
+            Some(RemoteAiTerminalDetail {
+                code: RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                message,
+                ..
+            }) if message.contains("retry")
+        ));
+    }
+
+    #[test]
+    fn settings_recovery_started_before_completed_publication_prevents_ready() {
+        let _data_dir = crate::settings_db::DataDirOverrideGuard::new();
+        let (session, registry, calls) = fixture();
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        registry
+            .completion_publication_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before_admission = Some(CompletionPublicationTestBarrier {
+            arrived: Arc::clone(&arrived),
+            release: Arc::clone(&release),
+        });
+
+        let job = start(&session, &registry, "settings-recovery-before-publication");
+        calls
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .complete
+            .send(FakeCompletion::Ready)
+            .unwrap();
+        arrived.wait();
+        let permit = crate::settings_db::quiesce_settings_family().unwrap();
+        release.wait();
+
+        let snapshot = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Failed);
+        assert!(matches!(
+            snapshot.terminal,
+            Some(RemoteAiTerminalDetail {
+                code: RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                ..
+            })
+        ));
+        assert!(!matches!(
+            registry.result("client", &job.job_id, 0),
+            RemoteAiResultResponse::Success(_)
+        ));
+        permit.resume_local().unwrap();
+    }
+
+    #[test]
+    fn completed_publication_lease_delays_settings_recovery_until_ready_is_visible() {
+        let _data_dir = crate::settings_db::DataDirOverrideGuard::new();
+        let (session, registry, calls) = fixture();
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        registry
+            .completion_publication_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .after_admission = Some(CompletionPublicationTestBarrier {
+            arrived: Arc::clone(&arrived),
+            release: Arc::clone(&release),
+        });
+
+        let job = start(&session, &registry, "publication-before-settings-recovery");
+        calls
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .complete
+            .send(FakeCompletion::Ready)
+            .unwrap();
+        arrived.wait();
+
+        let (permit_tx, permit_rx) = mpsc::channel();
+        let quiesce = std::thread::spawn(move || {
+            permit_tx
+                .send(crate::settings_db::quiesce_settings_family())
+                .unwrap();
+        });
+        let quiescing_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match crate::settings_db::acquire_settings_family_read_lease() {
+                Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing) => break,
+                Ok(probe) => drop(probe),
+                Err(error) => panic!("settings-family phase probe failed: {error}"),
+            }
+            assert!(
+                Instant::now() < quiescing_deadline,
+                "settings recovery did not enter quiescing"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            permit_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.wait();
+
+        let snapshot = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        assert!(snapshot.terminal.is_none());
+        assert!(matches!(
+            registry.result("client", &job.job_id, 0),
+            RemoteAiResultResponse::Success(_)
+        ));
+        let permit = permit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("quiesce completes after publication")
+            .expect("mutation permit");
+        quiesce.join().unwrap();
+        permit.resume_local().unwrap();
     }
 
     #[test]

@@ -596,8 +596,99 @@ pub(super) struct ServerGuard {
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
+    settings_reader_control: super::live_favorites::RemoteSettingsReaderControl,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
+}
+
+/// Owns every worker started after the persistent settings reader is created. Any early return
+/// runs the same ordered shutdown as `ServerGuard::drop`, so `RemoteIpcServer::start(Err)` proves
+/// that no detached worker can retain a `CollectionEngine`/`LiveFavorites` clone.
+struct ServerStartupWorkers {
+    armed: bool,
+    stop: Arc<AtomicBool>,
+    listeners: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    stream_workers: Vec<std::thread::JoinHandle<()>>,
+    home_worker: Option<std::thread::JoinHandle<()>>,
+    write_worker: Option<std::thread::JoinHandle<()>>,
+    heavy_queue: Arc<HeavyQueueWiring>,
+    home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
+}
+
+struct StartedWorkers {
+    stop: Arc<AtomicBool>,
+    listeners: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    stream_workers: Vec<std::thread::JoinHandle<()>>,
+    home_worker: Option<std::thread::JoinHandle<()>>,
+    write_worker: Option<std::thread::JoinHandle<()>>,
+    heavy_queue: Arc<HeavyQueueWiring>,
+    home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
+}
+
+impl ServerStartupWorkers {
+    fn finish(mut self) -> StartedWorkers {
+        self.armed = false;
+        StartedWorkers {
+            stop: Arc::clone(&self.stop),
+            listeners: std::mem::take(&mut self.listeners),
+            workers: std::mem::take(&mut self.workers),
+            stream_workers: std::mem::take(&mut self.stream_workers),
+            home_worker: self.home_worker.take(),
+            write_worker: self.write_worker.take(),
+            heavy_queue: Arc::clone(&self.heavy_queue),
+            home_work_tx: self.home_work_tx.clone(),
+            write_work_tx: self.write_work_tx.clone(),
+            stream_work_tx: self.stream_work_tx.clone(),
+        }
+    }
+
+    fn shutdown(&mut self, reason: &'static str) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        respond_stopped_works(self.heavy_queue.stop(), reason);
+        self.stop.store(true, Ordering::Release);
+        for _ in 0..self.listeners.len() {
+            poke_listener();
+        }
+        for listener in self.listeners.drain(..) {
+            let _ = listener.join();
+        }
+        if self.home_worker.is_some() {
+            let _ = self.home_work_tx.send(Work::Stop);
+        }
+        if self.write_worker.is_some() {
+            let _ = self.write_work_tx.send(Work::Stop);
+        }
+        for _ in 0..self.stream_workers.len() {
+            let _ = self.stream_work_tx.send(Work::Stop);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.home_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.write_worker.take() {
+            let _ = worker.join();
+        }
+        for worker in self.stream_workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ServerStartupWorkers {
+    fn drop(&mut self) {
+        self.shutdown("startup_rollback");
+    }
 }
 
 impl ServerGuard {
@@ -625,6 +716,7 @@ impl ServerGuard {
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
+        let settings_reader_control = favorites.control();
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
         let container_engine = Arc::new(ContainerEngine::new_with_session(
             settings.clone(),
@@ -654,6 +746,7 @@ impl ServerGuard {
         let home_metrics = Arc::new(QueueMetrics::new("home"));
         let write_metrics = Arc::new(QueueMetrics::new("write"));
         let stream_metrics = Arc::new(QueueMetrics::new("stream"));
+        let stop = Arc::new(AtomicBool::new(false));
         let home_collection_engine = Arc::clone(&collection_engine);
         let home_container_engine = Arc::clone(&container_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
@@ -668,28 +761,42 @@ impl ServerGuard {
                 )
             })
             .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
+        let mut startup = ServerStartupWorkers {
+            armed: true,
+            stop: Arc::clone(&stop),
+            listeners: Vec::with_capacity(ACCEPTOR_COUNT),
+            workers: Vec::with_capacity(worker_count),
+            stream_workers: Vec::with_capacity(STREAM_WORKER_COUNT),
+            home_worker: Some(home_worker),
+            write_worker: None,
+            heavy_queue: Arc::clone(&heavy_queue),
+            home_work_tx: home_work_tx.clone(),
+            write_work_tx: write_work_tx.clone(),
+            stream_work_tx: stream_work_tx.clone(),
+        };
         let write_container_engine = Arc::clone(&container_engine);
         let write_session = session_handle.clone();
         let write_worker_metrics = Arc::clone(&write_metrics);
-        let write_worker = std::thread::Builder::new()
-            .name("remote-write".to_owned())
-            .spawn(move || {
-                write_worker_loop(
-                    write_work_rx,
-                    &write_container_engine,
-                    &write_session,
-                    &write_worker_metrics,
-                )
-            })
-            .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?;
-        let mut workers = Vec::with_capacity(worker_count);
+        startup.write_worker = Some(
+            std::thread::Builder::new()
+                .name("remote-write".to_owned())
+                .spawn(move || {
+                    write_worker_loop(
+                        write_work_rx,
+                        &write_container_engine,
+                        &write_session,
+                        &write_worker_metrics,
+                    )
+                })
+                .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?,
+        );
         for index in 0..worker_count {
             let worker_queue = Arc::clone(&heavy_queue);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
             let session = session_handle.clone();
-            workers.push(
+            startup.workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-thumb-{index}"))
                     .spawn(move || {
@@ -705,13 +812,12 @@ impl ServerGuard {
                     .map_err(|error| format!("remote IPC worker を開始できません: {error}"))?,
             );
         }
-        let mut stream_workers = Vec::with_capacity(STREAM_WORKER_COUNT);
         for index in 0..STREAM_WORKER_COUNT {
             let work_rx = Arc::clone(&stream_work_rx);
             let engine = Arc::clone(&video_stream_engine);
             let session = session_handle.clone();
             let worker_metrics = Arc::clone(&stream_metrics);
-            stream_workers.push(
+            startup.stream_workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-stream-ipc-{index}"))
                     .spawn(move || {
@@ -723,9 +829,7 @@ impl ServerGuard {
             );
         }
 
-        let stop = Arc::new(AtomicBool::new(false));
         let next_connection_id = Arc::new(AtomicU64::new(1));
-        let mut listeners = Vec::with_capacity(ACCEPTOR_COUNT);
         for (index, initial_pipe) in initial_pipes.into_iter().enumerate() {
             let listener_stop = Arc::clone(&stop);
             let listener_heavy_queue = Arc::clone(&heavy_queue);
@@ -738,51 +842,28 @@ impl ServerGuard {
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_session = session_handle.clone();
             let listener_page_jobs = Arc::clone(&page_jobs);
-            match std::thread::Builder::new()
-                .name(format!("remote-ipc-listener-{index}"))
-                .spawn(move || {
-                    acceptor_loop(
-                        listener_stop,
-                        listener_heavy_queue,
-                        listener_home_tx,
-                        listener_write_tx,
-                        listener_stream_tx,
-                        listener_home_metrics,
-                        listener_write_metrics,
-                        listener_stream_metrics,
-                        listener_next_connection_id,
-                        listener_session,
-                        listener_page_jobs,
-                        initial_pipe,
-                        index,
-                    )
-                }) {
-                Ok(listener) => listeners.push(listener),
-                Err(error) => {
-                    stop.store(true, Ordering::Release);
-                    for _ in 0..listeners.len() {
-                        poke_listener();
-                    }
-                    for listener in listeners {
-                        let _ = listener.join();
-                    }
-                    respond_stopped_works(heavy_queue.stop(), "listener_start_failed");
-                    let _ = home_work_tx.send(Work::Stop);
-                    let _ = write_work_tx.send(Work::Stop);
-                    for _ in 0..STREAM_WORKER_COUNT {
-                        let _ = stream_work_tx.send(Work::Stop);
-                    }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    let _ = home_worker.join();
-                    let _ = write_worker.join();
-                    for worker in stream_workers {
-                        let _ = worker.join();
-                    }
-                    return Err(format!("remote IPC listener を開始できません: {error}"));
-                }
-            }
+            startup.listeners.push(
+                std::thread::Builder::new()
+                    .name(format!("remote-ipc-listener-{index}"))
+                    .spawn(move || {
+                        acceptor_loop(
+                            listener_stop,
+                            listener_heavy_queue,
+                            listener_home_tx,
+                            listener_write_tx,
+                            listener_stream_tx,
+                            listener_home_metrics,
+                            listener_write_metrics,
+                            listener_stream_metrics,
+                            listener_next_connection_id,
+                            listener_session,
+                            listener_page_jobs,
+                            initial_pipe,
+                            index,
+                        )
+                    })
+                    .map_err(|error| format!("remote IPC listener を開始できません: {error}"))?,
+            );
         }
 
         crate::logger::log(format!(
@@ -791,18 +872,20 @@ impl ServerGuard {
             HEAVY_WORK_QUEUE_CAPACITIES.interactive,
             HEAVY_WORK_QUEUE_CAPACITIES.prefetch,
         ));
+        let started = startup.finish();
         Ok(Self {
-            stop,
-            listeners,
-            workers,
-            stream_workers,
-            home_worker: Some(home_worker),
-            write_worker: Some(write_worker),
-            heavy_queue,
-            home_work_tx,
-            write_work_tx,
-            stream_work_tx,
+            stop: started.stop,
+            listeners: started.listeners,
+            workers: started.workers,
+            stream_workers: started.stream_workers,
+            home_worker: started.home_worker,
+            write_worker: started.write_worker,
+            heavy_queue: started.heavy_queue,
+            home_work_tx: started.home_work_tx,
+            write_work_tx: started.write_work_tx,
+            stream_work_tx: started.stream_work_tx,
             session_runtime,
+            settings_reader_control,
             _ai_jobs: ai_jobs,
             _archive_jobs: archive_jobs,
         })
@@ -810,6 +893,12 @@ impl ServerGuard {
 
     pub(super) fn session_handle(&self) -> SessionHandle {
         self.session_runtime.handle()
+    }
+
+    pub(super) fn settings_reader_control(
+        &self,
+    ) -> super::live_favorites::RemoteSettingsReaderControl {
+        self.settings_reader_control.clone()
     }
 }
 
@@ -3891,6 +3980,41 @@ fn wide_nul(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_rollback_joins_worker_before_releasing_remote_reader_owner() {
+        let page_jobs = Arc::new(PageJobRegistry::new());
+        let heavy_queue = Arc::new(HeavyQueueWiring::new(1, page_jobs));
+        let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(1);
+        let (write_work_tx, _write_work_rx) = mpsc::sync_channel::<Work>(1);
+        let (stream_work_tx, _stream_work_rx) = mpsc::sync_channel::<Work>(1);
+        let favorites = super::super::live_favorites::LiveFavorites::snapshot(Vec::new());
+        let worker_favorites = Arc::clone(&favorites);
+        let home_worker = std::thread::spawn(move || {
+            let _reader_owner = worker_favorites;
+            assert!(matches!(home_work_rx.recv(), Ok(Work::Stop)));
+        });
+        let startup = ServerStartupWorkers {
+            armed: true,
+            stop: Arc::new(AtomicBool::new(false)),
+            listeners: Vec::new(),
+            workers: Vec::new(),
+            stream_workers: Vec::new(),
+            home_worker: Some(home_worker),
+            write_worker: None,
+            heavy_queue,
+            home_work_tx,
+            write_work_tx,
+            stream_work_tx,
+        };
+        assert_eq!(Arc::strong_count(&favorites), 2);
+        drop(startup);
+        assert_eq!(
+            Arc::strong_count(&favorites),
+            1,
+            "startup Err must not detach a worker that owns LiveFavorites"
+        );
+    }
 
     fn test_owner() -> RemoteSessionIdentity {
         RemoteSessionIdentity {

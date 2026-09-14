@@ -1300,6 +1300,9 @@ pub fn run() -> eframe::Result {
     let remote_session_handle = _remote_ipc_server
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::session_handle);
+    let remote_settings_reader_control = _remote_ipc_server
+        .as_ref()
+        .map(remote_ipc::RemoteIpcServer::settings_reader_control);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let _remote_service_manager = if _remote_ipc_server.is_some() {
@@ -1380,6 +1383,9 @@ pub fn run() -> eframe::Result {
             }
             if let Some(handle) = remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
+            }
+            if let Some(control) = remote_settings_reader_control.clone() {
+                app.set_remote_settings_reader_control(control);
             }
             app.set_remote_service_control(
                 remote_service_status.clone(),

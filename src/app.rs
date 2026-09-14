@@ -42472,7 +42472,8 @@ impl App {
     /// and bridge `WM_PAINT` callbacks are serialized on the winit main thread, and every update
     /// entry acknowledges the single bridge claim.
     /// Paused/handled-terminal players, cached but non-current players, still images, and tray
-    /// residency by itself do not qualify.
+    /// residency by itself do not qualify. A deferred settings-family process close also
+    /// qualifies until its exact worker terminal can replay Close from a hidden tray window.
     #[cfg(windows)]
     pub(crate) fn tray_resident_media_updates_needed(&self) -> bool {
         if self.window_visible {
@@ -42511,7 +42512,11 @@ impl App {
                 || self.native_video_fast_swap_pending.is_some()
                 || self.video_tile_swap_pending.is_some());
 
-        mounted || detached || eof_resolution || eof_handoff
+        mounted
+            || detached
+            || eof_resolution
+            || eof_handoff
+            || self.settings_family_deferred_close_needs_hidden_wake()
     }
 
     /// Non-Windows builds have no tray residency and no hidden-root wake bridge, so nothing
@@ -73647,6 +73652,10 @@ impl eframe::App for App {
         // Process-global clipboard events must be visible before fullscreen/native early
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
+        // A settings-family mutation may already hold the exclusive DB permit. Defer only a
+        // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
+        // remains under the established close policy.
+        self.defer_settings_family_root_close(ctx);
         #[cfg(windows)]
         self.poll_similar_preview_workers_in_all_contexts(ctx);
         #[cfg(not(windows))]
@@ -73692,6 +73701,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A process exit that bypassed the ordinary close-event frame must still fence the exact
+        // settings-family mutation before any settings save/flush in `on_exit_inner`.
+        self.resolve_settings_family_operation_for_exit();
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::on_app_exit();
         // Recovery's Checking phase leaves each live SidecarFile in the App cache while its worker

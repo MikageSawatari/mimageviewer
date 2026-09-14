@@ -809,11 +809,11 @@ impl RemoteListingSettingsSource {
     fn load(
         &self,
         fallback: &crate::settings::Settings,
-    ) -> Result<crate::settings_db::RemoteListingSettings, String> {
+    ) -> Result<crate::settings_db::RemoteListingSettings, crate::settings_db::SettingsDbError>
+    {
         match self {
             Self::Live => {
                 crate::settings_db::with_db_result(|db| db.load_remote_listing_settings(fallback))
-                    .map_err(|error| error.to_string())
             }
             #[cfg(test)]
             Self::Snapshot(settings) => Ok(settings.clone()),
@@ -835,6 +835,37 @@ struct RemotePreparedComposite {
     lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
     edits: RemoteEditSnapshot,
     settings: crate::settings_db::AdjustmentRenderSettings,
+}
+
+#[derive(Debug)]
+enum RemoteCompositePrepareError {
+    SettingsRecoveryInProgress,
+    Media(MediaError),
+}
+
+impl RemoteCompositePrepareError {
+    fn into_media_error(self) -> MediaError {
+        match self {
+            Self::SettingsRecoveryInProgress => media_error(
+                MediaErrorCode::Busy,
+                "設定の復旧中です。少し待ってから再試行してください",
+            ),
+            Self::Media(error) => error,
+        }
+    }
+
+    fn into_ai_error(self) -> RemoteAiRunError {
+        match self {
+            Self::SettingsRecoveryInProgress => RemoteAiRunError::SettingsRecoveryInProgress,
+            Self::Media(error) => remote_ai_media_error(error),
+        }
+    }
+}
+
+impl From<MediaError> for RemoteCompositePrepareError {
+    fn from(error: MediaError) -> Self {
+        Self::Media(error)
+    }
 }
 
 #[derive(Clone)]
@@ -2275,7 +2306,7 @@ impl ContainerEngine {
     }
     fn adjustment_render_settings(
         &self,
-    ) -> Result<crate::settings_db::AdjustmentRenderSettings, MediaError> {
+    ) -> Result<crate::settings_db::AdjustmentRenderSettings, RemoteCompositePrepareError> {
         match &self.adjustment_settings {
             AdjustmentSettingsSource::Live => {
                 crate::settings_db::with_db_result(|db| db.load_adjustment_render_settings())
@@ -2288,7 +2319,8 @@ impl ContainerEngine {
 
     fn adjustment_render_settings_timed(
         &self,
-    ) -> Result<(crate::settings_db::AdjustmentRenderSettings, f64), MediaError> {
+    ) -> Result<(crate::settings_db::AdjustmentRenderSettings, f64), RemoteCompositePrepareError>
+    {
         match &self.adjustment_settings {
             AdjustmentSettingsSource::Live => crate::settings_db::with_db_result(|db| {
                 db.load_adjustment_render_settings_with_lock_wait(true)
@@ -2303,15 +2335,10 @@ impl ContainerEngine {
         &self,
     ) -> Result<crate::settings::Settings, RemoteWriteError> {
         let mut settings = (*self.settings).clone();
-        let live = self.listing_settings.load(&settings).map_err(|error| {
-            crate::logger::log(format!(
-                "remote_ipc: live listing settings read failed: {error}"
-            ));
-            RemoteWriteError::new(
-                RemoteWriteErrorCode::PersistenceFailed,
-                "最新の一覧設定を読み込めませんでした",
-            )
-        })?;
+        let live = self
+            .listing_settings
+            .load(&settings)
+            .map_err(remote_listing_settings_error)?;
         live.apply_to(&mut settings);
         Ok(settings)
     }
@@ -2498,7 +2525,7 @@ impl ContainerEngine {
         rotation: crate::rotation_db::Rotation,
         preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         context: &WorkerContext,
-    ) -> Result<Option<RemotePreparedComposite>, MediaError> {
+    ) -> Result<Option<RemotePreparedComposite>, RemoteCompositePrepareError> {
         self.prepare_remote_composite_timed(
             address,
             logical_path,
@@ -2526,7 +2553,7 @@ impl ContainerEngine {
         context: &WorkerContext,
         primary: Option<&mut RemotePageStageGuard>,
         fallback: Option<&mut RemotePageStageGuard>,
-    ) -> Result<Option<RemotePreparedComposite>, MediaError> {
+    ) -> Result<Option<RemotePreparedComposite>, RemoteCompositePrepareError> {
         let Some(mut identity) = remote_adjustment_identity(address, logical_path) else {
             return Ok(None);
         };
@@ -3879,6 +3906,12 @@ impl ContainerEngine {
                         .to_owned(),
                 )
             }
+            Err(RemoteAiRunError::SettingsRecoveryInProgress) => {
+                super::ai_job::RemoteAiExecutionOutcome::SettingsRecoveryInProgress(
+                    "設定の復元またはリセット中です。完了後にもう一度 AI 処理を実行してください"
+                        .to_owned(),
+                )
+            }
             Err(RemoteAiRunError::Failed(message)) => {
                 crate::logger::log(format!("remote_ipc: remote AI execution failed: {message}"));
                 super::ai_job::RemoteAiExecutionOutcome::Failed(
@@ -3936,7 +3969,10 @@ impl ContainerEngine {
             u32,
             crate::rotation_db::Rotation,
             &WorkerContext,
-        ) -> Result<Option<RemotePreparedComposite>, MediaError>,
+        ) -> Result<
+            Option<RemotePreparedComposite>,
+            RemoteCompositePrepareError,
+        >,
         decode_source: &dyn Fn(
             &Self,
             &RemoteAddress,
@@ -3991,7 +4027,7 @@ impl ContainerEngine {
                 rotation,
                 &context,
             )
-            .map_err(remote_ai_media_error)?
+            .map_err(RemoteCompositePrepareError::into_ai_error)?
             .ok_or_else(|| {
                 RemoteAiRunError::Failed("address does not identify an image page".to_owned())
             })?;
@@ -4286,8 +4322,13 @@ impl ContainerEngine {
                     None,
                     &validation_context,
                 )
-                .map_err(|_| {
-                    RemoteAiRunError::Superseded("source snapshot cannot be revalidated".to_owned())
+                .map_err(|error| match error {
+                    RemoteCompositePrepareError::SettingsRecoveryInProgress => {
+                        RemoteAiRunError::SettingsRecoveryInProgress
+                    }
+                    RemoteCompositePrepareError::Media(_) => RemoteAiRunError::Superseded(
+                        "source snapshot cannot be revalidated".to_owned(),
+                    ),
                 })?
                 .map(|prepared| {
                     RemoteAiResultIdentity::from_prepared(&prepared, current_background)
@@ -5580,7 +5621,8 @@ impl ContainerEngine {
                 context,
                 page_timing.as_mut().map(|timing| &mut timing.resolve),
                 ambient_wait_stage.as_deref_mut(),
-            )?
+            )
+            .map_err(RemoteCompositePrepareError::into_media_error)?
         } else {
             None
         };
@@ -6327,6 +6369,7 @@ enum RemoteAiRunError {
         page_index: usize,
     },
     Superseded(String),
+    SettingsRecoveryInProgress,
     Failed(String),
 }
 
@@ -6544,23 +6587,64 @@ fn remote_adjustment_read_error(scope: &str, error: String) -> MediaError {
     )
 }
 
-fn remote_adjustment_settings_error(error: crate::settings_db::SettingsDbError) -> MediaError {
+fn remote_adjustment_settings_error(
+    error: crate::settings_db::SettingsDbError,
+) -> RemoteCompositePrepareError {
     crate::logger::log(format!(
         "remote_ipc: live adjustment settings read failed: {error}"
     ));
-    media_error(
-        MediaErrorCode::Internal,
-        "最新の補正設定を読み込めませんでした",
-    )
+    if matches!(
+        error,
+        crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+    ) {
+        RemoteCompositePrepareError::SettingsRecoveryInProgress
+    } else {
+        RemoteCompositePrepareError::Media(media_error(
+            MediaErrorCode::Internal,
+            "最新の補正設定を読み込めませんでした",
+        ))
+    }
+}
+
+fn remote_listing_settings_error(error: crate::settings_db::SettingsDbError) -> RemoteWriteError {
+    crate::logger::log(format!(
+        "remote_ipc: live listing settings read failed: {error}"
+    ));
+    if matches!(
+        error,
+        crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+    ) {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::Busy,
+            "設定の復旧中です。少し待ってから再試行してください",
+        )
+    } else {
+        RemoteWriteError::new(
+            RemoteWriteErrorCode::PersistenceFailed,
+            "最新の一覧設定を読み込めませんでした",
+        )
+    }
 }
 
 fn remote_reading_settings_error(error: crate::settings_db::SettingsDbError) -> MediaError {
     crate::logger::log(format!(
         "remote_ipc: live reading settings read failed: {error}"
     ));
+    let busy = matches!(
+        error,
+        crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+    );
     media_error(
-        MediaErrorCode::Internal,
-        "最新の読書設定を読み込めませんでした",
+        if busy {
+            MediaErrorCode::Busy
+        } else {
+            MediaErrorCode::Internal
+        },
+        if busy {
+            "設定の復旧中です。少し待ってから再試行してください"
+        } else {
+            "最新の読書設定を読み込めませんでした"
+        },
     )
 }
 
@@ -6985,6 +7069,44 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn settings_family_quiescing_maps_to_all_container_busy_codes() {
+        assert_eq!(
+            remote_reading_settings_error(
+                crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+            )
+            .code,
+            MediaErrorCode::Busy
+        );
+        assert_eq!(
+            remote_adjustment_settings_error(
+                crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+            )
+            .into_media_error()
+            .code,
+            MediaErrorCode::Busy
+        );
+        assert_eq!(
+            remote_listing_settings_error(
+                crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+            )
+            .code,
+            RemoteWriteErrorCode::Busy
+        );
+
+        let source = RemoteListingSettingsSource::Live;
+        let _guard = crate::settings_db::DataDirOverrideGuard::new();
+        let permit = crate::settings_db::quiesce_settings_family().unwrap();
+        let error = source
+            .load(&crate::settings::Settings::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+        ));
+        permit.resume_local().unwrap();
+    }
 
     fn source_test_identity(
         name: &str,
@@ -9153,6 +9275,40 @@ mod tests {
         settings.retained_final_ai_cache_max_entries = 0;
         let snapshot = crate::settings_db::AdjustmentRenderSettings::from_settings(&settings);
         assert_eq!(remote_ai_native_budget(&snapshot), None);
+    }
+
+    #[test]
+    fn remote_ai_preparation_keeps_settings_recovery_distinct_from_generic_failure() {
+        let data_dir = crate::settings_db::DataDirOverrideGuard::new();
+        let favorite_root = data_dir.path().join("favorite");
+        std::fs::create_dir_all(&favorite_root).unwrap();
+        let image_path = favorite_root.join("page.png");
+        std::fs::write(&image_path, remote_ai_test_png(4, 3)).unwrap();
+        let settings = crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("test".to_owned(), favorite_root)],
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new_with_session(
+            settings,
+            super::super::session::SessionHandle::new(),
+        );
+        let request = remote_ai_test_request(RemoteAddress::file(
+            image_path.to_string_lossy().into_owned(),
+        ));
+        let permit = crate::settings_db::quiesce_settings_family().unwrap();
+
+        let outcome = engine.execute_remote_ai(
+            &request,
+            &NoRemoteAiProgress,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        permit.resume_local().unwrap();
+        assert!(matches!(
+            outcome,
+            super::super::ai_job::RemoteAiExecutionOutcome::SettingsRecoveryInProgress(message)
+                if message.contains("もう一度")
+        ));
     }
 
     #[test]

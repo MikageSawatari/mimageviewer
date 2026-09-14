@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 54;
+pub const PROTOCOL_VERSION: u32 = 55;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1851,6 +1851,7 @@ pub enum RemoteAiTerminalCode {
     DiscardedByHost,
     BackgroundExpired,
     SourceChanged,
+    SettingsRecoveryInProgress,
     ExecutionFailed,
 }
 
@@ -2046,6 +2047,7 @@ pub enum RemoteArchiveTerminalCode {
     IgnoredBySettings,
     UnsupportedFormat,
     NoImages,
+    SettingsRecoveryInProgress,
     ExecutionFailed,
 }
 
@@ -2865,8 +2867,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v54_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 54);
+    fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 55);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3041,8 +3043,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v54_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 54);
+    fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 55);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3165,6 +3167,18 @@ mod tests {
                 read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn protocol_v55_names_settings_recovery_job_terminals_for_client_retry() {
+        assert_eq!(
+            serde_json::to_string(&RemoteAiTerminalCode::SettingsRecoveryInProgress).unwrap(),
+            "\"settings_recovery_in_progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteArchiveTerminalCode::SettingsRecoveryInProgress).unwrap(),
+            "\"settings_recovery_in_progress\""
+        );
     }
 
     #[test]
