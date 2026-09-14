@@ -7,11 +7,16 @@
 mod db;
 mod model;
 mod path;
+mod prepare;
 mod runtime;
 mod text;
 
 pub use model::*;
 pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
+pub(crate) use prepare::{
+    CollectionPrepareError, CollectionPreparedRegistration, prepare_collection_export,
+    prepare_collection_registrations, write_collection_export_atomic,
+};
 pub use runtime::{
     CollectionRevisionWatch, CollectionRuntimeEvent, CollectionStoreClient, CollectionStoreRuntime,
 };

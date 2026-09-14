@@ -3517,6 +3517,7 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
     match section {
         TS::FolderTree => "ツリー",
         TS::Bookshelf => "本棚",
+        TS::Collections => "コレクション",
         TS::Cols => "列",
         TS::Aspect => "比率",
         TS::Sort => "ソート",
@@ -3654,6 +3655,7 @@ fn set_toolbar_section_visible(
     match section {
         TS::FolderTree => settings.show_toolbar_folder_tree_button = visible,
         TS::Bookshelf => settings.show_toolbar_bookshelf = visible,
+        TS::Collections => settings.show_toolbar_collections = visible,
         TS::Cols => settings.show_toolbar_cols = visible,
         TS::Aspect => settings.show_toolbar_aspect = visible,
         TS::Sort => settings.show_toolbar_sort = visible,
@@ -7883,6 +7885,11 @@ impl App {
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
+        let show_collections = self.settings.show_toolbar_collections;
+        let (active_collection_id, toolbar_collections, collections_status) =
+            self.collection_toolbar_catalog();
+        let collections_ready =
+            collections_status == crate::ui_dialogs::collections::CollectionToolbarStatus::Ready;
         let sort_lock = self.grid_sort_lock_reason();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
@@ -7902,6 +7909,7 @@ impl App {
         let drag_enabled = self.settings.toolbar_section_drag_enabled;
         let any_toolbar_section = show_folder_tree_button
             || show_bookshelf
+            || show_collections
             || show_cols
             || show_aspect
             || show_sort
@@ -7925,6 +7933,8 @@ impl App {
         let mut toolbar_book_target_name: Option<String> = None;
         let mut toolbar_book_pin_open: Option<String> = None;
         let mut toolbar_book_pin_add: Option<String> = None;
+        let mut toolbar_collection_target: Option<crate::collection_store::CollectionId> = None;
+        let mut toolbar_collection_manage = false;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_tag_container: Option<String> = None;
@@ -8070,6 +8080,7 @@ impl App {
                     let visible = match section {
                         TS::FolderTree => show_folder_tree_button,
                         TS::Bookshelf => show_bookshelf,
+                        TS::Collections => show_collections,
                         TS::Cols => show_cols,
                         TS::Aspect => show_aspect,
                         TS::Sort => show_sort,
@@ -8217,6 +8228,90 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                                 toolbar_book_pin_add = Some(pin.clone());
                             }
                         }
+                    }
+                }
+                TS::Collections => {
+                    let lead = toolbar_label(ui, "コレクション:", 92.0, drag_enabled)
+                        .hover_tip(lead_hint);
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Collections,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
+                    let mode = self.settings.toolbar_collections_display;
+                    let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
+                        ui,
+                        mode,
+                        self.settings.toolbar_collections_collapsed,
+                    );
+                    if let Some(collapsed) = new_collapsed {
+                        self.settings.toolbar_collections_collapsed = collapsed;
+                        self.settings.save();
+                    }
+                    if mode == crate::settings::ToolbarSectionDisplay::Dropdown {
+                        let selected_text = collections_status
+                            .selected_text(active_collection_id, &toolbar_collections);
+                        let combo = toolbar_combo_slot(
+                            ui,
+                            collections_ready,
+                            180.0,
+                            selected_text,
+                            |ui, text| {
+                                egui::ComboBox::from_id_salt("toolbar_collection_target_combo")
+                                    .width(180.0)
+                                    .height(320.0)
+                                    .selected_text(text)
+                                    .show_ui(ui, |ui| {
+                                        apply_toolbar_style(ui);
+                                        if toolbar_collections.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "コレクションはまだありません",
+                                                )
+                                                .weak(),
+                                            );
+                                        }
+                                        for (id, name) in &toolbar_collections {
+                                            if ui
+                                                .selectable_label(
+                                                    Some(*id) == active_collection_id,
+                                                    name,
+                                                )
+                                                .clicked()
+                                            {
+                                                toolbar_collection_target = Some(*id);
+                                                ui.close();
+                                            }
+                                        }
+                                    })
+                            },
+                        );
+                        toolbar_combo_popup_open |=
+                            egui::ComboBox::is_open(ctx, combo.response.id);
+                    } else if show_inline {
+                        if !collections_ready {
+                            ui.label(egui::RichText::new(collections_status.label()).weak());
+                        } else if toolbar_collections.is_empty() {
+                            ui.label(egui::RichText::new("（なし）").weak());
+                        } else {
+                            for (id, name) in &toolbar_collections {
+                                if ui
+                                    .selectable_label(Some(*id) == active_collection_id, name)
+                                    .clicked()
+                                {
+                                    toolbar_collection_target = Some(*id);
+                                }
+                            }
+                        }
+                    }
+                    if ui
+                        .button("管理…")
+                        .on_hover_text("コレクションの作成・編集・インポート・エクスポート")
+                        .clicked()
+                    {
+                        toolbar_collection_manage = true;
                     }
                 }
                 TS::Cols => {
@@ -9074,6 +9169,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if let Some(name) = toolbar_book_pin_add {
             self.add_grid_selection_to_named_book(ctx, name);
         }
+        if let Some(id) = toolbar_collection_target {
+            self.select_collection_management_target(id);
+        }
+        if toolbar_collection_manage {
+            self.open_collection_manager(active_collection_id);
+        }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
         // ネスト ZIP は階層維持で再ソート、Ctrl+G は検索結果再ソート (§4.3.3。実フォルダを
@@ -9190,6 +9291,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .checkbox(&mut s.show_toolbar_folder_tree_button, "ツリー")
             .changed();
         changed |= ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚").changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_collections, "コレクション")
+            .changed();
         changed |= ui
             .checkbox(&mut s.show_toolbar_cols, "列")
             .on_hover_text("項目が無いと表示されません (セクションのラベルを右クリックで列を選択)")
@@ -9316,6 +9420,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // 表示フラグ
         s.show_toolbar_folder_tree_button = true;
         s.show_toolbar_bookshelf = true;
+        s.show_toolbar_collections = true;
         s.show_toolbar_cols = true;
         s.show_toolbar_aspect = true;
         s.show_toolbar_sort = true;
@@ -9356,10 +9461,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.toolbar_smart_folders_display = ToolbarSectionDisplay::default();
         s.toolbar_tags_display = ToolbarSectionDisplay::default();
         s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
+        s.toolbar_collections_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_favorites_collapsed = false;
         s.toolbar_smart_folders_collapsed = false;
         s.toolbar_tags_collapsed = false;
         s.toolbar_bookshelf_collapsed = false;
+        s.toolbar_collections_collapsed = false;
         // 出す項目
         s.toolbar_cols_items = crate::settings::default_toolbar_cols_items();
         s.toolbar_cols_details_visible = true;
@@ -9411,6 +9518,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.separator();
                 if ui.button("本の管理…").clicked() {
                     self.show_book_manager = true;
+                    ui.close();
+                }
+            }
+            TS::Collections => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_collections_display,
+                    TD::all_with_collapsible(),
+                    &mut changed,
+                );
+                ui.separator();
+                if ui.button("コレクションを管理…").clicked() {
+                    self.open_collection_manager(None);
                     ui.close();
                 }
             }
@@ -21627,8 +21747,10 @@ mod toolbar_reorder_tests {
     #[test]
     fn reorder_noop_returns_none() {
         let order = TS::default_order().to_vec();
-        // Bookshelf を Cols (= 元々その直後) の手前へ → 位置不変。
-        assert!(reorder_toolbar_section(&order, TS::Bookshelf, Some(TS::Cols), None).is_none());
+        // Bookshelf を Collections (= 現在その直後) の手前へ → 位置不変。
+        assert!(
+            reorder_toolbar_section(&order, TS::Bookshelf, Some(TS::Collections), None).is_none()
+        );
     }
 
     #[test]

@@ -11786,6 +11786,9 @@ pub struct App {
     /// 誤って起点にしない。表示中の一覧コンテキストと一緒に所有・交換する。
     pub(crate) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
     pub(crate) settings: crate::settings::Settings,
+    /// Process-global collection actor/catalog/editor owner. App::defaultはinertで、production
+    /// `lib.rs`から明示runtimeを注入したときだけcollection.dbを開く。
+    pub(crate) collection_ui: crate::ui_dialogs::collections::CollectionUiState,
     pub(crate) creative_lut_library: crate::creative_lut::CreativeLutLibrary,
     pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
@@ -15808,6 +15811,7 @@ impl App {
             grid_click_pairing: GridClickPairingState::default(),
             grid_click_selection_anchor: None,
             settings,
+            collection_ui: crate::ui_dialogs::collections::CollectionUiState::default(),
             creative_lut_library,
             keymap,
             gamepad: crate::gamepad::GamepadRuntime::new(),
@@ -18217,6 +18221,7 @@ impl App {
             // (2026-09-02)。
             self.external_tool_materialize_progress_visible() => "external_tool_materialize_progress",
             self.show_settings_restore => "settings_restore",
+            self.collection_manager_open() => "collection_manager",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
             self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
@@ -72431,6 +72436,7 @@ impl App {
         self.show_external_tool_modals(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
+        self.show_collection_manager(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
         //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、
@@ -73661,6 +73667,9 @@ impl eframe::App for App {
         // Process-global clipboard events must be visible before fullscreen/native early
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
+        // Collection startup/revision/worker responses must likewise progress even when
+        // update_frame returns through a fullscreen or native-video presentation path.
+        self.poll_collection_ui(ctx);
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
@@ -73719,6 +73728,9 @@ impl eframe::App for App {
         // holds immutable Arc reservations. Join and reconcile those reservations before the
         // established exit path queues and waits for the final process-global writer snapshots.
         self.resolve_sidecar_restore_for_exit();
+        // Final exit is the only UI lifecycle boundary allowed to wait for the collection actor.
+        // Closing admission first prevents future Remote integration from enqueueing behind it.
+        self.shutdown_collection_runtime_for_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         self.on_exit_inner();

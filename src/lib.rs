@@ -1284,6 +1284,12 @@ pub fn run() -> eframe::Result {
         ..Default::default()
     };
 
+    // Collection DBはproduction起動だけで開始し、runtime本体はcreatorでAppへ一度だけmoveする。
+    // App::default / snapshot harnessはinertなので通常profileを開かない。
+    let mut collection_runtime = Some(collection_store::CollectionStoreRuntime::start_at(
+        data_dir::get().join("collection.db"),
+    ));
+
     // ローカル named pipe は常設する。受信・生成の読み取りと検証は remote_ipc 配下の
     // 専用スレッドで行う。永続書き込みだけは
     // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
@@ -1375,6 +1381,13 @@ pub fn run() -> eframe::Result {
                 settings_load_meta.clone(),
                 move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
             );
+            match collection_runtime
+                .take()
+                .expect("eframe creator must run at most once")
+            {
+                Ok(runtime) => app.install_collection_runtime(runtime),
+                Err(error) => app.install_collection_runtime_failure(error),
+            }
             #[cfg(windows)]
             {
                 let clipboard_repaint_ctx = cc.egui_ctx.clone();

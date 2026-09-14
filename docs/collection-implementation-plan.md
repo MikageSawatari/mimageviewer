@@ -173,10 +173,11 @@ clone 可能な `CollectionStoreClient` だけを受け取る。
 後段統合時の順序を次に固定する。
 
 1. App が collection actor を開始し、client を UI に保持する。
-2. Remote server はその client を注入される。Remote が DB connection を別所有しない。
-3. 通常終了は collection request admission を閉じ、Remote の collection request producer を止める。
-4. App が actor へ Shutdown を送り、ACK 後に join する。
-5. actor connection が drop した後に process が終了する。
+2. Phase 5 の Remote serverはraw clientではなく、同じclientを包むshared typed producer controlを
+   注入される。RemoteがDB connectionを別所有しない。
+3. 通常終了はRemote collection producer admissionを閉じ、in-flight短期requestのdrain ACKを得る。
+4. App が actor の全request admissionを閉じてShutdownを送り、ACK後にjoinする。
+5. actor connectionがdropした後、Appより長生きするRemote guardを含むprocess終了へ進む。
 
 通常 frame、dialog close、viewer closeでは join しない。App final exit の drain だけが待機可能な境界である。
 Remote startup partial failure は注入 client を破棄するだけで actor owner を失わず、App が通常どおり
@@ -367,6 +368,118 @@ snapshot の出力を変えず、完了時に使用 revision を表示できる�
 - pure preview → confirm 後 worker → actor batch の import と、snapshot → worker write の export。
 - error / progress / cancel / Conflict 表示。UI thread の I/O は増やさない。
 
+#### Phase 2 の具体的な統合境界
+
+**production lifecycle**
+
+- `src/lib.rs` の production 起動だけが `data_dir/collection.db` を指定して
+  `CollectionStoreRuntime` を開始する。`App::default` や snapshot / headless harness は inert のままで、
+  module load や test construction だけでは通常 profile を開かない。
+- 起動順は collection runtime → App への runtime move とする。Phase 2 では raw
+  `CollectionStoreClient` cloneをApp外へ保持せず、Remoteへもまだ渡さない。Phase 5は同じactor clientを内部に持つ
+  `CollectionRemoteProducerControl`（名称は実装時に既存Remote ownerへ合わせる）をAppとRemote serverへ注入する。
+  Remote requestは必ずこのshared admissionを通り、App finalがproducerをClosingへしてin-flight短期requestを
+  drainできるACKを受けてからcollection actorをShutdownする。現状の`RemoteIpcServer` guardが`run_native`外で
+  Appより長生きしても、Remote側がraw clientでpost-shutdown requestを送れる構造にはしない。Phase 5では
+  producer先行close→actor shutdown、Remote guard遅drop、startup partial failureの順序を直接回帰する。
+  thread spawn 失敗または非同期 DB open 失敗は
+  collection UI だけを `Unavailable` にし、通常 folder / viewer / Remote の起動を継続する。
+- App は runtime event と revision watch を `update` の viewport / fullscreen 早期 return より前で drain する。
+  `Ready` 後だけ catalog request と編集操作を有効化する。revision notice は再読込の通知であり、toolbar や
+  dialog が DB snapshot を独自に書き換える合図にはしない。
+- App final `on_exit` は collection の request admission を閉じ、actor の短い transaction 完了と connection / WAL
+  drop ACK を待って join する。通常 frame、toolbar、dialog closeでは join しない。App field の通常 Drop は
+  `begin_shutdown` までの非blocking backstopとし、未完了 filesystem import/export worker は cancelしてdetachする。
+- collection runtime / DB は §234 settings-family lease、復元、完全リセットの対象外である。設定復元中も actor と
+  snapshot/revision は生存し、settings toolbar preferenceだけが復元対象になる。settings operation の success / cancel /
+  recoverable failureの各後も collection DB bytes と catalog を変更しない。成功後のprocess終了では上記App final
+  boundaryがcollection actorを通常終了させる。
+
+**App-owned catalog と dialog request**
+
+- `CollectionUiState` を一つのApp-global ownerとし、runtime lifecycle、immutable catalog、選択中
+  `CollectionId`、revision watch、管理windowとそのtyped requestを保持する。collection選択は管理対象の選択だけで、
+  Phase 3 の `TopLevelGridSurface::Collection` が無い間は `load_folder` や既存grid openへ変換しない。
+- catalog / snapshot requestは、一つだけ保持するprivate receiver自体をrequest tokenとして、
+  `{collection_id, requested catalog revision, requested collection revision}` と同じownerに持つ。
+  選択変更、再要求、window close、collection deleteでreceiverをdropし、遅着resultは現在のreceiver ownerとstable
+  ID/revisionが全て一致するときだけ採用する。newer revision noticeを見たら最新catalog/snapshotを再要求し、古い応答をapplyしない。
+- dialog操作は `Idle | EditingName | ConfirmDelete | ConfirmRemove | ReadingImport | PreviewImport |
+  Classifying | Submitting | ExportSnapshot | ExportWriting | Result` のような相互排他的typed ownerにする。
+  作成/rename/delete/order/reorder/remove/relinkはactorのone-shot receiverをそのvariantが所有し、commit成功前に
+  catalog/snapshotをoptimisticに変更しない。`Conflict` は操作内容と最新再読込導線を表示し、勝手に再送しない。
+- delete はcollection definitionと参照だけ、removeは選択entryの参照だけを消す。どちらもfilesystem delete、
+  ごみ箱、metadata cleanupを呼ばない。relinkは利用者が選んだ新sourceをclassifierへ通して同じentry IDへactor
+  mutationし、元sourceをrename/move/deleteしない。
+
+**toolbar と editor**
+
+- `ToolbarSectionId::Collections` を新規defaultではBookshelf直後へ置く。既存の保存済みsection順は
+  `ordered_with_fallback` の現契約どおり新sectionを末尾補完する。専用display/collapsed/show設定だけをSettingsへ
+  保存し、catalog、active collection、entry、revisionをSettingsへ複製しない。
+- sectionはcatalog名と「管理」を表示し、名前選択は同じ管理windowの対象を切り替える。Phase 2では閲覧一覧を
+  開いたと表示せず、「一覧で開く」は出さない。create/rename/delete、order mode/sort、manual move、add/remove/relink、
+  import/exportは管理window内へ集約し、空・長名・大量entryをscroll可能にする。
+- 手動reorderはManualだけ有効、Standard中は保存済みmanual positionを表示上も破壊しない。Standard sort選択は
+  collection definitionだけを更新し、通常一覧/Favorite/folder tree/folder representativeの設定を変更しない。
+
+**import と direct add**
+
+- native file pickerはpath選択だけをUIで行う。text bytes読込はcancel token付きworker、解析は既存の純
+  `parse_collection_text` をworker内で行う。最初のpreviewはparsed/invalid/duplicate、解決済みlexical path、
+  network表記だけで、targetへ `stat` / canonicalize / link解決 / thumbnail要求をしない。
+- previewの明示Confirm後だけ、共通 `prepare_collection_sources` workerがaccepted sourceを一件ずつ現在の
+  physical kindへ分類する。既存file/dirはImage/Video/Audio/Folder/Zip/Pdf/ConvertibleArchive、not-foundは
+  `Unresolved`、permission/network/unsupportedはtyped line errorとする。folderを再帰展開せず、reparse targetを
+  stable keyへ書き換えない。direct file/folder addとrelinkもこのclassifierを共有し、UIでkindを再推定しない。
+- progressはlatest valueとして表示し、cancelはworker tokenを立てreceiverをdropする。actorへbatchをenqueueする
+  前が取消可能なcommit boundaryであり、cancel済みworkerの遅着resultをenqueueしない。`Submitting`に入った後は
+  cancelを完了済みtransactionの取消と表示せず、短いactor結果を待つ。actorはpreview時のcollection revisionを
+  expected revisionとして最終unique/conflictを決める。
+- previewに無効行がある間はConfirmを無効にする。Confirm後の分類でもunsupported/access errorが一件でもあれば、
+  成功項目だけを部分登録せずbatch全体をactorへ送らない。分類成功とmissingだけで構成されたbatchを一transactionで
+  登録し、duplicateはactorのunique判定結果として表示する。
+- import source text、登録source、relink旧/新sourceはいずれも読取り/参照だけで内容を変更しない。cancel、parse
+  failure、classifier error、revision conflictでcollection DBを部分更新せず、元データのhash/bytesを維持する。
+
+**export**
+
+- Exportクリック時にactorへ選択collectionの最新snapshotを要求し、dialogが保持する古いsnapshotをそのまま
+  書かない。Manualは保存manual順を使用する。StandardはPhase 3でも共用する上記prepare workerで全entryの
+  current kind、4行category、name/mtime/typed size factsを作り、snapshotのexact entry ID集合を検証して
+  `effective_collection_order`へ渡す。`GridDisplayOrder`はworker開始時のimmutable settings snapshotを渡し、
+  worker/UIが通常一覧設定を変更しない。categoryは
+  `CollectionPreparedCategory::Display(GridItemDisplayKind) | UnresolvedTail`（名称は実装時調整可）として
+  availabilityと分ける。現在missingでもDBのlast-known kindが既知なら、そのkindのDisplay categoryへ置き、
+  metadataだけunknownにする。最初から`Unresolved`または現時点でも分類不能でlast-known kindが無いentryは、
+  custom `GridDisplayOrder`の4行すべての後にdeterministic tailとして置き、同じtail内は選択`SortOrder`と
+  filename tieを適用する。missing/unavailableをcategory 0やsize 0へ畳まず、昇順/降順でも全件を残す。
+- immutable `{collection_id, collection revision, effective entry order}` から
+  `serialize_collection_text` を呼び、absolute pathを一行一件で全件出力する。local filterや現在editorの選択は
+  除外条件にしない。Phase 3のGrid prepareも同じ分類/facts builderを再利用し、export専用の別sort正本を作らない。
+- 書込workerはdestination同directoryのrequest-owned temporary fileへwrite/flushし、cancel確認後だけatomic replaceする。
+  failure/cancelでは既存destinationを維持してtemporaryをcleanupする。filesystem writeとthread joinをUIで行わず、
+  結果はcollection ID/revision/request token一致時だけ表示する。exportは参照textであり、source、collection DB、
+  rating/adjustment/settingsを変更しない。
+
+**Phase 2 の直接回帰**
+
+- production injectionだけがdata-dirのruntimeを開始し、App default/snapshot testはinert。Ready/Failed、catalog refresh、
+  revision通知、late catalog/snapshot/mutation result、selection switch、dialog cancel、actor conflictをfake clientまたは
+  TempDir runtimeで固定する。
+- App final exitだけがactorをdrain/joinし、通常frame/dialog closeは待たない。settings restore/resetのsuccess/cancel/
+  recoverable経路でcollection snapshot/revision/DB familyが不変かつruntime request可能である。
+- create/rename/delete/order/manual reorder/add/remove/relinkのactual handlerを通し、stable ID/manual順、definition削除cascade、
+  source非変更、removeとdeleteの文言/command分離を確認する。
+- importはpreview中no-access、Confirm前accessなし、Confirm後classificationのexists/missing/unsupported/network error、
+  progress/cancel、cancel遅着、actor enqueue境界、duplicate/conflict/rollback、source bytes不変を確認する。
+- exportは最新snapshot、Manual/Standard effective order、custom 4行category、known-kind missingとUnresolved tail、
+  全`SortOrder`でmissing全件保持、local filter非依存、atomic replace failure/cancel、
+  parse/serialize roundtrip、destination/source/DB非変更をTempDirで確認する。
+- toolbar fallback/default、専用設定roundtrip/customization copy、Favorite/Bookshelf/Smart/通常sortの不変、editorの
+  empty/long name/scroll/import preview/progress/error/conflictをdark/light snapshotで確認する。Phase 3未接続のため
+  toolbar name選択がfolder/grid openを起こさないhandler回帰も置く。
+
 ### Phase 3: collection grid / context / source migration
 
 - `TopLevelGridSurface::Collection`、prepared snapshot、thumbnail/details、missing cell。
@@ -466,3 +579,70 @@ Focused verification:
   subscriber fanout、Shutdown races、startup failure、actor panic、unknown schema no-write。
 - GUI、通常 profile、real data、verification build は未使用。Phase 1 は user-runnable surface 未接続なので、
   build handoff は toolbar/grid を接続する Phase 2 以降で行う。
+
+## 15. Phase 2 実装記録（2026-09-14）
+
+Phase 2 は `collection.db` actorをproduction Appへ接続し、PCのtoolbarと管理windowからcatalogと参照を編集できる
+段階まで実装した。collection内容を通常Grid、context menu、navigation、slideshow、playback、Remoteで閲覧する接続は
+Phase 3以降であり、toolbarのcollection名は通常folderへ変換せず管理対象だけを切り替える。
+
+- production creatorだけが通常data directoryの`collection.db` runtimeを開始してAppへ一度だけmoveする。
+  App defaultとheadless fixtureはinertである。startup errorはcollection UIだけをUnavailableにし、runtime event、
+  catalog/snapshot private receiver、latest revision watchはfullscreen/native-videoの早期returnより前でpollする。
+  final `App::on_exit`だけがrequest admissionを閉じてactorをdrain/joinし、通常frameとdialog closeは待たない。
+- `CollectionUiState`がruntime、immutable catalog/snapshot、選択ID、管理window、相互排他的operationを所有する。
+  create/rename/delete/order/reorder/add/remove/relinkはactor応答のcommit後だけsnapshotへ反映し、Conflictは再送せず
+  latest catalog/snapshotを取り直す。remove/deleteは参照だけを消し、元sourceを削除・移動・書換えしない。
+- actorの`Failed`/`Closed`後は同じtyped Ready判定で全mutation/import/export入口を無効化し、古いsnapshotは
+  read-only表示に留める。toolbarは`準備中`と`利用不可`を区別し、利用不可でも管理windowのerrorへ到達できる。
+- direct add/relinkとtext import confirm後は共通classifier workerを使う。text bytesの読込とpure previewはworker内、
+  preview中はtargetへI/Oせず、明示confirm後だけcurrent existence/kindを調べる。progress/cancel ownerをoperationへ保持し、
+  ReadingImport/Classifying/ExportWritingは明示的な取消buttonを持つ。cancel/選択変更/window close後の遅着結果はactorへ
+  enqueueしない。Submitting/ExportSnapshotは短いactor処理なので取消可能とは表示しない。
+- exportはクリック時にactorへ最新snapshotを要求し、workerが同じprepared category/order正本を通して全参照を並べ、
+  destination同directoryの一時fileへwrite/flush/sync後にatomic replaceする。cancel/書込/replace失敗は既存destinationを保持し、
+  source、collection DB、通常Grid設定を変更しない。
+- Settingsへ追加したのはtoolbarのshow/display/collapsed preferenceだけである。既存profileの保存済みsection順には
+  `ordered_with_fallback`で新sectionを末尾補完し、新規defaultはBookshelf直後、表示形式はDropdownとした。
+  catalog/active collection/revisionはSettingsへ複製しない。settings復元/完全reset中もcollection DB/runtimeは独立して残る。
+
+Focused verification（final gate前の実装checkpoint）:
+
+- `cargo test -p mimageviewer --lib ui_dialogs::collections::tests -- --nocapture`: 9 passed, 0 failed
+  （handler 7件、production managerのdark/light snapshot 2件）。
+- `cargo test -p mimageviewer --lib collection_store::prepare::tests -- --nocapture`: 5 passed, 0 failed。
+- `cargo test -p mimageviewer --lib settings_full_reset_does_not_change_collection_family -- --nocapture`: 1 passed, 0 failed。
+- `cargo test -p mimageviewer --lib collection_toolbar_defaults_roundtrip -- --nocapture`: 1 passed, 0 failed。
+- handler回帰はcreate→direct add→manual reorder→Standard sort→stable ID relink→reference remove→
+  import preview/confirm→deleteを実actorへ通し、source bytes不変、Conflict再読込、toolbar名選択で通常folder不変、
+  final shutdown後admission拒否を確認する。加えてFailed時の全編集共通拒否、toolbar利用不可表示、classifier/preview
+  error時の部分登録なし、明示取消buttonによるlate result owner破棄、stale dialog snapshotからのexportがactor最新revisionと
+  全entryを出力することを確認する。
+- snapshotは長いcollection名、missing row、選択/check、管理操作、no-access import preview、network/invalid lineを
+  production manager描画で確認する。GUI、通常profile、real dataは使用していない。
+
+Final automated verification:
+
+- 初回 `scripts/test-full.ps1` は main `8463 passed / 2 failed / 45 ignored`、exit 101 だった。新しいcollection名入力が
+  IME helperを通らない既存契約違反と、Bookshelf直後へCollectionsを追加した後も旧隣接関係を期待していたtoolbar
+  reorder testを特定した。入力を `ime_focus::add_singleline` へ統一し、no-op期待を新default順へ補正した後、該当回帰は
+  それぞれ1/1 passed。初回ログは `target/collection-phase2-20260914/test-full.{stdout,stderr}.log` と
+  `test-full.exit.txt` に失敗証拠として分離保持した。
+- 最終source freezeは `target/collection-phase2-20260914/source-freeze-final.sha256.txt`
+  （manifest SHA-256 `1AD6B020E59471D74814691838CB84221FBD65DA3559A94DD32A0716C06C0F51`）。同freezeの
+  `scripts/test-full.ps1` は exit 0、main `8465 passed / 0 failed / 45 ignored`、UI snapshot 50/50、vendor egui /
+  egui-wgpu / eframe 25/25・9/9・15/15、`[test-full] PASS`。ログSHA-256は stdout
+  `2F563ED13D9AB5BBEA1EA46159843294ED012AB0BCF5055D2D58956682A17ADB`、stderr
+  `5CECC9B45ACB4B1E2966D8D8525FEAF4F10BD076C859DCE9312EA0440968F78E`、exit
+  `13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`。
+- 同freezeで `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --all -- --check`、
+  `python scripts/check_ui_glyphs.py`、`cargo run -p viewer_context_audit --quiet`、`git diff --check` はすべてexit 0。
+- resident 0をbuild前後に確認し、`scripts/build-dev.ps1 -PreserveRuntime` はexit 0。agentによるAppの起動・停止は
+  行っていない。verification artifactはcore SHA-256
+  `6B634E07BB0B71071209AB399215BCF878F67DDCA91580FDF281152474DF1761`、remote SHA-256
+  `192E2F800704A833C46831C2A42C47F24558B17A19C80F3DC23BEC21CE7D057D`。buildログSHA-256はstdout
+  `E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855`、stderr
+  `67CB9CD919B566F1251ED28CD7122DE180C8B1689284F7DDB2E64CBC025441E5`、exit
+  `13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`。
+- GUI確認は未実施。Phase 3のcollection Grid/context/source migration、Phase 4のnavigation/slideshow/playback、
+  Phase 5のRemote閲覧は未接続である。

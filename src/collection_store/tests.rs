@@ -803,6 +803,52 @@ fn actor_panic_closes_admission_and_publishes_failure() {
 }
 
 #[test]
+fn settings_full_reset_does_not_change_collection_family_or_runtime_snapshot() {
+    let guard = crate::settings_db::DataDirOverrideGuard::new();
+    let data_dir = guard.path();
+    {
+        let db = crate::settings_db::SettingsDb::create_new(data_dir).unwrap();
+        db.save_full(&crate::settings::Settings::default()).unwrap();
+    }
+    let collection_path = data_dir.join("collection.db");
+    let runtime = CollectionStoreRuntime::start_at(collection_path.clone()).unwrap();
+    wait_ready(&runtime);
+    let client = runtime.client();
+    let created = client
+        .create_collection("Survives settings reset".into())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let before_snapshot = client
+        .load_collection(created.collection_id())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let before_files = collection_family_bytes(&collection_path);
+
+    let permit = crate::settings_db::quiesce_settings_family().unwrap();
+    let reset = crate::settings_restore::full_reset_with_permit(data_dir, &permit).unwrap();
+    permit.resume_local().unwrap();
+    assert!(reset.deleted.iter().all(|path| {
+        !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("collection.db"))
+    }));
+    assert_eq!(collection_family_bytes(&collection_path), before_files);
+
+    let after_snapshot = client
+        .load_collection(created.collection_id())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_snapshot, before_snapshot);
+    runtime.shutdown_and_join();
+}
+
+#[test]
 fn newer_schema_is_not_replaced_with_an_empty_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("collection.db");
@@ -837,6 +883,20 @@ fn wait_ready(runtime: &CollectionStoreRuntime) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn collection_family_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ]
+    .into_iter()
+    .filter_map(|candidate| {
+        let bytes = std::fs::read(&candidate).ok()?;
+        Some((candidate.file_name()?.to_string_lossy().into_owned(), bytes))
+    })
+    .collect()
 }
 
 fn wait_notice(

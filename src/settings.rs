@@ -1650,7 +1650,8 @@ impl FacetEditFlag {
 /// ツールバーの各セクションの表示形式。
 ///
 /// `Buttons` (展開): 横並びの `selectable_label` 群。すべての選択肢が常時見える。
-/// `Collapsible` (折りたたみ): 展開と同じ横並びだが ▶/▽ で畳める (お気に入り/タグ/本棚のみ)。
+/// `Collapsible` (折りたたみ): 展開と同じ横並びだが ▶/▽ で畳める
+/// (お気に入り/タグ/本棚/コレクション)。
 /// `Dropdown` (プルダウン): `ComboBox` + アクションボタン。選択肢を一覧してスペース節約。
 /// `Unknown`: 将来バージョンの未知の値を旧バイナリが読んだ場合の安全弁 (= 展開扱い)。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -1699,6 +1700,7 @@ impl ToolbarSectionDisplay {
 pub enum ToolbarSectionId {
     FolderTree,
     Bookshelf,
+    Collections,
     Cols,
     Aspect,
     Sort,
@@ -1720,6 +1722,7 @@ impl ToolbarSectionId {
         &[
             Self::FolderTree,
             Self::Bookshelf,
+            Self::Collections,
             Self::Cols,
             Self::Aspect,
             Self::Sort,
@@ -4247,6 +4250,9 @@ pub struct Settings {
     /// ツールバーに「本棚」セクションを表示する。
     #[serde(default = "default_true")]
     pub show_toolbar_bookshelf: bool,
+    /// ツールバーに「コレクション」管理セクションを表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_collections: bool,
     /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_history_nav: bool,
@@ -4749,6 +4755,8 @@ pub struct Settings {
     pub toolbar_tags_display: ToolbarSectionDisplay,
     #[serde(default)]
     pub toolbar_bookshelf_display: ToolbarSectionDisplay,
+    #[serde(default = "default_toolbar_collections_display")]
+    pub toolbar_collections_display: ToolbarSectionDisplay,
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
@@ -4758,6 +4766,8 @@ pub struct Settings {
     pub toolbar_tags_collapsed: bool,
     #[serde(default)]
     pub toolbar_bookshelf_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_collections_collapsed: bool,
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
@@ -6476,6 +6486,9 @@ pub(crate) fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
 pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
     true
 }
+fn default_toolbar_collections_display() -> ToolbarSectionDisplay {
+    ToolbarSectionDisplay::Dropdown
+}
 pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
@@ -6785,6 +6798,7 @@ impl Default for Settings {
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
             show_toolbar_bookshelf: true,
+            show_toolbar_collections: true,
             show_address_bar_history_nav: true,
             show_address_bar_quick_folders: true,
             show_toolbar_parent_button: true,
@@ -6828,10 +6842,12 @@ impl Default for Settings {
             toolbar_smart_folders_display: ToolbarSectionDisplay::default(),
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
+            toolbar_collections_display: default_toolbar_collections_display(),
             toolbar_favorites_collapsed: false,
             toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
+            toolbar_collections_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_sort_size_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
@@ -9061,6 +9077,7 @@ impl Settings {
         self.show_toolbar_tags = src.show_toolbar_tags;
         self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
         self.show_toolbar_bookshelf = src.show_toolbar_bookshelf;
+        self.show_toolbar_collections = src.show_toolbar_collections;
         self.show_toolbar_rating = src.show_toolbar_rating;
         self.show_toolbar_facet_filter = src.show_toolbar_facet_filter;
         self.toolbar_cols_display = src.toolbar_cols_display;
@@ -9070,10 +9087,12 @@ impl Settings {
         self.toolbar_smart_folders_display = src.toolbar_smart_folders_display;
         self.toolbar_tags_display = src.toolbar_tags_display;
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
+        self.toolbar_collections_display = src.toolbar_collections_display;
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
         self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
+        self.toolbar_collections_collapsed = src.toolbar_collections_collapsed;
         self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
         self.toolbar_cols_details_visible = src.toolbar_cols_details_visible;
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
@@ -12072,6 +12091,43 @@ mod tests {
             loaded.toolbar_favorites_display,
             ToolbarSectionDisplay::Buttons
         );
+    }
+
+    #[test]
+    fn collection_toolbar_defaults_roundtrip_and_old_order_appends_the_new_section() {
+        let defaults = Settings::default();
+        assert!(defaults.show_toolbar_collections);
+        assert_eq!(
+            defaults.toolbar_collections_display,
+            ToolbarSectionDisplay::Dropdown
+        );
+        assert!(!defaults.toolbar_collections_collapsed);
+        assert_eq!(
+            ToolbarSectionId::default_order()[2],
+            ToolbarSectionId::Collections
+        );
+
+        let old_order = ToolbarSectionId::default_order()
+            .iter()
+            .copied()
+            .filter(|section| *section != ToolbarSectionId::Collections)
+            .collect::<Vec<_>>();
+        let upgraded = ToolbarSectionId::ordered_with_fallback(&old_order);
+        assert_eq!(upgraded[..old_order.len()], old_order);
+        assert_eq!(upgraded.last(), Some(&ToolbarSectionId::Collections));
+
+        let mut customized = Settings::default();
+        customized.show_toolbar_collections = false;
+        customized.toolbar_collections_display = ToolbarSectionDisplay::Collapsible;
+        customized.toolbar_collections_collapsed = true;
+        let json = serde_json::to_string(&customized).unwrap();
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.show_toolbar_collections);
+        assert_eq!(
+            loaded.toolbar_collections_display,
+            ToolbarSectionDisplay::Collapsible
+        );
+        assert!(loaded.toolbar_collections_collapsed);
     }
 
     #[test]
