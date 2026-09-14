@@ -19,6 +19,13 @@ rating filter の一時解除 anchor も context 所有であり、一方の sna
 anchor や fallback を `take()` してはならない。canonical `return_to` が存在する遷移では、
 未使用の legacy fallback slot は consume しない。
 
+検索結果の「フォルダに移動」は通常の検索 close と異なり、canonical `return_to` を consume して
+復元せず、typed request が移動先と exact target を一緒に所有する。物理 directory は
+`FolderOpenScanPurpose::JumpToPhysicalFolder` の worker scan と同じ寿命で target を保持し、成功後に
+実パスで選択する。検索集約の ZIP は directory scan へ渡さず archive open 経路へ送る。request が
+勝った時点で検索行を空の Folder surface へ差し替えるため、scan failure、別 navigation による cancel、
+archive conversion の cancel 後に、終了済み検索の行が Folder surface として残らない。
+
 ブックマーク一覧は `TopLevelGridSurface::Bookmarks` を所有者とし、動画・音声・本の各ブックマークを
 `App.items` の 1 行へ materialize する。ブックマーク ID、登録位置、登録日時、欠落状態、保存済み動画
 サムネイルは同じ index の sidecar row に保持する。通常の facet / rating / tag / details 表示を共有する一方、

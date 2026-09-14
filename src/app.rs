@@ -4576,6 +4576,12 @@ pub(crate) enum FolderOpenScanPurpose {
     DetachedImage {
         image_path: PathBuf,
     },
+    /// A context-menu jump to one physical directory. The scan and optional exact
+    /// leaf selection share one bundle-owned lifecycle, so replacement/cancel/error
+    /// cannot leak the selection into a later unrelated load.
+    JumpToPhysicalFolder {
+        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+    },
     /// A similar-result navigation to one exact image in a physical folder.  The
     /// completed scan and leaf identity move together; the current viewer is not
     /// torn down until the scan succeeds.
@@ -4601,6 +4607,7 @@ impl FolderOpenScanPurpose {
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
             | Self::DetachedImage { .. }
+            | Self::JumpToPhysicalFolder { .. }
             | Self::CurrentViewOrderRefresh { .. } => None,
         }
     }
@@ -4614,6 +4621,7 @@ impl FolderOpenScanPurpose {
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
             | Self::DetachedImage { .. }
+            | Self::JumpToPhysicalFolder { .. }
             | Self::CurrentViewOrderRefresh { .. } => None,
         }
     }
@@ -38884,6 +38892,82 @@ impl App {
         self.keymap.consume_context_shortcuts_help_action(ctx)
     }
 
+    /// Commit a winning context-menu jump before dispatching its destination.
+    ///
+    /// Search/read-history rows cannot remain mounted after their typed surface has been
+    /// dismissed: a slow scan, read error, replacement, or archive-conversion cancel would
+    /// otherwise expose those stale rows as an ordinary Folder surface. Install an empty
+    /// generation first, then let the request-owned folder scan or archive lifecycle replace it.
+    fn begin_context_jump_to_folder(
+        &mut self,
+        request: crate::ui_dialogs::context_menu::JumpToFolderRequest,
+    ) -> Option<PathBuf> {
+        use crate::ui_dialogs::context_menu::JumpToFolderDestination;
+
+        self.dismiss_source_for_jump_to_folder(&request);
+        let destination_label = request.destination.path().to_string_lossy().to_string();
+
+        self.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        self.install_prepared_aggregate_items(Vec::new(), Vec::new());
+        self.invalidate_idx_state_and_queues();
+        self.visible_indices.clear();
+        self.details_order.clear();
+        self.details_order_revision = self.details_order_revision.wrapping_add(1);
+        self.details_tag_prewarm_indices.clear();
+        self.search_filter = None;
+        self.selected = None;
+        // This winning typed request supersedes legacy basename hints from an older
+        // navigation.  In particular, a failed/cancelled scan must not let such a hint
+        // escape into the next unrelated folder load.
+        self.select_after_load = None;
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+        self.pending_grid_scroll = None;
+        self.current_folder = None;
+        self.archive_source_override = None;
+        self.address = destination_label;
+        self.empty_items_reason = None;
+
+        match request.destination {
+            JumpToFolderDestination::PhysicalDirectory(path) => {
+                self.start_folder_open_scan(
+                    path,
+                    FolderOpenScanPurpose::JumpToPhysicalFolder {
+                        selection: request.selection,
+                    },
+                );
+                None
+            }
+            JumpToFolderDestination::ArchiveContainer(path) => {
+                debug_assert!(matches!(
+                    request.selection,
+                    crate::ui_dialogs::context_menu::JumpToFolderSelection::None
+                ));
+                Some(path)
+            }
+        }
+    }
+
+    fn finish_jump_to_physical_folder_selection(
+        &mut self,
+        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+    ) {
+        use crate::ui_dialogs::context_menu::JumpToFolderSelection;
+
+        let JumpToFolderSelection::ExactPath(target) = selection else {
+            return;
+        };
+        let Some(index) = self.items.iter().position(|item| {
+            item.drag_source_path()
+                .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, &target))
+        }) else {
+            self.show_feedback_toast("移動先の項目が見つかりませんでした".to_string());
+            return;
+        };
+        self.select_item_after_load(index);
+    }
+
     /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。
     /// UI スレッドで `scan_directory` を直接走らせず、worker で read_dir + メタ取得を
     /// 済ませる。完了結果は `poll_folder_pane_open` で回収し、通常 nav と同じ
@@ -38983,6 +39067,15 @@ impl App {
         if let Some(mut prev) = self.folder_pane_open_pending.take() {
             prev.cancel_with_diagnostic("scan_cancelled");
         }
+    }
+
+    pub(crate) fn context_folder_jump_pending(&self) -> bool {
+        matches!(
+            self.folder_pane_open_pending
+                .as_ref()
+                .map(|pending| &pending.purpose),
+            Some(FolderOpenScanPurpose::JumpToPhysicalFolder { .. })
+        )
     }
 
     /// Cancel only an explicit similar-result location scan. Page turns and a true viewer close
@@ -39102,6 +39195,9 @@ impl App {
                         }
                         FolderOpenScanPurpose::DetachedFolder => "detached-folder",
                         FolderOpenScanPurpose::DetachedImage { .. } => "detached-image",
+                        FolderOpenScanPurpose::JumpToPhysicalFolder { .. } => {
+                            "jump-to-physical-folder"
+                        }
                         FolderOpenScanPurpose::RequiredFullscreenTarget { .. } => {
                             "required-fullscreen-target"
                         }
@@ -39183,6 +39279,11 @@ impl App {
                     "main folder scan rejected detached-owned result path={}",
                     ready.path.display()
                 ));
+                None
+            }
+            FolderOpenScanPurpose::JumpToPhysicalFolder { selection } => {
+                self.load_folder_with_scan(ready.path, Some(scan));
+                self.finish_jump_to_physical_folder_selection(selection);
                 None
             }
             FolderOpenScanPurpose::RequiredFullscreenTarget {
@@ -39311,6 +39412,13 @@ impl App {
                 // cross the ownership boundary, so never materialize it here.
                 crate::logger::log(format!(
                     "detached folder scan rejected main-owned grid candidate path={}",
+                    ready.path.display()
+                ));
+                DetachedPhysicalFolderOpenPoll::Failed
+            }
+            FolderOpenScanPurpose::JumpToPhysicalFolder { .. } => {
+                crate::logger::log(format!(
+                    "detached folder scan rejected main-owned context jump path={}",
                     ready.path.display()
                 ));
                 DetachedPhysicalFolderOpenPoll::Failed
@@ -73618,13 +73726,12 @@ impl App {
             } else if let Some(p) = open_folder_nav {
                 Some(p)
             } else if let Some(action) = context_nav {
-                // context_nav が実際に勝ったときだけ副作用 (検索終了 + 履歴 push +
-                // suppress フラグ) を適用する。show_context_menu 内で副作用を起こすと
-                // 別 nav 源が同フレームで勝ったときに順序が脆くなる (Codex P3)。
+                // context_nav が実際に勝ったときだけ source surface の終了と typed
+                // destination/selection の dispatch を適用する。show_context_menu 内で
+                // 副作用を起こすと別 nav 源が同フレームで勝ったときに順序が脆くなる。
                 match action {
-                    crate::ui_dialogs::context_menu::ContextMenuAction::JumpFromSearch(path) => {
-                        self.apply_jump_from_search_to(&path);
-                        Some(path)
+                    crate::ui_dialogs::context_menu::ContextMenuAction::JumpToFolder(request) => {
+                        self.begin_context_jump_to_folder(request)
                     }
                     crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer {
                         idx,
@@ -73692,6 +73799,11 @@ impl App {
                         purpose,
                     } = ready;
                     match (purpose, scan) {
+                        (FolderOpenScanPurpose::JumpToPhysicalFolder { selection }, Ok(scan)) => {
+                            self.load_folder_with_scan(path, Some(scan));
+                            self.finish_jump_to_physical_folder_selection(selection);
+                            None
+                        }
                         (FolderOpenScanPurpose::CurrentViewOrderRefresh { order }, Ok(scan)) => {
                             self.apply_current_view_order_refresh(path, scan, order);
                             None

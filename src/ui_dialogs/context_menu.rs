@@ -29,15 +29,87 @@ fn primary_mouse_button_physically_down() -> bool {
 /// だけが先に走るという順序の脆さを避ける (Codex P3)。
 #[derive(Debug)]
 pub(crate) enum ContextMenuAction {
-    /// 検索結果 (Ctrl+G / Ctrl+S) から実フォルダへ着地。検索を明示終了し、検索前フォルダを
-    /// 履歴に積んで `suppress_folder_nav_record_once` を立てる遷移。実適用は
-    /// `apply_jump_from_search_to`。
-    JumpFromSearch(PathBuf),
+    /// 検索結果 (Ctrl+G / Ctrl+S / タグ) または閲覧履歴から実フォルダへ着地する。
+    /// source surface の終了、destination、移動後の exact selection を一つの request に
+    /// 保持し、優先度判定でこの action が勝った後だけ適用する。
+    JumpToFolder(JumpToFolderRequest),
     /// ZIP/PDF/対応アーカイブを、グローバル設定ではなく明示モードで開く。
     OpenGridContainer {
         idx: usize,
         mode: crate::app::GridContainerOpenMode,
     },
+}
+
+/// 「フォルダに移動」の行先種別。検索集約の ZIP はファイルであり directory scan へ
+/// 渡せないため、物理ディレクトリと archive container を型で分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JumpToFolderDestination {
+    PhysicalDirectory(PathBuf),
+    ArchiveContainer(PathBuf),
+}
+
+impl JumpToFolderDestination {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::PhysicalDirectory(path) | Self::ArchiveContainer(path) => path,
+        }
+    }
+}
+
+/// directory scan と同じ owner が成功 / target 消失 / cancel / error まで保持する選択。
+/// basename hint では同名や大小文字差を一意に扱えないため実パスを正本にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JumpToFolderSelection {
+    None,
+    ExactPath(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JumpToFolderRequest {
+    pub(crate) destination: JumpToFolderDestination,
+    pub(crate) selection: JumpToFolderSelection,
+}
+
+fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
+    use crate::grid_item::SearchContainerKind;
+
+    match item {
+        GridItem::Folder(path) => Some(JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(native_nav_path(path)),
+            selection: JumpToFolderSelection::None,
+        }),
+        GridItem::SearchContainer { path, kind, .. } => {
+            let destination = match kind {
+                SearchContainerKind::Folder => {
+                    JumpToFolderDestination::PhysicalDirectory(native_nav_path(path))
+                }
+                SearchContainerKind::Zip => {
+                    JumpToFolderDestination::ArchiveContainer(native_nav_path(path))
+                }
+            };
+            Some(JumpToFolderRequest {
+                destination,
+                selection: JumpToFolderSelection::None,
+            })
+        }
+        _ => {
+            let exact_path = item.drag_source_path().map(native_nav_path)?;
+            let destination = parent_folder_for_nav(&exact_path)?;
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination),
+                selection: JumpToFolderSelection::ExactPath(exact_path),
+            })
+        }
+    }
+}
+
+fn jump_to_book_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
+    let exact_path = item.container_path().map(native_nav_path)?;
+    let destination = parent_folder_for_nav(&exact_path)?;
+    Some(JumpToFolderRequest {
+        destination: JumpToFolderDestination::PhysicalDirectory(destination),
+        selection: JumpToFolderSelection::ExactPath(exact_path),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1551,22 +1623,11 @@ impl crate::app::App {
                 }
                 None
             }
-            MenuCommand::JumpToFolder => match &target.item {
-                GridItem::Folder(path) => {
-                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
-                }
-                GridItem::SearchContainer { path, .. } => {
-                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
-                }
-                _ => target.item.drag_source_path().and_then(|path| {
-                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
-                }),
-            },
+            MenuCommand::JumpToFolder => {
+                jump_to_folder_request(&target.item).map(ContextMenuAction::JumpToFolder)
+            }
             MenuCommand::JumpToBookFolder => {
-                self.select_after_load = Some(target.item.name().to_string());
-                target.item.container_path().and_then(|path| {
-                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
-                })
+                jump_to_book_folder_request(&target.item).map(ContextMenuAction::JumpToFolder)
             }
             MenuCommand::OpenContainerAsPage => {
                 target
@@ -1702,51 +1763,50 @@ impl crate::app::App {
         }
     }
 
-    /// `ContextMenuAction::JumpFromSearch` の副作用を適用する。検索終了 (Ctrl+G /
-    /// Ctrl+S) と、検索前フォルダを back stack に積んだうえで履歴の二重 push を抑止する。
+    /// `ContextMenuAction::JumpToFolder` の source surface 終了を適用する。検索終了
+    /// (Ctrl+G / Ctrl+S / タグ) と canonical return owner の消費を同じ境界で行い、
+    /// 検索前の実フォルダだけを back stack に積む。
     ///
     /// **呼び出しは context_nav が優先度判定で実際に勝ったあとに限る** (Codex P3): 副作用を
     /// show_context_menu 内で発火すると、同フレームに別 nav 源 (キーボード等) が勝った
     /// ときに、別ナビが意図せず検索終了済み・suppress 立て済みの状態を引き継いでしまう。
-    pub(crate) fn apply_jump_from_search_to(&mut self, target: &Path) {
-        // 検索を抜ける前に、検索開始時の実フォルダ C を捕捉する。検索中は
-        // current_folder がドリルイン先や合成パスを指しうるので、確実に検索前の
-        // 実フォルダを保持している saved_folder から取る。
-        let pre_search_folder = if self.global_search.active {
-            self.global_search.saved_folder.clone()
-        } else if self.favsearch.active {
-            self.favsearch.saved_folder.clone()
-        } else if self.tag_view.active {
-            self.tag_view.saved_folder.clone()
-        } else {
-            None
-        };
-        // saved_folder の復帰で旧フォルダへ無駄なロードが走らないよう、先に
-        // saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
+    pub(crate) fn dismiss_source_for_jump_to_folder(&mut self, request: &JumpToFolderRequest) {
+        // `dismiss_*_without_restore` が canonical `return_to` を consume する。ここで
+        // `close_*` / `restore_view_return_context` を呼ぶと origin load と destination
+        // load が競合するため、戻り先は履歴用途にだけ使う。
+        let mut return_context = None;
         if self.global_search.active {
-            self.global_search.saved_folder = None;
-            self.close_global_search();
+            return_context = Some(self.dismiss_global_search_without_restore());
         }
         if self.favsearch.active {
-            self.favsearch.saved_folder = None;
-            self.close_favsearch();
+            let dismissed = self.dismiss_favsearch_without_restore();
+            return_context.get_or_insert(dismissed);
         }
         if self.tag_view.active {
-            self.tag_view.saved_folder = None;
-            self.close_tag_view();
+            let dismissed = self.dismiss_tag_view_without_restore();
+            return_context.get_or_insert(dismissed);
         }
-        // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
-        // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。
-        // X で ← を押すと検索前の C に戻れる。C == X のときは無意味なので積まない。
-        if let Some(c) = pre_search_folder {
-            if !crate::folder_tree::path_eq(&c, target) {
+
+        // active flag が stale でも typed surface が Search なら canonical owner を
+        // consume する。閲覧履歴の JumpToBookFolder には return owner がない。
+        if return_context.is_none()
+            && matches!(
+                self.top_level_grid_view.surface(),
+                crate::app::top_level_grid_view::TopLevelGridSurface::Search(_)
+            )
+        {
+            return_context = self.top_level_grid_view.take_return_to();
+        }
+
+        // synthetic origin を実フォルダ履歴へ平坦化しない。物理 Folder origin だけが
+        // 「移動先で戻る」を構成できる。
+        if let Some(crate::app::top_level_grid_view::TopLevelGridRestore::Folder(c)) =
+            return_context
+        {
+            if !crate::folder_tree::path_eq(&c, request.destination.path()) {
                 self.push_nav_history_entry(c);
             }
         }
-        // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
-        // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
-        // record_folder_nav_transition 側で行われる)。
-        self.set_active_folder_nav_suppress_record_once(true);
     }
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
@@ -2571,6 +2631,64 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 #[cfg(test)]
 mod delete_confirm_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn jump_request_keeps_exact_leaf_and_separates_folder_from_zip_container() {
+        let image = PathBuf::from(r"C:\media\album\image.jpg");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::Image(image.clone())),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(PathBuf::from(
+                    r"C:\media\album"
+                )),
+                selection: JumpToFolderSelection::ExactPath(image),
+            })
+        );
+
+        let folder = PathBuf::from(r"C:\media\album");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::SearchContainer {
+                path: folder.clone(),
+                kind: crate::grid_item::SearchContainerKind::Folder,
+                hit_count: 2,
+                representative: None,
+            }),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(folder),
+                selection: JumpToFolderSelection::None,
+            })
+        );
+
+        let archive = PathBuf::from(r"C:\media\book.zip");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::SearchContainer {
+                path: archive.clone(),
+                kind: crate::grid_item::SearchContainerKind::Zip,
+                hit_count: 2,
+                representative: None,
+            }),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::ArchiveContainer(archive),
+                selection: JumpToFolderSelection::None,
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn jump_to_book_folder_carries_container_path_without_eager_app_hint() {
+        let book = PathBuf::from(r"C:\media\shelf\book.zip");
+        assert_eq!(
+            jump_to_book_folder_request(&GridItem::ZipFile(book.clone())),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(PathBuf::from(
+                    r"C:\media\shelf"
+                )),
+                selection: JumpToFolderSelection::ExactPath(book),
+            })
+        );
+    }
 
     /// 拒否文は「なぜ実行されなかったか」と対処を伝えるので、読み切れる表示時間が要る。
     /// 表示時間は文字数から決まる (`feedback_toast_duration`) ので、文言を伸ばしたときに

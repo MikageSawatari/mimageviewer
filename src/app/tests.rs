@@ -9632,9 +9632,10 @@ mod folder_pane_open_nav_tests {
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
-        FolderNavHistoryState, GridClickSelectionAnchor, GridScrollIntent, QuickFolderSlotId,
-        QuickFolderSwitchTarget, drive_current_key_for_letter, drive_current_key_for_path,
-        drive_root_path_for_letter, location_root_for_path,
+        App, FolderNavHistoryState, FolderOpenOutcome, FolderPaneOpenReady,
+        GridClickSelectionAnchor, GridScrollIntent, QuickFolderSlotId, QuickFolderSwitchTarget,
+        ScannedDir, drive_current_key_for_letter, drive_current_key_for_path,
+        drive_root_path_for_letter, location_root_for_path, scan_directory,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
@@ -11411,38 +11412,451 @@ mod phase_c_folder_nav_history_tests {
         );
     }
 
+    #[cfg(windows)]
+    fn arm_context_jump_source(
+        app: &mut App,
+        search: crate::app::top_level_grid_view::TopLevelSearchView,
+        origin: PathBuf,
+        item: GridItem,
+    ) {
+        app.install_new_items(vec![item], vec![None]);
+        app.visible_indices = vec![0];
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+        match search {
+            crate::app::top_level_grid_view::TopLevelSearchView::Favorite => {
+                app.favsearch.active = true;
+                app.favsearch.saved_folder = Some(origin.clone());
+            }
+            crate::app::top_level_grid_view::TopLevelSearchView::Global => {
+                app.global_search.active = true;
+                app.global_search.saved_folder = Some(origin.clone());
+                app.items_are_global_search_view = true;
+            }
+            crate::app::top_level_grid_view::TopLevelSearchView::Tag => {
+                app.tag_view.active = true;
+                app.tag_view.saved_folder = Some(origin.clone());
+                app.items_are_tag_view = true;
+            }
+        }
+        app.top_level_grid_view.begin(
+            crate::app::top_level_grid_view::TopLevelGridSurface::Search(search),
+            Some(crate::app::top_level_grid_view::TopLevelGridRestore::Folder(origin)),
+        );
+    }
+
+    #[cfg(windows)]
+    fn take_context_jump_ready(
+        app: &mut App,
+        scan: std::io::Result<ScannedDir>,
+    ) -> FolderPaneOpenReady {
+        let pending = app
+            .folder_pane_open_pending
+            .take()
+            .expect("context jump scan pending");
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        FolderPaneOpenReady {
+            path: pending.path,
+            scan,
+            purpose: pending.purpose,
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn navigate_to_folder_from_search_records_pre_search_folder() {
+    fn context_jump_consumes_canonical_return_and_selects_exact_tag_target() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
         let mut app = setup_app();
-        let c = PathBuf::from(r"C:\miv-test\pre-search");
-        let x = app.tmp.path().join("jump-target");
-        std::fs::create_dir_all(&x).unwrap();
+        let origin = PathBuf::from(r"C:\miv-test\pre-search");
+        let destination = app.tmp.path().join("jump-target");
+        std::fs::create_dir_all(&destination).unwrap();
+        let selected_path = destination.join("selected.jpg");
+        std::fs::write(&selected_path, b"not-an-image").unwrap();
         let older = PathBuf::from(r"C:\miv-test\older");
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
-        app.current_folder = Some(crate::app::search_results_synthetic_path());
-        app.favsearch.active = true;
-        app.favsearch.saved_folder = Some(c.clone());
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Tag,
+            origin.clone(),
+            GridItem::Image(selected_path.clone()),
+        );
 
-        // context_menu「フォルダに移動」後処理の模擬: 検索前フォルダ C を捕捉して
-        // 検索を閉じ、C を明示的に積んでから移動先 X へ load する。
-        let pre = app.favsearch.saved_folder.clone();
-        app.favsearch.saved_folder = None;
-        app.close_favsearch();
-        if let Some(cc) = pre {
-            if !crate::folder_tree::path_eq(&cc, &x) {
-                app.push_nav_history_entry(cc);
-            }
-        }
-        app.set_active_folder_nav_suppress_record_once(true);
-        app.load_folder(x.clone());
+        let request = JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+            selection: JumpToFolderSelection::ExactPath(selected_path.clone()),
+        };
+        assert!(app.begin_context_jump_to_folder(request).is_none());
 
-        // 「検索前フォルダ C → 移動先 X」が積まれ、X で ← を押すと C に戻れる。
+        assert!(!app.tag_view.active);
+        assert!(!app.items_are_tag_view);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert!(app.top_level_grid_view.return_to().is_none());
+        assert!(app.items.is_empty(), "search rows leave with their surface");
+        assert!(app.current_folder.is_none());
+        assert!(app.context_folder_jump_pending());
+        assert!(app.select_after_load.is_none());
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![older, c]
+            vec![older.clone(), origin.clone()]
         );
-        assert_eq!(app.recent_folder_entries().first(), Some(&x));
+
+        let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
+        let ctx = egui::Context::default();
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+
+        assert!(!app.context_folder_jump_pending());
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        let selected = app.selected.expect("exact target selected");
+        assert!(app.items.get(selected).is_some_and(|item| {
+            item.drag_source_path()
+                .is_some_and(|path| crate::folder_tree::path_eq(path, &selected_path))
+        }));
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.recent_folder_entries().first(), Some(&destination));
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![older, origin]
+        );
+        assert!(
+            !app.quick_folder_workspaces[slot.index()]
+                .history
+                .suppress_record_once
+        );
+        assert!(app.select_after_load.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reading_history_book_jump_selects_exact_container_in_parent_folder() {
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        let mut app = setup_app();
+        let destination = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&destination).unwrap();
+        let book = destination.join("book.zip");
+        std::fs::write(&book, b"not-a-real-zip").unwrap();
+        app.install_new_items(vec![GridItem::ZipFile(book.clone())], vec![None]);
+        app.items_are_reading_history_view = true;
+        app.current_folder = Some(crate::app::reading_history_synthetic_path());
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::ReadingHistory);
+
+        assert!(
+            app.begin_context_jump_to_folder(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+                selection: JumpToFolderSelection::ExactPath(book.clone()),
+            })
+            .is_none()
+        );
+        assert!(!app.items_are_reading_history_view);
+        assert!(app.items.is_empty());
+
+        let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
+        assert!(
+            app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(app.selected.is_some_and(|index| {
+            app.items.get(index).is_some_and(|item| {
+                item.drag_source_path()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, &book))
+            })
+        }));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn all_search_surfaces_dismiss_without_restoring_their_canonical_origin() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        for search in [
+            TopLevelSearchView::Favorite,
+            TopLevelSearchView::Global,
+            TopLevelSearchView::Tag,
+        ] {
+            let mut app = setup_app();
+            let origin = app.tmp.path().join(format!("origin-{search:?}"));
+            let destination = app.tmp.path().join(format!("destination-{search:?}"));
+            std::fs::create_dir_all(&destination).unwrap();
+            arm_context_jump_source(
+                &mut app,
+                search,
+                origin.clone(),
+                GridItem::Image(destination.join("target.jpg")),
+            );
+
+            let request = JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination),
+                selection: JumpToFolderSelection::None,
+            };
+            assert!(app.begin_context_jump_to_folder(request).is_none());
+            assert!(!app.favsearch.active);
+            assert!(!app.global_search.active);
+            assert!(!app.tag_view.active);
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Folder
+            ));
+            assert!(app.top_level_grid_view.return_to().is_none());
+            assert_eq!(
+                app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                    .history
+                    .back_stack,
+                vec![origin]
+            );
+            app.cancel_folder_pane_open();
+            assert!(!app.context_folder_jump_pending());
+            assert!(app.items.is_empty());
+            assert!(app.current_folder.is_none());
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Folder
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_folder_canonical_return_is_consumed_without_physical_history_flattening() {
+        use crate::app::top_level_grid_view::{
+            TopLevelGridRestore, TopLevelGridSurface, TopLevelSearchView,
+        };
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        let mut app = setup_app();
+        let slot = QuickFolderSlotId::A;
+        let older = app.tmp.path().join("older");
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
+        let origin = app.tmp.path().join("legacy-folder-fallback");
+        let destination = app.tmp.path().join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Tag,
+            origin,
+            GridItem::Image(destination.join("target.jpg")),
+        );
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag),
+            Some(TopLevelGridRestore::Rating { stars: 3 }),
+        );
+
+        assert!(
+            app.begin_context_jump_to_folder(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination),
+                selection: JumpToFolderSelection::None,
+            })
+            .is_none()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![older]
+        );
+        assert!(app.top_level_grid_view.return_to().is_none());
+        assert!(
+            !app.quick_folder_workspaces[slot.index()]
+                .history
+                .suppress_record_once
+        );
+        app.cancel_folder_pane_open();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn losing_context_jump_action_has_no_eager_surface_or_selection_side_effect() {
+        use crate::app::top_level_grid_view::{TopLevelGridRestore, TopLevelSearchView};
+        use crate::ui_dialogs::context_menu::{
+            ContextMenuAction, JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("origin");
+        let target = app.tmp.path().join("destination").join("book.zip");
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Tag,
+            origin.clone(),
+            GridItem::ZipFile(target.clone()),
+        );
+
+        let _losing_action = ContextMenuAction::JumpToFolder(JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(
+                target.parent().unwrap().to_path_buf(),
+            ),
+            selection: JumpToFolderSelection::ExactPath(target),
+        });
+
+        assert!(app.tag_view.active);
+        assert_eq!(app.items.len(), 1);
+        assert!(app.select_after_load.is_none());
+        assert!(matches!(
+            app.top_level_grid_view.return_to(),
+            Some(TopLevelGridRestore::Folder(path)) if path == &origin
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn context_jump_missing_target_and_scan_failure_end_with_empty_owned_request() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        let mut missing_app = setup_app();
+        let destination = missing_app.tmp.path().join("missing-target-folder");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("other.jpg"), b"other").unwrap();
+        let missing = destination.join("gone.jpg");
+        let missing_origin = missing_app.tmp.path().join("origin");
+        arm_context_jump_source(
+            &mut missing_app,
+            TopLevelSearchView::Tag,
+            missing_origin,
+            GridItem::Image(missing.clone()),
+        );
+        assert!(
+            missing_app
+                .begin_context_jump_to_folder(JumpToFolderRequest {
+                    destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+                    selection: JumpToFolderSelection::ExactPath(missing),
+                })
+                .is_none()
+        );
+        let ready = take_context_jump_ready(&mut missing_app, Ok(scan_directory(&destination)));
+        assert!(
+            missing_app
+                .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        assert!(missing_app.folder_pane_open_pending.is_none());
+        assert!(missing_app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("移動先の項目が見つかりません")
+        }));
+        drop(missing_app);
+
+        let mut failed_app = setup_app();
+        let failed_destination = failed_app.tmp.path().join("unreadable");
+        let failed_origin = failed_app.tmp.path().join("origin");
+        arm_context_jump_source(
+            &mut failed_app,
+            TopLevelSearchView::Global,
+            failed_origin,
+            GridItem::Image(failed_destination.join("target.jpg")),
+        );
+        assert!(
+            failed_app
+                .begin_context_jump_to_folder(JumpToFolderRequest {
+                    destination: JumpToFolderDestination::PhysicalDirectory(
+                        failed_destination.clone(),
+                    ),
+                    selection: JumpToFolderSelection::ExactPath(
+                        failed_destination.join("target.jpg"),
+                    ),
+                })
+                .is_none()
+        );
+        let ready = take_context_jump_ready(
+            &mut failed_app,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test denied",
+            )),
+        );
+        assert!(
+            failed_app
+                .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        assert!(failed_app.folder_pane_open_pending.is_none());
+        assert!(failed_app.items.is_empty());
+        assert!(failed_app.current_folder.is_none());
+        assert!(matches!(
+            failed_app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert!(
+            failed_app
+                .fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| { toast.0.contains("フォルダを読み取れません") })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_search_container_conversion_cancel_does_not_restore_search_rows() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+
+        let mut app = setup_app();
+        let archive = app.tmp.path().join("search-container.7z");
+        let origin = app.tmp.path().join("origin");
+        std::fs::write(&archive, b"not-a-real-archive").unwrap();
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Global,
+            origin.clone(),
+            GridItem::SearchContainer {
+                path: archive.clone(),
+                kind: crate::grid_item::SearchContainerKind::Zip,
+                hit_count: 1,
+                representative: None,
+            },
+        );
+        let navigate = app.begin_context_jump_to_folder(JumpToFolderRequest {
+            destination: JumpToFolderDestination::ArchiveContainer(archive.clone()),
+            selection: JumpToFolderSelection::None,
+        });
+        assert_eq!(navigate.as_ref(), Some(&archive));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(navigate.unwrap()),
+            FolderOpenOutcome::ConversionDialogOpened
+        ));
+        assert!(app.archive_convert.is_some());
+
+        assert!(app.cancel_archive_convert_for_navigation("test_user_cancel"));
+        assert!(app.archive_convert.is_none());
+        assert!(!app.global_search.active);
+        assert!(app.items.is_empty());
+        assert!(app.current_folder.is_none());
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .back_stack,
+            vec![origin]
+        );
+        assert!(
+            !app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .suppress_record_once
+        );
+        assert!(app.select_after_load.is_none());
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
     }
 
     #[test]
