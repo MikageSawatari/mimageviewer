@@ -95,7 +95,43 @@ mimageviewer::ai::runtime::AiRuntime::new_with_backend
 | FFmpeg 6 DLL | なし (UCRT の `api-ms-win-crt-*` のみ。Windows 10 以降は OS 同梱) |
 | `pdfium.dll` / susie32 / vst3-host / core / remote / launcher | なし |
 
-VC++ ランタイムを要するのは ORT の 2 DLL だけ。TensorRT pack 側の ORT (GPU 版) は調べていない。
+本体に同梱する物で VC++ ランタイムを要するのは ORT の 2 DLL だけ。
+
+### 追加ダウンロード (2026-09-15、開発機にインストール済みのパックを dumpbin)
+
+**TensorRT パック** (`%APPDATA%\mimageviewer\tensorrt\`、pack version 3 = アプリの `EXPECTED_TRT_PACK_VERSION` と同じ、ORT GPU 1.24.2):
+
+| ファイル | MSVCP140 / VCRUNTIME140 系 |
+| --- | --- |
+| `onnxruntime.dll` (GPU 版) | **MSVCP140, MSVCP140_1, VCRUNTIME140, VCRUNTIME140_1** |
+| `onnxruntime_providers_cuda.dll` | **MSVCP140, VCRUNTIME140, VCRUNTIME140_1** |
+| `onnxruntime_providers_tensorrt.dll` | **MSVCP140, VCRUNTIME140, VCRUNTIME140_1** |
+| `onnxruntime_providers_shared.dll` | **VCRUNTIME140** |
+| NVIDIA の 13 DLL (cuBLAS / cuBLASLt / cudart / cuDNN 3 本 / cuFFT / nvJitLink / nvinfer / nvinfer_plugin / nvonnxparser / NVRTC 2 本) | なし (KERNEL32 等の OS DLL だけ。CRT は静的リンク) |
+
+- TensorRT は本体プロセスではなく**子プロセス** (`current_exe()` を `--tensorrt-infer-worker` で起動) で
+  `AiRuntime::new_with_backend(TensorRt)` → パックの `onnxruntime.dll` で `ort::init_from` する
+  ([trt_worker_pool.rs](../src/ai/trt_worker_pool.rs) / [trt_worker_runtime.rs](../src/ai/trt_worker_runtime.rs))。
+  依存 DLL の探索には `SetDllDirectoryW(パックのフォルダ)` と PATH 先頭追加を使う ([ai/runtime.rs](../src/ai/runtime.rs))。
+- **VC++ ランタイムが無い場合 (コードからの推定、未観測)**: 子プロセスの `ort` 初期化が §3 と同じくデッドロック →
+  バックグラウンドスレッドの起動ハンドシェイクが 45 秒で timeout → 子を kill →
+  エラー文の「通信失敗」で一時的な失敗と判定され 1 回だけ自動再試行
+  ([trt_worker_notice.rs](../src/ui_dialogs/trt_worker_notice.rs) `is_transient_spawn_failure`) →
+  「ワーカー起動 timeout / 通信失敗」の通知が出て DirectML で続行。**画面は固まらないが、原因と違う理由が表示され、
+  TensorRT を 2 回・合計 90 秒以上待つ**。ただし現状は、その前に本体の DirectML 初期化 (§3) で起動自体が止まる。
+- 修正への影響: 子プロセスは本体と同じ exe なので、**VC++ ランタイムを core exe の隣に置く方式 (候補 B) なら
+  TensorRT パックの ORT GPU 版にも効く** (exe のディレクトリは `SetDllDirectoryW` の指定より先に探索される)。
+  パック側に VC++ DLL を足す必要は無い見込み。候補 A (失敗を戻す) も子プロセス側の `ort::init_from` に同じく必要。
+  パックが要求する VC++ ランタイムの版は本体の ORT と同じ 1.24.2 系だが、同梱する版はパック側の要件も満たすこと。
+- Windows Sandbox には NVIDIA GPU / CUDA が無いので、TensorRT 経路はクリーンな環境で観測できない。
+  修正後は、VC++ ランタイムのある開発機での TensorRT 動作 (回帰なし) と、子プロセス側の失敗が timeout ではなく
+  正しい理由で報告されること (テストまたはログ) で確認する。
+
+**編集用パック** (`%APPDATA%\mimageviewer\addons\editing\packs\2026.06.0\`): フォント 18 種 (`.ttf`) +
+`models/birefnet_fp16.onnx` + ライセンス文 + `pack-manifest.json` + `INSTALL_OK`。**DLL / exe は含まない**
+(パック作成ツール [build_editing_pack.rs](../src/bin/build_editing_pack.rs) の対象もフォントとモデルだけ)。
+フォントは OS の DLL を使わず読み込む。被写体分離モデルは本体の DirectML ランタイム (§3 の ORT) で動くので、
+**§3 の修正に含まれる以外の対応は不要**。
 
 ## 4. 修正の候補 (判断は開発担当)
 
