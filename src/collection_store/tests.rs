@@ -213,6 +213,28 @@ fn database_keeps_ids_manual_order_and_revisions_across_reopen() {
 }
 
 #[test]
+fn collection_standard_sort_roundtrips_every_list_sort_variant() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Sort variants").unwrap();
+    let collection_id = created.collection_id();
+    let mut revision = created.revision();
+
+    for &sort in SortOrder::all() {
+        let updated = db
+            .set_order(collection_id, revision, CollectionOrderMode::Standard, sort)
+            .unwrap();
+        revision = updated.revision();
+        drop(db);
+
+        db = open_db(&temp);
+        let reopened = db.snapshot(collection_id).unwrap();
+        assert_eq!(reopened.definition.standard_sort, sort, "{sort:?}");
+        assert_eq!(reopened.revision(), revision);
+    }
+}
+
+#[test]
 fn database_mutation_lifecycle_preserves_ids_compacts_positions_and_cascades() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("collection.db");

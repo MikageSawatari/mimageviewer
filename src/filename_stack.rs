@@ -744,6 +744,20 @@ mod tests {
     }
 
     #[test]
+    fn name_and_numeric_desc_apply_inside_a_stack() {
+        let media = vec![img("post_p10.jpg"), img("post_p2.jpg"), img("post_p1.jpg")];
+        for order in [SortOrder::FileNameDesc, SortOrder::NumericDesc] {
+            let groups = group_media(media.clone(), '_', order);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(
+                member_names(&groups[0]),
+                ["post_p10.jpg", "post_p2.jpg", "post_p1.jpg"],
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
     fn date_sort_orders_groups_by_representative_mtime() {
         // DateDesc: 代表 (グループ内 sort 先頭 = 最新) が新しいグループほど前。
         let media = vec![

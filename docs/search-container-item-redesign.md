@@ -391,7 +391,8 @@ aggregate_auto == false のとき:
 - 日付順 (`DateAsc` / `DateDesc`) には各ヒットのmtime、サイズ順 (`SizeAsc` / `SizeDesc`) には
   file_sizeが必要で、どちらも既存Tantivy文書のSTORED fieldから同じdoc fetchで取得する。
   実在する0バイトは既知の0、fieldのない旧・合成docだけは不明として両方向とも末尾に置く。
-  ファイル名順 / 番号順はpathから導出する。
+  名前順 (`FileName` / `FileNameDesc`) と番号順 (`Numeric` / `NumericDesc`) はpathから導出する。
+  番号順は記号・空白などの区切りを無視し、降順でも同値は名前昇順で確定する。
 
 ---
 

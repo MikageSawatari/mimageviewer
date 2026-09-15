@@ -1900,11 +1900,13 @@ impl FacetNameFilterWidth {
 pub enum SortOrder {
     #[default]
     FileName, // ファイル名順（辞書順）
-    Numeric,  // 番号順（自然順: 1, 2, 9, 10, 11）
-    DateAsc,  // 日付順（昇順）
-    DateDesc, // 日付順（降順）
-    SizeAsc,  // サイズ順（昇順、不明は末尾）
-    SizeDesc, // サイズ順（降順、不明は末尾）
+    FileNameDesc, // ファイル名順（降順）
+    Numeric,      // 番号順（自然順: 1, 2, 9, 10, 11）
+    NumericDesc,  // 番号順（自然順、降順）
+    DateAsc,      // 日付順（昇順）
+    DateDesc,     // 日付順（降順）
+    SizeAsc,      // サイズ順（昇順、不明は末尾）
+    SizeDesc,     // サイズ順（降順、不明は末尾）
 }
 
 /// 一覧の並び替えだけが使うmetadata snapshot。
@@ -1926,10 +1928,12 @@ impl ListingSortMetadata {
 impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FileName => "ファイル名順",
-            Self::Numeric => "番号順（区切り無視）",
-            Self::DateAsc => "日付順（古い順）",
-            Self::DateDesc => "日付順（新しい順）",
+            Self::FileName => "名前（昇順）",
+            Self::FileNameDesc => "名前（降順）",
+            Self::Numeric => "番号（昇順）",
+            Self::NumericDesc => "番号（降順）",
+            Self::DateAsc => "日付（古い順）",
+            Self::DateDesc => "日付（新しい順）",
             Self::SizeAsc => "サイズ順（小さい順）",
             Self::SizeDesc => "サイズ順（大きい順）",
         }
@@ -1937,8 +1941,10 @@ impl SortOrder {
 
     pub fn short_label(self) -> &'static str {
         match self {
-            Self::FileName => "名前",
-            Self::Numeric => "番号*",
+            Self::FileName => "名前↑",
+            Self::FileNameDesc => "名前↓",
+            Self::Numeric => "番号↑",
+            Self::NumericDesc => "番号↓",
             Self::DateAsc => "日付↑",
             Self::DateDesc => "日付↓",
             Self::SizeAsc => "サイズ↑",
@@ -1948,8 +1954,10 @@ impl SortOrder {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::FileName => "Windows に近い名前順で並び替えます",
-            Self::Numeric => "記号・空白などを無視して連番を優先して並び替えます",
+            Self::FileName => "Windows に近い名前の昇順で並び替えます",
+            Self::FileNameDesc => "Windows に近い名前の降順で並び替えます",
+            Self::Numeric => "記号・空白などの区切りを無視して連番を昇順で比較し、並び替えます",
+            Self::NumericDesc => "記号・空白などの区切りを無視して連番を降順で比較し、並び替えます",
             Self::DateAsc => "更新日時が古いものから並び替えます",
             Self::DateDesc => "更新日時が新しいものから並び替えます",
             Self::SizeAsc => "ファイルサイズが小さいものから並び替えます（不明は末尾）",
@@ -1960,7 +1968,9 @@ impl SortOrder {
     pub fn all() -> &'static [Self] {
         &[
             Self::FileName,
+            Self::FileNameDesc,
             Self::Numeric,
+            Self::NumericDesc,
             Self::DateAsc,
             Self::DateDesc,
             Self::SizeAsc,
@@ -1972,6 +1982,14 @@ impl SortOrder {
     /// 一覧のサイズ順を代表画像選択へ波及させない。
     pub fn folder_thumb_options() -> &'static [Self] {
         &[Self::FileName, Self::Numeric, Self::DateAsc, Self::DateDesc]
+    }
+
+    pub(crate) fn sanitized_for_folder_thumb(self) -> Self {
+        if Self::folder_thumb_options().contains(&self) {
+            self
+        } else {
+            Self::FileName
+        }
     }
 
     pub(crate) const fn is_size(self) -> bool {
@@ -2007,7 +2025,9 @@ impl SortOrder {
 
     pub fn name_key(self, name: &str) -> crate::filename_sort::SortNameKey {
         match self {
-            Self::Numeric => crate::filename_sort::SortNameKey::with_natural(name),
+            Self::Numeric | Self::NumericDesc => {
+                crate::filename_sort::SortNameKey::with_natural(name)
+            }
             _ => crate::filename_sort::SortNameKey::file_name(name),
         }
     }
@@ -2025,7 +2045,11 @@ impl SortOrder {
     ) -> std::cmp::Ordering {
         match self {
             Self::FileName => name_a.compare_file_name(name_b),
+            Self::FileNameDesc => name_b.compare_file_name(name_a),
             Self::Numeric => name_a.compare_natural(name_b),
+            Self::NumericDesc => name_b
+                .compare_natural_primary(name_a)
+                .then_with(|| name_a.compare_file_name(name_b)),
             Self::DateAsc => mtime_a
                 .cmp(&mtime_b)
                 .then_with(|| name_a.compare_file_name(name_b)),
@@ -2055,7 +2079,9 @@ impl SortOrder {
         let name_tie = || name_a.compare_file_name(name_b);
         match self {
             Self::FileName => name_tie(),
+            Self::FileNameDesc => name_b.compare_file_name(name_a),
             Self::Numeric => name_a.compare_natural(name_b).then_with(name_tie),
+            Self::NumericDesc => name_b.compare_natural_primary(name_a).then_with(name_tie),
             Self::DateAsc => meta_a.mtime.cmp(&meta_b.mtime).then_with(name_tie),
             Self::DateDesc => meta_b.mtime.cmp(&meta_a.mtime).then_with(name_tie),
             Self::SizeAsc | Self::SizeDesc => {
@@ -4778,6 +4804,10 @@ pub struct Settings {
     /// 非表示にしたcanonical4を維持する。
     #[serde(default)]
     pub(crate) toolbar_sort_size_options_migrated: bool,
+    /// 名前 / 番号の降順候補を旧既定6項目へ一度だけ補完したmarker。
+    /// custom順、部分集合、空vectorは変更せず、補完後に候補を隠した状態も復活させない。
+    #[serde(default)]
+    pub(crate) toolbar_sort_name_numeric_desc_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
@@ -6850,6 +6880,7 @@ impl Default for Settings {
             toolbar_collections_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_sort_size_options_migrated: true,
+            toolbar_sort_name_numeric_desc_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_facet_name_filter_index_stash: None,
             facet_name_filter_width: FacetNameFilterWidth::default(),
@@ -7433,12 +7464,14 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
 /// 4. `migrate_toolbar_sort_size_options`
-/// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+/// 5. `migrate_toolbar_sort_name_numeric_desc_options`
+/// 6. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
     settings.migrate_toolbar_sort_size_options();
+    settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.sanitize();
 }
 
@@ -8041,9 +8074,36 @@ impl Settings {
             SortOrder::DateDesc,
         ];
         if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
-            self.toolbar_sort_items = default_toolbar_sort_items();
+            self.toolbar_sort_items = vec![
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+                SortOrder::SizeAsc,
+                SortOrder::SizeDesc,
+            ];
         }
         self.toolbar_sort_size_options_migrated = true;
+        true
+    }
+
+    /// 名前 / 番号の降順を追加する前の既定6候補だけを、保存世代ごとに一度だけ8候補へ補完する。
+    fn migrate_toolbar_sort_name_numeric_desc_options(&mut self) -> bool {
+        if self.toolbar_sort_name_numeric_desc_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_SORT_ITEMS: [SortOrder; 6] = [
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+        ];
+        if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_name_numeric_desc_options_migrated = true;
         true
     }
 
@@ -8097,6 +8157,8 @@ impl Settings {
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
         let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
+        let toolbar_sort_name_numeric_desc_options_migrated =
+            settings.migrate_toolbar_sort_name_numeric_desc_options();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
@@ -8239,6 +8301,7 @@ impl Settings {
             || grid_click_selection_mode_migrated
             || ai_prefetch_forward_migrated
             || toolbar_sort_size_options_migrated
+            || toolbar_sort_name_numeric_desc_options_migrated
             || legacy_keymap_import.changed
             || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -8609,9 +8672,7 @@ impl Settings {
     fn sanitize(&mut self) {
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
-        if self.folder_thumb_sort.is_size() {
-            self.folder_thumb_sort = default_folder_thumb_sort();
-        }
+        self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
@@ -9099,6 +9160,8 @@ impl Settings {
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
         self.toolbar_sort_size_options_migrated = src.toolbar_sort_size_options_migrated;
+        self.toolbar_sort_name_numeric_desc_options_migrated =
+            src.toolbar_sort_name_numeric_desc_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
             src.toolbar_facet_name_filter_index_stash.take();
@@ -14470,6 +14533,81 @@ mod tests {
         let result = ord.compare("Bbb.jpg", 0, "aaa.jpg", 0, |s: &str| s.to_string());
         assert_eq!(result, std::cmp::Ordering::Greater); // "bbb" > "aaa"
     }
+
+    #[test]
+    fn sort_order_serde_names_preserve_existing_ascending_values() {
+        assert_eq!(
+            serde_json::to_string(&SortOrder::FileName).unwrap(),
+            "\"FileName\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::Numeric).unwrap(),
+            "\"Numeric\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::FileNameDesc).unwrap(),
+            "\"FileNameDesc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::NumericDesc).unwrap(),
+            "\"NumericDesc\""
+        );
+    }
+
+    #[test]
+    fn name_and_numeric_desc_reverse_only_the_primary_key() {
+        let metadata = ListingSortMetadata::new(0, None);
+
+        let two = SortOrder::NumericDesc.name_key("page2.jpg");
+        let ten = SortOrder::NumericDesc.name_key("page10.jpg");
+        assert_eq!(
+            SortOrder::NumericDesc.compare_listing_keys(&two, metadata, &ten, metadata),
+            std::cmp::Ordering::Greater,
+            "descending numeric primary key must put page10 before page2"
+        );
+
+        let delimited = SortOrder::NumericDesc.name_key("#2.jpg");
+        let plain = SortOrder::NumericDesc.name_key("2.jpg");
+        assert_eq!(
+            delimited.compare_natural_primary(&plain),
+            std::cmp::Ordering::Equal,
+            "numeric comparison must continue to ignore delimiters"
+        );
+        assert_eq!(
+            SortOrder::NumericDesc.compare_listing_keys(&delimited, metadata, &plain, metadata),
+            delimited.compare_file_name(&plain),
+            "equal descending numeric keys must retain an ascending filename tie-break"
+        );
+
+        let alpha = SortOrder::FileNameDesc.name_key("alpha.jpg");
+        let beta = SortOrder::FileNameDesc.name_key("beta.jpg");
+        assert_eq!(
+            SortOrder::FileNameDesc.compare_listing_keys(&alpha, metadata, &beta, metadata),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn list_name_numeric_and_date_labels_match_folder_tree() {
+        let pairs = [
+            (SortOrder::FileName, FolderTreeSortOrder::NameAsc),
+            (SortOrder::FileNameDesc, FolderTreeSortOrder::NameDesc),
+            (SortOrder::Numeric, FolderTreeSortOrder::NumericAsc),
+            (SortOrder::NumericDesc, FolderTreeSortOrder::NumericDesc),
+            (SortOrder::DateAsc, FolderTreeSortOrder::DateAsc),
+            (SortOrder::DateDesc, FolderTreeSortOrder::DateDesc),
+        ];
+        for (list, tree) in pairs {
+            assert_eq!(list.label(), tree.label());
+            assert_eq!(list.short_label(), tree.short_label());
+        }
+        assert!(SortOrder::Numeric.description().contains("区切りを無視"));
+        assert!(
+            SortOrder::NumericDesc
+                .description()
+                .contains("区切りを無視")
+        );
+    }
     #[cfg(windows)]
     #[test]
     fn sort_order_compare_precomputed_name_keys() {
@@ -14547,42 +14685,87 @@ mod tests {
     }
 
     #[test]
-    fn legacy_toolbar_defaults_gain_size_once_without_rewriting_current_custom_choice() {
+    fn legacy_toolbar_defaults_gain_size_then_desc_once_without_rewriting_custom_choices() {
         let mut defaults: Settings = serde_json::from_value(serde_json::json!({
             "toolbar_sort_items": ["FileName", "Numeric", "DateAsc", "DateDesc"],
-            "folder_thumb_sort": "SizeDesc"
+            "folder_thumb_sort": "NumericDesc"
         }))
         .unwrap();
         assert!(defaults.migrate_toolbar_sort_size_options());
+        assert_eq!(
+            defaults.toolbar_sort_items,
+            [
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+                SortOrder::SizeAsc,
+                SortOrder::SizeDesc,
+            ]
+        );
+        assert!(defaults.migrate_toolbar_sort_name_numeric_desc_options());
         defaults.sanitize();
         assert_eq!(defaults.toolbar_sort_items, SortOrder::all());
         assert!(defaults.toolbar_sort_size_options_migrated);
+        assert!(defaults.toolbar_sort_name_numeric_desc_options_migrated);
         assert_eq!(defaults.folder_thumb_sort, SortOrder::FileName);
-        assert_eq!(SortOrder::folder_thumb_options().len(), 4);
+        assert_eq!(
+            SortOrder::folder_thumb_options(),
+            [
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+            ]
+        );
 
-        // 現行版で利用者がサイズ2候補だけを非表示にすると値は旧canonical4と同じになる。
-        // 保存済みmarkerにより、次回loadでそれらを勝手に復活させない。
+        // 移行後に降順2候補だけを隠してcanonical6へ戻しても、markerにより復活させない。
         defaults.toolbar_sort_items = vec![
             SortOrder::FileName,
             SortOrder::Numeric,
             SortOrder::DateAsc,
             SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
         ];
         let mut reloaded: Settings =
             serde_json::from_value(serde_json::to_value(&defaults).unwrap()).unwrap();
         assert!(!reloaded.migrate_toolbar_sort_size_options());
+        assert!(!reloaded.migrate_toolbar_sort_name_numeric_desc_options());
         assert_eq!(reloaded.toolbar_sort_items, defaults.toolbar_sort_items);
 
-        let mut custom: Settings = serde_json::from_value(serde_json::json!({
-            "toolbar_sort_items": ["DateDesc", "FileName"]
+        // 既にサイズ候補の移行を終え、その2候補を隠した利用者のcanonical4も補完しない。
+        let mut hidden_sizes: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": ["FileName", "Numeric", "DateAsc", "DateDesc"],
+            "toolbar_sort_size_options_migrated": true
         }))
         .unwrap();
-        assert!(custom.migrate_toolbar_sort_size_options());
-        custom.sanitize();
-        assert_eq!(
-            custom.toolbar_sort_items,
-            [SortOrder::DateDesc, SortOrder::FileName]
-        );
+        let hidden_sizes_expected = hidden_sizes.toolbar_sort_items.clone();
+        assert!(!hidden_sizes.migrate_toolbar_sort_size_options());
+        assert!(hidden_sizes.migrate_toolbar_sort_name_numeric_desc_options());
+        assert_eq!(hidden_sizes.toolbar_sort_items, hidden_sizes_expected);
+
+        for custom_items in [
+            serde_json::json!([]),
+            serde_json::json!(["DateDesc", "FileName"]),
+            serde_json::json!([
+                "Numeric", "FileName", "DateAsc", "DateDesc", "SizeAsc", "SizeDesc"
+            ]),
+        ] {
+            let mut custom: Settings = serde_json::from_value(serde_json::json!({
+                "toolbar_sort_items": custom_items
+            }))
+            .unwrap();
+            let expected = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_size_options());
+            assert!(custom.migrate_toolbar_sort_name_numeric_desc_options());
+            custom.sanitize();
+            assert_eq!(custom.toolbar_sort_items, expected);
+        }
+
+        let current = Settings::default();
+        assert!(current.toolbar_sort_name_numeric_desc_options_migrated);
+        assert_eq!(current.toolbar_sort_items.len(), 8);
     }
 
     // -- CachePolicy --
@@ -14686,6 +14869,35 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
         s
+    }
+
+    #[test]
+    fn toolbar_name_numeric_desc_migration_is_persisted_once_in_settings_db() {
+        let _env = setup_backup_env();
+        let canonical_six = vec![
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+        ];
+        let mut previous_release = Settings::default();
+        previous_release.toolbar_sort_items = canonical_six.clone();
+        previous_release.toolbar_sort_name_numeric_desc_options_migrated = false;
+        previous_release.save();
+
+        reset_backup_state_for_test();
+        let mut migrated = Settings::load();
+        assert_eq!(migrated.toolbar_sort_items, SortOrder::all());
+        assert!(migrated.toolbar_sort_name_numeric_desc_options_migrated);
+
+        migrated.toolbar_sort_items = canonical_six.clone();
+        migrated.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.toolbar_sort_items, canonical_six);
+        assert!(reloaded.toolbar_sort_name_numeric_desc_options_migrated);
     }
 
     #[test]

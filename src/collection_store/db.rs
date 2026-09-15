@@ -809,7 +809,9 @@ fn checked_u64_sql(value: i64, column: usize) -> rusqlite::Result<u64> {
 fn sort_order_as_str(sort: SortOrder) -> &'static str {
     match sort {
         SortOrder::FileName => "file_name",
+        SortOrder::FileNameDesc => "file_name_desc",
         SortOrder::Numeric => "numeric",
+        SortOrder::NumericDesc => "numeric_desc",
         SortOrder::DateAsc => "date_asc",
         SortOrder::DateDesc => "date_desc",
         SortOrder::SizeAsc => "size_asc",
@@ -820,7 +822,9 @@ fn sort_order_as_str(sort: SortOrder) -> &'static str {
 fn sort_order_from_str(value: &str) -> Option<SortOrder> {
     match value {
         "file_name" => Some(SortOrder::FileName),
+        "file_name_desc" => Some(SortOrder::FileNameDesc),
         "numeric" => Some(SortOrder::Numeric),
+        "numeric_desc" => Some(SortOrder::NumericDesc),
         "date_asc" => Some(SortOrder::DateAsc),
         "date_desc" => Some(SortOrder::DateDesc),
         "size_asc" => Some(SortOrder::SizeAsc),

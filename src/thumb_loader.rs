@@ -158,17 +158,16 @@ pub fn folder_thumb_auto_cache_key(
     sort: crate::settings::SortOrder,
     depth: u32,
 ) -> String {
-    let sort = if sort.is_size() {
-        crate::settings::SortOrder::FileName
-    } else {
-        sort
-    };
+    let sort = sort.sanitized_for_folder_thumb();
     let sort_token = match sort {
         crate::settings::SortOrder::FileName => "name",
         crate::settings::SortOrder::Numeric => "numeric",
         crate::settings::SortOrder::DateAsc => "date-asc",
         crate::settings::SortOrder::DateDesc => "date-desc",
-        crate::settings::SortOrder::SizeAsc | crate::settings::SortOrder::SizeDesc => "name",
+        crate::settings::SortOrder::FileNameDesc
+        | crate::settings::SortOrder::NumericDesc
+        | crate::settings::SortOrder::SizeAsc
+        | crate::settings::SortOrder::SizeDesc => "name",
     };
     format!(
         "{CACHE_KEY_FOLDER}auto-v{FOLDER_THUMB_AUTO_ALGO_VERSION}:{sort_token}:d{depth}:{identity}"
@@ -2454,11 +2453,7 @@ fn resolve_folder_thumb_image_inner(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     cache_dir: &Path,
 ) -> Option<FolderThumbResolution> {
-    let sort = if sort.is_size() {
-        crate::settings::SortOrder::FileName
-    } else {
-        sort
-    };
+    let sort = sort.sanitized_for_folder_thumb();
     fn mtime_for_sort(entry: &std::fs::DirEntry, sort: crate::settings::SortOrder) -> i64 {
         match sort {
             crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc => entry
@@ -2466,7 +2461,9 @@ fn resolve_folder_thumb_image_inner(
                 .ok()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(&m)),
             crate::settings::SortOrder::FileName
+            | crate::settings::SortOrder::FileNameDesc
             | crate::settings::SortOrder::Numeric
+            | crate::settings::SortOrder::NumericDesc
             | crate::settings::SortOrder::SizeAsc
             | crate::settings::SortOrder::SizeDesc => 0,
         }
@@ -3993,6 +3990,13 @@ mod tests {
             name,
             "list-only size values are sanitized to the existing name policy"
         );
+        for list_only in [SortOrder::FileNameDesc, SortOrder::NumericDesc] {
+            assert_eq!(
+                folder_thumb_auto_cache_key("folder", list_only, 3),
+                name,
+                "list-only descending values must not enter representative selection"
+            );
+        }
     }
 
     fn resolved_image_path(result: Option<FolderThumbResolution>) -> Option<PathBuf> {

@@ -3160,6 +3160,37 @@ mod tests {
         assert_eq!(kinds, vec!["Image", "Image", "Video", "PdfFile"]);
     }
 
+    #[test]
+    fn flat_and_drilled_search_apply_name_and_numeric_desc() {
+        let mut state = GlobalSearchState::default();
+        for path in ["c:/results/page2.jpg", "c:/results/page10.jpg"] {
+            state.accumulate_hit(&GlobalHit {
+                path: path.into(),
+                score: 1.0,
+                mtime: 0,
+                file_size: Some(1),
+                stars: 0,
+            });
+        }
+        let names = |items: &[GridItem]| {
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let (flat, _) = build_flat_items(&state, order, &[true; 6]);
+            let (drilled, _) =
+                build_drilled_items(&state, Path::new("c:/results"), false, order, &[true; 6]);
+            assert_eq!(names(&flat), ["page10.jpg", "page2.jpg"], "{order:?}");
+            assert_eq!(names(&drilled), names(&flat), "{order:?}");
+        }
+    }
+
     /// build_flat_items: rating_filter で個々のヒットを絞れる (一覧ビューでは★有効、§6)。
     #[test]
     fn build_flat_items_applies_rating_filter() {

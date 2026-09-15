@@ -6004,6 +6004,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn smart_sort_applies_name_and_numeric_desc_with_the_shared_comparator() {
+        let mut entries = vec![
+            smart_entry(r"C:\Smart\page2.jpg", 0, ""),
+            smart_entry(r"C:\Smart\page10.jpg", 1, ""),
+        ];
+        for entry in &mut entries {
+            entry.kind = SmartFolderEntryKind::Image;
+        }
+        let included = [0, 1];
+        let names = |sort| {
+            let keys = build_smart_entry_sort_keys(
+                &entries,
+                &included,
+                sort,
+                &crate::settings::GridDisplayOrder::default(),
+            );
+            let mut positions = [0, 1];
+            positions.sort_by(|&a, &b| {
+                compare_smart_entries_within_group(
+                    sort,
+                    &entries[included[a]],
+                    &keys[a],
+                    &entries[included[b]],
+                    &keys[b],
+                )
+            });
+            positions.map(|position| {
+                entries[included[position]]
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        };
+        assert_eq!(
+            names(crate::settings::SortOrder::FileNameDesc),
+            ["page10.jpg", "page2.jpg"]
+        );
+        assert_eq!(
+            names(crate::settings::SortOrder::NumericDesc),
+            ["page10.jpg", "page2.jpg"]
+        );
+    }
+
     /// Manual release-gate benchmark. Run each size in a fresh test process so the external
     /// harness can sample WorkingSet independently:
     /// `MIV_SMART_FOLDER_BENCH_ITEMS=100000 cargo test --bin mimageviewer-core

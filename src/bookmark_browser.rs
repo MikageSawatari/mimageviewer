@@ -1190,6 +1190,19 @@ mod tests {
     }
 
     #[test]
+    fn normal_sort_applies_name_and_numeric_desc() {
+        let base = vec![media_row(2, 1, "page2"), media_row(10, 1, "page10")];
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let mut rows = base.clone();
+            sort_rows(&mut rows, BookmarkViewSort::Normal(order));
+            assert_eq!(ids(&rows), [10, 2], "{order:?}");
+        }
+    }
+
+    #[test]
     fn book_kind_filter_groups_compiled_with_image_folders() {
         assert!(
             BookKindFilter::ImageFolder

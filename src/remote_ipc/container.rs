@@ -10377,6 +10377,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_physical_folder_reuses_local_numeric_desc_sort_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let pages = root.join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(pages.join("page2.jpg"), [2_u8]).unwrap();
+        std::fs::write(pages.join("page10.jpg"), [10_u8]).unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            sort_order: crate::settings::SortOrder::NumericDesc,
+            auto_fullscreen_image_folders: false,
+            ..Default::default()
+        });
+
+        let remote = assert_local_remote_folder_listing_match(&engine, &favorite, "pages");
+        let image_names = remote
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::Image)
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, ["page10.jpg", "page2.jpg"]);
+        assert_eq!(
+            remote.sort_state.selected,
+            super::super::sort_order_wire_value(crate::settings::SortOrder::NumericDesc)
+        );
+        assert!(remote.sort_state.locked_reason.is_none());
+    }
+
+    #[test]
     fn folder_spread_groups_share_cover_landscape_rtl_and_portrait_rules() {
         let items = (0..5)
             .map(|index| {

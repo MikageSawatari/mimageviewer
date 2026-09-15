@@ -4,8 +4,9 @@
 
 状態: §1.238 Phase A は実装、focused 自動回帰、独立 completion review を完了。2026-09-14 に
 設計 lead と独立 reviewer が typed jump の構造へ合意し、2026-09-15 に完成差分が承認された。
-名前 / 番号降順と §1.237 の製品実装は別 chunk とし、特に `GridDisplayOrderState` は追加の設計 review と
-scope 決定まで着手しない。
+Phase B の名前 / 番号降順と表示名統一も製品実装、focused回帰、独立completion reviewを完了した。
+§1.237 の製品実装は別 chunk とし、特に `GridDisplayOrderState` は追加の設計 review とscope決定まで
+着手しない。
 
 ## 0. 正本、範囲、完了条件
 
@@ -188,13 +189,14 @@ intent を更新する。Phase A は未承認の新しい表示順 owner に依�
 | `NumericDesc` | 番号（降順） | 番号↓ |
 | `DateAsc` | 日付（古い順） | 日付↑ |
 | `DateDesc` | 日付（新しい順） | 日付↓ |
-| `SizeAsc` | サイズ（小さい順） | サイズ↑ |
-| `SizeDesc` | サイズ（大きい順） | サイズ↓ |
+| `SizeAsc` | サイズ順（小さい順） | サイズ↑ |
+| `SizeDesc` | サイズ順（大きい順） | サイズ↓ |
 | `RatingAsc` | 評価（昇順） | 評価↑ |
 | `RatingDesc` | 評価（降順） | 評価↓ |
 
-名前 / 番号 / 日付はフォルダツリーの表記と完全に揃える。番号順の description には両方向とも
-「記号・空白などの区切りを無視して連番を比較する」という現行説明を残す。
+名前 / 番号 / 日付はフォルダツリーの表記と完全に揃える。サイズは既存表示との互換性を優先し、
+長い表示名の「サイズ順」を維持する。番号順の description には両方向とも「記号・空白などの
+区切りを無視して連番を比較する」という現行説明を残す。
 
 降順は主 key だけを反転する。日付、サイズ、番号、評価の同値 key はファイル名昇順を tie-break にし、
 filesystem 列挙順へ依存させない。名前降順は名前 key 自体を反転する。番号降順の delimiter 除去後に
@@ -411,9 +413,11 @@ rename / move 後は既存 rating key migration の結果を再 snapshot し、�
 
 ### Phase B: 名前 / 番号降順と表示名
 
-- `SortOrder`、comparator、labels、descriptions、serde / DB / Remote mapping を更新する。
-- 新しい toolbar migration marker と custom-hidden 回帰を追加する。
-- representative / fixed-order allowlist を明示的に現行値へ固定する。
+2026-09-15 に実装、focused回帰、独立completion reviewを完了した。
+
+- `SortOrder`、comparator、labels、descriptions、serde / DB / Remote mapping を更新した。
+- 新しい toolbar migration marker と custom-hidden 回帰を追加した。
+- representative / fixed-order allowlist を明示的に現行値へ固定した。
 
 ### Phase C: rating metadata と表示順 owner（再設計待ち）
 
@@ -494,3 +498,30 @@ portable data を先に提示し、別途明示承認を得る。
 Phase A だけを実装し、focused test、`cargo check -p mimageviewer --bin mimageviewer-core`、
 `cargo fmt --check`、UI glyph check、`scripts/test-full.ps1` を完走した。`scripts/build-dev.ps1` で
 通常プロファイルの検証用 core / remote service も生成したが、GUI は起動していない。
+
+### 10.1 Phase B 実装 checkpoint（2026-09-15）
+
+- 既存の `FileName` / `Numeric` serde値を昇順のまま維持し、一覧専用の
+  `FileNameDesc` / `NumericDesc` を追加した。番号降順は自然順の主keyだけを反転し、区切り除去後に
+  同値となる項目の名前昇順tieを維持する。
+- 名前 / 番号 / 日付の長短ラベルを `FolderTreeSortOrder` と一致させた。番号のdescriptionには
+  記号・空白などの区切りを無視する説明を両方向に残した。
+- toolbarは独立markerで旧canonical6だけをcanonical8へ一度だけ拡張する。さらに古いcanonical4は
+  既存size migrationで6へ進めてから8へ進める。custom順、部分集合、空vector、移行済み候補を
+  隠した状態は補完しないことをJSON / settings DB回帰で固定した。
+- フォルダ代表サムネイルは `folder_thumb_options()` の明示4候補だけを許可し、一覧専用の降順、
+  サイズ順を設定・cache key・workerへ流さない。本 / ZIP / PDFの固定順定数とconsumerは変更していない。
+- 通常一覧、Ctrl+G flat / drill、Smart Folder、サブフォルダ展開、Stack、rating view、bookmark、
+  collection、Remote physical folderが同じ比較契約を使う直接回帰を追加した。Phase Cのrating sortや
+  表示順ownerは編集していない。
+- 製品コードと各consumerの完成差分を独立reviewし、blocking defectなしを確認した。サイズの長い表示名は
+  今回の統一対象から外れる既存表示「サイズ順（小さい順 / 大きい順）」を維持すると明文化した。
+- focused回帰は比較契約、全consumer、toolbar / settings DB migration、serde / collection / Remote mapping、
+  folder representative allowlist、一覧integrationを通過した。可視ラベル変更に合わせて環境設定のsnapshotを
+  更新し、`scripts/test-full.ps1` は再実行でPASSした。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --check`、UI glyph check、
+  `cargo run -p viewer_context_audit --quiet`、`git diff --check` を完了した。
+- `scripts/build-dev.ps1 -PreserveRuntime` で通常profileの検証用core / remote serviceを生成した。
+  core SHA-256 は `1CE7557215DCE8EDF760E5E1A0D93738E86FEF9AE5B5B2ADB39D6C9867AA8E1A`、
+  remote service SHA-256 は `192E2F800704A833C46831C2A42C47F24558B17A19C80F3DC23BEC21CE7D057D`。
+  agentはGUIを起動せず、動作中processも停止していない。

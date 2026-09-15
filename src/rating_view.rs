@@ -615,6 +615,32 @@ mod tests {
         assert_eq!(keys(&rows), ["zero", "ten", "virtual"]);
     }
 
+    #[test]
+    fn normal_sort_applies_name_and_numeric_desc() {
+        let base = vec![
+            RatingViewRow {
+                key: "two".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\page2.jpg")),
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "ten".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\page10.jpg")),
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+        ];
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let mut rows = base.clone();
+            sort_rows(&mut rows, RatingViewSort::Normal(order));
+            assert_eq!(keys(&rows), ["ten", "two"], "{order:?}");
+        }
+    }
+
     fn write_zip_entries(zip_path: &Path, entries: &[&str]) {
         let file = std::fs::File::create(zip_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);

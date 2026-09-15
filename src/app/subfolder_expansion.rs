@@ -3177,6 +3177,36 @@ mod tests {
     }
 
     #[test]
+    fn subfolder_sort_applies_name_and_numeric_desc() {
+        let root = PathBuf::from(r"C:\root");
+        let entries = vec![
+            SubfolderExpansionEntry {
+                path: root.join("page2.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 1,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("page10.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 1,
+            },
+        ];
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let sorted = sort_entries_for_view(entries.clone(), order, &root);
+            let names = sorted
+                .iter()
+                .map(|entry| entry.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["page10.jpg", "page2.jpg"], "{order:?}");
+        }
+    }
+
+    #[test]
     fn folder_grouped_order_keeps_each_relative_folder_together() {
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
