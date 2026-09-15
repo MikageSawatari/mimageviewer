@@ -63,6 +63,10 @@ $Assets = @(
     'engines-ampere_plus.zip'
 )
 
+& (Join-Path $RepoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $DistDir `
+    -ReportPath 'target\vcrt-pe-reports\trt-pack-v3.json'
+
 # --- Pre-flight: every asset exists and is non-empty -----------------------
 Write-Host '============================================='
 Write-Host " Pre-flight: dist\trt-pack-v3\ verification"

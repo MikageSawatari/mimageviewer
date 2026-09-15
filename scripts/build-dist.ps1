@@ -15,6 +15,7 @@
 #   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
+#   7. inspect the final runtime/portable/installer PE closure
 #
 # For day-to-day development keep using scripts\build-release.ps1 directly: it is
 # the fast incremental build and does NOT clean. This script is only for cutting
@@ -110,9 +111,9 @@ if ($running.Count -gt 0) {
 # Run the complete Rust gate before cleaning release outputs. The explicit skip
 # exists for retrying packaging/signing on an unchanged, already-tested tree.
 if ($SkipRustTests) {
-    Write-Warning '[build-dist] (1/6) Rust test gate skipped; use only for an unchanged tested tree'
+    Write-Warning '[build-dist] (1/7) Rust test gate skipped; use only for an unchanged tested tree'
 } else {
-    Write-Host '[build-dist] (1/6) scripts\test-full.ps1'
+    Write-Host '[build-dist] (1/7) scripts\test-full.ps1'
     $testArgs = @()
     if ($PreserveRuntime) { $testArgs += '-SuppressCrashDialogs' }
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-full.ps1') @testArgs
@@ -123,7 +124,7 @@ if ($SkipRustTests) {
 
 # The idle-health smoke is a release gate, so its analyzer tests must be part of
 # the distribution path rather than relying on a separate remembered command.
-Write-Host "[build-dist] (2/6) python scripts\test_analyze_perf.py"
+Write-Host "[build-dist] (2/7) python scripts\test_analyze_perf.py"
 & python (Join-Path $scripts 'test_analyze_perf.py')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests failed (exit {0})" -f $LASTEXITCODE) }
 
@@ -132,7 +133,7 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests faile
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/6) cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher"
+Write-Host "[build-dist] (3/7) cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher"
 & cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
 Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote"
@@ -144,7 +145,7 @@ $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
 if ($PreserveRuntime) { $releaseArgs += '-PreserveRuntime' }
-Write-Host ("[build-dist] (4/6) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
+Write-Host ("[build-dist] (4/7) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-release.ps1') @releaseArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-release.ps1 failed (exit {0})" -f $LASTEXITCODE) }
 
@@ -160,14 +161,14 @@ if (-not $isccPath) {
     }
 }
 if (-not $isccPath) { throw "[build-dist] ISCC.exe not found. Install Inno Setup 6." }
-Write-Host ("[build-dist] (5/6) {0} installer\mimageviewer.iss" -f $isccPath)
+Write-Host ("[build-dist] (5/7) {0} installer\mimageviewer.iss" -f $isccPath)
 & $isccPath (Join-Path $repoRoot 'installer\mimageviewer.iss')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] ISCC failed (exit {0})" -f $LASTEXITCODE) }
 
+$setupExe = Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'
 if ($sign) {
     # Sign the installer itself. The launcher inside it was already signed in
     # step 2 (build-release), before Inno embedded it.
-    $setupExe = Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'
     Write-Host ("[build-dist]       signing {0}" -f $setupExe)
     Invoke-MivSign -Files @($setupExe) -Verify
 }
@@ -176,9 +177,34 @@ if ($sign) {
 $portableArgs = @()
 if ($sign) { $portableArgs += '-Sign' }
 if ($PreserveRuntime) { $portableArgs += '-PreserveRuntime' }
-Write-Host "[build-dist] (6/6) build-portable.ps1"
+Write-Host "[build-dist] (6/7) build-portable.ps1"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1') @portableArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit {0})" -f $LASTEXITCODE) }
+
+# The sub-builds inspect their source and staging layouts. Re-run the gate over
+# the final loose package and the final installer wrapper before declaring the
+# distribution complete. The installer does not load ORT and embeds the launcher,
+# so its own directory does not require the app-local companion DLLs.
+$cargoToml = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml')
+$version = $null
+foreach ($line in $cargoToml) {
+    if ($line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
+}
+if (-not $version) { throw '[build-dist] could not parse version from Cargo.toml' }
+$portableDir = Join-Path $repoRoot "dist\mImageViewer_portable_v$version"
+$finalRuntimePe = @(
+    (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
+    $portableDir
+)
+Write-Host '[build-dist] (7/7) final PE dependency closure'
+& (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $finalRuntimePe -RequireCompanionRuntime `
+    -ReportPath 'target\vcrt-pe-reports\dist-runtime-portable.json'
+& (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $setupExe `
+    -ReportPath 'target\vcrt-pe-reports\dist-installer.json'
 
 # --- Summary ---
 Write-Host ""

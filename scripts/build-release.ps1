@@ -350,6 +350,8 @@ if ($Sign) {
 
 Ensure-LibclangPath
 
+& (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1')
+
 # NOTE: this script is the fast DEV build (incremental, shared target\release).
 # It does NOT guard against cargo's occasional false "up-to-date" for the release
 # build. For distribution artifacts use scripts\build-dist.ps1, which cargo cleans
@@ -376,6 +378,11 @@ if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
     throw "[build-release] remote service executable was not produced: $releaseRemoteExe"
 }
 
+foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\vcrt\$name") `
+        -Destination (Join-Path $repoRoot "target\release\$name") -Force
+}
+
 if ($Sign) {
     # Sign both inner executables BEFORE the launcher build, because the launcher
     # embeds and later extracts both of them into the versioned APPDATA runtime.
@@ -398,6 +405,26 @@ if ($Sign) {
     Write-Host "[build-release] signing mimageviewer.exe (launcher)"
     Invoke-MivSign -Files @($releaseExe) -Verify
 }
+
+$releasePe = @(
+    (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe')
+)
+& (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $releasePe -RequireCompanionRuntime `
+    -ReportPath 'target\vcrt-pe-reports\release-runtime.json'
+
+$embeddedPe = @(
+    (Join-Path $repoRoot 'vendor\pdfium\bin\pdfium.dll'),
+    (Join-Path $repoRoot 'vendor\ort'),
+    (Join-Path $repoRoot 'vendor\ffmpeg\bin'),
+    (Join-Path $repoRoot 'vendor\susie-worker\mimageviewer-susie32.exe'),
+    (Join-Path $repoRoot 'vendor\vst3-host\mimageviewer-vst3-host.exe')
+)
+& (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $embeddedPe `
+    -ReportPath 'target\vcrt-pe-reports\release-embedded.json'
 
 $extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 $extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'

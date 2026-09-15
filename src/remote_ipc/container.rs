@@ -2446,7 +2446,7 @@ impl ContainerEngine {
         let ai_resources = edits.erase.as_ref().and_then(|_| {
             self.session
                 .as_ref()
-                .and_then(super::session::SessionHandle::remote_ai_resources)
+                .and_then(|session| session.remote_ai_resources(cancel))
         });
         let inpaint_runtime = ai_resources
             .as_ref()
@@ -3946,11 +3946,11 @@ impl ContainerEngine {
             &|engine, address, resolved, metadata, page_index, cancel| {
                 engine.decode_remote_ai_source(address, resolved, metadata, page_index, cancel)
             },
-            &|engine| {
+            &|engine, cancel| {
                 engine
                     .session
                     .as_ref()
-                    .and_then(super::session::SessionHandle::remote_ai_resources)
+                    .and_then(|session| session.remote_ai_resources(cancel))
             },
         )
     }
@@ -3982,7 +3982,10 @@ impl ContainerEngine {
             &Arc<AtomicBool>,
         )
             -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError>,
-        resources_for_remote: &dyn Fn(&Self) -> Option<super::session::RemoteAiResources>,
+        resources_for_remote: &dyn Fn(
+            &Self,
+            &AtomicBool,
+        ) -> Option<super::session::RemoteAiResources>,
     ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
         let context = WorkerContext::open();
         let page_count = request.pages.len();
@@ -4085,7 +4088,7 @@ impl ContainerEngine {
             // Animated/vector/size-gated pages become page-local NotApplicable outcomes above
             // without initializing or loading the shared runtime. Remaining pages continue, and
             // only an applicable final-AI request claims the bridge.
-            let resources = resources_for_remote(self)
+            let resources = resources_for_remote(self, cancel)
                 .ok_or_else(|| RemoteAiRunError::Failed("AI runtime is unavailable".to_owned()))?;
 
             let native_key = RemoteAiNativeCacheKey {
@@ -4299,7 +4302,7 @@ impl ContainerEngine {
         let current_background = self
             .session
             .as_ref()
-            .and_then(super::session::SessionHandle::remote_ai_resources)
+            .and_then(|session| session.remote_ai_resources(cancel))
             .map(|resources| resources.background_mode)
             .ok_or_else(|| RemoteAiRunError::Superseded("AI runtime was detached".to_owned()))?;
         for (address, target_px, expected) in identities {
@@ -9402,7 +9405,7 @@ mod tests {
         let engine = ContainerEngine::new(settings);
         let cancel = Arc::new(AtomicBool::new(false));
         let runtime_acquisitions = AtomicUsize::new(0);
-        let resources = |_engine: &ContainerEngine| {
+        let resources = |_engine: &ContainerEngine, _cancel: &AtomicBool| {
             runtime_acquisitions.fetch_add(1, Ordering::Relaxed);
             None
         };

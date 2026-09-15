@@ -161,6 +161,8 @@ function Wait-ForOtherNativeBuilds {
 
 Push-Location $repoRoot
 try {
+    & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1')
+
     if ($WaitForOtherBuildsMinutes -gt 0) {
         Wait-ForOtherNativeBuilds
     }
@@ -207,6 +209,10 @@ try {
         @{ src = 'vendor\ffmpeg\bin\avfilter-10.dll'; dst = 'avfilter-10.dll' }
         @{ src = 'vendor\ffmpeg\bin\swscale-8.dll'; dst = 'swscale-8.dll' }
         @{ src = 'vendor\ffmpeg\bin\swresample-5.dll'; dst = 'swresample-5.dll' }
+        @{ src = 'vendor\vcrt\msvcp140.dll'; dst = 'msvcp140.dll' }
+        @{ src = 'vendor\vcrt\msvcp140_1.dll'; dst = 'msvcp140_1.dll' }
+        @{ src = 'vendor\vcrt\vcruntime140.dll'; dst = 'vcruntime140.dll' }
+        @{ src = 'vendor\vcrt\vcruntime140_1.dll'; dst = 'vcruntime140_1.dll' }
     )
 
     foreach ($copy in $copies) {
@@ -214,6 +220,10 @@ try {
             -Source (Join-Path $repoRoot $copy.src) `
             -Destination (Join-Path $outputDir $copy.dst)
     }
+
+    & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+        -InputPaths @($coreExe, $remoteExe) -RequireCompanionRuntime `
+        -ReportPath 'target\vcrt-pe-reports\dev-runtime.json'
 
     Write-Host ''
     Write-Host '[build-dev] DONE'

@@ -156,7 +156,7 @@ pub struct PageEditContext {
     pub conceal_preset: crate::conceal::ConcealPreset,
     pub erase_mono_tolerance: u8,
     pub comic_source_dims: Option<[usize; 2]>,
-    pub ai_runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+    pub ai_runtime_init: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     pub ai_model_manager: Arc<crate::ai::model_manager::ModelManager>,
     /// AI 段を焼くための材料。`None` は「この経路では AI 段を焼かない」。
     pub ai_materials: Option<crate::books::BookAiMaterials>,
@@ -403,7 +403,6 @@ impl Materializer {
         MaterializeSession {
             inner: Arc::clone(&self.inner),
             databases: None,
-            worker_ai_runtime: None,
         }
     }
 
@@ -472,7 +471,6 @@ impl EditDatabases {
 pub struct MaterializeSession {
     inner: Arc<MaterializerInner>,
     databases: Option<EditDatabases>,
-    worker_ai_runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
 }
 
 struct LoadedPageEdits {
@@ -636,33 +634,6 @@ impl MaterializeSession {
         lease.finish(key, source_stamp)
     }
 
-    /// worker で使う AI runtime。UI が既に持っていればそれを、無ければ worker が 1 度だけ作る。
-    ///
-    /// 消しゴム (MI-GAN) と AI 段が同じ 1 つを共有する。別々に作ると同じ GPU 上に
-    /// 2 つの session が並ぶ。
-    fn resolve_worker_ai_runtime(
-        &mut self,
-        context: &PageEditContext,
-    ) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
-        if let Some(runtime) = context.ai_runtime.clone() {
-            return Some(runtime);
-        }
-        if self.worker_ai_runtime.is_none() {
-            self.worker_ai_runtime = crate::ai::runtime::AiRuntime::new_with_backend(
-                crate::ai::AiBackend::DirectMl,
-            )
-            .map(Arc::new)
-            .map_err(|error| {
-                crate::logger::log(format!(
-                    "materializer: AI runtime init failed; using diffusion fallback: {error}"
-                ));
-                error
-            })
-            .ok();
-        }
-        self.worker_ai_runtime.clone()
-    }
-
     fn load_page_edits(
         &mut self,
         context: &PageEditContext,
@@ -765,22 +736,33 @@ impl MaterializeSession {
         // 通さないページまで書き出せなくなる (レビュー N03)。実際に通すと決まった時点で
         // runner が失敗にする (レビュー R14)。
         let ai = match ai_materials {
-            Some(materials) => {
-                let runtime = self.resolve_worker_ai_runtime(context);
-                Some(crate::books::book_ai_snapshot(
-                    materials,
-                    runtime,
-                    params.clone(),
-                ))
-            }
+            Some(materials) => Some(crate::books::book_ai_snapshot(
+                materials,
+                Arc::clone(&context.ai_runtime_init),
+                params.clone(),
+            )),
             None => None,
         };
         let erase = erase_raw.map(|(bitmap, shapes, size)| {
-            let runtime = self.resolve_worker_ai_runtime(context);
+            let runtime_init = Arc::clone(&context.ai_runtime_init);
             let manager = Arc::clone(&context.ai_model_manager);
             let mono_tolerance = context.erase_mono_tolerance;
             let run: crate::books::BookEraseRunner =
                 Box::new(move |base, bitmap, shapes, cancel| {
+                    let runtime = match runtime_init
+                        .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
+                    {
+                        crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(runtime),
+                        crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                            crate::logger::log(format!(
+                                "materializer: erase AI runtime unavailable; using diffusion fallback: {error}"
+                            ));
+                            None
+                        }
+                        crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                            return Err("消しゴム処理をキャンセルしました".to_owned());
+                        }
+                    };
                     let result = crate::ui_erase::erase_from_saved_mask(
                         runtime.as_ref(),
                         &manager,
@@ -1698,7 +1680,9 @@ mod tests {
             conceal_preset: crate::conceal::ConcealPreset::default(),
             erase_mono_tolerance: 0,
             comic_source_dims: None,
-            ai_runtime: None,
+            ai_runtime_init: crate::ai::runtime::AiRuntimeInitOwner::failed_for_test(
+                "materializer test runtime unavailable",
+            ),
             ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
             ai_materials: None,
             load_page_params_from_db,

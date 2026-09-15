@@ -515,6 +515,25 @@ fn main() {
 
     let total_user_dl = common_total_bytes + engine_total_bytes;
 
+    #[cfg(windows)]
+    {
+        let report = format!("target/vcrt-pe-reports/trt-pack-v{PACK_VERSION}.json");
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "scripts/check-vcrt-pe-dependencies.ps1",
+                "-InputPaths",
+            ])
+            .arg(&dist_dir)
+            .args(["-ReportPath", &report])
+            .status()
+            .expect("failed to start VC runtime / PE dependency gate");
+        assert!(status.success(), "VC runtime / PE dependency gate failed");
+    }
+
     println!();
     println!("==================== 完了 ====================");
     println!("出力ディレクトリ: {}", dist_dir.display());

@@ -649,7 +649,7 @@ impl crate::app::App {
         };
         self.remote_session_ui.last_control_return_sequence = snapshot.control_return_sequence;
         handle.install_ai_bridge(super::session::RemoteAiExecutionBridge::new(
-            self.ai_runtime.clone(),
+            std::sync::Arc::clone(&self.ai_runtime_init),
             std::sync::Arc::clone(&self.ai_model_manager),
             self.fs_transparent_bg_mode,
         ));
@@ -744,13 +744,6 @@ impl crate::app::App {
         let handle = self.remote_session_ui.handle.clone();
         if let Some(handle) = handle.as_ref() {
             handle.install_repaint_context(ctx);
-        }
-        if self.ai_runtime.is_none()
-            && let Some(runtime) = self
-                .remote_ai_execution_bridge()
-                .and_then(|bridge| bridge.ready_runtime())
-        {
-            self.ai_runtime = Some(runtime);
         }
         let snapshot = self
             .remote_session_ui

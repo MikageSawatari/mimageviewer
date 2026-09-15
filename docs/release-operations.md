@@ -150,6 +150,26 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
   シナリオを測り、`target/idle-health/` の統合 report が全て PASS であることを確認する。
   手順と閾値は [idle-health-check.md](idle-health-check.md) を正とする。
 
+### 3.1 全 PE と app-local VC runtime gate
+
+`build-dist.ps1` は installer と portable の生成後、DONE 表示前に
+`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote、
+installer wrapper、portable directory 配下、および埋め込み元 PDFium / DirectML ORT / FFmpeg /
+Susie / VST host を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
+`target/vcrt-pe-reports/` の JSON に残る。
+
+Microsoft VC/Redist 由来の `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` /
+`vcruntime140_1.dll` は `vendor/vcrt/provenance.json` が正本で、全4本同一版、最低14.44、x64、
+manifest exact hash、Microsoft Authenticode Valid を必須とする。package 内コピーも canonical と
+exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。app-local CRT は Windows Update で
+更新されないため、toolchain / native dependency 更新時にこの正本と実体を一体で更新する。
+
+`onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /
+`vcruntime*` / `concrt*` import は依存 closure の再設計が必要なので fail とする。artifact の machine
+条件は一律ではなく、通常 x64、Susie worker と Inno Setup bootstrapper は x86 を許容する。
+Microsoft 署名済み CRT / ORT は mIV の署名処理へ渡さず、元署名を保持する。TensorRT pack は
+setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` 作成や公開より先に失敗させる。
+
 ---
 
 ## 4. コード署名 (v2.3.0 以降・全配布 PE)
@@ -185,7 +205,8 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
   vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL) → core + remote → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
-- **`onnxruntime*.dll` は Microsoft 署名済みなので再署名しない**。`*.onnx` は PE でないので対象外。
+- **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
+  `*.onnx` は PE でないので対象外。
 - `build-dist.ps1` は**署名を既定 ON** (`-NoSign` で回避)。実装は `scripts/sign-files.ps1`
   (証明書 subject は既定値、拇印固定は `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。
 - **検証**: 最終成果物 (単体exe / setup.exe / portable の mimageviewer.exe) に

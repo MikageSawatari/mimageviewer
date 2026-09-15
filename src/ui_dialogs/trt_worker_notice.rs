@@ -38,7 +38,7 @@ impl App {
     /// 回まで silent)。起動時の transient failure も 1 回だけ silent retry する。
     /// それを超えたらバナーを出してユーザーに手動再起動を促す。
     pub(crate) fn poll_trt_worker_notice(&mut self) {
-        let Some(rt) = self.ai_runtime.as_ref() else {
+        let Some(rt) = self.ai_runtime_init.ready_runtime() else {
             return;
         };
         if rt.has_worker_pool() {
@@ -56,9 +56,9 @@ impl App {
             return;
         };
         match notice.kind {
-            crate::ai::runtime::WorkerNoticeKind::SpawnFailed
+            crate::ai::runtime::WorkerNoticeKind::SpawnFailed(failure_kind)
                 if self.trt_spawn_restart_attempts < MAX_TRT_SPAWN_RESTART_ATTEMPTS
-                    && is_transient_spawn_failure(&notice.detail) =>
+                    && failure_kind.is_automatic_retry_allowed() =>
             {
                 self.trt_spawn_restart_attempts += 1;
                 crate::logger::log(format!(
@@ -67,7 +67,7 @@ impl App {
                     self.trt_spawn_restart_attempts, MAX_TRT_SPAWN_RESTART_ATTEMPTS, notice.detail
                 ));
                 Self::spawn_trt_worker_pool_guarded_after(
-                    rt,
+                    &rt,
                     self.trt_restart_in_flight.clone(),
                     TRT_SPAWN_RETRY_BACKOFF,
                 );
@@ -84,7 +84,7 @@ impl App {
                 ));
                 // 多重 spawn ガード付き: 並行する複数 AI 推論が同じ死亡通知を
                 // 観測しても、1 個の spawn 試行しか走らない (Codex P2)。
-                Self::spawn_trt_worker_pool_guarded(rt, self.trt_restart_in_flight.clone());
+                Self::spawn_trt_worker_pool_guarded(&rt, self.trt_restart_in_flight.clone());
             }
             _ => {
                 // 自動再起動できない (SpawnFailed か、retry 上限到達): バナーで通知。
@@ -148,9 +148,8 @@ impl App {
             self.trt_spawn_restart_attempts = 0;
             // 通知を消してから再起動 (失敗したらまた通知される)
             self.trt_worker_notice = None;
-            if let Some(rt) = self.ai_runtime.as_ref() {
-                let runtime_arc = rt.clone();
-                Self::spawn_trt_worker_pool(&runtime_arc, self.local_ai_activity_lease());
+            if let Some(runtime) = self.ai_runtime_init.ready_runtime() {
+                Self::spawn_trt_worker_pool(&runtime, self.local_ai_activity_lease());
             }
         } else if close_clicked {
             self.trt_worker_notice = None;
@@ -158,48 +157,31 @@ impl App {
     }
 }
 
-fn is_transient_spawn_failure(detail: &str) -> bool {
-    let detail_lower = detail.to_ascii_lowercase();
-    detail.contains("worker 応答 timeout")
-        || detail.contains("worker stdout が EOF")
-        || detail.contains("worker stdout reader thread が終了している")
-        || detail.contains("通信失敗")
-        || detail_lower.contains("0x8007045a")
-        || detail.contains("DLL 初期化")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::is_transient_spawn_failure;
+    use crate::ai::trt_worker_pool::WorkerStartFailureKind;
 
     #[test]
-    fn classifies_transient_spawn_failures() {
-        assert!(is_transient_spawn_failure(
-            "ワーカー起動 timeout / 通信失敗: worker 応答 timeout (45 秒)"
-        ));
-        assert!(is_transient_spawn_failure(
-            "provider preload failed: HRESULT(0x8007045A)"
-        ));
-        assert!(is_transient_spawn_failure(
-            "provider preload failed: HRESULT(0x8007045a)"
-        ));
+    fn retries_only_transport_classes() {
+        assert!(WorkerStartFailureKind::ProcessSpawn.is_automatic_retry_allowed());
+        assert!(WorkerStartFailureKind::Transport.is_automatic_retry_allowed());
+        assert!(WorkerStartFailureKind::Timeout.is_automatic_retry_allowed());
     }
 
     #[test]
-    fn leaves_non_transient_spawn_failures_for_user_notice() {
-        assert!(!is_transient_spawn_failure(
-            "TensorRT pack が見つかりません: tensorrt_pack"
-        ));
-        assert!(!is_transient_spawn_failure(
-            "engine metadata mismatch: expected fp16"
-        ));
+    fn runtime_init_is_terminal_even_when_detail_looks_transient() {
+        let detail = "provider preload failed: HRESULT(0x8007045A) DLL 初期化";
+        assert!(detail.contains("0x8007045A"));
+        assert!(!WorkerStartFailureKind::RuntimeInit.is_automatic_retry_allowed());
+        assert!(!WorkerStartFailureKind::CommandRejected.is_automatic_retry_allowed());
+        assert!(!WorkerStartFailureKind::Protocol.is_automatic_retry_allowed());
     }
 }
 
 /// 通知種別ごとの (タイトル, 本文, 再起動ボタンを出すか) を返す。
 fn notice_text(notice: &WorkerNotice) -> (&'static str, String, bool) {
     match notice.kind {
-        WorkerNoticeKind::SpawnFailed => (
+        WorkerNoticeKind::SpawnFailed(_) => (
             "TensorRT 起動失敗",
             format!(
                 "TensorRT ワーカープロセスを起動できませんでした。\n\

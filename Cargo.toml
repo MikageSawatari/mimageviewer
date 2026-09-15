@@ -18,6 +18,7 @@ members = [
     "tools/viewer_context_audit",
 ]
 exclude = [
+    "crates/ort-patched",
     "crates/unrar-patched",
     "vendor/eframe",
     "vendor/egui",
@@ -28,6 +29,7 @@ exclude = [
 eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+ort = { path = "crates/ort-patched" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
 # launcher = `mimageviewer.exe`) の

@@ -189,3 +189,23 @@ mimageviewer::ai::runtime::AiRuntime::new_with_backend
 - Microsoft へは利用者が続報を送る (原因が分かったこと、前回の質問は不要になったこと、修正版で再申請すること)。
   下書き: `target/msstore-hang-20260915/ms-store-followup-email.md`。
 - Store への再申請は修正版の正式リリース後。申請前に §5 の Sandbox 起動確認を通す。
+
+## 8. 修正実装 checkpoint (2026-09-15)
+
+開発側の設計正本は
+[section241-ort-vcrt-startup-fix-plan.md](section241-ort-vcrt-startup-fix-plan.md)。候補は A+B+C を
+同じ修正境界で採用した。
+
+- `ort` 2.0.0-rc.12へ upstream `17ed727` をlocal backportし、load-dynamic初期化中の error生成を
+  ORT APIから分離した。missing DLL / missing export回帰は隔離processで停止せず返る。
+- GUI processのApp / Remote / materializerは一つの `AiRuntimeInitOwner` を共有し、DLL展開と
+  runtime constructorをworker上で一度だけ実行する。UIはterminalを待たず、consumer固有workerはcancel-awareに待つ。
+- Visual Studio VC/Redist由来のMicrosoft署名済みx64 runtime 4本を、単体launcherの展開先、installer経由の
+  runtime、portable、dev-runtimeで各exe隣へ配置する。利用者のglobal VC++ redist導入は不要。
+- TensorRT infer workerのinit rejectionを型付きで即時返し、文字列によるsilent retry判定を撤去した。
+  setup / pack build / uploadにも全PE dependency gateを接続した。
+- 配布gateは全PEを列挙し、artifact別machine、direct import closure、全input hash、CRTの同一版・最低版・
+  exact manifest・Microsoft署名とMicrosoft ORT署名を検査する。
+
+自動検証と独立reviewの最終記録は設計正本§11へ集約する。Sandboxと実アプリはまだ起動せず、完成成果物を
+公開担当へ渡して§5のclean Windows検証を行う。

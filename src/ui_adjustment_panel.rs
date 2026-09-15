@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 use rayon::prelude::*;
@@ -14025,10 +14026,8 @@ impl App {
             self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
             return;
         }
-        let Some(runtime) = self.ai_runtime.clone() else {
-            self.show_feedback_toast("AI ランタイムが初期化されていません".to_string());
-            return;
-        };
+        self.ensure_ai_runtime();
+        let runtime_init = Arc::clone(&self.ai_runtime_init);
         // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
         // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
         let Some(model_path) = self.subject_matte_path.clone() else {
@@ -14047,13 +14046,27 @@ impl App {
             .copied()
             .unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
         let local_ai_activity = self.local_ai_activity_lease();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-subject-segmentation".to_string())
             .spawn(move || {
                 let _local_ai_activity = local_ai_activity;
-                let result = run_local_adjust_subject_segmentation(runtime, model_path, source)
-                    .map(LocalAdjustGeneratedMask::Subject);
+                let result = match runtime_init
+                    .wait_terminal_while(|| !cancel_worker.load(Ordering::Acquire))
+                {
+                    crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => {
+                        run_local_adjust_subject_segmentation(runtime, model_path, source)
+                            .map(LocalAdjustGeneratedMask::Subject)
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                        Err(format!("AI ランタイム初期化失敗: {error}"))
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                        Err("被写体マスク生成をキャンセルしました".to_owned())
+                    }
+                };
                 let _ = tx.send(result);
             });
         match spawn_result {
@@ -14063,6 +14076,7 @@ impl App {
                         fs_idx,
                         layer_idx,
                         generation,
+                        cancel,
                         rx,
                     });
                 self.show_feedback_toast("被写体マスク生成中...".to_string());
@@ -14118,6 +14132,7 @@ impl App {
             .copied()
             .unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-region-segmentation".to_string())
             .spawn(move || {
@@ -14141,6 +14156,7 @@ impl App {
                         fs_idx,
                         layer_idx,
                         generation,
+                        cancel,
                         rx,
                     });
                 self.show_feedback_toast(scope.pending_label().to_string());

@@ -3109,7 +3109,7 @@ impl App {
             return;
         }
         self.ensure_ai_runtime();
-        let runtime = self.ai_runtime.clone();
+        let runtime_init = Arc::clone(&self.ai_runtime_init);
         let manager = self.ai_model_manager.clone();
         let kind = if is_preview {
             EraseInpaintKind::Preview
@@ -3139,6 +3139,18 @@ impl App {
             .name("erase-inpaint".to_string())
             .spawn(move || {
                 let _local_ai_activity = local_ai_activity;
+                let runtime = match runtime_init
+                    .wait_terminal_while(|| !cancel_for_thread.load(Ordering::Acquire))
+                {
+                    crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(runtime),
+                    crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                        crate::logger::log(format!(
+                            "erase: AI runtime unavailable; using diffusion fallback: {error}"
+                        ));
+                        None
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Cancelled => return,
+                };
                 let result = crate::edit_source::run_inpaint_pure(
                     runtime.as_ref(),
                     &manager,

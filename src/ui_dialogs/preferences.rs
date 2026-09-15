@@ -2040,6 +2040,7 @@ impl App {
 
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
+            let ai_runtime = self.ai_runtime_init.ready_runtime();
             let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
                 self.fullscreen_idx
                     .or(self.selected)
@@ -2049,7 +2050,7 @@ impl App {
             let mut new_state = PreferencesState::from_settings(
                 &self.settings,
                 external_tool_target,
-                self.ai_runtime.as_deref(),
+                ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
                     .as_ref()
@@ -2810,10 +2811,11 @@ impl App {
         }
 
         if self.operation_customize_state.is_none() {
+            let ai_runtime = self.ai_runtime_init.ready_runtime();
             let mut state = PreferencesState::from_settings(
                 &self.settings,
                 crate::external_tool::LaunchTarget::None,
-                self.ai_runtime.as_deref(),
+                ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
                     .as_ref()
@@ -3034,7 +3036,7 @@ impl App {
     ///   (UI 状態は呼び出し時点で既に「削除済」相当に同期されている)。
     pub(crate) fn uninstall_trt_pack_now(&mut self) {
         // 1. worker pool 停止 (DLL ハンドル解放)。これは速い (ms オーダー) ので UI thread で OK。
-        if let Some(runtime) = self.ai_runtime.as_ref() {
+        if let Some(runtime) = self.ai_runtime_init.ready_runtime() {
             if runtime.has_worker_pool() {
                 crate::logger::log(
                     "[AI] TRT パック削除のため worker pool を停止します".to_string(),

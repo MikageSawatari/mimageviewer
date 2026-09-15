@@ -22,6 +22,7 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
@@ -43164,11 +43165,25 @@ impl App {
 
         let erase = erase_mask.map(|mask| {
             self.ensure_ai_runtime();
-            let runtime = self.ai_runtime.clone();
+            let runtime_init = Arc::clone(&self.ai_runtime_init);
             let manager = Arc::clone(&self.ai_model_manager);
             let mono_tolerance = self.settings.erase_inpaint_mono_tolerance;
             let run: crate::books::BookEraseRunner =
                 Box::new(move |base, bitmap, shapes, cancel| {
+                    let runtime = match runtime_init
+                        .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
+                    {
+                        crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(runtime),
+                        crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                            crate::logger::log(format!(
+                                "book-composite: AI runtime unavailable; using diffusion fallback: {error}"
+                            ));
+                            None
+                        }
+                        crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                            return Err("消しゴム処理をキャンセルしました".to_owned());
+                        }
+                    };
                     let result = crate::ui_erase::erase_from_saved_mask(
                         runtime.as_ref(),
                         &manager,
@@ -43198,7 +43213,7 @@ impl App {
             self.ensure_ai_runtime();
             Some(crate::books::book_ai_snapshot(
                 materials,
-                self.ai_runtime.clone(),
+                Arc::clone(&self.ai_runtime_init),
                 params.clone(),
             ))
         } else {

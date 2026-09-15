@@ -421,12 +421,12 @@ pub fn ai_runtime_unavailable_error() -> String {
 /// 入力をそのまま返す。**そこで失敗にしない** — 段は「ここまで焼く」であって「必ず AI を
 /// 通す」ではない。
 ///
-/// `runtime` が `None` = 用意できなかった。**その場でエラーにしない。** 実際にモデルが
-/// 選ばれるかは合成途中の画素の寸法に依るので、対象外の画像まで書き出せなくなる
-/// (v3.5.0 レビュー N03)。選ばれたときにだけ失敗にする。
+/// 実際にモデルが選ばれるかは合成途中の画素の寸法に依る。対象外なら runtime を待たず、
+/// 対象になったページだけ worker 上で process 共通 owner の Ready / Failed terminal を
+/// cancel-aware に待つ。
 pub fn book_ai_snapshot(
     materials: BookAiMaterials,
-    runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+    runtime_init: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     params: crate::adjustment::AdjustParams,
 ) -> BookAiSnapshot {
     let run: BookAiRunner = Box::new(move |image, cancel| {
@@ -443,10 +443,16 @@ pub fn book_ai_snapshot(
                 used_upscale: false,
             });
         };
-        // ここまで来た = このページはこの寸法で本当に AI を通す。用意できていなければ
-        // 失敗にする (AI 抜きの絵は寸法から別物なので、黙って落とさない)。
-        let Some(runtime) = runtime.as_ref() else {
-            return Err(ai_runtime_unavailable_error());
+        // ここまで来た = このページはこの寸法で本当に AI を通す。worker 上で共通
+        // runtime owner の terminal を待ち、request cancel は待機中にも反映する。
+        let runtime = match runtime_init.wait_terminal_while(|| !cancel.load(Ordering::Acquire)) {
+            crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => runtime,
+            crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                return Err(format!("{}: {error}", ai_runtime_unavailable_error()));
+            }
+            crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                return Err("AI 処理をキャンセルしました".to_owned());
+            }
         };
         let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
             source: Arc::new(image.clone()),
@@ -457,7 +463,7 @@ pub fn book_ai_snapshot(
             background_mode: materials.policy.transparent_bg_mode,
         };
         match crate::ai::final_pipeline::execute_selected_final_ai(
-            runtime,
+            &runtime,
             &materials.manager,
             request,
             cancel,
@@ -3000,7 +3006,11 @@ mod tests {
                 transparent_bg_mode: 0,
             },
         };
-        let snapshot = book_ai_snapshot(materials, None, wants);
+        let snapshot = book_ai_snapshot(
+            materials,
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("AI unavailable"),
+            wants,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
 
         // 上限外。AI を通さないので、runtime が無くてもそのまま返す。

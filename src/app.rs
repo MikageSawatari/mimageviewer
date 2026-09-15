@@ -3586,7 +3586,14 @@ pub(crate) struct LocalAdjustSegmentationPending {
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) generation: u64,
+    pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: mpsc::Receiver<Result<LocalAdjustGeneratedMask, String>>,
+}
+
+impl Drop for LocalAdjustSegmentationPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) enum LocalAdjustGeneratedMask {
@@ -8459,16 +8466,20 @@ pub(crate) struct FinalCompositeEntry {
 
 /// 既存 final composite を返して、このフレームの同期 CPU 合成を省略できるか。
 ///
-/// final-effect worker 待ちは AI 結果到着後だけを対象にする。AI 失敗時や AI 未起動時まで
-/// pending を理由に抜けると、complete 昇格・PDF rerender・`maybe_start_final_ai` の各経路を
-/// 遅延させるため、それらは従来どおり呼び出し側の state transition へ流す。
+/// final-effect worker 待ちは AI 結果到着後だけを対象にする。AI 結果前の暫定 entry は、
+/// runtime 初期化・AI job・PDF rerender など結果を進める producer が実在する間だけ返す。
+/// owner が Ready / Failed へ遷移したのに job が無い entry は再評価へ流し、初回要求を
+/// Ready runtime へ投入するか complete へ昇格させる。
 fn should_return_cached_final_composite(
     entry_complete: bool,
     ai_ready: bool,
     ai_failed: bool,
+    ai_progress_pending: bool,
     same_key_final_effect_pending: bool,
 ) -> bool {
-    entry_complete || (!ai_ready && !ai_failed) || (ai_ready && same_key_final_effect_pending)
+    entry_complete
+        || (!ai_ready && !ai_failed && ai_progress_pending)
+        || (ai_ready && same_key_final_effect_pending)
 }
 
 /// 連結読みで表示済みのページを、同ページの新しい final composite が完成するまで
@@ -14002,8 +14013,8 @@ pub struct App {
     pub(crate) viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
 
     // ── AI アップスケール ──────────────────────────────────────────
-    /// AI ランタイム (ONNX Runtime)
-    pub(crate) ai_runtime: Option<std::sync::Arc<crate::ai::runtime::AiRuntime>>,
+    /// GUI / Remote / materializer が共有する唯一の ONNX Runtime 初期化 owner。
+    pub(crate) ai_runtime_init: std::sync::Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     /// AI モデルマネージャ
     pub(crate) ai_model_manager: std::sync::Arc<crate::ai::model_manager::ModelManager>,
     /// local AI worker の実 lifetime。viewer bundle の pending map から cancel 済み
@@ -14546,8 +14557,8 @@ pub struct App {
     /// ためのガード)。
     pub(crate) trt_auto_restart_attempts: u32,
     /// セッション中に worker 起動失敗 → 自動再試行を試みた回数。
-    /// 起動時の provider DLL 初期化 timeout は一時的なことがあるため 1 回だけ
-    /// silent retry する。worker attach 成功で 0 に戻す。
+    /// `ProcessSpawn / Transport / Timeout` と型付けされた失敗だけを 1 回 silent retry する。
+    /// RuntimeInit / CommandRejected 等は即時 terminal。worker attach 成功で 0 に戻す。
     pub(crate) trt_spawn_restart_attempts: u32,
     /// 自動再起動が現在進行中か (= spawn_trt_worker_pool の background thread が
     /// 起動中で、まだ attach も failure 通知もしていない状態)。
@@ -16664,7 +16675,7 @@ impl App {
             viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
 
             // AI (settings から復元)
-            ai_runtime: None,
+            ai_runtime_init: crate::ai::runtime::AiRuntimeInitOwner::new(),
             ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
             local_ai_activity: Arc::new(AtomicUsize::new(0)),
             ai_upscale_enabled,
@@ -57045,7 +57056,7 @@ impl App {
     ///   Drop で shutdown される)
     /// - 同じ → 何もしない
     pub(crate) fn apply_ai_backend_change(&mut self, new_backend_str: Option<&str>) {
-        let Some(runtime) = self.ai_runtime.as_ref() else {
+        let Some(runtime) = self.ai_runtime_init.ready_runtime() else {
             crate::logger::log("[AI] runtime 未初期化のためバックエンド変更はスキップ".to_string());
             return;
         };
@@ -57069,7 +57080,7 @@ impl App {
                 crate::logger::log(
                     "[AI] AI バックエンド変更: → TensorRT (worker pool 起動)".to_string(),
                 );
-                Self::spawn_trt_worker_pool(runtime, self.local_ai_activity_lease());
+                Self::spawn_trt_worker_pool(&runtime, self.local_ai_activity_lease());
             }
             (false, true) => {
                 crate::logger::log(
@@ -57255,8 +57266,8 @@ impl App {
 
     /// 焼き込みの AI 段に渡す材料。**設定と上限の解釈はここ 1 か所。**
     ///
-    /// 製本・一括書き出し・外部ツールが同じ答えを使う。runtime は渡さない — UI が持って
-    /// いなければ worker が自分で作る経路があるため (v3.5.0 レビュー F03)。
+    /// 製本・一括書き出し・外部ツールが同じ答えを使う。runtime はこの材料へ複製せず、
+    /// worker が process 共通 owner の terminal を cancel-aware に待って受け取る。
     pub(crate) fn book_ai_materials(&self) -> crate::books::BookAiMaterials {
         crate::books::BookAiMaterials {
             manager: Arc::clone(&self.ai_model_manager),
@@ -57309,45 +57320,16 @@ impl App {
         }
     }
 
-    pub(crate) fn ensure_ai_runtime(&mut self) {
-        if self.ai_runtime.is_some() {
-            return;
-        }
-        let bridge = self.remote_ai_execution_bridge();
-        if let Some(bridge) = bridge.as_ref() {
-            match bridge.claim_local_runtime_init() {
-                crate::remote_ipc::session::RemoteLocalRuntimeClaim::Ready(runtime) => {
-                    self.ai_runtime = Some(runtime);
-                    return;
-                }
-                crate::remote_ipc::session::RemoteLocalRuntimeClaim::WaitingForRemote => {
-                    // Runtime construction remains on the remote worker. poll_remote_session
-                    // adopts it after completion; never wait on its Condvar from the UI thread.
-                    return;
-                }
-                crate::remote_ipc::session::RemoteLocalRuntimeClaim::Initialize => {}
-            }
-        }
-        // 常に DirectML で起動 (Phase 3)
-        let created =
-            crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl);
-        let created = match bridge.as_ref() {
-            Some(bridge) => bridge.complete_claimed_runtime_init(created),
-            None => created.map(std::sync::Arc::new),
-        };
-        match created {
-            Ok(runtime) => {
-                let active = runtime.active_backend();
-                crate::logger::log(format!(
-                    "[AI] Runtime initialized (DirectML always in main, requested={:?}, effective={:?})",
-                    active.requested, active.effective
-                ));
-                self.ai_runtime = Some(runtime);
-            }
-            Err(e) => {
-                crate::logger::log(format!("[AI] Runtime init failed: {e}"));
-            }
-        }
+    pub(crate) fn start_ai_runtime_initialization(&self, ctx: egui::Context) {
+        self.ai_runtime_init.start(move || {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+    }
+
+    pub(crate) fn ensure_ai_runtime(&self) {
+        // Production starts this after the Remote bridge is installed. Tests and other App
+        // constructors can still reach an AI producer directly; starting here remains async.
+        self.ai_runtime_init.start(|| {});
     }
 
     /// 単一 AI ワーカー + 優先度キューを遅延起動する (初回 final AI ジョブ時)。
@@ -57487,6 +57469,10 @@ impl App {
             })
         {
             crate::logger::log(format!("[AI] TRT worker pool 起動 thread 作成に失敗: {e}"));
+            runtime.report_worker_spawn_failed(crate::ai::trt_worker_pool::WorkerStartError::new(
+                crate::ai::trt_worker_pool::WorkerStartFailureKind::ProcessSpawn,
+                format!("TRT worker pool 起動 thread 作成に失敗: {e}"),
+            ));
             if let Some(g) = guard {
                 g.store(false, std::sync::atomic::Ordering::SeqCst);
             }
@@ -57698,7 +57684,7 @@ impl App {
         // AI ランタイム / モデルマネージャを遅延初期化
         self.ensure_ai_runtime();
 
-        let Some(runtime) = self.ai_runtime.clone() else {
+        let Some(runtime) = self.ai_runtime_init.ready_runtime() else {
             return;
         };
         self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
@@ -63015,8 +63001,13 @@ impl App {
         }
 
         self.ensure_ai_runtime();
-        let Some(runtime) = self.ai_runtime.clone() else {
-            return false;
+        let runtime = match self.ai_runtime_init.snapshot() {
+            crate::ai::runtime::AiRuntimeInitSnapshot::Ready(runtime) => runtime,
+            // The owner completion requests a repaint. Keep this composite provisional so that
+            // the next frame can enqueue the exact same request from the Ready snapshot.
+            crate::ai::runtime::AiRuntimeInitSnapshot::Initializing => return true,
+            crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
+            | crate::ai::runtime::AiRuntimeInitSnapshot::Failed(_) => return false,
         };
         self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
         let manager = self.ai_model_manager.clone();
@@ -63711,12 +63702,21 @@ impl App {
         // poll 側の cleanup ではなくここで判定して再合成 (failed 分岐 → complete=true)
         // に流す。
         let ai_failed = ai_key.is_some_and(|key| self.final_ai_failed.contains(&key));
+        let ai_progress_pending = ai_key.is_some()
+            && (matches!(
+                self.ai_runtime_init.snapshot(),
+                crate::ai::runtime::AiRuntimeInitSnapshot::Initializing
+            ) || self.final_ai_pending.iter().any(|(pending_key, pending)| {
+                pending_key.edit_key.idx == idx && !pending.cancel.load(Ordering::Relaxed)
+            }) || self.remote_session_blocks_local_control()
+                || self.display_should_defer_final_ai(idx));
         if let Some(entry) = self.final_composite_cache.get(&final_key) {
             let same_key_final_effect_pending = self.final_effect_pending.contains_key(&final_key);
             if should_return_cached_final_composite(
                 entry.complete,
                 ai_ready.is_some(),
                 ai_failed,
+                ai_progress_pending,
                 same_key_final_effect_pending,
             ) {
                 return Some(entry.texture.clone());
@@ -64119,7 +64119,7 @@ impl App {
         // SubjectMatte session を破棄して次回生成で新しいパスから読み直させる。
         // 破棄しないと load_model() が「既にロード済み」で早期 return し、更新後も旧 BiRefNet
         // session を使い続ける / uninstall 後も VRAM を抱えたままになる (Codex P2)。
-        if let Some(rt) = &self.ai_runtime {
+        if let Some(rt) = self.ai_runtime_init.ready_runtime() {
             rt.unload_model(crate::ai::ModelKind::SubjectMatte);
         }
         crate::logger::log(format!(

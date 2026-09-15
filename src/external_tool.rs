@@ -2178,7 +2178,7 @@ impl crate::app::App {
                     self.source_dims_for_idx(index)
                         .map(|(width, height)| [width.round() as usize, height.round() as usize])
                 }),
-                ai_runtime: self.ai_runtime.clone(),
+                ai_runtime_init: Arc::clone(&self.ai_runtime_init),
                 ai_model_manager: Arc::clone(&self.ai_model_manager),
                 load_page_params_from_db,
             }

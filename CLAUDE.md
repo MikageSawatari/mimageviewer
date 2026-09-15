@@ -140,7 +140,7 @@ dual-window approach.
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (設定 3〜10、既定 5、1 つを Critical 予約)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
-- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
+- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、AI runtime 初期化 worker が `%APPDATA%/mimageviewer/` に展開して `ort::init_from()` で動的ロードする。Microsoft 公式 app-local VC runtime 4 本も全配布 exe の隣へ同梱するため、利用者による VC++ 再頒布可能パッケージの追加インストールは不要
 - **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/archive/ai/tensorrt-batching-feasibility.md](docs/archive/ai/tensorrt-batching-feasibility.md)
 - **AI image classification**: ヒューリスティクスでイラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
@@ -844,11 +844,19 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 AI 機能 (アップスケール・ノイズ除去・消しゴム) は ONNX Runtime + DirectML EP を
 使用する。`ort` クレートの `load-dynamic` 機能で、メイン exe は静的リンクせず、起動時に
 `%APPDATA%\mimageviewer\onnxruntime.dll` を動的ロードする。DLL は PDFium と同様
-`include_bytes!` で exe に埋め込み、初回 `AiRuntime::new()` で APPDATA へ展開する。
+`include_bytes!` で exe に埋め込み、process 共通 AI runtime 初期化 worker が APPDATA へ展開する。
 
-この方式の利点:
-- Visual C++ 再頒布可能パッケージへの依存が不要になる (VCRUNTIME140.dll 等が消える)
-- 利用者は単体 exe 版・インストーラ版どちらでも追加セットアップ不要
+`onnxruntime.dll` は Microsoft の動的 CRT build なので、公式 VC/Redist 由来の
+`msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` / `vcruntime140_1.dll` を
+app-local 配置する。単体 launcher は versioned runtime directory へ hash 検証付きで展開し、
+portable / 開発 build は exe 隣へ loose 配置する。利用者による追加セットアップは不要。
+由来、版、署名、hash の正本は `vendor/vcrt/provenance.json` とし、native dependency 更新時は
+`scripts/check-vcrt-pe-dependencies.ps1` を通して4本を一体更新する。
+
+GUI process の ORT constructor は process 共通 `AiRuntimeInitOwner` だけが worker 上で一度実行する。
+App / Remote / materializer は同じ Ready / Failed terminal snapshot を使い、UI thread は待たない。
+`ort` 2.0.0-rc.12 は upstream `17ed727` を `crates/ort-patched` へ backport し、dynamic load / export /
+C API version の初期化失敗を ORT API に再入せず `LoadDynamicError` として返す。
 
 ### セットアップ
 
@@ -1546,13 +1554,14 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   remote service をその隣へ同梱。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **CRT 静的リンク**: `.cargo/config.toml` でメイン exe (x86_64) と Susie ワーカー (i686)
-  の両方に `+crt-static` を有効にしている。これにより `VCRUNTIME140.dll` / `MSVCP140.dll`
-  など Visual C++ 再頒布可能パッケージへの依存を排除している。
-  - メイン exe は `ort` クレートの `load-dynamic` 機能と組み合わせて成立している
-    (静的リンク版 `onnxruntime.lib` は動的 CRT 前提でビルドされており、crt-static と
-    両立しない)。どちらも触らないこと。
-  - **解除すると Vector の「要ソフト」欄指摘が再発する**。
+- **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
+  `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
+  するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
+  `scripts/check-vcrt-pe-dependencies.ps1` が全配布 PE の machine / import closure と、CRT・ORT の
+  Microsoft 署名、CRT の同一版・最低版・manifest hash を検査する。未知の `msvcp*` /
+  `vcruntime*` / `concrt*` import は gate failure とし、追加 DLL を場当たり的に配布しない。
+  app-local CRT は Windows Update で更新されないため、toolchain / native dependency 更新時に
+  `vendor/vcrt/provenance.json` と実体を一体で見直す。
 - **設定保存先**: インストーラ版・単体exe版は `%APPDATA%\mimageviewer`、
   ポータブル版は `<exe_dir>\data` (書込不可なら APPDATA へフォールバックせずエラー起動拒否)。
 
@@ -1941,11 +1950,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       いずれかを 1 回ずつ確認。`<exe_dir>\data` が作られ APPDATA が触られないこと、
       インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
       検証チェックリスト全項目は [docs/portable-build-plan.md](docs/portable-build-plan.md) §8。
-12. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
-    `VCRUNTIME140.dll` / `MSVCP140.dll` が現れていないことを確認する。もし現れていたら:
-    - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認
-    - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
-      `+crt-static` 設定が残っているか確認
+12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
+    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / installer、
+    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host を filesystem から
+    列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
+    4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、
+    `onnxruntime*.dll` も Microsoft 署名を必須にする。未知の VC runtime import、companion CRT 欠落、
+    package copy の hash 不一致は配布停止。TRT pack は setup / build / upload の各入口で同じ gate を通す。
 12.5. **コード署名の回帰チェック** — 配布成果物 (単体exe / setup.exe / portable の mimageviewer.exe) に
     `signtool verify /pa /v <exe>` を走らせ、`Open Source Developer Taku Sano` 名義の証明書チェーン
     (Certum Code Signing → Certum Trusted Network CA) と **RFC3161 タイムスタンプ**が付いていることを

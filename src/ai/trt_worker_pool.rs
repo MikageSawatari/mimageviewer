@@ -50,7 +50,63 @@ static TRT_INFER_BREAKDOWN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LOG_ALL_TRT_INFER_BREAKDOWN: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("MIV_TRT_INFER_BREAKDOWN_LOG").is_some());
 
-use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
+use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerFailureKind, WorkerResp};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStartFailureKind {
+    ProcessSpawn,
+    Transport,
+    Timeout,
+    Protocol,
+    ParentSetup,
+    RuntimeInit,
+    CommandRejected,
+}
+
+impl WorkerStartFailureKind {
+    pub fn is_automatic_retry_allowed(self) -> bool {
+        matches!(self, Self::ProcessSpawn | Self::Transport | Self::Timeout)
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkerStartError {
+    pub kind: WorkerStartFailureKind,
+    pub detail: String,
+}
+
+impl WorkerStartError {
+    pub fn new(kind: WorkerStartFailureKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for WorkerStartError {}
+
+enum WorkerReceiveError {
+    Transport(String),
+    Timeout(String),
+    Protocol(String),
+}
+
+impl std::fmt::Display for WorkerReceiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(detail) | Self::Timeout(detail) | Self::Protocol(detail) => {
+                f.write_str(detail)
+            }
+        }
+    }
+}
 
 /// 1 個のワーカー子プロセスのハンドル。
 struct WorkerHandle {
@@ -80,32 +136,58 @@ const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 impl WorkerHandle {
     /// 親プロセス側でワーカー子プロセスを起動し、ハンドシェイクを待つ。
-    fn spawn(exe: &std::path::Path) -> Result<Self, String> {
+    fn spawn(exe: &std::path::Path) -> Result<Self, WorkerStartError> {
         let mut child = Command::new(exe)
             .arg(TRT_INFER_WORKER_ARG)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("spawn worker: {e}"))?;
+            .map_err(|e| {
+                WorkerStartError::new(
+                    WorkerStartFailureKind::ProcessSpawn,
+                    format!("spawn worker: {e}"),
+                )
+            })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "child stdin missing".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "child stdout missing".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "child stderr missing".to_string())?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::Transport,
+                    "child stdin missing",
+                ));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::Transport,
+                    "child stdout missing",
+                ));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::Transport,
+                    "child stderr missing",
+                ));
+            }
+        };
 
         // stderr ドレインスレッド: 子の stderr を黙々と読み捨てる
         // (= 子のパイプ満杯で write block するのを防ぐ)。CUDA / TensorRT /
         // ORT は init / load 中に多量の警告 / 進捗を stderr に出すため必須。
-        let stderr_join = std::thread::Builder::new()
+        let stderr_join = match std::thread::Builder::new()
             .name("trt-worker-stderr-drain".to_string())
             .spawn(move || {
                 let mut reader = std::io::BufReader::new(stderr);
@@ -122,14 +204,23 @@ impl WorkerHandle {
                         Err(_) => break,
                     }
                 }
-            })
-            .map_err(|e| format!("spawn stderr drain thread: {e}"))?;
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::ProcessSpawn,
+                    format!("spawn stderr drain thread: {error}"),
+                ));
+            }
+        };
 
         // stdout 読み取りスレッド: 行ごとに channel に push。
         // 親が read_resp_line で recv_timeout して拾う。これにより
         // read_line の無限 block を timeout 内に切り上げられる。
         let (tx, stdout_rx) = std::sync::mpsc::channel();
-        let stdout_join = std::thread::Builder::new()
+        let stdout_join = match std::thread::Builder::new()
             .name("trt-worker-stdout-reader".to_string())
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
@@ -154,8 +245,18 @@ impl WorkerHandle {
                         }
                     }
                 }
-            })
-            .map_err(|e| format!("spawn stdout reader thread: {e}"))?;
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_join.join();
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::ProcessSpawn,
+                    format!("spawn stdout reader thread: {error}"),
+                ));
+            }
+        };
 
         let mut handle = WorkerHandle {
             child,
@@ -167,20 +268,44 @@ impl WorkerHandle {
 
         // ハンドシェイク: 子の起動成功 / 失敗のレスポンスを 1 行読む。
         // pack 不在 + DirectML フォールバック等の場合は失敗で来る。
-        let resp = handle
-            .recv_resp_with_timeout(WORKER_HANDSHAKE_TIMEOUT)
-            .map_err(|e| {
-                // ハンドシェイクが時間内に来ない / 失敗 → 子を kill して回収
+        let resp = match handle.recv_resp_with_timeout(WORKER_HANDSHAKE_TIMEOUT) {
+            Ok(resp) => resp,
+            Err(error) => {
                 let _ = handle.child.kill();
                 let _ = handle.child.wait();
-                format!("ワーカー起動 timeout / 通信失敗: {e}")
-            })?;
+                let (kind, detail) = match error {
+                    WorkerReceiveError::Transport(detail) => {
+                        (WorkerStartFailureKind::Transport, detail)
+                    }
+                    WorkerReceiveError::Timeout(detail) => {
+                        (WorkerStartFailureKind::Timeout, detail)
+                    }
+                    WorkerReceiveError::Protocol(detail) => {
+                        (WorkerStartFailureKind::Protocol, detail)
+                    }
+                };
+                return Err(WorkerStartError::new(kind, detail));
+            }
+        };
         if !resp.ok {
             let _ = handle.child.kill();
             let _ = handle.child.wait();
-            return Err(format!(
-                "ワーカー初期化失敗: {}",
-                resp.error.unwrap_or_else(|| "(理由不明)".to_string())
+            let Some(failure_kind) = resp.failure_kind else {
+                return Err(WorkerStartError::new(
+                    WorkerStartFailureKind::Protocol,
+                    "worker rejection is missing failure_kind",
+                ));
+            };
+            let kind = match failure_kind {
+                WorkerFailureKind::RuntimeInit => WorkerStartFailureKind::RuntimeInit,
+                WorkerFailureKind::CommandRejected => WorkerStartFailureKind::CommandRejected,
+            };
+            return Err(WorkerStartError::new(
+                kind,
+                format!(
+                    "ワーカー初期化失敗: {}",
+                    resp.error.unwrap_or_else(|| "(理由不明)".to_string())
+                ),
             ));
         }
 
@@ -194,6 +319,7 @@ impl WorkerHandle {
             .flush()
             .map_err(|e| format!("stdin flush: {e}"))?;
         self.recv_resp_with_timeout(WORKER_RESP_TIMEOUT)
+            .map_err(|error| error.to_string())
     }
 
     /// stdout から 1 つの response 行を timeout 付きで受信して JSON parse する。
@@ -203,29 +329,35 @@ impl WorkerHandle {
     fn recv_resp_with_timeout(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Result<WorkerResp, String> {
+    ) -> Result<WorkerResp, WorkerReceiveError> {
         let line = match self.stdout_rx.recv_timeout(timeout) {
             Ok(Ok(line)) if line.is_empty() => {
-                return Err("worker stdout が EOF (子プロセスが予期せず終了した可能性)".to_string());
-            }
-            Ok(Ok(line)) => line,
-            Ok(Err(e)) => return Err(e),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!(
-                    "worker 応答 timeout ({} 秒、子プロセスが hang した可能性)",
-                    timeout.as_secs()
+                return Err(WorkerReceiveError::Transport(
+                    "worker stdout が EOF (子プロセスが予期せず終了した可能性)".to_string(),
                 ));
             }
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(WorkerReceiveError::Transport(e)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(WorkerReceiveError::Timeout(format!(
+                    "worker 応答 timeout ({} 秒、子プロセスが hang した可能性)",
+                    timeout.as_secs()
+                )));
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("worker stdout reader thread が終了している".to_string());
+                return Err(WorkerReceiveError::Transport(
+                    "worker stdout reader thread が終了している".to_string(),
+                ));
             }
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return Err("worker から空レスポンス".to_string());
+            return Err(WorkerReceiveError::Protocol(
+                "worker から空レスポンス".to_string(),
+            ));
         }
         serde_json::from_str::<WorkerResp>(trimmed)
-            .map_err(|e| format!("resp parse: {e} (raw: {line:?})"))
+            .map_err(|e| WorkerReceiveError::Protocol(format!("resp parse: {e} (raw: {line:?})")))
     }
 
     fn shutdown_and_wait(mut self) {
@@ -318,8 +450,13 @@ pub struct TrtWorkerPool {
 impl TrtWorkerPool {
     /// プールを起動 (現在の exe をワーカーとして spawn)。
     /// メインアプリ (mimageviewer.exe) から呼ぶ用途。
-    pub fn start() -> Result<Self, String> {
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    pub fn start() -> Result<Self, WorkerStartError> {
+        let exe = std::env::current_exe().map_err(|e| {
+            WorkerStartError::new(
+                WorkerStartFailureKind::ParentSetup,
+                format!("current_exe: {e}"),
+            )
+        })?;
         Self::start_with_exe(&exe)
     }
 
@@ -328,7 +465,7 @@ impl TrtWorkerPool {
     /// 指定する用途。指定 exe には `--tensorrt-infer-worker` 引数が付くので
     /// 当該サブコマンド処理を持つバイナリでなければならない。
     #[cfg(windows)]
-    pub fn start_with_exe(exe: &std::path::Path) -> Result<Self, String> {
+    pub fn start_with_exe(exe: &std::path::Path) -> Result<Self, WorkerStartError> {
         use super::trt_worker_proto::shm_name;
         use super::trt_worker_shm::SharedMem;
 
@@ -345,10 +482,18 @@ impl TrtWorkerPool {
         let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
         let in_shm_name = shm_name("in", pid, seq);
         let out_shm_name = shm_name("out", pid, seq);
-        let in_shm = SharedMem::create(&in_shm_name, PERSIST_IN_SHM_SIZE)
-            .map_err(|e| format!("create persistent in_shm: {e}"))?;
-        let out_shm = SharedMem::create(&out_shm_name, PERSIST_OUT_SHM_SIZE)
-            .map_err(|e| format!("create persistent out_shm: {e}"))?;
+        let in_shm = SharedMem::create(&in_shm_name, PERSIST_IN_SHM_SIZE).map_err(|e| {
+            WorkerStartError::new(
+                WorkerStartFailureKind::ParentSetup,
+                format!("create persistent in_shm: {e}"),
+            )
+        })?;
+        let out_shm = SharedMem::create(&out_shm_name, PERSIST_OUT_SHM_SIZE).map_err(|e| {
+            WorkerStartError::new(
+                WorkerStartFailureKind::ParentSetup,
+                format!("create persistent out_shm: {e}"),
+            )
+        })?;
 
         crate::logger::log(format!(
             "[TRT-worker-pool] 起動完了 (persistent shm: in={} ({} MiB), out={} ({} MiB))",
@@ -369,8 +514,11 @@ impl TrtWorkerPool {
     }
 
     #[cfg(not(windows))]
-    pub fn start_with_exe(_exe: &std::path::Path) -> Result<Self, String> {
-        Err("TRT worker pool は Windows 専用".to_string())
+    pub fn start_with_exe(_exe: &std::path::Path) -> Result<Self, WorkerStartError> {
+        Err(WorkerStartError::new(
+            WorkerStartFailureKind::ParentSetup,
+            "TRT worker pool は Windows 専用",
+        ))
     }
 
     /// 子プロセスが死亡判定済みか。

@@ -39915,20 +39915,40 @@ mod pipeline_cache_refactor_tests {
     #[test]
     fn pending_same_key_final_effect_skips_the_repeated_cpu_build() {
         assert!(
-            should_return_cached_final_composite(false, true, false, true),
+            should_return_cached_final_composite(false, true, false, false, true),
             "AI ready + same-key final-effect pending must reuse the incomplete texture"
         );
         assert!(
-            !should_return_cached_final_composite(false, true, false, false),
+            !should_return_cached_final_composite(false, true, false, false, false),
             "a missing or different-key job must continue into the CPU build path"
         );
         assert!(
-            !should_return_cached_final_composite(false, false, true, true),
+            !should_return_cached_final_composite(false, false, true, true, true),
             "AI failure must still reach the complete=true promotion path"
         );
         assert!(
-            should_return_cached_final_composite(false, false, false, false),
-            "the existing AI-wait provisional cache behavior remains unchanged"
+            should_return_cached_final_composite(false, false, false, true, false),
+            "an initializing runtime or an in-flight producer must retain the provisional cache"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, false, false, false, false),
+            "a Ready/Failed runtime transition without a job must retry the provisional request"
+        );
+    }
+
+    #[test]
+    fn final_ai_runtime_terminal_retries_an_initializing_provisional_cache() {
+        assert!(
+            should_return_cached_final_composite(false, false, false, true, false),
+            "Initializing is a live producer, so its provisional cache remains reusable"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, false, false, false, false),
+            "Ready without an enqueued job must re-enter maybe_start_final_ai"
+        );
+        assert!(
+            !should_return_cached_final_composite(false, false, true, false, false),
+            "Failed must re-enter the terminal complete promotion path"
         );
     }
 
@@ -39936,7 +39956,7 @@ mod pipeline_cache_refactor_tests {
     /// (同フレームで failed 直接 insert / runtime 初期化失敗・モデル不在で何も
     /// 立てずに return) 場合も、stuck な incomplete entry を残さないこと。
     /// 不変条件: incomplete entry が存在してよいのは「AI 結果がまだ届きうる
-    /// (pending or cache 済み)」ときだけ。
+    /// (runtime 初期化中、pending、または cache 済み)」ときだけ。
     #[test]
     fn ensure_final_composite_never_leaves_stuck_incomplete_entry() {
         let ctx = egui::Context::default();
@@ -39977,13 +39997,20 @@ mod pipeline_cache_refactor_tests {
             .find(|(key, _)| key.edit_key.idx == idx)
             .map(|(_, entry)| entry.complete)
             .expect("final composite must exist");
-        let ai_may_still_arrive =
-            app.final_ai_pending.contains_key(&ai_key) || app.final_ai_cache.contains_key(&ai_key);
+        let ai_may_still_arrive = matches!(
+            app.ai_runtime_init.snapshot(),
+            crate::ai::runtime::AiRuntimeInitSnapshot::Initializing
+        ) || app.final_ai_pending.contains_key(&ai_key)
+            || app.final_ai_cache.contains_key(&ai_key);
         assert!(
             complete || ai_may_still_arrive,
             "an incomplete composite may exist only while an AI result can still arrive \
-             (failed={})",
-            app.final_ai_failed.contains(&ai_key)
+             (failed={}, runtime_initializing={})",
+            app.final_ai_failed.contains(&ai_key),
+            matches!(
+                app.ai_runtime_init.snapshot(),
+                crate::ai::runtime::AiRuntimeInitSnapshot::Initializing
+            )
         );
     }
 

@@ -85,6 +85,24 @@ fn main() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
+    let vcrt_dir = workspace_root.join("vendor").join("vcrt");
+    let vcrt = [
+        ("MIMV_MSVCP140_DLL", "msvcp140.dll"),
+        ("MIMV_MSVCP140_1_DLL", "msvcp140_1.dll"),
+        ("MIMV_VCRUNTIME140_DLL", "vcruntime140.dll"),
+        ("MIMV_VCRUNTIME140_1_DLL", "vcruntime140_1.dll"),
+    ];
+    for (var, name) in &vcrt {
+        let path = vcrt_dir.join(name);
+        if !path.exists() {
+            eprintln!("VC runtime DLL not found: {}", path.display());
+            std::process::exit(1);
+        }
+        println!("cargo:rustc-env={var}={}", path.display());
+        println!("cargo:rustc-env={var}_SHA256={}", sha256_file_hex(&path));
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
     println!("cargo:rustc-env=MIMV_CORE_EXE={}", core_exe.display());
     println!(
         "cargo:rustc-env=MIMV_CORE_EXE_SHA256={}",

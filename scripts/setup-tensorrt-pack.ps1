@@ -286,6 +286,13 @@ if ($cudnnCount -eq 0) {
     exit 1
 }
 
+# INSTALL_OK is the atomic viability marker. Inspect every extracted PE before
+# publishing it so a new VC runtime import or an unsigned Microsoft ORT binary
+# cannot turn a partial/incompatible setup into an accepted runtime pack.
+& (Join-Path $ScriptDir 'check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $TargetDir `
+    -ReportPath 'target\vcrt-pe-reports\tensorrt-setup.json'
+
 $installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $json = @"
 {

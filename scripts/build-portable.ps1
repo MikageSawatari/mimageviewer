@@ -419,6 +419,10 @@ $copies = @(
     @{ src = 'vendor\pdfium\bin\pdfium.dll';         dst = 'pdfium.dll' }
     @{ src = 'vendor\ort\onnxruntime.dll';           dst = 'onnxruntime.dll' }
     @{ src = 'vendor\ort\onnxruntime_providers_shared.dll'; dst = 'onnxruntime_providers_shared.dll' }
+    @{ src = 'vendor\vcrt\msvcp140.dll';             dst = 'msvcp140.dll' }
+    @{ src = 'vendor\vcrt\msvcp140_1.dll';           dst = 'msvcp140_1.dll' }
+    @{ src = 'vendor\vcrt\vcruntime140.dll';         dst = 'vcruntime140.dll' }
+    @{ src = 'vendor\vcrt\vcruntime140_1.dll';       dst = 'vcruntime140_1.dll' }
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
     # NOTE: mimageviewer-vst3-host.exe is intentionally NOT bundled. The unsigned
     # bridge exe is false-flagged by some security software, which blocked the
@@ -501,6 +505,10 @@ if ($Sign) {
     Write-Host "[portable] signing portable PE files"
     Invoke-MivSign -Files $portablePe -Verify
 }
+
+& (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $pkgDir -RequireCompanionRuntime `
+    -ReportPath 'target\vcrt-pe-reports\portable.json'
 
 # ---------------------------------------------------------------------------
 # Zip it.

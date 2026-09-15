@@ -1399,6 +1399,7 @@ pub fn run() -> eframe::Result {
             if let Some(handle) = remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
             }
+            app.start_ai_runtime_initialization(cc.egui_ctx.clone());
             if let Some(control) = remote_settings_reader_control.clone() {
                 app.set_remote_settings_reader_control(control);
             }

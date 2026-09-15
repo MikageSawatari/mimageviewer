@@ -216,6 +216,18 @@ ACK 後はキャンセル操作を表示しない。
 この handshake により、navigation が completion poll より先に起きても古い対象を spawn / Invoke しない。
 一時 directory の起動時孤児回収と終了時削除も専用 worker で行い、UI から `read_dir` / 再帰削除を呼ばない。
 
+### 2.1.2 AI runtime 初期化 owner
+
+DirectML用DLLの展開と `ort::init_from` は `AiRuntimeInitOwner` の専用 worker が一度だけ実行する。
+App / Remote / external materializer は同じ owner の `Ready(Arc<AiRuntime>)` / `Failed(Arc<AiError>)`
+terminalだけを使い、UI threadでは待たない。background requestの待機はCondvarとrequest cancel /
+generation確認を組み合わせ、request終了時は初期化完了を待たずに抜ける。worker spawn failure / panicも
+Failedをpublishして全waiterを起こすため、Initializingを永久状態にしない。
+
+final AIの表示要求はInitializing中に暫定合成を保持するが、owner completionのrepaint後、job無しの
+暫定cacheを必ず再評価する。Readyなら元の一回要求をqueueし、Failedなら通常合成をcompleteへ昇格する。
+owner外constructorやUI側の同期fallbackを足してはならない。
+
 ### 2.2 キャンセルの置き場所
 
 3 箇所で cancel できるようにするのが基本:
@@ -446,11 +458,12 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
 | creator_exit | 0.0 | 678.6 | 自前 |
 | first_frame (初回 update()) | 4.4 | **683.0** | egui/自前 |
 
-**結論**: 起動時間の **98% は eframe (winit + wgpu) の初期化** (ウィンドウ生成、wgpu Instance
+**この計測環境での結論**: 起動時間の **98% は eframe (winit + wgpu) の初期化** (ウィンドウ生成、wgpu Instance
 /Adapter/Device/Queue、シェーダーコンパイル)。自前コードは合計 **12ms** と既に最適化済み。
 
-**アプリ側にボトルネックはない**。起動時間を短縮するには eframe 本体に手を入れる必要があり、
-費用対効果が合わない。現状の 683ms は wgpu バックエンドの Rust GUI として標準的な値。
+正常環境の定常起動を短縮するためにアプリ側を変える費用対効果は低い。2026-09-15にはVC runtimeの無い
+clean Windowsで、初回frameの同期ORT初期化がload failure後に停止する別経路を確認した。この経路は
+§2.1.2のprocess共通worker ownerとupstream error-path backportへ移し、UIの応答性を初期化成否から分離した。
 
 ### 6.1 起動後の追加ウォームアップ
 

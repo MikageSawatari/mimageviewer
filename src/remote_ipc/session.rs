@@ -1045,21 +1045,9 @@ pub(crate) enum UiReadError {
 /// App が所有し、remote worker へ許可した AI 資源だけを公開する bridge。
 #[derive(Clone)]
 pub(crate) struct RemoteAiExecutionBridge {
-    runtime: Arc<(Mutex<RemoteAiRuntimeState>, Condvar)>,
+    runtime: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     manager: Arc<crate::ai::model_manager::ModelManager>,
     background_mode: Arc<AtomicU8>,
-}
-
-enum RemoteAiRuntimeState {
-    Empty,
-    Initializing,
-    Ready(Arc<crate::ai::runtime::AiRuntime>),
-}
-
-pub(crate) enum RemoteLocalRuntimeClaim {
-    Initialize,
-    WaitingForRemote,
-    Ready(Arc<crate::ai::runtime::AiRuntime>),
 }
 
 pub(crate) struct RemoteAiResources {
@@ -1070,13 +1058,12 @@ pub(crate) struct RemoteAiResources {
 
 impl RemoteAiExecutionBridge {
     pub(crate) fn new(
-        runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+        runtime: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
         manager: Arc<crate::ai::model_manager::ModelManager>,
         background_mode: u8,
     ) -> Self {
-        let state = runtime.map_or(RemoteAiRuntimeState::Empty, RemoteAiRuntimeState::Ready);
         Self {
-            runtime: Arc::new((Mutex::new(state), Condvar::new())),
+            runtime,
             manager,
             background_mode: Arc::new(AtomicU8::new(background_mode.min(2))),
         }
@@ -1086,107 +1073,34 @@ impl RemoteAiExecutionBridge {
         self.background_mode.store(mode.min(2), Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(crate) fn ready_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
-        let (state, _) = &*self.runtime;
-        match &*state.lock().unwrap_or_else(|error| error.into_inner()) {
-            RemoteAiRuntimeState::Ready(runtime) => Some(Arc::clone(runtime)),
-            RemoteAiRuntimeState::Empty | RemoteAiRuntimeState::Initializing => None,
-        }
+        self.runtime.ready_runtime()
     }
 
-    /// Runtime constructor を実行してよい owner を一つに限定する。
-    ///
-    /// remote worker が初期化中なら App は UI thread で待たず、後続 frame の
-    /// ready_runtime poll に委ねる。逆に App が claim 済みなら remote worker は
-    /// Condvar で待つため、起動直後の acquire と初回 App update が競合しても
-    /// Runtime を二重生成しない。
-    pub(crate) fn claim_local_runtime_init(&self) -> RemoteLocalRuntimeClaim {
-        let (state, wake) = &*self.runtime;
-        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-        match &*state {
-            RemoteAiRuntimeState::Ready(existing) => {
-                RemoteLocalRuntimeClaim::Ready(Arc::clone(existing))
-            }
-            RemoteAiRuntimeState::Initializing => RemoteLocalRuntimeClaim::WaitingForRemote,
-            RemoteAiRuntimeState::Empty => {
-                *state = RemoteAiRuntimeState::Initializing;
-                // No waiter exists yet, but keep all state changes paired with the same
-                // Condvar owner.
-                wake.notify_all();
-                RemoteLocalRuntimeClaim::Initialize
-            }
-        }
-    }
-
-    pub(crate) fn complete_claimed_runtime_init(
-        &self,
-        created: Result<crate::ai::runtime::AiRuntime, crate::ai::AiError>,
-    ) -> Result<Arc<crate::ai::runtime::AiRuntime>, crate::ai::AiError> {
-        let (runtime_state, wake) = &*self.runtime;
-        let mut state = runtime_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        match created {
-            Ok(runtime) => {
-                let runtime = Arc::new(runtime);
-                debug_assert!(matches!(*state, RemoteAiRuntimeState::Initializing));
-                *state = RemoteAiRuntimeState::Ready(Arc::clone(&runtime));
-                wake.notify_all();
-                Ok(runtime)
-            }
-            Err(error) => {
-                if matches!(*state, RemoteAiRuntimeState::Initializing) {
-                    *state = RemoteAiRuntimeState::Empty;
-                }
-                wake.notify_all();
-                Err(error)
-            }
-        }
-    }
-
-    /// shared runtime が未生成なら、この呼び出し元 remote worker 上で生成する。
-    pub(crate) fn resources_for_remote(&self) -> Option<RemoteAiResources> {
-        self.resources_for_remote_inner()
+    pub(crate) fn resources_for_remote(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        self.resources_for_remote_inner(cancel)
     }
 }
 
 impl RemoteAiExecutionBridge {
-    fn resources_for_remote_inner(&self) -> Option<RemoteAiResources> {
-        let (runtime_state, wake) = &*self.runtime;
-        let mut state = runtime_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        loop {
-            match &*state {
-                RemoteAiRuntimeState::Ready(runtime) => {
-                    return Some(RemoteAiResources {
-                        runtime: Arc::clone(runtime),
-                        manager: Arc::clone(&self.manager),
-                        background_mode: self.background_mode.load(Ordering::Acquire),
-                    });
-                }
-                RemoteAiRuntimeState::Initializing => {
-                    state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
-                }
-                RemoteAiRuntimeState::Empty => break,
-            }
-        }
-        *state = RemoteAiRuntimeState::Initializing;
-        drop(state);
-        let created =
-            crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl);
-        match self.complete_claimed_runtime_init(created) {
-            Ok(runtime) => Some(RemoteAiResources {
+    fn resources_for_remote_inner(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        match self
+            .runtime
+            .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
+        {
+            crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(RemoteAiResources {
                 runtime,
                 manager: Arc::clone(&self.manager),
                 background_mode: self.background_mode.load(Ordering::Acquire),
             }),
-            Err(error) => {
+            crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
                 crate::logger::log(format!(
                     "remote_ipc: shared AI runtime init failed; using diffusion fallback: {error}"
                 ));
                 None
             }
+            crate::ai::runtime::AiRuntimeInitWait::Cancelled => None,
         }
     }
 }
@@ -1621,8 +1535,8 @@ impl SessionHandle {
             .clone()
     }
 
-    pub(crate) fn remote_ai_resources(&self) -> Option<RemoteAiResources> {
-        self.ai_bridge()?.resources_for_remote()
+    pub(crate) fn remote_ai_resources(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        self.ai_bridge()?.resources_for_remote(cancel)
     }
 
     pub(crate) fn remote_web_connected(&self, connection_id: u64) {
@@ -2807,21 +2721,31 @@ mod tests {
     }
 
     #[test]
-    fn shared_runtime_initialization_has_exactly_one_claimant() {
+    fn remote_bridge_uses_the_shared_runtime_owner() {
+        let runtime = crate::ai::runtime::AiRuntimeInitOwner::new();
         let bridge = RemoteAiExecutionBridge::new(
-            None,
+            Arc::clone(&runtime),
             Arc::new(crate::ai::model_manager::ModelManager::new()),
             0,
         );
-        assert!(matches!(
-            bridge.claim_local_runtime_init(),
-            RemoteLocalRuntimeClaim::Initialize
-        ));
-        assert!(matches!(
-            bridge.claim_local_runtime_init(),
-            RemoteLocalRuntimeClaim::WaitingForRemote
-        ));
+        assert!(Arc::ptr_eq(&bridge.runtime, &runtime));
         assert!(bridge.ready_runtime().is_none());
+    }
+
+    #[test]
+    fn remote_runtime_wait_stops_on_request_cancel_without_mutating_owner() {
+        let runtime = crate::ai::runtime::AiRuntimeInitOwner::new();
+        let bridge = RemoteAiExecutionBridge::new(
+            Arc::clone(&runtime),
+            Arc::new(crate::ai::model_manager::ModelManager::new()),
+            0,
+        );
+        let cancel = AtomicBool::new(true);
+        assert!(bridge.resources_for_remote(&cancel).is_none());
+        assert!(matches!(
+            runtime.snapshot(),
+            crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
+        ));
     }
 
     #[test]
