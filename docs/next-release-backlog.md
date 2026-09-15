@@ -29,6 +29,32 @@
 
 ## 1. 優先候補
 
+### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す (2026-09-15)
+
+- 出典: §1.241 修正 (`dd96be073`) の GPU 実機回帰。**ClaudeCode が開発機 (RTX 4090) の隔離ポータブル版で観測**
+  (`target/section241-release-verification-20260915/gpu/gui-4-tensorrt-packort-corrupt.log`、記録は同フォルダ `RESULTS.md`)。
+- 再現: `ai_backend=tensorrt` の隔離プロファイルで、TensorRT パックの `onnxruntime.dll` を同じ長さのまま壊して起動し、
+  AI アップスケール対象の画像を全画面で開いて送る。
+- 観測: 1 回目は起動試行から 31 ms で `TRT worker spawn failed (RuntimeInit)` になり、DirectML で処理が完了し、
+  メインウィンドウに「TensorRT 起動失敗」通知が出る (ここまでは期待どおり)。ところが**次の AI 処理でも**
+  `TensorRT worker pool を初回 AI 処理で遅延起動します` → 子プロセス起動 → 約 30 ms で同じ `RuntimeInit` 失敗、を繰り返し、
+  6 枚で 6 回起動した。固まりはせず、45 秒待ちも無い。
+- 構造 (コードから): `App::maybe_start_trt_worker_pool_for_ai_use` ([app.rs](../src/app.rs)) は
+  `runtime.has_worker_pool()` と `trt_restart_in_flight` (起動中フラグ) しか見ない。起動失敗は
+  `report_worker_spawn_failed` で通知に載るだけで、「このセッションでは TensorRT を起動しない」終端状態がどこにも無い。
+  §1.241 で型付けした `WorkerStartFailureKind::is_automatic_retry_allowed` (通知経由の自動再試行) は守られているが、
+  遅延起動の入口がそれと別経路で再試行している。
+- 守るべき不変条件: `RuntimeInit` / `CommandRejected` / `Protocol` / `ParentSetup` の失敗後は、利用者が
+  「ワーカーを再起動」を押すか、TensorRT の設定・パックが変わるかアプリを再起動するまで、遅延起動しない。
+  一時的な失敗 (`ProcessSpawn` / `Transport` / `Timeout`) の 1 回再試行は現状どおり。
+- 直し方の方向: `has_worker_pool` + `trt_restart_in_flight` + notice に分かれている状態を、TensorRT ワーカープールの
+  単一の型付き状態 (未起動 / 起動中 / 接続済み / 失敗(種別)) にまとめ、遅延起動・自動再試行・手動再起動・パック導入が
+  同じ状態を見るようにする。遅延起動の入口に失敗フラグを足すだけの対処は避ける (CLAUDE.md「バグ修正の一般原則」)。
+- 回帰確認: 決定的失敗で起動は 1 回だけ、通知は 1 回、DirectML で処理継続。「ワーカーを再起動」で 1 回だけ再試行。
+  パックを直して再起動で TensorRT に戻る。一時的失敗の 1 回再試行と、推論中の死亡からの自動再起動 (最大 3 回) は不変。
+  handler-level test で「失敗後に AI job を N 件流しても spawn は 1 回」を検証する。
+- 規模 / 優先度: Small-Medium / P2 (壊れたパックや GPU 環境の不整合があるときだけ。子プロセス起動が画像枚数ぶん走る)。
+
 ### 1.241 VC++ ランタイムの無い Windows で起動画面のまま応答なしになる — Store 審査却下の原因 (2026-09-15)
 
 - 正本: [調査記録と修正候補](msstore-startup-hang-vcrt-investigation-20260915.md)。ここは要点と残りだけ。
