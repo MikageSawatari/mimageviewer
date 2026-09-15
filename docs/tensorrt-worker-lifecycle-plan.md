@@ -1,6 +1,6 @@
 # TensorRT worker lifecycle owner 設計 (§1.243)
 
-状態: **実装・focused / full / static gate・独立 completion review・unsigned release verification build 完了。隔離 TensorRT 実機再検証待ち** (2026-09-15)。
+状態: **実装・focused / full / static gate・独立 completion review・unsigned release verification build・限定隔離実機5項目完了** (2026-09-15)。通知入力の別観測は§13を参照。
 
 この文書は [next-release-backlog.md](next-release-backlog.md) §1.243 の正本である。
 §1.241 の ORT / VC Runtime 修正を入れた GPU 実機検証で見つかった、決定的な
@@ -479,3 +479,20 @@ fault injection は隔離 profile の TensorRT pack だけへ行い、通常 `%A
 - 残るrelease handoffは、隔離packだけを用いた壊れたpackでの複数画像、通知close、manual restart、
   修復済み正常pack attachの限定再検証である。§1.241で完了したunsigned三形態、Defender有効host、
   DirectML / subject / TensorRT / Remoteの成功証跡は再利用し、GUIはこの実装taskでは起動していない。
+
+## 13. ClaudeCode限定実機結果の受領 (2026-09-15)
+
+ClaudeCodeが `ffeaacfa9` から作成した隔離ポータブル版を操作し、§10の5項目をPASSと報告した。
+証跡は [RESULTS.md](../target/section243-verification-20260915/RESULTS.md) と同directoryのrun-A/B/Cログ。
+壊れたpackで6枚、通知close後の新規画像を含め14処理でも起動・失敗・子プロセス各1回。
+手動再起動ではrevision=2の試行が1回だけ、正常packへ復旧後の手動再起動でrevision=3が25msでattachし、
+表示中・先読みの8枚がTensorRTの3モデルで完了した。通常packは読取コピーのみ、隔離packは復元済みと報告。
+任意項目のRemote AIは今回未実施で、§1.241の正常Remote結果と自動回帰を再利用する。
+これにより§1.243の限定実機完了条件を満たす。最終署名済み配布物の起動検証は公開工程に残る。
+
+別観測として、通知初期位置で再起動ボタンが反応せず、画像のない場所へ通知を移すと反応したケースがある。
+手動再起動のPASSは移動後のボタン操作による。別アプリの最前面windowが重なる環境で、fullscreen終了にも
+WM_CLOSEを使用したため、原因・通常操作での再現性は未確定。WM_CLOSE原因説は報告者が取り下げ済み。
+一覧クリックは反応し、無反応時はManualRestartログが出なかったという観測を保持する。
+通知のinput ownership／layer順を既存§1.232等と照合する別調査対象とし、本項目のworker lifecycle成功から
+通知UIも問題なしとは結論しない。追加実機操作は具体的な検証枠の了承後に実施する。

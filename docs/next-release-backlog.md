@@ -29,14 +29,17 @@
 
 ## 1. 優先候補
 
-### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す (2026-09-15) — 隔離実機再検証待ち
+### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す (2026-09-15) — 修正・隔離実機再検証完了
 
 - 正本: [typed lifecycle owner 設計](tensorrt-worker-lifecycle-plan.md)。v4.0.0 出荷前の必須修正として、
   producer / retry / pool identity / backend・pack・exit revision を一つの owner に統合する設計へ
   統合した。focused / full / static、unsigned release verification build、独立 completion reviewは完了。
   final fullは本体 **8560 / 0 / 45**、snapshot **52 / 52**、vendor **25 / 9 / 15**、release buildは
-  runtime **4 / PE 3**、embedded **4 / PE 11**でexit 0。残る必須確認は隔離TensorRT packでの
-  決定的失敗後の複数画像、通知close、manual restart、正常pack attachだけである。
+  runtime **4 / PE 3**、embedded **4 / PE 11**でexit 0。
+- 2026-09-15、ClaudeCodeが `ffeaacfa9` の隔離ポータブル版で限定実機5項目をPASSと報告。
+  複数画像・通知close後も起動/失敗各1回、手動再起動は1回のみ、正常pack復旧後はTensorRTで8枚完了。
+  [結果](../target/section243-verification-20260915/RESULTS.md)。任意項目のRemote AI再確認は未実施。
+  通知の初期位置でボタンが反応しない観測は原因未確定の別件として正本§13へ記録し、解決済み扱いにしない。
 
 - 出典: §1.241 修正 (`dd96be073`) の GPU 実機回帰。**ClaudeCode が開発機 (RTX 4090) の隔離ポータブル版で観測**
   (`target/section241-release-verification-20260915/gpu/gui-4-tensorrt-packort-corrupt.log`、記録は同フォルダ `RESULTS.md`)。
