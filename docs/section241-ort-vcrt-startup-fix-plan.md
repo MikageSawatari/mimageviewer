@@ -1,6 +1,6 @@
 # §1.241 ORT 初期化失敗・VC++ ランタイム同梱の修正計画
 
-状態: **実装・focused / full / static gate・独立 completion review 完了。verification build は resident を停止しないため保留** (2026-09-15)。
+状態: **実装・focused / full / static gate・独立 completion review・unsigned release verification build 完了。署名済み三形態 / Sandbox / TensorRT実GPUはrelease handoff待ち** (2026-09-15)。
 
 調査の正本は
 [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md)、
@@ -241,7 +241,9 @@ TRT pack の `setup` / `build` / `upload` にも同じ script の pack mode を�
 
 ## 9. ClaudeCode へ渡す隔離実機シナリオ
 
-修正 source と署名・hash・build report が揃ってから、公開担当へ次を渡す。現段階では起動しない。
+修正 source と署名・hash・build report が揃ってから、公開担当へ次を渡す。現段階では起動しない。ClaudeCode向けの短い依頼は
+[section241-claudecode-verification-request.md](section241-claudecode-verification-request.md)、詳細コマンド・artifact ledger・合否と終了条件は
+[section241-sandbox-handoff.md](section241-sandbox-handoff.md) を正本とする。
 
 1. VC++ redist 未導入の Windows Sandbox で単体 launcher、silent installer、portable の 3 形態を
    それぞれ fresh data で初回 / 2 回目起動する。起動画面から進む、`Responding=True`、初回設定 UI、
@@ -320,6 +322,20 @@ residentだった。安全preflightが停止せず拒否したためverification
 `D5227F9FDEB03F5CE5BA9C8264125D87B6DD2FDD608D453C2342F04FC92A78BB`、
 `F1B2F662800122BED0FF255693DF89C4487FBDCF453D3524A42D4EC20C3D9C04`である。アプリ起動、GUI操作、
 resident停止、通常profile / real dataへのアクセスは行っていない。
+
+その後、利用者が全window / tray終了を明示した。read-only `Get-Process` とscript自身のpreflightで対象process不在を
+確認し、同じsource commit `dd96be07394d5276db6a94ebd8a65db7bf32fd44`から
+`build-release.ps1 -PreserveRuntime`を再実行した。core / remote / launcherの構築、release runtime
+**runtime 4 / PE 3**、embedded **runtime 4 / PE 11** はexit 0で、extracted VST3 bridge cacheも保持した。
+launcher / core / remoteのSHA-256は順に`3966900559C6F2EF70A3498ECF014FE2AB19D3C786A2000EB86A57EB16B9B4E9`、
+`08E41A4B1D8CEE7865DFFB43986AD12EAD09B619397182EFA86AD9D3E8FC0578`、
+`1B313FF1D89347EAE2F073AFA3C1AB9EC07331825568F96F820A226C3863237A`である。PE reportは
+`target/vcrt-pe-reports/release-{runtime,embedded}.json`、SHA-256は順に
+`549A38429F0207C2BECCAB3C68D0944FE1E403F341587E68E8ACC7CBA623DB65`、
+`3A1D9FF87F82CB069D3EF021D8EBC55201D269DFDC62C835C8600FB0FCCB046F`である。全9 artifactのexact ledgerは
+`target/section241-release-build-20260915/BUILD-MANIFEST.sha256`、そのSHA-256は
+`E2721702AFF3B2C590B11D9DDCAD57AEBE2DB8D89484C808A1EB4481228BF395`である。この確認buildの3 exeは未署名で、
+installer / portable / signed distribution、Sandbox / GUI / TensorRT実GPUは未実施のrelease handoffとして残す。
 
 static logは`target/section241-final-20260915/static.{stdout.log,stderr.log,exit.txt}`、SHA-256は順に
 `6148BA18192E65F9E4930484CD138C545F149673DC3370518A90C9F574EABAE1`、
