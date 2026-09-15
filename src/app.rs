@@ -7688,7 +7688,7 @@ pub(crate) struct LocalAiRemoteBarrierSnapshot {
     local_adjust_segmentation_pending: bool,
     book_op_pending: bool,
     local_ai_activity: usize,
-    trt_restart_in_flight: bool,
+    trt_worker_starting: bool,
     video_upscale: Option<VideoUpscaleRemoteBarrierSnapshot>,
 }
 
@@ -7701,7 +7701,7 @@ impl LocalAiRemoteBarrierSnapshot {
             && !self.local_adjust_segmentation_pending
             && !self.book_op_pending
             && self.local_ai_activity == 0
-            && !self.trt_restart_in_flight
+            && !self.trt_worker_starting
             && self
                 .video_upscale
                 .is_none_or(|video_upscale| video_upscale.paused_idle)
@@ -7741,8 +7741,8 @@ impl LocalAiRemoteBarrierSnapshot {
         if self.local_ai_activity != 0 {
             blockers.push(format!("local_ai_activity={}", self.local_ai_activity));
         }
-        if self.trt_restart_in_flight {
-            blockers.push("trt_restart_in_flight".to_owned());
+        if self.trt_worker_starting {
+            blockers.push("trt_worker_starting".to_owned());
         }
         if let Some(video_upscale) = self.video_upscale
             && !video_upscale.paused_idle
@@ -14544,28 +14544,13 @@ pub struct App {
     /// PDF の有効/無効状態ではなく UI 表示だけを所有する。
     pub(crate) pdf_worker_notice: Option<crate::pdf_loader::PdfWorkerNotice>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
-    /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
+    /// typed lifecycle owner の one-shot event を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
-    pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    pub(crate) trt_worker_notice: Option<crate::ai::trt_worker_lifecycle::WorkerNotice>,
     /// Susie の読み込み枠が全部尽きたことを 1 回だけ知らせる notice。
     /// 発行条件は `susie_loader::should_notify_workers_gone` が単独で所有する。
     pub(crate) susie_worker_notice: Option<crate::susie_loader::SusieWorkerNotice>,
-    /// セッション中に worker 死亡 → 自動再起動を試みた回数。
-    /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
-    /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
-    /// ためのガード)。
-    pub(crate) trt_auto_restart_attempts: u32,
-    /// セッション中に worker 起動失敗 → 自動再試行を試みた回数。
-    /// `ProcessSpawn / Transport / Timeout` と型付けされた失敗だけを 1 回 silent retry する。
-    /// RuntimeInit / CommandRejected 等は即時 terminal。worker attach 成功で 0 に戻す。
-    pub(crate) trt_spawn_restart_attempts: u32,
-    /// 自動再起動が現在進行中か (= spawn_trt_worker_pool の background thread が
-    /// 起動中で、まだ attach も failure 通知もしていない状態)。
-    /// 並行する複数の AI 推論が同じ「死亡」イベントを観測したときに 2 重 spawn を
-    /// 防ぐためのガード (Codex P2 指摘)。spawn 完了 (attach 成功 or 失敗通知) で
-    /// false に戻す。
-    pub(crate) trt_restart_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// TRT pack のオンラインインストールダイアログの状態。
     /// Some の間ダイアログが表示され、worker thread が動作している。
     /// 閉じる (Drop) と worker は cancel される。数 GB の取得中も閲覧を続けられる
@@ -16862,9 +16847,6 @@ impl App {
             pdf_worker_notice: None,
             trt_worker_notice: None,
             susie_worker_notice: None,
-            trt_auto_restart_attempts: 0,
-            trt_spawn_restart_attempts: 0,
-            trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trt_install_state: None,
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
@@ -17155,6 +17137,16 @@ impl App {
             snapshot_internal_nav: false,
             remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState::default(),
         };
+
+        let initial_ai_backend = app
+            .settings
+            .ai_backend
+            .as_deref()
+            .and_then(crate::ai::AiBackend::from_str)
+            .unwrap_or_default();
+        app.ai_runtime_init
+            .trt_worker_lifecycle()
+            .configure_at_app_start(initial_ai_backend);
 
         #[cfg(windows)]
         {
@@ -22601,6 +22593,7 @@ impl App {
             if let Some(state) = self.play_test.as_mut() {
                 state.close_sent = true;
             }
+            self.ai_runtime_init.trt_worker_lifecycle().retire();
             std::process::exit(0);
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -57050,52 +57043,18 @@ impl App {
     ///
     /// 引数 `new_backend_str`: 新しい設定値 (`"directml"` / `"tensorrt"` / `"cpu"` / None)。
     ///
-    /// 動作:
-    /// - TensorRT に変わった: TrtWorkerPool を spawn して runtime に attach
-    /// - TensorRT から DirectML に戻った: 既存の worker pool を detach (子プロセスは
-    ///   Drop で shutdown される)
-    /// - 同じ → 何もしない
+    /// TensorRT 選択は新 lifecycle revision の worker start、DirectML / CPU 選択は
+    /// current start / pool の失効と background retire になる。再選択も利用者の明示的な
+    /// rearm として扱い、以前の terminal failure を解除する。
     pub(crate) fn apply_ai_backend_change(&mut self, new_backend_str: Option<&str>) {
-        let Some(runtime) = self.ai_runtime_init.ready_runtime() else {
-            crate::logger::log("[AI] runtime 未初期化のためバックエンド変更はスキップ".to_string());
-            return;
-        };
-        let want_trt = new_backend_str.and_then(crate::ai::AiBackend::from_str)
-            == Some(crate::ai::AiBackend::TensorRt);
-        let has_trt = runtime.has_worker_pool();
-
-        // TRT 選択でも pack が未インストールなら spawn 試行しない
-        // (= UI 側で「DirectML で動作」と既に表示済みだが、pack を後で
-        // インストールしたときに settings.json の TensorRT が活きるよう設定値は維持)。
-        if want_trt && !crate::ai::tensorrt_pack::is_pack_installed() {
-            crate::logger::log(
-                "[AI] AI バックエンド: TensorRT 選択中だが pack 未インストール、DirectML で動作"
-                    .to_string(),
-            );
-            return;
-        }
-
-        match (want_trt, has_trt) {
-            (true, false) => {
-                crate::logger::log(
-                    "[AI] AI バックエンド変更: → TensorRT (worker pool 起動)".to_string(),
-                );
-                Self::spawn_trt_worker_pool(&runtime, self.local_ai_activity_lease());
-            }
-            (false, true) => {
-                crate::logger::log(
-                    "[AI] AI バックエンド変更: → DirectML (worker pool 停止)".to_string(),
-                );
-                runtime.detach_worker_pool();
-            }
-            _ => {
-                // 変更なし (TRT pack 未インストール等で TRT を選んでも spawn 失敗、
-                // または同じ設定値) — ログのみ
-                crate::logger::log(format!(
-                    "[AI] AI バックエンド変更: state 変化なし (want_trt={want_trt}, has_trt={has_trt})"
-                ));
-            }
-        }
+        let backend = new_backend_str
+            .and_then(crate::ai::AiBackend::from_str)
+            .unwrap_or_default();
+        crate::logger::log(format!("[AI] AI バックエンド変更: → {backend:?}"));
+        self.trt_worker_notice = None;
+        self.ai_runtime_init
+            .trt_worker_lifecycle()
+            .select_backend(backend);
     }
 
     /// AI ランタイムとモデルマネージャを遅延初期化する。
@@ -57307,7 +57266,11 @@ impl App {
             local_adjust_segmentation_pending: self.local_adjust_segmentation_pending.is_some(),
             book_op_pending: self.book_op_pending.is_some(),
             local_ai_activity: self.local_ai_activity.load(Ordering::Acquire),
-            trt_restart_in_flight: self.trt_restart_in_flight.load(Ordering::Acquire),
+            trt_worker_starting: self
+                .ai_runtime_init
+                .trt_worker_lifecycle()
+                .snapshot()
+                .is_starting(),
             video_upscale,
         }
     }
@@ -57339,143 +57302,6 @@ impl App {
             let (queue, rx) = AiJobQueue::new();
             self.ai_job_queue = Some(queue);
             self.final_ai_rx = Some(rx);
-        }
-    }
-
-    fn maybe_start_trt_worker_pool_for_ai_use(
-        &self,
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-    ) {
-        let want_trt = self
-            .settings
-            .ai_backend
-            .as_deref()
-            .and_then(crate::ai::AiBackend::from_str)
-            == Some(crate::ai::AiBackend::TensorRt);
-        if !want_trt || runtime.has_worker_pool() {
-            return;
-        }
-        if !crate::ai::tensorrt_pack::is_pack_installed() {
-            crate::logger::log(
-                "[AI] TensorRT 選択中だが pack 未インストール、DirectML で動作".to_string(),
-            );
-            return;
-        }
-        crate::logger::log("[AI] TensorRT worker pool を初回 AI 処理で遅延起動します".to_string());
-        Self::spawn_trt_worker_pool_guarded(runtime, self.trt_restart_in_flight.clone());
-    }
-
-    /// TRT ワーカープールをバックグラウンドで起動して runtime に attach する。
-    ///
-    /// 起動には ORT init + DLL preload + ハンドシェイクで数秒かかるので、
-    /// メインスレッドで同期実行すると UI が固まる。`std::thread::spawn` で
-    /// 別スレッドに逃がし、起動完了したら attach する。
-    ///
-    /// 起動失敗時は AiRuntime は DirectML のままで動作続行し、ログにエラーを残す。
-    ///
-    /// **多重 spawn ガード**: `App.trt_restart_in_flight` を CAS で立てる。
-    /// 既に立っていたら早期 return (= 別の spawn が進行中)。worker 死亡時に
-    /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
-    /// 新 pool を起こさない (Codex P2 指摘)。
-    /// `spawn_trt_worker_pool` の guard 付き版。worker 死亡時の自動再起動から
-    /// 呼ぶ際に使う (= 複数の死亡通知が並行して走る場合の多重 spawn を防ぐ)。
-    pub(crate) fn spawn_trt_worker_pool_guarded(
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-        guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), None, std::time::Duration::ZERO);
-    }
-
-    /// `spawn_trt_worker_pool_guarded` の遅延版。起動 timeout 直後の transient retry で
-    /// CUDA / TensorRT provider 初期化状態を少し落ち着かせるために使う。
-    pub(crate) fn spawn_trt_worker_pool_guarded_after(
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-        guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        delay: std::time::Duration,
-    ) {
-        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), None, delay);
-    }
-
-    pub(crate) fn spawn_trt_worker_pool(
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-        activity: LocalAiActivityLease,
-    ) {
-        Self::spawn_trt_worker_pool_inner(runtime, None, Some(activity), std::time::Duration::ZERO);
-    }
-
-    fn spawn_trt_worker_pool_inner(
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-        guard: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        local_ai_activity: Option<LocalAiActivityLease>,
-        delay: std::time::Duration,
-    ) {
-        // CAS: false → true。すでに in-flight なら true のままで、ここは false 戻り → skip。
-        if let Some(g) = guard.as_ref() {
-            if g.compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-            {
-                crate::logger::log(
-                    "[AI] TRT worker pool 起動はすでに進行中、新規 spawn を skip".to_string(),
-                );
-                return;
-            }
-        }
-        let runtime_for_thread = runtime.clone();
-        let guard_for_thread = guard.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name("trt-worker-spawn".to_string())
-            .spawn(move || {
-                let _local_ai_activity = local_ai_activity;
-                if !delay.is_zero() {
-                    crate::logger::log(format!(
-                        "[AI] TRT worker pool 再起動を {} ms 待ってから試行します",
-                        delay.as_millis()
-                    ));
-                    std::thread::sleep(delay);
-                }
-                crate::logger::log(
-                    "[AI] TRT worker pool バックグラウンド起動を試行中...".to_string(),
-                );
-                match crate::ai::trt_worker_pool::TrtWorkerPool::start() {
-                    Ok(pool) => {
-                        runtime_for_thread.attach_worker_pool(std::sync::Arc::new(pool));
-                        crate::logger::log(
-                            "[AI] TRT worker pool 起動成功、attach 完了".to_string(),
-                        );
-                        // spawn 試行が完了 → guard を解放。
-                        if let Some(g) = guard_for_thread.as_ref() {
-                            g.store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
-                    Err(e) => {
-                        // 起動失敗 (TRT pack 不在 / engine 不整合 / DLL ロード失敗 等)。
-                        // DirectML で動作続行するが、UI に通知して気付かせる
-                        // (Phase 3 Step 5)。ログだけだとユーザーが「なぜ TRT に
-                        // ならないか」を追えない。
-                        //
-                        // 通知を見た UI が同じ frame で retry を起動できるよう、
-                        // report 前に guard を下ろしておく。
-                        if let Some(g) = guard_for_thread.as_ref() {
-                            g.store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        runtime_for_thread.report_worker_spawn_failed(e);
-                    }
-                }
-            })
-        {
-            crate::logger::log(format!("[AI] TRT worker pool 起動 thread 作成に失敗: {e}"));
-            runtime.report_worker_spawn_failed(crate::ai::trt_worker_pool::WorkerStartError::new(
-                crate::ai::trt_worker_pool::WorkerStartFailureKind::ProcessSpawn,
-                format!("TRT worker pool 起動 thread 作成に失敗: {e}"),
-            ));
-            if let Some(g) = guard {
-                g.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
         }
     }
 
@@ -57687,7 +57513,6 @@ impl App {
         let Some(runtime) = self.ai_runtime_init.ready_runtime() else {
             return;
         };
-        self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
         let manager = self.ai_model_manager.clone();
 
         // デノイズモデル選択・ロード
@@ -63009,7 +62834,6 @@ impl App {
             crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
             | crate::ai::runtime::AiRuntimeInitSnapshot::Failed(_) => return false,
         };
-        self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
         let manager = self.ai_model_manager.clone();
 
         let denoise_model = if denoise_in_range {
@@ -74598,6 +74422,9 @@ impl eframe::App for App {
         // established exit path queues and waits for the final process-global writer snapshots.
         self.resolve_sidecar_restore_for_exit();
         self.resolve_collection_migration_for_exit();
+        // Fence TensorRT worker starts before Remote/background owners can publish a late pool.
+        // Pool shutdown and child wait stay on the lifecycle reaper, never on this UI callback.
+        self.ai_runtime_init.trt_worker_lifecycle().retire();
         // Final exit is the only UI lifecycle boundary allowed to wait for the collection actor.
         // Closing admission first prevents future Remote integration from enqueueing behind it.
         self.shutdown_collection_runtime_for_exit();

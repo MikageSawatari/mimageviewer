@@ -33927,6 +33927,25 @@ mod pipeline_cache_refactor_tests {
                 complete: false,
             },
         );
+        // This regression exercises the display-only holdover, not the colorize worker timing.
+        // Keep an exact-key result pending so a fast 1x1 worker cannot land between the
+        // explicit cache removal and the following resolver call. In the full serial suite that
+        // race deterministically completed before the assertion, while the isolated test happened
+        // to observe the worker first; both outcomes were valid product behavior but made the
+        // fixture depend on scheduling.
+        let (_final_effect_tx, final_effect_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        app.final_effect_pending.insert(
+            final_key,
+            FinalEffectPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: final_effect_rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
         let old_holdover = ctx.load_texture(
             "colorize_ai_old_holdover",
             egui::ColorImage::filled([1, 1], egui::Color32::from_rgb(40, 50, 60)),
@@ -50383,7 +50402,7 @@ mod still_window_mode_key_tests {
             local_adjust_segmentation_pending: true,
             book_op_pending: true,
             local_ai_activity: 5,
-            trt_restart_in_flight: true,
+            trt_worker_starting: true,
             video_upscale: Some(VideoUpscaleRemoteBarrierSnapshot {
                 queue_paused: false,
                 pause_requested: true,
@@ -50401,7 +50420,7 @@ mod still_window_mode_key_tests {
             "local_adjust_segmentation_pending",
             "book_op_pending",
             "local_ai_activity=5",
-            "trt_restart_in_flight",
+            "trt_worker_starting",
             "video_upscale(queue_paused=false,pause_requested=true,paused_idle=false)",
         ] {
             assert!(
@@ -50409,6 +50428,65 @@ mod still_window_mode_key_tests {
                 "missing {expected}: {blockers}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_ai_backend_transition_clears_projected_trt_notice() {
+        let mut app = setup_app();
+        app.trt_worker_notice = Some(crate::ai::trt_worker_lifecycle::WorkerNotice::for_test(
+            crate::ai::trt_worker_lifecycle::WorkerNoticeKind::DiedDuringInfer,
+        ));
+
+        app.apply_ai_backend_change(Some(crate::ai::AiBackend::DirectMl.as_str()));
+
+        assert!(app.trt_worker_notice.is_none());
+        assert_eq!(
+            app.ai_runtime_init.trt_worker_lifecycle().snapshot().phase,
+            crate::ai::trt_worker_lifecycle::TrtWorkerPhase::Disabled
+        );
+    }
+
+    #[test]
+    fn trt_pack_uninstall_does_not_race_an_existing_install_operation() {
+        let mut app = setup_app();
+        app.ai_runtime_init
+            .trt_worker_lifecycle()
+            .configure_at_app_start(crate::ai::AiBackend::TensorRt);
+        let before = app.ai_runtime_init.trt_worker_lifecycle().snapshot();
+        let mut preferences = crate::ui_dialogs::preferences::PreferencesState::from_settings(
+            &app.settings,
+            crate::external_tool::LaunchTarget::None,
+            app.ai_runtime_init.ready_runtime().as_deref(),
+            before,
+            false,
+            0,
+            0,
+            0,
+        );
+        preferences.trt_pack_installed = true;
+        preferences.trt_pack_size_mib = 1_900;
+        preferences.trt_engine_cache_size_mib = 400;
+        preferences.trt_worker_active = true;
+        preferences.settings.ai_backend = Some(crate::ai::AiBackend::TensorRt.as_str().to_owned());
+        app.pref_state = Some(preferences);
+        app.trt_install_state = Some(crate::ui_dialogs::trt_install::TrtInstallState::new(None));
+
+        assert!(!app.uninstall_trt_pack_now());
+
+        assert_eq!(
+            app.ai_runtime_init.trt_worker_lifecycle().snapshot(),
+            before
+        );
+        assert!(app.trt_install_state.is_some());
+        let preferences = app.pref_state.as_ref().unwrap();
+        assert!(preferences.trt_pack_installed);
+        assert_eq!(preferences.trt_pack_size_mib, 1_900);
+        assert_eq!(preferences.trt_engine_cache_size_mib, 400);
+        assert!(preferences.trt_worker_active);
+        assert_eq!(
+            preferences.settings.ai_backend.as_deref(),
+            Some(crate::ai::AiBackend::TensorRt.as_str())
+        );
     }
 
     #[test]

@@ -47,10 +47,13 @@ pub fn draw_favorite_view_state_settings_snapshot_fixture(ui: &mut egui::Ui) {
         remember_favorite_view_state: true,
         ..Settings::default()
     };
+    let trt_worker_snapshot =
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot();
     let mut state = PreferencesState::from_settings(
         &settings,
         crate::external_tool::LaunchTarget::None,
         None,
+        trt_worker_snapshot,
         false,
         0,
         0,
@@ -860,7 +863,7 @@ pub(crate) struct PreferencesState {
     // ── AI バックエンド ページ用のキャッシュ ────────────────────
     /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
     pub gpu_vendor: Option<crate::gpu_info::GpuVendor>,
-    /// TRT ワーカープールが現在 attach されているか (Phase 3、ホットリロード)。
+    /// TRT lifecycle owner が現在 `Attached` か (Phase 3、ホットリロード)。
     /// `true` ならアップスケール/デノイズはワーカー経由 TRT で動いている。
     pub trt_worker_active: bool,
     /// 起動時にフォールバックが起きた場合の理由 (UI バナー表示用)
@@ -877,9 +880,9 @@ pub(crate) struct PreferencesState {
     /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
     pub trt_cache_delete_confirm_open: bool,
     /// 「TensorRT パックを削除」ボタンで実行された pack 全体削除をリクエスト。
-    /// dialog 内では state 更新だけ行い、実際の worker pool detach + ファイル削除は
+    /// dialog 内では state 更新だけ行い、実際の retire barrier + ファイル削除は
     /// App 側で Preferences ウィンドウ closure 抜けた後に処理する
-    /// (= worker pool が DLL を握ったままだと remove_dir_all が失敗するため)。
+    /// (= active route / child が DLL を握ったままだと remove_dir_all が失敗するため)。
     pub uninstall_trt_pack_requested: bool,
 
     // ── 編集用追加パック ページ用のキャッシュ ────────────────────
@@ -1176,6 +1179,7 @@ impl PreferencesState {
         s: &Settings,
         external_tool_target: crate::external_tool::LaunchTarget,
         ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
+        trt_worker_snapshot: crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot,
         audio_normalize_db_available: bool,
         audio_normalize_entry_count: usize,
         book_resume_entry_count: usize,
@@ -1206,13 +1210,9 @@ impl PreferencesState {
 
         // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
         let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
-        let (current_runtime_fallback_reason, trt_worker_active) = match ai_runtime {
-            Some(rt) => (
-                rt.active_backend().fallback_reason.clone(),
-                rt.has_worker_pool(),
-            ),
-            None => (None, false),
-        };
+        let current_runtime_fallback_reason =
+            ai_runtime.and_then(|runtime| runtime.active_backend().fallback_reason.clone());
+        let trt_worker_active = trt_worker_snapshot.is_attached();
         let trt_pack_installed = crate::ai::tensorrt_pack::is_pack_installed();
         let trt_pack_size_mib = if trt_pack_installed {
             dir_size_bytes(&crate::ai::tensorrt_pack::pack_dir()) / (1024 * 1024)
@@ -2041,6 +2041,7 @@ impl App {
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
             let ai_runtime = self.ai_runtime_init.ready_runtime();
+            let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
             let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
                 self.fullscreen_idx
                     .or(self.selected)
@@ -2051,6 +2052,7 @@ impl App {
                 &self.settings,
                 external_tool_target,
                 ai_runtime.as_deref(),
+                trt_worker_snapshot,
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
                     .as_ref()
@@ -2752,8 +2754,13 @@ impl App {
         // 「TensorRT パックをダウンロード」ボタンが押されていたら、環境設定ダイアログを
         // 閉じて TRT install dialog を開く (= ユーザーは設定変更を保存しなくてもインストール
         // フローへ進める。完了後の TensorRT 有効化は再起動 + AiBackend 設定で行う想定)。
+        let trt_pack_uninstalling = self
+            .ai_runtime_init
+            .trt_worker_lifecycle()
+            .snapshot()
+            .is_pack_uninstalling();
         if let Some(ps) = self.pref_state.as_mut() {
-            if ps.start_trt_install_requested {
+            if ps.start_trt_install_requested && !trt_pack_uninstalling {
                 ps.start_trt_install_requested = false;
                 self.pref_state = None;
                 self.show_preferences = false;
@@ -2764,12 +2771,12 @@ impl App {
             }
         }
 
-        // 「TensorRT パックを削除」ボタンが確定されていたら、worker pool を停止 →
-        // ファイル削除 → live settings を DirectML に切替 → save をまとめて実行。
+        // 「TensorRT パックを削除」ボタンが確定されていたら、lifecycle retire →
+        // background file delete → live settings DirectML をまとめて開始する。
         if let Some(ps) = self.pref_state.as_mut() {
             if ps.uninstall_trt_pack_requested {
                 ps.uninstall_trt_pack_requested = false;
-                self.uninstall_trt_pack_now();
+                let _ = self.uninstall_trt_pack_now();
             }
         }
 
@@ -2812,10 +2819,12 @@ impl App {
 
         if self.operation_customize_state.is_none() {
             let ai_runtime = self.ai_runtime_init.ready_runtime();
+            let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
             let mut state = PreferencesState::from_settings(
                 &self.settings,
                 crate::external_tool::LaunchTarget::None,
                 ai_runtime.as_deref(),
+                trt_worker_snapshot,
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
                     .as_ref()
@@ -3029,21 +3038,27 @@ impl App {
     }
 
     /// TRT パック削除フロー本体。
-    /// - 走行中の worker pool を detach (= 子プロセス停止 + DLL ハンドル解放、UI thread)
+    /// - lifecycle owner を先に `PackUninstalling` にし、走行中 request / start / pool の
+    ///   retirement barrier を取得する
     /// - live `settings.ai_backend` を DirectML に切替して save (UI thread、瞬時)
-    /// - `tensorrt/` と `tensorrt-engines/` を **背景 thread で** 削除 (= 多 GB の I/O で
-    ///   UI thread をブロックしないため Codex P2 指摘)。削除完了は logger に出力するのみ
-    ///   (UI 状態は呼び出し時点で既に「削除済」相当に同期されている)。
-    pub(crate) fn uninstall_trt_pack_now(&mut self) {
-        // 1. worker pool 停止 (DLL ハンドル解放)。これは速い (ms オーダー) ので UI thread で OK。
-        if let Some(runtime) = self.ai_runtime_init.ready_runtime() {
-            if runtime.has_worker_pool() {
-                crate::logger::log(
-                    "[AI] TRT パック削除のため worker pool を停止します".to_string(),
-                );
-                runtime.detach_worker_pool();
-            }
+    /// - barrier 完了後だけ `tensorrt/` と `tensorrt-engines/` を背景 thread で削除する
+    ///   (= active child の DLL handle と競合させず、UI thread もブロックしない)
+    pub(crate) fn uninstall_trt_pack_now(&mut self) -> bool {
+        // Install completion atomically publishes the new pack before notifying App. Do not let
+        // a pre-existing install dialog race that publish with directory removal. New install
+        // requests are separately held while the owner reports PackUninstalling.
+        if self.trt_install_state.is_some() {
+            crate::logger::log("[AI] TensorRT インストール処理中のためパック削除を開始しません");
+            return false;
         }
+        // 1. 新しい route/start を先に止める。permit の barrier は既存 route lease と
+        // lifecycle start task、reaper の child shutdown がすべて終わった時だけ開く。
+        let lifecycle = self.ai_runtime_init.trt_worker_lifecycle();
+        let Some(uninstall_permit) = lifecycle.begin_pack_uninstall() else {
+            crate::logger::log("[AI] TensorRT 削除は既に終了処理中のため開始しません");
+            return false;
+        };
+        self.trt_worker_notice = None;
 
         // 2. live settings を DirectML に固定 → save (UI thread、瞬時)
         let was_trt =
@@ -3055,17 +3070,42 @@ impl App {
                 "[AI] AI バックエンドを DirectML に切替しました (TRT パック削除後)".to_string(),
             );
         }
+        if let Some(state) = self.pref_state.as_mut() {
+            state.trt_pack_installed = false;
+            state.trt_pack_size_mib = 0;
+            state.trt_engine_cache_size_mib = 0;
+            state.trt_worker_active = false;
+            state.current_runtime_fallback_reason = None;
+            state.settings.ai_backend = Some(crate::ai::AiBackend::DirectMl.as_str().to_string());
+        }
 
-        // 3. ファイル削除は背景 thread に逃がす。
-        //    pack ~2 GB + engine cache 数百 MB の remove_dir_all は秒〜十数秒かかり、
-        //    UI を凍らせるため (CLAUDE.md: UI thread 同期 I/O 禁止)。
-        //    削除完了前に再 install を要求した場合、install 側の atomic rename + INSTALL_OK
-        //    最終書き込みパターンで上書きできるので race は実害なし。
+        // 3. ファイル削除は背景 thread に逃がす。PackUninstalling 中の install request は
+        // App 側で保留され、backend/pack rearm も owner が削除完了まで start しない。
         let pack_dir = crate::ai::tensorrt_pack::pack_dir();
         let engine_cache_dir = crate::ai::tensorrt_pack::engine_cache_dir();
-        std::thread::Builder::new()
+        let uninstall_work = std::sync::Arc::new(std::sync::Mutex::new(Some((
+            uninstall_permit,
+            pack_dir,
+            engine_cache_dir,
+        ))));
+        let worker_work = std::sync::Arc::clone(&uninstall_work);
+        let spawned = std::thread::Builder::new()
             .name("trt-pack-uninstall".to_string())
             .spawn(move || {
+                let Some((permit, pack_dir, engine_cache_dir)) = worker_work
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                else {
+                    return;
+                };
+                permit.wait_for_retirement();
+                if !permit.is_current() {
+                    crate::logger::log(
+                        "[AI] TensorRT 削除は lifecycle revision 更新後のため破棄しました",
+                    );
+                    return;
+                }
                 for dir in [pack_dir, engine_cache_dir] {
                     match std::fs::remove_dir_all(&dir) {
                         Ok(()) => {
@@ -3083,8 +3123,21 @@ impl App {
                         }
                     }
                 }
-            })
-            .ok();
+                permit.complete();
+            });
+        if let Err(error) = spawned {
+            crate::logger::log(format!(
+                "[AI] TensorRT 削除 worker を開始できませんでした: {error}"
+            ));
+            if let Some((permit, _, _)) = uninstall_work
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                permit.complete();
+            }
+        }
+        true
     }
 }
 
@@ -3352,16 +3405,38 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 mod tests {
     use super::*;
 
+    fn disabled_trt_worker_snapshot() -> crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot {
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()
+    }
+
     fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
         PreferencesState::from_settings(
             settings,
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
             0,
         )
+    }
+
+    #[test]
+    fn preferences_projects_attached_owner_while_main_runtime_is_dormant() {
+        let state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
+            None,
+            crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot::attached_for_projection_test(),
+            false,
+            0,
+            0,
+            0,
+        );
+
+        assert!(state.trt_worker_active);
+        assert!(state.current_runtime_fallback_reason.is_none());
     }
 
     /// 操作カスタマイズで切った設定が、OK で本体へ届く。
@@ -3379,6 +3454,7 @@ mod tests {
             &app.settings,
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
@@ -3778,6 +3854,7 @@ mod tests {
             &settings,
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
@@ -3932,6 +4009,7 @@ mod tests {
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
@@ -3990,6 +4068,7 @@ mod tests {
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
@@ -4025,6 +4104,7 @@ mod tests {
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,
@@ -4496,6 +4576,7 @@ mod tests {
             &live,
             crate::external_tool::LaunchTarget::None,
             None,
+            disabled_trt_worker_snapshot(),
             false,
             0,
             0,

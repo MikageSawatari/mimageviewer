@@ -1,6 +1,6 @@
 # §1.241 ORT 初期化失敗・VC++ ランタイム同梱の修正計画
 
-状態: **実装・focused / full / static gate・独立 completion review・unsigned release verification build 完了。署名済み三形態 / Sandbox / TensorRT実GPUはrelease handoff待ち** (2026-09-15)。
+状態: **実装・focused / full / static gate・独立 completion review・unsigned release verification build / 三形態 Sandbox / Defender 有効host / TensorRT実GPU 完了。署名済み最終配布と§1.243限定再検証はrelease handoff待ち** (2026-09-15)。
 
 調査の正本は
 [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md)、
@@ -334,8 +334,14 @@ launcher / core / remoteのSHA-256は順に`3966900559C6F2EF70A3498ECF014FE2AB19
 `549A38429F0207C2BECCAB3C68D0944FE1E403F341587E68E8ACC7CBA623DB65`、
 `3A1D9FF87F82CB069D3EF021D8EBC55201D269DFDC62C835C8600FB0FCCB046F`である。全9 artifactのexact ledgerは
 `target/section241-release-build-20260915/BUILD-MANIFEST.sha256`、そのSHA-256は
-`E2721702AFF3B2C590B11D9DDCAD57AEBE2DB8D89484C808A1EB4481228BF395`である。この確認buildの3 exeは未署名で、
-installer / portable / signed distribution、Sandbox / GUI / TensorRT実GPUは未実施のrelease handoffとして残す。
+`E2721702AFF3B2C590B11D9DDCAD57AEBE2DB8D89484C808A1EB4481228BF395`である。この確認buildの3 exeは未署名である。
+その後ClaudeCodeは同じsourceのunsigned single-exe / installer / portableを別々のfresh Sandboxで検証し、
+三形態のfirst / second launch、launcher CRT self-repair、portable loose ORT failureを完了した。Defender有効hostの
+portable first / second launch、実GPUのDirectML / subject / TensorRT / Remoteも完了している。詳細は
+[`RESULTS.md`](../target/section241-release-verification-20260915/RESULTS.md)。TensorRTの壊れたpackで画像ごとに
+lazy startを繰り返す残件は§1.243としてtyped lifecycle ownerへ修正し、自動gateとunsigned release buildまで完了した。
+署名済み最終三形態、版番号・公開・Store再申請と、§1.243の壊れたpack / manual restart / 正常pack限定再検証を
+release handoffとして残す。
 
 static logは`target/section241-final-20260915/static.{stdout.log,stderr.log,exit.txt}`、SHA-256は順に
 `6148BA18192E65F9E4930484CD138C545F149673DC3370518A90C9F574EABAE1`、

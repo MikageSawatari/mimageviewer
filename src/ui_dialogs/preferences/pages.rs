@@ -6717,10 +6717,9 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     } else {
         "DirectML"
     };
-    // TensorRT を選択しているが pack が未インストールの場合、OK 押下時に
-    // worker spawn 失敗 → エラー通知が出る代わりに、UI 上で「実際には
-    // DirectML で動作する」ことを明示する (= apply_ai_backend_change 側でも
-    // spawn 試行を skip する仕様と整合)。
+    // TensorRT を選択しているが pack が未インストールの場合、UI 上で「実際には
+    // DirectML で動作する」ことを明示する。lifecycle owner も pack status を
+    // `Disabled(PackUnavailable)` として保持し、AI demand ごとの再検査はしない。
     let trt_unavailable = new_choice == AiBackend::TensorRt && !state.trt_pack_installed;
     let pending_change = if trt_unavailable {
         false
@@ -6850,25 +6849,15 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 if do_delete {
                     // 実際の削除は App 側に委譲。理由:
                     // - TRT worker pool が DLL を握ったままだと remove_dir_all が失敗する
-                    //   ため、先に worker pool を detach する必要がある (= AiRuntime API)
-                    // - ai_backend = TensorRT のままだと AI 機能呼び出し時に再 attach で
+                    //   ため、lifecycle owner が全 request lease と background reaper の
+                    //   child shutdown 完了を待ってから削除する必要がある
+                    // - ai_backend = TensorRT のままだと削除完了後の AI 機能呼び出しで再 start して
                     //   失敗 (= 削除直後の DLL 不在) → エラーダイアログが出る
-                    // → App 側で「detach → 削除 → ai_backend を DirectML に切替 → save」を
+                    // → App 側で「disable → retire barrier → 背景削除 → DirectML 保存」を
                     //   一括処理する
                     state.uninstall_trt_pack_requested = true;
-                    // dialog 上の表示も即時切替 (= 「ダウンロード」分岐へ)
-                    state.trt_pack_installed = false;
-                    state.trt_pack_size_mib = 0;
-                    state.trt_engine_cache_size_mib = 0;
-                    // 「現在動作中」表記も DirectML に同期 (= App 側で detach するので
-                    // 実際の worker pool は止まる。state は dialog 開いた時のスナップ
-                    // ショットなので、ここで明示的に false にしないと表記が古いまま)。
-                    state.trt_worker_active = false;
-                    state.current_runtime_fallback_reason = None;
-                    // 設定 UI 上のラジオボタンも DirectML に同期
-                    // (= state.settings は draft、live settings は App 側で切替)
-                    state.settings.ai_backend =
-                        Some(crate::ai::AiBackend::DirectMl.as_str().to_string());
+                    // 実行を App/lifecycle owner が受理した後だけ projection を削除済みに
+                    // 更新する。modeless install と競合して拒否された場合は現在値を保つ。
                     state.trt_cache_delete_confirm_open = false;
                 } else if do_cancel {
                     state.trt_cache_delete_confirm_open = false;
@@ -10356,6 +10345,7 @@ mod tests {
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
             None,
+            crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
             false,
             0,
             0,

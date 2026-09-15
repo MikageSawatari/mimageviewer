@@ -213,12 +213,9 @@ impl TrtInstallState {
 impl App {
     /// install 完了直後に呼ばれ、TensorRT バックエンドを「保存 + ホットスイッチ」する。
     ///
-    /// `apply_ai_backend_change` は worker pool の起動/停止を担当するメソッドで、
-    /// 環境設定ダイアログの Apply パスからも呼ばれる。設定値変更を伴うので
-    /// settings 永続化もここでやる。
-    ///
-    /// 起動失敗時は `apply_ai_backend_change` 内で `report_worker_spawn_failed`
-    /// が呼ばれ、UI バナー (trt_worker_notice) で通知される。
+    /// install completion は同版の再インストールでも lifecycle owner の明示 rearm とする。
+    /// owner が background で pack を再検査して start し、terminal failure は UI バナーへ
+    /// one-shot event として投影される。設定値変更を伴うので永続化もここで行う。
     fn activate_tensorrt_after_install(&mut self) {
         let prev = self.settings.ai_backend.clone();
         self.settings.ai_backend = Some("tensorrt".to_string());
@@ -227,8 +224,10 @@ impl App {
             "[AI] install 完了後、ai_backend を自動切替: {:?} -> tensorrt",
             prev
         ));
-        // ホットスイッチ (= worker pool を起動)。再起動不要。
-        self.apply_ai_backend_change(Some("tensorrt"));
+        self.trt_worker_notice = None;
+        // install completion is an explicit lifecycle rearm even when the saved backend was
+        // already TensorRT. The owner invalidates every older start before hot activation.
+        self.ai_runtime_init.trt_worker_lifecycle().pack_installed();
     }
 
     /// インストールダイアログ本体。`update()` から毎フレーム呼ぶ。

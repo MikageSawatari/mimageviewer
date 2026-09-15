@@ -6423,7 +6423,7 @@ fn remote_ai_model_epoch(
     digest.update(crate::ai::tensorrt_pack::EXPECTED_TRT_PACK_VERSION.to_le_bytes());
     for kind in [selected.denoise, selected.upscale].into_iter().flatten() {
         digest.update(format!("{kind:?}").as_bytes());
-        digest.update([u8::from(runtime.should_route_to_worker(kind))]);
+        digest.update(runtime.trt_route_generation(kind).digest_bytes());
         if let Some(path) = manager.model_path(kind) {
             digest.update(path.as_os_str().to_string_lossy().as_bytes());
             if let Ok(metadata) = std::fs::metadata(path) {

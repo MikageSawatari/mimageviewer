@@ -150,6 +150,7 @@
 | [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) | FFmpeg LGPLv3-or-later build の配布時チェックリスト、対応ソース、同梱外部ライブラリの確認メモ |
 | [licensing-tensorrt.md](licensing-tensorrt.md) | TensorRT 対応のライセンス、再配布境界、確認事項 |
 | [tensorrt-worker-design.md](tensorrt-worker-design.md) | TensorRT worker / IPC / fallback の現行設計 |
+| [tensorrt-worker-lifecycle-plan.md](tensorrt-worker-lifecycle-plan.md) | **§1.243 実装・自動 gate・独立 completion review・unsigned release build完了、隔離 TensorRT 実機再検証待ち**。決定的起動失敗、全 AI producer、retry、pool identity、backend / pack / exit を単一 typed lifecycle owner へ統合 |
 | [tensorrt-pack-distribution.md](tensorrt-pack-distribution.md) | TensorRT pack の作成・検証・配布 runbook |
 | [tensorrt-pack-release-notes.md](tensorrt-pack-release-notes.md) | TensorRT pack 配布時のリリース本文の正本 |
 | [ffmpeg-lgpl-current-report.txt](ffmpeg-lgpl-current-report.txt) | 現在の同梱 FFmpeg DLL から抽出した版、ライセンス、configure flags、GPL 混入検査の監査記録。依存更新時に `collect-ffmpeg-lgpl-info.ps1` で再生成する |

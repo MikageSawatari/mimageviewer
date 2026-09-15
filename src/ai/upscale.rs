@@ -31,8 +31,11 @@ const TILE_OVERLAP: u32 = 32;
 /// `active_backend().effective` だけ見ると DirectML になってしまい、TRT 用
 /// engine cache (256) が使えず再コンパイルが走るので、ここで dispatch を
 /// 反映する。
-fn effective_backend_for_tile(runtime: &AiRuntime, kind: ModelKind) -> super::AiBackend {
-    if runtime.should_route_to_worker(kind) {
+fn effective_backend_for_route(
+    runtime: &AiRuntime,
+    route: &super::trt_worker_lifecycle::TrtInferenceRoute,
+) -> super::AiBackend {
+    if route.uses_worker() {
         super::AiBackend::TensorRt
     } else {
         runtime.active_backend().effective
@@ -215,14 +218,17 @@ pub fn pdf_render_differs_from_native_ai_target(
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
-fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32, AiError> {
+fn detect_scale_factor(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    effective_backend: super::AiBackend,
+) -> Result<u32, AiError> {
     // キャッシュ済みならそのまま返す
     if let Some(&scale) = SCALE_CACHE.lock().unwrap().get(&model_kind) {
         return Ok(scale);
     }
 
-    let test_size =
-        model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)) as usize;
+    let test_size = model_tile_size(model_kind, effective_backend) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
     let tensor =
         ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
@@ -353,9 +359,15 @@ fn upscale_with_timings_impl(
     let t_all = std::time::Instant::now();
     let t_prep = std::time::Instant::now();
 
+    // Resolve exactly one route for the whole image. An Eligible lifecycle may start a worker,
+    // but this request stays on DirectML; a worker failure also falls back in one direction for
+    // the failed tile and every remaining tile.
+    let mut inference_route = runtime.trt_route_or_begin(model_kind);
+    let effective_backend = effective_backend_for_route(runtime, &inference_route);
+
     let (in_w, in_h) = (input.width(), input.height());
 
-    let scale = detect_scale_factor(runtime, model_kind)?;
+    let scale = detect_scale_factor(runtime, model_kind, effective_backend)?;
     let full_out_w = in_w.saturating_mul(scale).max(1);
     let full_out_h = in_h.saturating_mul(scale).max(1);
     let (out_w, out_h) = target_max_dim.map_or((full_out_w, full_out_h), |max_dim| {
@@ -363,9 +375,8 @@ fn upscale_with_timings_impl(
     });
     let used_upscale = scale > 1;
 
-    let tile_size = tile_size_override.unwrap_or_else(|| {
-        model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind))
-    });
+    let tile_size =
+        tile_size_override.unwrap_or_else(|| model_tile_size(model_kind, effective_backend));
 
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → model {}x{} ({}x) → target {}x{} with {:?}, tile={}px overlap={}px",
@@ -530,15 +541,21 @@ fn upscale_with_timings_impl(
                 let crop_h = (tile.h * scale) as usize;
                 let t_infer_begin = std::time::Instant::now();
                 let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
-                let (tile_out, breakdown) =
-                    match run_tile_inference(runtime, model_kind, tile_input, crop_w, crop_h) {
-                        Ok(out) => out,
-                        Err(e) => {
-                            drop(tx);
-                            let _ = blender.join();
-                            return Err(e);
-                        }
-                    };
+                let (tile_out, breakdown) = match run_tile_inference(
+                    runtime,
+                    &mut inference_route,
+                    model_kind,
+                    tile_input,
+                    crop_w,
+                    crop_h,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        drop(tx);
+                        let _ = blender.join();
+                        return Err(e);
+                    }
+                };
                 let t_send = std::time::Instant::now();
                 let infer_ms = t_send.duration_since(t_infer_begin).as_secs_f64() * 1000.0;
 
@@ -816,21 +833,21 @@ fn build_tile_output(
 
 /// 1 タイルの推論を実行する。
 ///
-/// `should_route_to_worker(kind) == true` ならば TRT ワーカープロセスにルーティング、
-/// そうでなければ従来通り `with_session` でローカル DirectML 推論。
-/// どちらの経路でも (TileOutput, InferBreakdown) を返すので呼び出し側は同じ。
+/// request 開始時に取得した route lease が TRT worker を保持していれば worker へ、
+/// そうでなければ `with_session` でローカル DirectML 推論する。同じ request の途中で
+/// lifecycle state を再読せず、どちらの経路でも (TileOutput, InferBreakdown) を返す。
 fn run_tile_inference(
     runtime: &AiRuntime,
+    route: &mut super::trt_worker_lifecycle::TrtInferenceRoute,
     model_kind: ModelKind,
     input: ndarray::Array4<f32>,
     crop_w: usize,
     crop_h: usize,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
-    let worker_route = runtime.should_route_to_worker(model_kind);
-    if worker_route {
+    if route.uses_worker() {
         // TRT ワーカー経路: tensor_build / extract / shm 転送はワーカー内で完結
         let t_run = std::time::Instant::now();
-        match runtime.infer_via_worker(model_kind, &input) {
+        match route.infer(model_kind, &input) {
             Ok((shape, raw)) => {
                 let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
                 let (output, post_copy_ms) = build_tile_output(&raw, &shape, crop_w, crop_h)?;
@@ -848,11 +865,11 @@ fn run_tile_inference(
                 // T51 (Codex P2 / 2026-05-16): worker 由来エラーで in-flight upscale 全体を
                 // 中断するのではなく、このタイルだけ DirectML フォールバックで再 inference する。
                 // worker mark_dead 自体は trt_worker_pool の `classify_io_error` が担当 (T48)。
-                // mark_dead 後の次回 `should_route_to_worker` は false を返すので、以降のタイルは
-                // 全てローカル DirectML 経由になる。
+                // lease を DirectML へ落とし、同じ request の残りタイルもローカル経路に固定する。
                 crate::logger::log(format!(
                     "[AI upscale] TRT worker failed for tile ({model_kind:?}): {e} — DirectML フォールバックを試行"
                 ));
+                route.fall_back_to_direct_ml();
                 // fall through to the local DirectML branch below
             }
         }

@@ -238,20 +238,12 @@ fn main() {
     // Phase 3 アーキテクチャ: メインは常に DirectML、TRT は別プロセスのワーカー。
     // --legacy-direct-trt 時のみ、Phase 2 互換で main で直接 TRT を init する。
     // (Phase 3 vs Phase 2 のパフォーマンス比較用)
+    let mut diagnostic_worker_exe = None;
     let runtime = if args.legacy_direct_trt && args.backend == AiBackend::TensorRt {
         println!("[legacy] AiRuntime::new_with_backend(TensorRt) — main で直接 TRT 初期化");
         AiRuntime::new_with_backend(AiBackend::TensorRt)
             .expect("AiRuntime::new_with_backend(TensorRt) [legacy]")
-    } else {
-        AiRuntime::new_with_backend(AiBackend::DirectMl)
-            .expect("AiRuntime::new_with_backend(DirectMl)")
-    };
-    let runtime = std::sync::Arc::new(runtime);
-
-    if args.backend == AiBackend::TensorRt && !args.legacy_direct_trt {
-        // bench_ai は別 bin なので current_exe() は bench_ai.exe を返す。
-        // ワーカーは mimageviewer.exe (--tensorrt-infer-worker subcommand を持つ
-        // バイナリ) でなければならないため、sibling の mimageviewer.exe を指す。
+    } else if args.backend == AiBackend::TensorRt {
         let bench_exe = std::env::current_exe().expect("current_exe");
         let main_exe = bench_exe
             .parent()
@@ -267,16 +259,27 @@ fn main() {
             );
             std::process::exit(1);
         }
+        diagnostic_worker_exe = Some(main_exe.clone());
+        AiRuntime::new_with_backend_and_worker_exe(AiBackend::DirectMl, main_exe)
+            .expect("AiRuntime::new_with_backend_and_worker_exe(DirectMl)")
+    } else {
+        AiRuntime::new_with_backend(AiBackend::DirectMl)
+            .expect("AiRuntime::new_with_backend(DirectMl)")
+    };
+    let runtime = std::sync::Arc::new(runtime);
+
+    if args.backend == AiBackend::TensorRt && !args.legacy_direct_trt {
         println!(
             "Spawning TRT worker pool (sync, worker={})...",
-            main_exe.display()
+            diagnostic_worker_exe.as_ref().unwrap().display()
         );
         let t0 = std::time::Instant::now();
-        match mimageviewer::ai::trt_worker_pool::TrtWorkerPool::start_with_exe(&main_exe) {
-            Ok(pool) => {
+        let lifecycle = runtime.trt_worker_lifecycle();
+        lifecycle.select_backend(AiBackend::TensorRt);
+        match lifecycle.wait_for_diagnostic_start(std::time::Duration::from_secs(60)) {
+            Ok(()) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 println!("  worker pool ready in {elapsed:.2} s");
-                runtime.attach_worker_pool(std::sync::Arc::new(pool));
             }
             Err(e) => {
                 eprintln!("ERROR: failed to start TRT worker pool: {e}");
@@ -296,7 +299,7 @@ fn main() {
         active.effective,
         active.dll_path.display()
     );
-    if runtime.has_worker_pool() {
+    if runtime.trt_worker_snapshot().is_attached() {
         println!("  TRT worker pool: attached (Upscale/Denoise route to worker)");
     }
     if let Some(reason) = &active.fallback_reason {

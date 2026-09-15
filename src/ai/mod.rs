@@ -16,6 +16,7 @@ pub mod runtime;
 pub mod tensorrt_builder;
 pub mod tensorrt_installer;
 pub mod tensorrt_pack;
+pub mod trt_worker_lifecycle;
 pub mod trt_worker_pool;
 pub mod trt_worker_proto;
 pub mod trt_worker_runtime;

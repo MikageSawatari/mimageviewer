@@ -103,6 +103,7 @@ src/
 ├── ai/
 │   ├── runtime.rs           # AiRuntime: with_session を「ローカル DirectML or
 │   │                          ワーカー TRT」にディスパッチ
+│   ├── trt_worker_lifecycle.rs # 親 process の typed state、retry、route lease、reaper
 │   ├── trt_worker_pool.rs   # 新規: ワーカー起動・IPC・推論ルーティング
 │   ├── trt_worker_proto.rs  # 新規: IPC プロトコル型 (Cmd / Resp / Shm 名)
 │   ├── tensorrt_pack.rs     # 既存
@@ -160,20 +161,20 @@ fn infer_target(kind: ModelKind, backend: AiBackend) -> InferTarget {
 ```
 ユーザーが TRT を選択 (現状 DirectML 動作中)
   ↓
-TrtWorkerPool::ensure_started() を呼ぶ
+TrtWorkerLifecycleOwner::select_backend(TensorRt) を呼ぶ
   ↓
 - pack 存在確認 → なければ「未インストール」表示で UI 通知
 - ワーカープロセス起動 (mimageviewer.exe --tensorrt-infer-worker)
 - ワーカー側で TRT 対象モデルのセッションをロード (キャッシュ済みエンジンなら数秒)
   ↓
-完了通知が来たら、AiRuntime の dispatcher が TRT 経路を使い始める
+同じ lifecycle revision の完了だけを attach し、以後の request route が TRT 経路を使う
 DirectML セッションはそのまま温存 (MI-GAN 用)
 
 ユーザーが DirectML に戻す
   ↓
-TrtWorkerPool::shutdown()
+owner を Disabled にして current start / route を失効
   ↓
-ワーカーに stdin で `{"cmd":"shutdown"}` 送信、子プロセス自然終了
+最後の request lease 解放後、reaper が shutdown と child wait
 DirectML セッションだけ残る
 ```
 
@@ -211,19 +212,19 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 ### 起動
 
 設定で TRT 有効化 + 「TRT 機能が必要なモデルが呼ばれたら」 (lazy):
-- `TrtWorkerPool::ensure_started()` を初回 infer 直前に呼ぶ
-- ワーカープロセス spawn → ハンドシェイク → モデルロード
-- 起動失敗 (pack 不在等) は `AiBackend::DirectMl` に自動退避し UI 通知
+- 全 producer の共通 upscale pipeline が `TrtWorkerLifecycleOwner::route_or_begin` を通る
+- `Eligible` から 1 個だけ `Starting` を作り、ワーカープロセス spawn → ハンドシェイクを背景実行
+- current revision / attempt / requested backend が一致した成功だけを `Attached` にする
+- pack 不在は `Disabled(PackUnavailable)`、決定的起動失敗は `Failed` terminal にし、後続 request は
+  子を再起動せず DirectML で完了する
 
 ### シャットダウン
 
-メインプロセス終了時:
-- 親が stdin に `{"cmd":"shutdown"}` 送信
-- 子は ORT セッションを破棄して exit
-- 親は子の終了を `child.wait()` で待つ
-
-ユーザーが設定で DirectML に戻したとき:
-- 同様にシャットダウン → DirectML 経路に切り替え
+backend off、pack uninstall、App exit は owner revision を先に更新して新しい route と start を止める。
+各 request は取得時の pool identity を持つ lease を最後まで使う。最後の lease が解放されたら reaper が
+`shutdown` と `child.wait()` を背景実行し、UI thread は待たない。pack uninstall は revision ごとの retire
+barrier が start task、route lease、child shutdown の完了を確認してから directory を削除する。
+`AppRetired` は absorbing state で、遅い backend / install / manual 操作から復帰しない。
 
 ### クラッシュ検出 (Step 5 実装済み)
 
@@ -237,27 +238,21 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
   - `worker stdout が EOF (子プロセスが予期せず終了した可能性)`
 - `ok=false` の正常レスポンス (例: shape mismatch) では `is_dead` を立てない
   (送受信は成立しているので worker は生存)
-- `infer_via_worker` が `pool.is_dead()` を見て `AiRuntime::report_worker_died()`
-  を呼ぶ。中身: `detach_worker_pool()` (= worker_pool を None に) + UI 通知キュー
-  `worker_notice` に `WorkerNoticeKind::DiedDuringInfer` を積む
-- 以降の `should_route_to_worker` は worker_pool が None なので false → 推論は
-  自動的に DirectML へフォールバック
-- **自動再起動 (silent recovery、Apr 29 追加)**: `App::trt_auto_restart_attempts` が
-  `MAX_TRT_AUTO_RESTART_ATTEMPTS` (= 3) 未満なら、`poll_trt_worker_notice` が
-  バナー表示の代わりに `spawn_trt_worker_pool_guarded` でバックグラウンドに
-  pool 再 spawn を投げる (= ユーザー無通知)。`trt_restart_in_flight: AtomicBool` で
-  並行する複数の死亡通知から 2 重 spawn を防ぐ (Codex P2.6 反映)
-- silent recovery が **3 回失敗したら** (= TRT pack 自体の問題等)、4 回目以降は
-  通常の floating banner を出してユーザー操作を待つ。「ワーカーを再起動」ボタンで
-  `spawn_trt_worker_pool` を再呼び出し可能 (連続失敗時はまた通知される)
-- バックエンド切替・pack 再インストール等の正常な再起動成功で `trt_auto_restart_attempts`
-  はリセットされる
+- request route が `pool.is_dead()` を見て、取得時の pool identity と共に lifecycle owner へ死亡を報告する
+- current `Attached.pool_id` と一致する最初の報告だけが pool を外し、同じ request は失敗 tile から
+  DirectML へフォールバックする。旧 pool と同じ pool の重複報告は current state を変更しない
+- **自動再起動**: owner の recovery budget により death #1、#2、#3 は各 1 回 silent restart し、
+  新しい pool が実際に inference を成功したときだけ budget を reset する。成功無しの death #4 は
+  `Failed` terminal と floating banner になる
+- 起動段階の `ProcessSpawn / Transport / Timeout` は exact episode で 1 回だけ retry し、
+  `RuntimeInit / CommandRejected / Protocol / ParentSetup` と lifecycle task panic は直ちに terminal にする
+- backend 選択、pack install、通知の「ワーカーを再起動」だけが `Failed` を明示 rearm できる。
+  banner の「閉じる」は表示を消すだけで state は変えない
 - `TrtWorkerPool::shutdown` 時に `is_dead` なら念のため `child.kill()` してから
   `child.wait()` (子が hang した病理的ケースの保険、kill は冪等)
 
-起動失敗 (pack 不在 / DLL ロード失敗 / 初期化エラー) も同じ通知機構で扱う:
-`spawn_trt_worker_pool` の Err 経路で `report_worker_spawn_failed()` を呼んで
-`WorkerNoticeKind::SpawnFailed` を積む (これまでは log のみだった)。
+起動失敗と死亡 terminal は owner の one-shot event から UI banner へ投影する。UI が保持する
+`Option<WorkerNotice>` は表示用であり、retry 可否の正本ではない。
 
 ## 実装フェーズ
 
@@ -278,9 +273,9 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 
 ### Step 3: メイン側ディスパッチ (約 2 日)
 
-- `AiRuntime::with_session` を `infer_target` で分岐
+- 共通 upscale request の入口で typed lifecycle owner から request route を一度取得
 - ローカル DirectML 経路は既存維持
-- TRT 経路は worker_pool 経由
+- TRT 経路は request 全体で同じ worker pool identity を保持
 - TRT 経路の Send/Sync 制約クリア (mpsc + Arc<Mutex>)
 
 ### Step 4: 設定 UI 変更 (約 1 日)
@@ -293,10 +288,10 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 
 - `TrtWorkerPool::is_dead` フラグ + `load_model` / `infer` 内の I/O 失敗パターン
   自動判定 (`classify_io_error`)
-- `AiRuntime::report_worker_died` / `report_worker_spawn_failed` で UI 通知キュー
-  `worker_notice: Mutex<Option<WorkerNotice>>` に積む
-- `App::poll_trt_worker_notice` が毎フレーム `take_worker_notice()` を呼んで
-  `App::trt_worker_notice` に転写
+- `TrtWorkerLifecycleOwner` が start、retry budget、pool identity、terminal failure、retire を一つの
+  排他 state と revision で所有する
+- `App::poll_trt_worker_notice` は owner の one-shot event を `App::trt_worker_notice` に転写するだけで、
+  retry 判断はしない
 - `ui_dialogs/trt_worker_notice.rs` が右上に floating Window を出す:
   - メッセージ + [ワーカーを再起動] [閉じる]
   - 時間で消えない (ユーザー認知が必要)
@@ -454,7 +449,7 @@ GPU が冷えた状態 / 他に重いプロセスがいない状態で実測す�
 
 GeneralV3 は元から軽量モデル (= 1 tile あたり ~30 ms) で TRT の最適化余地が小さい。
 worker IPC overhead (~5-10 ms/tile) を払うと利得が完全に相殺される。よって pack v3
-からは engine を同梱せず、`runtime.rs::should_route_to_worker` が GeneralV3 を
+からは engine を同梱せず、`trt_worker_lifecycle::model_uses_trt_worker` が GeneralV3 を
 in-process DirectML へ送る運用に切り替えた。tile 数が多い長尺動画でも GeneralV3 は
 DirectML の方が速い。
 
@@ -470,7 +465,8 @@ TRT サブシステムの責務分割は **clean** で、video / VST3 のよう�
 
 | ファイル | 行数 | 責務 | 評価 |
 |---|---:|---|---|
-| `runtime.rs` | 648 | AiRuntime + multi-EP dispatch + `report_worker_*` | ✅ |
+| `runtime.rs` | — | AiRuntime + multi-EP dispatch + process 共通 lifecycle への接続 | ✅ |
+| `trt_worker_lifecycle.rs` | — | typed state、start/retry、request route、pool identity、retire barrier | ✅ |
 | `tensorrt_pack.rs` | 67 | pack のロード判定 | ✅ |
 | `tensorrt_builder.rs` | 163 | `--tensorrt-build` 子プロセス (engine 事前ビルド) | ✅ |
 | `tensorrt_installer.rs` | 1053 | オンラインインストーラ + manifest fetch + DL UI | ⚠ 1000 行超だが UI とロジックが緊密 |
@@ -486,13 +482,10 @@ manifest 検証 / final move + UI コールバックを一連で行うインス�
 責務が「pack をローカルに展開する」に閉じている。ロジックと UI の分離が必要に
 なった時点で `installer/core.rs` + `installer/ui.rs` に分けるのが自然 (Phase 10+)。
 
-### 自動再起動が `app.rs` に住んでいる件
+### 自動再起動と owner
 
-silent recovery 3 回までの自動再起動ロジックは `App::trt_auto_restart_attempts` /
-`App::trt_restart_in_flight` / `App::poll_trt_worker_notice` で実装されているため、
-**TRT サブシステムから見ると app.rs に逆依存している**形になっている。
-
-これ自体は不健全とまでは言えない (= UI 表示判断と再起動判断は同じ場所で持つのが
-自然) が、もし将来的に「mIV 以外のフロントエンドからも TRT runtime を使いたい」
-状況が出たら、auto-restart ループは `AiRuntime` 側に移すべき。現状の単一フロント
-エンド (= mIV 本体のみ) では問題なし。
+§1.243 で silent recovery、起動失敗、pool identity、明示 rearm、retire を
+`TrtWorkerLifecycleOwner` へ移した。App は backend / pack / manual / exit event を渡し、owner の
+terminal event を banner へ投影するだけである。通常表示、prefetch、book、materializer、video、
+Remote は同じ request route API を使う。詳細な不変条件と回帰は
+[tensorrt-worker-lifecycle-plan.md](tensorrt-worker-lifecycle-plan.md) を正本とする。

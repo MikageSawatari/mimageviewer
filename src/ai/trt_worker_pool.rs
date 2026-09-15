@@ -69,7 +69,7 @@ impl WorkerStartFailureKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorkerStartError {
     pub kind: WorkerStartFailureKind,
     pub detail: String,

@@ -603,20 +603,19 @@ fn write_and_hash_notices(dist_dir: &Path) -> std::io::Result<Vec<AssetEntry>> {
 }
 
 /// pack に同梱必須なモデル一覧 (= worker 経由で TRT 動作させたい全モデル)。
-/// `runtime.rs::should_route_to_worker` で TRT に route される 5 モデルと一致させる。
+/// runtime route と同じ canonical `ModelKind` list から directory 名を導出する。
 /// build_engine_zip がこれら全モデルの engine を見つけられなかったら build を失敗
 /// させて出荷ミスを未然に防ぐ (Codex P2.4 指摘)。
 ///
 /// **`realesr_general_v3` は意図的に除外** (pack v3、2026-05): RTX 4090 bench で
 /// 全サイズで TRT/DirectML がほぼ互角だったため、worker IPC overhead を払うより
-/// in-process DirectML へ流す方針 (`should_route_to_worker` 参照)。
-const REQUIRED_ENGINE_MODELS: &[&str] = &[
-    "realesrgan_x4plus",
-    "realesrgan_anime6b",
-    "realcugan_4x",
-    "nmkd_siax_4x",
-    "denoise_realplksr",
-];
+/// in-process DirectML へ流す方針 (`model_uses_trt_worker` 参照)。
+fn required_engine_models() -> Vec<&'static str> {
+    mimageviewer::ai::trt_worker_lifecycle::TRT_WORKER_MODEL_KINDS
+        .iter()
+        .map(mimageviewer::ai::ModelKind::as_str)
+        .collect()
+}
 
 /// 入力 shape が動的 = `.profile` ファイルが必須なモデル。ORT TRT EP は dynamic
 /// shape model に対してのみ `.profile` を書き出す。これらが `.profile` を欠く場合
@@ -634,19 +633,20 @@ const FIXED_SHAPE_MODELS: &[&str] = &["denoise_realplksr"];
 /// 5 モデル分の engine cache を 1 つの zip にまとめる。
 /// 戻り値: 生成された zip ファイルのバイト数。
 ///
-/// 全 `REQUIRED_ENGINE_MODELS` が揃っていることを検証し、欠けているモデルが
+/// `required_engine_models()` が返す canonical list の全モデルが揃っていることを検証し、欠けているモデルが
 /// あれば build を失敗させる (= 中途半端な pack を distribute しないためのガード)。
 ///
-/// **走査ポリシー (Codex P1 指摘)**: `REQUIRED_ENGINE_MODELS` のみを走査する。
+/// **走査ポリシー (Codex P1 指摘)**: runtime と共有する canonical list のみを走査する。
 /// `read_dir(src_engines)` で全 directory を回ると、過去 build (例: pack v2 時代の
 /// `realesr_general_v3`) が残っていると stale engine が zip に混入してしまうため。
 /// 余分な directory が `tensorrt-engines/` に居る場合は warning を出して気付かせる
 /// (= silent inclusion を防ぐ)。
 fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
+    let required_engine_models = required_engine_models();
     // 不要 directory の検出 (warning のみ、build は続行)。
     if let Ok(entries) = fs::read_dir(src_engines) {
         let allowed: std::collections::HashSet<&str> =
-            REQUIRED_ENGINE_MODELS.iter().copied().collect();
+            required_engine_models.iter().copied().collect();
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -677,7 +677,7 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
     let mut missing_profile: Vec<&str> = Vec::new();
 
     // 必須モデルだけを順に走査 (= stale dir は無視)。
-    for &model_name in REQUIRED_ENGINE_MODELS {
+    for &model_name in &required_engine_models {
         let model_dir = src_engines.join(model_name);
         if !model_dir.is_dir() {
             missing_engine.push(model_name);
@@ -928,5 +928,26 @@ mod tests {
         // 2026-01-01T00:00:00Z = 1767225600 秒
         let (y, m, d, h, mi, s) = unix_to_ymdhms(1767225600);
         assert_eq!((y, m, d, h, mi, s), (2026, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn required_engine_models_are_the_runtime_route_canonical_list() {
+        let required = required_engine_models();
+        assert_eq!(
+            required,
+            [
+                "realesrgan_x4plus",
+                "realesrgan_anime6b",
+                "realcugan_4x",
+                "nmkd_siax_4x",
+                "denoise_realplksr",
+            ]
+        );
+        assert!(
+            mimageviewer::ai::trt_worker_lifecycle::TRT_WORKER_MODEL_KINDS
+                .iter()
+                .copied()
+                .all(mimageviewer::ai::trt_worker_lifecycle::model_uses_trt_worker)
+        );
     }
 }

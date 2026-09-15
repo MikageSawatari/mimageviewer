@@ -11,7 +11,7 @@
 
 source commit は実装・自動検証・独立 Sol / xhigh completion review まで完了している。review は ORT load failure の再入防止、process 共通 init owner、request cancel、final AI provisional 再評価、TensorRT の型付き retry、launcher の exact self-repair、VC Runtime provenance と全 PE closure を確認し、blocking / should-fix なしと判定した。既存の green gate を引継ぎだけの理由で再実行しない。
 
-`scripts/build-release.ps1 -PreserveRuntime` による unsigned development verification build はexit 0で完了した。この build は source / launcher / embedded assets の確認用で、最終配布物ではない。署名済み installer / portable / single-exe は未生成。unsigned single-exe の Sandbox 検証は下記のとおり完了し、§5 の三形態すべての検証は未完了である。
+`scripts/build-release.ps1 -PreserveRuntime` による unsigned development verification build はexit 0で完了した。この build は source / launcher / embedded assets の確認用で、最終配布物ではない。署名済み installer / portable / single-exe は未生成。ClaudeCodeは同じsourceのunsigned single-exe / installer / portableを別々のfresh Sandboxで検証し、Defender有効hostのportable起動と実GPUのDirectML / subject / TensorRT / Remoteも完了した。
 
 ### 2026-09-15 ClaudeCodeからの検証結果受領
 
@@ -33,8 +33,11 @@ Codexは報告を受領し、ローカル成果物のSHA一致を確認した。
 正常版の埋込ORTはhash sidecarを信頼するため、同一長破損が自己修復されない既存挙動も観測された。
 今回の停止防止は機能しており、この自己修復の拡張は別課題として扱う。ここでは製品変更を追加しない。
 
-残りは署名済み最終配布物、installer／portableの初回・再起動とportable loose ORT失敗、DirectML／編集用パック／Remote AI／TensorRT infer・builderの実GPU回帰、Defender有効環境の起動確認。
-担当が変わっただけで今回の6シナリオをやり直す必要はない。成果物・source・試験条件が変わった場合は影響範囲に応じて再確認する。
+unsigned installer / portableの初回・再起動、portable loose ORT欠落・破損、DirectML / 編集用pack / Remote AI /
+TensorRT infer・builderの実GPU回帰、Defender有効hostのportable起動は完了した。残りは署名済み最終三形態、
+Defender有効かつVC++ runtime無しの組合せ、§1.243修正後の壊れたTensorRT packでの複数画像・通知close・
+manual restart・正常pack attachの限定再検証である。担当が変わっただけで成功済みscenarioをやり直す必要はない。
+成果物・source・試験条件が変わった場合は影響範囲に応じて再確認する。
 
 Phase 5 Remote と rating sort の製品実装には着手していない。
 

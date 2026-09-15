@@ -35,6 +35,7 @@ use super::{AiBackend, AiError, ModelKind};
 pub struct AiRuntimeInitOwner {
     state: Mutex<AiRuntimeInitState>,
     changed: Condvar,
+    trt_worker_lifecycle: Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner>,
 }
 
 enum AiRuntimeInitState {
@@ -63,7 +64,14 @@ impl AiRuntimeInitOwner {
         Arc::new(Self {
             state: Mutex::new(AiRuntimeInitState::Dormant),
             changed: Condvar::new(),
+            trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
         })
+    }
+
+    pub fn trt_worker_lifecycle(
+        &self,
+    ) -> Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner> {
+        Arc::clone(&self.trt_worker_lifecycle)
     }
 
     pub fn snapshot(&self) -> AiRuntimeInitSnapshot {
@@ -87,10 +95,14 @@ impl AiRuntimeInitOwner {
 
     /// DirectML runtime worker を一度だけ開始する。呼び出し元は待たない。
     pub fn start(self: &Arc<Self>, repaint: impl Fn() + Send + Sync + 'static) -> bool {
+        let trt_worker_lifecycle = Arc::clone(&self.trt_worker_lifecycle);
         self.start_with(
             "ai-runtime-init",
-            || {
-                let created = AiRuntime::new_with_backend(AiBackend::DirectMl);
+            move || {
+                let created = AiRuntime::new_with_backend_and_trt_lifecycle(
+                    AiBackend::DirectMl,
+                    trt_worker_lifecycle,
+                );
                 match &created {
                     Ok(runtime) => {
                         let active = runtime.active_backend();
@@ -447,11 +459,10 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
 /// ## Phase 3 アーキテクチャ
 ///
 /// メインプロセスは **常に DirectML** で初期化される (`backend.effective` は
-/// 常に `DirectMl` または `Cpu`)。TensorRT を使いたいときは `worker_pool` に
-/// `TrtWorkerPool` を attach し、TRT 対応モデルの推論を子プロセスにルーティング
-/// する。これにより:
+/// 常に `DirectMl` または `Cpu`)。TensorRT 対象の推論は process 共通の typed
+/// lifecycle owner から request 単位の worker route を取得する。これにより:
 ///
-/// - バックエンド切り替えで再起動が不要 (worker を attach/detach するだけ)
+/// - バックエンド切り替えでアプリ再起動が不要
 /// - TRT で動かないモデル (MI-GAN など) は DirectML で動かせる
 /// - TRT クラッシュで GUI 全体が落ちない
 pub struct AiRuntime {
@@ -460,34 +471,9 @@ pub struct AiRuntime {
     sessions: Mutex<HashMap<ModelKind, Session>>,
     /// 現プロセスで実際にロードされたバックエンド情報。
     backend: ActiveBackend,
-    /// TRT 推論ワーカープール。`None` なら全推論ローカル DirectML。
-    /// 設定で TRT 有効化時に attach され、無効化で detach される (ホットリロード)。
-    worker_pool: Mutex<Option<std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>>>,
-    /// UI に表示する worker 関連の最新通知 (Phase 3 Step 5、クラッシュ通知など)。
-    /// `take_worker_notice()` で 1 回だけ取り出される。
-    /// 設定: 起動失敗 / 推論中の死亡 / 手動 detach はここに乗らず、log のみ。
-    worker_notice: Mutex<Option<WorkerNotice>>,
-}
-
-/// Phase 3 Step 5: TRT ワーカー関連の UI 通知。
-///
-/// `kind` で表示色 (赤/青) と動作 (再起動可能か) を分岐する。
-#[derive(Debug, Clone)]
-pub struct WorkerNotice {
-    /// 通知種別 (UI で文言/動作分岐用)。
-    pub kind: WorkerNoticeKind,
-    /// 詳細メッセージ (英語/日本語混在 OK、log にも出る)。
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerNoticeKind {
-    /// 起動を試みたが TRT pack 不在 / engine 不整合 / その他で起動失敗。
-    /// バックエンド設定は TensorRt のままだが、実体は DirectML で動作している。
-    SpawnFailed(super::trt_worker_pool::WorkerStartFailureKind),
-    /// 起動後の推論中に子プロセスが死亡 (DLL クラッシュ等)。
-    /// 自動 detach 済みで、以降の推論は DirectML にフォールバックされる。
-    DiedDuringInfer,
+    /// GUI process で共有する TensorRT child-process lifecycle。pool、retry、notice、
+    /// backend/pack revision はこの owner の排他 state だけが所有する。
+    trt_worker_lifecycle: Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner>,
 }
 
 impl AiRuntime {
@@ -510,12 +496,33 @@ impl AiRuntime {
     /// FP16 推論は TensorRT 利用時に常時 ON (画質劣化は知覚不能、1.5-2x 高速化)。
     /// FP32 比較が必要なデバッグ用途のため設定として外出ししない方針。
     pub fn new_with_backend(backend: AiBackend) -> Result<Self, AiError> {
+        Self::new_with_backend_and_trt_lifecycle(
+            backend,
+            super::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+        )
+    }
+
+    pub fn new_with_backend_and_worker_exe(
+        backend: AiBackend,
+        worker_exe: PathBuf,
+    ) -> Result<Self, AiError> {
+        Self::new_with_backend_and_trt_lifecycle(
+            backend,
+            super::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new_for_diagnostic_worker(
+                worker_exe,
+            ),
+        )
+    }
+
+    fn new_with_backend_and_trt_lifecycle(
+        backend: AiBackend,
+        trt_worker_lifecycle: Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner>,
+    ) -> Result<Self, AiError> {
         let active = ensure_ort_initialized(backend)?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
             backend: active,
-            worker_pool: Mutex::new(None),
-            worker_notice: Mutex::new(None),
+            trt_worker_lifecycle,
         })
     }
 
@@ -526,138 +533,28 @@ impl AiRuntime {
         &self.backend
     }
 
-    /// TRT ワーカープールを attach する (Phase 3、ホットリロード対応)。
-    /// 既に attach されている場合は古いものを drop してから差し替える
-    /// (drop で worker プロセスが shutdown される)。
-    pub fn attach_worker_pool(&self, pool: std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>) {
-        *self.worker_pool.lock().unwrap() = Some(pool);
-        crate::logger::log("[AI] TRT worker pool attached".to_string());
+    pub fn trt_worker_lifecycle(
+        &self,
+    ) -> Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner> {
+        Arc::clone(&self.trt_worker_lifecycle)
     }
 
-    /// TRT ワーカープールを detach する (停止)。
-    #[allow(dead_code)]
-    pub fn detach_worker_pool(&self) {
-        let prev = self.worker_pool.lock().unwrap().take();
-        if let Some(pool) = prev {
-            // Arc 内 TrtWorkerPool は Drop で shutdown_and_wait される。
-            // ここでは Arc::strong_count をチェックして他で使われていなければ
-            // 即時 drop されるが、共有されていたら最後の Arc が drop されたとき
-            // にクリーンアップされる。
-            crate::logger::log(format!(
-                "[AI] TRT worker pool detached (other Arc refs: {})",
-                std::sync::Arc::strong_count(&pool) - 1
-            ));
-            drop(pool);
-        }
+    pub fn trt_worker_snapshot(&self) -> super::trt_worker_lifecycle::TrtWorkerSnapshot {
+        self.trt_worker_lifecycle.snapshot()
     }
 
-    /// TRT ワーカープールが attach されているか。
-    #[allow(dead_code)]
-    pub fn has_worker_pool(&self) -> bool {
-        self.worker_pool.lock().unwrap().is_some()
-    }
-
-    /// UI 通知を 1 回だけ取り出す (consume)。
-    ///
-    /// アプリの update ループで毎フレーム呼び、`Some(notice)` が返ったら
-    /// バナー表示に転写する。読み出し済みの通知は次の `report_*` まで `None`。
-    pub fn take_worker_notice(&self) -> Option<WorkerNotice> {
-        self.worker_notice.lock().unwrap().take()
-    }
-
-    /// 起動失敗を UI 通知に登録する (Phase 3 Step 5)。
-    ///
-    /// `spawn_trt_worker_pool` 内で `TrtWorkerPool::start()` が Err を返したときに
-    /// 呼ぶ。pool は attach されないので detach は不要、log + UI 通知のみ。
-    pub fn report_worker_spawn_failed(&self, error: super::trt_worker_pool::WorkerStartError) {
-        crate::logger::log(format!(
-            "[AI] TRT worker spawn failed ({:?}): {}",
-            error.kind, error.detail
-        ));
-        *self.worker_notice.lock().unwrap() = Some(WorkerNotice {
-            kind: WorkerNoticeKind::SpawnFailed(error.kind),
-            detail: error.detail,
-        });
-    }
-
-    /// 推論中の死亡を UI 通知に登録し、pool を detach する (Phase 3 Step 5)。
-    ///
-    /// 内部で `detach_worker_pool()` を呼ぶので、以降の `should_route_to_worker` は
-    /// 即 `false` を返し、推論は DirectML にフォールバックする。
-    fn report_worker_died(&self, detail: String) {
-        crate::logger::log(format!("[AI] TRT worker died during infer: {detail}"));
-        // 同 lock 内で detach すると detach 内部の logger も無問題 (Mutex は別)。
-        self.detach_worker_pool();
-        *self.worker_notice.lock().unwrap() = Some(WorkerNotice {
-            kind: WorkerNoticeKind::DiedDuringInfer,
-            detail,
-        });
-    }
-
-    /// 指定モデルが TRT ワーカーへルーティングされるかを判定する。
-    ///
-    /// 条件:
-    /// - worker pool が attach 済み
-    /// - そのモデルが TRT で動かしてうれしいタイプ
-    ///   - Upscale 系 (5 モデル): 1.4-3.4x 高速化
-    ///   - Denoise: 4.5x 高速化
-    ///   - MI-GAN: TRT エンジンビルドが 5+ 分かかるため、安定するまで DirectML
-    ///   - **UpscaleRealEsrGeneralV3**: 軽量モデルで bench 上 TRT/DirectML が
-    ///     互角〜DirectML 微優位 (2026-05 RTX 4090 計測、tile=512)。worker IPC
-    ///     overhead を払うほどの利得が無いため、TRT pack を入れていても本モデル
-    ///     だけは in-process DirectML へルーティングする。pack v3 ではこのモデル
-    ///     用 engine を同梱しない方針。
-    pub fn should_route_to_worker(&self, kind: ModelKind) -> bool {
-        if !self.has_worker_pool() {
-            return false;
-        }
-        match kind {
-            ModelKind::InpaintMiGan => false,
-            ModelKind::SubjectMatte => false,
-            ModelKind::UpscaleRealEsrGeneralV3 => false,
-            ModelKind::UpscaleRealEsrganX4Plus
-            | ModelKind::UpscaleRealEsrganAnime6B
-            | ModelKind::UpscaleRealCugan4x
-            | ModelKind::UpscaleNmkdSiax4x
-            | ModelKind::DenoiseRealplksr => true,
-        }
-    }
-
-    /// TRT ワーカー経由で推論を実行する。
-    ///
-    /// 呼び出し前に `should_route_to_worker(kind) == true` でなければならない
-    /// (worker_pool が None だと panic ではなく Err を返す)。
-    /// 戻り値: `(出力 shape NCHW, 平坦化された Vec<f32>)`。
-    ///
-    /// ワーカー側は initial LoadModel を要求する仕様なので、ここで lazy load する
-    /// (1 度ロードしたモデルは worker 側で kept、再 LoadModel は idempotent)。
-    pub fn infer_via_worker(
+    pub fn trt_route_generation(
         &self,
         kind: ModelKind,
-        input: &ndarray::Array4<f32>,
-    ) -> Result<(Vec<i64>, Vec<f32>), AiError> {
-        let pool_opt = self.worker_pool.lock().unwrap().clone();
-        let pool = pool_opt.ok_or_else(|| {
-            AiError::Ort("infer_via_worker: pool が attach されていない".to_string())
-        })?;
-        // ワーカー側で lazy load (idempotent)。failure は Err にフォワード。
-        if let Err(e) = pool.load_model(kind) {
-            // load_model 内で I/O 失敗を検出していたら pool.is_dead() == true。
-            // その場合はここで報告 + detach して、以降の呼び出しは DirectML へ。
-            if pool.is_dead() {
-                self.report_worker_died(format!("load_model({kind:?}): {e}"));
-            }
-            return Err(AiError::Ort(format!("worker.load_model({kind:?}): {e}")));
-        }
-        match pool.infer(kind, input) {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                if pool.is_dead() {
-                    self.report_worker_died(format!("infer({kind:?}): {e}"));
-                }
-                Err(AiError::Ort(format!("worker.infer({kind:?}): {e}")))
-            }
-        }
+    ) -> super::trt_worker_lifecycle::TrtRouteGeneration {
+        self.trt_worker_lifecycle.route_generation(kind)
+    }
+
+    pub fn trt_route_or_begin(
+        &self,
+        kind: ModelKind,
+    ) -> super::trt_worker_lifecycle::TrtInferenceRoute {
+        self.trt_worker_lifecycle.route_or_begin(kind)
     }
 
     /// 指定モデルのセッションがロード済みか確認する。
@@ -883,8 +780,7 @@ mod tests {
                 dll_path: PathBuf::from("fake-onnxruntime.dll"),
                 fallback_reason: None,
             },
-            worker_pool: Mutex::new(None),
-            worker_notice: Mutex::new(None),
+            trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
         }
     }
 
