@@ -1,6 +1,6 @@
 # 永続コレクション Phase 5: Remote 読み取り専用統合計画
 
-状態: **独立設計レビュー合意済み・製品実装開始可（製品未実装）**
+状態: **製品実装・独立 source review・focused / full / static gate 完了。verification build は既存 resident を停止しないため保留**
 
 作成日: 2026-09-15
 
@@ -648,3 +648,60 @@ child内部順、current Remote公開scopeと二重path検証、full prepared se
 pending、Page / AI bridgeのcancel / retire handleを一つのtyped resource bundleとして所有させ、明示final処理を
 通らないDropだけでも全resourceをterminal化して一回だけACKできることを直接回帰する。この条件を満たすまで
 outer ownerはserver worker drainへ進まない。
+
+## 16. 製品実装・独立 completion review checkpoint（2026-09-16）
+
+protocolを56へ更新し、既存aggregate `CollectionKind`とは別に、名前付き永続collectionのcatalog、snapshot、
+latest navigationをtyped IPC / HTTPへ接続した。Remoteは同じ`CollectionStoreRuntime` actorのimmutable snapshotと
+`prepare_collection_snapshot`を使い、Manual / StandardのPC有効順、missing / blocked row、root direct mediaと
+container childを分けて表示する。create / edit / sort write APIは追加していない。
+
+requestはRemote session operation、producer lease、collection / catalog revision watch、deadline、request cancelを
+一つのcurrent predicateで監視する。wire factsはactual kindとRemote path policyを一回だけ検査し、streaming digestと
+64 MiB未満のdisplay-unit境界prefixをO(N)で作る。truncated prefix外targetはroot配列へ追加せずsparse viewer ownerが
+ordinal / totalとstable identityを持つ。First / Last / ordinal locate / next / prev / video・audio EOFは同じRemote有効列と
+Phase 4 pure resolverを使い、partner片側消失、ID→source identity→head、Stop / Loopへ収束する。
+
+browserは`Root / DirectViewer / Child / Inactive`とsession epoch / route sequenceを持つownerへ統一した。catalog、snapshot、
+deep locate、archive conversion、navigation replyはcurrent ownerだけがinstallし、session交代時は過去history entryの
+source fallback / return originもepoch不一致で無効になる。Folder / ZIP / PDF / convertible archiveは既存child routeへ
+合流し、Back時だけlatest rootでentry ID→source identityを解く。通常folder、aggregate、AI、HLS、password、conversionの
+既存経路は維持した。
+
+終了はApp final入口でpublic/session admissionを不可逆に止め、App所有のpending UI reply、bookmark write、video stateを
+`RemoteAppDrainLease::Drop`でterminal化してACKする。`run_native`復帰後だけserver worker、collection producer、actorを
+順にdrain / joinする。`CollectionRemoteProducerControl`は単一close channelで全leaseをwakeし、Closing後の要求を拒否し、
+最後のlease Dropまでprocess-final drainを完了しない。creator未install / App Drop fallbackも同じ一回だけの経路を使う。
+
+独立Sol / xhigh reviewerは設計review後、revision / delete race、route / session ABA、response budget、Remote path / actual
+kind二重検証、sparse viewer、spread anchor、ordinal seek、EOF terminal、child return、catalog owner、App / producer drainを
+反復して照合した。completion coverageとして、複数producer leaseのclose wake / last-Drop drainと、Drop-only App bundleの
+pending read / bookmark write / video Opening terminal / duplicate ACK拒否を実owner・counterで追加し、最終sourceに
+**blocking / should-fixなし**と承認した。
+
+focusedはpersistent resolver **6 / 6**、collection actor **18 / 18**、session lifecycle **43 / 43**、pipe **17 / 17**、
+Remote UI **28 / 28**に加え、上記completion ownership回帰 **各1 / 1**、remote-web **122 passed / 0 failed /
+1 ignored**、IPC **57 / 57**、browser runtime **122 / 122**、`node --check`、`mimageviewer-core` checkがexit 0。
+同じsource freezeの`test-full.ps1 -SuppressCrashDialogs`は本体 **8571 passed / 0 failed / 45 ignored**、snapshot
+**52 / 52**、vendor egui / egui-wgpu / eframe **25 / 9 / 15**、exit 0。ログは
+`target/collection-phase5-final-20260916/test-full.{stdout.log,stderr.log,exit.txt}`、SHA-256は順に
+`995162F5E230873A3F4E1A4BA23114258C344601BF1538210F5973A1F32EAE93`、
+`B24BE12EBDCD5FA6F0E74ACB35FF316FDE6BBF34B5AD2CCC0550064C41BC72C7`、
+`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`である。
+
+static gateはfmt、UI glyph、viewer-context audit、diff-checkをfail-fastで実行しexit 0。
+`target/collection-phase5-final-20260916/static.{stdout.log,stderr.log,exit.txt}`のSHA-256は順に
+`2812128CD32AD8EE9E943478B1F1928924CC86E17E63886912B145CA6B094E58`、
+`5299BE0EE001D5AD8AC4EF1A84AB9FB2F1AA31FDF34CD04A769CF34576E58DCB`、
+`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`である。
+
+`scripts/build-dev.ps1 -PreserveRuntime`は、既存`target/dev-runtime/mimageviewer-core.exe` PID 4708を検出し、
+停止せず安全にexit 1とした。ログは`target/collection-phase5-final-20260916/build-dev.{stdout.log,stderr.log,exit.txt}`、
+SHA-256は順に`C2945D9C4B04D2040CD172E1385CB1B2B61856594C3E8A068DC816859827B55F`、
+`7C4D07717EED986304B8D7C3A0F5E93279DF86B2A1833880D87AB3385AD6D84B`、
+`F1B2F662800122BED0FF255693DF89C4487FBDCF453D3524A42D4EC20C3D9C04`。agentはresident停止、GUI、
+通常profile、real dataを使用していない。verification buildだけをresident終了後のhandoffに残す。
+
+バックログ§1.246のZIP混在child順疑いは、本体 / bookmark / 既存Remote container間の既存差である。本Phaseは
+persistent root / outer順だけを追加し、childを既存Remote `enumerate_zip`へ合流させたため症状修正を混ぜていない。
+§1.246でchild materializeを共通化する際も、本Phaseのroot owner / return identityを変更しない。

@@ -16,9 +16,10 @@ use crate::collection_store::{
     CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntryId, CollectionId,
     CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
     CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
-    CollectionRuntimeEvent, CollectionSnapshot, CollectionStoreClient, CollectionStoreError,
-    CollectionStoreRuntime, parse_collection_text, prepare_collection_export,
-    prepare_collection_registrations, serialize_collection_paths, write_collection_export_atomic,
+    CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
+    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime, parse_collection_text,
+    prepare_collection_export, prepare_collection_registrations, serialize_collection_paths,
+    write_collection_export_atomic,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,6 +263,7 @@ impl CollectionDialogOperation {
 
 pub(crate) struct CollectionUiState {
     runtime: Option<CollectionStoreRuntime>,
+    events: Option<CollectionRuntimeEventStream>,
     client: Option<CollectionStoreClient>,
     watch: Option<CollectionRevisionWatch>,
     phase: CollectionRuntimePhase,
@@ -283,6 +285,7 @@ impl Default for CollectionUiState {
     fn default() -> Self {
         Self {
             runtime: None,
+            events: None,
             client: None,
             watch: None,
             phase: CollectionRuntimePhase::Inert,
@@ -310,7 +313,20 @@ impl CollectionUiState {
     fn install_runtime(&mut self, runtime: CollectionStoreRuntime) {
         self.shutdown_for_exit();
         self.client = Some(runtime.client());
+        self.events = Some(runtime.event_stream());
         self.runtime = Some(runtime);
+        self.phase = CollectionRuntimePhase::Starting;
+        self.message = None;
+    }
+
+    fn install_process_owned_runtime(
+        &mut self,
+        client: CollectionStoreClient,
+        events: CollectionRuntimeEventStream,
+    ) {
+        self.shutdown_for_exit();
+        self.client = Some(client);
+        self.events = Some(events);
         self.phase = CollectionRuntimePhase::Starting;
         self.message = None;
     }
@@ -326,6 +342,7 @@ impl CollectionUiState {
         self.catalog_request = None;
         self.snapshot_request = None;
         self.watch = None;
+        self.events = None;
         self.client = None;
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_and_join();
@@ -485,6 +502,15 @@ impl App {
         self.collection_ui.install_runtime(runtime);
     }
 
+    pub(crate) fn install_process_owned_collection_runtime(
+        &mut self,
+        client: CollectionStoreClient,
+        events: CollectionRuntimeEventStream,
+    ) {
+        self.collection_ui
+            .install_process_owned_runtime(client, events);
+    }
+
     pub(crate) fn install_collection_runtime_failure(&mut self, error: CollectionStoreError) {
         self.collection_ui.install_start_failure(error);
     }
@@ -577,9 +603,9 @@ impl App {
     pub(crate) fn poll_collection_ui(&mut self, ctx: &egui::Context) {
         let events = self
             .collection_ui
-            .runtime
+            .events
             .as_ref()
-            .map(|runtime| std::iter::from_fn(|| runtime.try_recv_event()).collect::<Vec<_>>())
+            .map(|events| std::iter::from_fn(|| events.try_recv()).collect::<Vec<_>>())
             .unwrap_or_default();
         for event in events {
             match event {

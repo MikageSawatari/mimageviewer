@@ -7,6 +7,7 @@ mod live_favorites;
 mod long_job;
 mod page_jobs;
 mod path_guard;
+mod persistent_collections;
 mod service;
 mod thumbnail;
 mod video_jump;
@@ -814,15 +815,34 @@ pub(crate) struct RemoteIpcServer {
     _guard: pipe::ServerGuard,
 }
 
+#[derive(Clone)]
+pub(crate) struct RemoteIpcServerControl {
+    #[cfg(windows)]
+    inner: pipe::ServerControl,
+}
+
+impl RemoteIpcServerControl {
+    pub(crate) fn begin_app_exit(&self) {
+        #[cfg(windows)]
+        self.inner.begin_app_exit();
+    }
+}
+
 impl RemoteIpcServer {
-    pub(crate) fn start(settings: crate::settings::Settings) -> Result<Self, String> {
+    pub(crate) fn start(
+        settings: crate::settings::Settings,
+        persistent_collection_producer: Option<
+            crate::collection_store::CollectionRemoteProducerControl,
+        >,
+    ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            return pipe::ServerGuard::start(settings).map(|guard| Self { _guard: guard });
+            return pipe::ServerGuard::start(settings, persistent_collection_producer)
+                .map(|guard| Self { _guard: guard });
         }
         #[cfg(not(windows))]
         {
-            let _ = settings;
+            let _ = (settings, persistent_collection_producer);
             Err("リモート接続は Windows の名前付きパイプ専用です".to_owned())
         }
     }
@@ -831,6 +851,19 @@ impl RemoteIpcServer {
         #[cfg(windows)]
         {
             self._guard.session_handle()
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("remote IPC server is Windows-only")
+        }
+    }
+
+    pub(crate) fn control(&self) -> RemoteIpcServerControl {
+        #[cfg(windows)]
+        {
+            RemoteIpcServerControl {
+                inner: self._guard.control(),
+            }
         }
         #[cfg(not(windows))]
         {

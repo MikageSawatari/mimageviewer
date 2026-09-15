@@ -1378,6 +1378,9 @@ const state = {
   tagBrowse: null,
   tagBrowseLoadError: "",
   tagBrowseFilter: { query: "", kind: "all" },
+  savedCollectionCatalog: null,
+  savedCollectionCatalogError: "",
+  savedCollection: { ownerKind: "inactive", routeSequence: 0 },
   collection: null,
   container: null,
   gridSortState: null,
@@ -1449,6 +1452,167 @@ const state = {
   appUpdateWatchStarted: false,
   appVersionReportedPair: "",
 };
+
+export class PersistentCollectionNavigationQueue {
+  constructor(run, onError = () => {}) {
+    this.run = run;
+    this.onError = onError;
+    this.active = null;
+    this.activeStep = 0;
+    this.pendingDelta = 0;
+    this.intent = null;
+    this.sequence = 0;
+  }
+
+  enqueue(direction, intent) {
+    const step = direction < 0 ? -1 : 1;
+    const sameIntent = this.intent === intent ||
+      (this.intent?.key && this.intent.key === intent?.key);
+    if (this.active && (!sameIntent || this.activeStep !== step)) {
+      this.active.abort();
+      this.active = null;
+      this.activeStep = 0;
+      this.pendingDelta = 0;
+    }
+    this.intent = intent;
+    this.pendingDelta = clamp(this.pendingDelta + step, -32, 32);
+    if (!this.active) this.startNext();
+  }
+
+  cancel() {
+    this.sequence += 1;
+    this.active?.abort();
+    this.active = null;
+    this.activeStep = 0;
+    this.pendingDelta = 0;
+    this.intent = null;
+  }
+
+  startNext() {
+    if (!this.pendingDelta || !this.intent) return;
+    const step = Math.sign(this.pendingDelta);
+    this.pendingDelta -= step;
+    const controller = new AbortController();
+    const ticket = ++this.sequence;
+    this.active = controller;
+    this.activeStep = step;
+    Promise.resolve(this.run(step, this.intent, controller.signal, ticket))
+      .catch((error) => {
+        if (error?.name !== "AbortError") this.onError(error);
+      })
+      .finally(() => {
+        if (this.active !== controller) return;
+        this.active = null;
+        this.activeStep = 0;
+        if (this.pendingDelta) this.startNext();
+        else this.intent = null;
+      });
+  }
+}
+
+const savedCollectionNavigationOwner = new PersistentCollectionNavigationQueue(
+  performPersistentCollectionNavigation,
+  (error) => state.viewer?.showBoundaryMessage(
+    error instanceof Error ? error.message : "次の項目を開けませんでした。"
+  )
+);
+let savedCollectionRouteSequence = 0;
+let savedCollectionRouteRequestSequence = 0;
+
+function savedCollectionRootContext() {
+  const context = state.savedCollection;
+  return context && context.ownerKind !== "inactive" ? context : null;
+}
+
+function deactivateSavedCollectionOwner() {
+  state.savedCollection = {
+    ownerKind: "inactive",
+    routeSequence: ++savedCollectionRouteSequence,
+  };
+}
+
+function savedCollectionChildRouteState() {
+  const context = savedCollectionRootContext();
+  const originIdentity = persistentIdentityOf(state.entries[state.gridIndex]);
+  if (context && originIdentity) {
+    context.returnIdentity = originIdentity;
+    history.replaceState({
+      ...(history.state ?? {}),
+      mivRoute: true,
+      savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+      savedCollectionReturnIdentity: originIdentity,
+    }, "", location.href);
+  }
+  return context ? {
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionChild: {
+      collectionId: context.collectionId,
+      sourceRouteSequence: context.routeSequence,
+      ...(originIdentity ? { originIdentity } : {}),
+    },
+  } : {};
+}
+
+export function immutableRemoteArchiveRouteState(routeState) {
+  const marker = routeState?.savedCollectionChild;
+  if (!marker || typeof marker.collectionId !== "string" ||
+      !Number.isInteger(marker.sourceRouteSequence)) {
+    return {};
+  }
+  const identity = marker.originIdentity;
+  const originIdentity = identity && typeof identity.entry_id === "string" &&
+      typeof identity.source_identity === "string"
+    ? {
+        entry_id: identity.entry_id,
+        source_identity: identity.source_identity,
+      }
+    : null;
+  return {
+    ...(typeof routeState.returnHash === "string"
+      ? { returnHash: routeState.returnHash }
+      : {}),
+    ...(typeof routeState.savedCollectionSessionEpoch === "string"
+      ? { savedCollectionSessionEpoch: routeState.savedCollectionSessionEpoch }
+      : {}),
+    savedCollectionChild: {
+      collectionId: marker.collectionId,
+      sourceRouteSequence: marker.sourceRouteSequence,
+      ...(originIdentity ? { originIdentity } : {}),
+    },
+  };
+}
+
+function prepareSavedCollectionRouteOwner(route) {
+  if (route.kind === "saved_collection") return;
+  const routeState = persistentCollectionHistoryStateForSession(
+    globalThis.history?.state,
+    state.remoteSessionCacheEpoch
+  );
+  state.savedCollection = persistentCollectionRouteOwnerTransition(
+    savedCollectionRootContext(),
+    routeState?.savedCollectionChild,
+    route.kind,
+    ++savedCollectionRouteSequence
+  );
+}
+
+export function persistentCollectionRouteOwnerTransition(
+  context,
+  marker,
+  routeKind,
+  routeSequence
+) {
+  const childRoute = ["folder", "container", "media", "image"].includes(routeKind);
+  if (
+    context && context.ownerKind !== "inactive" && childRoute && marker &&
+    marker.collectionId === context.collectionId &&
+    Number.isInteger(marker.sourceRouteSequence) &&
+    marker.sourceRouteSequence === context.routeSequence
+  ) {
+    return { ...context, ownerKind: "child", routeSequence };
+  }
+  return { ownerKind: "inactive", routeSequence };
+}
 
 let recentPointerSource = { source: "mouse", at: 0 };
 if (!RUNTIME_TEST_MODE) {
@@ -1721,6 +1885,25 @@ export function applyRemoteSessionId(
   // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
+  const previousHistoryState = globalThis.history?.state;
+  if (previousHistoryState && typeof globalThis.history?.replaceState === "function") {
+    globalThis.history.replaceState(
+      historyStateWithoutPersistentCollectionSession(previousHistoryState),
+      "",
+      globalThis.location?.href ?? undefined
+    );
+  }
+  savedCollectionRouteRequestSequence += 1;
+  if (state.requestController) {
+    state.requestController.abort();
+    state.requestController = null;
+  }
+  state.folderContainerLoad = null;
+  savedCollectionNavigationOwner.cancel("session_changed");
+  remoteHomeDataRefreshCoordinator.retireSavedCollectionCatalog();
+  state.savedCollectionCatalog = null;
+  state.savedCollectionCatalogError = "";
+  deactivateSavedCollectionOwner();
   invalidateViewerPendingLoad(state.viewer);
   invalidatePageResources(PageCancelCause.SESSION_INVALIDATED);
   state.imageInfoCache.clear();
@@ -1957,6 +2140,80 @@ async function pingRemoteSession() {
   applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
 }
 
+export class SavedCollectionCatalogRequestOwner {
+  constructor({ requestJson, appState, begin = () => {}, install, fail }) {
+    this.requestJson = requestJson;
+    this.appState = appState;
+    this.begin = begin;
+    this.install = install;
+    this.fail = fail;
+    this.sequence = 0;
+    this.pending = null;
+  }
+
+  sessionEpoch() {
+    return String(this.appState.remoteSessionCacheEpoch ?? "");
+  }
+
+  isCurrent(request) {
+    return this.pending === request && !request.controller.signal.aborted &&
+      this.sequence === request.sequence && this.sessionEpoch() === request.epoch;
+  }
+
+  refresh() {
+    const epoch = this.sessionEpoch();
+    if (this.pending?.epoch === epoch) return this.pending.promise;
+    this.retire();
+    const controller = new AbortController();
+    const request = {
+      epoch,
+      controller,
+      sequence: ++this.sequence,
+      promise: null,
+    };
+    this.begin();
+    request.promise = Promise.resolve(
+      this.requestJson("/api/saved-collections", {}, controller.signal)
+    ).then((data) => {
+      if (!this.isCurrent(request)) return null;
+      return this.install(data);
+    }).catch((error) => {
+      if (!this.isCurrent(request) || error?.name === "AbortError") return null;
+      this.fail(error);
+      return null;
+    }).finally(() => {
+      if (this.pending === request) this.pending = null;
+    });
+    this.pending = request;
+    return request.promise;
+  }
+
+  retire() {
+    this.sequence += 1;
+    this.pending?.controller.abort();
+    this.pending = null;
+  }
+}
+
+export function historyStateWithoutPersistentCollectionSession(historyState) {
+  if (!historyState || typeof historyState !== "object") return historyState ?? null;
+  const {
+    savedCollectionReturnIdentity: _returnIdentity,
+    savedCollectionIdentity: _viewerIdentity,
+    savedCollectionChild: _childOwner,
+    savedCollectionSessionEpoch: _sessionEpoch,
+    ...retained
+  } = historyState;
+  return retained;
+}
+
+export function persistentCollectionHistoryStateForSession(historyState, sessionEpoch) {
+  return typeof sessionEpoch === "string" && sessionEpoch &&
+      historyState?.savedCollectionSessionEpoch === sessionEpoch
+    ? historyState
+    : historyStateWithoutPersistentCollectionSession(historyState);
+}
+
 export function createRemoteHomeDataRefreshCoordinator({
   requestJson,
   appState,
@@ -2005,9 +2262,36 @@ export function createRemoteHomeDataRefreshCoordinator({
           error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
       },
     },
+    {
+      key: "saved_collections",
+      endpoint: "/api/saved-collections",
+      install(data) {
+        appState.savedCollectionCatalog = data;
+        appState.savedCollectionCatalogError = "";
+        if (appState.screenContext === "home" && appState.homeTab === "collections") {
+          renderHomeScreen("collections");
+        }
+        return data;
+      },
+      handleInitialFailure(error) {
+        appState.savedCollectionCatalogError =
+          error instanceof Error ? error.message : "コレクションを読み込めませんでした。";
+      },
+    },
   ]);
+  const catalogTarget = targets.find((target) => target.key === "saved_collections");
+  const savedCollectionCatalogOwner = new SavedCollectionCatalogRequestOwner({
+    requestJson,
+    appState,
+    begin: () => {
+      appState.savedCollectionCatalogError = "";
+    },
+    install: (data) => catalogTarget.install(data),
+    fail: (error) => catalogTarget.handleInitialFailure(error),
+  });
 
   function refresh(target) {
+    if (target === catalogTarget) return savedCollectionCatalogOwner.refresh();
     const existing = pendingByTarget.get(target.key);
     if (existing) return existing;
 
@@ -2043,6 +2327,12 @@ export function createRemoteHomeDataRefreshCoordinator({
       }
     },
     refreshAfterSessionAcquire,
+    refreshSavedCollectionCatalog() {
+      return savedCollectionCatalogOwner.refresh();
+    },
+    retireSavedCollectionCatalog() {
+      savedCollectionCatalogOwner.retire();
+    },
   };
 }
 
@@ -2319,7 +2609,9 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 
 async function dispatchRoute() {
   if (!state.authenticated) return;
+  savedCollectionNavigationOwner.cancel("route_changed");
   const route = parseRoute(location.hash);
+  prepareSavedCollectionRouteOwner(route);
   if (
     state.screenContext === "viewer" &&
     route.kind !== "media" &&
@@ -2335,6 +2627,10 @@ async function dispatchRoute() {
     }
     if (route.kind === "collection") {
       await showCollection(route);
+      return;
+    }
+    if (route.kind === "saved_collection") {
+      await showSavedCollection(route);
       return;
     }
     if (route.kind === "search") {
@@ -2428,12 +2724,14 @@ export function parseRoute(hash) {
   if (hash === "#favorites") {
     return { kind: "home", tab: "favorites" };
   }
-  const home = hash.match(/^#home\/(favorites|smart|places|search|tags)$/);
+  const home = hash.match(/^#home\/(favorites|smart|places|search|tags|collections)$/);
   if (home) {
     return { kind: "home", tab: home[1] };
   }
   const collection = parseCollectionRoute(hash);
   if (collection) return collection;
+  const savedCollection = parseSavedCollectionRoute(hash);
+  if (savedCollection) return savedCollection;
   const search = hash.match(/^#search\/(all|folder|zip|pdf)\/(.*)$/);
   if (search) {
     try {
@@ -2770,6 +3068,8 @@ function dispatchCommand(requested, meta = {}) {
   ) {
     const tab = state.collection?.kind === "smart"
       ? "smart"
+      : state.collection?.kind === "saved_collection" || savedCollectionRootContext()
+        ? "collections"
       : state.collection?.kind === "favorite_search"
         ? "search"
       : state.collection?.kind === "tag_items"
@@ -2811,7 +3111,11 @@ function dispatchCommand(requested, meta = {}) {
     } else if (state.viewer?.isVideoStreamViewer) {
       if (requested.name === CommandName.NEXT_PAGE) {
         const endingViewer = state.viewer;
-        const result = changeVideoFile(1, Boolean(requested.payload.wrap));
+        const result = changeVideoFile(
+          1,
+          Boolean(requested.payload.wrap),
+          meta.detail === "video_ended"
+        );
         handled = result.handled;
         if (
           meta.detail === "video_ended" &&
@@ -2825,9 +3129,23 @@ function dispatchCommand(requested, meta = {}) {
       } else handled = state.viewer.execute(requested);
     } else if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
-    else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
+    else if (requested.name === CommandName.FIRST_PAGE) {
+      handled = enqueuePersistentCollectionNavigation(
+        -1,
+        "still_image",
+        "stop",
+        null,
+        "first"
+      ) || changeImageTo(0);
+    }
     else if (requested.name === CommandName.LAST_PAGE) {
-      handled = changeImageTo(state.pageGroups.length - 1);
+      handled = enqueuePersistentCollectionNavigation(
+        1,
+        "still_image",
+        "stop",
+        null,
+        "last"
+      ) || changeImageTo(state.pageGroups.length - 1);
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
       handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
     } else if (requested.name === CommandName.SET_RATING) {
@@ -2967,8 +3285,14 @@ function executeOpenCommand(payload, meta) {
     );
     state.archiveOpenController = controller;
     meta.openRoute = "archive_job";
+    const readyRouteState = savedCollectionRootContext()
+      ? immutableRemoteArchiveRouteState({
+          returnHash: state.gridHash,
+          ...savedCollectionChildRouteState(),
+        })
+      : {};
     controller
-      .open(payload.address, payload.name || "アーカイブ")
+      .open(payload.address, payload.name || "アーカイブ", readyRouteState)
       .catch((error) => controller.showRequestError(error));
     return true;
   }
@@ -2981,12 +3305,16 @@ function executeOpenCommand(payload, meta) {
   }
   if (payload.kind === "favorite" || payload.kind === "folder") {
     meta.openRoute = payload.kind;
-    navigate(folderHash(payload.path));
+    navigate(folderHash(payload.path), savedCollectionRootContext()
+      ? { returnHash: state.gridHash, ...savedCollectionChildRouteState() }
+      : {});
     return true;
   }
   if (payload.kind === "container" && payload.address) {
     meta.openRoute = "container";
-    navigate(containerHash(payload.address));
+    navigate(containerHash(payload.address), savedCollectionRootContext()
+      ? { returnHash: state.gridHash, ...savedCollectionChildRouteState() }
+      : {});
     return true;
   }
   const addressedMediaEntry = payload.kind === "media" && payload.address
@@ -3024,6 +3352,8 @@ function executeOpenCommand(payload, meta) {
     }
     meta.openRoute = `media_${mediaRoute}`;
     tryEnterBrowserFullscreen();
+    const savedEntryId = addressedEntry?.persistent_identity?.entry_id ?? "";
+    const persistentContext = savedCollectionRootContext();
     history.pushState(
       {
         mivRoute: true,
@@ -3031,9 +3361,15 @@ function executeOpenCommand(payload, meta) {
         viewerFromGrid: true,
         viewerDepth: 1,
         returnHash: state.gridHash,
+        ...(persistentContext ? savedCollectionChildRouteState() : {}),
+        ...(savedEntryId ? {
+          savedCollectionIdentity: addressedEntry.persistent_identity,
+        } : {}),
       },
       "",
-      mediaHash(payload.address)
+      savedEntryId && persistentContext
+        ? savedCollectionHash(persistentContext.collectionId, savedEntryId)
+        : mediaHash(payload.address)
     );
     const renderedViewer = renderResolvedMediaOpen(
       mediaRoute,
@@ -3044,6 +3380,11 @@ function executeOpenCommand(payload, meta) {
     if (renderedViewer === "rejected") {
       meta.openRoute = "video_viewer_entry_rejected";
       return false;
+    }
+    if (savedEntryId && persistentContext) {
+      persistentContext.ownerKind = "direct_viewer";
+      persistentContext.routeSequence = ++savedCollectionRouteSequence;
+      persistentContext.returnIdentity = addressedEntry.persistent_identity;
     }
     return true;
   }
@@ -3118,6 +3459,7 @@ function openFolderImageFromGrid(payload, meta) {
       viewerFromGrid: true,
       viewerDepth: 1,
       returnHash,
+      ...savedCollectionChildRouteState(),
     },
     "",
     pageAddress.subresource.kind === "file"
@@ -3174,7 +3516,7 @@ export async function activateFolderContainerForImage(pageAddress, gridIndex) {
 
 function openGridEntry(index, meta) {
   const entry = state.entries[index];
-  if (!entry) return false;
+  if (!entry || entry.unavailable) return false;
   const path = entryPath(entry);
   if (entryIsFolder(entry)) {
     return executeOpenCommand(
@@ -3359,7 +3701,7 @@ function rememberParentGridReturnTarget(targetHash) {
     ? containerParentHash(state.container.address)
     : targetHash;
   const targetKind = parseRoute(returnContext).kind;
-  if (!["folder", "container", "collection"].includes(targetKind)) return;
+  if (!["folder", "container", "collection", "saved_collection"].includes(targetKind)) return;
   const currentAddress = state.container?.address ?? (
     !state.collection && state.folderPath
       ? {
@@ -3424,10 +3766,11 @@ function cleanupScreen(preserveRequestController = null) {
 function renderHome(tab = "places") {
   cleanupScreen();
   state.screenContext = "home";
-  state.homeTab = ["favorites", "smart", "places", "search", "tags"].includes(tab)
+  state.homeTab = ["favorites", "smart", "places", "search", "tags", "collections"].includes(tab)
     ? tab
     : "places";
   state.collection = null;
+  deactivateSavedCollectionOwner();
   state.container = null;
   exitBrowserFullscreen();
   document.title = "mIV Remote";
@@ -3449,6 +3792,7 @@ function renderHome(tab = "places") {
   else if (state.homeTab === "smart") renderSmartFolderTab(content);
   else if (state.homeTab === "search") renderFavoriteSearchTab(content);
   else if (state.homeTab === "tags") renderTagBrowseTab(content);
+  else if (state.homeTab === "collections") renderSavedCollectionCatalogTab(content);
   else renderPlacesTab(content);
   screen.append(content);
   state.commandMenu = new CommandMenu(screen, "home");
@@ -3464,6 +3808,7 @@ function createHomeTabs(active) {
     ["places", "場所"],
     ["search", "検索"],
     ["tags", "タグ"],
+    ["collections", "コレクション"],
   ]) {
     const button = textElement("button", label, "home-tab");
     button.type = "button";
@@ -4464,6 +4809,414 @@ export function normalizeFinalCoverSpreadPreference(value) {
     : "follow_global";
 }
 
+export function persistentCollectionIdentityKey(identity) {
+  if (!identity || typeof identity.entry_id !== "string" ||
+      typeof identity.source_identity !== "string") return "";
+  return `saved:${identity.entry_id}:${identity.source_identity}`;
+}
+
+export function normalizePersistentCollectionEntry(entry) {
+  const identity = {
+    entry_id: String(entry?.entry_id ?? ""),
+    source_identity: String(entry?.source_identity ?? ""),
+  };
+  const stateName = String(entry?.state?.state ?? "");
+  const base = {
+    name: String(entry?.name ?? ""),
+    persistent_identity: identity,
+    persistent_state: stateName,
+  };
+  if (stateName === "available" && entry.state.address && entry.state.kind) {
+    return {
+      ...base,
+      kind: entry.state.kind,
+      address: entry.state.address,
+      ...(entry.state.thumbnail_address
+        ? { thumbnail_address: entry.state.thumbnail_address }
+        : {}),
+      ...(entry.state.detail ? { detail: entry.state.detail } : {}),
+      ...(Number.isInteger(entry.state.rating) ? { rating: entry.state.rating } : {}),
+    };
+  }
+  return {
+    ...base,
+    kind: "persistent_unavailable",
+    unavailable: true,
+    unavailable_reason: stateName,
+    last_known_kind: entry?.state?.last_known_kind ?? null,
+  };
+}
+
+export function normalizePersistentCollectionPageGroups(groups, entries) {
+  const byIdentity = new Map(
+    entries.map((entry) => [persistentCollectionIdentityKey(entry.persistent_identity), entry])
+  );
+  return (groups ?? []).map((group) => {
+    const pages = (group.pages ?? []).map((slot) => {
+      const key = persistentCollectionIdentityKey(slot);
+      const entry = byIdentity.get(key) ?? {
+        name: "コレクション項目",
+        kind: "image",
+        address: slot.address,
+        persistent_identity: {
+          entry_id: slot.entry_id,
+          source_identity: slot.source_identity,
+        },
+      };
+      return { entry, role: slot.role ?? "navigation" };
+    });
+    const anchor = byIdentity.get(persistentCollectionIdentityKey(group.anchor)) ??
+      pages[0]?.entry;
+    if (!anchor || !pages.length) return null;
+    return {
+      anchor,
+      navigationEntries: pages.map(({ entry }) => entry),
+      presentationSlots: pages,
+      slice: Object.values(PageSlice).includes(group.slice) ? group.slice : PageSlice.FULL,
+      singletonPlacement: ["left", "right"].includes(group.singleton_placement)
+        ? group.singleton_placement
+        : "center",
+    };
+  }).filter(Boolean);
+}
+
+function persistentCollectionSortState(order) {
+  if (order?.kind === "standard") {
+    return {
+      selected: order.value,
+      options: [{
+        value: order.value,
+        label: order.label,
+        short_label: order.short_label,
+      }],
+      locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+    };
+  }
+  return {
+    selected: "manual",
+    options: [{ value: "manual", label: "手動順", short_label: "手動" }],
+    locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+  };
+}
+
+async function showSavedCollection(route) {
+  const previousContext = savedCollectionRootContext();
+  const carriedReturnIdentity = previousContext?.collectionId === route.collectionId
+    ? previousContext.returnIdentity
+    : null;
+  renderLoading("コレクションを読み込んでいます");
+  const forceSinglePage = containerForceSinglePage();
+  state.requestController?.abort();
+  const controller = new AbortController();
+  const requestSequence = ++savedCollectionRouteRequestSequence;
+  const cacheEpoch = state.remoteSessionCacheEpoch;
+  const expectedHash = savedCollectionHash(route.collectionId, route.entryId);
+  state.requestController = controller;
+  const data = await apiJson("/api/saved-collection", {
+    id: route.collectionId,
+    spread: state.spreadMode,
+    direction: state.readingDirection,
+    single: forceSinglePage ? 1 : 0,
+  }, controller.signal);
+  if (!persistentCollectionRouteRequestIsCurrent({
+    aborted: controller.signal.aborted,
+    controllerMatches: state.requestController === controller,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    requestSequence: savedCollectionRouteRequestSequence,
+    expectedRequestSequence: requestSequence,
+    routeHash: location.hash,
+    expectedRouteHash: expectedHash,
+  })) return;
+  applyPersistentCollectionSnapshot(data, forceSinglePage);
+  const routeHistory = persistentCollectionHistoryStateForSession(
+    globalThis.history?.state,
+    state.remoteSessionCacheEpoch
+  );
+  const returnIdentity = carriedReturnIdentity ?? routeHistory?.savedCollectionReturnIdentity;
+  const returnSelection = persistentCollectionReturnSelection(
+    state.entries,
+    returnIdentity,
+    Boolean(state.collection?.truncated)
+  );
+  const returnIndex = returnSelection.index;
+  const returnOutsidePrefix = returnSelection.outsidePrefix;
+  if (returnIndex >= 0) state.gridIndex = returnIndex;
+  else if (returnIdentity) state.gridIndex = -1;
+  if (route.entryId) {
+    const index = state.entries.findIndex(
+      (entry) => entry.persistent_identity?.entry_id === route.entryId && !entry.unavailable
+    );
+    if (index >= 0 && openGridEntry(index, { at: performance.now() })) return;
+    const historicalIdentity = routeHistory?.savedCollectionIdentity;
+    if (await locatePersistentCollectionRouteTarget(
+      route,
+      persistentCollectionIdentityKey(historicalIdentity) &&
+        historicalIdentity.entry_id === route.entryId
+        ? historicalIdentity
+        : null,
+      {
+        controller,
+        cacheEpoch,
+        requestSequence,
+        expectedHash,
+      }
+    )) return;
+    history.replaceState({ mivRoute: true }, "", state.gridHash);
+  }
+  renderFolder();
+  if (returnOutsidePrefix && state.gridActionNotice) {
+    state.gridActionNotice.textContent = "一覧上限外の項目です。";
+    state.gridActionNotice.hidden = false;
+  }
+}
+
+export function persistentCollectionRouteRequestIsCurrent({
+  aborted,
+  controllerMatches,
+  cacheEpoch,
+  expectedCacheEpoch,
+  requestSequence,
+  expectedRequestSequence,
+  routeHash,
+  expectedRouteHash,
+}) {
+  return !aborted && controllerMatches && cacheEpoch === expectedCacheEpoch &&
+    requestSequence === expectedRequestSequence && routeHash === expectedRouteHash;
+}
+
+export function persistentCollectionEntryIndexByIdentity(entries, identity) {
+  if (!persistentCollectionIdentityKey(identity)) return -1;
+  const byId = entries.findIndex(
+    (entry) => entry?.persistent_identity?.entry_id === identity.entry_id
+  );
+  if (byId >= 0) return byId;
+  return entries.findIndex(
+    (entry) => entry?.persistent_identity?.source_identity === identity.source_identity
+  );
+}
+
+export function persistentCollectionReturnSelection(entries, identity, truncated) {
+  if (!identity) return { index: -1, outsidePrefix: false };
+  const index = persistentCollectionEntryIndexByIdentity(entries, identity);
+  return {
+    index,
+    outsidePrefix: index < 0 && Boolean(truncated),
+  };
+}
+
+async function locatePersistentCollectionRouteTarget(route, identity, requestOwner) {
+  const context = savedCollectionRootContext();
+  if (!context || context.collectionId !== route.collectionId) return false;
+  const { controller, cacheEpoch, requestSequence, expectedHash } = requestOwner;
+  const signal = controller.signal;
+  const routeSequence = context.routeSequence;
+  const response = await apiPostJson("/api/saved-collection/navigate", {
+    collection_id: context.collectionId,
+    presented_revision: context.collectionRevision,
+    presented_view_token: context.viewToken,
+    anchor: identity ? { primary: identity } : null,
+    locate_entry_id: route.entryId,
+    locate_ordinal: null,
+    direction: "current",
+    target_kind: "navigable_media",
+    tail: "stop",
+    viewer_sequence: state.viewerItemStateSequence,
+    spread_mode: state.spreadMode,
+    reading_direction: state.readingDirection,
+    force_single_page: state.forceSinglePage,
+  }, signal);
+  if (!persistentCollectionRouteRequestIsCurrent({
+    aborted: signal.aborted,
+    controllerMatches: state.requestController === controller,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    requestSequence: savedCollectionRouteRequestSequence,
+    expectedRequestSequence: requestSequence,
+    routeHash: location.hash,
+    expectedRouteHash: expectedHash,
+  }) || savedCollectionRootContext()?.routeSequence !== routeSequence) return false;
+  if (response.result !== "landed" || !response.target) return false;
+  if (response.replacement) {
+    applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage);
+  }
+  const current = savedCollectionRootContext();
+  if (!current || current.collectionId !== route.collectionId) return false;
+  current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
+  current.viewToken = String(response.exact_view_token ?? current.viewToken);
+  const targetPosition = persistentCollectionTargetPosition(
+    response.target_ordinal,
+    response.target_count
+  );
+  const target = response.target;
+  if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
+    return false;
+  }
+  let identityForHistory;
+  if (target.kind === "direct_image_display_unit") {
+    const index = installPersistentSparseImageTarget(target.group, targetPosition);
+    if (index < 0) return false;
+    identityForHistory = state.images[index].persistent_identity;
+    current.returnIdentity = identityForHistory;
+    history.replaceState({
+      ...(history.state ?? {}),
+      mivRoute: true,
+      savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+      savedCollectionIdentity: identityForHistory,
+      returnHash: savedCollectionHash(current.collectionId),
+    }, "", savedCollectionHash(current.collectionId, identityForHistory.entry_id));
+    renderImageViewer(index, performance.now());
+    return true;
+  }
+  identityForHistory = target.identity;
+  current.ownerKind = "direct_viewer";
+  current.routeSequence = ++savedCollectionRouteSequence;
+  current.sparsePosition = targetPosition;
+  current.returnIdentity = identityForHistory;
+  history.replaceState({
+    ...(history.state ?? {}),
+    mivRoute: true,
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionIdentity: identityForHistory,
+    returnHash: savedCollectionHash(current.collectionId),
+  }, "", savedCollectionHash(current.collectionId, identityForHistory.entry_id));
+  renderVideoViewer({
+    name: `${persistentAddressDisplayName(target.address)} · ${targetPosition.label}`,
+    kind: target.kind === "direct_audio" ? "audio" : "video",
+    address: target.address,
+    persistent_identity: identityForHistory,
+  });
+  return true;
+}
+
+function applyPersistentCollectionSnapshot(data, forceSinglePage, options = {}) {
+  const baseHash = savedCollectionHash(data.collection_id);
+  const entries = (data.entries ?? []).map(normalizePersistentCollectionEntry);
+  state.savedCollection = {
+    ownerKind: options.ownerKind ?? "root",
+    collectionId: data.collection_id,
+    collectionRevision: Number(data.collection_revision) || 0,
+    viewToken: String(data.view_token ?? ""),
+    imageCount: Math.max(0, Number(data.image_count) || 0),
+    routeSequence: ++savedCollectionRouteSequence,
+  };
+  state.collection = {
+    kind: "saved_collection",
+    value: data.collection_id,
+    title: data.title ?? "コレクション",
+    truncated: Boolean(data.truncated),
+    entryLimit: Number(data.entry_limit) || 0,
+    emptyMessage: "このコレクションには表示できる項目がありません。",
+  };
+  state.container = null;
+  state.gridSortState = persistentCollectionSortState(data.order);
+  state.gridSortScope = null;
+  state.gridReturnHash = homeHash("collections");
+  state.gridHash = baseHash;
+  state.favoriteName = data.title ?? "コレクション";
+  state.folderPath = "";
+  state.thumbAspectHeightRatio = 1;
+  state.entries = entries;
+  state.images = entries.filter((entry) => entry.kind === "image");
+  state.spreadMode = data.configured_spread_mode ?? SpreadMode.SINGLE;
+  state.effectiveSpreadMode = data.effective_spread_mode ?? SpreadMode.SINGLE;
+  state.readingDirection = data.reading_direction ?? ReadingDirection.LTR;
+  state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.forceSinglePage = Boolean(forceSinglePage);
+  setContainerPageGroups([], normalizePersistentCollectionPageGroups(data.page_groups, entries));
+  state.savedCollection.rootBinding = {
+    entries,
+    images: state.images,
+    pageGroups: state.pageGroups,
+  };
+  state.gridIndex = options.preserveGridIndex
+    ? clamp(state.gridIndex, 0, Math.max(0, entries.length - 1))
+    : 0;
+}
+
+function renderSavedCollectionCatalogTab(content) {
+  const catalog = state.savedCollectionCatalog;
+  if (!catalog && !state.savedCollectionCatalogError) {
+    content.append(textElement("p", "コレクションを読み込んでいます…", "empty-state"));
+    loadSavedCollectionCatalog().catch(() => {});
+    return;
+  }
+  if (state.savedCollectionCatalogError) {
+    content.append(textElement("p", state.savedCollectionCatalogError, "empty-state"));
+    const retry = textElement("button", "再読み込み", "icon-button");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      state.savedCollectionCatalogError = "";
+      state.savedCollectionCatalog = null;
+      renderHome("collections");
+      remoteHomeDataRefreshCoordinator.refreshSavedCollectionCatalog().catch(() => {});
+    });
+    content.append(retry);
+    return;
+  }
+  const rows = catalog?.collections ?? [];
+  if (catalog?.truncated) {
+    content.append(textElement(
+      "p",
+      persistentCollectionCatalogTruncationText(catalog),
+      "thumbnail-service-notice"
+    ));
+  }
+  if (!rows.length) {
+    content.append(
+      textElement(
+        "p",
+        "コレクションはまだありません。mIV 本体で作成・編集できます。",
+        "empty-state"
+      )
+    );
+    return;
+  }
+  const list = element("div", "favorite-list");
+  for (const row of rows) {
+    const button = homeCard("▤", row.name || "コレクション");
+    button.addEventListener("click", () =>
+      navigate(savedCollectionHash(row.collection_id), {
+        returnHash: homeHash("collections"),
+      })
+    );
+    list.append(button);
+  }
+  content.append(list);
+}
+
+export function persistentCollectionCatalogTruncationText(catalog) {
+  if (!catalog?.truncated) return "";
+  const count = Math.max(0, Number(catalog.limit) || (catalog.collections ?? []).length);
+  return `件数が多いため先頭 ${count} 件を表示しています。`;
+}
+
+async function loadSavedCollectionCatalog() {
+  await remoteHomeDataRefreshCoordinator.refreshSavedCollectionCatalog();
+  if (state.screenContext === "home" && state.homeTab === "collections") {
+    renderHome("collections");
+  }
+}
+
+export function savedCollectionHash(collectionId, entryId = "") {
+  const root = `#saved-collection/${encodeURIComponent(collectionId)}`;
+  return entryId ? `${root}/entry/${encodeURIComponent(entryId)}` : root;
+}
+
+function parseSavedCollectionRoute(hash) {
+  const match = hash.match(/^#saved-collection\/([^/]+)(?:\/entry\/([^/]+))?$/);
+  if (!match) return null;
+  try {
+    const collectionId = decodeURIComponent(match[1]);
+    const entryId = match[2] ? decodeURIComponent(match[2]) : "";
+    if (!/^[0-9a-fA-F-]{36}$/.test(collectionId)) return null;
+    if (entryId && !/^[0-9a-fA-F-]{36}$/.test(entryId)) return null;
+    return { kind: "saved_collection", collectionId, entryId };
+  } catch {
+    return null;
+  }
+}
+
 export function normalizeSingletonSpreadPlacementPreference(value) {
   return ["follow_global", "place", "center"].includes(value)
     ? value
@@ -4642,7 +5395,34 @@ function captureViewerPageGroupRequest(
   };
 }
 
-function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
+function currentPersistentImagePosition() {
+  const context = persistentDirectViewerContext();
+  if (!context) return null;
+  if (context.sparsePosition) return context.sparsePosition;
+  const anchorIdentity = persistentIdentityOf(currentPageGroup()?.anchor);
+  const prefixImages = context.rootBinding?.images ?? [];
+  const ordinal = persistentCollectionEntryIndexByIdentity(prefixImages, anchorIdentity);
+  return ordinal >= 0
+    ? persistentCollectionTargetPosition(ordinal, context.imageCount)
+    : null;
+}
+
+function viewerSeekSnapshot(groupIndex = state.pageGroupIndex, persistentOrdinal = null) {
+  const currentPersistentPosition = currentPersistentImagePosition();
+  const persistentPosition = currentPersistentPosition && persistentOrdinal !== null
+    ? persistentCollectionTargetPosition(persistentOrdinal, currentPersistentPosition.count)
+    : currentPersistentPosition;
+  if (persistentPosition) {
+    return {
+      visible: persistentPosition.count > 1,
+      min: 0,
+      max: Math.max(0, persistentPosition.count - 1),
+      value: persistentPosition.ordinal,
+      groupIndex: persistentPosition.ordinal,
+      direction: state.readingDirection,
+      label: persistentPosition.label,
+    };
+  }
   const seekState = viewerSeekState({
     groupPageIndexes: state.seekPageGroups,
     currentGroupIndex: groupIndex,
@@ -5183,8 +5963,9 @@ function shouldForceSinglePageForViewport() {
 
 function requestSpreadMode(mode) {
   const collectionRoute = refreshableCollectionRoute();
+  const persistentContext = persistentDirectViewerContext();
   if (
-    (!state.container && !collectionRoute) ||
+    (!state.container && !collectionRoute && !persistentContext) ||
     !Object.values(SpreadMode).includes(mode)
   ) return false;
   // **書き込み先は、こちらが要求した場所ではなく本体が実際に開いた場所。**
@@ -5202,18 +5983,20 @@ function requestSpreadMode(mode) {
     viewportHeight: window.innerHeight,
   });
   const writeRequest = spreadIntent.writeRequest;
-  if (!writeRequest) return false;
-  const readingDirection = writeRequest.reading_direction;
+  if (!writeRequest && !persistentContext) return false;
+  const readingDirection = writeRequest?.reading_direction ?? spreadIntent.readingDirection;
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
+    : persistentContext
+      ? savedCollectionHash(persistentContext.collectionId)
     : activeSpreadContextIdentity();
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
   spreadWriteTail = spreadWriteTail.then(async () => {
     let writeError = null;
-    if (!collectionRoute) {
+    if (!collectionRoute && !persistentContext) {
       try {
         await apiAddressPostJson("/api/write", writeRequest);
       } catch (error) {
@@ -5326,6 +6109,22 @@ function refreshContainerSpread(
   renderTrigger = "spread_refresh",
   requested = {}
 ) {
+  if (persistentDirectViewerContext()) {
+    state.forceSinglePage = Boolean(forceSinglePage);
+    if (requested.spreadMode) state.spreadMode = requested.spreadMode;
+    if (requested.readingDirection) state.readingDirection = requested.readingDirection;
+    const accepted = enqueuePersistentCollectionNavigation(
+      1,
+      "still_image",
+      "stop",
+      null,
+      "current"
+    );
+    return Promise.resolve(accepted ? {
+      outcome: ViewerGroupLoadOutcome.DISPLAYED,
+      reason: renderTrigger,
+    } : VIEWER_GROUP_LOAD_SUPERSEDED);
+  }
   const collectionRoute = refreshableCollectionRoute();
   if (!state.container && !collectionRoute) {
     return Promise.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
@@ -5372,6 +6171,10 @@ function refreshableCollectionRoute() {
 }
 
 function activeSpreadContextIdentity() {
+  const persistentContext = persistentDirectViewerContext();
+  if (persistentContext) {
+    return savedCollectionHash(persistentContext.collectionId);
+  }
   const collectionRoute = refreshableCollectionRoute();
   if (collectionRoute) {
     return collectionHash(collectionRoute.collectionKind, collectionRoute.value);
@@ -6026,6 +6829,11 @@ export function createGridTile(
   tile.classList.toggle("page-tile", Boolean(state.container) && entry.kind === "image");
   tile.classList.toggle("image-tile", entry.kind === "image");
   tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
+  if (entry.unavailable) {
+    tile.disabled = true;
+    tile.classList.add("grid-unavailable");
+    tile.setAttribute("aria-disabled", "true");
+  }
   tile.addEventListener("focus", () => {
     commandDispatcher(command(CommandName.GRID_SELECT, { index: entryIndex }), {
       source: "keyboard",
@@ -6040,7 +6848,12 @@ export function createGridTile(
   image.decoding = "async";
   image.dataset.telemetryObserved = "true";
 
-  if (entryIsFolder(entry)) {
+  if (entry.unavailable) {
+    preview.append(textElement("span", "!", "file-glyph"));
+    preview.append(
+      textElement("span", persistentUnavailableLabel(entry.unavailable_reason), "type-badge")
+    );
+  } else if (entryIsFolder(entry)) {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
@@ -6159,10 +6972,19 @@ export function createGridTile(
   tile.append(preview, label);
   // Audio and unopened convertible archives have no thumbnail source. Keeping
   // them out of the binding avoids guaranteed-to-fail /api/thumb requests.
-  if (entry.kind !== "audio" && entry.kind !== "archive") {
+  if (!entry.unavailable && entry.kind !== "audio" && entry.kind !== "archive") {
     tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   }
   return tile;
+}
+
+function persistentUnavailableLabel(reason) {
+  return {
+    missing: "見つかりません",
+    unsupported: "未対応",
+    access_error: "アクセス不可",
+    blocked_by_remote_policy: "Remote非公開",
+  }[reason] ?? "利用不可";
 }
 
 function createAudioThumbnailIcon() {
@@ -6222,12 +7044,16 @@ function addressIdentity(address) {
 }
 
 function entryIdentity(entry) {
+  const persistent = persistentCollectionIdentityKey(entry.persistent_identity);
+  if (persistent) return persistent;
   return entry.address
     ? addressIdentity(entry.address)
     : entryPath(entry);
 }
 
 export function gridReturnItemIdentity(entry) {
+  const persistent = persistentCollectionIdentityKey(entry.persistent_identity);
+  if (persistent) return persistent;
   return addressIdentity(entryAddress(entry));
 }
 
@@ -6396,10 +7222,373 @@ export function videoFileTargetIndex(currentIndex, count, delta, wrap = false) {
   return target < 0 ? length - 1 : 0;
 }
 
-function changeVideoFile(delta, wrap = false) {
+function persistentDirectViewerContext() {
+  if (
+    state.screenContext !== "viewer" ||
+    state.container ||
+    state.collection?.kind !== "saved_collection" ||
+    state.savedCollection?.ownerKind !== "direct_viewer"
+  ) return null;
+  return state.savedCollection;
+}
+
+function persistentIdentityOf(entry) {
+  const identity = entry?.persistent_identity;
+  return persistentCollectionIdentityKey(identity) ? { ...identity } : null;
+}
+
+function currentPersistentNavigationAnchor(targetKind) {
+  if (targetKind === "still_image") {
+    const group = currentPageGroup();
+    const primary = persistentIdentityOf(group?.anchor);
+    if (!primary) return null;
+    const partner = pageGroupNavigationEntries(group)
+      .map(persistentIdentityOf)
+      .find((identity) => identity && persistentCollectionIdentityKey(identity) !==
+        persistentCollectionIdentityKey(primary));
+    return { primary, ...(partner ? { partner } : {}) };
+  }
+  const primary = persistentIdentityOf(state.viewer?.entry);
+  return primary ? { primary } : null;
+}
+
+function persistentNavigationIntent(
+  targetKind,
+  tail = "stop",
+  eofTerminal = null,
+  navigationDirection = null,
+  locateOrdinal = null
+) {
+  const context = persistentDirectViewerContext();
+  if (!context) return null;
+  const ordinalLocator = locateOrdinal === null
+    ? null
+    : persistentCollectionOrdinalLocator(locateOrdinal);
+  if (locateOrdinal !== null && !ordinalLocator) return null;
+  return {
+    key: `${context.collectionId}:${context.routeSequence}:${targetKind}:${tail}:${navigationDirection ?? "step"}:${locateOrdinal ?? "anchor"}`,
+    targetKind,
+    tail,
+    eofTerminal,
+    navigationDirection,
+    locateOrdinal: ordinalLocator?.locate_ordinal ?? null,
+  };
+}
+
+export function persistentCollectionOrdinalLocator(ordinal) {
+  const value = Number(ordinal);
+  if (!Number.isSafeInteger(value) || value < 0) return null;
+  return {
+    direction: "current",
+    locate_entry_id: null,
+    locate_ordinal: value,
+  };
+}
+
+function enqueuePersistentCollectionNavigation(
+  delta,
+  targetKind,
+  tail = "stop",
+  eofTerminal = null,
+  navigationDirection = null,
+  locateOrdinal = null
+) {
+  const intent = persistentNavigationIntent(
+    targetKind,
+    tail,
+    eofTerminal,
+    navigationDirection,
+    locateOrdinal
+  );
+  if (!intent) return false;
+  savedCollectionNavigationOwner.enqueue(delta, intent);
+  return true;
+}
+
+function sparseImageEntries(group) {
+  return (group?.pages ?? []).map((slot) => ({
+    name: persistentAddressDisplayName(slot.address),
+    kind: "image",
+    address: slot.address,
+    persistent_identity: {
+      entry_id: slot.entry_id,
+      source_identity: slot.source_identity,
+    },
+  }));
+}
+
+function persistentAddressDisplayName(address) {
+  const path = String(address?.path ?? "");
+  const subresource = address?.subresource ?? {};
+  const value = subresource.entry_name ?? subresource.prefix ?? path;
+  const parts = String(value).replaceAll("\\", "/").split("/").filter(Boolean);
+  return parts.at(-1) ?? "コレクション項目";
+}
+
+export function persistentCollectionTargetPosition(ordinal, count) {
+  const safeCount = Math.max(1, Number(count) || 1);
+  const safeOrdinal = clamp(Number(ordinal) || 0, 0, safeCount - 1);
+  return {
+    ordinal: safeOrdinal,
+    count: safeCount,
+    label: `${safeOrdinal + 1} / ${safeCount}`,
+  };
+}
+
+function installPersistentSparseImageTarget(group, position = null) {
+  const presentation = persistentSparseViewerPresentation(group);
+  const { entries: sparseEntries, group: normalized } = presentation ?? {};
+  if (!normalized) return -1;
+  state.images = sparseEntries;
+  setContainerPageGroups([], [normalized]);
+  const context = savedCollectionRootContext();
+  if (context) {
+    context.ownerKind = "direct_viewer";
+    context.routeSequence = ++savedCollectionRouteSequence;
+    context.sparseDisplayUnit = normalized;
+    context.sparsePosition = position;
+  }
+  const targetIdentity = entryIdentity(normalized.anchor);
+  return state.images.findIndex((entry) => entryIdentity(entry) === targetIdentity);
+}
+
+export function persistentSparseViewerPresentation(group) {
+  const entries = sparseImageEntries(group);
+  const normalized = normalizePersistentCollectionPageGroups([group], entries)[0];
+  return normalized ? { entries, group: normalized } : null;
+}
+
+export function persistentSparseTargetMatchesRootBinding(target, rootEntries) {
+  const entries = Array.isArray(rootEntries) ? rootEntries : [];
+  const matchesPrefix = (identity, address, kind) => {
+    const key = persistentCollectionIdentityKey(identity);
+    if (!key || !remoteAddressIdentity(address)) return false;
+    const root = entries.find(
+      (entry) => persistentCollectionIdentityKey(entry?.persistent_identity) === key
+    );
+    if (!root) return true;
+    return root.kind === kind &&
+      remoteAddressIdentity(root.address) === remoteAddressIdentity(address);
+  };
+  if (target?.kind === "direct_image_display_unit") {
+    const pages = target.group?.pages;
+    return Array.isArray(pages) && pages.length > 0 && pages.every(
+      (slot) => matchesPrefix(slot, slot.address, "image")
+    );
+  }
+  if (target?.kind === "direct_video") {
+    return matchesPrefix(target.identity, target.address, "video");
+  }
+  if (target?.kind === "direct_audio") {
+    return matchesPrefix(target.identity, target.address, "audio");
+  }
+  return false;
+}
+
+export function persistentCollectionResponseIsCurrent({
+  aborted,
+  viewerMatches,
+  viewerSequence,
+  expectedViewerSequence,
+  cacheEpoch,
+  expectedCacheEpoch,
+  collectionId,
+  expectedCollectionId,
+  routeSequence,
+  expectedRouteSequence,
+}) {
+  return !aborted && viewerMatches && viewerSequence === expectedViewerSequence &&
+    cacheEpoch === expectedCacheEpoch && collectionId === expectedCollectionId &&
+    routeSequence === expectedRouteSequence;
+}
+
+async function performPersistentCollectionNavigation(step, intent, signal) {
+  const context = persistentDirectViewerContext();
+  const { targetKind, tail } = intent;
+  const anchor = currentPersistentNavigationAnchor(targetKind);
+  const viewer = state.viewer;
+  const viewerSequence = state.viewerItemStateSequence;
+  const routeSequence = context?.routeSequence;
+  const cacheEpoch = state.remoteSessionCacheEpoch;
+  if (!context || !anchor || !viewer) return;
+  let response;
+  try {
+    response = await apiPostJson("/api/saved-collection/navigate", {
+      collection_id: context.collectionId,
+      presented_revision: context.collectionRevision,
+      presented_view_token: context.viewToken,
+      anchor,
+      locate_entry_id: null,
+      locate_ordinal: intent.locateOrdinal,
+      direction: intent.navigationDirection ?? (step < 0 ? "backward" : "forward"),
+      target_kind: targetKind,
+      tail,
+      viewer_sequence: viewerSequence,
+      spread_mode: state.spreadMode,
+      reading_direction: state.readingDirection,
+      force_single_page: state.forceSinglePage,
+    }, signal);
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  const landedContext = persistentDirectViewerContext();
+  if (!persistentCollectionResponseIsCurrent({
+    aborted: signal.aborted,
+    viewerMatches: state.viewer === viewer,
+    viewerSequence: state.viewerItemStateSequence,
+    expectedViewerSequence: viewerSequence,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    collectionId: landedContext?.collectionId,
+    expectedCollectionId: context.collectionId,
+    routeSequence: landedContext?.routeSequence,
+    expectedRouteSequence: routeSequence,
+  })) {
+    settlePersistentEofStale(intent);
+    return;
+  }
+  if (response.result === "boundary") {
+    savedCollectionNavigationOwner.pendingDelta = 0;
+    const labels = { start: "先頭の項目です", end: "最後の項目です", empty: "表示できる項目がありません", target_unavailable: "次の項目を開けませんでした" };
+    viewer.showBoundaryMessage(labels[response.reason] ?? "次の項目はありません");
+    settlePersistentEofFailure(intent, signal);
+    return;
+  }
+  if (response.result !== "landed" || !response.target) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
+  try {
+    if (response.replacement) {
+      applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage, {
+        preserveGridIndex: true,
+        ownerKind: "direct_viewer",
+      });
+    }
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  const current = persistentDirectViewerContext();
+  if (!current || current.collectionId !== context.collectionId) {
+    settlePersistentEofFailure(intent, signal);
+    return;
+  }
+  current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
+  current.viewToken = String(response.exact_view_token ?? current.viewToken);
+  const targetPosition = persistentCollectionTargetPosition(
+    response.target_ordinal,
+    response.target_count
+  );
+  const target = response.target;
+  if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
+  let entry;
+  try {
+    if (target.kind === "direct_image_display_unit") {
+      const imageIndex = installPersistentSparseImageTarget(target.group, targetPosition);
+      if (imageIndex < 0) throw new Error("次の画像を構成できませんでした。");
+      entry = state.images[imageIndex];
+      pushPersistentViewerHistory(current.collectionId, entry.persistent_identity);
+      renderImageViewer(imageIndex, performance.now());
+    } else if (target.kind === "direct_audio" || target.kind === "direct_video") {
+      const mediaKind = target.kind === "direct_audio" ? "audio" : "video";
+      entry = {
+        name: persistentAddressDisplayName(target.address),
+        kind: mediaKind,
+        address: target.address,
+        persistent_identity: target.identity,
+      };
+      current.ownerKind = "direct_viewer";
+      current.routeSequence = ++savedCollectionRouteSequence;
+      current.sparsePosition = targetPosition;
+      pushPersistentViewerHistory(current.collectionId, target.identity);
+      renderVideoViewer({ ...entry, name: `${entry.name} · ${targetPosition.label}` });
+    } else {
+      throw new Error("次の項目の応答が不正です。");
+    }
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  completePersistentEofTerminal(intent);
+}
+
+export class PersistentEofTerminalOwner {
+  constructor(viewer, viewerSequence) {
+    this.viewer = viewer;
+    this.viewerSequence = viewerSequence;
+    this.state = "pending";
+  }
+
+  fail({ aborted, currentViewer, currentViewerSequence }) {
+    if (this.state !== "pending") return false;
+    if (aborted || currentViewer !== this.viewer ||
+        currentViewerSequence !== this.viewerSequence) {
+      this.state = "stale";
+      return false;
+    }
+    this.state = "failed";
+    this.viewer.setPlaying(false).catch(() => {});
+    return true;
+  }
+
+  complete() {
+    if (this.state === "pending") this.state = "landed";
+  }
+
+  stale() {
+    if (this.state === "pending") this.state = "stale";
+  }
+}
+
+function settlePersistentEofFailure(intent, signal = null) {
+  const terminal = intent?.eofTerminal;
+  return terminal?.fail({
+    aborted: Boolean(signal?.aborted),
+    currentViewer: state.viewer,
+    currentViewerSequence: state.viewerItemStateSequence,
+  }) ?? false;
+}
+
+function completePersistentEofTerminal(intent) {
+  intent?.eofTerminal?.complete();
+}
+
+function settlePersistentEofStale(intent) {
+  intent?.eofTerminal?.stale();
+}
+
+function pushPersistentViewerHistory(collectionId, identity) {
+  const context = savedCollectionRootContext();
+  if (context?.collectionId === collectionId) context.returnIdentity = identity;
+  history.pushState({
+    ...(history.state ?? {}),
+    mivRoute: true,
+    navigatedInApp: true,
+    viewerFromGrid: true,
+    viewerDepth: (Number(history.state?.viewerDepth) || 0) + 1,
+    returnHash: savedCollectionHash(collectionId),
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionIdentity: identity,
+  }, "", savedCollectionHash(collectionId, identity.entry_id));
+}
+
+function changeVideoFile(delta, wrap = false, eof = false) {
   const viewer = state.viewer;
   if (!viewer?.isVideoStreamViewer) return { handled: false, advanced: false };
   const mediaKind = viewer.entry?.kind ?? "video";
+  if (enqueuePersistentCollectionNavigation(
+    delta,
+    mediaKind === "audio" ? "audio" : "video",
+    wrap ? "loop" : "stop",
+    eof ? new PersistentEofTerminalOwner(viewer, state.viewerItemStateSequence) : null
+  )) {
+    return { handled: true, advanced: true };
+  }
   const mediaEntries = state.entries.filter((entry) => entry.kind === mediaKind);
   const current = mediaEntries.findIndex(
     (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(viewer.address)
@@ -6554,6 +7743,12 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   let seekPointerDrag = null;
   let seekCommitSequence = 0;
   const previewSeekGroup = (rawGroupIndex) => {
+    const persistentPosition = currentPersistentImagePosition();
+    if (persistentPosition) {
+      const ordinal = clamp(Number(rawGroupIndex) || 0, 0, persistentPosition.count - 1);
+      state.viewer?.setSeekState(viewerSeekSnapshot(state.pageGroupIndex, ordinal));
+      return ordinal;
+    }
     const groupIndex = viewerSeekGroupIndex(rawGroupIndex, state.pageGroups.length);
     state.viewer?.setSeekState(viewerSeekSnapshot(groupIndex));
     return groupIndex;
@@ -6561,6 +7756,17 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
     if (!viewer) return;
+    if (currentPersistentImagePosition()) {
+      enqueuePersistentCollectionNavigation(
+        1,
+        "still_image",
+        "stop",
+        null,
+        "current",
+        groupIndex
+      );
+      return;
+    }
     const request = requestPageGroup(groupIndex, { reason, deferDisplay: true });
     if (!request.moved || !request.request) return;
     const sequence = ++seekCommitSequence;
@@ -6596,7 +7802,9 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     event.stopPropagation();
     if (seekPointerDrag) return;
     commitSeekGroup(
-      viewerSeekGroupIndex(seekInput.value, state.pageGroups.length),
+      currentPersistentImagePosition()
+        ? clamp(Number(seekInput.value) || 0, 0, currentPersistentImagePosition().count - 1)
+        : viewerSeekGroupIndex(seekInput.value, state.pageGroups.length),
       "viewer_seek_native"
     );
   });
@@ -6613,7 +7821,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       startClientY: event.clientY,
       startGroupIndex: seekState.groupIndex,
       groupIndex: seekState.groupIndex,
-      groupCount: state.pageGroups.length,
+      groupCount: currentPersistentImagePosition()?.count ?? state.pageGroups.length,
       trackLeft: trackRect.left,
       trackWidth: trackRect.width,
       direction: seekState.direction,
@@ -6724,6 +7932,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
 }
 
 function changeImage(delta) {
+  if (enqueuePersistentCollectionNavigation(delta, "still_image")) return true;
   const message = viewerBoundaryMessage({
     currentIndex: state.pageGroupIndex,
     count: state.pageGroups.length,
@@ -11808,7 +13017,7 @@ function createRemoteArchiveRequestId(address) {
 }
 
 export class RemoteArchiveOpenController {
-  constructor(host, subscribeRemoteSessionState = () => () => {}) {
+  constructor(host, subscribeRemoteSessionState = () => () => {}, testHooks = {}) {
     this.host = host;
     this.address = null;
     this.requestId = null;
@@ -11816,6 +13025,12 @@ export class RemoteArchiveOpenController {
     this.pollTimer = 0;
     this.destroyed = false;
     this.cancelOnDestroy = true;
+    this.readyRouteState = {};
+    this.createJob = testHooks.createJob ?? ((source, requestId) =>
+      apiAddressPostJson("/api/archive/jobs", { request_id: requestId, source }));
+    this.loadResult = testHooks.loadResult ?? ((jobId) =>
+      apiJson(`/api/archive/jobs/${encodeURIComponent(jobId)}/result`));
+    this.navigateTo = testHooks.navigate ?? navigate;
     this.remoteSessionState = { blocksInteraction: false };
     this.previousFocus = document.activeElement;
 
@@ -11866,17 +13081,18 @@ export class RemoteArchiveOpenController {
     queueMicrotask(() => this.panel.focus?.());
   }
 
-  async open(address, name) {
+  async open(address, name, readyRouteState = {}) {
     if (this.destroyed) return;
     this.address = address;
+    // Capture the originating collection root when the job starts. Conversion and password
+    // prompts may outlive later root edits or route changes, but a successful landing must still
+    // carry the immutable Back target for this exact job.
+    this.readyRouteState = immutableRemoteArchiveRouteState(readyRouteState);
     this.requestId = createRemoteArchiveRequestId(address);
     this.sourceName.textContent = name;
     this.showWorking("アーカイブを準備しています");
     try {
-      const snapshot = await apiAddressPostJson("/api/archive/jobs", {
-        request_id: this.requestId,
-        source: address,
-      });
+      const snapshot = await this.createJob(address, this.requestId);
       await this.handleSnapshot(snapshot);
     } catch (error) {
       const recovered = await this.recover().catch(() => null);
@@ -12061,9 +13277,7 @@ export class RemoteArchiveOpenController {
   async openReady(snapshot) {
     this.showWorking("アーカイブを開いています");
     this.actions.replaceChildren();
-    const result = await apiJson(
-      `/api/archive/jobs/${encodeURIComponent(snapshot.job_id)}/result`
-    );
+    const result = await this.loadResult(snapshot.job_id);
     if (this.destroyed) return;
     if (
       !result?.source ||
@@ -12073,7 +13287,7 @@ export class RemoteArchiveOpenController {
     }
     this.cancelOnDestroy = false;
     this.close(false);
-    navigate(containerHash(result.source));
+    this.navigateTo(containerHash(result.source), this.readyRouteState);
   }
 
   showWorking(message, progress = null) {

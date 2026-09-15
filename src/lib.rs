@@ -1285,35 +1285,49 @@ pub fn run() -> eframe::Result {
         ..Default::default()
     };
 
-    // Collection DBはproduction起動だけで開始し、runtime本体はcreatorでAppへ一度だけmoveする。
-    // App::default / snapshot harnessはinertなので通常profileを開かない。
-    let mut collection_runtime = Some(collection_store::CollectionStoreRuntime::start_at(
-        data_dir::get().join("collection.db"),
-    ));
+    // Collection DBはproduction起動だけで開始する。actorのjoin権限はrun_native外のprocess
+    // ownerに残し、Appへはclientとevent streamだけを渡す。
+    let collection_runtime =
+        collection_store::CollectionStoreRuntime::start_at(data_dir::get().join("collection.db"));
+    let collection_install = collection_runtime
+        .as_ref()
+        .map(|runtime| (runtime.client(), runtime.event_stream()))
+        .map_err(Clone::clone);
+    let collection_remote_producer = collection_runtime
+        .as_ref()
+        .ok()
+        .map(|runtime| collection_store::CollectionRemoteProducerControl::new(runtime.client()));
 
     // ローカル named pipe は常設する。受信・生成の読み取りと検証は remote_ipc 配下の
     // 専用スレッドで行う。永続書き込みだけは
     // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
     // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
     let remote_service_status = remote_ipc::RemoteServiceStatus::stopped();
-    let _remote_ipc_server = match remote_ipc::RemoteIpcServer::start(saved.clone()) {
-        Ok(server) => Some(server),
-        Err(error) => {
-            eprintln!("remote IPC を開始できません: {error}");
-            logger::log(format!("remote_ipc: startup failed: {error}"));
-            remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
-            None
-        }
-    };
-    let remote_session_handle = _remote_ipc_server
+    let mut remote_ipc_server =
+        match remote_ipc::RemoteIpcServer::start(saved.clone(), collection_remote_producer.clone())
+        {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("remote IPC を開始できません: {error}");
+                logger::log(format!("remote_ipc: startup failed: {error}"));
+                remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
+                None
+            }
+        };
+    let remote_session_handle = remote_ipc_server
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::session_handle);
-    let remote_settings_reader_control = _remote_ipc_server
+    let remote_ipc_control = remote_ipc_server
+        .as_ref()
+        .map(remote_ipc::RemoteIpcServer::control);
+    let app_remote_session_handle = remote_session_handle.clone();
+    let app_remote_ipc_control = remote_ipc_control.clone();
+    let remote_settings_reader_control = remote_ipc_server
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::settings_reader_control);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
-    let _remote_service_manager = if _remote_ipc_server.is_some() {
+    let mut remote_service_manager = if remote_ipc_server.is_some() {
         match data_dir::remote_service_log_dir(&remote_data_dir).and_then(|log_dir| {
             remote_ipc::RemoteServiceManager::start(
                 remote_data_dir,
@@ -1333,7 +1347,7 @@ pub fn run() -> eframe::Result {
     } else {
         None
     };
-    let remote_service_control = _remote_service_manager
+    let remote_service_control = remote_service_manager
         .as_ref()
         .map(remote_ipc::RemoteServiceManager::control);
 
@@ -1382,11 +1396,10 @@ pub fn run() -> eframe::Result {
                 settings_load_meta.clone(),
                 move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
             );
-            match collection_runtime
-                .take()
-                .expect("eframe creator must run at most once")
-            {
-                Ok(runtime) => app.install_collection_runtime(runtime),
+            match collection_install.clone() {
+                Ok((client, events)) => {
+                    app.install_process_owned_collection_runtime(client, events)
+                }
                 Err(error) => app.install_collection_runtime_failure(error),
             }
             #[cfg(windows)]
@@ -1396,8 +1409,11 @@ pub fn run() -> eframe::Result {
                     clipboard_repaint_ctx.request_repaint_of(egui::ViewportId::ROOT)
                 });
             }
-            if let Some(handle) = remote_session_handle.clone() {
+            if let Some(handle) = app_remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
+            }
+            if let Some(control) = app_remote_ipc_control.clone() {
+                app.set_remote_ipc_server_control(control);
             }
             app.start_ai_runtime_initialization(cc.egui_ctx.clone());
             if let Some(control) = remote_settings_reader_control.clone() {
@@ -1480,6 +1496,23 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(app))
         }),
     );
+    // Stop public admission before named-pipe workers, then close the only Remote collection
+    // producer before joining the actor. The App normally completed its drain in on_exit; this
+    // outer fallback also covers creator failure/panic and is deliberately idempotent.
+    if let Some(control) = remote_ipc_control.as_ref() {
+        control.begin_app_exit();
+    }
+    drop(remote_service_manager.take());
+    if let Some(handle) = remote_session_handle.as_ref() {
+        handle.retire_app_without_ui_owner();
+    }
+    drop(remote_ipc_server.take());
+    if let Some(producer) = collection_remote_producer.as_ref() {
+        producer.close_and_drain();
+    }
+    if let Ok(runtime) = collection_runtime {
+        runtime.shutdown_and_join();
+    }
     #[cfg(all(feature = "test-script", windows))]
     if scripted_run && run_result.is_ok() {
         test_script::exit_after_run_native();

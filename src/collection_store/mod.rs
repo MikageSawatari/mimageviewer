@@ -14,12 +14,17 @@ mod text;
 pub use model::*;
 pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
 pub(crate) use prepare::{
-    CollectionNavigationAnchor, CollectionNavigationDirection, CollectionNavigationEntryIdentity,
-    CollectionNavigationTail, CollectionNavigationTargetKind, CollectionPrepareError,
+    CollectionNavigationAnchor, CollectionNavigationAnchorResolution,
+    CollectionNavigationDirection, CollectionNavigationEntryIdentity, CollectionNavigationTail,
+    CollectionNavigationTargetKind, CollectionPrepareError, CollectionPreparedNavigationCandidates,
     CollectionPreparedNavigationTarget, CollectionPreparedRegistration, CollectionPreparedSnapshot,
-    CollectionSourcePreparation, prepare_collection_export, prepare_collection_registrations,
-    prepare_collection_snapshot, resolve_prepared_collection_navigation,
+    CollectionSourcePreparation, PreparedCollectionEntry, inspect_collection_source,
+    prepare_collection_export, prepare_collection_registrations, prepare_collection_snapshot,
+    prepare_collection_snapshot_while, resolve_prepared_collection_navigation,
     write_collection_export_atomic,
+};
+pub(crate) use runtime::{
+    CollectionRemoteProducerControl, CollectionRemoteRequestLease, CollectionRuntimeEventStream,
 };
 pub use runtime::{
     CollectionRevisionWatch, CollectionRuntimeEvent, CollectionStoreClient, CollectionStoreRuntime,

@@ -13920,6 +13920,72 @@ pub(crate) fn build_remote_spread_page_groups(
     )
 }
 
+/// Persistent collection roots already own an immutable prepared list, so they
+/// provide image indices directly instead of cloning every `GridItem` merely to
+/// recover the same navigation sequence. Grouping still uses the canonical
+/// spread/split implementation in this module.
+pub(crate) fn build_remote_direct_image_page_groups(
+    image_indices: &[usize],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+) -> Vec<RemotePageGroupSpec> {
+    if let Some(direction) = crate::page_split::SplitDirection::from_spread_mode(spread_mode) {
+        return crate::page_split::presentation_steps(image_indices, direction, |_, idx| {
+            is_landscape.get(idx).copied().unwrap_or(false)
+        })
+        .into_iter()
+        .map(|step| RemotePageGroupSpec {
+            indices: vec![step.source_idx],
+            slice: step.slice,
+            singleton_placement: SingletonSpreadPlacement::Center,
+            presentation: None,
+        })
+        .collect();
+    }
+    if !spread_mode.is_spread() {
+        return image_indices
+            .iter()
+            .copied()
+            .map(|index| RemotePageGroupSpec::whole(vec![index]))
+            .collect();
+    }
+    let units = build_spread_display_units_with_predicates(
+        image_indices,
+        spread_mode,
+        None,
+        |_, idx| is_landscape.get(idx).copied().unwrap_or(false),
+        |_| true,
+    );
+    units
+        .iter()
+        .enumerate()
+        .map(|(unit_pos, unit)| {
+            let mut group = match unit.spread_pair(spread_mode) {
+                SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
+                SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
+            };
+            let composition = resolve_spread_display_composition(
+                &units,
+                unit_pos,
+                spread_mode,
+                false,
+                false,
+                false,
+            )
+            .expect("remote direct-image unit comes from the same non-empty unit list");
+            if composition
+                .pages_in_reading_order()
+                .iter()
+                .any(|page| page.role != SpreadPageRole::Navigation)
+            {
+                group.presentation = Some(composition.pages_in_screen_order(spread_mode));
+            }
+            group.singleton_placement = composition.singleton_placement();
+            group
+        })
+        .collect()
+}
+
 pub(crate) fn build_remote_spread_page_groups_with_composition(
     items: &[GridItem],
     spread_mode: SpreadMode,

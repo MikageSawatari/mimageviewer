@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 55;
+pub const PROTOCOL_VERSION: u32 = 56;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1338,6 +1338,283 @@ pub enum CollectionResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionCatalogRequest;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistentCollectionOrderSummary {
+    Manual,
+    Standard {
+        value: String,
+        label: String,
+        short_label: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionSummary {
+    pub collection_id: String,
+    pub name: String,
+    pub order: PersistentCollectionOrderSummary,
+    pub collection_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionCatalogPayload {
+    pub catalog_revision: u64,
+    pub collections: Vec<PersistentCollectionSummary>,
+    pub limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum PersistentCollectionCatalogResponse {
+    Success(PersistentCollectionCatalogPayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionIdentity {
+    pub entry_id: String,
+    pub source_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PersistentCollectionEntryState {
+    Available {
+        address: RemoteAddress,
+        kind: RemoteEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thumbnail_address: Option<RemoteAddress>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rating: Option<u8>,
+    },
+    Missing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    Unsupported {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    AccessError {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    BlockedByRemotePolicy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionEntry {
+    #[serde(flatten)]
+    pub identity: PersistentCollectionIdentity,
+    pub name: String,
+    pub state: PersistentCollectionEntryState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionPageSlot {
+    #[serde(flatten)]
+    pub identity: PersistentCollectionIdentity,
+    pub address: RemoteAddress,
+    pub role: RemotePagePresentationRole,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionPageGroup {
+    pub anchor: PersistentCollectionIdentity,
+    pub pages: Vec<PersistentCollectionPageSlot>,
+    #[serde(default)]
+    pub slice: RemotePageSlice,
+    #[serde(default)]
+    pub singleton_placement: RemoteSingletonSpreadPlacement,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionSnapshotRequest {
+    pub collection_id: String,
+    pub spread_mode: Option<RemoteSpreadMode>,
+    pub reading_direction: Option<RemoteReadingDirection>,
+    pub force_single_page: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PersistentCollectionSnapshotPayload {
+    pub collection_id: String,
+    pub collection_revision: u64,
+    pub view_token: String,
+    pub title: String,
+    pub order: PersistentCollectionOrderSummary,
+    pub entries: Vec<PersistentCollectionEntry>,
+    pub configured_spread_mode: RemoteSpreadMode,
+    pub effective_spread_mode: RemoteSpreadMode,
+    pub reading_direction: RemoteReadingDirection,
+    pub image_count: usize,
+    pub page_groups: Vec<PersistentCollectionPageGroup>,
+    pub spread_page_gap_px: u32,
+    pub entry_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum PersistentCollectionSnapshotResponse {
+    Success(PersistentCollectionSnapshotPayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationDirection {
+    Forward,
+    Backward,
+    First,
+    Last,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationKind {
+    NavigableMedia,
+    StillImage,
+    Video,
+    Audio,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationTail {
+    Stop,
+    Loop,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionNavigationAnchor {
+    pub primary: PersistentCollectionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partner: Option<PersistentCollectionIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionNavigateRequest {
+    pub collection_id: String,
+    pub presented_revision: u64,
+    pub presented_view_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<PersistentCollectionNavigationAnchor>,
+    /// Entry-ID-only locator for a pasted/deep route that has no prior source token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locate_entry_id: Option<String>,
+    /// Zero-based ordinal in the requested media-kind projection of the latest prepared view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locate_ordinal: Option<usize>,
+    pub direction: PersistentCollectionNavigationDirection,
+    pub target_kind: PersistentCollectionNavigationKind,
+    pub tail: PersistentCollectionNavigationTail,
+    pub viewer_sequence: u64,
+    pub spread_mode: Option<RemoteSpreadMode>,
+    pub reading_direction: Option<RemoteReadingDirection>,
+    pub force_single_page: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistentCollectionSparseTarget {
+    DirectImageDisplayUnit {
+        group: PersistentCollectionPageGroup,
+    },
+    DirectVideo {
+        identity: PersistentCollectionIdentity,
+        address: RemoteAddress,
+    },
+    DirectAudio {
+        identity: PersistentCollectionIdentity,
+        address: RemoteAddress,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionAnchorResolution {
+    EntryId,
+    SourceIdentity,
+    Ordinal,
+    Head,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionBoundaryReason {
+    Start,
+    End,
+    Empty,
+    TargetUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum PersistentCollectionNavigatePayload {
+    Landed {
+        exact_revision: u64,
+        exact_view_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<PersistentCollectionSnapshotPayload>,
+        target: PersistentCollectionSparseTarget,
+        target_ordinal: usize,
+        target_count: usize,
+        anchor_resolution: PersistentCollectionAnchorResolution,
+    },
+    Boundary {
+        exact_revision: u64,
+        exact_view_token: String,
+        anchor_resolution: PersistentCollectionAnchorResolution,
+        reason: PersistentCollectionBoundaryReason,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum PersistentCollectionNavigateResponse {
+    Success(PersistentCollectionNavigatePayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionError {
+    pub code: PersistentCollectionErrorCode,
+    pub message: String,
+}
+
+impl PersistentCollectionError {
+    pub fn new(code: PersistentCollectionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionErrorCode {
+    BadRequest,
+    Starting,
+    Busy,
+    NotFound,
+    Conflict,
+    Incompatible,
+    Unavailable,
+    PrepareFailed,
+    Cancelled,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FavoriteSearchRequest {
     pub query: String,
     pub kind: FavoriteSearchKind,
@@ -2228,6 +2505,21 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         request: CollectionRequest,
     },
+    PersistentCollectionCatalog {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionCatalogRequest,
+    },
+    PersistentCollectionSnapshot {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionSnapshotRequest,
+    },
+    PersistentCollectionNavigate {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionNavigateRequest,
+    },
     FavoriteSearch {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -2402,6 +2694,9 @@ impl ClientMessage {
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
+            | Self::PersistentCollectionCatalog { id, .. }
+            | Self::PersistentCollectionSnapshot { id, .. }
+            | Self::PersistentCollectionNavigate { id, .. }
             | Self::FavoriteSearch { id, .. }
             | Self::TagBrowse { id, .. }
             | Self::TagItems { id, .. }
@@ -2459,6 +2754,18 @@ pub enum ServerMessage {
     Collection {
         id: RequestId,
         response: CollectionResponse,
+    },
+    PersistentCollectionCatalog {
+        id: RequestId,
+        response: PersistentCollectionCatalogResponse,
+    },
+    PersistentCollectionSnapshot {
+        id: RequestId,
+        response: PersistentCollectionSnapshotResponse,
+    },
+    PersistentCollectionNavigate {
+        id: RequestId,
+        response: PersistentCollectionNavigateResponse,
     },
     FavoriteSearch {
         id: RequestId,
@@ -2590,6 +2897,9 @@ impl ServerMessage {
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
+            | Self::PersistentCollectionCatalog { id, .. }
+            | Self::PersistentCollectionSnapshot { id, .. }
+            | Self::PersistentCollectionNavigate { id, .. }
             | Self::FavoriteSearch { id, .. }
             | Self::TagBrowse { id, .. }
             | Self::TagItems { id, .. }
@@ -2868,7 +3178,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 55);
+        assert_eq!(PROTOCOL_VERSION, 56);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3044,7 +3354,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 55);
+        assert_eq!(PROTOCOL_VERSION, 56);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4051,5 +4361,44 @@ mod tests {
         assert!(!encoded.contains("super-secret"));
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert!(value.get("password").is_none());
+    }
+
+    #[test]
+    fn persistent_collection_navigation_positions_and_locator_round_trip() {
+        let identity = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        for direction in [
+            PersistentCollectionNavigationDirection::Forward,
+            PersistentCollectionNavigationDirection::Backward,
+            PersistentCollectionNavigationDirection::First,
+            PersistentCollectionNavigationDirection::Last,
+            PersistentCollectionNavigationDirection::Current,
+        ] {
+            let request = PersistentCollectionNavigateRequest {
+                collection_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                presented_revision: 7,
+                presented_view_token: "view".to_owned(),
+                anchor: Some(PersistentCollectionNavigationAnchor {
+                    primary: identity.clone(),
+                    partner: None,
+                }),
+                locate_entry_id: (direction == PersistentCollectionNavigationDirection::Current)
+                    .then(|| identity.entry_id.clone()),
+                locate_ordinal: None,
+                direction,
+                target_kind: PersistentCollectionNavigationKind::NavigableMedia,
+                tail: PersistentCollectionNavigationTail::Stop,
+                viewer_sequence: 9,
+                spread_mode: Some(RemoteSpreadMode::Ltr),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            };
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: PersistentCollectionNavigateRequest =
+                serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
     }
 }

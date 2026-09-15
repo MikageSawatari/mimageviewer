@@ -6775,7 +6775,7 @@ pub(super) fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::Sprea
     }
 }
 
-fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
+pub(super) fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
     match mode {
         crate::settings::SpreadMode::Ltr => RemoteSpreadMode::Ltr,
         crate::settings::SpreadMode::LtrCover => RemoteSpreadMode::LtrCover,
@@ -6790,7 +6790,7 @@ fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
     }
 }
 
-fn remote_reading_direction(
+pub(super) fn remote_reading_direction(
     direction: crate::settings::ReadingDirection,
 ) -> RemoteReadingDirection {
     match direction {

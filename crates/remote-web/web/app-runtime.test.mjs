@@ -121,6 +121,10 @@ const {
   LatestPageLoadQueue,
   PageDemandAdapter,
   PageResourceCache,
+  PersistentEofTerminalOwner,
+  PersistentCollectionNavigationQueue,
+  RemoteArchiveOpenController,
+  SavedCollectionCatalogRequestOwner,
   RemoteAiController,
   ViewerAdjustmentPanel,
   ViewerImageUpdateExitReason,
@@ -145,7 +149,9 @@ const {
   favoriteSearchResultTitle,
   finalCoverSpreadWriteRequest,
   gridReturnItemIdentity,
+  historyStateWithoutPersistentCollectionSession,
   imageRequest,
+  immutableRemoteArchiveRouteState,
   invalidateViewerPendingLoad,
   isStreamMediaKind,
   loadFolder,
@@ -168,6 +174,20 @@ const {
   pageRenderContextForSlot,
   parentContainerAddress,
   parseRoute,
+  persistentCollectionIdentityKey,
+  persistentCollectionHistoryStateForSession,
+  persistentCollectionOrdinalLocator,
+  persistentCollectionCatalogTruncationText,
+  persistentCollectionEntryIndexByIdentity,
+  persistentCollectionResponseIsCurrent,
+  persistentCollectionReturnSelection,
+  persistentCollectionRouteRequestIsCurrent,
+  persistentCollectionRouteOwnerTransition,
+  persistentCollectionTargetPosition,
+  persistentSparseViewerPresentation,
+  persistentSparseTargetMatchesRootBinding,
+  normalizePersistentCollectionEntry,
+  normalizePersistentCollectionPageGroups,
   reloadApplication,
   reportContainerSpreadRefreshError,
   renderResolvedMediaOpen,
@@ -183,6 +203,7 @@ const {
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
   selectRecoverableRemoteArchiveJob,
+  savedCollectionHash,
   telemetryHudVisible,
   setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
@@ -209,6 +230,458 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+test("saved collection routes keep collection and stable entry identities out of URLs", () => {
+  const collectionId = "11111111-1111-4111-8111-111111111111";
+  const entryId = "22222222-2222-4222-8222-222222222222";
+  assert.deepEqual(parseRoute(savedCollectionHash(collectionId)), {
+    kind: "saved_collection",
+    collectionId,
+    entryId: "",
+  });
+  assert.deepEqual(parseRoute(savedCollectionHash(collectionId, entryId)), {
+    kind: "saved_collection",
+    collectionId,
+    entryId,
+  });
+  assert.equal(savedCollectionHash(collectionId, entryId).includes("C:"), false);
+  assert.equal(parseRoute("#saved-collection/not-a-uuid").kind, "home");
+});
+
+test("persistent collection mapping keeps unavailable entries address-free and spread identity stable", () => {
+  const identity = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const available = normalizePersistentCollectionEntry({
+    ...identity,
+    name: "page.jpg",
+    state: { state: "available", kind: "image", address: TEST_PAGE_ADDRESS },
+  });
+  const blocked = normalizePersistentCollectionEntry({
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+    name: "secret.jpg",
+    state: { state: "blocked_by_remote_policy", last_known_kind: "image" },
+  });
+  assert.equal(persistentCollectionIdentityKey(available.persistent_identity),
+    `saved:${identity.entry_id}:${identity.source_identity}`);
+  assert.equal(blocked.unavailable, true);
+  assert.equal("address" in blocked, false);
+  const groups = normalizePersistentCollectionPageGroups([{
+    anchor: identity,
+    pages: [{ ...identity, address: TEST_PAGE_ADDRESS, role: "navigation" }],
+    slice: "full",
+    singleton_placement: "center",
+  }], [available, blocked]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].anchor, available);
+  assert.equal(groups[0].presentationSlots[0].entry, available);
+});
+
+test("persistent collection route owner keeps marked children and deactivates sibling routes", () => {
+  const root = {
+    ownerKind: "root",
+    collectionId: "11111111-1111-4111-8111-111111111111",
+    routeSequence: 4,
+    rootBinding: { entries: ["root"] },
+  };
+  const child = persistentCollectionRouteOwnerTransition(
+    root,
+    { collectionId: root.collectionId, sourceRouteSequence: 4 },
+    "container",
+    5
+  );
+  assert.equal(child.ownerKind, "child");
+  assert.strictEqual(child.rootBinding, root.rootBinding);
+  assert.deepEqual(persistentCollectionRouteOwnerTransition(
+    { ...root, routeSequence: 5 },
+    { collectionId: root.collectionId, sourceRouteSequence: 4 },
+    "container",
+    6
+  ), { ownerKind: "inactive", routeSequence: 6 });
+  const sibling = persistentCollectionRouteOwnerTransition(
+    child,
+    null,
+    "search",
+    6
+  );
+  assert.deepEqual(sibling, { ownerKind: "inactive", routeSequence: 6 });
+});
+
+test("persistent collection return selection resolves entry ID before source identity", () => {
+  const old = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const relinkedSameId = {
+    persistent_identity: { ...old, source_identity: "b".repeat(64) },
+  };
+  const sameOldSource = {
+    persistent_identity: {
+      entry_id: "33333333-3333-4333-8333-333333333333",
+      source_identity: old.source_identity,
+    },
+  };
+  assert.equal(
+    persistentCollectionEntryIndexByIdentity([sameOldSource, relinkedSameId], old),
+    1
+  );
+  assert.equal(
+    persistentCollectionEntryIndexByIdentity([sameOldSource], old),
+    0
+  );
+  assert.deepEqual(
+    persistentCollectionReturnSelection([relinkedSameId], sameOldSource.persistent_identity, true),
+    { index: -1, outsidePrefix: true }
+  );
+});
+
+test("archive jobs retain an immutable saved collection child return owner", () => {
+  const original = {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 7,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  };
+  const captured = immutableRemoteArchiveRouteState(original);
+  original.returnHash = "#home";
+  original.savedCollectionChild.sourceRouteSequence = 8;
+  original.savedCollectionChild.originIdentity.source_identity = "b".repeat(64);
+  assert.deepEqual(captured, {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 7,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  });
+  assert.deepEqual(immutableRemoteArchiveRouteState({}), {});
+});
+
+test("archive ready landing forwards the child owner captured when the job began", async () => {
+  const address = {
+    path: testPath("books/book.rar"),
+    subresource: { kind: "file" },
+  };
+  const routeState = {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 11,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  };
+  const created = deferred();
+  const navigations = [];
+  const host = new FakeElement("main");
+  const controller = new RemoteArchiveOpenController(host, () => () => {}, {
+    createJob: () => created.promise,
+    loadResult: async () => ({ source: address }),
+    navigate: (hash, state) => navigations.push({ hash, state }),
+  });
+  const opened = controller.open(address, "book.rar", routeState);
+  routeState.returnHash = "#home";
+  routeState.savedCollectionChild.sourceRouteSequence = 99;
+  created.resolve({ job_id: "job-1", state: "ready" });
+  await opened;
+  assert.equal(navigations.length, 1);
+  assert.equal(navigations[0].hash.startsWith("#container/"), true);
+  assert.equal(navigations[0].state.returnHash.startsWith("#saved-collection/"), true);
+  assert.equal(navigations[0].state.savedCollectionChild.sourceRouteSequence, 11);
+});
+
+test("persistent EOF terminal stops only its current viewer and settles once", async () => {
+  let stopped = 0;
+  const viewer = {
+    setPlaying(value) {
+      assert.equal(value, false);
+      stopped += 1;
+      return Promise.resolve();
+    },
+  };
+  const failed = new PersistentEofTerminalOwner(viewer, 4);
+  assert.equal(failed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), true);
+  assert.equal(failed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), false);
+  assert.equal(failed.state, "failed");
+  assert.equal(stopped, 1);
+
+  for (const input of [
+    { aborted: true, currentViewer: viewer, currentViewerSequence: 4 },
+    { aborted: false, currentViewer: {}, currentViewerSequence: 4 },
+    { aborted: false, currentViewer: viewer, currentViewerSequence: 5 },
+  ]) {
+    const stale = new PersistentEofTerminalOwner(viewer, 4);
+    assert.equal(stale.fail(input), false);
+    assert.equal(stale.state, "stale");
+  }
+  const landed = new PersistentEofTerminalOwner(viewer, 4);
+  landed.complete();
+  assert.equal(landed.state, "landed");
+  assert.equal(landed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), false);
+  await Promise.resolve();
+  assert.equal(stopped, 1);
+});
+
+test("persistent target position keeps the full ordinal while sparse arrays stay local", () => {
+  assert.deepEqual(persistentCollectionTargetPosition(41, 100_000), {
+    ordinal: 41,
+    count: 100_000,
+    label: "42 / 100000",
+  });
+  assert.deepEqual(persistentCollectionTargetPosition(99, 3), {
+    ordinal: 2,
+    count: 3,
+    label: "3 / 3",
+  });
+  assert.deepEqual(persistentCollectionOrdinalLocator(41), {
+    direction: "current",
+    locate_entry_id: null,
+    locate_ordinal: 41,
+  });
+  assert.equal(persistentCollectionOrdinalLocator(-1), null);
+  assert.equal(persistentCollectionOrdinalLocator(1.5), null);
+});
+
+test("session replacement retires persistent collection history without changing the route", () => {
+  const previousHistory = globalThis.history;
+  const historyCalls = [];
+  const sessionAState = {
+    mivRoute: true,
+    navigatedInApp: true,
+    unrelated: "keep",
+    savedCollectionReturnIdentity: { entry_id: "old-return", source_identity: "a".repeat(64) },
+    savedCollectionIdentity: { entry_id: "old-viewer", source_identity: "b".repeat(64) },
+    savedCollectionChild: { collectionId: "old", sourceRouteSequence: 2 },
+  };
+  globalThis.history = {
+    state: sessionAState,
+    replaceState(next, title, url) {
+      historyCalls.push({ next, title, url });
+      this.state = next;
+    },
+  };
+  try {
+    const sessionA = "11111111111111111111111111111111";
+    const sessionB = "22222222222222222222222222222222";
+    applyRemoteSessionId(sessionA, () => {});
+    globalThis.history.state = sessionAState;
+    const routeBefore = globalThis.location.href;
+    applyRemoteSessionId(sessionB, () => {});
+    assert.deepEqual(globalThis.history.state, {
+      mivRoute: true,
+      navigatedInApp: true,
+      unrelated: "keep",
+    });
+    assert.equal(historyCalls.at(-1).url, routeBefore);
+  } finally {
+    globalThis.history = previousHistory;
+    applyRemoteSessionId("", () => {});
+  }
+  assert.deepEqual(historyStateWithoutPersistentCollectionSession(null), null);
+  const oldEntry = {
+    mivRoute: true,
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionReturnIdentity: { entry_id: "old", source_identity: "a".repeat(64) },
+    savedCollectionIdentity: { entry_id: "old", source_identity: "a".repeat(64) },
+    savedCollectionChild: { collectionId: "old", sourceRouteSequence: 1 },
+  };
+  assert.deepEqual(
+    persistentCollectionHistoryStateForSession(oldEntry, "epoch-b"),
+    { mivRoute: true }
+  );
+  assert.strictEqual(
+    persistentCollectionHistoryStateForSession(oldEntry, "epoch-a"),
+    oldEntry
+  );
+});
+
+test("saved collection request current gate rejects session route and controller ABA", () => {
+  const current = {
+    aborted: false,
+    controllerMatches: true,
+    cacheEpoch: "epoch-2",
+    expectedCacheEpoch: "epoch-2",
+    requestSequence: 8,
+    expectedRequestSequence: 8,
+    routeHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    expectedRouteHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+  };
+  assert.equal(persistentCollectionRouteRequestIsCurrent(current), true);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, cacheEpoch: "epoch-3" }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, requestSequence: 9 }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, controllerMatches: false }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, routeHash: "#home" }), false);
+});
+
+test("saved collection catalog owner drops an old session result and exposes truncation", async () => {
+  const appState = { remoteSessionCacheEpoch: "epoch-1" };
+  const requests = [];
+  const installed = [];
+  const owner = new SavedCollectionCatalogRequestOwner({
+    requestJson(_path, _params, signal) {
+      const request = deferred();
+      requests.push({ ...request, signal });
+      return request.promise;
+    },
+    appState,
+    install: (value) => installed.push(value),
+    fail: (error) => assert.fail(error),
+  });
+  const old = owner.refresh();
+  appState.remoteSessionCacheEpoch = "epoch-2";
+  const current = owner.refresh();
+  assert.equal(requests[0].signal.aborted, true);
+  requests[0].resolve({ catalog_revision: 1, collections: [{ name: "old" }] });
+  requests[1].resolve({ catalog_revision: 2, collections: [{ name: "new" }] });
+  await Promise.all([old, current]);
+  assert.deepEqual(installed, [{ catalog_revision: 2, collections: [{ name: "new" }] }]);
+  assert.equal(persistentCollectionCatalogTruncationText({
+    truncated: true,
+    limit: 37,
+    collections: Array(37),
+  }), "件数が多いため先頭 37 件を表示しています。");
+});
+
+test("persistent sparse viewer owns exactly one display unit and route sequence gates replies", () => {
+  const first = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+    address: TEST_PAGE_ADDRESS,
+    role: "navigation",
+  };
+  const second = {
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+    address: { path: testPath("second.jpg"), subresource: { kind: "file" } },
+    role: "navigation",
+  };
+  const presentation = persistentSparseViewerPresentation({
+    anchor: second,
+    pages: [first, second],
+    slice: "full",
+    singleton_placement: "center",
+  });
+  assert.equal(presentation.entries.length, 2);
+  assert.equal(presentation.group.navigationEntries.length, 2);
+  const gate = {
+    aborted: false,
+    viewerMatches: true,
+    viewerSequence: 7,
+    expectedViewerSequence: 7,
+    cacheEpoch: "epoch",
+    expectedCacheEpoch: "epoch",
+    collectionId: "collection",
+    expectedCollectionId: "collection",
+    routeSequence: 9,
+    expectedRouteSequence: 9,
+  };
+  assert.equal(persistentCollectionResponseIsCurrent(gate), true);
+  assert.equal(persistentCollectionResponseIsCurrent({ ...gate, routeSequence: 10 }), false);
+});
+
+test("persistent sparse targets must exactly match identities already present in the root prefix", () => {
+  const identity = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const partner = {
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+  };
+  const first = { path: testPath("first.jpg"), subresource: { kind: "file" } };
+  const second = { path: testPath("second.jpg"), subresource: { kind: "file" } };
+  const roots = [
+    { kind: "image", address: first, persistent_identity: identity },
+    { kind: "image", address: second, persistent_identity: partner },
+  ];
+  const group = {
+    kind: "direct_image_display_unit",
+    group: {
+      anchor: identity,
+      pages: [
+        { ...identity, address: first, role: "navigation" },
+        { ...partner, address: second, role: "navigation" },
+      ],
+    },
+  };
+  assert.equal(persistentSparseTargetMatchesRootBinding(group, roots), true);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    ...group,
+    group: {
+      ...group.group,
+      pages: [group.group.pages[0], {
+        ...group.group.pages[1],
+        address: { path: testPath("wrong.jpg"), subresource: { kind: "file" } },
+      }],
+    },
+  }, roots), false);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    kind: "direct_video",
+    identity,
+    address: first,
+  }, roots), false);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    kind: "direct_audio",
+    identity: { entry_id: "outside", source_identity: "c".repeat(64) },
+    address: { path: testPath("outside.flac"), subresource: { kind: "file" } },
+  }, roots), true, "prefix-external sparse targets remain self-contained");
+});
+
+test("persistent navigation queues same-direction inputs one by one and replaces reverse intent", async () => {
+  const first = deferred();
+  const calls = [];
+  const queue = new PersistentCollectionNavigationQueue((step, intent, signal) => {
+    calls.push({ step, intent, signal });
+    return calls.length === 1 ? first.promise : Promise.resolve();
+  });
+  queue.enqueue(1, "same");
+  queue.enqueue(1, "same");
+  queue.enqueue(1, "same");
+  assert.equal(calls.length, 1);
+  first.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.map(({ step }) => step), [1, 1, 1]);
+
+  const pending = deferred();
+  const reverseCalls = [];
+  const reverse = new PersistentCollectionNavigationQueue((step, intent, signal) => {
+    reverseCalls.push({ step, intent, signal });
+    return reverseCalls.length === 1 ? pending.promise : Promise.resolve();
+  });
+  reverse.enqueue(1, "viewer");
+  reverse.enqueue(-1, "viewer");
+  assert.equal(reverseCalls[0].signal.aborted, true);
+  assert.equal(reverseCalls[1].step, -1);
+  pending.resolve();
+});
 
 test("PIN login uses a text-capable mobile keyboard without text correction", () => {
   const pin = createPinLoginInput();
@@ -2107,7 +2580,7 @@ test("session acquisition refreshes favorites and home once without taking the v
 
   const firstRefresh = coordinator.refreshAfterSessionAcquire();
   const consecutiveRefresh = coordinator.refreshAfterSessionAcquire();
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 
   const nextFavorites = [{ name: "更新後のお気に入り" }];
   const nextHome = {
@@ -2119,6 +2592,7 @@ test("session acquisition refreshes favorites and home once without taking the v
     favorites: nextFavorites,
   });
   pending.get("/api/home").resolve(nextHome);
+  pending.get("/api/saved-collections").resolve({ collections: [] });
   await Promise.all([firstRefresh, consecutiveRefresh]);
 
   assert.strictEqual(appState.favorites, nextFavorites);
@@ -2153,17 +2627,18 @@ test("initial loading consumes an already completed acquisition refresh without 
   });
 
   const acquisitionRefresh = coordinator.refreshAfterSessionAcquire();
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 
   pending.get("/api/favorites").resolve({
     remote_state_generation: "generation-1",
     favorites: [],
   });
   pending.get("/api/home").resolve({ places: [], smart_folders: [] });
+  pending.get("/api/saved-collections").resolve({ collections: [] });
   await acquisitionRefresh;
   await coordinator.loadInitial();
 
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 });
 
 test("successful session home refresh redraws only the visible home data tab", async () => {
@@ -2228,7 +2703,11 @@ test("failed session home refresh preserves the last good places and smart folde
 
   const results = await coordinator.refreshAfterSessionAcquire();
 
-  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected"]);
+  assert.deepEqual(results.map((result) => result.status), [
+    "fulfilled",
+    "rejected",
+    "fulfilled",
+  ]);
   assert.strictEqual(appState.home, previousHome);
   assert.deepEqual(appState.home.places, previousHome.places);
   assert.deepEqual(appState.home.smart_folders, previousHome.smart_folders);

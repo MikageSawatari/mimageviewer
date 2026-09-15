@@ -897,4 +897,17 @@ ParkedLive landingを維持した。編集noticeは現在再生とroot rowsを�
 same-context / detached nested ZIP、既存EOF landingをaffected pathで再照合し、blocking / should-fixなしで承認した。
 focused / full / staticの数値とログhash、build保留理由は
 [`collection-playback-plan.md` §11.2](collection-playback-plan.md#112-製品実装独立-completion-review-checkpoint2026-09-15)
-を正本とする。Phase 5 Remoteは未実装である。
+を正本とする。このcheckpoint時点で未実装だったPhase 5 Remoteは、後続の§18で実装した。
+
+## 18. Phase 5 Remote read-only実装checkpoint（2026-09-16）
+
+認証済みmIV Remoteへ、名前付き永続collectionのcatalog、root一覧、direct image / video / audio、
+container child open / return、latest next / prev / EOFを追加した。protocolは56で、既存aggregate collectionとは
+別message / route / browser ownerを使う。PCと同じactor snapshot / immutable prepared model / pure resolverを読み、
+Remoteからcreate / edit / sort writeを公開しない。
+
+session / route / revision / deadline / cancel、Remote pathとactual kindの二重検証、64 MiB response budget、
+truncated sparse target、display-unit / ordinal、終了時App ACK→server→producer→actorの所有境界と独立review、
+focused / full / static / verification build保留証跡は
+[`collection-remote-plan.md` §16](collection-remote-plan.md#16-製品実装独立-completion-review-checkpoint2026-09-16)
+を正本とする。通常RemoteとPC編集、Folder / ZIP / PDF child内部順、AI / streamingは既存経路を維持する。

@@ -36,6 +36,7 @@ const REMOTE_KEY_EXPIRY_WARNING_DAYS: i64 = 30;
 #[derive(Default)]
 pub(crate) struct RemoteSessionUiState {
     handle: Option<SessionHandle>,
+    final_exit_control: Option<super::RemoteIpcServerControl>,
     /// Process-global settings-family reader owner. It belongs to the Remote server lifetime,
     /// not to any mounted/detached viewer context.
     settings_reader_control: Option<super::RemoteSettingsReaderControl>,
@@ -53,6 +54,26 @@ pub(crate) struct RemoteSessionUiState {
     video_stream: Option<AppRemoteVideoStreamState>,
     local_ai_lease: Option<RemoteLocalAiLease>,
     acquire_barrier_diagnostics: RemoteAcquireBarrierDiagnostics,
+}
+
+impl Drop for RemoteSessionUiState {
+    fn drop(&mut self) {
+        if let Some(control) = self.final_exit_control.as_ref() {
+            control.begin_app_exit();
+        }
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let generation = handle.retire_app_admission();
+        drop(RemoteAppDrainLease {
+            pending_ui: handle.close_ui_request_admission_and_take_pending(),
+            video_stream: self.video_stream.take(),
+            pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
+            pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
+            handle,
+            generation,
+        });
+    }
 }
 
 struct RemoteConnectionDialogState {
@@ -571,6 +592,66 @@ struct PendingFullscreenRestore {
     wait_frames: u8,
 }
 
+/// Final-exit bundle for every App-owned resource that can keep a Remote operation alive.
+/// Dropping the bundle is terminal: pending replies are completed, media is stopped, then the
+/// session drain ACK is published. This lets creator panic and ordinary on_exit share one finite
+/// ownership rule without waiting for another UI frame.
+struct RemoteAppDrainLease {
+    handle: SessionHandle,
+    generation: u64,
+    pending_ui: Vec<ClaimedRemoteUiRequest>,
+    video_stream: Option<AppRemoteVideoStreamState>,
+    pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
+    pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+}
+
+impl Drop for RemoteAppDrainLease {
+    fn drop(&mut self) {
+        super::session::complete_remote_ui_requests_for_app_exit(
+            self.pending_ui.drain(..).collect(),
+        );
+        for (_, pending) in self.pending_bookmark_writes.drain() {
+            pending.claimed.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::UiTimeout,
+                "アプリを終了しています",
+            )));
+        }
+        if let Some(video) = self.video_stream.take() {
+            match video {
+                AppRemoteVideoStreamState::Opening(opening) => {
+                    if let Some(player) = opening.player.as_ref() {
+                        player.set_playing(false);
+                    }
+                    opening
+                        .claimed
+                        .complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                            VideoStreamErrorCode::SessionMismatch,
+                            "アプリを終了しています",
+                        )));
+                }
+                AppRemoteVideoStreamState::Starting(starting) => {
+                    starting.streaming.player.set_playing(false);
+                    self.handle
+                        .clear_video_stream(Some(starting.streaming.session.id().0));
+                    starting
+                        .claimed
+                        .complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                            VideoStreamErrorCode::SessionMismatch,
+                            "アプリを終了しています",
+                        )));
+                }
+                AppRemoteVideoStreamState::Streaming(streaming) => {
+                    streaming.player.set_playing(false);
+                    self.handle
+                        .clear_video_stream(Some(streaming.session.id().0));
+                }
+            }
+        }
+        self.pending_fullscreen_restore = None;
+        let _ = self.handle.complete_app_drain(self.generation);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReloadedView {
     ReadingHistory,
@@ -640,6 +721,10 @@ fn remote_video_start_outcome_for_player(
 }
 
 impl crate::app::App {
+    pub(crate) fn set_remote_ipc_server_control(&mut self, control: super::RemoteIpcServerControl) {
+        self.remote_session_ui.final_exit_control = Some(control);
+    }
+
     pub(crate) fn set_remote_session_handle(&mut self, handle: SessionHandle) {
         let snapshot = handle.snapshot();
         self.remote_session_ui.last_acquisition_sequence = if snapshot.active.is_some() {
@@ -655,6 +740,32 @@ impl crate::app::App {
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
         self.remote_session_ui.handle = Some(handle);
+    }
+
+    pub(crate) fn retire_remote_resources_for_final_exit(&mut self) {
+        if let Some(control) = self.remote_session_ui.final_exit_control.as_ref() {
+            control.begin_app_exit();
+        }
+        let Some(handle) = self.remote_session_ui.handle.take() else {
+            return;
+        };
+        let generation = handle.retire_app_admission();
+        if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
+            self.release_local_ai_remote_barrier(lease.resume_video_upscale);
+        }
+        let lease = RemoteAppDrainLease {
+            // Closing admission and taking the queue share one mutex boundary,
+            // so no already-admitted producer can enqueue after this final take.
+            pending_ui: handle.close_ui_request_admission_and_take_pending(),
+            video_stream: self.remote_session_ui.video_stream.take(),
+            pending_bookmark_writes: std::mem::take(
+                &mut self.remote_session_ui.pending_bookmark_writes,
+            ),
+            pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
+            handle,
+            generation,
+        };
+        drop(lease);
     }
 
     pub(crate) fn set_remote_settings_reader_control(
@@ -4106,6 +4217,114 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_session() -> (SessionHandle, RemoteSessionIdentity, u64) {
+        let handle = SessionHandle::new();
+        let response = handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "drain-test".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: SessionConnectionKind::Direct,
+                device_name: Some("test device".to_owned()),
+            },
+        });
+        assert_eq!(response.status, SessionStatus::Active);
+        let generation = handle.snapshot().generation;
+        assert!(handle.finish_acquire(generation));
+        let owner = handle.owner_for_test("drain-test");
+        (handle, owner, generation)
+    }
+
+    #[test]
+    fn app_drain_lease_drop_terminals_every_representative_resource_before_one_ack() {
+        let (handle, owner, generation) = active_session();
+
+        let (pending_read, read_rx) = super::super::session::ClaimedBookResumeRead::for_test(
+            std::path::PathBuf::from(r"C:\books\resume.zip"),
+        );
+        let write_operation = handle
+            .begin_operation(&owner, "bookmark write".to_owned())
+            .unwrap();
+        let (pending_write, write_rx) = ClaimedRemoteWrite::for_test(
+            write_operation,
+            RemoteWriteRequest::SetSortOrder {
+                scope: mimageviewer_ipc::RemoteGridScope::Address {
+                    address: mimageviewer_ipc::RemoteAddress::file(r"C:\books"),
+                },
+                sort_order: "FileName".to_owned(),
+            },
+        );
+        let video_request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            std::path::PathBuf::from(r"C:\videos\clip.mp4"),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let video_operation = handle
+            .begin_operation(&owner, "video opening".to_owned())
+            .unwrap();
+        let (pending_video, video_rx) =
+            ClaimedVideoStreamUiRequest::for_test(video_operation, video_request);
+
+        let retired_generation = handle.retire_app_admission();
+        assert_eq!(retired_generation, generation);
+        let mut pending_bookmark_writes = std::collections::HashMap::new();
+        pending_bookmark_writes.insert(
+            1,
+            PendingRemoteBookmarkWrite {
+                claimed: pending_write,
+                kind: PendingRemoteBookmarkWriteKind::SetPresence,
+                container_path: std::path::PathBuf::from(r"C:\books\resume.zip"),
+            },
+        );
+        drop(RemoteAppDrainLease {
+            handle: handle.clone(),
+            generation,
+            pending_ui: vec![ClaimedRemoteUiRequest::BookResumeRead(pending_read)],
+            video_stream: Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed: pending_video,
+                owner,
+                requested_path: std::path::PathBuf::from(r"C:\videos\clip.mp4"),
+                quality: crate::video::stream::quality::QualityPreset::default(),
+                player: None,
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+            })),
+            pending_bookmark_writes,
+            pending_fullscreen_restore: Some(PendingFullscreenRestore {
+                item_key: "resume".to_owned(),
+                view: ReloadedView::Other,
+                wait_frames: 1,
+            }),
+        });
+
+        assert_eq!(
+            read_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            write_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::UiTimeout,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            video_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            VideoStreamUiOutcome::Error(VideoStreamError {
+                code: VideoStreamErrorCode::SessionMismatch,
+                ..
+            })
+        ));
+        assert_eq!(
+            handle.snapshot().phase,
+            super::super::session::RemoteControlPhase::Local
+        );
+        assert!(!handle.complete_app_drain(generation));
+    }
 
     #[test]
     fn only_remote_sort_write_uses_settings_family() {

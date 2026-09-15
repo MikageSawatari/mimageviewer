@@ -143,7 +143,41 @@ impl ReleaseReason {
 struct OperationState {
     description: String,
     started: bool,
-    cancel: Arc<AtomicBool>,
+    cancel: RemoteOperationCancelSource,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteOperationCancelSource {
+    flag: Arc<AtomicBool>,
+    wake_tx: crossbeam_channel::Sender<()>,
+}
+
+impl RemoteOperationCancelSource {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = self.wake_tx.try_send(());
+    }
+}
+
+/// Operation cancellation with both a cheap polling predicate and an immediate blocking wake.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteOperationCancellation {
+    flag: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+}
+
+impl RemoteOperationCancellation {
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wake_receiver(&self) -> crossbeam_channel::Receiver<()> {
+        self.wake_rx.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +242,9 @@ struct SessionStateMachine {
     drain_started_at: Option<Duration>,
     next_drain_log_at: Duration,
     app_drain_complete: bool,
+    /// Process-final absorbing gate. Once set, no later acquire may create an
+    /// owner after the App has relinquished its UI resources.
+    app_retired: bool,
 }
 
 impl Default for SessionStateMachine {
@@ -226,6 +263,7 @@ impl Default for SessionStateMachine {
             drain_started_at: None,
             next_drain_log_at: Duration::from_secs(3),
             app_drain_complete: false,
+            app_retired: false,
         }
     }
 }
@@ -237,6 +275,9 @@ impl SessionStateMachine {
         connected_unix_ms: u64,
         request: SessionAcquireRequest,
     ) -> SessionResponse {
+        if self.app_retired {
+            return session_closing_response();
+        }
         match self.lifecycle.phase {
             // The previous owner's resources still belong to that drain. A new acquire is a
             // waiter, not a second BeginDrain transition, and must not replace its reason.
@@ -380,7 +421,7 @@ impl SessionStateMachine {
         now: Duration,
         owner: &RemoteSessionIdentity,
         description: String,
-    ) -> Result<(u64, u64, Arc<AtomicBool>), SessionResponse> {
+    ) -> Result<(u64, u64, RemoteOperationCancellation), SessionResponse> {
         self.expire(now);
         let Some(active) = self.active.as_ref() else {
             return Err(self.inactive_response(&owner.client_id));
@@ -404,16 +445,25 @@ impl SessionStateMachine {
         active.request_count = active.request_count.saturating_add(1);
         let token = self.next_operation;
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let cancel = RemoteOperationCancelSource {
+            flag: Arc::clone(&flag),
+            wake_tx,
+        };
         active.operations.insert(
             token,
             OperationState {
                 description,
                 started: false,
-                cancel: Arc::clone(&cancel),
+                cancel: cancel.clone(),
             },
         );
-        Ok((self.generation, token, cancel))
+        Ok((
+            self.generation,
+            token,
+            RemoteOperationCancellation { flag, wake_rx },
+        ))
     }
 
     fn streaming_owner(
@@ -651,10 +701,22 @@ impl SessionStateMachine {
         if let Some(active) = self.active.as_mut() {
             active.cancel_streaming();
             for operation in active.operations.values() {
-                operation.cancel.store(true, Ordering::Release);
+                operation.cancel.cancel();
             }
         }
         true
+    }
+
+    fn retire_app(&mut self, now: Duration) -> bool {
+        let newly_retired = !self.app_retired;
+        self.app_retired = true;
+        if matches!(
+            self.lifecycle.phase,
+            RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive
+        ) {
+            self.begin_drain(ReleaseReason::Local, now);
+        }
+        newly_retired
     }
 
     fn drain_wait_diagnostic(
@@ -1113,6 +1175,7 @@ pub(crate) struct SessionHandle {
     remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
     ui_request_tx: mpsc::SyncSender<QueuedRemoteUiRequest>,
     ui_request_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteUiRequest>>>,
+    ui_request_admission: Arc<Mutex<UiRequestAdmission>>,
     published_video_stream: Arc<Mutex<Option<PublishedVideoStream>>>,
     phase_wake: Arc<(Mutex<u64>, Condvar)>,
     ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
@@ -1120,6 +1183,21 @@ pub(crate) struct SessionHandle {
     archive_jobs: Arc<Mutex<Weak<super::archive_job::RemoteArchiveJobRegistry>>>,
     page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiRequestAdmission {
+    /// `Some` only while the matching Remote owner may enqueue App-owned work.
+    /// The mutex stays held through the non-blocking send so closing admission
+    /// and draining the receiver form one linearized boundary.
+    open_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiRequestEnqueueError {
+    Closed,
+    Full,
+    Disconnected,
 }
 
 impl UiRequestDispatch {
@@ -1169,6 +1247,23 @@ impl ClaimedRemoteWrite {
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: SessionOperation,
+        request: RemoteWriteRequest,
+    ) -> (Self, mpsc::Receiver<UiWriteOutcome>) {
+        operation.started();
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                operation,
+                reply,
+            },
+            receiver,
+        )
+    }
 }
 
 impl ClaimedBookResumeRead {
@@ -1178,6 +1273,12 @@ impl ClaimedBookResumeRead {
 
     pub(crate) fn complete(self, page: Option<usize>) {
         let _ = self.reply.send(page);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: std::path::PathBuf) -> (Self, mpsc::Receiver<Option<usize>>) {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (Self { path, reply }, receiver)
     }
 }
 
@@ -1201,6 +1302,23 @@ impl ClaimedVideoStreamUiRequest {
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: SessionOperation,
+        request: VideoStreamUiRequest,
+    ) -> (Self, mpsc::Receiver<VideoStreamUiOutcome>) {
+        operation.started();
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                operation,
+                reply,
+            },
+            receiver,
+        )
+    }
 }
 
 impl SessionHandle {
@@ -1213,6 +1331,7 @@ impl SessionHandle {
             remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
             ui_request_tx,
             ui_request_rx: Arc::new(Mutex::new(ui_request_rx)),
+            ui_request_admission: Arc::new(Mutex::new(UiRequestAdmission::default())),
             published_video_stream: Arc::new(Mutex::new(None)),
             phase_wake: Arc::new((Mutex::new(0), Condvar::new())),
             ai_bridge: Arc::new(Mutex::new(None)),
@@ -1334,6 +1453,11 @@ impl SessionHandle {
             )
         };
         if phase_changed || generation_changed {
+            if generation_changed && response.status == SessionStatus::Active {
+                self.open_ui_request_admission(self.snapshot().generation);
+            } else {
+                self.close_ui_request_admission();
+            }
             self.clear_video_stream(None);
             self.notify_phase_changed();
         }
@@ -1366,6 +1490,7 @@ impl SessionHandle {
             (response, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1382,6 +1507,7 @@ impl SessionHandle {
             (response, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_long_job_drain(ReleaseReason::Logout);
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1407,18 +1533,19 @@ impl SessionHandle {
             (result, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
             self.notify_ui();
         }
-        let (generation, token, cancel) = result?;
+        let (generation, token, cancellation) = result?;
         Ok(SessionOperation {
             handle: self.clone(),
             generation,
             token,
             owner: owner.clone(),
-            cancel,
+            cancellation,
             finished: false,
         })
     }
@@ -1430,6 +1557,7 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .finish_acquire(generation);
         if changed {
+            self.open_ui_request_admission(generation);
             self.notify_phase_changed();
             self.notify_ui();
         }
@@ -1443,6 +1571,7 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .abort_acquire_barrier(generation, self.now());
         if changed {
+            self.close_ui_request_admission();
             self.notify_long_job_drain(ReleaseReason::AcquireBarrierTimeout);
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1587,6 +1716,9 @@ impl SessionHandle {
     }
 
     pub(crate) fn local_disconnect(&self) {
+        // A sender either completes its non-blocking enqueue before this lock,
+        // or observes closed admission. Final drain can then take the queue once.
+        self.close_ui_request_admission();
         let phase_changed = self
             .inner
             .lock()
@@ -1599,6 +1731,43 @@ impl SessionHandle {
             crate::logger::log("remote_ipc: session_drain_started reason=local".to_owned());
             self.notify_ui();
         }
+    }
+
+    /// Irreversibly retires Remote ownership for process exit. Unlike an ordinary
+    /// local disconnect, reaching Local again does not reopen SessionAcquire.
+    pub(crate) fn retire_app_admission(&self) -> u64 {
+        self.close_ui_request_admission();
+        let (generation, began_drain, newly_retired) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let before = state.lifecycle.phase;
+            let newly_retired = state.retire_app(self.now());
+            (
+                state.generation,
+                before != state.lifecycle.phase
+                    && state.lifecycle.phase == RemoteControlPhase::DrainingRemote,
+                newly_retired,
+            )
+        };
+        if began_drain {
+            self.notify_long_job_drain(ReleaseReason::Local);
+            self.clear_video_stream(None);
+        }
+        if began_drain || newly_retired {
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        generation
+    }
+
+    /// Outer-process fallback for creator failure before an App can own the UI
+    /// bundle. It gives every queued request a typed terminal result before ACK.
+    pub(crate) fn retire_app_without_ui_owner(&self) {
+        let generation = self.retire_app_admission();
+        complete_remote_ui_requests_for_app_exit(
+            self.close_ui_request_admission_and_take_pending(),
+        );
+        self.clear_video_stream(None);
+        let _ = self.complete_app_drain(generation);
     }
 
     pub(crate) fn note_long_job_client_seen(&self, owner: &RemoteSessionIdentity) {
@@ -1645,6 +1814,7 @@ impl SessionHandle {
         operation: SessionOperation,
         timeout: Duration,
     ) -> UiWriteOutcome {
+        let generation = operation.generation();
         let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
@@ -1653,10 +1823,12 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, Some(generation)) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => return write_busy_outcome(),
-            Err(mpsc::TrySendError::Disconnected(_)) => return write_stopped_outcome(),
+            Err(UiRequestEnqueueError::Full) => return write_busy_outcome(),
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
+                return write_stopped_outcome();
+            }
         }
         match receiver.recv_timeout(timeout) {
             Ok(outcome) => outcome,
@@ -1692,10 +1864,12 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, None) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => return Err(UiReadError::Busy),
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err(UiReadError::Stopped),
+            Err(UiRequestEnqueueError::Full) => return Err(UiReadError::Busy),
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
+                return Err(UiReadError::Stopped);
+            }
         }
         match receiver.recv_timeout(timeout) {
             Ok(page) => Ok(page),
@@ -1714,6 +1888,7 @@ impl SessionHandle {
         request: VideoStreamUiRequest,
         operation: SessionOperation,
     ) -> VideoStreamUiOutcome {
+        let generation = operation.generation();
         let start_budget = match &request {
             VideoStreamUiRequest::Start { budget, .. } => Some(*budget),
             _ => None,
@@ -1729,15 +1904,15 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, Some(generation)) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(UiRequestEnqueueError::Full) => {
                 return video_stream_ui_error(
                     VideoStreamErrorCode::Busy,
                     "本体 UI の動画操作 queue が混み合っています",
                 );
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
                 return video_stream_ui_error(
                     VideoStreamErrorCode::Internal,
                     "本体 UI の動画操作受付が停止しています",
@@ -1809,6 +1984,23 @@ impl SessionHandle {
     }
 
     pub(crate) fn take_pending_ui_requests(&self) -> Vec<ClaimedRemoteUiRequest> {
+        self.take_pending_ui_requests_inner()
+    }
+
+    /// Stops future App-owned queue producers and atomically takes every request
+    /// that won the admission race. Final App drain uses this before publishing ACK.
+    pub(crate) fn close_ui_request_admission_and_take_pending(
+        &self,
+    ) -> Vec<ClaimedRemoteUiRequest> {
+        let mut admission = self
+            .ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.open_generation = None;
+        self.take_pending_ui_requests_inner()
+    }
+
+    fn take_pending_ui_requests_inner(&self) -> Vec<ClaimedRemoteUiRequest> {
         let receiver = self
             .ui_request_rx
             .lock()
@@ -1848,6 +2040,42 @@ impl SessionHandle {
             }
         }
         claimed
+    }
+
+    fn open_ui_request_admission(&self, generation: u64) {
+        self.ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .open_generation = Some(generation);
+    }
+
+    fn close_ui_request_admission(&self) {
+        self.ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .open_generation = None;
+    }
+
+    fn try_enqueue_ui_request(
+        &self,
+        request: QueuedRemoteUiRequest,
+        expected_generation: Option<u64>,
+    ) -> Result<(), UiRequestEnqueueError> {
+        let admission = self
+            .ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(open_generation) = admission.open_generation else {
+            return Err(UiRequestEnqueueError::Closed);
+        };
+        if expected_generation.is_some_and(|generation| generation != open_generation) {
+            return Err(UiRequestEnqueueError::Closed);
+        }
+        match self.ui_request_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(UiRequestEnqueueError::Full),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(UiRequestEnqueueError::Disconnected),
+        }
     }
 
     #[cfg(test)]
@@ -1921,10 +2149,26 @@ impl SessionHandle {
             self.notify_long_job_drain(reason);
         }
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_phase_changed();
             self.notify_ui();
         }
         reason
+    }
+}
+
+pub(crate) fn complete_remote_ui_requests_for_app_exit(pending_ui: Vec<ClaimedRemoteUiRequest>) {
+    for pending in pending_ui {
+        match pending {
+            ClaimedRemoteUiRequest::Write(pending) => pending.complete(write_stopped_outcome()),
+            ClaimedRemoteUiRequest::BookResumeRead(pending) => pending.complete(None),
+            ClaimedRemoteUiRequest::VideoStream(pending) => {
+                pending.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                    VideoStreamErrorCode::SessionMismatch,
+                    "アプリを終了しています",
+                )))
+            }
+        }
     }
 }
 
@@ -2126,7 +2370,7 @@ pub(crate) struct SessionOperation {
     generation: u64,
     token: u64,
     owner: RemoteSessionIdentity,
-    cancel: Arc<AtomicBool>,
+    cancellation: RemoteOperationCancellation,
     finished: bool,
 }
 
@@ -2214,7 +2458,11 @@ impl SessionOperation {
     }
 
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+        self.cancellation.flag()
+    }
+
+    pub(crate) fn cancellation(&self) -> RemoteOperationCancellation {
+        self.cancellation.clone()
     }
 
     pub(crate) fn long_job_drain_cause(&self) -> Option<RemoteLongJobDrainCause> {
@@ -3373,6 +3621,159 @@ mod tests {
         assert_eq!(released.phase, RemoteControlPhase::Local);
         assert!(released.active.is_none());
         assert_eq!(released.control_return_sequence, 1);
+    }
+
+    #[test]
+    fn final_drain_closes_ui_enqueue_before_one_time_queue_take() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let owner = handle.owner_for_test("client");
+        let operation = handle
+            .begin_operation(&owner, "late write".to_owned())
+            .unwrap();
+        let worker_handle = handle.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            worker_handle.submit_write(write_request(), operation)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        handle.local_disconnect();
+        assert!(
+            handle
+                .close_ui_request_admission_and_take_pending()
+                .is_empty()
+        );
+        assert!(!handle.complete_app_drain(generation));
+        resume_tx.send(()).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Internal,
+                ..
+            }))
+        ));
+        assert!(handle.take_pending_ui_requests().is_empty());
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+    }
+
+    #[test]
+    fn app_retire_is_absorbing_after_old_generation_drains() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "old".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let old_owner = handle.owner_for_test("old");
+        let operation = handle
+            .begin_operation(&old_owner, "old request".to_owned())
+            .unwrap();
+
+        assert_eq!(handle.retire_app_admission(), generation);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+        assert!(!handle.complete_app_drain(generation));
+        operation.finish(false);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+
+        let response = handle.acquire(SessionAcquireRequest {
+            client_id: "late".to_owned(),
+            peer: peer(),
+        });
+        assert_ne!(response.status, SessionStatus::Active);
+        assert_eq!(handle.snapshot().generation, generation.wrapping_add(1));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+    }
+
+    #[test]
+    fn app_drop_fallback_terminals_pending_write_read_and_video_before_ack() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let owner = handle.owner_for_test("client");
+
+        let write_operation = handle.begin_operation(&owner, "write".to_owned()).unwrap();
+        let write_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (write_tx, write_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
+                    request: write_request(),
+                    operation: write_operation,
+                    reply: write_tx,
+                    dispatch: write_dispatch,
+                }),
+                Some(generation),
+            )
+            .unwrap();
+
+        let read_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (read_tx, read_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {
+                    path: std::path::PathBuf::from(r"C:\books\book.zip"),
+                    reply: read_tx,
+                    dispatch: read_dispatch,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let video_operation = handle.begin_operation(&owner, "video".to_owned()).unwrap();
+        let video_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (video_tx, video_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::VideoStream(QueuedVideoStreamUiRequest {
+                    request: VideoStreamUiRequest::Control {
+                        session: 7,
+                        action: VideoStreamControlAction::Pause,
+                    },
+                    operation: video_operation,
+                    reply: video_tx,
+                    dispatch: video_dispatch,
+                }),
+                Some(generation),
+            )
+            .unwrap();
+
+        handle.retire_app_without_ui_owner();
+
+        assert!(matches!(
+            write_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(_))
+        ));
+        assert_eq!(read_rx.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        assert!(matches!(
+            video_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            VideoStreamUiOutcome::Error(VideoStreamError {
+                code: VideoStreamErrorCode::SessionMismatch,
+                ..
+            })
+        ));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert!(handle.snapshot().active.is_none());
+        assert!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "late".to_owned(),
+                    peer: peer(),
+                })
+                .status
+                != SessionStatus::Active
+        );
     }
 
     #[test]

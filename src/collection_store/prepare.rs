@@ -358,13 +358,30 @@ pub(crate) fn prepare_collection_snapshot(
     snapshot: &CollectionSnapshot,
     display_order: &GridDisplayOrder,
     cancel: &AtomicBool,
+    progress: impl FnMut(usize, usize),
+) -> Result<CollectionPreparedSnapshot, CollectionPrepareError> {
+    prepare_collection_snapshot_while(
+        snapshot,
+        display_order,
+        || !cancel.load(Ordering::Acquire),
+        progress,
+    )
+}
+
+/// Remote requests combine their session and producer lifetimes without creating a polling
+/// thread. Keep the ordering/classification implementation here and let the caller provide the
+/// current predicate checked between filesystem entries.
+pub(crate) fn prepare_collection_snapshot_while(
+    snapshot: &CollectionSnapshot,
+    display_order: &GridDisplayOrder,
+    mut keep_running: impl FnMut() -> bool,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<CollectionPreparedSnapshot, CollectionPrepareError> {
     let total = snapshot.entries.len();
     let mut facts = Vec::with_capacity(total);
     let mut prepared_by_id = std::collections::HashMap::with_capacity(total);
     for (index, entry) in snapshot.entries.iter().enumerate() {
-        if cancel.load(Ordering::Acquire) {
+        if !keep_running() {
             return Err(CollectionPrepareError::Cancelled);
         }
         let state = inspect_collection_source(&entry.source_path);
@@ -538,7 +555,7 @@ fn write_collection_export_atomic_with(
     Ok(())
 }
 
-fn inspect_collection_source(path: &Path) -> CollectionSourcePreparation {
+pub(crate) fn inspect_collection_source(path: &Path) -> CollectionSourcePreparation {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

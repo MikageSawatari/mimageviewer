@@ -835,7 +835,63 @@ fn remote_entry_grid_item(kind: RemoteEntryKind, path: PathBuf) -> GridItem {
     }
 }
 
-fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
+pub(super) fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
+    cached_image_landscape_flags(
+        entries.len(),
+        |index| {
+            let entry = entries.get(index)?;
+            (entry.kind == RemoteEntryKind::Image).then(|| Path::new(&entry.path))
+        },
+        || true,
+    )
+    .unwrap_or_else(|| vec![false; entries.len()])
+}
+
+pub(super) fn cached_grid_item_landscape_flags(items: &[GridItem]) -> Vec<bool> {
+    cached_image_landscape_flags(
+        items.len(),
+        |index| match items.get(index)? {
+            GridItem::Image(path) => Some(path.as_path()),
+            _ => None,
+        },
+        || true,
+    )
+    .unwrap_or_else(|| vec![false; items.len()])
+}
+
+pub(super) fn cached_prepared_collection_landscape_flags(
+    entries: &[crate::collection_store::PreparedCollectionEntry],
+) -> Vec<bool> {
+    cached_prepared_collection_landscape_flags_while(entries, || true)
+        .unwrap_or_else(|| vec![false; entries.len()])
+}
+
+pub(super) fn cached_prepared_collection_landscape_flags_while(
+    entries: &[crate::collection_store::PreparedCollectionEntry],
+    keep_running: impl FnMut() -> bool,
+) -> Option<Vec<bool>> {
+    cached_image_landscape_flags(
+        entries.len(),
+        |index| {
+            let entry = entries.get(index)?;
+            matches!(
+                entry.availability,
+                crate::collection_store::CollectionSourcePreparation::Available {
+                    kind: crate::collection_store::CollectionResolvedKind::Image,
+                    ..
+                }
+            )
+            .then_some(entry.source_path.as_path())
+        },
+        keep_running,
+    )
+}
+
+fn cached_image_landscape_flags<'a>(
+    len: usize,
+    path_at: impl Fn(usize) -> Option<&'a Path>,
+    mut keep_running: impl FnMut() -> bool,
+) -> Option<Vec<bool>> {
     struct ParentImages {
         path: PathBuf,
         images: Vec<(usize, String)>,
@@ -843,11 +899,13 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
 
     let mut parents = Vec::<ParentImages>::new();
     let mut parent_indexes = HashMap::<String, usize>::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.kind != RemoteEntryKind::Image {
-            continue;
+    for index in 0..len {
+        if !keep_running() {
+            return None;
         }
-        let path = Path::new(&entry.path);
+        let Some(path) = path_at(index) else {
+            continue;
+        };
         let Some(parent) = path.parent() else {
             continue;
         };
@@ -869,16 +927,18 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
     }
 
     let cache_dir = crate::catalog::default_cache_dir();
-    let mut landscape = vec![false; entries.len()];
-    let rotation_keys = entries
-        .iter()
-        .map(|entry| {
-            (entry.kind == RemoteEntryKind::Image)
-                .then(|| GridItem::Image(PathBuf::from(&entry.path)))
+    let mut landscape = vec![false; len];
+    let rotation_keys = (0..len)
+        .map(|index| {
+            path_at(index)
+                .map(|path| GridItem::Image(path.to_path_buf()))
                 .as_ref()
                 .and_then(crate::edit_source::page_key_for_grid_item)
         })
         .collect::<Vec<_>>();
+    if !keep_running() {
+        return None;
+    }
     let rotations = crate::rotation_db::RotationDb::open_readonly()
         .ok()
         .map(|db| db.get_many(rotation_keys.iter().filter_map(|key| key.as_deref())))
@@ -886,6 +946,9 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
     // 親フォルダごとに一度だけ catalog を開き、寸法列だけを一括取得する。
     // フォルダを処理し終えたら DB と寸法 map を drop するので、全親の blob/map を保持しない。
     for parent in parents {
+        if !keep_running() {
+            return None;
+        }
         let catalog = crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, &parent.path)
             .ok()
             .flatten();
@@ -901,21 +964,28 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             .images
             .iter()
             .filter(|(_, filename)| !cached.contains_key(filename))
-            .map(|(index, filename)| (filename.clone(), PathBuf::from(&entries[*index].path)))
+            .filter_map(|(index, filename)| {
+                Some((filename.clone(), path_at(*index)?.to_path_buf()))
+            })
             .collect::<Vec<_>>();
         // 位置ではなく名前で引く。位置で対応させると「2 つのループが同じ順に回る」ことが
         // 暗黙の前提になり、片方の絞り込みを変えた瞬間に**別のページの寸法**を返す。
-        let probed = super::container::file_image_dims_batch(
-            &uncataloged
+        let mut probed = HashMap::new();
+        for chunk in uncataloged.chunks(256) {
+            if !keep_running() {
+                return None;
+            }
+            let paths = chunk
                 .iter()
                 .map(|(_, path)| path.clone())
-                .collect::<Vec<_>>(),
-        );
-        let probed = uncataloged
-            .into_iter()
-            .map(|(filename, _)| filename)
-            .zip(probed)
-            .collect::<HashMap<_, _>>();
+                .collect::<Vec<_>>();
+            for ((filename, _), dims) in chunk
+                .iter()
+                .zip(super::container::file_image_dims_batch(&paths))
+            {
+                probed.insert(filename.clone(), dims);
+            }
+        }
         for (index, filename) in parent.images {
             let dims = match cached.get(&filename) {
                 Some(recorded) => recorded.or_else(|| {
@@ -936,7 +1006,7 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             });
         }
     }
-    landscape
+    Some(landscape)
 }
 
 fn empty_tag_browse_payload(state: TagIndexState) -> TagBrowsePayload {

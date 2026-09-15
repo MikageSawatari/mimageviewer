@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use image::GenericImageView;
-use mimageviewer_ipc::RemoteAddress;
+use mimageviewer_ipc::{RemoteAddress, RemoteEntryKind, RemoteSubresource};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use uuid::Uuid;
@@ -279,14 +279,59 @@ impl Library {
         Ok(())
     }
 
+    /// Revalidates both the address and its claimed root-entry kind. Persistent collection
+    /// responses are assembled asynchronously, so a source can change after core preflight.
+    pub(crate) fn validate_remote_file_kind(
+        &self,
+        address: &RemoteAddress,
+        expected: RemoteEntryKind,
+    ) -> Result<(), StoreError> {
+        if !matches!(address.subresource, RemoteSubresource::File) {
+            return Err(StoreError::BadRequest);
+        }
+        address.validate_syntax().map_err(|error| match error {
+            mimageviewer_ipc::AddressError::NetworkPath => StoreError::NetworkPath,
+            mimageviewer_ipc::AddressError::InvalidPath
+            | mimageviewer_ipc::AddressError::InvalidZipPath => StoreError::BadRequest,
+        })?;
+        let path = resolve_existing(&address.path)?.canonical;
+        let metadata = std::fs::metadata(&path)?;
+        let actual = classify_entry(
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+            metadata.is_dir(),
+            metadata.is_file(),
+        );
+        let matches = match expected {
+            RemoteEntryKind::Folder => actual == EntryKind::Dir,
+            RemoteEntryKind::Image => actual == EntryKind::Image,
+            RemoteEntryKind::Video => actual == EntryKind::Video,
+            RemoteEntryKind::Audio => actual == EntryKind::Audio,
+            RemoteEntryKind::Zip => actual == EntryKind::Zip,
+            RemoteEntryKind::Pdf => actual == EntryKind::Pdf,
+            RemoteEntryKind::Archive => {
+                actual == EntryKind::Other
+                    && path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| {
+                            matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "rar" | "cbr" | "7z" | "cb7" | "lzh" | "lha"
+                            )
+                        })
+            }
+            RemoteEntryKind::Other => actual == EntryKind::Other,
+        };
+        matches.then_some(()).ok_or(StoreError::BadRequest)
+    }
+
     pub(crate) fn validate_remote_file_image(
         &self,
         address: &RemoteAddress,
     ) -> Result<(), StoreError> {
-        if !matches!(
-            address.subresource,
-            mimageviewer_ipc::RemoteSubresource::File
-        ) {
+        if !matches!(address.subresource, RemoteSubresource::File) {
             return Err(StoreError::BadRequest);
         }
         let path = resolve_existing(&address.path)?.canonical;
@@ -303,10 +348,7 @@ impl Library {
         &self,
         address: &RemoteAddress,
     ) -> Result<(), StoreError> {
-        if !matches!(
-            address.subresource,
-            mimageviewer_ipc::RemoteSubresource::File
-        ) {
+        if !matches!(address.subresource, RemoteSubresource::File) {
             return Err(StoreError::BadRequest);
         }
         let path = resolve_existing(&address.path)?.canonical;
@@ -676,6 +718,32 @@ mod tests {
         assert_eq!(classify_entry("a.pdf", false, true), EntryKind::Pdf);
         assert_eq!(classify_entry("notes.txt", false, true), EntryKind::Other);
         assert_eq!(classify_entry("a.jpg", false, false), EntryKind::Other);
+    }
+
+    #[test]
+    fn persistent_file_kind_revalidation_rejects_changed_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let library = Library::empty_for_test(cache);
+        let path = temp.path().join("clip.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+        assert!(
+            library
+                .validate_remote_file_kind(&address, RemoteEntryKind::Video)
+                .is_ok()
+        );
+        assert!(matches!(
+            library.validate_remote_file_kind(&address, RemoteEntryKind::Audio),
+            Err(StoreError::BadRequest)
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            library.validate_remote_file_kind(&address, RemoteEntryKind::Video),
+            Err(StoreError::BadRequest)
+        ));
     }
 
     #[test]

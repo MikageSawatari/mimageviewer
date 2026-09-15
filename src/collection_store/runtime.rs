@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased, unbounded};
@@ -66,6 +66,10 @@ impl CollectionRevisionWatch {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+    }
+
+    pub(crate) fn wake_receiver(&self) -> Receiver<()> {
+        self.wake_rx.clone()
     }
 
     #[cfg(test)]
@@ -144,6 +148,13 @@ impl CollectionStoreRuntime {
         self.event_rx.try_recv().ok()
     }
 
+    /// UI receives an event-only clone; process shutdown ownership stays with the runtime.
+    pub(crate) fn event_stream(&self) -> CollectionRuntimeEventStream {
+        CollectionRuntimeEventStream {
+            receiver: self.event_rx.clone(),
+        }
+    }
+
     /// request admission と同じmutex内でClosingへ遷移してからShutdownをpublishする。
     pub fn begin_shutdown(&mut self) {
         if self.shutdown_ack.is_some() {
@@ -177,6 +188,245 @@ impl CollectionStoreRuntime {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CollectionRuntimeEventStream {
+    receiver: Receiver<CollectionRuntimeEvent>,
+}
+
+impl CollectionRuntimeEventStream {
+    pub(crate) fn try_recv(&self) -> Option<CollectionRuntimeEvent> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteProducerPhase {
+    Open,
+    Closing,
+    Closed,
+}
+
+struct RemoteProducerState {
+    phase: RemoteProducerPhase,
+    in_flight: usize,
+    close_tx: Option<Sender<()>>,
+}
+
+struct RemoteProducerInner {
+    client: CollectionStoreClient,
+    state: Mutex<RemoteProducerState>,
+    close_rx: Receiver<()>,
+    drained: Condvar,
+}
+
+/// The only collection-actor capability exposed to Remote workers.
+///
+/// A request lease couples actor admission with producer-close cancellation. The process owner
+/// closes and drains this owner before it shuts down the actor, so a Remote worker can never race
+/// an actor join with a newly cloned raw client.
+#[derive(Clone)]
+pub(crate) struct CollectionRemoteProducerControl {
+    inner: Arc<RemoteProducerInner>,
+}
+
+pub(crate) struct CollectionRemoteRequestLease {
+    inner: Arc<RemoteProducerInner>,
+    close_rx: Receiver<()>,
+    released: bool,
+}
+
+impl CollectionRemoteProducerControl {
+    pub(crate) fn new(client: CollectionStoreClient) -> Self {
+        let (close_tx, close_rx) = unbounded();
+        Self {
+            inner: Arc::new(RemoteProducerInner {
+                client,
+                state: Mutex::new(RemoteProducerState {
+                    phase: RemoteProducerPhase::Open,
+                    in_flight: 0,
+                    close_tx: Some(close_tx),
+                }),
+                close_rx,
+                drained: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin_request(&self) -> Option<CollectionRemoteRequestLease> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase != RemoteProducerPhase::Open {
+            return None;
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        Some(CollectionRemoteRequestLease {
+            inner: Arc::clone(&self.inner),
+            close_rx: self.inner.close_rx.clone(),
+            released: false,
+        })
+    }
+
+    pub(crate) fn begin_close(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase == RemoteProducerPhase::Open {
+            state.phase = RemoteProducerPhase::Closing;
+            state.close_tx.take();
+        }
+        if state.in_flight == 0 {
+            state.phase = RemoteProducerPhase::Closed;
+            self.inner.drained.notify_all();
+        }
+    }
+
+    /// Process-final only. UI frames and dialogs must never wait here.
+    pub(crate) fn close_and_drain(&self) {
+        self.close_and_drain_with(|| {});
+    }
+
+    fn close_and_drain_with(&self, on_waiting_for_lease: impl FnOnce()) {
+        self.begin_close();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.in_flight != 0 {
+            on_waiting_for_lease();
+        }
+        while state.in_flight != 0 {
+            state = self
+                .inner
+                .drained
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.phase = RemoteProducerPhase::Closed;
+    }
+}
+
+impl CollectionRemoteRequestLease {
+    pub(crate) fn client(&self) -> &CollectionStoreClient {
+        &self.inner.client
+    }
+
+    pub(crate) fn close_receiver(&self) -> Receiver<()> {
+        self.close_rx.clone()
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .phase
+            == RemoteProducerPhase::Open
+    }
+}
+
+impl Drop for CollectionRemoteRequestLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 && state.phase != RemoteProducerPhase::Open {
+            state.phase = RemoteProducerPhase::Closed;
+            self.inner.drained.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_producer_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn remote_producer_close_wakes_every_lease_and_drains_before_actor_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db"))
+            .expect("collection runtime starts");
+        assert!(matches!(
+            runtime.event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(CollectionRuntimeEvent::Ready(_))
+        ));
+
+        let producer = CollectionRemoteProducerControl::new(runtime.client());
+        let lease_a = producer.begin_request().expect("first request is admitted");
+        let lease_b = producer
+            .begin_request()
+            .expect("second request is admitted");
+        let close_a = lease_a.close_receiver();
+        let close_b = lease_b.close_receiver();
+
+        producer.begin_close();
+        assert!(matches!(
+            close_a.recv_timeout(Duration::from_secs(1)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(matches!(
+            close_b.recv_timeout(Duration::from_secs(1)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(producer.begin_request().is_none());
+
+        let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+        let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+        let draining = producer.clone();
+        let waiter = std::thread::spawn(move || {
+            draining.close_and_drain_with(|| {
+                waiting_tx
+                    .send(())
+                    .expect("main waits until producer drain owns the state lock");
+            });
+            let _ = drained_tx.send(());
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer drain reached its in-flight wait");
+        assert!(matches!(
+            drained_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lease_a);
+        assert!(matches!(
+            drained_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lease_b);
+        drained_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("last lease drop releases producer drain");
+        waiter.join().unwrap();
+        assert_eq!(
+            producer
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .phase,
+            RemoteProducerPhase::Closed
+        );
+
+        runtime.begin_shutdown();
+        runtime.shutdown_and_join();
     }
 }
 

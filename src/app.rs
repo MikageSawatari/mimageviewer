@@ -74425,8 +74425,11 @@ impl eframe::App for App {
         // Fence TensorRT worker starts before Remote/background owners can publish a late pool.
         // Pool shutdown and child wait stay on the lifecycle reaper, never on this UI callback.
         self.ai_runtime_init.trt_worker_lifecycle().retire();
-        // Final exit is the only UI lifecycle boundary allowed to wait for the collection actor.
-        // Closing admission first prevents future Remote integration from enqueueing behind it.
+        // Cancel every App-owned Remote resource and publish the drain ACK without requiring
+        // another frame. Server/producer/actor joins remain with the outer process owner.
+        self.retire_remote_resources_for_final_exit();
+        // The App owns only the collection UI client/event stream. This closes UI admission;
+        // actor shutdown is ordered after Remote worker drain outside run_native.
         self.shutdown_collection_runtime_for_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。

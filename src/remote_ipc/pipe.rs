@@ -48,9 +48,10 @@ use super::page_jobs::{
     DisplayRequestId, PageJobCancelCause, PageJobId, PageJobPriority, PageJobRegistry,
     PromotePageJobResult, RegisterPageJobError, ReleasePageJobResult,
 };
+use super::persistent_collections::PersistentCollectionEngine;
 use super::session::{
-    SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome, VideoStreamUiOutcome,
-    VideoStreamUiRequest,
+    RemoteOperationCancellation, SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome,
+    VideoStreamUiOutcome, VideoStreamUiRequest,
 };
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 use super::video_stream::{VideoStreamEngine, VideoStreamStartBudget, VideoStreamStartStage};
@@ -601,6 +602,23 @@ pub(super) struct ServerGuard {
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
 }
 
+#[derive(Clone)]
+pub(super) struct ServerControl {
+    stop: Arc<AtomicBool>,
+    session: SessionHandle,
+}
+
+impl ServerControl {
+    pub(super) fn begin_app_exit(&self) {
+        if !self.stop.swap(true, Ordering::AcqRel) {
+            for _ in 0..ACCEPTOR_COUNT {
+                poke_listener();
+            }
+        }
+        self.session.retire_app_admission();
+    }
+}
+
 /// Owns every worker started after the persistent settings reader is created. Any early return
 /// runs the same ordered shutdown as `ServerGuard::drop`, so `RemoteIpcServer::start(Err)` proves
 /// that no detached worker can retain a `CollectionEngine`/`LiveFavorites` clone.
@@ -692,7 +710,12 @@ impl Drop for ServerStartupWorkers {
 }
 
 impl ServerGuard {
-    pub(super) fn start(settings: crate::settings::Settings) -> Result<Self, String> {
+    pub(super) fn start(
+        settings: crate::settings::Settings,
+        persistent_collection_producer: Option<
+            crate::collection_store::CollectionRemoteProducerControl,
+        >,
+    ) -> Result<Self, String> {
         // 最初の instance は同名サーバの二重起動検出も兼ねる。他の instance も
         // listener 開始前に作り、起動完了時点で複数本が必ず待機できる形にする。
         let mut initial_pipes = Vec::with_capacity(ACCEPTOR_COUNT);
@@ -737,6 +760,9 @@ impl ServerGuard {
         let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
             settings, favorites,
         ));
+        let persistent_collection_engine = persistent_collection_producer
+            .map(PersistentCollectionEngine::new)
+            .map(Arc::new);
         let heavy_queue = Arc::new(HeavyQueueWiring::new(worker_count, Arc::clone(&page_jobs)));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
         let (write_work_tx, write_work_rx) = mpsc::sync_channel::<Work>(WRITE_WORK_QUEUE_CAPACITY);
@@ -748,6 +774,7 @@ impl ServerGuard {
         let stream_metrics = Arc::new(QueueMetrics::new("stream"));
         let stop = Arc::new(AtomicBool::new(false));
         let home_collection_engine = Arc::clone(&collection_engine);
+        let home_persistent_collection_engine = persistent_collection_engine.clone();
         let home_container_engine = Arc::clone(&container_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
         let home_worker = std::thread::Builder::new()
@@ -756,6 +783,7 @@ impl ServerGuard {
                 home_worker_loop(
                     home_work_rx,
                     &home_collection_engine,
+                    home_persistent_collection_engine.as_deref(),
                     &home_container_engine,
                     &home_worker_metrics,
                 )
@@ -795,6 +823,7 @@ impl ServerGuard {
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
+            let persistent_collection_engine = persistent_collection_engine.clone();
             let session = session_handle.clone();
             startup.workers.push(
                 std::thread::Builder::new()
@@ -805,6 +834,7 @@ impl ServerGuard {
                             &thumbnail_engine,
                             &container_engine,
                             &collection_engine,
+                            persistent_collection_engine.as_deref(),
                             &session,
                             index,
                         )
@@ -895,6 +925,13 @@ impl ServerGuard {
         self.session_runtime.handle()
     }
 
+    pub(super) fn control(&self) -> ServerControl {
+        ServerControl {
+            stop: Arc::clone(&self.stop),
+            session: self.session_runtime.handle(),
+        }
+    }
+
     pub(super) fn settings_reader_control(
         &self,
     ) -> super::live_favorites::RemoteSettingsReaderControl {
@@ -951,6 +988,7 @@ fn worker_loop(
     thumbnail_engine: &ThumbnailEngine,
     container_engine: &ContainerEngine,
     collection_engine: &CollectionEngine,
+    persistent_collection_engine: Option<&PersistentCollectionEngine>,
     session: &SessionHandle,
     worker_index: usize,
 ) {
@@ -985,7 +1023,7 @@ fn worker_loop(
                 &format!("heavy-{worker_index}"),
                 session_operation,
                 page_job,
-                |message, _session_cancel, page_job| match message {
+                |message, session_cancel, page_job| match message {
                     ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
                         id,
                         response: thumbnail_engine.handle(request, &context, container_engine),
@@ -998,6 +1036,51 @@ fn worker_loop(
                         id,
                         response: collection_engine.collection(request),
                     },
+                    ClientMessage::PersistentCollectionCatalog { id, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response: engine.catalog(id, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
+                    ClientMessage::PersistentCollectionSnapshot { id, request, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionSnapshot {
+                                id,
+                                response: engine.snapshot(id, request, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionSnapshot {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
+                    ClientMessage::PersistentCollectionNavigate { id, request, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionNavigate {
+                                id,
+                                response: engine.navigate(id, request, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionNavigate {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
                     ClientMessage::FavoriteSearch { id, request, .. } => {
                         ServerMessage::FavoriteSearch {
                             id,
@@ -1126,6 +1209,7 @@ fn worker_loop(
 fn home_worker_loop(
     work_rx: mpsc::Receiver<Work>,
     collection_engine: &CollectionEngine,
+    persistent_collection_engine: Option<&PersistentCollectionEngine>,
     container_engine: &ContainerEngine,
     metrics: &QueueMetrics,
 ) {
@@ -1146,7 +1230,7 @@ fn home_worker_loop(
                 "home-0",
                 session_operation,
                 page_job,
-                |message, _cancel, _page_job| match message {
+                |message, cancel, _page_job| match message {
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
                         response: collection_engine.home(),
@@ -1155,6 +1239,21 @@ fn home_worker_loop(
                         id,
                         response: container_engine.folder_list(request),
                     },
+                    ClientMessage::PersistentCollectionCatalog { id, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response: engine.catalog(id, &cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
                     other => service_stopped_response(&other),
                 },
             ),
@@ -1616,7 +1715,11 @@ fn execute_work(
     worker: &str,
     session_operation: SessionOperation,
     page_job: Option<PageJobWork>,
-    handler: impl FnOnce(ClientMessage, Arc<AtomicBool>, Option<&PageJobWork>) -> ServerMessage,
+    handler: impl FnOnce(
+        ClientMessage,
+        RemoteOperationCancellation,
+        Option<&PageJobWork>,
+    ) -> ServerMessage,
 ) {
     let request_id = message.id();
     let request_kind = match (&message, page_job.as_ref()) {
@@ -1656,7 +1759,7 @@ fn execute_work(
         }
     } else {
         session_operation.started();
-        handler(message, session_operation.cancel_flag(), page_job.as_ref())
+        handler(message, session_operation.cancellation(), page_job.as_ref())
     };
     let ownership = session_operation.ownership_response();
     let response =
@@ -1744,6 +1847,9 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
+        ClientMessage::PersistentCollectionCatalog { .. } => "persistent_collection_catalog",
+        ClientMessage::PersistentCollectionSnapshot { .. } => "persistent_collection_snapshot",
+        ClientMessage::PersistentCollectionNavigate { .. } => "persistent_collection_navigate",
         ClientMessage::FavoriteSearch { .. } => "favorite_search",
         ClientMessage::TagBrowse { .. } => "tag_browse",
         ClientMessage::TagItems { .. } => "tag_items",
@@ -1782,7 +1888,9 @@ fn request_kind(message: &ClientMessage) -> &'static str {
 
 fn work_lane(message: &ClientMessage) -> WorkLane {
     match message {
-        ClientMessage::Home { .. } | ClientMessage::FolderList { .. } => WorkLane::Home,
+        ClientMessage::Home { .. }
+        | ClientMessage::FolderList { .. }
+        | ClientMessage::PersistentCollectionCatalog { .. } => WorkLane::Home,
         ClientMessage::Write { .. } => WorkLane::Write,
         ClientMessage::VideoStreamStart { .. }
         | ClientMessage::VideoStreamControl { .. }
@@ -1813,6 +1921,9 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         ClientMessage::Thumbnail { owner, .. }
         | ClientMessage::Home { owner, .. }
         | ClientMessage::Collection { owner, .. }
+        | ClientMessage::PersistentCollectionCatalog { owner, .. }
+        | ClientMessage::PersistentCollectionSnapshot { owner, .. }
+        | ClientMessage::PersistentCollectionNavigate { owner, .. }
         | ClientMessage::FavoriteSearch { owner, .. }
         | ClientMessage::TagBrowse { owner, .. }
         | ClientMessage::TagItems { owner, .. }
@@ -1861,6 +1972,15 @@ fn operation_description(message: &ClientMessage) -> String {
         },
         ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
         ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
+        ClientMessage::PersistentCollectionCatalog { .. } => {
+            "コレクション一覧を読み込み中".to_owned()
+        }
+        ClientMessage::PersistentCollectionSnapshot { .. } => {
+            "コレクション内容を読み込み中".to_owned()
+        }
+        ClientMessage::PersistentCollectionNavigate { .. } => {
+            "コレクションの次の項目を確認中".to_owned()
+        }
         ClientMessage::FavoriteSearch { .. } => "お気に入りを検索中".to_owned(),
         ClientMessage::TagBrowse { .. } => "タグ一覧を読み込み中".to_owned(),
         ClientMessage::TagItems { .. } => "タグの項目を検索中".to_owned(),
@@ -2039,6 +2159,18 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: CollectionResponse::Success(_),
             ..
         }
+        | ServerMessage::PersistentCollectionCatalog {
+            response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Success(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionSnapshot {
+            response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Success(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionNavigate {
+            response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Success(_),
+            ..
+        }
         | ServerMessage::FavoriteSearch {
             response: FavoriteSearchResponse::Success(_),
             ..
@@ -2168,6 +2300,18 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Collection {
             response: CollectionResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionCatalog {
+            response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionSnapshot {
+            response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionNavigate {
+            response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(_),
             ..
         }
         | ServerMessage::FavoriteSearch {
@@ -3263,6 +3407,30 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の集約ビューワーカーが停止しています",
             )),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(CollectionError::new(
@@ -3421,6 +3589,20 @@ fn duplicate_collection_error() -> CollectionError {
     )
 }
 
+fn persistent_collection_unavailable_error() -> mimageviewer_ipc::PersistentCollectionError {
+    persistent_collection_error(
+        mimageviewer_ipc::PersistentCollectionErrorCode::Unavailable,
+        "mIV 本体の永続コレクション機能を利用できません",
+    )
+}
+
+fn persistent_collection_error(
+    code: mimageviewer_ipc::PersistentCollectionErrorCode,
+    message: &'static str,
+) -> mimageviewer_ipc::PersistentCollectionError {
+    mimageviewer_ipc::PersistentCollectionError::new(code, message)
+}
+
 fn duplicate_request_response(message: &ClientMessage) -> ServerMessage {
     match message {
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
@@ -3434,6 +3616,39 @@ fn duplicate_request_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: CollectionResponse::Error(duplicate_collection_error()),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(duplicate_collection_error()),
@@ -3522,6 +3737,39 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のリモート集約ビュー queue が混み合っています",
             )),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション一覧 queue が混み合っています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション queue が混み合っています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション移動 queue が混み合っています",
+                    ),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(CollectionError::new(
@@ -4143,6 +4391,7 @@ mod tests {
             home_worker_loop(
                 work_rx,
                 &collection_engine,
+                None,
                 &container_engine,
                 &worker_metrics,
             )
