@@ -2965,7 +2965,17 @@ impl App {
         if from_idx == target_idx {
             return true;
         }
-        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
+        // Collection navigation can install a newer immutable root in which the playing entry was
+        // deleted before it delegates to this established landing. In that case the typed
+        // navigation owner keeps the old player under a transient, out-of-range index. The cache
+        // entry remains the authoritative source owner, so it is safe to source-swap even though
+        // the latest item list no longer has a row at `from_idx`.
+        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+            && !matches!(
+                self.fs_cache.get(&from_idx),
+                Some(FsCacheEntry::Video { .. })
+            )
+        {
             return false;
         }
 
@@ -14026,6 +14036,14 @@ impl App {
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
         // (`maybe_apply_deferred_native_video_nav` 参照)。most-recent-wins。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            if self.start_collection_manual_navigation(
+                ctx,
+                fs_idx,
+                base_delta,
+                crate::app::ManualMediaNavigationLanding::NativeVideo,
+            ) {
+                return;
+            }
             self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
@@ -14039,6 +14057,17 @@ impl App {
         }
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
+        }
+        // A collection root may have changed while the currently installed order still reports a
+        // boundary. Resolve every step from the actor's latest prepared order before consulting
+        // the old page-nav boundary.
+        if self.start_collection_manual_navigation(
+            ctx,
+            fs_idx,
+            base_delta,
+            crate::app::ManualMediaNavigationLanding::NativeVideo,
+        ) {
+            return;
         }
         let display_order = self.current_grid_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);

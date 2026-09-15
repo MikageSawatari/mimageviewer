@@ -26,7 +26,7 @@ pub(crate) struct CollectionGridRemoveTarget {
 }
 
 impl App {
-    fn collection_grid_context_id(&self) -> ViewerContextId {
+    pub(in crate::app) fn collection_grid_context_id(&self) -> ViewerContextId {
         #[cfg(windows)]
         {
             self.projected_viewer_context_id()
@@ -266,6 +266,10 @@ impl App {
             accepted_revision: session.accepted_revision,
             wanted_revision: session.wanted_revision,
             anchor,
+            navigation_prepared: None,
+            navigation_origin: None,
+            navigation_request: None,
+            navigation_watch: None,
         })
     }
 
@@ -280,21 +284,53 @@ impl App {
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return false;
         };
-        if !matches!(session.position, CollectionGridPosition::Root)
-            || session.accepted_revision != owner.accepted_revision
+        if let Some(prepared) = owner.navigation_prepared.as_ref() {
+            // The grid and navigation use independent revision watches. Navigation may already
+            // own exact revision N while the mounted grid still reports N-1, then the grid watch
+            // may catch up to N while an archive conversion is pending. Only a revision newer
+            // than the transferred exact prepared snapshot makes that navigation owner stale.
+            if session.wanted_revision > prepared.collection_revision {
+                return false;
+            }
+        } else if session.accepted_revision != owner.accepted_revision
             || session.wanted_revision != owner.wanted_revision
+        {
+            return false;
+        }
+        if !self.collection_navigation_source_owner_is_current(owner) {
+            return false;
+        }
+        if let Some(origin) = &owner.navigation_origin {
+            if !matches!(
+                &session.position,
+                CollectionGridPosition::PhysicalSource {
+                    entry_id,
+                    source_key,
+                    ..
+                } if *entry_id == origin.entry_id && *source_key == origin.source_key
+            ) && !(matches!(session.position, CollectionGridPosition::Root)
+                && session.installed_items_generation == Some(self.items_generation))
+            {
+                return false;
+            }
+        } else if !matches!(session.position, CollectionGridPosition::Root)
             || session.installed_items_generation != Some(self.items_generation)
         {
             return false;
         }
-        session.prepared().is_some_and(|prepared| {
-            prepared.collection_revision == owner.accepted_revision
-                && prepared.entries.iter().any(|entry| {
-                    entry.entry_id == owner.anchor.entry_id
-                        && entry.source_key == owner.anchor.source_key
-                        && crate::folder_tree::path_eq(&entry.source_path, path)
-                })
-        })
+        owner
+            .navigation_prepared
+            .as_ref()
+            .or_else(|| session.prepared())
+            .is_some_and(|prepared| {
+                (owner.navigation_prepared.is_some()
+                    || prepared.collection_revision == owner.accepted_revision)
+                    && prepared.entries.iter().any(|entry| {
+                        entry.entry_id == owner.anchor.entry_id
+                            && entry.source_key == owner.anchor.source_key
+                            && crate::folder_tree::path_eq(&entry.source_path, path)
+                    })
+            })
     }
 
     pub(crate) fn commit_collection_grid_source_open_owned(
@@ -302,11 +338,50 @@ impl App {
         owner: &CollectionGridSourceOpenOwner,
         path: std::path::PathBuf,
     ) -> bool {
-        if !self.collection_grid_source_open_owner_is_current(owner, &path) {
+        if !self.collection_grid_source_open_owner_landed_is_current(owner, &path) {
             return false;
+        }
+        if let Some(prepared) = owner.navigation_prepared.clone()
+            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+        {
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
+            session.load = if prepared.entries.is_empty() {
+                CollectionGridLoadState::Empty(prepared)
+            } else {
+                CollectionGridLoadState::Ready(prepared)
+            };
+            session.installed_items_generation = None;
         }
         self.commit_collection_grid_source_open(owner.anchor.clone(), path);
         true
+    }
+
+    pub(crate) fn collection_grid_source_open_owner_landed_is_current(
+        &self,
+        owner: &CollectionGridSourceOpenOwner,
+        path: &std::path::Path,
+    ) -> bool {
+        if owner.navigation_request.is_none() {
+            return self.collection_grid_source_open_owner_is_current(owner, path);
+        }
+        if !self.collection_grid_stamp_is_current(owner.stamp)
+            || !self.collection_navigation_source_owner_landed_is_current(owner)
+            || !self
+                .effective_folder()
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, path))
+        {
+            return false;
+        }
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return false;
+        };
+        session.identity.collection_id == owner.stamp.collection_id
+            && owner
+                .navigation_prepared
+                .as_ref()
+                .is_some_and(|prepared| session.wanted_revision <= prepared.collection_revision)
     }
 
     pub(crate) fn commit_collection_grid_source_open(
@@ -779,7 +854,7 @@ impl App {
         self.schedule_collection_grid_snapshot();
     }
 
-    fn apply_collection_grid_prepared(
+    pub(in crate::app) fn apply_collection_grid_prepared(
         &mut self,
         prepared: Arc<CollectionPreparedSnapshot>,
         previous: Option<Arc<CollectionPreparedSnapshot>>,
@@ -810,6 +885,24 @@ impl App {
         } else {
             Vec::new()
         };
+        let old_search_anchors = if old_binding_is_current {
+            self.search_filter.as_ref().map(|filter| {
+                filter
+                    .iter()
+                    .filter_map(|index| previous.as_ref()?.entries.get(*index))
+                    .map(|entry| CollectionGridViewportAnchor {
+                        entry_id: entry.entry_id,
+                        source_key: entry.source_key.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        let old_search_query = old_binding_is_current.then(|| self.search_query.clone());
+        let old_search_origin = old_binding_is_current
+            .then(|| self.search_filter_origin_folder.clone())
+            .flatten();
         let restore_anchor = self
             .top_level_grid_view
             .collection_session_mut()
@@ -850,6 +943,30 @@ impl App {
             .collect::<std::collections::HashSet<_>>();
         self.install_collection_grid_items(items, image_metas, selected);
         self.checked = checked;
+        if let Some(query) = old_search_query {
+            self.search_query = query;
+            self.search_filter_origin_folder = old_search_origin;
+        }
+        if let Some(anchors) = old_search_anchors {
+            self.search_filter = Some(
+                anchors
+                    .iter()
+                    .filter_map(|anchor| {
+                        prepared
+                            .entries
+                            .iter()
+                            .position(|entry| entry.entry_id == anchor.entry_id)
+                            .or_else(|| {
+                                prepared
+                                    .entries
+                                    .iter()
+                                    .position(|entry| entry.source_key == anchor.source_key)
+                            })
+                    })
+                    .collect(),
+            );
+            self.rebuild_visible_indices();
+        }
         self.address = format!("コレクション: {}", prepared.collection_name);
         let installed_generation = self.items_generation;
         if let Some(session) = self.top_level_grid_view.collection_session_mut() {
@@ -1021,6 +1138,65 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    #[test]
+    fn navigation_materialization_preserves_and_remaps_local_search_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a.png");
+        let second = temp.path().join("b.png");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (first, CollectionResolvedKind::Image),
+                (second, CollectionResolvedKind::Image),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let previous = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .cloned()
+            .unwrap();
+        let filtered_identity = previous.entries[0].entry_id;
+        app.search_query = "a".into();
+        app.search_filter_origin_folder = Some(temp.path().to_path_buf());
+        app.search_filter = Some([0].into_iter().collect());
+        app.rebuild_visible_indices();
+
+        let mut entries = previous.entries.to_vec();
+        entries.reverse();
+        let reordered = Arc::new(CollectionPreparedSnapshot {
+            collection_id: previous.collection_id,
+            collection_revision: previous.collection_revision + 1,
+            collection_name: previous.collection_name.clone(),
+            entries: Arc::from(entries.into_boxed_slice()),
+        });
+        app.apply_collection_grid_prepared(Arc::clone(&reordered), Some(previous));
+
+        assert_eq!(app.search_query, "a");
+        assert_eq!(
+            app.search_filter_origin_folder.as_deref(),
+            Some(temp.path())
+        );
+        assert_eq!(
+            app.search_filter,
+            Some(
+                [reordered
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == filtered_identity)
+                    .unwrap()]
+                .into_iter()
+                .collect()
+            )
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

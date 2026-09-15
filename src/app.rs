@@ -177,6 +177,7 @@ mod runtime_ops;
 mod sidecar_restore;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
 pub(crate) mod collection_grid;
+pub(crate) mod collection_navigation;
 pub(crate) mod smart_folder;
 mod snapshot_ops;
 mod startup_ops;
@@ -434,6 +435,15 @@ pub(crate) struct MainGridArchiveTransitionIntent {
     suppress_facet_filter: bool,
     smart_folder_drill: bool,
     collection_grid_owner: Option<top_level_grid_view::CollectionGridSourceOpenOwner>,
+    collection_navigation_continuation: Option<CollectionArchiveNavigationContinuation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionArchiveNavigationContinuation {
+    pub(crate) steps: i32,
+    pub(crate) fullscreen: bool,
+    pub(crate) resume_slideshow: bool,
+    pub(crate) native_toast: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3017,6 +3027,7 @@ pub(crate) enum DeferredFsTarget {
     None,
     Preferred(crate::snapshot::SnapshotTarget),
     Required(crate::snapshot::SnapshotTarget),
+    CollectionNavigation(CollectionArchiveNavigationContinuation),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18819,6 +18830,24 @@ impl App {
             suppress_facet_filter,
             smart_folder_drill: self.top_level_grid_view.smart_folder_session().is_some(),
             collection_grid_owner: self.collection_grid_source_open_owner(idx, source_path),
+            collection_navigation_continuation: None,
+        })
+    }
+
+    pub(in crate::app) fn collection_archive_open_owner(
+        &self,
+        source_path: &Path,
+        collection_grid_owner: top_level_grid_view::CollectionGridSourceOpenOwner,
+        continuation: Option<CollectionArchiveNavigationContinuation>,
+    ) -> OpenRequestOwner {
+        OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
+            source_path: source_path.to_path_buf(),
+            reading_history_return_from: None,
+            suppress_rating_filter: false,
+            suppress_facet_filter: false,
+            smart_folder_drill: false,
+            collection_grid_owner: Some(collection_grid_owner),
+            collection_navigation_continuation: continuation,
         })
     }
 
@@ -18833,6 +18862,21 @@ impl App {
             .as_ref()
             .is_none_or(|collection| {
                 self.collection_grid_source_open_owner_is_current(collection, &intent.source_path)
+            })
+    }
+
+    fn main_grid_archive_transition_landed_is_current(&self, owner: &OpenRequestOwner) -> bool {
+        let OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return true;
+        };
+        intent
+            .collection_grid_owner
+            .as_ref()
+            .is_none_or(|collection| {
+                self.collection_grid_source_open_owner_landed_is_current(
+                    collection,
+                    &intent.source_path,
+                )
             })
     }
 
@@ -18859,7 +18903,7 @@ impl App {
         let OpenRequestOwner::MainGridArchive(intent) = owner else {
             return;
         };
-        if !self.main_grid_archive_transition_is_current(owner) {
+        if !self.main_grid_archive_transition_landed_is_current(owner) {
             return;
         }
         self.reading_history_return_from = intent.reading_history_return_from.clone();
@@ -18872,9 +18916,19 @@ impl App {
         if intent.suppress_facet_filter {
             self.maybe_suppress_facet_filter_for_opened_container_path(&intent.source_path);
         }
-        if let Some(collection) = intent.collection_grid_owner.clone() {
-            let _ = self
-                .commit_collection_grid_source_open_owned(&collection, intent.source_path.clone());
+        let collection_committed = intent
+            .collection_grid_owner
+            .as_ref()
+            .is_none_or(|collection| {
+                self.commit_collection_grid_source_open_owned(
+                    collection,
+                    intent.source_path.clone(),
+                )
+            });
+        if collection_committed
+            && let Some(continuation) = intent.collection_navigation_continuation.clone()
+        {
+            self.resume_collection_archive_navigation(continuation);
         }
     }
 
@@ -24354,6 +24408,27 @@ impl App {
     }
 
     pub(crate) fn load_zip_as_folder_with_input_seq(&mut self, zip_path: PathBuf, input_seq: u64) {
+        self.load_zip_as_folder_with_prepared_enumeration(zip_path, input_seq, None);
+    }
+
+    pub(in crate::app) fn load_zip_as_folder_prepared(
+        &mut self,
+        zip_path: PathBuf,
+        enumeration: crate::zip_loader::ZipEnumeration,
+    ) {
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            self.input_seq,
+            Some(enumeration),
+        );
+    }
+
+    fn load_zip_as_folder_with_prepared_enumeration(
+        &mut self,
+        zip_path: PathBuf,
+        input_seq: u64,
+        prepared: Option<crate::zip_loader::ZipEnumeration>,
+    ) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
@@ -24381,7 +24456,8 @@ impl App {
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
         // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
         // miss して通常経路 → 列挙で再検出 → 再変換提案)。
-        if !crate::rar_loader::is_rar_path(&zip_path)
+        if prepared.is_none()
+            && !crate::rar_loader::is_rar_path(&zip_path)
             && !self.settings.archive_file_handling_ignores_convertible()
             && let Some(cached) = self.try_archive_cache_lookup(&zip_path)
             && !crate::folder_tree::path_eq(&cached, &zip_path)
@@ -24496,6 +24572,11 @@ impl App {
         // クリアし、ZIP enumerate 完了前に黒画面遷移してしまう (Codex 指摘)。
         // 代わりに「ZIP 投入直後の repaint」は tail repaint reasons に
         // zip_enumerate_pending を含めることで担保する。
+
+        if let Some(enumeration) = prepared {
+            self.finalize_zip_enumerate(zip_path, input_seq, Ok(enumeration));
+            return;
+        }
 
         // worker spawn
         let cancel = Arc::new(AtomicBool::new(false));
@@ -25295,6 +25376,22 @@ impl App {
     }
 
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, None);
+    }
+
+    pub(in crate::app) fn load_pdf_as_folder_prepared(
+        &mut self,
+        pdf_path: PathBuf,
+        pages: Vec<crate::pdf_loader::PdfPageEntry>,
+    ) {
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages));
+    }
+
+    fn load_pdf_as_folder_with_prepared_pages(
+        &mut self,
+        pdf_path: PathBuf,
+        prepared_pages: Option<Vec<crate::pdf_loader::PdfPageEntry>>,
+    ) {
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
@@ -25382,7 +25479,10 @@ impl App {
         let placeholder_built = self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some());
 
         // ── 非同期でページ列挙をリクエスト (検証 + cache 更新) ──
-        let handle = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
+        let handle = match prepared_pages {
+            Some(pages) => crate::pdf_loader::completed_enumerate_handle(&pdf_path, Ok(pages)),
+            None => crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref()),
+        };
         self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
@@ -25476,6 +25576,10 @@ impl App {
         &mut self,
         deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        let collection_continuation = match &deferred.target {
+            DeferredFsTarget::CollectionNavigation(continuation) => Some(continuation.clone()),
+            _ => None,
+        };
         // ★固定 navigation の Preferred target は従来どおり miss 時に読書位置 / 先頭へ
         // fallback する。一方、detached の明示 leaf open は Required で、対象が列挙結果に
         // 無ければ別ページを開かず terminal close へ進める。
@@ -25490,6 +25594,7 @@ impl App {
                 }
                 resolved
             }
+            DeferredFsTarget::CollectionNavigation(_) => None,
         };
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
         if new_idx.is_none() && deferred.resume_to_last_page {
@@ -25509,6 +25614,9 @@ impl App {
             if deferred.resume_slideshow {
                 self.slideshow_playing = true;
                 self.schedule_next_slideshow_from_now();
+            }
+            if let Some(continuation) = collection_continuation {
+                self.resume_collection_archive_navigation(continuation);
             }
             DeferredFsOpenOutcome::Opened
         } else {
@@ -25941,6 +26049,9 @@ impl App {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
+        if self.resume_collection_pdf_password_request(&request.path, password.clone(), save) {
+            return true;
+        }
         self.pdf_current_password = Some(password.clone());
         self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
         self.resume_fs_navigation_sequence_after_password();
@@ -25970,6 +26081,10 @@ impl App {
     fn cancel_pdf_password_request_in_mounted_context(&mut self) -> bool {
         if self.pdf_password_request.take().is_none() {
             return false;
+        }
+        if self.cancel_collection_pdf_password_request() {
+            self.pdf_password_pending_save = None;
+            return true;
         }
         self.pdf_password_pending_save = None;
         self.fs_nav_after_pdf_enumerate = None;
@@ -38436,6 +38551,7 @@ impl App {
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
                 // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
+            } else if self.start_collection_outer_grid_navigation(ctx, true) {
             } else if self.start_smart_folder_scope_nav(true, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
@@ -38462,6 +38578,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
+            } else if self.start_collection_outer_grid_navigation(ctx, false) {
             } else if self.start_smart_folder_scope_nav(false, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
@@ -56191,6 +56308,7 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.cancel_collection_navigation_intent();
         #[cfg(windows)]
         if self.video_presentation_transition.is_transitioning() {
             self.video_presentation_transition
@@ -70466,6 +70584,9 @@ impl App {
         source: &'static str,
         landing: ManualMediaNavigationLanding,
     ) {
+        if self.start_collection_manual_navigation(ctx, fs_idx, delta, landing) {
+            return;
+        }
         let candidates = Self::collect_manual_media_navigation_candidates(
             &self.items,
             display_order,
@@ -70689,6 +70810,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
+        self.cancel_collection_media_eof_navigation_intent();
         self.video_continuous_mode = mode;
         self.video_continuous_last_eof = None;
         if self.settings.video_continuous_mode != mode {
@@ -70741,6 +70863,10 @@ impl App {
             return;
         }
         self.video_continuous_last_eof = Some(eof_key);
+
+        if self.start_collection_video_eof_navigation(ctx, fs_idx, seek_serial) {
+            return;
+        }
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
@@ -70871,6 +70997,10 @@ impl App {
             return;
         }
         self.video_continuous_last_eof = Some(eof_key);
+
+        if self.start_collection_video_audio_mode_eof_navigation(ctx, fs_idx, seek_serial) {
+            return;
+        }
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
@@ -71127,6 +71257,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
+        self.cancel_collection_media_eof_navigation_intent();
         self.video_continuous_mode = mode;
         self.video_continuous_last_eof = None;
         if self.settings.video_continuous_mode != mode {
@@ -71160,6 +71291,10 @@ impl App {
             return;
         }
         self.video_continuous_last_eof = Some(eof_key);
+
+        if self.start_collection_music_eof_navigation(ctx, fs_idx, seek_serial) {
+            return;
+        }
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
@@ -74403,6 +74538,7 @@ impl eframe::App for App {
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
         self.poll_collection_grid(ctx);
+        self.poll_collection_navigation(ctx);
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.

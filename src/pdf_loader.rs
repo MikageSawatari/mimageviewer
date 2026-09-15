@@ -4598,8 +4598,7 @@ impl Drop for PdfEnumerateHandle {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn completed_enumerate_handle_for_test(
+pub(crate) fn completed_enumerate_handle(
     pdf_path: &Path,
     result: std::io::Result<Vec<PdfPageEntry>>,
 ) -> PdfEnumerateHandle {
@@ -4611,6 +4610,14 @@ pub(crate) fn completed_enumerate_handle_for_test(
     };
     coordinator.complete(&key, start.request_id, result);
     handle
+}
+
+#[cfg(test)]
+pub(crate) fn completed_enumerate_handle_for_test(
+    pdf_path: &Path,
+    result: std::io::Result<Vec<PdfPageEntry>>,
+) -> PdfEnumerateHandle {
+    completed_enumerate_handle(pdf_path, result)
 }
 
 /// UI ナビゲーション経路の PDF ページ列挙。

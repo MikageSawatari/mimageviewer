@@ -1454,6 +1454,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-15 §1.118 Phase 4 collection playback / latest navigation（親Codex／独立Sol構造合意、実装・自動検証）**
+
+collection rootの通常 page / native / slideshow / video・video-audio・music EOFと、Grid / fullscreenの
+Ctrl+上下を、`TopLevelGridView`がviewer contextごとに所有するtyped navigation stateへ接続した。requestは
+context ID、surface / items generation、input intent sequence、collection ID、entry ID / source keyのanchorと
+独立revision watchを持ち、actorの最新snapshotをexact preparedへ変換してから有限候補をpreflightする。
+containerは着地可能payloadが確定するまで現在のpresentationとroot bindingを維持し、成功時だけ既存loaderへ
+terminal ownerを一度移譲する。park / mount / retireは既存bundle境界を使い、cloneではreceiver / cancel tokenを
+共有しない。
+
+detached physical contextはPhase 3の`TopLevelGridRestore::Collection`を読み、同じpure resolverへoriginを渡す。
+nested ZIPではdetached collection originでも既存ZIP child DFSを先に処理し、そのtailだけcollection outerへ進む。
+通常detached physicalのfilesystem navigation、viewport生成、host identity、placement、focus、geometry、window
+predicateは変更していない。新しいdetached bool、時間guard、retry、repaint loopを追加せず、same-contextとdetachedの
+ZIP child-first、context / revision / selection / close / replacementのstale rejectionをhandler回帰で固定したため、
+§2のcontext ownershipを拡張する構造変更として親と独立Sol / xhigh reviewerが合意した。
+
 **2026-09-14 §1.118 Phase 3 collection Grid / return origin（親Codex／独立Sol構造合意、実装・自動検証）**
 
 collection一覧とその非同期prepareはApp-globalなcurrent flagへ置かず、既存`ViewerContextBundle`内の

@@ -65676,6 +65676,7 @@ mod smart_folder_transition_tests {
                     suppress_facet_filter: false,
                     smart_folder_drill: false,
                     collection_grid_owner: None,
+                    collection_navigation_continuation: None,
                 },
             ),
             None,

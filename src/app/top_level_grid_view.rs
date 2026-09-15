@@ -287,13 +287,68 @@ pub(crate) struct CollectionGridRequestStamp {
 /// The surface stamp prevents a completion from crossing viewer contexts or collection
 /// replacements. Both revisions are kept because a notice may advance `wanted_revision` while
 /// the currently installed immutable binding still has `accepted_revision`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct CollectionGridSourceOpenOwner {
     pub(crate) stamp: CollectionGridRequestStamp,
     pub(crate) accepted_revision: u64,
     pub(crate) wanted_revision: u64,
     pub(crate) anchor: CollectionGridViewportAnchor,
+    /// Exact immutable root selected by collection playback navigation. Ordinary grid opens leave
+    /// this empty; delayed archive conversion carries it until the physical-source commit.
+    pub(crate) navigation_prepared:
+        Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    pub(crate) navigation_origin: Option<CollectionGridViewportAnchor>,
+    /// Full intent and revision watch transferred from collection navigation into a delayed
+    /// archive conversion. They keep close/replacement/revision races observable after the
+    /// preflight request itself has left `collection_navigation_pending`.
+    pub(in crate::app) navigation_request:
+        Option<super::collection_navigation::CollectionNavigationRequest>,
+    pub(in crate::app) navigation_watch: Option<crate::collection_store::CollectionRevisionWatch>,
 }
+
+impl std::fmt::Debug for CollectionGridSourceOpenOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectionGridSourceOpenOwner")
+            .field("stamp", &self.stamp)
+            .field("accepted_revision", &self.accepted_revision)
+            .field("wanted_revision", &self.wanted_revision)
+            .field("anchor", &self.anchor)
+            .field(
+                "navigation_revision",
+                &self
+                    .navigation_prepared
+                    .as_ref()
+                    .map(|prepared| prepared.collection_revision),
+            )
+            .field("navigation_origin", &self.navigation_origin)
+            .field("navigation_request", &self.navigation_request)
+            .field("navigation_watch", &self.navigation_watch.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for CollectionGridSourceOpenOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.stamp == other.stamp
+            && self.accepted_revision == other.accepted_revision
+            && self.wanted_revision == other.wanted_revision
+            && self.anchor == other.anchor
+            && self.navigation_origin == other.navigation_origin
+            && self.navigation_request == other.navigation_request
+            && self.navigation_watch.is_some() == other.navigation_watch.is_some()
+            && self
+                .navigation_prepared
+                .as_ref()
+                .map(|prepared| (prepared.collection_id, prepared.collection_revision))
+                == other
+                    .navigation_prepared
+                    .as_ref()
+                    .map(|prepared| (prepared.collection_id, prepared.collection_revision))
+    }
+}
+
+impl Eq for CollectionGridSourceOpenOwner {}
 
 pub(crate) enum CollectionGridLoadState {
     RequestNeeded {
@@ -587,6 +642,19 @@ pub(crate) struct TopLevelGridView {
     /// owns the navigation scope.
     smart_folder_session: Option<super::smart_folder::SmartFolderSession>,
     collection_session: Option<CollectionGridSession>,
+    /// Playback/navigation work belongs to this exact viewer context. It is deliberately not
+    /// cloned into duplicated contexts; dropping/replacing a surface cancels its workers.
+    collection_navigation_pending:
+        Option<super::collection_navigation::CollectionNavigationPending>,
+    /// Monotonic intent identity for collection playback requests in this viewer context.
+    /// Navigation producers and terminal actions advance it so an index ABA cannot make an old
+    /// asynchronous result current again.
+    collection_navigation_sequence: u64,
+    /// A surface transition can retire a pending fullscreen request while `TopLevelGridView` is
+    /// mutably borrowed on its own. App consumes this bit at the next poll and releases the shared
+    /// fullscreen-navigation lock through the normal terminal path.
+    collection_navigation_retired_fs_lock: bool,
+    collection_navigation_retired_pdf_password: bool,
 }
 
 impl Clone for TopLevelGridView {
@@ -599,6 +667,18 @@ impl Clone for TopLevelGridView {
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
             collection_session: self.collection_session.clone(),
+            collection_navigation_pending: None,
+            collection_navigation_sequence: self.collection_navigation_sequence,
+            collection_navigation_retired_fs_lock: false,
+            collection_navigation_retired_pdf_password: false,
+        }
+    }
+}
+
+impl Drop for TopLevelGridView {
+    fn drop(&mut self) {
+        if let Some(pending) = self.collection_navigation_pending.as_ref() {
+            pending.cancel();
         }
     }
 }
@@ -626,6 +706,10 @@ impl Default for TopLevelGridView {
             generation: 0,
             smart_folder_session: None,
             collection_session: None,
+            collection_navigation_pending: None,
+            collection_navigation_sequence: 0,
+            collection_navigation_retired_fs_lock: false,
+            collection_navigation_retired_pdf_password: false,
         }
     }
 }
@@ -645,7 +729,9 @@ impl TopLevelGridView {
         return_to: Option<TopLevelGridRestore>,
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
+        self.set_collection_navigation_pending(None);
         self.collection_session = match &surface {
             TopLevelGridSurface::Collection(identity) => {
                 Some(CollectionGridSession::new(*identity))
@@ -666,9 +752,11 @@ impl TopLevelGridView {
             ) if session.definition_id() == state.definition_id
         );
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         if !keeps_smart_folder_session {
             self.smart_folder_session = None;
         }
+        self.set_collection_navigation_pending(None);
         self.collection_session = match &surface {
             TopLevelGridSurface::Collection(identity) => {
                 Some(CollectionGridSession::new(*identity))
@@ -682,7 +770,9 @@ impl TopLevelGridView {
 
     pub(crate) fn take_return_to(&mut self) -> Option<TopLevelGridRestore> {
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
+        self.set_collection_navigation_pending(None);
         self.collection_session = None;
         self.surface = TopLevelGridSurface::Folder;
         self.return_to.take()
@@ -704,6 +794,90 @@ impl TopLevelGridView {
 
     pub(crate) fn collection_session_mut(&mut self) -> Option<&mut CollectionGridSession> {
         self.collection_session.as_mut()
+    }
+
+    pub(crate) fn collection_navigation_pending(&self) -> bool {
+        self.collection_navigation_pending.is_some()
+    }
+
+    pub(in crate::app) fn collection_navigation_owns_fs_lock(&self) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owns_fs_navigation_lock())
+    }
+
+    pub(in crate::app) fn collection_navigation_owns_pdf_password(&self) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_pdf_password())
+    }
+
+    pub(in crate::app) fn advance_collection_navigation_sequence(&mut self) -> u64 {
+        self.collection_navigation_sequence = self.collection_navigation_sequence.wrapping_add(1);
+        if self.collection_navigation_sequence == 0 {
+            self.collection_navigation_sequence = 1;
+        }
+        self.collection_navigation_sequence
+    }
+
+    pub(in crate::app) fn collection_navigation_sequence(&self) -> u64 {
+        self.collection_navigation_sequence
+    }
+
+    pub(in crate::app) fn take_collection_navigation_retired_fs_lock(&mut self) -> bool {
+        std::mem::take(&mut self.collection_navigation_retired_fs_lock)
+    }
+
+    pub(in crate::app) fn take_collection_navigation_retired_pdf_password(&mut self) -> bool {
+        std::mem::take(&mut self.collection_navigation_retired_pdf_password)
+    }
+
+    pub(crate) fn accumulate_collection_outer_navigation(
+        &mut self,
+        fullscreen: bool,
+        forward: bool,
+    ) -> bool {
+        self.collection_navigation_pending
+            .as_mut()
+            .is_some_and(|pending| pending.accumulate_outer(fullscreen, forward))
+    }
+
+    pub(in crate::app) fn accumulate_collection_manual_navigation(
+        &mut self,
+        delta: i32,
+        landing: super::ManualMediaNavigationLanding,
+        still_only: bool,
+        display_unit_step: bool,
+    ) -> bool {
+        self.collection_navigation_pending
+            .as_mut()
+            .is_some_and(|pending| {
+                pending.accumulate_manual(delta, landing, still_only, display_unit_step)
+            })
+    }
+
+    pub(crate) fn set_collection_outer_queued_steps(&mut self, steps: i32) {
+        if let Some(pending) = self.collection_navigation_pending.as_mut() {
+            pending.set_outer_queued_steps(steps);
+        }
+    }
+
+    pub(in crate::app) fn set_collection_navigation_pending(
+        &mut self,
+        pending: Option<super::collection_navigation::CollectionNavigationPending>,
+    ) {
+        if let Some(previous) = std::mem::replace(&mut self.collection_navigation_pending, pending)
+        {
+            self.collection_navigation_retired_fs_lock |= previous.owns_fs_navigation_lock();
+            self.collection_navigation_retired_pdf_password |= previous.is_pdf_password();
+            previous.cancel();
+        }
+    }
+
+    pub(in crate::app) fn take_collection_navigation_pending(
+        &mut self,
+    ) -> Option<super::collection_navigation::CollectionNavigationPending> {
+        self.collection_navigation_pending.take()
     }
 
     pub(crate) fn smart_folder(&self) -> Option<&SmartFolderViewState> {

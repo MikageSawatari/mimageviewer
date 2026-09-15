@@ -1019,8 +1019,15 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
 
 /// `enumerate_image_entries` + 付帯情報 (非 ZIP アーカイブの有無)。
 pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_with_cancel(zip_path, None)
+}
+
+pub fn enumerate_image_entries_detailed_with_cancel(
+    zip_path: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
     if crate::rar_loader::is_rar_path(zip_path) {
-        return crate::rar_loader::enumerate_image_entries_detailed(zip_path);
+        return crate::rar_loader::enumerate_image_entries_detailed_with_cancel(zip_path, cancel);
     }
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
 
@@ -1041,7 +1048,8 @@ pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipE
         &mut out,
         &mut has_foreign,
         &mut legacy_renames,
-    );
+        cancel,
+    )?;
     Ok(ZipEnumeration {
         entries: out,
         has_foreign_archives: has_foreign,
@@ -1059,9 +1067,16 @@ fn enumerate_recursive<R: Read + Seek>(
     out: &mut Vec<ZipImageEntry>,
     has_foreign: &mut bool,
     legacy_renames: &mut Vec<(String, String)>,
-) {
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
     let len = archive.len();
     for i in 0..len {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "ZIP enumeration cancelled",
+            ));
+        }
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
         };
@@ -1107,7 +1122,10 @@ fn enumerate_recursive<R: Read + Seek>(
                 }
                 None => {
                     let mut buf = Vec::with_capacity(size as usize);
-                    if entry.read_to_end(&mut buf).is_err() {
+                    if read_to_end_with_cancel(&mut entry, &mut buf, cancel).is_err() {
+                        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                            return Err(interrupted_error());
+                        }
                         continue;
                     }
                     drop(entry);
@@ -1135,7 +1153,28 @@ fn enumerate_recursive<R: Read + Seek>(
                 out,
                 has_foreign,
                 legacy_renames,
-            );
+                cancel,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn read_to_end_with_cancel(
+    reader: &mut impl Read,
+    output: &mut Vec<u8>,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<()> {
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(interrupted_error());
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(read) => output.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
 }

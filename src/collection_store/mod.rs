@@ -14,8 +14,11 @@ mod text;
 pub use model::*;
 pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
 pub(crate) use prepare::{
-    CollectionPrepareError, CollectionPreparedRegistration, CollectionPreparedSnapshot,
-    prepare_collection_export, prepare_collection_registrations, prepare_collection_snapshot,
+    CollectionNavigationAnchor, CollectionNavigationDirection, CollectionNavigationEntryIdentity,
+    CollectionNavigationTail, CollectionNavigationTargetKind, CollectionPrepareError,
+    CollectionPreparedNavigationTarget, CollectionPreparedRegistration, CollectionPreparedSnapshot,
+    CollectionSourcePreparation, prepare_collection_export, prepare_collection_registrations,
+    prepare_collection_snapshot, resolve_prepared_collection_navigation,
     write_collection_export_atomic,
 };
 pub use runtime::{

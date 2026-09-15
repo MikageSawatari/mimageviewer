@@ -52,6 +52,7 @@ pub struct CollectionStoreClient {
     revision_hub: Arc<Mutex<RevisionHub>>,
 }
 
+#[derive(Clone)]
 pub struct CollectionRevisionWatch {
     slot: Arc<RevisionWatchSlot>,
     wake_rx: Receiver<()>,
@@ -65,6 +66,15 @@ impl CollectionRevisionWatch {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.slot
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 }
 

@@ -725,14 +725,34 @@ impl App {
         self.cancel_bookmark_open_request(owner.request_id, "archive_owner_stale")
     }
 
+    fn discard_stale_main_grid_archive_request(&mut self) -> bool {
+        let owner = self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.completion.open_owner());
+        let Some(owner @ crate::app::OpenRequestOwner::MainGridArchive(_)) = owner else {
+            return false;
+        };
+        if self.main_grid_archive_transition_is_current(&owner) {
+            return false;
+        }
+        self.cancel_archive_convert_for_navigation("main_grid_archive_owner_stale")
+    }
+
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
     pub(crate) fn show_archive_convert_dialog(&mut self, ctx: &egui::Context) {
+        if self.discard_stale_main_grid_archive_request() {
+            return;
+        }
         if self.discard_stale_archive_bookmark_request() {
             return;
         }
         // 先にメッセージ処理 (ステート遷移)
         self.poll_archive_convert_messages();
 
+        if self.discard_stale_main_grid_archive_request() {
+            return;
+        }
         if self.discard_stale_archive_bookmark_request() {
             return;
         }

@@ -492,6 +492,9 @@ snapshot の出力を変えず、完了時に使用 revision を表示できる�
 - Ctrl+上下、slideshow NextFolder の collection outer sequence。
 - entry ID → source key → head の latest resolver と stop/loop。
 - book 内部順、通常 folder/search/smart route、別 collection の不変回帰。
+- 2026-09-15 に製品実装と独立 Sol / xhigh completion reviewを完了。非同期 owner、
+  container preflight、通常 page / native / slideshow / 3媒体EOFの詳細と検収記録は
+  [`collection-playback-plan.md`](collection-playback-plan.md)を正本とする。
 
 ### Phase 5: Remote read-only
 
@@ -800,8 +803,9 @@ viewer-context 境界へ collection surface を追加する。
   crash-recovery journalを必ず先にloadしてcurrent queueへ統合し、最新full snapshotをもう一度非同期writerへ渡してから
   flushする。恒久的なI/O障害ではsource操作を巻き戻さず、stageを未開始のままunsaved errorとしてlogへ残す。
   書けない永続媒体を成功扱いしたり、終了を無期限に止めたりしないという物理的な限界は明示する。
-- Phase 4のCtrl+上下、slideshow NextFolder、再生中編集のlatest-nextはまだ接続しない。ただしこのPhaseでoriginに
-  entry ID / source key / collection IDを保存し、indexだけのfallbackや物理DFSへcollectionを流さない。
+- Phase 4のCtrl+上下、slideshow NextFolder、再生中編集のlatest-nextは
+  [`collection-playback-plan.md`](collection-playback-plan.md)のtyped owner / latest prepared resolverへ接続した。originは
+  entry ID / source key / collection IDを保持し、indexだけのfallbackや物理DFSへcollectionを流さない。
   Phase 5 Remoteへraw UI sessionを流用せず、同じimmutable prepared modelとactor revisionを渡せるようにする。
 - 主な変更候補は`src/collection_store/{model,runtime,db,prepare}.rs`、
   `src/app/top_level_grid_view.rs`、`src/app/viewer_context_registry.rs`、`src/app.rs`、`src/ui_main.rs`、
@@ -877,5 +881,20 @@ viewer-context 境界へ collection surface を追加する。
   resident 0確認後の`build-dev.ps1 -PreserveRuntime`もexit 0で、core SHA-256は
   `7B1928E134AD370FCB5312600404D18B7171C391DF7D5966A48211E2B105E36C`、Remoteは
   `192E2F800704A833C46831C2A42C47F24558B17A19C80F3DC23BEC21CE7D057D`。アプリの起動 / 停止、GUI、
-  通常profile、real dataは使用していない。Phase 4のCtrl+上下 / slideshow / playback latest-nextとPhase 5の
-  Remote閲覧は未接続である。
+  通常profile、real dataは使用していない。この記録時点ではPhase 4のCtrl+上下 / slideshow / playback latest-nextと
+  Phase 5のRemote閲覧は未接続だった。Phase 4は2026-09-15に後続chunkで実装し、Phase 5は未接続である。
+
+## 17. Phase 4 実装checkpoint（2026-09-15）
+
+Ctrl+上下、通常 page / native next・prev、slideshow / NextFolder、video / video-audio / music EOFを、
+viewer-context所有のtyped requestと最新`CollectionPreparedSnapshot`のpure resolverへ接続した。entry ID→source key→
+head、見開きdisplay-unit anchor、media / container kind、Stop / Loop、有限preflightを一つの順序正本で扱う。
+folder / ZIP / PDF / convertibleは着地可能payload成功後だけcommitし、暗号sourceは既存password / conversion ownerへ
+exact request / revision watchを移譲する。book / ZIP / PDF child内の固定順、local query / filter、既存native /
+ParkedLive landingを維持した。編集noticeは現在再生とroot rowsを変更せず、次requestだけが最新有効順を使う。
+
+独立Sol / xhigh reviewerは非同期current / cancel / drop、同revision watch race、Grid selection、manual rapid input、
+same-context / detached nested ZIP、既存EOF landingをaffected pathで再照合し、blocking / should-fixなしで承認した。
+focused / full / staticの数値とログhash、build保留理由は
+[`collection-playback-plan.md` §11.2](collection-playback-plan.md#112-製品実装独立-completion-review-checkpoint2026-09-15)
+を正本とする。Phase 5 Remoteは未実装である。

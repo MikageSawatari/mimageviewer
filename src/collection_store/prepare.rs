@@ -73,6 +73,180 @@ pub(crate) struct PreparedCollectionEntry {
     pub(crate) display_meta: Option<(i64, i64)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionNavigationDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionNavigationTargetKind {
+    NavigableMedia,
+    StillImage,
+    Video,
+    Audio,
+    OuterContainer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionNavigationTail {
+    Stop,
+    Loop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionNavigationEntryIdentity {
+    pub(crate) entry_id: CollectionEntryId,
+    pub(crate) source_key: super::CollectionSourcePathKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionNavigationAnchor {
+    pub(crate) primary: CollectionNavigationEntryIdentity,
+    pub(crate) partner: Option<CollectionNavigationEntryIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionNavigationAnchorResolution {
+    EntryId,
+    SourceKey,
+    DisplayUnit,
+    Head,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionPreparedNavigationTarget {
+    pub(crate) entry_id: CollectionEntryId,
+    pub(crate) source_key: super::CollectionSourcePathKey,
+    pub(crate) source_path: PathBuf,
+    pub(crate) resolved_kind: CollectionResolvedKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionPreparedNavigationCandidates {
+    pub(crate) anchor_resolution: CollectionNavigationAnchorResolution,
+    pub(crate) targets: Vec<CollectionPreparedNavigationTarget>,
+}
+
+/// Resolve a collection traversal from one immutable, fully classified snapshot.
+///
+/// `entries` is already the current Manual or Standard effective order. This helper performs no
+/// filesystem or UI-index access; callers may asynchronously preflight the returned paths and
+/// record rejected IDs in `tried` before asking for the remaining candidates again.
+pub(crate) fn resolve_prepared_collection_navigation(
+    prepared: &CollectionPreparedSnapshot,
+    anchor: Option<&CollectionNavigationAnchor>,
+    direction: CollectionNavigationDirection,
+    target_kind: CollectionNavigationTargetKind,
+    tail: CollectionNavigationTail,
+    tried: &std::collections::HashSet<CollectionEntryId>,
+) -> CollectionPreparedNavigationCandidates {
+    let resolve_identity = |identity: &CollectionNavigationEntryIdentity| {
+        prepared
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == identity.entry_id)
+            .map(|position| (position, CollectionNavigationAnchorResolution::EntryId))
+            .or_else(|| {
+                prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.source_key == identity.source_key)
+                    .map(|position| (position, CollectionNavigationAnchorResolution::SourceKey))
+            })
+    };
+
+    let resolved_anchor = anchor.and_then(|anchor| {
+        let primary = resolve_identity(&anchor.primary);
+        let partner = anchor.partner.as_ref().and_then(resolve_identity);
+        let position = match direction {
+            CollectionNavigationDirection::Forward => primary
+                .map(|value| value.0)
+                .into_iter()
+                .chain(partner.map(|value| value.0))
+                .max(),
+            CollectionNavigationDirection::Backward => primary
+                .map(|value| value.0)
+                .into_iter()
+                .chain(partner.map(|value| value.0))
+                .min(),
+        }?;
+        let resolution = if anchor.partner.is_some() && primary.is_some() && partner.is_some() {
+            CollectionNavigationAnchorResolution::DisplayUnit
+        } else {
+            primary.or(partner).unwrap().1
+        };
+        Some((position, resolution))
+    });
+
+    let (indices, anchor_resolution): (Vec<usize>, _) = match resolved_anchor {
+        None => (
+            (0..prepared.entries.len()).collect(),
+            CollectionNavigationAnchorResolution::Head,
+        ),
+        Some((position, resolution)) => {
+            let mut indices = match direction {
+                CollectionNavigationDirection::Forward => {
+                    ((position + 1)..prepared.entries.len()).collect::<Vec<_>>()
+                }
+                CollectionNavigationDirection::Backward => (0..position).rev().collect::<Vec<_>>(),
+            };
+            if tail == CollectionNavigationTail::Loop {
+                match direction {
+                    CollectionNavigationDirection::Forward => indices.extend(0..=position),
+                    CollectionNavigationDirection::Backward => {
+                        indices.extend(((position + 1)..prepared.entries.len()).rev())
+                    }
+                }
+            }
+            (indices, resolution)
+        }
+    };
+
+    let matches_target = |kind| match target_kind {
+        CollectionNavigationTargetKind::NavigableMedia => matches!(
+            kind,
+            CollectionResolvedKind::Image
+                | CollectionResolvedKind::Video
+                | CollectionResolvedKind::Audio
+        ),
+        CollectionNavigationTargetKind::StillImage => kind == CollectionResolvedKind::Image,
+        CollectionNavigationTargetKind::Video => kind == CollectionResolvedKind::Video,
+        CollectionNavigationTargetKind::Audio => kind == CollectionResolvedKind::Audio,
+        CollectionNavigationTargetKind::OuterContainer => matches!(
+            kind,
+            CollectionResolvedKind::Folder
+                | CollectionResolvedKind::Zip
+                | CollectionResolvedKind::Pdf
+                | CollectionResolvedKind::ConvertibleArchive
+        ),
+    };
+
+    let targets = indices
+        .into_iter()
+        .filter_map(|index| {
+            let entry = prepared.entries.get(index)?;
+            if tried.contains(&entry.entry_id) {
+                return None;
+            }
+            let CollectionSourcePreparation::Available { kind, .. } = &entry.availability else {
+                return None;
+            };
+            matches_target(*kind).then(|| CollectionPreparedNavigationTarget {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key.clone(),
+                source_path: entry.source_path.clone(),
+                resolved_kind: *kind,
+            })
+        })
+        .collect();
+
+    CollectionPreparedNavigationCandidates {
+        anchor_resolution,
+        targets,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CollectionPrepareError {
     Cancelled,
@@ -513,6 +687,215 @@ mod tests {
             },
             entries: Arc::from(entries),
         }
+    }
+
+    fn prepared_entry(path: &Path, kind: CollectionResolvedKind) -> PreparedCollectionEntry {
+        let source = CollectionSourcePath::from_trusted(path).unwrap();
+        let availability = CollectionSourcePreparation::Available {
+            kind,
+            mtime: 1,
+            file_size: Some(1),
+        };
+        PreparedCollectionEntry {
+            entry_id: CollectionEntryId::new(),
+            source_key: source.key().clone(),
+            source_path: path.to_path_buf(),
+            item: grid_item_for_prepared_source(path, kind, &availability),
+            availability,
+            display_meta: Some((1, 1)),
+        }
+    }
+
+    fn navigation_snapshot(entries: Vec<PreparedCollectionEntry>) -> CollectionPreparedSnapshot {
+        CollectionPreparedSnapshot {
+            collection_id: CollectionId::new(),
+            collection_revision: 9,
+            collection_name: "Navigation".into(),
+            entries: Arc::from(entries),
+        }
+    }
+
+    fn identity(entry: &PreparedCollectionEntry) -> CollectionNavigationEntryIdentity {
+        CollectionNavigationEntryIdentity {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key.clone(),
+        }
+    }
+
+    #[test]
+    fn prepared_navigation_uses_media_filter_direction_tail_and_tried_ids() {
+        let entries = vec![
+            prepared_entry(Path::new(r"C:\nav\a.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\nav\folder"), CollectionResolvedKind::Folder),
+            prepared_entry(Path::new(r"C:\nav\b.mp4"), CollectionResolvedKind::Video),
+            prepared_entry(Path::new(r"C:\nav\c.mp3"), CollectionResolvedKind::Audio),
+        ];
+        let anchor = CollectionNavigationAnchor {
+            primary: identity(&entries[0]),
+            partner: None,
+        };
+        let prepared = navigation_snapshot(entries);
+        let mut tried = std::collections::HashSet::new();
+        let forward = resolve_prepared_collection_navigation(
+            &prepared,
+            Some(&anchor),
+            CollectionNavigationDirection::Forward,
+            CollectionNavigationTargetKind::NavigableMedia,
+            CollectionNavigationTail::Stop,
+            &tried,
+        );
+        assert_eq!(
+            forward
+                .targets
+                .iter()
+                .map(|target| target.resolved_kind)
+                .collect::<Vec<_>>(),
+            [CollectionResolvedKind::Video, CollectionResolvedKind::Audio]
+        );
+        tried.insert(forward.targets[0].entry_id);
+        let after_failure = resolve_prepared_collection_navigation(
+            &prepared,
+            Some(&anchor),
+            CollectionNavigationDirection::Forward,
+            CollectionNavigationTargetKind::NavigableMedia,
+            CollectionNavigationTail::Stop,
+            &tried,
+        );
+        assert_eq!(after_failure.targets.len(), 1);
+        assert_eq!(
+            after_failure.targets[0].resolved_kind,
+            CollectionResolvedKind::Audio
+        );
+
+        let tail_anchor = CollectionNavigationAnchor {
+            primary: identity(prepared.entries.last().unwrap()),
+            partner: None,
+        };
+        assert!(
+            resolve_prepared_collection_navigation(
+                &prepared,
+                Some(&tail_anchor),
+                CollectionNavigationDirection::Forward,
+                CollectionNavigationTargetKind::Audio,
+                CollectionNavigationTail::Stop,
+                &std::collections::HashSet::new(),
+            )
+            .targets
+            .is_empty()
+        );
+        assert_eq!(
+            resolve_prepared_collection_navigation(
+                &prepared,
+                Some(&tail_anchor),
+                CollectionNavigationDirection::Forward,
+                CollectionNavigationTargetKind::StillImage,
+                CollectionNavigationTail::Loop,
+                &std::collections::HashSet::new(),
+            )
+            .targets[0]
+                .resolved_kind,
+            CollectionResolvedKind::Image
+        );
+    }
+
+    #[test]
+    fn prepared_navigation_resolves_id_then_source_then_head_and_spread_edges() {
+        let entries = vec![
+            prepared_entry(Path::new(r"C:\spread\a.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\spread\b.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\spread\c.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\spread\d.jpg"), CollectionResolvedKind::Image),
+        ];
+        let spread = CollectionNavigationAnchor {
+            primary: identity(&entries[1]),
+            partner: Some(identity(&entries[2])),
+        };
+        let prepared = navigation_snapshot(entries);
+        let forward = resolve_prepared_collection_navigation(
+            &prepared,
+            Some(&spread),
+            CollectionNavigationDirection::Forward,
+            CollectionNavigationTargetKind::StillImage,
+            CollectionNavigationTail::Stop,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            forward.anchor_resolution,
+            CollectionNavigationAnchorResolution::DisplayUnit
+        );
+        assert_eq!(forward.targets[0].entry_id, prepared.entries[3].entry_id);
+        let backward = resolve_prepared_collection_navigation(
+            &prepared,
+            Some(&spread),
+            CollectionNavigationDirection::Backward,
+            CollectionNavigationTargetKind::StillImage,
+            CollectionNavigationTail::Stop,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(backward.targets[0].entry_id, prepared.entries[0].entry_id);
+
+        let reordered = navigation_snapshot(vec![
+            prepared.entries[1].clone(),
+            prepared.entries[2].clone(),
+            prepared.entries[3].clone(),
+            prepared.entries[0].clone(),
+        ]);
+        let latest_forward = resolve_prepared_collection_navigation(
+            &reordered,
+            Some(&spread),
+            CollectionNavigationDirection::Forward,
+            CollectionNavigationTargetKind::StillImage,
+            CollectionNavigationTail::Stop,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            latest_forward.targets[0].entry_id, reordered.entries[2].entry_id,
+            "the same display-unit identities must anchor in the latest prepared order"
+        );
+
+        let removed_id = CollectionNavigationAnchor {
+            primary: CollectionNavigationEntryIdentity {
+                entry_id: CollectionEntryId::new(),
+                source_key: prepared.entries[1].source_key.clone(),
+            },
+            partner: None,
+        };
+        assert_eq!(
+            resolve_prepared_collection_navigation(
+                &prepared,
+                Some(&removed_id),
+                CollectionNavigationDirection::Forward,
+                CollectionNavigationTargetKind::StillImage,
+                CollectionNavigationTail::Stop,
+                &std::collections::HashSet::new(),
+            )
+            .anchor_resolution,
+            CollectionNavigationAnchorResolution::SourceKey
+        );
+
+        let absent = CollectionNavigationAnchor {
+            primary: CollectionNavigationEntryIdentity {
+                entry_id: CollectionEntryId::new(),
+                source_key: CollectionSourcePath::from_trusted(Path::new(r"C:\gone\x.jpg"))
+                    .unwrap()
+                    .key()
+                    .clone(),
+            },
+            partner: None,
+        };
+        let head = resolve_prepared_collection_navigation(
+            &prepared,
+            Some(&absent),
+            CollectionNavigationDirection::Backward,
+            CollectionNavigationTargetKind::StillImage,
+            CollectionNavigationTail::Stop,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            head.anchor_resolution,
+            CollectionNavigationAnchorResolution::Head
+        );
+        assert_eq!(head.targets[0].entry_id, prepared.entries[0].entry_id);
     }
 
     #[test]

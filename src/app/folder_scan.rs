@@ -311,6 +311,7 @@ pub(crate) fn image_folder_page_count(
         entries,
         options.include_convertible_archives,
         options.show_hidden_files,
+        None,
     )?;
     if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
         return Ok(None);
@@ -372,14 +373,34 @@ pub(crate) fn scan_directory_with_convertible_archives(
     include_convertible_archives: bool,
     show_hidden_files: bool,
 ) -> std::io::Result<ScannedDir> {
+    scan_directory_with_convertible_archives_cancel(
+        path,
+        include_convertible_archives,
+        show_hidden_files,
+        None,
+    )
+}
+
+pub(crate) fn scan_directory_with_convertible_archives_cancel(
+    path: &std::path::Path,
+    include_convertible_archives: bool,
+    show_hidden_files: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<ScannedDir> {
     let entries = std::fs::read_dir(path)?;
-    scan_directory_entries(entries, include_convertible_archives, show_hidden_files)
+    scan_directory_entries(
+        entries,
+        include_convertible_archives,
+        show_hidden_files,
+        cancel,
+    )
 }
 
 fn scan_directory_entries<I>(
     entries: I,
     include_convertible_archives: bool,
     show_hidden_files: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir>
 where
     I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
@@ -390,6 +411,12 @@ where
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "folder scan cancelled",
+            ));
+        }
         // A ReadDir can fail after yielding some entries (for example when a network share
         // disconnects during FindNextFile). Treating that as a successful partial snapshot lets
         // catalog delete_missing remove rows for every unseen tail entry, so discard the whole
@@ -1224,7 +1251,7 @@ mod page_count_tests {
             )),
         ];
 
-        let error = match scan_directory_entries(entries, true, false) {
+        let error = match scan_directory_entries(entries, true, false, None) {
             Ok(_) => panic!("a partial directory snapshot must not be published"),
             Err(error) => error,
         };

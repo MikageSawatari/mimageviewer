@@ -32380,6 +32380,12 @@ impl App {
             ctx.request_repaint();
             return;
         }
+        // Collection-root media navigation resolves from a fresh immutable collection snapshot.
+        // Same-source split movement above remains local to the current page; every actual next
+        // item decision is delegated before consulting the installed (possibly older) grid order.
+        if self.start_collection_slideshow_navigation(ctx, cur) {
+            return;
+        }
         let next_idx = match slide_nav {
             FsPageNav::Target(idx) => Some(idx),
             // 別ページの半分へ。着地してから左右を確定する。
@@ -32422,7 +32428,7 @@ impl App {
                     return;
                 }
                 // 次フォルダへ。検索コンテキスト等で発火できなければループにフォールバック。
-                if !self.try_start_slideshow_next_folder(cur) {
+                if !self.try_start_slideshow_next_folder(ctx, cur) {
                     self.loop_slideshow_to_first(ctx);
                 }
             }
@@ -32432,6 +32438,7 @@ impl App {
     /// 既存の手動停止と remote session lock が共有する停止入口。
     /// 表示位置と fullscreen/window 構成は保持し、タイマーだけを止める。
     pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
+        self.cancel_collection_slideshow_navigation_intent();
         let was_playing = self.slideshow_playing;
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
@@ -32469,7 +32476,7 @@ impl App {
     ///
     /// 次フォルダ概念が無い (検索ビュー / お気に入り検索 / Ctrl+F 中) か、現在フォルダが
     /// 取れない場合は発火せず false を返す (呼び出し側でループにフォールバック)。
-    fn try_start_slideshow_next_folder(&mut self, fs_idx: usize) -> bool {
+    fn try_start_slideshow_next_folder(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
         if self.fs_nav_is_locked() {
             // 既に nav 進行中: 二重発火しない (が、ループフォールバックもしない)。
             return true;
@@ -32507,6 +32514,13 @@ impl App {
                 return true;
             }
             // ツリーの端 (これ以上先の本がない): fall through して ZIP を抜けて次フォルダへ。
+        }
+        if self.start_collection_outer_fullscreen_navigation(ctx, fs_idx, true, true, false) {
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
+            self.continuous_reading_scroll_transition = None;
+            self.slideshow_scroll_range_cache = None;
+            return true;
         }
         // 変換キャッシュ閲覧中は current_folder がキャッシュ ZIP を指すため、必ず
         // effective_folder() (= archive_source_override 優先) を起点にする。さもないと
@@ -32879,7 +32893,11 @@ impl App {
         }
     }
 
-    fn open_fullscreen_from_slideshow_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+    pub(crate) fn open_fullscreen_from_slideshow_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) {
         // Timer-driven slideshow advances are fullscreen-internal navigation too, so
         // use the same cursor-state carry path as keyboard/mouse page turns.
         self.open_fullscreen_from_fs_navigation(ctx, idx, slideshow_history_trigger());
@@ -33052,6 +33070,12 @@ impl App {
             return;
         }
         if self.fs_nav_is_locked() {
+            if self
+                .top_level_grid_view
+                .accumulate_collection_outer_navigation(true, forward)
+            {
+                return;
+            }
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(false) {
                 // A follow-up accepted during the display-wait window targets the next items
                 // generation. Keep the existing holdover handle, but do not let readiness of
@@ -33077,6 +33101,28 @@ impl App {
         // 経路 (Ctrl+G DrilledInto の global_search_ctrl_nav_fullscreen など) も含めて
         // 確実にカバーするため、Ctrl+↑↓ ハンドラの入口で一括で消す
         // (Codex 第 8/9 P2 指摘)。
+        let detached_collection_origin = self.top_level_grid_view.collection_session().is_none()
+            && matches!(
+                self.top_level_grid_view.return_to(),
+                Some(crate::app::top_level_grid_view::TopLevelGridRestore::Collection(_))
+            );
+        if detached_collection_origin
+            && self.zip_nav.is_some()
+            && self.zip_nav_dfs_fullscreen(Some(ctx), fs_idx, forward)
+        {
+            return;
+        }
+        if detached_collection_origin
+            && self.start_collection_outer_fullscreen_navigation(
+                ctx,
+                fs_idx,
+                forward,
+                false,
+                native_toast,
+            )
+        {
+            return;
+        }
         #[cfg(windows)]
         if self.detached_physical_folder_nav_available() {
             // Independent detached still viewers deliberately ignore main-window
@@ -33168,6 +33214,16 @@ impl App {
         // DFS へ続く (グリッド側 zip_nav_handle_ctrl_updown と対称)。
         // holdover は移動確定後に zip_nav_dfs_fullscreen 内で取る (端で lock が残るのを防ぐ)。
         if self.zip_nav.is_some() && self.zip_nav_dfs_fullscreen(Some(ctx), fs_idx, forward) {
+            return;
+        }
+
+        if self.start_collection_outer_fullscreen_navigation(
+            ctx,
+            fs_idx,
+            forward,
+            false,
+            native_toast,
+        ) {
             return;
         }
 
@@ -33560,6 +33616,40 @@ impl App {
             );
         } else if !close_fs && !close_to_page_list {
             let page_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            // A direct media leaf at a collection root must resolve every next/previous request
+            // against the actor's latest prepared order. Movement to the other half of the same
+            // split image remains an in-page operation and stays on the existing path below.
+            let collection_delta = match page_nav {
+                FsPageNav::Delta(delta) => Some(delta),
+                FsPageNav::Target(target) => {
+                    navigable_delta_between(&self.items, self.current_grid_order(), fs_idx, target)
+                }
+                FsPageNav::Boundary { at_end } => Some(if at_end { 1 } else { -1 }),
+                FsPageNav::Split(step) if step.source_idx != fs_idx => navigable_delta_between(
+                    &self.items,
+                    self.current_grid_order(),
+                    fs_idx,
+                    step.source_idx,
+                ),
+                FsPageNav::None | FsPageNav::Split(_) => None,
+            };
+            if jump_to.is_none()
+                && let Some(delta) = collection_delta
+                && self.start_collection_manual_display_unit_navigation(
+                    ctx,
+                    fs_idx,
+                    delta,
+                    crate::app::ManualMediaNavigationLanding::Fullscreen,
+                )
+            {
+                finish_fs_navigation_perf_span(
+                    &mut fs_navigation_perf,
+                    FsNavigationPerfSpan::Page,
+                    page_nav_perf_t0,
+                );
+                finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
+                return;
+            }
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
@@ -33786,7 +33876,11 @@ impl App {
         // slideshow_playing=false にしているのでそもそも入らない)。手動 Ctrl+↑↓ が
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
-        if self.slideshow_playing && !close_fs && !self.fs_nav_is_locked() {
+        if self.slideshow_playing
+            && !close_fs
+            && !self.fs_nav_is_locked()
+            && !self.top_level_grid_view.collection_navigation_pending()
+        {
             let now = std::time::Instant::now();
             let anchored = self
                 .fullscreen_idx

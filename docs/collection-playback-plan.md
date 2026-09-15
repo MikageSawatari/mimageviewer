@@ -1,7 +1,7 @@
 # コレクション Phase 4 再生・横断ナビゲーション実装計画
 
 最終更新: 2026-09-15  
-状態: 製品編集前の設計 checkpoint。`1dfffab2f` の Phase 3 owner / prepared / current gate を前提にし、独立設計レビュー完了後だけ製品実装へ進む。
+状態: Phase 4 製品実装、独立 completion review、focused / full / static gateを完了。`target/dev-runtime`のresidentを停止しないためverification buildだけ保留。
 
 ## 1. 目的と範囲
 
@@ -372,3 +372,41 @@ focused pure / handler / viewer-context lifecycle test、`cargo check -p mimagev
 実装担当とは別の Sol / xhigh reviewer が最終合意した。Grid root load から独立した viewer-context typed owner、watch→actor load→exact prepare→pure resolve→有限 preflight→単一 commit、全 pending variant の cancel / drop と landing owner への一回だけの terminal 移譲を確認した。entry ID→identity 固有 source key→head、root direct media / physical child / outer container の分離、Manual↔Standard / Standard sort 編集を次要求だけへ反映する規則にも合意した。
 
 通常 paged / continuous / native manual、見開き display unit、slideshow、video / video-audio / music EOF の producer、dedup、history trigger を回帰範囲とし、book / ZIP / PDF child の固定順を保護する。PC と Phase 5 Remote は UI index / filter を読まない同じ prepared pure resolver を使う。本 checkpoint により Phase 4 製品実装を開始できる。
+
+### 11.2 製品実装・独立 completion review checkpoint（2026-09-15）
+
+`CollectionPreparedSnapshot`を直接読むpure resolverへentry ID→source key→head、direction、Stop / Loop、
+media kind、outer container、見開きdisplay-unit anchor、tried IDの有限走査を実装した。PCのGrid / fullscreen
+Ctrl+上下、通常paged / continuous / native next・prev、slideshow通常送り / NextFolder、video / video-audio /
+music EOFを、viewer contextごとのtyped requestへ接続した。watch→actor load→exact prepare→resolve→cancel-aware
+preflight→single commitの順を守り、編集noticeは現在presentationやroot rowsを置換せず、次requestだけが最新順を
+採用する。navigation materializeでもlocal query / filterをstable identityで保持する。
+
+folderは最終scan payload、ZIP / PDFは実列挙payload、暗号PDF / convertibleは既存password / conversion ownerへ
+terminal責任を移譲する。current presentationを先に閉じず、失敗候補は同じexact revisionで一度だけskipする。
+container child順とouter順を分離し、same-context / detached collectionのnested ZIPはchild DFSを先に、tailだけ
+outerへ進む。direct mediaは既存fullscreen / native source swap / video-audio / ParkedLive landingへ戻し、manual
+連打は着地中もbounded queueへ保持して一stepごとに最新snapshotを取り直す。
+
+独立Sol / xhigh reviewerのcompletion reviewでは、commit直前revision/current barrier、close / stop / surface replace /
+ABA、既存EOF landing、container payload / password、全pending cancel / drop、filter保持、ZIP child優先、native
+Boundary / landing queue、delayed conversion owner、Grid selectionと同revision再materialize raceを順に照合した。
+各findingをhandler回帰とともに修正後、製品sourceにblocking / should-fixなしの承認を得た。Phase 5 Remoteと
+rating sort製品変更は本chunkへ含めていない。
+
+focusedはcollection navigation 14/14、prepared resolver 8/8、collection Grid 14/14、core checkがpassした。
+final `RUST_TEST_THREADS=1 scripts/test-full.ps1 -SuppressCrashDialogs`は本体8530 passed / 0 failed /
+45 ignored、UI snapshot 52/52、vendor egui / egui-wgpu / eframe 25 / 9 / 15、`[test-full] PASS`、
+exit 0でprocess error modeを`0x00008001`へ復元した。ログは
+`target/collection-phase4-final-20260915/test-full.{stdout.log,stderr.log,exit.txt}`、SHA-256は順に
+`13541E7C82B403B229787E5AF7D97A51E24EBA73C7DF14FAAE4A9A48B75D26B5`、
+`ED648F190BE0D09280BEC80E87C4B2897562365E95D2B918479DDE69FE4D8BEE`、
+`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`である。
+
+同じ製品sourceでfmt、UI glyph、viewer-context audit、diff checkもexit 0。staticログのSHA-256はstdout
+`3E016394B8A58CA0495DCABC1600314F92395A983F58085E313A6B11CE0AE7A4`、stderr
+`3C118FCF903FA9E4E36E33EEBF1495B0848EE6DA8814CC9312312C0F9E2FE4EE`、exit
+`13BF7B3039C63BF5A50491FA3CFD8EB4E699D1BA1436315AEF9CBE5711530354`。
+`target/dev-runtime`には2026-09-15 12:23開始のcore 8 processとRemote 1 processがresidentしていたため、
+それらを停止せず`build-dev.ps1 -PreserveRuntime`は保留した。アプリ起動、GUI操作、通常profile / real dataへの
+アクセスは行っていない。

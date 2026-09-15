@@ -479,6 +479,13 @@ fn check_inspection_cancel(cancel: &AtomicBool) -> io::Result<()> {
 }
 
 pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_with_cancel(path, None)
+}
+
+pub fn enumerate_image_entries_detailed_with_cancel(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<ZipEnumeration> {
     let (mut archive, _, resolved_path) = open_listing_from_volume(path)?;
     let mtime = std::fs::metadata(&resolved_path)
         .ok()
@@ -486,6 +493,12 @@ pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeratio
     let mut entries = Vec::new();
     let mut seen_names = HashSet::new();
     for entry in archive.by_ref() {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "RAR enumeration cancelled",
+            ));
+        }
         let entry = entry.map_err(unrar_io)?;
         if !entry.is_file() {
             continue;
