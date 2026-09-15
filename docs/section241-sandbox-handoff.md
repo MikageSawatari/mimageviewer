@@ -11,7 +11,30 @@
 
 source commit は実装・自動検証・独立 Sol / xhigh completion review まで完了している。review は ORT load failure の再入防止、process 共通 init owner、request cancel、final AI provisional 再評価、TensorRT の型付き retry、launcher の exact self-repair、VC Runtime provenance と全 PE closure を確認し、blocking / should-fix なしと判定した。既存の green gate を引継ぎだけの理由で再実行しない。
 
-`scripts/build-release.ps1 -PreserveRuntime` による unsigned development verification build はexit 0で完了した。この build は source / launcher / embedded assets の確認用で、最終配布物ではない。署名済み installer / portable / single-exe は未生成であり、§5 の三形態 Sandbox matrix も未実施である。
+`scripts/build-release.ps1 -PreserveRuntime` による unsigned development verification build はexit 0で完了した。この build は source / launcher / embedded assets の確認用で、最終配布物ではない。署名済み installer / portable / single-exe は未生成。unsigned single-exe の Sandbox 検証は下記のとおり完了し、§5 の三形態すべての検証は未完了である。
+
+### 2026-09-15 ClaudeCodeからの検証結果受領
+
+ClaudeCodeがサブPCのWindows SandboxをComputer Useで操作し、6シナリオをPASSと報告した。
+対象は本書のsource commitとlauncher SHA `3966900559C6F2EF70A3498ECF014FE2AB19D3C786A2000EB86A57EB16B9B4E9`。
+Codexは報告を受領し、ローカル成果物のSHA一致を確認した。画面操作の観測者はClaudeCodeである。
+
+| 実施シナリオ | 報告結果 |
+| --- | --- |
+| VC++未導入で初回起動 | PASS。展開を含む10.8秒でAI初期化成功、画像閲覧・ページ移動可能 |
+| 2回目起動 | PASS。1.6秒でAI初期化成功、場所復元・ZIP閲覧可能 |
+| CRT同一長破損からlauncher自己修復 | PASS。正本hashへ復旧して起動 |
+| 修復後の再起動 | PASS。正常CRTの更新時刻不変 |
+| CRT4本なしでcore直接起動 | PASS。1.101秒で初期化失敗1回、UI・画像閲覧が応答 |
+| ORT同一長破損からlauncher起動 | PASS。0.959秒で初期化失敗1回、UIが応答 |
+
+詳細証跡: [RESULTS.md](../target/section241-release-verification-20260915/RESULTS.md)。
+環境はx64 Windows build 26100、System32に対象CRT4本なし。SandboxのDefenderは無効だったと報告されており、有効環境の結果には一般化しない。
+正常版の埋込ORTはhash sidecarを信頼するため、同一長破損が自己修復されない既存挙動も観測された。
+今回の停止防止は機能しており、この自己修復の拡張は別課題として扱う。ここでは製品変更を追加しない。
+
+残りは署名済み最終配布物、installer／portableの初回・再起動とportable loose ORT失敗、DirectML／編集用パック／Remote AI／TensorRT infer・builderの実GPU回帰、Defender有効環境の起動確認。
+担当が変わっただけで今回の6シナリオをやり直す必要はない。成果物・source・試験条件が変わった場合は影響範囲に応じて再確認する。
 
 Phase 5 Remote と rating sort の製品実装には着手していない。
 
