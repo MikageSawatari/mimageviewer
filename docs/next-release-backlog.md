@@ -2934,6 +2934,72 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
+### 1.244 詳細表示の列ソートが、ZIP・PDF などの本の中でも一覧と読み順を並べ替える疑い — 未確認 (2026-09-15)
+
+- 出典: §1.242 (本の構成) の影響調査中に**コードを読んで見つけた疑い**。実行して確かめてはいない
+  (観測者なし)。
+- 構造 (コードから):
+  - 本の中では列ヘッダのクリック自体は無効 (`src/ui_main.rs:15345` 付近の `sort_enabled = !book_sort_locked`、
+    `book_sort_locked = self.page_order_locked_for_current_view()`)。
+  - ところが並びを決める `App::details_header_sort_active` (`src/app.rs:51321`) は、除外条件が
+    `current_folder_is_book_folder()` (**製本だけ**) と閲覧履歴だけで、`page_order_locked_for_current_view()`
+    (ZIP / PDF / 直接閲覧 RAR / 変換キャッシュ / 画像だけのフォルダを含む) を見ていない。
+  - `settings.details_sort_key` は全フォルダ共通の永続設定 (`reset_details_sort_to_toolbar` の doc コメント)。
+    戻すのはレーティング / ブックマーク一覧などに入るときだけ (`src/app.rs:19960, 19966, 23973, 33624`)。
+  - したがって、通常フォルダで列ヘッダを押して並べ替えたまま ZIP / PDF を開くと、`rebuild_details_order`
+    (`src/app.rs:51454`) がその列で `details_order` を作り、`current_grid_order()` (`src/app.rs:51271`) が
+    それを返す。フルスクリーンの読み順 `get_nav_indices` / `get_still_image_indices`
+    (`src/ui_fullscreen.rs:25869` 付近) も `current_grid_order()` から作るので、**本のページ順
+    (§1.14 の名前順固定) が列ソートで崩れる**はず。本の中では列ヘッダが押せないので、そこで戻す手段も無い。
+  - `grid_sort_lock_reason` (`src/app.rs:51333`) は本の中を `PageOrderFixed` と判定するので、表示上は
+    「ページ順固定」なのに実際の並びは列ソート、という食い違いにもなる。
+- 確認方法: 詳細表示で通常フォルダを開き、サイズ列などで並べ替える → 画像が名前順でない ZIP を開く →
+  一覧の並びと、フルスクリーンでのページ送りの順を見る。製本・閲覧履歴では起きない想定。
+- 直し方の方向 (確認できたら): 「一覧の並びを列ヘッダが持つか」の判定を `page_order_locked_for_current_view()`
+  と 1 つの述語にまとめる (§1.143(a) と同じく、UI の無効化と並びの所有者を同じ述語から導く)。
+- 規模 / 優先度: Small / P2 (確認できた場合。本の読み順が崩れる)。
+
+### 1.245 しおり一覧の「P.N」「N ページ」表示が、本の中のページ番号ではなく一覧上の番号になっている疑い — 未確認 (2026-09-15)
+
+- 出典: §1.242 の影響調査中に**コードを読んで見つけた疑い**。実行して確かめてはいない (観測者なし)。
+- 構造 (コードから):
+  - しおりを作るとき `page_index_hint: idx` は `items` の生の番号 (`src/app.rs:32997`)。
+  - 表示は `bookmark_browser.rs` の `format!("{} / {} ページ", …, page_index_hint + 1)` と
+    `format!("P.{}", page_index_hint + 1)` (`src/bookmark_browser.rs:381, 395`)。
+  - 一覧の `items` は行配置設定に従い、既定ではフォルダ・書庫の行が画像より前に並ぶ。**サブフォルダや動画を
+    含む本フォルダ / サブフォルダのある ZIP** では、先頭の画像でも番号が 1 にならず、表示がずれるはず。
+    PDF はページだけなので一致する想定。
+  - ジャンプ先の正本は `PageIdentity` なので、**移動先は正しく、表示される数字だけがずれる**想定。
+  - 同じ hint を並べ替えにも使っている (`src/app.rs:33116-33117`)。本の中の順序としては単調なので、
+    並び順への実害は無い想定。
+- 確認方法: サブフォルダを 2 つ含む画像フォルダ (または ZIP) の 1 ページ目にしおりを付け、しおり一覧の表示が
+  「P.1」か「P.3」かを見る。
+- 直し方の方向 (確認できたら): 保存時に「本の読み順での位置」を hint にするか、表示時に `PageIdentity` から
+  読み順の位置を解決する。mIV Remote のしおり表示 (`src/remote_ipc/collections.rs:592` 付近) も同じ hint を
+  使っているかを合わせて確認する。
+- 規模 / 優先度: Small / P3 (表示の数字だけ)。
+
+### 1.246 mIV Remote の ZIP 一覧が本体と違う並べ方をしていて、読書位置がずれる疑い — 未確認 (2026-09-15)
+
+- 出典: §1.242 の影響調査中に**コードを読んで見つけた疑い**。実行して確かめてはいない (観測者なし)。
+- 構造 (コードから):
+  - 本体は ZIP の階層を `materialize_level(.., BOOK_READING_PAGE_ORDER)` で作った後、一覧の行配置設定に
+    従って `arrange_grid_items` で並べ直す (しおりの解決も同じ、`src/book_bookmarks.rs:1554-1556`)。
+    `arrange_grid_items` は「設定された 4 行のカテゴリ割り当てで items を並べ直す」(`src/grid_item.rs:621`)。
+  - mIV Remote の `enumerate_zip` (`src/remote_ipc/container.rs:4605`) は `materialize_level` の結果を
+    **並べ直さずに**そのまま一覧にする。同じファイルの `enumerate_zip_page_context` (`container.rs:3487`) は
+    `arrange_grid_items` を呼んでいるので、Remote の中でも経路によって並べ方が違う。
+  - 読書位置 `book_resume.db` は本体の `items` の番号で保存され、Remote はその番号を**自分の並び**に当てて
+    解決する (`resolve_resume_page`、`container.rs:4488`)。
+  - したがって、**フォルダと画像が混ざる階層**で `materialize_level` の出力順と行配置設定の順が違うと、
+    Remote の一覧順・読書位置の再開ページが本体とずれる可能性がある。画像だけの階層では差が出ない想定。
+- 確認方法: ルートにサブフォルダと画像が混在する ZIP を用意する。環境設定の一覧の行配置を既定から変えた場合と
+  既定のままの場合で、本体で途中まで読んで閉じ、Remote で同じ ZIP を開いたときの一覧順と再開ページを比べる。
+  あわせて `materialize_level` の出力順 (フォルダが先か) をテストで固定する。
+- 直し方の方向 (確認できたら): 本の階層の一覧を作る処理を本体・しおり・Remote で 1 つにする
+  (§1.242 の下準備と同じ作業。先にこちらだけ単独で直してもよい)。
+- 規模 / 優先度: Small-Medium / P3 (混在階層かつ行配置の組み合わせ次第)。
+
 ### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
