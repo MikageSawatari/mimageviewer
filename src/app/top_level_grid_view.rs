@@ -306,6 +306,41 @@ pub(crate) struct CollectionGridSourceOpenOwner {
     pub(in crate::app) navigation_watch: Option<crate::collection_store::CollectionRevisionWatch>,
 }
 
+/// Exact authorization for one physical load that remains owned by a mounted collection.
+///
+/// `Root` opens the selected collection entry. `PhysicalSource` covers a descendant open or an
+/// in-place reload after that entry has already become the mounted physical source. An ordinary
+/// address/history/favourite navigation never receives this value, even when it targets the same
+/// path, so the common load boundary can retire the collection session deterministically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPhysicalLoadOwner {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) anchor: CollectionGridViewportAnchor,
+    pub(crate) root_source_path: PathBuf,
+    pub(crate) target_path: PathBuf,
+    pub(crate) origin: CollectionGridPhysicalLoadOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPhysicalLoadOrigin {
+    Root { items_generation: u64 },
+    PhysicalSource { current_path: PathBuf },
+}
+
+impl CollectionGridPhysicalLoadOwner {
+    pub(crate) fn restore(&self, wanted_revision: u64) -> CollectionGridRestore {
+        CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: self.stamp.collection_id,
+            },
+            revision_at_open: self.accepted_revision.max(wanted_revision),
+            viewport_anchor: Some(self.anchor.clone()),
+        }
+    }
+}
+
 impl std::fmt::Debug for CollectionGridSourceOpenOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -371,10 +406,7 @@ pub(crate) enum CollectionGridLoadState {
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         receiver: std::sync::mpsc::Receiver<
-            Result<
-                crate::collection_store::CollectionPreparedSnapshot,
-                crate::collection_store::CollectionPrepareError,
-            >,
+            Result<CollectionGridPreparedInstall, crate::collection_store::CollectionPrepareError>,
         >,
     },
     Ready(std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>),
@@ -384,6 +416,17 @@ pub(crate) enum CollectionGridLoadState {
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
     },
     Deleted,
+}
+
+pub(crate) struct CollectionGridPreparedInstall {
+    pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
+    pub(crate) thumbnail_sources: CollectionGridThumbnailSources,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectionGridThumbnailSources {
+    pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
+    pub(crate) video_pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>>,
 }
 
 impl CollectionGridLoadState {
@@ -411,6 +454,10 @@ pub(crate) struct CollectionGridSession {
     pub(crate) watch: Option<crate::collection_store::CollectionRevisionWatch>,
     pub(crate) restore_anchor: Option<CollectionGridViewportAnchor>,
     pub(crate) installed_items_generation: Option<u64>,
+    /// Collection video extraction has no queue shared with the bundle thumbnail pool. Keep its
+    /// cancellation lifetime with the collection session; image/container workers remain owned by
+    /// `ViewerContextBundle` and may be reused by another synthetic surface.
+    pub(crate) video_worker_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CollectionGridSession {
@@ -425,6 +472,7 @@ impl CollectionGridSession {
             watch: None,
             restore_anchor: None,
             installed_items_generation: None,
+            video_worker_cancel: None,
         }
     }
 
@@ -463,6 +511,9 @@ impl Drop for CollectionGridSession {
         if let CollectionGridLoadState::Preparing { cancel, .. } = &self.load {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(cancel) = self.video_worker_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -480,6 +531,7 @@ impl Clone for CollectionGridSession {
             watch: None,
             restore_anchor: self.restore_anchor.clone(),
             installed_items_generation: self.installed_items_generation,
+            video_worker_cancel: None,
         }
     }
 }

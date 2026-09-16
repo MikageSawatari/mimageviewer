@@ -102,62 +102,30 @@ impl RemoteThumbnailSources {
             return Self::default();
         }
 
-        let requested = videos
-            .iter()
-            .map(|path| crate::path_key::normalize_keep_drive(path))
-            .collect::<std::collections::HashSet<_>>();
-        let mut parent_keys = std::collections::HashSet::new();
-        let mut parents = Vec::new();
-        for video in &videos {
-            if let Some(parent) = video.parent() {
-                let key = crate::path_key::normalize_keep_drive(parent);
-                if parent_keys.insert(key) {
-                    parents.push(parent.to_path_buf());
-                }
-            }
-        }
-
-        let skipped_parents = parents
-            .len()
-            .saturating_sub(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS);
-        if skipped_parents > 0 {
+        let discovered = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+            settings,
+            &videos,
+            MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+            || true,
+        )
+        .expect("unconditional remote sidecar discovery cannot be cancelled");
+        if discovered.skipped_parents > 0 {
             crate::logger::log(format!(
-                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={skipped_parents}",
+                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={}",
                 MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
-                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+                discovered.scanned_parents,
+                discovered.skipped_parents,
             ));
         }
-
-        // 64 parents bounds synchronous read_dir latency while covering clustered
-        // aggregate results; later parents safely fall through to the Shell thumbnail.
-        // With V requested videos and capped parents p, this is expected
-        // O(V + sum(E_p + S_p)) time and O(V + max(E_p + S_p)) working memory.
-        let mut sources = Self::default();
-        for parent in parents
-            .into_iter()
-            .take(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS)
-        {
-            let mut scan =
-                match crate::app::folder_scan::scan_directory_with_settings(&parent, settings) {
-                    Ok(scan) => scan,
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
-                            parent.display()
-                        ));
-                        continue;
-                    }
-                };
-            let found =
-                crate::app::folder_scan::filter_video_image_duplicates(&mut scan.all_media, true);
-            for (video, image) in found.sidecars {
-                let key = crate::path_key::normalize_keep_drive(&video);
-                if requested.contains(&key) {
-                    sources.video_sidecars.insert(key, image);
-                }
-            }
+        for (parent, error) in discovered.scan_errors {
+            crate::logger::log(format!(
+                "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
+                parent.display()
+            ));
         }
-        sources
+        Self {
+            video_sidecars: discovered.by_video_path,
+        }
     }
 
     pub(super) fn source_address(

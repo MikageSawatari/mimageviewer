@@ -1454,6 +1454,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-16 collection physical owner / thumbnail worker寿命（親Codex／独立Sol構造合意）**
+
+collection rootからFolder / ZIP / PDFへ開く要求は、source anchor、surface stamp、revision、
+items generationを持つtyped physical ownerをmain / detachedのopen planへ渡す。Root開始は
+accepted / wanted revisionをexactに検証し、いったんPhysicalSourceへ着地したdescendant / reloadは
+同じentry / source / path ownerを保ったままwanted進行を許容する。detached固有predicate、viewport、
+host identity、focus、geometryは変更しない。collection sessionのcloneはwatch、prepare task、
+root専用video cancelを共有せず、共有image / container poolは従来どおり各ViewerContextBundleが所有する。
+このためsibling contextやcollection退出後のsynthetic surfaceをcancelしない。
+
 **2026-09-15 §1.118 Phase 4 collection playback / latest navigation（親Codex／独立Sol構造合意、実装・自動検証）**
 
 collection rootの通常 page / native / slideshow / video・video-audio・music EOFと、Grid / fullscreenの

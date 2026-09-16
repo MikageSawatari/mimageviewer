@@ -109,6 +109,76 @@ pub(crate) struct MaterializedFolderListing {
     pub(crate) duplicate_filter_ms: f64,
 }
 
+/// Cross-folder sidecar discovery result for aggregate views.
+///
+/// Keys are normalized full video paths. A basename/stem key is intentionally never emitted:
+/// aggregate views may contain the same filename from unrelated physical parents.
+#[derive(Default)]
+pub(crate) struct AggregateVideoSidecars {
+    pub(crate) by_video_path: std::collections::HashMap<String, PathBuf>,
+    pub(crate) scanned_parents: usize,
+    pub(crate) skipped_parents: usize,
+    pub(crate) scan_errors: Vec<(PathBuf, String)>,
+}
+
+pub(crate) fn discover_aggregate_video_sidecars_while(
+    settings: &crate::settings::Settings,
+    videos: &[PathBuf],
+    max_parent_scans: usize,
+    mut keep_running: impl FnMut() -> bool,
+) -> Option<AggregateVideoSidecars> {
+    if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
+        return Some(AggregateVideoSidecars::default());
+    }
+    let requested = videos
+        .iter()
+        .map(|path| crate::path_key::normalize_keep_drive(path))
+        .collect::<std::collections::HashSet<_>>();
+    if requested.is_empty() {
+        return Some(AggregateVideoSidecars::default());
+    }
+
+    let mut parent_keys = std::collections::HashSet::new();
+    let mut parents = Vec::new();
+    for video in videos {
+        if !keep_running() {
+            return None;
+        }
+        if let Some(parent) = video.parent() {
+            let key = crate::path_key::normalize_keep_drive(parent);
+            if parent_keys.insert(key) {
+                parents.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let mut result = AggregateVideoSidecars {
+        scanned_parents: parents.len().min(max_parent_scans),
+        skipped_parents: parents.len().saturating_sub(max_parent_scans),
+        ..AggregateVideoSidecars::default()
+    };
+    for parent in parents.into_iter().take(max_parent_scans) {
+        if !keep_running() {
+            return None;
+        }
+        let mut scan = match scan_directory_with_settings(&parent, settings) {
+            Ok(scan) => scan,
+            Err(error) => {
+                result.scan_errors.push((parent, error.to_string()));
+                continue;
+            }
+        };
+        let found = filter_video_image_duplicates(&mut scan.all_media, true);
+        for (video, image) in found.sidecars {
+            let key = crate::path_key::normalize_keep_drive(&video);
+            if requested.contains(&key) {
+                result.by_video_path.insert(key, image);
+            }
+        }
+    }
+    keep_running().then_some(result)
+}
+
 pub(crate) fn materialize_local_folder_listing(
     path: &std::path::Path,
     scan: ScannedDir,
@@ -1225,6 +1295,63 @@ mod page_count_tests {
         assert_eq!(filtered.omitted, 1);
         assert!(filtered.sidecars.is_empty());
         assert_eq!(media.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_video_sidecars_are_full_path_scoped_and_cancel_atomically() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let left_video = left.join("same.mp4");
+        let right_video = right.join("same.mp4");
+        let left_image = left.join("same.jpg");
+        let right_image = right.join("same.jpg");
+        for path in [&left_video, &right_video, &left_image, &right_image] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_image_if_video_exists = true;
+        settings.video_thumb_use_sidecar_image = true;
+
+        let found = discover_aggregate_video_sidecars_while(
+            &settings,
+            &[left_video.clone(), right_video.clone()],
+            64,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(found.scanned_parents, 2);
+        assert_eq!(found.skipped_parents, 0);
+        assert_eq!(
+            found
+                .by_video_path
+                .get(&crate::path_key::normalize_keep_drive(&left_video)),
+            Some(&left_image)
+        );
+        assert_eq!(
+            found
+                .by_video_path
+                .get(&crate::path_key::normalize_keep_drive(&right_video)),
+            Some(&right_image)
+        );
+        assert!(!found.by_video_path.contains_key("same"));
+
+        let mut polls = 0;
+        assert!(
+            discover_aggregate_video_sidecars_while(
+                &settings,
+                &[left_video, right_video],
+                64,
+                || {
+                    polls += 1;
+                    polls < 2
+                },
+            )
+            .is_none(),
+            "cancelled discovery must not publish a partial source map"
+        );
     }
 
     #[test]

@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::top_level_grid_view::{
-    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition,
+    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPhysicalLoadOrigin,
+    CollectionGridPhysicalLoadOwner, CollectionGridPosition, CollectionGridPreparedInstall,
     CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
-    CollectionGridSourceOpenOwner, CollectionGridViewportAnchor, TopLevelGridRestore,
-    TopLevelGridSurface,
+    CollectionGridSourceOpenOwner, CollectionGridThumbnailSources, CollectionGridViewportAnchor,
+    TopLevelGridRestore, TopLevelGridSurface,
 };
 use super::{App, GridItem, ViewerContextId};
 use crate::collection_store::{
@@ -23,6 +24,60 @@ pub(crate) struct CollectionGridRemoveTarget {
     pub(crate) stamp: CollectionGridRequestStamp,
     pub(crate) expected_revision: u64,
     pub(crate) entry_ids: Vec<CollectionEntryId>,
+}
+
+pub(in crate::app) fn prepare_collection_grid_install(
+    snapshot: &crate::collection_store::CollectionSnapshot,
+    display_order: &crate::settings::GridDisplayOrder,
+    settings: &crate::settings::Settings,
+    cancel: &AtomicBool,
+) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
+    let prepared = prepare_collection_snapshot(snapshot, display_order, cancel, |_, _| {})?;
+    let videos = prepared
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.item {
+            GridItem::Video(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(sidecars) =
+        super::folder_scan::discover_aggregate_video_sidecars_while(settings, &videos, 64, || {
+            !cancel.load(Ordering::Acquire)
+        })
+    else {
+        return Err(CollectionPrepareError::Cancelled);
+    };
+    if sidecars.skipped_parents > 0 {
+        crate::logger::log(format!(
+            "collection grid: aggregate sidecar parent scan capped limit=64 scanned={} skipped_parents={}",
+            sidecars.scanned_parents, sidecars.skipped_parents,
+        ));
+    }
+    for (parent, error) in sidecars.scan_errors {
+        crate::logger::log(format!(
+            "collection grid: aggregate sidecar scan failed parent={} error={error}",
+            parent.display()
+        ));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(CollectionPrepareError::Cancelled);
+    }
+    let video_pin_blobs =
+        crate::video_pins::VideoPinDb::open_readonly(&crate::video_pins::VideoPinDb::db_path())
+            .ok()
+            .map(|db| db.lookup_webps_many(videos.iter()))
+            .unwrap_or_default();
+    if cancel.load(Ordering::Acquire) {
+        return Err(CollectionPrepareError::Cancelled);
+    }
+    Ok(CollectionGridPreparedInstall {
+        prepared,
+        thumbnail_sources: CollectionGridThumbnailSources {
+            video_sidecars: sidecars.by_video_path,
+            video_pin_blobs,
+        },
+    })
 }
 
 impl App {
@@ -271,6 +326,162 @@ impl App {
             navigation_request: None,
             navigation_watch: None,
         })
+    }
+
+    /// Capture the exact collection-owned physical load represented by a grid item.
+    ///
+    /// At the root the item must still be the immutable prepared entry selected by `index`.
+    /// Inside a physical source the root anchor remains stable while `target_path` identifies the
+    /// descendant requested by this one interaction. Callers must carry the returned owner through
+    /// scan/conversion and may not reconstruct it from the later selection.
+    pub(crate) fn collection_grid_physical_load_owner(
+        &self,
+        index: usize,
+        target_path: &std::path::Path,
+    ) -> Option<CollectionGridPhysicalLoadOwner> {
+        let stamp = self.collection_grid_stamp()?;
+        let session = self.top_level_grid_view.collection_session()?;
+        match &session.position {
+            CollectionGridPosition::Root => {
+                let anchor = self.collection_grid_source_anchor(index, target_path)?;
+                Some(CollectionGridPhysicalLoadOwner {
+                    stamp,
+                    accepted_revision: session.accepted_revision,
+                    wanted_revision: session.wanted_revision,
+                    anchor,
+                    root_source_path: target_path.to_path_buf(),
+                    target_path: target_path.to_path_buf(),
+                    origin: CollectionGridPhysicalLoadOrigin::Root {
+                        items_generation: self.items_generation,
+                    },
+                })
+            }
+            CollectionGridPosition::PhysicalSource {
+                entry_id,
+                source_key,
+                path,
+            } => Some(CollectionGridPhysicalLoadOwner {
+                stamp,
+                accepted_revision: session.accepted_revision,
+                wanted_revision: session.wanted_revision,
+                anchor: CollectionGridViewportAnchor {
+                    entry_id: *entry_id,
+                    source_key: source_key.clone(),
+                },
+                root_source_path: path.clone(),
+                target_path: target_path.to_path_buf(),
+                origin: CollectionGridPhysicalLoadOrigin::PhysicalSource {
+                    current_path: self.effective_folder()?,
+                },
+            }),
+        }
+    }
+
+    /// Capture a collection-owned in-place reload. Only a mounted physical descendant can own
+    /// this route; root materialization has its own actor/prepare lifecycle.
+    pub(crate) fn collection_grid_physical_reload_owner(
+        &self,
+        target_path: &std::path::Path,
+    ) -> Option<CollectionGridPhysicalLoadOwner> {
+        self.collection_grid_physical_load_owner(self.selected.unwrap_or(0), target_path)
+            .filter(|owner| {
+                matches!(
+                    owner.origin,
+                    CollectionGridPhysicalLoadOrigin::PhysicalSource { .. }
+                )
+            })
+    }
+
+    pub(crate) fn grid_physical_navigation(
+        &self,
+        index: usize,
+        path: std::path::PathBuf,
+    ) -> crate::ui_main::AddressBarNav {
+        match self.collection_grid_physical_load_owner(index, &path) {
+            Some(owner) => crate::ui_main::AddressBarNav::CollectionSource { path, owner },
+            None => crate::ui_main::AddressBarNav::Direct(path),
+        }
+    }
+
+    pub(crate) fn collection_grid_physical_load_owner_is_current(
+        &self,
+        owner: &CollectionGridPhysicalLoadOwner,
+        target_path: &std::path::Path,
+    ) -> bool {
+        if !crate::folder_tree::path_eq(&owner.target_path, target_path)
+            || !self.collection_grid_stamp_is_current(owner.stamp)
+        {
+            return false;
+        }
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return false;
+        };
+        if session.accepted_revision != owner.accepted_revision {
+            return false;
+        }
+        match &owner.origin {
+            CollectionGridPhysicalLoadOrigin::Root { items_generation } => {
+                let root_entry_is_current = session.prepared().is_some_and(|prepared| {
+                    prepared.entries.iter().any(|entry| {
+                        entry.entry_id == owner.anchor.entry_id
+                            && entry.source_key == owner.anchor.source_key
+                            && crate::folder_tree::path_eq(
+                                &entry.source_path,
+                                &owner.root_source_path,
+                            )
+                    })
+                });
+                root_entry_is_current
+                    && matches!(session.position, CollectionGridPosition::Root)
+                    && session.wanted_revision == owner.wanted_revision
+                    && session.installed_items_generation == Some(*items_generation)
+                    && self.items_generation == *items_generation
+                    && crate::folder_tree::path_eq(&owner.root_source_path, target_path)
+            }
+            CollectionGridPhysicalLoadOrigin::PhysicalSource { current_path } => {
+                matches!(
+                    &session.position,
+                    CollectionGridPosition::PhysicalSource {
+                        entry_id,
+                        source_key,
+                        path,
+                    } if *entry_id == owner.anchor.entry_id
+                        && *source_key == owner.anchor.source_key
+                        && crate::folder_tree::path_eq(path, &owner.root_source_path)
+                ) && self
+                    .effective_folder()
+                    .as_deref()
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, current_path))
+            }
+        }
+    }
+
+    /// Commit one already-adopted physical load. Root opens advance to PhysicalSource; descendant
+    /// loads and same-folder reloads keep the original collection entry as their parent anchor.
+    pub(crate) fn commit_collection_grid_physical_load(
+        &mut self,
+        owner: &CollectionGridPhysicalLoadOwner,
+        target_path: &std::path::Path,
+    ) -> bool {
+        if !self.collection_grid_physical_load_owner_is_current(owner, target_path) {
+            return false;
+        }
+        if matches!(owner.origin, CollectionGridPhysicalLoadOrigin::Root { .. }) {
+            // Root thumbnails are generation-owned presentation work. Once the physical child
+            // is adopted, that root is no longer visible, including for ZIP/PDF children whose
+            // collection session remains mounted for parent navigation. The shared image pool
+            // remains owned by ViewerContextBundle and is intentionally not cancelled here.
+            if let Some(session) = self.top_level_grid_view.collection_session_mut()
+                && let Some(cancel) = session.video_worker_cancel.take()
+            {
+                cancel.store(true, Ordering::Release);
+            }
+            self.commit_collection_grid_source_open(
+                owner.anchor.clone(),
+                owner.root_source_path.clone(),
+            );
+        }
+        true
     }
 
     pub(crate) fn collection_grid_source_open_owner_is_current(
@@ -531,17 +742,18 @@ impl App {
     ) {
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
+        let settings = self.settings.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let spawn = std::thread::Builder::new()
             .name("collection-grid-prepare".into())
             .spawn(move || {
-                let result = prepare_collection_snapshot(
+                let result = prepare_collection_grid_install(
                     &snapshot,
                     &display_order,
+                    &settings,
                     &worker_cancel,
-                    |_, _| {},
                 );
                 let _ = sender.send(result);
             });
@@ -788,14 +1000,14 @@ impl App {
             }) => match receiver.try_recv() {
                 Ok(Ok(prepared)) => {
                     let accepts = self.collection_grid_stamp_is_current(stamp)
-                        && prepared.collection_id == stamp.collection_id
-                        && prepared.collection_revision == exact_revision
+                        && prepared.prepared.collection_id == stamp.collection_id
+                        && prepared.prepared.collection_revision == exact_revision
                         && self
                             .top_level_grid_view
                             .collection_session()
                             .is_some_and(|session| session.wanted_revision <= exact_revision);
                     if accepts {
-                        self.apply_collection_grid_prepared(Arc::new(prepared), installed);
+                        self.apply_collection_grid_prepared_install(prepared, installed);
                         ctx.request_repaint();
                     }
                 }
@@ -854,11 +1066,20 @@ impl App {
         self.schedule_collection_grid_snapshot();
     }
 
-    pub(in crate::app) fn apply_collection_grid_prepared(
+    pub(in crate::app) fn apply_collection_grid_prepared_install(
         &mut self,
-        prepared: Arc<CollectionPreparedSnapshot>,
+        install: CollectionGridPreparedInstall,
         previous: Option<Arc<CollectionPreparedSnapshot>>,
     ) {
+        let CollectionGridPreparedInstall {
+            prepared,
+            thumbnail_sources,
+        } = install;
+        let CollectionGridThumbnailSources {
+            video_sidecars,
+            video_pin_blobs,
+        } = thumbnail_sources;
+        let prepared = Arc::new(prepared);
         let old_binding_is_current =
             self.top_level_grid_view
                 .collection_session()
@@ -941,7 +1162,13 @@ impl App {
                     .position(|entry| entry.entry_id == anchor.entry_id)
             })
             .collect::<std::collections::HashSet<_>>();
-        self.install_collection_grid_items(items, image_metas, selected);
+        self.install_collection_grid_items_with_thumbnail_sources(
+            items,
+            image_metas,
+            selected,
+            video_sidecars,
+            video_pin_blobs,
+        );
         self.checked = checked;
         if let Some(query) = old_search_query {
             self.search_query = query;
@@ -982,12 +1209,57 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::app) fn apply_collection_grid_prepared(
+        &mut self,
+        prepared: Arc<CollectionPreparedSnapshot>,
+        previous: Option<Arc<CollectionPreparedSnapshot>>,
+    ) {
+        self.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                prepared: (*prepared).clone(),
+                thumbnail_sources: CollectionGridThumbnailSources::default(),
+            },
+            previous,
+        );
+    }
+
     fn install_collection_grid_items(
         &mut self,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
         selected: Option<usize>,
     ) {
+        self.install_collection_grid_items_with_thumbnail_sources(
+            items,
+            image_metas,
+            selected,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+    }
+
+    fn install_collection_grid_items_with_thumbnail_sources(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        selected: Option<usize>,
+        video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
+        video_pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        if let Some(session) = self.top_level_grid_view.collection_session_mut()
+            && let Some(cancel) = session.video_worker_cancel.take()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        // The regular thumbnail pool belongs to this ViewerContextBundle. Rebuild it for the new
+        // aggregate generation, but do not transfer ownership to the collection session: another
+        // synthetic surface may intentionally reuse this pool after the collection is retired.
+        self.bump_full_context_for_load();
+        let image_worker_cancel = Arc::clone(&self.cancel_token);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx = tx.clone();
+        self.rx = rx;
         self.current_folder = None;
         self.archive_source_override = None;
         self.zip_nav = None;
@@ -1001,6 +1273,9 @@ impl App {
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
+        self.folder_pin_map.clear();
+        self.converted_archive_cache_paths.clear();
+        self.video_thumb_overrides = video_sidecars;
         self.search_filter = None;
         self.search_query.clear();
 
@@ -1011,6 +1286,72 @@ impl App {
         }
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
+
+        let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        self.current_color_cache_map = Some(Arc::clone(&cache_map));
+        self.current_color_catalog = None;
+        self.reset_and_seed_auto_aspect(&cache_map);
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let initial_display_px = super::compute_display_px(
+            self.last_cell_size,
+            self.last_cell_h,
+            self.last_pixels_per_point,
+        );
+        self.display_px_shared
+            .store(initial_display_px, Ordering::Relaxed);
+
+        if self.items.is_empty() {
+            self.reload_queue = None;
+            self.heavy_io_queue = None;
+            return;
+        }
+
+        let reload_queue: Arc<super::NotifyQueue> =
+            Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let heavy_io_queue: Arc<super::NotifyQueue> =
+            Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.spawn_thumbnail_workers(
+            &tx,
+            image_worker_cancel,
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            None,
+            self.folder_thumb_pin_db.clone(),
+        );
+
+        let video_items = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                GridItem::Video(path) => Some((
+                    index,
+                    path.clone(),
+                    self.image_metas
+                        .get(index)
+                        .and_then(|meta| *meta)
+                        .map_or(0, |(_, size)| size.max(0) as u64),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !video_items.is_empty() {
+            let video_worker_cancel = Arc::new(AtomicBool::new(false));
+            self.spawn_video_thread(
+                tx,
+                Arc::clone(&video_worker_cancel),
+                video_items,
+                self.video_thumb_overrides.clone(),
+                video_pin_blobs,
+            );
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.video_worker_cancel = Some(video_worker_cancel);
+            }
+        }
     }
 }
 
@@ -1477,6 +1818,485 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.entries[selected].entry_id, anchor.entry_id);
         assert_eq!(app.address, "コレクション: Renamed while in child");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn independent_physical_load_retires_root_watch_before_later_collection_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let physical = temp.path().join("physical");
+        let added = temp.path().join("later.png");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&added, b"later").unwrap();
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::write(physical.join("visible.png"), b"visible").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&physical, &app.settings)
+                .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            physical.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::Navigation,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert!(app.top_level_grid_view.collection_session().is_none());
+        let held_generation = app.items_generation;
+        let held_address = app.address.clone();
+        let held_items = app
+            .items
+            .iter()
+            .map(|item| item.drag_source_path().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        let held_selected = app.selected;
+        let held_checked = app.checked.clone();
+        let held_scroll = app.scroll_offset_y;
+
+        let updated = recv(
+            client
+                .add_batch(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    vec![
+                        CollectionRegistration::from_trusted_path(
+                            &added,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .expect("add request"),
+        );
+        for _ in 0..4 {
+            app.poll_collection_grid(&egui::Context::default());
+        }
+        assert_eq!(updated.snapshot.revision(), snapshot.revision() + 1);
+        assert_eq!(app.items_generation, held_generation);
+        assert_eq!(app.address, held_address);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.drag_source_path().map(Path::to_path_buf))
+                .collect::<Vec<_>>(),
+            held_items
+        );
+        assert_eq!(app.selected, held_selected);
+        assert_eq!(app.checked, held_checked);
+        assert_eq!(app.scroll_offset_y, held_scroll);
+        assert_eq!(app.current_folder.as_deref(), Some(physical.as_path()));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn failed_independent_scan_keeps_collection_root_surface_and_items_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, b"source").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let held_generation = app.items_generation;
+        let held_address = app.address.clone();
+        let held_source = app.items[0].drag_source_path().unwrap().to_path_buf();
+
+        assert!(!app.load_folder_with_scan_owned(
+            temp.path().join("missing"),
+            None,
+            crate::app::OpenRequestOwner::Navigation,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity)
+                if identity.collection_id == snapshot.collection_id()
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::Root
+        ));
+        assert_eq!(app.items_generation, held_generation);
+        assert_eq!(app.address, held_address);
+        assert_eq!(
+            app.items[0].drag_source_path().map(Path::to_path_buf),
+            Some(held_source)
+        );
+        assert!(app.current_folder.is_none());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn root_load_owner_stales_on_wanted_revision_but_physical_continuation_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("book");
+        let nested = root.join("nested");
+        let deeper = nested.join("deeper");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&deeper).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(root.join("page.png"), b"page").unwrap();
+        let root_same = root.join("same.jpg");
+        let other_same = other.join("same.jpg");
+        std::fs::write(&root_same, b"root same").unwrap();
+        std::fs::write(&other_same, b"other same").unwrap();
+        std::fs::write(nested.join("nested.png"), b"nested").unwrap();
+        std::fs::write(deeper.join("deep.png"), b"deep").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        // This test exercises two immediate accepted loads. A sidecar restore deliberately blocks
+        // sibling loads until its continuation finishes, which is an orthogonal lifecycle.
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let snapshot =
+            collection_with_sources(&client, &[(root.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+
+        let stale_root = app
+            .collection_grid_physical_load_owner(0, &root)
+            .expect("root owner");
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision += 1;
+        assert!(!app.collection_grid_physical_load_owner_is_current(&stale_root, &root));
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&root, &app.settings).unwrap();
+        assert!(!app.load_folder_with_scan_owned(
+            root.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::CollectionGridPhysical(stale_root.clone()),
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::Root
+        ));
+        assert!(app.current_folder.is_none());
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision = stale_root.wanted_revision;
+
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&root, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            root.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::CollectionGridPhysical(stale_root),
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::PhysicalSource { .. }
+        ));
+
+        // Collection-owned PhysicalSource keeps the Collection surface, so load requests and
+        // delete_missing must both use full paths. Model two same-basename rows from different
+        // parents in one catalog and verify pruning retains exactly the keys the readers request.
+        assert!(app.use_full_path_cache_keys());
+        let same_name_items = [
+            GridItem::Image(root_same.clone()),
+            GridItem::Image(other_same.clone()),
+        ];
+        let existing_keys = same_name_items
+            .iter()
+            .flat_map(|item| {
+                super::super::folder_thumb_existing_keys_for(
+                    item,
+                    None,
+                    &std::collections::HashMap::new(),
+                    None,
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    app.use_full_path_cache_keys(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let requested_keys = same_name_items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                super::super::make_load_request(
+                    item,
+                    idx,
+                    1,
+                    1,
+                    false,
+                    None,
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                    None,
+                    app.current_folder.as_deref(),
+                    None,
+                    None,
+                    app.use_full_path_cache_keys(),
+                )
+                .unwrap()
+                .cache_key_override
+                .unwrap()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(existing_keys, requested_keys);
+        assert_eq!(existing_keys.len(), 2);
+        let catalog = crate::catalog::CatalogDb::open(&temp.path().join("cache"), &root).unwrap();
+        for key in &requested_keys {
+            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+        }
+        catalog.delete_missing(&existing_keys).unwrap();
+        let retained = catalog.load_all().unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(requested_keys.iter().all(|key| retained.contains_key(key)));
+
+        let renamed = recv(
+            client
+                .rename_collection(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    "newer".into(),
+                )
+                .expect("rename request"),
+        );
+        poll_until(&mut app, "physical child did not observe revision", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.wanted_revision >= renamed.revision())
+        });
+        let nested_index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Folder(path) if path == &nested))
+            .unwrap();
+        let continuation = app
+            .collection_grid_physical_load_owner(nested_index, &nested)
+            .expect("physical continuation");
+        assert!(app.collection_grid_physical_load_owner_is_current(&continuation, &nested));
+        let scan = super::super::folder_scan::scan_directory_with_settings(&nested, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            nested.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::CollectionGridPhysical(continuation),
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
+        assert!(matches!(
+            app.collection_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Collection(_))
+        ));
+        let reload_owner = app
+            .collection_grid_physical_reload_owner(&nested)
+            .expect("physical same-folder reload owner");
+        let scan = super::super::folder_scan::scan_directory_with_settings(&nested, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            nested.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::CollectionGridPhysical(reload_owner),
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
+
+        let deleted = recv(
+            client
+                .delete_collection(snapshot.collection_id(), renamed.revision())
+                .expect("delete request"),
+        );
+        poll_until(&mut app, "physical child did not observe deletion", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.observed_catalog_revision >= deleted.catalog_revision
+                        && matches!(session.load, CollectionGridLoadState::Deleted)
+                })
+        });
+        let deeper_index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Folder(path) if path == &deeper))
+            .unwrap();
+        let continuation = app
+            .collection_grid_physical_load_owner(deeper_index, &deeper)
+            .expect("deleted collection keeps its mounted physical continuation");
+        let scan = super::super::folder_scan::scan_directory_with_settings(&deeper, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            deeper.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::CollectionGridPhysical(continuation),
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(deeper.as_path()));
+
+        // Typing the same currently visible path in the address bar is an independent
+        // navigation intent. Path equality must not preserve the collection owner.
+        let scan = super::super::folder_scan::scan_directory_with_settings(&deeper, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            deeper.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::Navigation,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert!(app.top_level_grid_view.collection_session().is_none());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_video_workers_use_generation_owned_full_path_sidecars_and_cancel_on_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        let child_folder = temp.path().join("child-folder");
+        let child_zip = temp.path().join("child.zip");
+        let child_pdf = temp.path().join("child.pdf");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::create_dir(&child_folder).unwrap();
+        std::fs::write(&child_zip, b"zip fixture").unwrap();
+        std::fs::write(&child_pdf, b"pdf fixture").unwrap();
+        let left_video = left.join("same.mp4");
+        let right_video = right.join("same.mp4");
+        let left_image = left.join("same.jpg");
+        let right_image = right.join("same.jpg");
+        std::fs::write(&left_video, b"left video").unwrap();
+        std::fs::write(&right_video, b"right video").unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]))
+            .save(&left_image)
+            .unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([0, 255, 0]))
+            .save(&right_image)
+            .unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.skip_image_if_video_exists = true;
+        app.settings.video_thumb_use_sidecar_image = true;
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (left_video.clone(), CollectionResolvedKind::Video),
+                (right_video.clone(), CollectionResolvedKind::Video),
+                (child_folder.clone(), CollectionResolvedKind::Folder),
+                (child_zip.clone(), CollectionResolvedKind::Zip),
+                (child_pdf.clone(), CollectionResolvedKind::Pdf),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+
+        assert!(app.use_full_path_cache_keys());
+        assert_eq!(
+            app.video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(&left_video)),
+            Some(&left_image)
+        );
+        assert_eq!(
+            app.video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(&right_video)),
+            Some(&right_image)
+        );
+        assert!(!app.video_thumb_overrides.contains_key("same"));
+        assert!(app.reload_queue.is_some() && app.heavy_io_queue.is_some());
+        assert!(app.current_color_catalog.is_none());
+        let old_video_cancel = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .video_worker_cancel
+            .as_ref()
+            .cloned()
+            .expect("video worker cancel");
+        let old_shared_pool_cancel = Arc::clone(&app.cancel_token);
+
+        let renamed = recv(
+            client
+                .rename_collection(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    "refreshed".into(),
+                )
+                .expect("rename request"),
+        );
+        poll_until(&mut app, "collection refresh did not install", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.accepted_revision == renamed.revision())
+        });
+        assert!(old_video_cancel.load(Ordering::Acquire));
+        assert!(
+            !app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .video_worker_cancel
+                .as_ref()
+                .unwrap()
+                .load(Ordering::Acquire)
+        );
+        assert!(old_shared_pool_cancel.load(Ordering::Acquire));
+
+        for child in [&child_folder, &child_zip, &child_pdf] {
+            let index = app
+                .items
+                .iter()
+                .position(|item| item.drag_source_path() == Some(child.as_path()))
+                .unwrap();
+            let owner = app
+                .collection_grid_physical_load_owner(index, child)
+                .expect("root physical owner");
+            let root_video_cancel = app
+                .top_level_grid_view
+                .collection_session()
+                .and_then(|session| session.video_worker_cancel.as_ref())
+                .cloned()
+                .expect("root video worker");
+            let physical_shared_pool_cancel = Arc::clone(&app.cancel_token);
+            assert!(app.commit_collection_grid_physical_load(&owner, child));
+            assert!(root_video_cancel.load(Ordering::Acquire));
+            assert!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .video_worker_cancel
+                    .is_none()
+            );
+            assert!(
+                !physical_shared_pool_cancel.load(Ordering::Acquire),
+                "root Folder/ZIP/PDF transition must leave the bundle pool alive"
+            );
+            app.open_collection_grid(snapshot.collection_id(), None);
+            wait_for_grid(&mut app, snapshot.collection_id());
+        }
+
+        let exit_video_cancel = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.video_worker_cancel.as_ref())
+            .cloned()
+            .expect("reopened root video worker");
+        let exit_shared_pool_cancel = Arc::clone(&app.cancel_token);
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Search(
+                super::super::top_level_grid_view::TopLevelSearchView::Global,
+            ));
+        assert!(exit_video_cancel.load(Ordering::Acquire));
+        assert!(
+            !exit_shared_pool_cancel.load(Ordering::Acquire),
+            "collection session drop must not cancel the bundle-owned image/container pool"
+        );
         app.shutdown_collection_runtime_for_exit();
     }
 

@@ -456,6 +456,7 @@ pub(crate) enum DetachedGridArchiveOpenOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
+    CollectionGridPhysical(top_level_grid_view::CollectionGridPhysicalLoadOwner),
     MainGridArchive(MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
@@ -2532,7 +2533,7 @@ enum DetachedGridItemOpenPlan {
     /// the worker proves that it is an image book.
     FolderCandidate {
         path: PathBuf,
-        collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
+        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     },
     /// Direct reading versus cache conversion is unknown until the archive probe completes.
     /// The request remains main-owned until a readable backing archive is selected, then creates
@@ -4588,7 +4589,7 @@ pub(crate) enum FolderOpenScanPurpose {
     /// owns this request until the completed scan classifies it as either an image
     /// book (detached) or an ordinary mixed folder (main navigation).
     GridFolderCandidate {
-        collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
+        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     },
     DetachedFolder,
     DetachedImage {
@@ -4612,6 +4613,7 @@ pub(crate) enum FolderOpenScanPurpose {
     /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
     CurrentViewOrderRefresh {
         order: CurrentViewOrderSnapshot,
+        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     },
 }
 
@@ -4663,7 +4665,7 @@ pub(crate) struct FolderPaneOpenReady {
 struct ResolvedMainFolderOpen {
     path: PathBuf,
     scan: ScannedDir,
-    collection_anchor: Option<top_level_grid_view::CollectionGridViewportAnchor>,
+    collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
 }
 
 impl FolderPaneOpenReady {
@@ -19124,6 +19126,15 @@ impl App {
                 self.clear_pending_folder_nav_steps();
                 true
             }
+            crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
+                let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path,
+                    false,
+                    OpenRequestOwner::CollectionGridPhysical(owner),
+                );
+                self.clear_pending_folder_nav_steps();
+                true
+            }
             crate::ui_main::AddressBarNav::DriveList(origin) => {
                 self.enter_drive_list_from_navigation(origin);
                 true
@@ -20568,7 +20579,12 @@ impl App {
         }
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
-        self.load_folder(folder);
+        let owner = self
+            .collection_grid_physical_reload_owner(&folder)
+            .map(OpenRequestOwner::CollectionGridPhysical)
+            .unwrap_or(OpenRequestOwner::Navigation);
+        let _ =
+            self.load_folder_or_convert_archive_with_auto_fullscreen_owned(folder, false, owner);
         if let Some(src) = saved_override {
             self.address = src.to_string_lossy().to_string();
             self.archive_source_override = Some(src);
@@ -20662,7 +20678,15 @@ impl App {
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
             match physical_mode {
-                PhysicalFolderSortReload::Immediate => self.load_folder(path),
+                PhysicalFolderSortReload::Immediate => {
+                    let owner = self
+                        .collection_grid_physical_reload_owner(&path)
+                        .map(OpenRequestOwner::CollectionGridPhysical)
+                        .unwrap_or(OpenRequestOwner::Navigation);
+                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path, false, owner,
+                    );
+                }
                 PhysicalFolderSortReload::WorkerScan => {
                     // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
                     // sort / category order のどちらも materialize 結果を変えない。
@@ -20679,9 +20703,13 @@ impl App {
                         return;
                     }
                     let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+                    let collection_owner = self.collection_grid_physical_reload_owner(&path);
                     self.start_folder_open_scan(
                         path,
-                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order },
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                            order,
+                            collection_owner,
+                        },
                     );
                 }
             }
@@ -21184,8 +21212,11 @@ impl App {
         if path.is_file() && crate::folder_tree::is_convertible_archive_path(&path) {
             self.load_folder_or_convert_archive(path)
         } else {
-            self.load_folder_with_scan(path, pre_scan);
-            FolderOpenOutcome::Loaded
+            if self.load_folder_with_scan_owned(path, pre_scan, OpenRequestOwner::Navigation) {
+                FolderOpenOutcome::Loaded
+            } else {
+                FolderOpenOutcome::Ignored
+            }
         }
     }
 
@@ -21282,8 +21313,11 @@ impl App {
         {
             self.pending_auto_fs_open = true;
         }
-        self.load_folder_with_scan_claimed(path, None, owner);
-        FolderOpenOutcome::Loaded
+        if self.load_folder_with_scan_claimed(path, None, owner) {
+            FolderOpenOutcome::Loaded
+        } else {
+            FolderOpenOutcome::Ignored
+        }
     }
 
     /// 事前スキャン済みディレクトリを受け取れる load_folder の本体。
@@ -21300,15 +21334,15 @@ impl App {
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
-    ) {
+    ) -> bool {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
-            return;
+            return false;
         }
         if !self.claim_open_request_owner(&path, &owner) {
-            return;
+            return false;
         }
-        self.load_folder_with_scan_claimed(path, pre_scan, owner);
+        self.load_folder_with_scan_claimed(path, pre_scan, owner)
     }
 
     /// Pure preflight for whether a visible open belongs to the current snapshot scope.
@@ -21329,7 +21363,9 @@ impl App {
                 crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
                 | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
             },
-            OpenRequestOwner::Navigation | OpenRequestOwner::DetachedGridArchive(_) => path,
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::CollectionGridPhysical(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => path,
         };
         self.snapshot_owner_entry(scope_path).is_some()
     }
@@ -21358,7 +21394,19 @@ impl App {
     /// `cancel_archive_convert_for_navigation_to`.
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
         match owner {
-            OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_) => {
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::CollectionGridPhysical(_)
+            | OpenRequestOwner::MainGridArchive(_) => {
+                if let OpenRequestOwner::CollectionGridPhysical(collection) = owner
+                    && !self.collection_grid_physical_load_owner_is_current(collection, path)
+                {
+                    crate::logger::log(format!(
+                        "collection physical load rejected after its owner became stale path={}",
+                        path.display()
+                    ));
+                    self.pending_auto_fs_open = false;
+                    return false;
+                }
                 if !self.main_grid_archive_transition_is_current(owner) {
                     crate::logger::log(format!(
                         "collection archive open rejected after its source owner became stale path={}",
@@ -21452,12 +21500,59 @@ impl App {
         }
     }
 
+    /// Adopt a physical destination only after its visible load has proved usable.
+    ///
+    /// Independent navigation retires a mounted collection at this boundary. A collection-owned
+    /// grid/descendant/reload request instead preserves the session and commits its exact root
+    /// anchor. Keeping this out of preflight leaves the old root intact on scan errors, refused
+    /// snapshots, stale async completions, and cancelled conversion dialogs.
+    fn adopt_collection_surface_for_physical_load(
+        &mut self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+    ) -> bool {
+        if self.sidecar_restore_active() {
+            crate::logger::log(format!(
+                "physical load adoption deferred by active sidecar restore path={}",
+                path.display()
+            ));
+            return false;
+        }
+        if self.navigation_scope.is_detached_physical() {
+            return true;
+        }
+        match owner {
+            OpenRequestOwner::CollectionGridPhysical(collection) => {
+                self.commit_collection_grid_physical_load(collection, path)
+            }
+            OpenRequestOwner::MainGridArchive(intent) if intent.collection_grid_owner.is_some() => {
+                // Archive conversion owns its existing commit tail. The cached ZIP/direct RAR
+                // load is adopted now, then commit_main_grid_archive_transition advances the
+                // exact collection source before control returns to the UI loop.
+                self.main_grid_archive_transition_is_current(owner)
+            }
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::MainGridArchive(_)
+            | OpenRequestOwner::Bookmark(_) => {
+                if matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Collection(_)
+                ) {
+                    self.top_level_grid_view
+                        .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+                }
+                true
+            }
+            OpenRequestOwner::DetachedGridArchive(_) => true,
+        }
+    }
+
     fn load_folder_with_scan_claimed(
         &mut self,
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
-    ) {
+    ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
@@ -21468,7 +21563,7 @@ impl App {
         // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
-            return;
+            return false;
         }
         // A converted cache ZIP is an implementation alias outside the source archive's smart
         // scope. Keep the resident session mounted here; the typed owner commits the logical
@@ -21497,11 +21592,11 @@ impl App {
         if !detached_physical {
             if self.restore_smart_folder_for_synthetic_path(&path) {
                 self.suppress_nav_record_for_search_restore = false;
-                return;
+                return true;
             }
             if self.restore_subfolder_expansion_for_synthetic_path(&path) {
                 self.suppress_nav_record_for_search_restore = false;
-                return;
+                return true;
             }
             if !defer_main_grid_archive_transition {
                 self.reconcile_smart_folder_scoped_real_folder_load(&path);
@@ -21528,7 +21623,9 @@ impl App {
         if !detached_physical
             && matches!(
                 owner,
-                OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_)
+                OpenRequestOwner::Navigation
+                    | OpenRequestOwner::CollectionGridPhysical(_)
+                    | OpenRequestOwner::MainGridArchive(_)
             )
         {
             self.reconcile_bookmark_return_target_for_folder_load(&path);
@@ -21542,6 +21639,7 @@ impl App {
                 | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
             },
             OpenRequestOwner::DetachedGridArchive(detached_owner) => &detached_owner.source_path,
+            OpenRequestOwner::CollectionGridPhysical(collection) => &collection.target_path,
             OpenRequestOwner::Navigation => &path,
         };
         self.transition_favorite_view_for_path(Some(favorite_path));
@@ -21609,6 +21707,10 @@ impl App {
                 .map(|e| e.to_ascii_lowercase())
                 .unwrap_or_default();
             if crate::folder_tree::is_zip_extension(&ext) {
+                if !self.adopt_collection_surface_for_physical_load(&path, &owner) {
+                    self.pending_auto_fs_open = false;
+                    return false;
+                }
                 self.load_zip_as_folder(path);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -21626,9 +21728,13 @@ impl App {
                         ],
                     );
                 }
-                return;
+                return true;
             }
             if ext == "pdf" {
+                if !self.adopt_collection_surface_for_physical_load(&path, &owner) {
+                    self.pending_auto_fs_open = false;
+                    return false;
+                }
                 self.load_pdf_as_folder(path);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -21646,7 +21752,7 @@ impl App {
                         ],
                     );
                 }
-                return;
+                return true;
             }
         }
 
@@ -21681,10 +21787,19 @@ impl App {
                     self.pending_auto_fs_open = false;
                     self.release_fs_nav_lock();
                     self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
-                    return;
+                    return false;
                 }
             },
         };
+        if !self.adopt_collection_surface_for_physical_load(&path, &owner) {
+            self.pending_auto_fs_open = false;
+            return false;
+        }
+        // Surface adoption is the canonical cache-key boundary. A collection-owned physical
+        // source deliberately keeps the Collection surface (and therefore uses full paths),
+        // while an independent navigation adopts Folder and keeps the ordinary basename keys.
+        // The same decision must feed request/read, seed, and delete_missing.
+        let use_full_path_cache_keys = self.use_full_path_cache_keys();
         // Keep the image-book boundary independent from the caller and from the eventual
         // detached/main owner. Grid Folder preflight uses this same predicate before it
         // commits a context, preventing the two load paths from drifting apart.
@@ -21815,7 +21930,7 @@ impl App {
                     self.folder_thumb_pin_db.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
-                    use_full_path_cache_keys_for_folder(&path),
+                    use_full_path_cache_keys,
                 )
             })
             .collect();
@@ -21945,6 +22060,7 @@ impl App {
         if !detached_physical {
             self.update_smart_folder_scoped_address();
         }
+        true
     }
 
     /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
@@ -38323,7 +38439,7 @@ impl App {
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             self.record_rating_view_nav_open(&p);
                             self.begin_smart_folder_drill(&p);
-                            return Some(crate::ui_main::AddressBarNav::Direct(p));
+                            return Some(self.grid_physical_navigation(idx, p));
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
@@ -39102,11 +39218,11 @@ impl App {
     fn start_grid_folder_candidate_open(
         &mut self,
         path: PathBuf,
-        collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
+        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     ) {
         self.start_folder_open_scan(
             path,
-            FolderOpenScanPurpose::GridFolderCandidate { collection_restore },
+            FolderOpenScanPurpose::GridFolderCandidate { collection_owner },
         );
     }
 
@@ -39345,9 +39461,18 @@ impl App {
             FolderOpenScanPurpose::PaneNavigation => Some(ResolvedMainFolderOpen {
                 path: ready.path,
                 scan,
-                collection_anchor: None,
+                collection_owner: None,
             }),
-            FolderOpenScanPurpose::GridFolderCandidate { collection_restore } => {
+            FolderOpenScanPurpose::GridFolderCandidate { collection_owner } => {
+                if let Some(owner) = collection_owner.as_ref()
+                    && !self.collection_grid_physical_load_owner_is_current(owner, &ready.path)
+                {
+                    crate::logger::log(format!(
+                        "grid folder candidate discarded after collection owner became stale path={}",
+                        ready.path.display()
+                    ));
+                    return None;
+                }
                 let image_book = self.settings.auto_fullscreen_image_folders_enabled()
                     && self.scanned_folder_is_image_book(&ready.path, &scan);
                 let should_detach =
@@ -39374,8 +39499,7 @@ impl App {
                     return Some(ResolvedMainFolderOpen {
                         path: ready.path,
                         scan,
-                        collection_anchor: collection_restore
-                            .and_then(|restore| restore.viewport_anchor),
+                        collection_owner,
                     });
                 }
 
@@ -39386,6 +39510,13 @@ impl App {
                 }
                 let placement_seed = had_active_detached
                     .then(|| self.offset_detached_image_window_placement(base_placement));
+                let collection_restore = collection_owner.as_ref().map(|owner| {
+                    let wanted_revision = self
+                        .top_level_grid_view
+                        .collection_session()
+                        .map_or(owner.accepted_revision, |session| session.wanted_revision);
+                    owner.restore(wanted_revision)
+                });
                 self.start_active_detached_book_context_from_scanned_folder_with_restore(
                     ready.path,
                     scan,
@@ -39422,8 +39553,11 @@ impl App {
                 );
                 None
             }
-            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
-                self.apply_current_view_order_refresh(ready.path, scan, order);
+            FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                order,
+                collection_owner,
+            } => {
+                self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner);
                 None
             }
         }
@@ -39434,6 +39568,7 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         order: CurrentViewOrderSnapshot,
+        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     ) -> bool {
         if !self
             .current_folder
@@ -39444,8 +39579,10 @@ impl App {
             return false;
         }
         self.preserve_cursor_hint_for_reload();
-        self.load_folder_with_scan(path, Some(scan));
-        true
+        let owner = collection_owner
+            .map(OpenRequestOwner::CollectionGridPhysical)
+            .unwrap_or(OpenRequestOwner::Navigation);
+        self.load_folder_with_scan_owned(path, Some(scan), owner)
     }
 
     /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
@@ -39559,8 +39696,12 @@ impl App {
                 );
                 DetachedPhysicalFolderOpenPoll::Applied
             }
-            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
-                if self.apply_current_view_order_refresh(ready.path, scan, order) {
+            FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                order,
+                collection_owner,
+            } => {
+                if self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner)
+                {
                     DetachedPhysicalFolderOpenPoll::Applied
                 } else {
                     DetachedPhysicalFolderOpenPoll::Failed
@@ -39689,7 +39830,7 @@ impl App {
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 self.record_rating_view_nav_open(&p);
                 self.begin_smart_folder_drill(&p);
-                Some(crate::ui_main::AddressBarNav::Direct(p))
+                Some(self.grid_physical_navigation(idx, p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
                 let owner = self.main_grid_archive_open_owner(idx, &path);
@@ -44434,7 +44575,7 @@ impl App {
             }
             return Some(DetachedGridItemOpenPlan::FolderCandidate {
                 path: path.clone(),
-                collection_restore: self.collection_grid_restore_for_source(idx, path),
+                collection_owner: self.collection_grid_physical_load_owner(idx, path),
             });
         }
         if let Some(GridItem::ConvertibleArchive { path, .. }) = self.items.get(idx) {
@@ -44581,7 +44722,7 @@ impl App {
             }
             DetachedGridItemOpenPlan::FolderCandidate {
                 path,
-                collection_restore,
+                collection_owner,
             } => {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_folder_candidate",
@@ -44589,7 +44730,7 @@ impl App {
                 // Classification is main-owned. No session/runtime or detached bundle exists
                 // until the completed scan proves this is an image book; mixed folders fall
                 // back through the normal main navigation arbitration.
-                self.start_grid_folder_candidate_open(path, collection_restore);
+                self.start_grid_folder_candidate_open(path, collection_owner);
                 ctx.request_repaint();
                 return true;
             }
@@ -73611,12 +73752,16 @@ impl App {
             let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
             let mut history_nav_rollback = None;
             let mut navigate_pre_scan: Option<ScannedDir> = None;
-            let mut navigate_collection_anchor = None;
+            let mut navigate_owner = OpenRequestOwner::Navigation;
             let navigate = if higher_priority_direct_nav.is_some() {
                 higher_priority_direct_nav
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                    crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
+                        navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                        Some(path)
+                    }
                     crate::ui_main::AddressBarNav::DriveList(origin) => {
                         self.enter_drive_list_from_navigation(origin);
                         None
@@ -73699,6 +73844,10 @@ impl App {
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                            crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
+                                navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                                Some(path)
+                            }
                             crate::ui_main::AddressBarNav::DriveList(origin) => {
                                 self.enter_drive_list_from_navigation(origin);
                                 None
@@ -73746,7 +73895,9 @@ impl App {
                     self.resolve_main_folder_open_ready(ctx, ready)
                         .map(|ready| {
                             navigate_pre_scan = Some(ready.scan);
-                            navigate_collection_anchor = ready.collection_anchor;
+                            if let Some(owner) = ready.collection_owner {
+                                navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                            }
                             ready.path
                         })
                 }
@@ -73782,13 +73933,44 @@ impl App {
                     }
                 }
             } else {
-                grid_nav
+                match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::Direct(path)) => Some(path),
+                    Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner }) => {
+                        navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                        Some(path)
+                    }
+                    Some(crate::ui_main::AddressBarNav::DriveList(origin)) => {
+                        self.enter_drive_list_from_navigation(origin);
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::ReadingHistory) => {
+                        self.enter_reading_history();
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::Bookmarks) => {
+                        self.enter_bookmark_view();
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::RatingViewBack) => {
+                        self.rating_view_parent_nav();
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::BooksRoot) => {
+                        self.open_books_root();
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::Collection(restore)) => {
+                        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+                        None
+                    }
+                    Some(
+                        crate::ui_main::AddressBarNav::HistoryBack
+                        | crate::ui_main::AddressBarNav::HistoryForward,
+                    )
+                    | None => None,
+                }
             };
             if let Some(p) = navigate {
-                let collection_anchor = navigate_collection_anchor.take().or_else(|| {
-                    self.selected
-                        .and_then(|index| self.collection_grid_source_anchor(index, &p))
-                });
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
                     || self.rating_view_nav_context_active()
@@ -73808,8 +73990,18 @@ impl App {
                 self.record_rating_view_nav_open(&p);
                 let open_target = p.clone();
                 let open_outcome = match navigate_pre_scan.take() {
-                    Some(scan) => self.load_folder_nav_target(p, Some(scan)),
-                    None => self.load_folder_or_convert_archive(p),
+                    Some(scan) => {
+                        if self.load_folder_with_scan_owned(p, Some(scan), navigate_owner.clone()) {
+                            FolderOpenOutcome::Loaded
+                        } else {
+                            FolderOpenOutcome::Ignored
+                        }
+                    }
+                    None => self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        p,
+                        false,
+                        navigate_owner.clone(),
+                    ),
                 };
                 // Ctrl+G 絞り込みビュー中に container (PDF/ZIP/サブフォルダ) を開いたら
                 // current_path を進めておく。BS で「PDF ページ → ヒット一覧 →
@@ -73817,9 +74009,6 @@ impl App {
                 // 変換確認ダイアログで実ナビゲーションが保留された場合は、キャンセル時に
                 // 位置だけ進んだ扱いにならないようここでは進めない。
                 if matches!(open_outcome, FolderOpenOutcome::Loaded) {
-                    if let Some(anchor) = collection_anchor {
-                        self.commit_collection_grid_source_open(anchor, open_target.clone());
-                    }
                     self.advance_drilled_current_path(&open_target);
                 }
                 let rollback = history_nav_rollback.or(search_rollback);
@@ -74542,6 +74731,10 @@ impl App {
             || self.items_are_tag_view
             || self.items_are_reading_history_view
             || self.items_are_rating_view
+            || matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Collection(_)
+            )
     }
 }
 

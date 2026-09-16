@@ -14950,7 +14950,7 @@ mod phase_c_drill_nav_tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
                 purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                    collection_restore: None,
+                    collection_owner: None,
                 },
             });
             let ready = app
@@ -47966,9 +47966,12 @@ mod still_window_mode_key_tests {
                 .expect("detached collection plan")
             {
                 DetachedGridItemOpenPlan::FolderCandidate {
-                    collection_restore, ..
+                    collection_owner, ..
+                } => {
+                    let owner = collection_owner.expect("collection origin");
+                    owner.restore(expected.revision_at_open)
                 }
-                | DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                     collection_restore,
                     ..
                 }
@@ -48037,26 +48040,33 @@ mod still_window_mode_key_tests {
             &folder,
             crate::collection_store::CollectionResolvedKind::Folder,
         );
+        let owner = app
+            .collection_grid_physical_load_owner(0, &folder)
+            .expect("collection load owner");
         app.selected = None;
         let ready = FolderPaneOpenReady {
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
             purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_restore: Some(restore.clone()),
+                collection_owner: Some(owner.clone()),
             },
         };
         let resolved = app
             .resolve_main_folder_open_ready(&egui::Context::default(), ready)
             .expect("mixed folder returns to main navigation");
         assert_eq!(
-            resolved.collection_anchor, restore.viewport_anchor,
+            resolved
+                .collection_owner
+                .as_ref()
+                .map(|owner| &owner.anchor),
+            restore.viewport_anchor.as_ref(),
             "selection changes cannot replace the request-owned collection anchor"
         );
-        assert!(matches!(
-            app.load_folder_nav_target(resolved.path.clone(), Some(resolved.scan)),
-            FolderOpenOutcome::Loaded
-        ));
-        app.commit_collection_grid_source_open(resolved.collection_anchor.unwrap(), resolved.path);
+        app.load_folder_with_scan_owned(
+            resolved.path,
+            Some(resolved.scan),
+            OpenRequestOwner::CollectionGridPhysical(resolved.collection_owner.unwrap()),
+        );
         assert!(matches!(
             app.top_level_grid_view
                 .collection_session()
@@ -48130,7 +48140,7 @@ mod still_window_mode_key_tests {
             cancel: Arc::new(AtomicBool::new(false)),
             rx: scan_rx,
             purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_restore: None,
+                collection_owner: None,
             },
         });
         let ready = app
@@ -48209,7 +48219,7 @@ mod still_window_mode_key_tests {
             path: child.clone(),
             scan: Ok(scan_directory(&child)),
             purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_restore: None,
+                collection_owner: None,
             },
         };
         let crate::app::ResolvedMainFolderOpen {

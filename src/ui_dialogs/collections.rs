@@ -647,6 +647,20 @@ impl App {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn collection_toolbar_add_settled_after_revision_for_test(
+        &self,
+        collection_id: CollectionId,
+        revision: u64,
+    ) -> bool {
+        self.collection_ui.operation.is_idle()
+            && self.collection_ui.catalog.as_ref().is_some_and(|catalog| {
+                catalog.definitions.iter().any(|definition| {
+                    definition.id == collection_id && definition.revision > revision
+                })
+            })
+    }
+
     /// Changes only the toolbar's durable add/open target. Manager selection, pending operations,
     /// collection Grid ownership, and navigation are deliberately outside this transition.
     pub(crate) fn select_collection_toolbar_target(&mut self, id: CollectionId) {

@@ -946,3 +946,39 @@ focused / full / static / verification build保留証跡は
   全体拒否、source不変、actor terminal / watch収束、Remote非変更を再照合し、重要指摘なしで承認した。
   `scripts/build-dev.ps1 -PreserveRuntime`はexit 0で、動作中アプリを停止せず
   `target/dev-runtime/mimageviewer-core.exe`と`mimageviewer-remote.exe`を更新した。アプリは起動していない。
+
+### 実機退行修正: 追加後のsurface復活と動画サムネイル（2026-09-16）
+
+- portable実機で、いったんコレクションを開いた後にアドレス入力で物理フォルダへ移動し、別動画を
+  toolbar追加すると、actor watch更新時にコレクションrootが再materializeされる事象を再現した。物理folderの
+  visible loadを採用しても`TopLevelGridSurface::Collection`とsession/watchを退役していなかったことが原因で、
+  toolbarのAdd intentやactor completionがOpenを発行したものではない。
+- root Folder / ZIP / PDF open、物理子のdescendant open、same-folder sort / external reloadを
+  `CollectionGridPhysicalLoadOwner`で型付けした。root originはsurface stamp、accepted / wanted revision、installed
+  items generation、entry / source / target pathの完全一致を要求する。採用済みPhysicalSourceはroot anchorと
+  current pathを要求し、child閲覧中のwanted revision進行とcollection削除を許容する。独立したアドレス・履歴・
+  お気に入り・pane navigationはvisible load採用時だけCollectionをFolderへ退役させる。scan失敗、stale async
+  candidate、scope拒否、変換取消ではsurfaceと旧itemsを分裂させない。
+- コレクションrootの動画がPendingのままだった原因は、aggregate items install後に通常thumbnail poolとvideo
+  workerを起動していなかったことだった。exact revisionのprepare workerがfull-path動画sidecarとvideo pinを
+  一括準備し、watch再表示とlatest再生root着地の両方へ同じsnapshotを渡す。root installはviewer bundleの
+  channel/cache/queueと通常workerを新generationへ作り直し、collection専用video workerだけをsession lifetimeで
+  cancelする。別synthetic surfaceが再利用するbundle共有pool tokenはsession dropでcancelしない。
+- Collection surfaceをfull-path thumbnail cache対象へ加え、別folderの同basename画像・動画sidecarを混同しない。
+  Remote read-onlyもsidecar探索helperを共有するが、64 parent上限、入力順、scan失敗時のShell fallback、protocolを
+  変更しない。
+- focused回帰はcollection grid 18/18、collection navigation 15/15、aggregate / Remote 13/13、
+  mixed folder 7/7、detached collection 2/2、folder candidate mode matrix 1/1、collection toolbar 6/6、
+  toolbar add 5/5がpassした。実egui primary Addからproduct dispatch、actor terminal、catalog watch、pollまでを
+  一続きに通す回帰でも、物理surface / folder / address / generation / selection / checked / scrollの維持と、
+  OpenだけがCollectionへ遷移することを固定した。
+- `scripts/test-full.ps1 -SuppressCrashDialogs`はmain / lib 8597 passed、0 failed、45 ignored、UI snapshot
+  52/52、IPC 57/57、Remote 122 passed（1 ignored）、vendor egui / egui-wgpu / eframe 25 / 9 / 15で
+  `[test-full] PASS`だった。core check、fmt、UI glyph、viewer-context audit、対象pathのdiff checkもpassした。
+  独立reviewerはcache read / seed / pruneのfull-path一致、Folder / ZIP / PDF移行時のroot video worker cancel、
+  bundle共有poolの継続、detached exact owner、実event sequenceを再確認し、重要指摘なしで承認した。
+- `scripts/build-dev.ps1 -PreserveRuntime`と`prepare-portable-smoke.ps1 -TestScript`はアプリを起動・停止せず
+  完了した。portableにはbaselineの隔離dataと、同basename・異sidecarを持つ2 folderのfixtureを復元した。
+  修正版portableの実機再確認では、cold / 再訪時のcollection動画thumb、collection訪問後に物理folderへ戻って
+  Addした場合のsurface / selection / scroll維持、Openだけのcollection遷移、別親にある同basename動画の各sidecar、
+  collection内folderから親rootへの復帰、sidecarなし動画の実frame thumbがすべてpassした。

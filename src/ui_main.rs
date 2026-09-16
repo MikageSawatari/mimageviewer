@@ -116,6 +116,10 @@ enum PinButtonClick {
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
     Direct(PathBuf),
+    CollectionSource {
+        path: PathBuf,
+        owner: crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner,
+    },
     DriveList(Option<PathBuf>),
     ReadingHistory,
     Bookmarks,
@@ -1580,7 +1584,7 @@ fn toolbar_combo_slot<R>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CollectionToolbarIntent {
+pub(crate) enum CollectionToolbarIntent {
     SelectTarget(crate::collection_store::CollectionId),
     Add(crate::collection_store::CollectionId),
     Open(crate::collection_store::CollectionId),
@@ -8015,6 +8019,22 @@ impl App {
 
     // ── ツールバー ───────────────────────────────────────────────────
 
+    /// Single product dispatch seam for toolbar pointer intents. Drawing only creates one typed
+    /// intent; this boundary owns every resulting state transition and is exercised end-to-end by
+    /// the raw pointer regression below.
+    fn dispatch_collection_toolbar_intent(
+        &mut self,
+        intent: CollectionToolbarIntent,
+        manager_target_id: Option<crate::collection_store::CollectionId>,
+    ) {
+        match intent {
+            CollectionToolbarIntent::SelectTarget(id) => self.select_collection_toolbar_target(id),
+            CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
+            CollectionToolbarIntent::Open(id) => self.open_collection_grid(id, None),
+            CollectionToolbarIntent::Manage => self.open_collection_manager(manager_target_id),
+        }
+    }
+
     /// ツールバーを描画し、お気に入りナビゲーション先を返す。
     /// ソート変更があった場合はフォルダの再ロードも行う。
     pub(crate) fn render_toolbar(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
@@ -9271,16 +9291,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.add_grid_selection_to_named_book(ctx, name);
         }
         if let Some(intent) = toolbar_collection_intent {
-            match intent {
-                CollectionToolbarIntent::SelectTarget(id) => {
-                    self.select_collection_toolbar_target(id)
-                }
-                CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
-                CollectionToolbarIntent::Open(id) => self.open_collection_grid(id, None),
-                CollectionToolbarIntent::Manage => {
-                    self.open_collection_manager(toolbar_collection_target_id)
-                }
-            }
+            self.dispatch_collection_toolbar_intent(intent, toolbar_collection_target_id);
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
@@ -12187,7 +12198,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .to_string()
                             } else {
                                 match parent_nav_target.as_ref() {
-                                    Some(AddressBarNav::Direct(p)) => {
+                                    Some(AddressBarNav::Direct(p))
+                                    | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
                                     }
                                     Some(AddressBarNav::DriveList(Some(origin))) => {
@@ -13465,7 +13477,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         touch_derived_pointer_activity: bool,
         suppress_primary_pointer: bool,
         previous_grid_click_pairing: GridClickPairingState,
-    ) -> Option<PathBuf> {
+    ) -> Option<AddressBarNav> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
@@ -13800,7 +13812,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
-                        nav = Some(p);
+                        nav = Some(self.grid_physical_navigation(idx, p));
                     }
                 }
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
@@ -13820,7 +13832,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if auto_fs {
                         self.pending_auto_fs_open = true;
                     }
-                    nav = Some(p);
+                    nav = Some(self.grid_physical_navigation(idx, p));
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
@@ -14191,7 +14203,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         spread_pair_cursor_idx: Option<usize>,
         suppress_primary_pointer: bool,
         previous_grid_click_pairing: GridClickPairingState,
-    ) -> Option<PathBuf> {
+    ) -> Option<AddressBarNav> {
         let horizontal_source_rect = ui.available_rect_before_wrap();
         let avail_w = horizontal_source_rect.width().max(1.0);
         let avail_h = ui.available_height().max(0.0);
@@ -14238,7 +14250,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.last_cell_h = Self::DETAILS_ROW_H;
         }
 
-        let mut nav: Option<PathBuf> = None;
+        let mut nav: Option<AddressBarNav> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
         let mut egui_offset_y = self.scroll_offset_y;
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
@@ -16043,7 +16055,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
-    pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         let scroll_to = self.scroll_to_selected;
         self.scroll_to_selected = false;
         if self.settings.grid_view_mode != GridViewMode::Details
@@ -16059,7 +16071,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         egui::CentralPanel::default()
-            .show(ctx, |ui| -> Option<PathBuf> {
+            .show(ctx, |ui| -> Option<AddressBarNav> {
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
                 // clearing App state up front so a primary click not accepted by any cell breaks
@@ -16567,7 +16579,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
 
-                let mut nav: Option<PathBuf> = None;
+                let mut nav: Option<AddressBarNav> = None;
                 let primary_click_pos = (!suppress_primary_pointer)
                     .then(|| {
                         ctx.input(|i| {
@@ -21910,6 +21922,14 @@ mod collection_toolbar_interaction_tests {
         collapsed: bool,
     ) -> Harness<'static, ToolbarState> {
         let first = crate::collection_store::CollectionId::new();
+        harness_with_target(mode, collapsed, first)
+    }
+
+    fn harness_with_target(
+        mode: crate::settings::ToolbarSectionDisplay,
+        collapsed: bool,
+        first: crate::collection_store::CollectionId,
+    ) -> Harness<'static, ToolbarState> {
         let second = crate::collection_store::CollectionId::new();
         Harness::builder()
             .with_size(egui::vec2(900.0, 240.0))
@@ -22053,6 +22073,153 @@ mod collection_toolbar_interaction_tests {
         assert!(harness.query_by_label("追加").is_some());
         assert!(harness.query_by_label("開く").is_some());
         assert!(harness.query_by_label("Second target").is_none());
+    }
+
+    #[test]
+    fn raw_video_add_dispatches_through_actor_watch_without_reopening_a_visited_collection() {
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let physical = temp.path().join("physical");
+        std::fs::create_dir(&physical).unwrap();
+        let video = physical.join("selected.mp4");
+        std::fs::write(&video, b"video fixture").unwrap();
+
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            temp.path().join("collection.db"),
+        )
+        .unwrap();
+        let client = runtime.client();
+        let mut app = App::new_from_settings(crate::settings::Settings::default());
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        while app.collection_toolbar_catalog().2
+            != crate::ui_dialogs::collections::CollectionToolbarStatus::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "collection runtime did not start"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        deadline = Instant::now() + Duration::from_secs(5);
+        let created = client
+            .create_collection("Video target".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        while !app
+            .collection_toolbar_catalog()
+            .1
+            .iter()
+            .any(|(id, _)| *id == created.collection_id())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "collection catalog did not settle"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        deadline = Instant::now() + Duration::from_secs(5);
+
+        // Visit the target first so this exercises the exact stale-watch sequence reported from
+        // the portable build, then leave through an independent address/navigation load.
+        app.open_collection_grid(created.collection_id(), None);
+        while !app
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| session.installed_items_generation == Some(app.items_generation))
+        {
+            assert!(Instant::now() < deadline, "collection root did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        deadline = Instant::now() + Duration::from_secs(5);
+        let scan = crate::app::folder_scan::scan_directory_with_settings(&physical, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            physical.clone(),
+            Some(scan),
+            crate::app::OpenRequestOwner::Navigation,
+        ));
+        let video_index = app
+            .items
+            .iter()
+            .position(
+                |item| matches!(item, crate::grid_item::GridItem::Video(path) if path == &video),
+            )
+            .unwrap();
+        app.selected = Some(video_index);
+        app.checked.insert(video_index);
+        app.scroll_offset_y = 246.5;
+        let held_surface = app.top_level_grid_view.surface().clone();
+        let held_folder = app.current_folder.clone();
+        let held_address = app.address.clone();
+        let held_generation = app.items_generation;
+        let held_selected = app.selected;
+        let held_checked = app.checked.clone();
+        let held_scroll = app.scroll_offset_y;
+
+        let mut add = harness_with_target(
+            crate::settings::ToolbarSectionDisplay::Dropdown,
+            false,
+            created.collection_id(),
+        );
+        raw_click(&mut add, "追加", egui::PointerButton::Primary);
+        let add_intent = add.state().intent.expect("raw Add intent");
+        app.dispatch_collection_toolbar_intent(add_intent, Some(created.collection_id()));
+        while !app.collection_toolbar_add_settled_after_revision_for_test(
+            created.collection_id(),
+            created.revision(),
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "toolbar actor add did not settle"
+            );
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..3 {
+            app.poll_collection_grid(&ctx);
+        }
+        assert_eq!(app.top_level_grid_view.surface(), &held_surface);
+        assert_eq!(app.current_folder, held_folder);
+        assert_eq!(app.address, held_address);
+        assert_eq!(app.items_generation, held_generation);
+        assert_eq!(app.selected, held_selected);
+        assert_eq!(app.checked, held_checked);
+        assert_eq!(app.scroll_offset_y, held_scroll);
+        assert!(app.top_level_grid_view.collection_session().is_none());
+        let added = client
+            .load_collection(created.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(added.entries.iter().any(|entry| entry.source_path == video));
+
+        let mut open = harness_with_target(
+            crate::settings::ToolbarSectionDisplay::Dropdown,
+            false,
+            created.collection_id(),
+        );
+        raw_click(&mut open, "開く", egui::PointerButton::Primary);
+        let open_intent = open.state().intent.expect("raw Open intent");
+        app.dispatch_collection_toolbar_intent(open_intent, Some(created.collection_id()));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Collection(identity)
+                if identity.collection_id == created.collection_id()
+        ));
+        app.shutdown_collection_runtime_for_exit();
     }
 }
 

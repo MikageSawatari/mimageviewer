@@ -101,6 +101,27 @@ synthetic path と、履歴 stack の同じ添字に置く `SmartFolderViewState
 「戻る」で root、「進む」で実フォルダへ復帰できる。検索、★固定、履歴、別スマートフォルダとの
 往復でも `current` と親 stack を含む scope 全体を復元する。
 
+### コレクションrootと物理子のowner
+
+`TopLevelGridSurface::Collection` のrootはactor snapshot、accepted / wanted revision、items generationを
+`CollectionGridSession`で所有する。root cellからFolder / ZIP / PDFを開くrequestは、root entry identity、
+source path、surface stamp、accepted / wanted revision、items generationを一つの
+`CollectionGridPhysicalLoadOwner::Root`へ捕捉する。非同期scanの完了時にもこのownerを再検証し、途中で
+wanted revisionが進んだ旧root requestは採用しない。
+
+物理子へ採用した後は同じ型の`PhysicalSource` variantがroot entry anchor、root source、現在の物理pathを
+所有する。配下container openと同一pathのsort / 外部更新reloadはこのownerを運び、collection watchの
+wanted revision進行や定義削除だけでは現在の子表示を置き換えない。rootへ戻るときにlatest revisionへ
+収束する。アドレス入力、履歴、お気に入り、folder pane等の独立navigationはownerを持たず、scan成功や
+ZIP / PDF非同期開始などvisible loadの採用境界でだけsurfaceを`Folder`へ切り替えてsessionを破棄する。
+scan失敗、scope拒否、stale async result、変換dialog取消ではcollection rootのsurfaceとitemsを分裂させない。
+
+collection root installはviewer bundle所有の通常thumbnail poolを新items generationへ作り直し、画像・Folder・
+ZIP・PDFの既存producerを起動する。collection専用video workerだけをsessionがcancelし、bundleの共有pool tokenを
+session dropで止めない。複数の物理folderを横断するrootではcache keyと同名画像sidecarを正規化full pathで扱い、
+pin / sidecar / Shellの動画サムネイル優先順位を通常一覧と揃える。watch再表示とlatest再生root着地は同じ
+prepare済みthumbnail source snapshotをinstallする。
+
 ## 3. 更新と失効
 
 明示的な一覧更新は `reload_top_level_grid` を唯一の router とし、

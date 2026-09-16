@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::folder_scan::ScannedDir;
 use super::top_level_grid_view::{
-    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition, CollectionGridSession,
+    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition,
+    CollectionGridPreparedInstall, CollectionGridSession, CollectionGridThumbnailSources,
     CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
@@ -18,7 +19,7 @@ use crate::collection_store::{
     CollectionNavigationEntryIdentity, CollectionNavigationTail, CollectionNavigationTargetKind,
     CollectionPrepareError, CollectionPreparedNavigationTarget, CollectionPreparedSnapshot,
     CollectionResolvedKind, CollectionRevisionWatch, CollectionSnapshot, CollectionStoreError,
-    prepare_collection_snapshot, resolve_prepared_collection_navigation,
+    resolve_prepared_collection_navigation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +176,7 @@ impl CollectionNavigationRequest {
 pub(in crate::app) struct CollectionNavigationRequest {
     origin: CollectionNavigationOrigin,
     action: CollectionNavigationAction,
+    root_thumbnail_sources: Option<Arc<CollectionGridThumbnailSources>>,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -226,8 +228,9 @@ pub(in crate::app) enum CollectionNavigationPending {
         watch: CollectionRevisionWatch,
         exact_revision: u64,
         cancel: Arc<AtomicBool>,
-        receiver:
-            std::sync::mpsc::Receiver<Result<CollectionPreparedSnapshot, CollectionPrepareError>>,
+        receiver: std::sync::mpsc::Receiver<
+            Result<CollectionGridPreparedInstall, CollectionPrepareError>,
+        >,
     },
     Preflighting {
         request: CollectionNavigationRequest,
@@ -829,7 +832,11 @@ impl App {
         origin: CollectionNavigationOrigin,
         action: CollectionNavigationAction,
     ) -> bool {
-        let request = CollectionNavigationRequest { origin, action };
+        let request = CollectionNavigationRequest {
+            origin,
+            action,
+            root_thumbnail_sources: None,
+        };
         self.top_level_grid_view
             .set_collection_navigation_pending(None);
         let Some(client) = self.collection_store_client() else {
@@ -1253,6 +1260,7 @@ impl App {
         ctx: &egui::Context,
         mut request: CollectionNavigationRequest,
     ) {
+        request.root_thumbnail_sources = None;
         request.origin.surface_generation = self.top_level_grid_view.generation();
         request.origin.items_generation = self.items_generation;
         let origin = request.origin.clone();
@@ -1269,17 +1277,18 @@ impl App {
     ) {
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
+        let settings = self.settings.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
         let spawn = std::thread::Builder::new()
             .name("collection-navigation-prepare".into())
             .spawn(move || {
-                let result = prepare_collection_snapshot(
+                let result = super::collection_grid::prepare_collection_grid_install(
                     &snapshot,
                     &display_order,
+                    &settings,
                     &worker_cancel,
-                    |_, _| {},
                 );
                 let _ = sender.send(result);
             });
@@ -1474,15 +1483,17 @@ impl App {
                     self.restart_collection_navigation(ctx, request);
                 }
                 _ => match receiver.try_recv() {
-                    Ok(Ok(prepared))
-                        if prepared.collection_id == request.origin.collection_id
-                            && prepared.collection_revision == exact_revision =>
+                    Ok(Ok(install))
+                        if install.prepared.collection_id == request.origin.collection_id
+                            && install.prepared.collection_revision == exact_revision =>
                     {
+                        let mut request = request;
+                        request.root_thumbnail_sources = Some(Arc::new(install.thumbnail_sources));
                         self.spawn_collection_navigation_preflight(
                             ctx,
                             request.clone(),
                             watch,
-                            Arc::new(prepared),
+                            Arc::new(install.prepared),
                             request.action.target_kind(),
                         );
                     }
@@ -2130,7 +2141,17 @@ impl App {
             (request.action.is_media_eof() && preserved_player.is_some())
                 .then_some(prepared.entries.len())
         });
-        self.apply_collection_grid_prepared(prepared.clone(), previous);
+        self.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                prepared: (*prepared).clone(),
+                thumbnail_sources: request
+                    .root_thumbnail_sources
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+            previous,
+        );
         if let (Some(new_idx), Some(player)) = (landing_origin_idx, preserved_player) {
             self.fs_cache.insert(new_idx, player);
             if self.fullscreen_idx == old_fs_idx {
@@ -2424,7 +2445,19 @@ impl App {
             };
             let outcome = match ready.payload {
                 CollectionNavigationPreflightPayload::Folder(scan) => {
-                    self.load_folder_nav_target(ready.target.source_path.clone(), Some(scan))
+                    let path = ready.target.source_path.clone();
+                    let owner = self
+                        .collection_grid_physical_load_owner(target_idx, &path)
+                        .map(super::OpenRequestOwner::CollectionGridPhysical);
+                    if let Some(owner) = owner {
+                        if self.load_folder_with_scan_owned(path, Some(scan), owner) {
+                            FolderOpenOutcome::Loaded
+                        } else {
+                            FolderOpenOutcome::Ignored
+                        }
+                    } else {
+                        FolderOpenOutcome::Ignored
+                    }
                 }
                 CollectionNavigationPreflightPayload::Zip(enumeration) => {
                     self.load_zip_as_folder_prepared(ready.target.source_path.clone(), enumeration);
@@ -2785,7 +2818,7 @@ mod tests {
 
     fn prepare_snapshot(snapshot: &CollectionSnapshot) -> Arc<CollectionPreparedSnapshot> {
         Arc::new(
-            prepare_collection_snapshot(
+            crate::collection_store::prepare_collection_snapshot(
                 snapshot,
                 &crate::settings::Settings::default().grid_display_order,
                 &AtomicBool::new(false),
@@ -2793,6 +2826,75 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn latest_navigation_root_install_carries_prepared_thumbnail_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("page.jpg");
+        let sidecar = temp.path().join("video.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("sources".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let target_entry = prepared.entries[0].clone();
+        let target = CollectionPreparedNavigationTarget {
+            entry_id: target_entry.entry_id,
+            source_key: target_entry.source_key,
+            source_path: target_entry.source_path,
+            resolved_kind: CollectionResolvedKind::Image,
+        };
+        let request = CollectionNavigationRequest {
+            origin: app.collection_root_navigation_origin(0, false).unwrap(),
+            action: CollectionNavigationAction::Manual {
+                fs_idx: 0,
+                delta: 1,
+                queued_steps: 0,
+                display_unit_step: false,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+                still_only: false,
+            },
+            root_thumbnail_sources: Some(Arc::new(CollectionGridThumbnailSources {
+                video_sidecars: std::collections::HashMap::from([(
+                    "full-video-key".into(),
+                    sidecar.clone(),
+                )]),
+                video_pin_blobs: std::collections::HashMap::new(),
+            })),
+        };
+
+        assert!(
+            app.install_collection_navigation_root(&request, prepared, &target, false)
+                .is_some()
+        );
+        assert_eq!(
+            app.video_thumb_overrides.get("full-video-key"),
+            Some(&sidecar)
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     fn candidate(
@@ -3100,6 +3202,7 @@ mod tests {
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
             },
+            root_thumbnail_sources: None,
         };
         let target_entry = prepared.entries[1].clone();
         let target = CollectionPreparedNavigationTarget {
@@ -3181,6 +3284,7 @@ mod tests {
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
             },
+            root_thumbnail_sources: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -3241,6 +3345,7 @@ mod tests {
                 forward: true,
                 queued_steps: 0,
             },
+            root_thumbnail_sources: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -3319,6 +3424,7 @@ mod tests {
                 forward: true,
                 queued_steps: 0,
             },
+            root_thumbnail_sources: None,
         };
         let watch = client.subscribe().unwrap();
         let target_entry = &prepared.entries[1];
@@ -3398,6 +3504,7 @@ mod tests {
                 forward: true,
                 queued_steps: 0,
             },
+            root_thumbnail_sources: None,
         };
         let target_entry = &prepared.entries[1];
         let target = CollectionPreparedNavigationTarget {

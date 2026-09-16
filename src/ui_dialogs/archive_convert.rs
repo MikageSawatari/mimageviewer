@@ -441,6 +441,13 @@ impl App {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
                 }
+                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                    debug_assert!(
+                        false,
+                        "convertible collection items use MainGridArchive owner"
+                    );
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
                     ArchiveConvertCompletionPolicy::MainGridArchive(intent)
                 }
@@ -500,6 +507,13 @@ impl App {
             fallback_cached_zip,
             completion: match owner {
                 crate::app::OpenRequestOwner::Navigation => {
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                    debug_assert!(
+                        false,
+                        "convertible collection items use MainGridArchive owner"
+                    );
                     ArchiveConvertCompletionPolicy::Navigation
                 }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
