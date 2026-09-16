@@ -1098,3 +1098,89 @@ focused / full / static / verification build保留証跡は
   操作していない。専用並べ替えwindowの実動画サムネイル、実ドラッグ、linked別窓動画nextは利用者確認へ引き渡した。
 - 2026-09-16、上記確認用ビルドの引き渡し後、利用者から「治りました。コミットお願いします。」との実機確認・
   コミット承認を受領した。個々の操作項目についての詳細な結果は未採取であり、agentによる実機検証とは区別する。
+
+## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
+
+状態: 未着手。実装は Codex（制限回復後）、レビューは ClaudeCode。指摘 ID は
+[docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
+利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
+が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
+「監査したが問題なし」節を読む。
+
+### 23.1 計装を先に入れる（B-6）
+
+`open_collection_grid` / prepare / navigation / import 解析・分類 / export / source migration の各区間に
+`perf::event` を差し、修正前後を `--perf-log` の同じ指標で測れるようにする。
+
+### 23.2 ソート UI（A-1 / A-2、案 C。仕様判断 1）
+
+- `top_level_grid_view.surface()` から導く単一の typed 述語（例 `TopLevelViewKind`）を用意し、
+  `page_order_locked_for_current_view` / `grid_sort_lock_reason` / `details_header_sort_active` /
+  `apply_sort_change_reload` / `main_window_title`（A-5）/ `can_jump_to_folder`（A-6）/
+  `ContextMenuViewFlags` を Collection 対応にする。新しい `items_are_collection_view` bool は足さない。
+- ツールバー Buttons / Dropdown と表示メニューの選択肢に「手動順」「シャッフル」を追加し、Collection root では
+  定義の `order_mode` / `standard_sort` を選択表示する。Collection 分岐では `settings.sort_order` を書かず
+  `CollectionGridSnapshotAction::SetOrder` を送る。`apply_sort_change_reload` は Collection で早期 return。
+- 手動順では `PageOrderFixed` を返して列ヘッダソートを無効化し、通常ソート / シャッフルでは
+  `open_collection_grid` と履歴からの Collection 復帰で `reset_details_sort_to_toolbar()` を呼ぶ。
+- 上部「コレクション」メニューの「並び順」は残し、同じ述語から表示を導く。無効時は理由を出す（A-9）。
+- 回帰: review README §2.2 の (a)〜(e)。
+
+### 23.3 シャッフル順（仕様判断 2、設計は仕様案「シャッフル順の設計」）
+
+`CollectionOrderMode::Shuffle` + `shuffle_seed` を model / db / prepare / UI / Remote wire へ通す。
+有効順は `hash(seed, entry_id)` 昇順。再選択で seed 更新。reducer は変更しない。
+
+### 23.4 参照解除の非対称（A-3 / C-11）
+
+`CollectionRootDeleteResolution::Unavailable(reason)` のとき `RemoveFromCollection` を無効項目 +
+`disabled_reason` として残す（`MenuNode::Item { enabled, disabled_reason }` の前例）。
+
+### 23.5 rename migration scope（M-1）
+
+`poll_rename_pending` が読む `rename_target_is_file` を `clear_rename_dialog_state()` より前に確定させるか、
+`rename_pending` に scope を同梱する。既存テストは `spawn_rename_key_migration` を直接呼び配線を迂回して
+いるので、dialog → poll を通す handler-level 回帰を 1 件足す。
+
+### 23.6 一過性状態の typed 化（C-1 / C-2 / C-3 / B-3）
+
+read 経路の入口を `collection_store_client_for_migration` と同じ `Result<Option<_>, CollectionStoreError>` へ揃え、
+`Busy` / `Starting` / 並べ替え保存中は終端 `Failed` や無言 drop にせず `RequestNeeded` + `request_repaint_after`
+で再駆動する。Grid の `Snapshot` / `Preparing` 待ちは tail repaint reasons に加える。
+
+### 23.7 上限と大量件数（仕様判断 3、B-1 / B-4 / D-2）
+
+- 1 コレクション 10,000 件の定数を model に置き、`add_batch` / import の actor 側で typed に拒否する。
+  Remote の `MAX_REMOTE_COLLECTION_ENTRIES` は同じ定数から導く。
+- import 確認画面を `show_rows` で仮想化し、`read_to_string` と `parse_collection_text` に上限を置く。
+- navigation の prepare は、actor revision が installed と一致し installed presentation が存在する場合、
+  選ばれた target entry（と隣接数件）だけ availability を確認し、全件 stat は revision 前進と明示更新に限る。
+  Remote の `persistent_collections.rs` も同じ helper を使う。
+
+### 23.8 バックアップと全件書き出し（仕様判断 5、K-1）
+
+- actor 起動時に `db_backup::rotate_generation_backups(data_dir, "collection.db", ..)` を tags.db と同じ
+  `rotate_backups_once` パターンで 1 回回す。settings-family lease には含めない（§3.3）。
+- 上部「コレクション」メニューに「すべてのコレクションをテキストで書き出す…」を追加する。フォルダ選択 →
+  1 コレクション 1 ファイル（`<name>.txt`、名前衝突は連番）+ `collections-index.txt`（名前・並び順・件数）。
+  既存の export serializer と worker を流用し、開始時の immutable catalog / snapshot を固定する。
+
+### 23.9 キー操作（A-4）
+
+`GridAddToCollectionTarget` / `FsAddToCollectionTarget` / `VideoAddToCollectionTarget` を `KeyAction` に追加し、
+`ini_name()` / `context()` / `trigger()` / `default_chords()`（空でよい）/ `ALL_ACTIONS` / helper /
+`docs/keymap.ini.default` を揃える。リングショートカットへの追加は任意。
+
+### 23.10 文書（E-1〜E-7、E-10 / E-11 / E-21、仕様判断 6）
+
+README v4.0.0 節（E 報告書 §A の下書きを Phase 0 の利用者承認へ）、`manual/collections.html` +
+`tut-collections.html` 新設とサイドバー 30 リンク同期、`shortcuts.html` の Delete 説明、`remote.html`、
+privacy.html / 製品ページの保存データ列挙、移行ガイドの「仮想フォルダ / プレイリスト → コレクション」、
+`version_highlights` 4.0.0 節、`architecture-overview` / `async-architecture` / `virtual-folders` /
+`keymap-spec` / `spec.md` の同時更新。
+
+### 23.11 v4.0.x 以降へ送るもの
+
+B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3 / D-4、M-2、
+A-8〜A-18 の P3、M3U 対応、登録順ソート、D&D 追加、件数表示、終了時の自動書き出し、通常フォルダの
+セッション限定シャッフル。前提件数（10,000）は known-issues と本書に明記する。
