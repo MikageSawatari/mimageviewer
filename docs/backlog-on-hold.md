@@ -106,6 +106,83 @@
 - 利用者へは「検討する」と回答済み (2026-09-02)。
 - 規模 / 優先度: Small〜Medium / P3 (方針決定が先)。
 
+### 1.247 EPUB を PDF へ変換して読む — 採否判断が要る (2026-09-16)
+
+- 出典: 利用者からの EPUB 対応要望 → 競合の対応状況調査 → suzunia の実装解析 (2026-09-16 の相談)。
+- **前提: EPUB 対応は 2026-08-01 に見送りを決めている。本項はその判断を覆す提案ではなく、
+  判断を変える場合の設計案と根拠を残すもの**。採否は未決。
+- 判断材料として新しく分かったこと:
+  1. 国内の現役競合 suzunia が EPUB へ対応した (同梱 CHANGELOG の `### 2026.08.09.`)。
+  2. その実装は**リアルタイムに文字を組み直すビューアではなく、固定レイアウトで組版して
+     画像で持つ方式**だった (下記)。
+  3. ウィンドウをリサイズしてもページ周囲の余白が増えるだけ (**利用者の観測、2026-09-16**)。
+  4. 競合の対応状況: NeeView / YACReader / ImageGlass / nomacs / QuickViewer はソース検索で 0 件、
+     BandiView は公式の対応形式一覧に無し、OpenComic は未リリースの v1.7.0 のみ。
+     SumatraPDF / Komga / Kavita は対応 (いずれもレンダリングエンジンを持つ製品)。
+- suzunia の実装 (2026-09-16 の**静的解析**。配布バイナリの import と文字列を読んだだけで、
+  **実行していない**):
+  - `WebView2Loader.dll` を同梱し、`CreateCoreWebView2EnvironmentWithOptions` を動的ロード。
+  - 展開した EPUB を `SetVirtualHostNameToFolderMapping` で WebView2 へ渡す。
+  - CSS / JS を注入して組版する。バイナリ内に実物がある:
+    `function isV(el) { return !!el && getComputedStyle(el).writingMode.indexOf('vertical') === 0; }`
+    で**縦書きを検出して分岐**し、横書き側は `html{width:Wpx}` `body{width:Wpx;padding:Mpx;font-size:…}`
+    + `column-gap:(2*M)px;column-fill:auto` でページへ割る。W / H / M (幅・高さ・余白) がパラメータ。
+  - `CapturePreview` で画像化し、`EpubLayoutCache` に保存 (README の「ページ数把握の為に最初に
+    開く際は時間が掛かります」と整合)。`png-cache hit` というログ文字列もある。
+  - **つまり「変換して画像で持つ」方式**。本項の案と設計思想は同じで、違うのは出力先だけ。
+- 提案する方式 (2026-09-16 利用者の選択: 画像 ZIP ではなく **PDF**):
+  - **EPUB を PDF へ変換してキャッシュし、既存の PDF 経路で読む**。変換は WebView2 の
+    `PrintToPdf` (ページサイズ・余白を指定し、ヘッダ / フッタは抑止)。
+  - **画像で構成された EPUB** (`rendition:layout=pre-paginated`、spine の実体が画像) は
+    WebView2 を通さず、spine 順に画像をそのまま無圧縮 ZIP へコピーする。無劣化かつ高速。
+  - リフロー型は**文字サイズもレイアウトも固定**になる。テキスト選択・コピーは提供しない。
+  - キャッシュは変換済みアーカイブキャッシュと同じ扱い (容量上限で古いものから破棄)。
+  - `page-progression-direction` から**右開きを自動設定**できる。
+  - DRM 付きは変換時に検出して明示的にエラーにする (無言で空の本にしない)。
+- 画像 ZIP ではなく PDF にする理由:
+  - `CapturePreview` は表示矩形で撮るため、**画面より大きいページを撮れるか (クランプされないか)
+    が不明**。PDF ならベクタで出るのでこの問題が消え、mIV 側は PDFium で任意倍率に描ける。
+  - ページ分割を Chromium の印刷改ページに任せられる。自前のスクロール制御が要らない。
+  - 出力が数 MB で済む。画像 ZIP は 300 ページで数十 MB 以上になる (**測っていない見積もり**)。
+  - 着地点が既存の PDF 経路なので、ページ列挙・並列レンダ・ズーム再レンダ・サムネイルの
+    **下流作業がゼロ**。
+- 実装の当たり所 (2026-09-16 のコード確認):
+  - `do_convert` が format で分岐して `expand_*` を呼ぶ構造 (`src/archive_converter.rs:782`)。
+    `ArchiveFormat` へ `Epub` を足して `expand_epub` を生やす形に嵌まる。
+  - `quick-xml = "0.41"` が既に依存にある (`Cargo.toml:393`)。container.xml / OPF / spine の解析に使う。
+  - **容量上限つきキャッシュは既存**: `prune_to_size_limit_locked` (`src/archive_cache.rs:475`)、
+    設定 `archive_cache_max_bytes` (`src/settings.rs:4153`)、キャッシュ管理 UI。
+  - 変換ダイアログ・進捗・キャンセル・`.part` からの atomic publish・検証も既存。
+  - `reserve_cache_zip_path` (`src/archive_cache.rs:542`) が ZIP 前提なので、PDF 出力を置けるように
+    する小改修が要る。
+  - 拡張子の認識: `is_convertible_archive_path` (`src/folder_tree.rs:173`) は `from_extension` へ
+    委譲しているので enum を足せば自動で通る。個別に列挙しているのは
+    `src/archive_cache.rs:591`、`src/app.rs:74620` / `74859`、`src/reading_history_db.rs:501`、
+    `src/app/grid_paint.rs:1474` (バッジ)、`crates/remote-web/src/store.rs:321`。
+  - **WebView2 ワーカーは新規 exe**。`Cargo.toml` に webview2 / wry の依存は無い。Susie 32bit
+    ワーカーや PDF ワーカーと同じ子プロセス方式にすれば、GUI 側が COM と Chromium のクラッシュを
+    背負わない。別 crate にすれば `windows` crate の版も本体と独立に選べる。変換は一度きりの
+    バッチなので、PDF プールのような優先度レーン / epoch / harvest は要らない。
+  - 配布への追加は Susie ワーカーと同じ形: `build.rs` の vendor 検査 (`build.rs:493` 付近)、
+    launcher の `include_bytes!`、`scripts/build-portable.ps1`、`scripts/sign-files.ps1`、
+    `scripts/check-vcrt-pe-dependencies.ps1`、`scripts/bootstrap-vendor.sh`。
+- **着手前に確かめること (スパイク 2〜3 日。いずれも未検証)**:
+  1. `PrintToPdf` が**縦書き** (`writing-mode: vertical-rl`) を正しく改ページするか。日本語の
+     小説はこちらが主なので、ここが割れると方式ごと変わる。
+  2. `@media print` による見た目の変化と、ヘッダ / フッタの抑止。
+  3. WebView2 Runtime が無い環境での失敗の出し方 (Windows 11 は同梱だが、無い環境はあり得る)。
+  4. WebView2 のユーザーデータフォルダの置き場 (APPDATA / ポータブルの `data`) と後始末。
+  - 画像化 (`CapturePreview`) 方式を採る場合は、加えて**画面より大きいページを撮れるか**を
+    確かめる必要がある。
+- 未決事項:
+  - 組版パラメータ (幅・高さ・余白・文字サイズ) を決め打ちにするか設定にするか。設定にするなら
+    キャッシュの鍵へ入れて、変更時は再変換する。初版は決め打ち + 「再変換」で足りる見込み。
+  - **対外的な名乗り方**。「EPUB 対応」と書くと DRM 付きの購入書籍と、リフロー時の文字サイズ変更を
+    期待される。書庫対応の拡張として書くほうが期待のズレが小さい。
+- テスト素材: 青空文庫の EPUB (縦書き・ルビ) で組める。
+- 規模 / 優先度: スパイクが順当なら Medium (1〜2 週間)、画像化方式を採るなら 2〜3 週間。P3
+  (採否未決)。**この数字は測っていない見立て**で、WebView2 側のスパイク結果で変わる。
+
 ---
 
 ## 2. 再現・確認待ち — こちらからは進められない
