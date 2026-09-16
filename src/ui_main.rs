@@ -7963,6 +7963,7 @@ impl App {
         let mut toolbar_book_pin_open: Option<String> = None;
         let mut toolbar_book_pin_add: Option<String> = None;
         let mut toolbar_collection_target: Option<crate::collection_store::CollectionId> = None;
+        let mut toolbar_collection_add_target: Option<crate::collection_store::CollectionId> = None;
         let mut toolbar_collection_manage = false;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
@@ -8294,6 +8295,12 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "左クリック: 開く / 右クリック: 選択を追加",
+                                            )
+                                            .weak(),
+                                        );
                                         if toolbar_collections.is_empty() {
                                             ui.label(
                                                 egui::RichText::new(
@@ -8303,14 +8310,20 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                                             );
                                         }
                                         for (id, name) in &toolbar_collections {
-                                            if ui
+                                            let response = ui
                                                 .selectable_label(
                                                     Some(*id) == active_collection_id,
                                                     name,
                                                 )
-                                                .clicked()
-                                            {
+                                                .on_hover_text(
+                                                    "左: このコレクションを開く / 右: 選択した項目を追加",
+                                                );
+                                            if response.clicked() {
                                                 toolbar_collection_target = Some(*id);
+                                                ui.close();
+                                            }
+                                            if response.secondary_clicked() {
+                                                toolbar_collection_add_target = Some(*id);
                                                 ui.close();
                                             }
                                         }
@@ -8326,11 +8339,16 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                             ui.label(egui::RichText::new("（なし）").weak());
                         } else {
                             for (id, name) in &toolbar_collections {
-                                if ui
+                                let response = ui
                                     .selectable_label(Some(*id) == active_collection_id, name)
-                                    .clicked()
-                                {
+                                    .on_hover_text(
+                                        "左: このコレクションを開く / 右: 選択した項目を追加",
+                                    );
+                                if response.clicked() {
                                     toolbar_collection_target = Some(*id);
+                                }
+                                if response.secondary_clicked() {
+                                    toolbar_collection_add_target = Some(*id);
                                 }
                             }
                         }
@@ -9197,6 +9215,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         if let Some(name) = toolbar_book_pin_add {
             self.add_grid_selection_to_named_book(ctx, name);
+        }
+        if let Some(id) = toolbar_collection_add_target {
+            self.add_grid_selection_to_collection(id);
         }
         if let Some(id) = toolbar_collection_target {
             self.open_collection_grid(id, None);

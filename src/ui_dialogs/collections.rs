@@ -1,7 +1,8 @@
 //! 名前付きコレクションのPC管理UI。
 //!
-//! Phase 2 はcatalog/edit/import/exportだけを接続する。collection gridをまだ通常folderへ
-//! 擬装しないため、toolbarの名前選択はこの管理windowの対象選択にだけ使う。
+//! Manager の編集/import/export と、main Grid から toolbar collection へ参照を追加する
+//! 非同期 ownership を接続する。Collection Grid を通常 folder に擬装せず、元ファイルも
+//! 変更しない。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -149,11 +150,31 @@ enum NameAction {
 }
 
 #[derive(Clone, Debug)]
+enum CollectionAddOrigin {
+    Manager,
+    Toolbar { collection_name: String },
+}
+
+impl CollectionAddOrigin {
+    fn is_toolbar(&self) -> bool {
+        matches!(self, Self::Toolbar { .. })
+    }
+
+    fn collection_name(&self) -> Option<&str> {
+        match self {
+            Self::Manager => None,
+            Self::Toolbar { collection_name } => Some(collection_name),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 enum ClassificationTarget {
     Add {
         collection_id: CollectionId,
         expected_revision: u64,
         import_errors: Vec<String>,
+        origin: CollectionAddOrigin,
     },
     Relink {
         collection_id: CollectionId,
@@ -189,8 +210,16 @@ enum ActorTask {
     Add {
         collection_id: CollectionId,
         errors: Vec<String>,
+        origin: CollectionAddOrigin,
         receiver: Receiver<Result<CollectionBatchAddOutcome, CollectionStoreError>>,
     },
+}
+
+struct ToolbarAddSnapshotRequest {
+    collection_id: CollectionId,
+    collection_name: String,
+    paths: Vec<PathBuf>,
+    receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
 }
 
 enum CollectionDialogOperation {
@@ -227,6 +256,7 @@ enum CollectionDialogOperation {
         progress: Arc<(AtomicUsize, AtomicUsize)>,
         task: WorkerTask<ClassificationResult>,
     },
+    ToolbarAddSnapshot(ToolbarAddSnapshotRequest),
     Submitting(ActorTask),
     ExportSnapshot {
         collection_id: CollectionId,
@@ -247,8 +277,41 @@ impl CollectionDialogOperation {
         matches!(self, Self::Idle)
     }
 
-    fn blocks_window_close(&self) -> bool {
-        matches!(self, Self::Submitting(_) | Self::ExportSnapshot { .. })
+    fn manager_close_behavior(&self) -> CollectionManagerCloseBehavior {
+        match self {
+            Self::ToolbarAddSnapshot(_)
+            | Self::Classifying {
+                target:
+                    ClassificationTarget::Add {
+                        origin: CollectionAddOrigin::Toolbar { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Submitting(ActorTask::Add {
+                origin: CollectionAddOrigin::Toolbar { .. },
+                ..
+            }) => CollectionManagerCloseBehavior::Detach,
+            Self::Submitting(_) | Self::ExportSnapshot { .. } => {
+                CollectionManagerCloseBehavior::KeepOpen
+            }
+            _ => CollectionManagerCloseBehavior::Cancel,
+        }
+    }
+
+    fn toolbar_add_origin(&self) -> Option<&CollectionAddOrigin> {
+        match self {
+            Self::Classifying {
+                target: ClassificationTarget::Add { origin, .. },
+                ..
+            }
+            | Self::Submitting(ActorTask::Add { origin, .. })
+                if origin.is_toolbar() =>
+            {
+                Some(origin)
+            }
+            _ => None,
+        }
     }
 
     fn cancel_worker(&self) {
@@ -259,6 +322,13 @@ impl CollectionDialogOperation {
             _ => {}
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionManagerCloseBehavior {
+    Cancel,
+    KeepOpen,
+    Detach,
 }
 
 pub(crate) struct CollectionUiState {
@@ -564,6 +634,89 @@ impl App {
         )
     }
 
+    /// Adds the current main-Grid selection to a toolbar collection without changing the
+    /// collection manager's selected definition. Checked cells take precedence over the cursor,
+    /// exactly as they do for the bookshelf. The actor snapshot is loaded after the click so the
+    /// add uses the target collection's latest revision rather than a possibly stale manager copy.
+    pub(crate) fn add_grid_selection_to_collection(&mut self, collection_id: CollectionId) {
+        if !self.collection_ui.can_edit() {
+            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            return;
+        }
+        if !self.collection_ui.operation.is_idle() {
+            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            return;
+        }
+        let Some(collection_name) = self
+            .collection_ui
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.id == collection_id)
+            })
+            .map(|definition| definition.name.clone())
+        else {
+            self.collection_ui
+                .request_catalog(self.collection_ui.wanted_catalog_revision);
+            self.show_feedback_toast("追加先のコレクションが見つかりません。".into());
+            return;
+        };
+
+        let indices = self.grid_selection_indices();
+        if indices.is_empty() {
+            self.show_feedback_toast("コレクションに追加する項目を選択してください。".into());
+            return;
+        }
+        let mut paths = Vec::with_capacity(indices.len());
+        for index in indices {
+            let Some(item) = self.items.get(index) else {
+                self.show_feedback_toast(
+                    "選択内容が更新されたため、コレクションに追加できません。".into(),
+                );
+                return;
+            };
+            let Some(path) = item.drag_source_path() else {
+                let message = item.file_operation_refusal().map_or_else(
+                    || "この項目はコレクションに追加できません".to_owned(),
+                    |reason| reason.message("コレクションに追加"),
+                );
+                self.show_feedback_toast(message);
+                return;
+            };
+            paths.push(path.to_path_buf());
+        }
+
+        let Some(client) = self.collection_ui.client.clone() else {
+            self.show_feedback_toast("コレクションを利用できません。".into());
+            return;
+        };
+        match client.load_collection(collection_id) {
+            Ok(receiver) => {
+                let count = paths.len();
+                self.collection_ui.operation =
+                    CollectionDialogOperation::ToolbarAddSnapshot(ToolbarAddSnapshotRequest {
+                        collection_id,
+                        collection_name: collection_name.clone(),
+                        paths,
+                        receiver,
+                    });
+                self.show_feedback_toast(format!(
+                    "「{collection_name}」へ追加する {count} 件を確認しています。"
+                ));
+            }
+            Err(error) => {
+                let message = collection_error_message(&error);
+                self.collection_ui.message = Some((true, message.clone()));
+                self.show_feedback_toast(format!(
+                    "「{collection_name}」へ追加できませんでした: {message}"
+                ));
+            }
+        }
+    }
+
     pub(crate) fn collection_store_client(&self) -> Option<CollectionStoreClient> {
         self.collection_ui
             .can_edit()
@@ -772,15 +925,73 @@ impl App {
                     task,
                 },
                 Some(Err(error)) => {
-                    self.collection_ui.message = Some((true, error));
+                    if let ClassificationTarget::Add { origin, .. } = &target {
+                        self.report_collection_add_result(origin, true, error);
+                    } else {
+                        self.collection_ui.message = Some((true, error));
+                    }
                     CollectionDialogOperation::Idle
                 }
                 Some(Ok(result)) if result.cancelled => {
-                    self.collection_ui.message = Some((false, "追加を取り消しました。".into()));
+                    if let ClassificationTarget::Add { origin, .. } = &target {
+                        self.report_collection_add_result(
+                            origin,
+                            false,
+                            "追加を取り消しました。".into(),
+                        );
+                    } else {
+                        self.collection_ui.message = Some((false, "処理を取り消しました。".into()));
+                    }
                     CollectionDialogOperation::Idle
                 }
                 Some(Ok(result)) => self.submit_collection_classification(target, result.prepared),
             },
+            CollectionDialogOperation::ToolbarAddSnapshot(request) => {
+                match request.receiver.try_recv() {
+                    Ok(Ok(snapshot)) if snapshot.collection_id() == request.collection_id => {
+                        let collection_name = snapshot.definition.name.clone();
+                        self.collection_classification_operation(
+                            request.paths,
+                            ClassificationTarget::Add {
+                                collection_id: request.collection_id,
+                                expected_revision: snapshot.revision(),
+                                import_errors: Vec::new(),
+                                origin: CollectionAddOrigin::Toolbar { collection_name },
+                            },
+                        )
+                    }
+                    Ok(Ok(_)) => {
+                        let message = "追加先のコレクション応答が一致しませんでした。".to_owned();
+                        self.collection_ui.message = Some((true, message.clone()));
+                        self.show_feedback_toast(format!(
+                            "「{}」へ追加できませんでした: {message}",
+                            request.collection_name
+                        ));
+                        CollectionDialogOperation::Idle
+                    }
+                    Ok(Err(error)) => {
+                        let message = collection_error_message(&error);
+                        self.collection_ui.message = Some((true, message.clone()));
+                        self.show_feedback_toast(format!(
+                            "「{}」へ追加できませんでした: {message}",
+                            request.collection_name
+                        ));
+                        CollectionDialogOperation::Idle
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        CollectionDialogOperation::ToolbarAddSnapshot(request)
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        let message = "追加先のコレクション応答が失われました。".to_owned();
+                        self.collection_ui.message = Some((true, message.clone()));
+                        self.show_feedback_toast(format!(
+                            "「{}」へ追加できませんでした: {message}",
+                            request.collection_name
+                        ));
+                        CollectionDialogOperation::Idle
+                    }
+                }
+            }
             CollectionDialogOperation::Submitting(task) => self.poll_collection_actor_task(task),
             CollectionDialogOperation::ExportSnapshot {
                 collection_id,
@@ -860,7 +1071,7 @@ impl App {
                 Err(error) => errors.push(format!("{}: {error}", item.path.display())),
             }
         }
-        let Some(client) = self.collection_ui.client.as_ref() else {
+        let Some(client) = self.collection_ui.client.clone() else {
             self.collection_ui.message = Some((true, "コレクションを利用できません。".into()));
             return CollectionDialogOperation::Idle;
         };
@@ -869,30 +1080,41 @@ impl App {
                 collection_id,
                 expected_revision,
                 import_errors,
+                origin,
             } => {
                 errors.extend(import_errors);
                 if !errors.is_empty() {
-                    self.collection_ui.message = Some((
+                    self.report_collection_add_result(
+                        &origin,
                         true,
                         format!(
                             "確認できない項目があるため、追加していません。\n{}",
                             errors.join("\n")
                         ),
-                    ));
+                    );
                     return CollectionDialogOperation::Idle;
                 }
                 if registrations.is_empty() {
-                    self.collection_ui.message = Some((false, "追加する項目がありません。".into()));
+                    self.report_collection_add_result(
+                        &origin,
+                        false,
+                        "追加する項目がありません。".into(),
+                    );
                     return CollectionDialogOperation::Idle;
                 }
                 match client.add_batch(collection_id, expected_revision, registrations) {
                     Ok(receiver) => CollectionDialogOperation::Submitting(ActorTask::Add {
                         collection_id,
                         errors,
+                        origin,
                         receiver,
                     }),
                     Err(error) => {
-                        self.collection_ui.message = Some((true, collection_error_message(&error)));
+                        self.report_collection_add_result(
+                            &origin,
+                            true,
+                            collection_error_message(&error),
+                        );
                         CollectionDialogOperation::Idle
                     }
                 }
@@ -1040,6 +1262,7 @@ impl App {
             ActorTask::Add {
                 collection_id,
                 errors,
+                origin,
                 receiver,
             } => match receiver.try_recv() {
                 Ok(Ok(outcome)) => {
@@ -1059,21 +1282,54 @@ impl App {
                         message.push_str("\n");
                         message.push_str(&errors.join("\n"));
                     }
-                    self.collection_ui.message = Some((!errors.is_empty(), message));
+                    self.report_collection_add_result(&origin, !errors.is_empty(), message);
                     CollectionDialogOperation::Idle
                 }
-                Ok(Err(error)) => self.finish_actor_error(error),
+                Ok(Err(error)) => {
+                    let message = collection_error_message(&error);
+                    let operation = self.finish_actor_error(error);
+                    if origin.is_toolbar() {
+                        self.report_collection_add_result(&origin, true, message);
+                    }
+                    operation
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     CollectionDialogOperation::Submitting(ActorTask::Add {
                         collection_id,
                         errors,
+                        origin,
                         receiver,
                     })
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.finish_actor_disconnect()
+                    let operation = self.finish_actor_disconnect();
+                    if origin.is_toolbar() {
+                        self.report_collection_add_result(
+                            &origin,
+                            true,
+                            "コレクション保存の応答が失われました。".into(),
+                        );
+                    }
+                    operation
                 }
             },
+        }
+    }
+
+    fn report_collection_add_result(
+        &mut self,
+        origin: &CollectionAddOrigin,
+        is_error: bool,
+        message: String,
+    ) {
+        self.collection_ui.message = Some((is_error, message.clone()));
+        if let Some(collection_name) = origin.collection_name() {
+            let prefix = if is_error {
+                format!("「{collection_name}」へ追加できませんでした")
+            } else {
+                format!("「{collection_name}」")
+            };
+            self.show_feedback_toast(format!("{prefix}: {message}"));
         }
     }
 
@@ -1242,7 +1498,7 @@ impl App {
                         action = Some(CollectionUiAction::OpenDelete);
                     }
                 });
-                ui.weak("コレクションの作成・編集・インポート・エクスポートを行えます。一覧表示は準備中です。");
+                ui.weak("項目の追加はメイン一覧で選択し、ツールバーのコレクション名を右クリックします。ここでは作成・編集・インポート・エクスポートを行えます。");
                 ui.separator();
 
                 if let Some(snapshot) = &snapshot {
@@ -1306,12 +1562,6 @@ impl App {
                         });
 
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!busy && can_edit, egui::Button::new("ファイルを追加…")).clicked() {
-                            action = Some(CollectionUiAction::PickFiles);
-                        }
-                        if ui.add_enabled(!busy && can_edit, egui::Button::new("フォルダを追加…")).clicked() {
-                            action = Some(CollectionUiAction::PickFolder);
-                        }
                         if ui.add_enabled(!busy && can_edit, egui::Button::new("テキストをインポート…")).clicked() {
                             action = Some(CollectionUiAction::PickImport);
                         }
@@ -1369,18 +1619,29 @@ impl App {
             });
 
         if cancel_worker {
+            let toolbar_origin = self.collection_ui.operation.toolbar_add_origin().cloned();
             self.collection_ui.operation.cancel_worker();
             self.collection_ui.operation = CollectionDialogOperation::Idle;
-            self.collection_ui.message = Some((false, "処理を取り消しました。".into()));
+            if let Some(origin) = toolbar_origin {
+                self.report_collection_add_result(&origin, false, "追加を取り消しました。".into());
+            } else {
+                self.collection_ui.message = Some((false, "処理を取り消しました。".into()));
+            }
         }
 
         if !open {
-            if self.collection_ui.operation.blocks_window_close() {
-                self.collection_ui.show_manager = true;
-            } else {
-                self.collection_ui.operation.cancel_worker();
-                self.collection_ui.operation = CollectionDialogOperation::Idle;
-                self.collection_ui.show_manager = false;
+            match self.collection_ui.operation.manager_close_behavior() {
+                CollectionManagerCloseBehavior::KeepOpen => {
+                    self.collection_ui.show_manager = true;
+                }
+                CollectionManagerCloseBehavior::Detach => {
+                    self.collection_ui.show_manager = false;
+                }
+                CollectionManagerCloseBehavior::Cancel => {
+                    self.collection_ui.operation.cancel_worker();
+                    self.collection_ui.operation = CollectionDialogOperation::Idle;
+                    self.collection_ui.show_manager = false;
+                }
             }
         }
         if let Some(action) = action {
@@ -1459,30 +1720,6 @@ impl App {
             }
             CollectionUiAction::MoveEntry(direction) => {
                 self.reorder_selected_collection_entry(&snapshot, direction)
-            }
-            CollectionUiAction::PickFiles => {
-                if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                    self.start_collection_classification(
-                        paths,
-                        ClassificationTarget::Add {
-                            collection_id: snapshot.collection_id(),
-                            expected_revision: snapshot.revision(),
-                            import_errors: Vec::new(),
-                        },
-                    );
-                }
-            }
-            CollectionUiAction::PickFolder => {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.start_collection_classification(
-                        vec![path],
-                        ClassificationTarget::Add {
-                            collection_id: snapshot.collection_id(),
-                            expected_revision: snapshot.revision(),
-                            import_errors: Vec::new(),
-                        },
-                    );
-                }
             }
             CollectionUiAction::PickImport => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -1627,7 +1864,11 @@ impl App {
                 task,
             },
             Err(error) => {
-                self.collection_ui.message = Some((true, error));
+                if let ClassificationTarget::Add { origin, .. } = &target {
+                    self.report_collection_add_result(origin, true, error);
+                } else {
+                    self.collection_ui.message = Some((true, error));
+                }
                 CollectionDialogOperation::Idle
             }
         }
@@ -1659,6 +1900,7 @@ impl App {
                 collection_id,
                 expected_revision,
                 import_errors: errors,
+                origin: CollectionAddOrigin::Manager,
             },
         )
     }
@@ -1957,8 +2199,6 @@ enum CollectionUiAction {
         sort: crate::settings::SortOrder,
     },
     MoveEntry(MoveEntry),
-    PickFiles,
-    PickFolder,
     PickImport,
     PickExport,
     PickRelinkFile,
@@ -1975,8 +2215,6 @@ impl CollectionUiAction {
             | Self::OpenRemove
             | Self::SetOrder { .. }
             | Self::MoveEntry(_)
-            | Self::PickFiles
-            | Self::PickFolder
             | Self::PickImport
             | Self::PickExport
             | Self::PickRelinkFile
@@ -2005,6 +2243,15 @@ fn draw_collection_operation_status(
                 ui.spinner();
                 ui.label(format!("参照を確認しています… {done}/{total}"));
                 cancel |= ui.button("取り消す").clicked();
+            });
+        }
+        CollectionDialogOperation::ToolbarAddSnapshot(request) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "「{}」の最新内容を確認しています…",
+                    request.collection_name
+                ));
             });
         }
         CollectionDialogOperation::Submitting(_)
@@ -2370,6 +2617,7 @@ mod tests {
                 collection_id,
                 expected_revision: created.revision(),
                 import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Manager,
             },
         );
         wait_for(&mut app, |app| {
@@ -2503,6 +2751,405 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_add_uses_checked_selection_latest_revision_and_preserves_manager_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let ignored = temp.path().join("ignored.png");
+        let checked = temp.path().join("checked.jpg");
+        let existing = temp.path().join("existing.mp4");
+        let folder = temp.path().join("selected-folder");
+        std::fs::write(&ignored, b"ignored-source").unwrap();
+        std::fs::write(&checked, b"checked-source").unwrap();
+        std::fs::write(&existing, b"existing-source").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+
+        let (mut app, client) = start_ready_app(&temp);
+        let manager = create_collection(&mut app, "Manager owner");
+        let target = create_collection(&mut app, "Toolbar target");
+        app.collection_ui
+            .select_collection(Some(manager.collection_id()));
+        wait_for(&mut app, |app| {
+            app.collection_ui
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.collection_id() == manager.collection_id())
+        });
+
+        let external = client
+            .add_batch(
+                target.collection_id(),
+                target.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &existing,
+                        CollectionResolvedKind::Video,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert!(external.revision() > target.revision());
+
+        app.items = vec![
+            crate::grid_item::GridItem::Image(ignored.clone()),
+            crate::grid_item::GridItem::Image(checked.clone()),
+        ];
+        app.selected = Some(0);
+        app.checked.insert(1);
+        app.add_grid_selection_to_collection(target.collection_id());
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+
+        let added = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(added.revision() > external.revision());
+        assert!(
+            added
+                .entries
+                .iter()
+                .any(|entry| entry.source_path == existing)
+        );
+        assert!(
+            added
+                .entries
+                .iter()
+                .any(|entry| entry.source_path == checked)
+        );
+        assert!(
+            added
+                .entries
+                .iter()
+                .all(|entry| entry.source_path != ignored)
+        );
+        assert_eq!(
+            app.collection_ui.selected_id,
+            Some(manager.collection_id()),
+            "toolbar add must not switch or cancel the manager selection owner"
+        );
+        assert_eq!(std::fs::read(&ignored).unwrap(), b"ignored-source");
+        assert_eq!(std::fs::read(&checked).unwrap(), b"checked-source");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing-source");
+
+        app.add_grid_selection_to_collection(target.collection_id());
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let duplicate = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(duplicate.entries.len(), added.entries.len());
+        assert!(
+            app.collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(_, text)| { text.contains("重複 1 件") })
+        );
+
+        app.checked.clear();
+        app.items = vec![crate::grid_item::GridItem::Folder(folder.clone())];
+        app.selected = Some(0);
+        app.add_grid_selection_to_collection(target.collection_id());
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let with_folder = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(with_folder.entries.iter().any(|entry| {
+            entry.source_path == folder && entry.resolved_kind == CollectionResolvedKind::Folder
+        }));
+        assert!(folder.is_dir());
+        assert_eq!(app.collection_ui.selected_id, Some(manager.collection_id()));
+        wait_for(&mut app, |app| {
+            app.collection_ui.catalog_request.is_none()
+                && app.collection_ui.catalog.as_ref().is_some_and(|catalog| {
+                    catalog.definitions.iter().any(|definition| {
+                        definition.id == target.collection_id()
+                            && definition.revision == with_folder.revision()
+                    })
+                })
+        });
+
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn toolbar_add_rejects_mixed_virtual_selection_atomically_and_keeps_busy_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real.png");
+        let pdf = temp.path().join("book.pdf");
+        std::fs::write(&real, b"real-source").unwrap();
+        std::fs::write(&pdf, b"pdf-source").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let target = create_collection(&mut app, "Virtual refusal");
+
+        app.items = vec![
+            crate::grid_item::GridItem::Image(real.clone()),
+            crate::grid_item::GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.checked.extend([0, 1]);
+        app.selected = Some(0);
+        app.add_grid_selection_to_collection(target.collection_id());
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("PDF 内のページ") && text.contains("追加できません")
+        }));
+        let unchanged = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.entries.is_empty());
+        assert_eq!(std::fs::read(&real).unwrap(), b"real-source");
+        assert_eq!(std::fs::read(&pdf).unwrap(), b"pdf-source");
+
+        app.items
+            .push(crate::grid_item::GridItem::CollectionPlaceholder {
+                path: temp.path().join("missing.jpg"),
+                last_known_kind: CollectionResolvedKind::Image,
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+            });
+        app.checked.clear();
+        app.checked.extend([0, 2]);
+        app.add_grid_selection_to_collection(target.collection_id());
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("見つからないコレクション項目") && text.contains("追加できません")
+        }));
+        let still_unchanged = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(still_unchanged.entries.is_empty());
+
+        let preview = parse_collection_text(
+            &format!("{}\n", real.display()),
+            &temp.path().join("import.txt"),
+        );
+        app.collection_ui.operation = CollectionDialogOperation::PreviewImport {
+            collection_id: target.collection_id(),
+            expected_revision: target.revision(),
+            source_path: temp.path().join("import.txt"),
+            preview,
+        };
+        app.items = vec![crate::grid_item::GridItem::Image(real)];
+        app.checked.clear();
+        app.selected = Some(0);
+        app.add_grid_selection_to_collection(target.collection_id());
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::PreviewImport { .. }
+        ));
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| { text.contains("別のコレクション処理") })
+        );
+
+        let (export_sender, export_receiver) = crossbeam_channel::bounded(1);
+        app.collection_ui.operation = CollectionDialogOperation::ExportSnapshot {
+            collection_id: target.collection_id(),
+            destination: temp.path().join("export.txt"),
+            receiver: export_receiver,
+        };
+        app.add_grid_selection_to_collection(target.collection_id());
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::ExportSnapshot { .. }
+        ));
+        drop(export_sender);
+
+        let relink_cancel_seen = Arc::new(AtomicBool::new(false));
+        let worker_cancel_seen = Arc::clone(&relink_cancel_seen);
+        let task = WorkerTask::spawn("toolbar-add-busy-relink-test", move |cancel| {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_cancel_seen.store(true, Ordering::Release);
+            ClassificationResult {
+                prepared: Vec::new(),
+                cancelled: true,
+            }
+        })
+        .unwrap();
+        app.collection_ui.operation = CollectionDialogOperation::Classifying {
+            target: ClassificationTarget::Relink {
+                collection_id: target.collection_id(),
+                expected_revision: target.revision(),
+                entry_id: CollectionEntryId::new(),
+            },
+            progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(1))),
+            task,
+        };
+        app.add_grid_selection_to_collection(target.collection_id());
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::Classifying {
+                target: ClassificationTarget::Relink { .. },
+                ..
+            }
+        ));
+        app.collection_ui.operation.cancel_worker();
+        app.collection_ui.operation = CollectionDialogOperation::Idle;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !relink_cancel_seen.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "relink cancel was not delivered");
+            std::thread::yield_now();
+        }
+
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn toolbar_add_operation_detaches_from_manager_window_lifetime() {
+        let collection_id = CollectionId::new();
+        let (_snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
+        let snapshot = CollectionDialogOperation::ToolbarAddSnapshot(ToolbarAddSnapshotRequest {
+            collection_id,
+            collection_name: "Detached toolbar".into(),
+            paths: vec![PathBuf::from(r"C:\media\page.png")],
+            receiver: snapshot_receiver,
+        });
+        assert_eq!(
+            snapshot.manager_close_behavior(),
+            CollectionManagerCloseBehavior::Detach
+        );
+
+        let classify_cancel_seen = Arc::new(AtomicBool::new(false));
+        let worker_cancel_seen = Arc::clone(&classify_cancel_seen);
+        let task = WorkerTask::spawn("toolbar-add-detach-classify-test", move |cancel| {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_cancel_seen.store(true, Ordering::Release);
+            ClassificationResult {
+                prepared: Vec::new(),
+                cancelled: true,
+            }
+        })
+        .unwrap();
+        let classifying = CollectionDialogOperation::Classifying {
+            target: ClassificationTarget::Add {
+                collection_id,
+                expected_revision: 1,
+                import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Toolbar {
+                    collection_name: "Detached toolbar".into(),
+                },
+            },
+            progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(1))),
+            task,
+        };
+        assert_eq!(
+            classifying.manager_close_behavior(),
+            CollectionManagerCloseBehavior::Detach
+        );
+        classifying.cancel_worker();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !classify_cancel_seen.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "classification cancel was not delivered"
+            );
+            std::thread::yield_now();
+        }
+
+        let (_add_sender, add_receiver) = crossbeam_channel::bounded(1);
+        let submitting = CollectionDialogOperation::Submitting(ActorTask::Add {
+            collection_id,
+            errors: Vec::new(),
+            origin: CollectionAddOrigin::Toolbar {
+                collection_name: "Detached toolbar".into(),
+            },
+            receiver: add_receiver,
+        });
+        assert_eq!(
+            submitting.manager_close_behavior(),
+            CollectionManagerCloseBehavior::Detach
+        );
+        assert_eq!(
+            CollectionDialogOperation::Name {
+                action: NameAction::Create,
+                draft: String::new(),
+            }
+            .manager_close_behavior(),
+            CollectionManagerCloseBehavior::Cancel
+        );
+    }
+
+    #[test]
+    fn toolbar_add_conflict_reports_terminal_toast_and_refreshes_actor_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("conflict.png");
+        std::fs::write(&source, b"conflict-source").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let stale = create_collection(&mut app, "Conflict target");
+        let external = client
+            .rename_collection(
+                stale.collection_id(),
+                stale.revision(),
+                "Conflict target renamed".into(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+
+        app.start_collection_classification(
+            vec![source.clone()],
+            ClassificationTarget::Add {
+                collection_id: stale.collection_id(),
+                expected_revision: stale.revision(),
+                import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Toolbar {
+                    collection_name: "Conflict target".into(),
+                },
+            },
+        );
+        wait_for(&mut app, |app| {
+            app.collection_ui.operation.is_idle()
+                && app.collection_ui.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.revision() == external.revision()
+                        && snapshot.definition.name == "Conflict target renamed"
+                })
+        });
+
+        assert!(
+            app.collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(error, text)| { *error && text.contains("更新") })
+        );
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("Conflict target") && text.contains("追加できませんでした")
+        }));
+        let latest = client
+            .load_collection(stale.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(latest.entries.is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), b"conflict-source");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn failed_runtime_keeps_stale_snapshot_read_only_and_toolbar_reports_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let (mut app, _client) = start_ready_app(&temp);
@@ -2565,6 +3212,7 @@ mod tests {
                 collection_id: snapshot.collection_id(),
                 expected_revision: snapshot.revision(),
                 import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Manager,
             },
         );
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
@@ -2595,6 +3243,7 @@ mod tests {
                 collection_id: snapshot.collection_id(),
                 expected_revision: snapshot.revision(),
                 import_errors: vec!["2 行: invalid path".into()],
+                origin: CollectionAddOrigin::Manager,
             },
             prepared,
         );
@@ -2672,6 +3321,7 @@ mod tests {
                 collection_id: CollectionId::new(),
                 expected_revision: 1,
                 import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Manager,
             },
             progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(1))),
             task,
@@ -2723,6 +3373,65 @@ mod tests {
                 .message
                 .as_ref()
                 .is_some_and(|(_, text)| { text.contains("取り消しました") })
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancel_seen.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "cancel was not delivered");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn manager_explicit_cancel_reports_toolbar_add_target_and_drops_worker_owner() {
+        let cancel_seen = Arc::new(AtomicBool::new(false));
+        let worker_seen = Arc::clone(&cancel_seen);
+        let task = WorkerTask::spawn("toolbar-add-ui-cancel-test", move |cancel| {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_seen.store(true, Ordering::Release);
+            ClassificationResult {
+                prepared: Vec::new(),
+                cancelled: true,
+            }
+        })
+        .unwrap();
+        let app = std::rc::Rc::new(std::cell::RefCell::new(snapshot_app(false)));
+        let collection_id = app.borrow().collection_ui.selected_id.unwrap();
+        app.borrow_mut().collection_ui.operation = CollectionDialogOperation::Classifying {
+            target: ClassificationTarget::Add {
+                collection_id,
+                expected_revision: 7,
+                import_errors: Vec::new(),
+                origin: CollectionAddOrigin::Toolbar {
+                    collection_name: "Toolbar target".into(),
+                },
+            },
+            progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(1))),
+            task,
+        };
+        let ui_app = std::rc::Rc::clone(&app);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1040.0, 760.0))
+            .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
+        harness.step();
+        harness.get_by_label("取り消す").click();
+        harness.step();
+        assert!(app.borrow().collection_ui.operation.is_idle());
+        assert!(
+            app.borrow()
+                .collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(_, text)| text.contains("追加を取り消しました"))
+        );
+        assert!(
+            app.borrow()
+                .fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| {
+                    text.contains("Toolbar target") && text.contains("取り消しました")
+                })
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         while !cancel_seen.load(Ordering::Acquire) {

@@ -911,3 +911,29 @@ truncated sparse target、display-unit / ordinal、終了時App ACK→server→p
 focused / full / static / verification build保留証跡は
 [`collection-remote-plan.md` §16](collection-remote-plan.md#16-製品実装独立-completion-review-checkpoint2026-09-16)
 を正本とする。通常RemoteとPC編集、Folder / ZIP / PDF child内部順、AI / streamingは既存経路を維持する。
+
+## 19. PC toolbarからの参照追加と管理picker撤去（2026-09-16）
+
+- メイン一覧のコレクション名を、本棚のピン留め本と同じく左クリックで開く、右クリックで現在の
+  Grid選択を追加する操作へ揃えた。`grid_selection_indices()`を共用し、checkedがあればcheckedを優先、
+  無ければselectedを使い、クリック時にpathを捕捉する。管理windowの`selected_id`は切り替えない。
+- 追加対象は`GridItem::drag_source_path()`を持つ物理sourceだけとする。仮想page / archive directory / Stack /
+  SearchContainer / CollectionPlaceholderを混在させたbatchは全体を保存前に拒否し、親archive・代表画像へ
+  丸めない。分類は既存worker、保存はactorの`add_batch`を使い、source bytesは変更しない。
+- toolbar click後に対象collectionの最新actor snapshotを非同期取得し、そのrevisionで分類結果をsubmitする。
+  managerの遅いsnapshotをexpected revisionに使わない。duplicate / conflict / actor errorは対象名付きtoastへ
+  terminal結果を返し、成功後のPC Collection GridとRemote read-only表示は既存watch fanoutで収束させる。
+- managerのfile/folder pickerと対応actionを撤去し、管理windowにはimport / export / remove / relinkを残した。
+  manager operationが進行中ならtoolbar addは開始しない。toolbar起点のsnapshot / classify / actor submitは
+  manager windowを閉じてもcancelせず、明示的な「取り消す」だけがclassify workerを止める。
+- handler回帰はchecked優先 / selected fallback、latest revision、duplicate、実folder、source無変更、仮想項目と
+  placeholderの全体拒否、import / export / relink owner保持、manager close 3段階detach、Conflict terminalと
+  watch/catalog refreshを固定する。管理windowのdark / light snapshotは旧picker撤去とtoolbar誘導文を固定する。
+- focusedはcollection handler / snapshot 15/15、core checkがpassした。final
+  `scripts/test-full.ps1 -SuppressCrashDialogs`はmain 8576 / 0 / 45、UI snapshot 52/52、IPC 57/57、
+  Remote 122/122（1 ignored）、vendor egui / egui-wgpu / eframe 25 / 9 / 15、`[test-full] PASS`、exit 0で、
+  process error modeを`0x00008001`へ復元した。fmt、UI glyph、viewer-context audit、diff checkもexit 0である。
+- 独立Sol / xhigh reviewerはselection捕捉、latest revision、manager owner / close lifecycle、physical-onlyの
+  全体拒否、source不変、actor terminal / watch収束、Remote非変更を再照合し、重要指摘なしで承認した。
+  resident PID 4708はbuild開始前に既に不在で、停止操作は行っていない。`scripts/build-dev.ps1 -PreserveRuntime`は
+  exit 0で、`target/dev-runtime/mimageviewer-core.exe`と`mimageviewer-remote.exe`を更新した。アプリは起動していない。
