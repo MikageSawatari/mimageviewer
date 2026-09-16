@@ -2403,6 +2403,7 @@ pub enum TopMenuId {
     Favorites,
     SmartFolders,
     Books,
+    Collections,
     Convert,
     Video,
     Tags,
@@ -2416,6 +2417,7 @@ impl TopMenuId {
         Self::Favorites,
         Self::SmartFolders,
         Self::Books,
+        Self::Collections,
         Self::Convert,
         Self::Video,
         Self::Tags,
@@ -2429,6 +2431,7 @@ impl TopMenuId {
             TopMenuId::Favorites => "お気に入り",
             TopMenuId::SmartFolders => "スマートフォルダ",
             TopMenuId::Books => "製本",
+            TopMenuId::Collections => "コレクション",
             TopMenuId::Convert => "変換",
             TopMenuId::Video => "動画",
             TopMenuId::Tags => "タグ",
@@ -2443,6 +2446,7 @@ impl TopMenuId {
             TopMenuId::Favorites => "Favorites",
             TopMenuId::SmartFolders => "SmartFolders",
             TopMenuId::Books => "Books",
+            TopMenuId::Collections => "Collections",
             TopMenuId::Convert => "Convert",
             TopMenuId::Video => "Video",
             TopMenuId::Tags => "Tags",
@@ -2457,6 +2461,7 @@ impl TopMenuId {
             "Favorites" => Some(TopMenuId::Favorites),
             "SmartFolders" => Some(TopMenuId::SmartFolders),
             "Books" => Some(TopMenuId::Books),
+            "Collections" => Some(TopMenuId::Collections),
             "Convert" => Some(TopMenuId::Convert),
             "Video" => Some(TopMenuId::Video),
             "Tags" => Some(TopMenuId::Tags),
@@ -2491,6 +2496,14 @@ pub enum MenuCommandId {
     BooksOpenActiveBook,
     BooksReorderCurrentBook,
     BooksManage,
+    CollectionsAddSelectionToTarget,
+    CollectionsOpenTarget,
+    CollectionsImportCurrent,
+    CollectionsExportCurrent,
+    CollectionsSetOrderCurrent,
+    CollectionsRelinkCurrent,
+    CollectionsReorderCurrent,
+    CollectionsManage,
     ConvertToZip,
     VideoRegisterUpscale,
     VideoDeleteUpscale,
@@ -2536,6 +2549,14 @@ impl MenuCommandId {
         Self::BooksOpenActiveBook,
         Self::BooksReorderCurrentBook,
         Self::BooksManage,
+        Self::CollectionsAddSelectionToTarget,
+        Self::CollectionsOpenTarget,
+        Self::CollectionsImportCurrent,
+        Self::CollectionsExportCurrent,
+        Self::CollectionsSetOrderCurrent,
+        Self::CollectionsRelinkCurrent,
+        Self::CollectionsReorderCurrent,
+        Self::CollectionsManage,
         Self::ConvertToZip,
         Self::VideoRegisterUpscale,
         Self::VideoDeleteUpscale,
@@ -2581,6 +2602,14 @@ impl MenuCommandId {
             MenuCommandId::BooksOpenActiveBook => "BooksOpenActiveBook",
             MenuCommandId::BooksReorderCurrentBook => "BooksReorderCurrentBook",
             MenuCommandId::BooksManage => "BooksManage",
+            MenuCommandId::CollectionsAddSelectionToTarget => "CollectionsAddSelectionToTarget",
+            MenuCommandId::CollectionsOpenTarget => "CollectionsOpenTarget",
+            MenuCommandId::CollectionsImportCurrent => "CollectionsImportCurrent",
+            MenuCommandId::CollectionsExportCurrent => "CollectionsExportCurrent",
+            MenuCommandId::CollectionsSetOrderCurrent => "CollectionsSetOrderCurrent",
+            MenuCommandId::CollectionsRelinkCurrent => "CollectionsRelinkCurrent",
+            MenuCommandId::CollectionsReorderCurrent => "CollectionsReorderCurrent",
+            MenuCommandId::CollectionsManage => "CollectionsManage",
             MenuCommandId::ConvertToZip => "ConvertToZip",
             MenuCommandId::VideoRegisterUpscale => "VideoRegisterUpscale",
             MenuCommandId::VideoDeleteUpscale => "VideoDeleteUpscale",
@@ -2758,6 +2787,54 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::BooksManage,
         parent: TopMenuId::Books,
         label: "製本の管理…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsAddSelectionToTarget,
+        parent: TopMenuId::Collections,
+        label: "追加先のコレクションに追加",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsOpenTarget,
+        parent: TopMenuId::Collections,
+        label: "追加先のコレクションを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsImportCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションへインポート…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsExportCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションをエクスポート…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsSetOrderCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションの並び順",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsRelinkCurrent,
+        parent: TopMenuId::Collections,
+        label: "選択中の参照を再リンク",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsReorderCurrent,
+        parent: TopMenuId::Collections,
+        label: "選択中の参照を手動で移動",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsManage,
+        parent: TopMenuId::Collections,
+        label: "コレクションの管理…",
         action: None,
     },
     MenuCommandSpec {
@@ -2971,6 +3048,13 @@ pub fn resolve_menu_layout(settings: &MenuLayoutSettings) -> ResolvedMenuLayout 
                 parents.push(parent);
             }
         }
+    }
+    // Collections was added after Books. Keep that peer relationship for saved pre-Collections
+    // layouts instead of appending the new menu after Help.
+    if !parents.contains(&TopMenuId::Collections)
+        && let Some(books) = parents.iter().position(|id| *id == TopMenuId::Books)
+    {
+        parents.insert(books + 1, TopMenuId::Collections);
     }
     for &parent in TopMenuId::ALL {
         if !parents.contains(&parent) {
@@ -9874,6 +9958,31 @@ mod tests {
                 .collect();
             assert_eq!(menu.commands, expected);
         }
+    }
+
+    #[test]
+    fn legacy_saved_menu_order_inserts_collections_directly_after_books() {
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec![
+                "Help".to_owned(),
+                "Books".to_owned(),
+                "File".to_owned(),
+                "Settings".to_owned(),
+            ],
+            command_order: Vec::new(),
+            hidden_commands: Vec::new(),
+        };
+        let resolved = resolve_menu_layout(&settings);
+        let parents = resolved
+            .menus
+            .iter()
+            .map(|menu| menu.id)
+            .collect::<Vec<_>>();
+        let books = parents
+            .iter()
+            .position(|id| *id == TopMenuId::Books)
+            .unwrap();
+        assert_eq!(parents[books + 1], TopMenuId::Collections);
     }
 
     #[test]

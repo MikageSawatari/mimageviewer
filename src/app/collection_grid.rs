@@ -26,6 +26,13 @@ pub(crate) struct CollectionGridRemoveTarget {
     pub(crate) entry_ids: Vec<CollectionEntryId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridContentTarget {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) expected_revision: u64,
+    pub(crate) selected_entry_id: Option<CollectionEntryId>,
+}
+
 /// Delete-key/context-menu resolution for the mounted collection surface. Root is fail-closed:
 /// an unavailable immutable binding must never fall through to a source-file deletion.
 #[derive(Clone, Debug)]
@@ -103,7 +110,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
 }
 
 impl App {
-    pub(in crate::app) fn collection_grid_context_id(&self) -> ViewerContextId {
+    pub(crate) fn collection_grid_context_id(&self) -> ViewerContextId {
         #[cfg(windows)]
         {
             self.projected_viewer_context_id()
@@ -127,6 +134,53 @@ impl App {
 
     fn collection_grid_stamp_is_current(&self, stamp: CollectionGridRequestStamp) -> bool {
         self.collection_grid_stamp() == Some(stamp)
+    }
+
+    pub(crate) fn collection_grid_request_stamp_is_current(
+        &self,
+        stamp: CollectionGridRequestStamp,
+    ) -> bool {
+        self.collection_grid_stamp_is_current(stamp)
+            && self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(session.position, CollectionGridPosition::Root)
+                        && session.installed_items_generation == Some(self.items_generation)
+                })
+    }
+
+    pub(crate) fn collection_grid_content_target(
+        &self,
+    ) -> Result<CollectionGridContentTarget, &'static str> {
+        let Some(stamp) = self.collection_grid_stamp() else {
+            return Err("現在の一覧はコレクション直下ではありません");
+        };
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return Err("コレクション一覧を更新中です");
+        };
+        if !matches!(session.position, CollectionGridPosition::Root)
+            || session.installed_items_generation != Some(self.items_generation)
+        {
+            return Err("コレクション直下を開くと使用できます");
+        }
+        let Some(prepared) = session.prepared() else {
+            return Err("コレクション一覧を更新中です");
+        };
+        if prepared.collection_revision != session.accepted_revision
+            || prepared.entries.len() != self.items.len()
+        {
+            return Err("コレクション一覧を更新中です");
+        }
+        let selected_entry_id = self
+            .selected
+            .and_then(|index| prepared.entries.get(index))
+            .map(|entry| entry.entry_id);
+        Ok(CollectionGridContentTarget {
+            stamp,
+            expected_revision: prepared.collection_revision,
+            selected_entry_id,
+        })
     }
 
     pub(crate) fn apply_collection_grid_remove_success(

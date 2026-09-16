@@ -929,6 +929,9 @@ focused / full / static / verification build保留証跡は
 
 ## 19. PC toolbarからの参照追加と管理picker撤去（2026-09-16）
 
+> この節は最初のtoolbar実装時点の記録である。現行の管理責務、固定shortcut、表示形式、上部メニューは
+> [§21](#21-本棚同型のcollection管理とgrid起点操作2026-09-16)で置き換えた。
+
 - 本棚と同じく、全表示形式で追加先コンボと明示的な`追加` / `開く`を常設した。コンボは追加先の
   選択だけを行い、一覧を開かない。`展開`と展開中の`折りたたみ`では名前shortcutを表示し、左クリックで
   開く、右クリックで現在のGrid選択を追加する。`プルダウン`はshortcut列だけを隠す既存compact表示として
@@ -1032,3 +1035,36 @@ focused / full / static / verification build保留証跡は
   `5E2E0D9C8407B800D4C93574F3AF56898FC51FAF5274721FE8A2E682C873C12E`、Remoteは
   `8ABADDA66BC570D269ABB22439C2A6CA90964A5C2DF2239124CD81B01AEED0AD`。アプリ、通常profile、real dataは
   起動・操作していない。履歴 / Delete key / Windows submenuの実機確認は親の手動検収として未実施である。
+
+## 21. 本棚同型のCollection管理とGrid起点操作（2026-09-16）
+
+- `request_collection_grid_remove`が確認modalの表示場所を管理windowに依存させ、Grid起点Deleteでも
+  `show_manager=true`と管理選択の切替を行っていた。operationのoriginを`Manager` / exact `Grid(stamp)`へ型付けし、
+  modal、進捗、取消、terminal toastをmanager windowの寿命から分離した。Collection rootのDelete確認を開いても
+  managerは非表示のままで、manager選択、追加先、表示surfaceを変更しない。
+- 管理windowは本棚managerと同じ入れ物管理へ限定した。現在の追加先を冒頭へ表示し、inlineの新規作成、各行の
+  名前変更、追加先指定、固定、削除、開くを同じ列で提供する。entry一覧は置かず、内容はメインGridを正本とする。
+  definition削除は参照だけを削除し、source file / folderを変更しない。
+- 上部に`コレクション`メニューを`製本`の隣へ追加した。保存済みの旧menu orderへは`製本`直後に補完する。
+  メニューの`追加` / `開く`はglobalな追加先を対象とし、import / export、order mode / sort、再リンク、手動移動は
+  現在表示中のexact Collection rootだけを対象とする。Grid requestはsurface stampとentry IDを運び、latest/full actor
+  snapshotを読んでからmutationする。Standard表示中の手動移動、stale surface、対象なしは理由付きで無効にする。
+- toolbarは本棚と同じく全catalogの追加先comboと明示的な`追加` / `開く`を常設し、固定したstable UUIDだけを
+  左Open / 右Addのshortcutとして表示する。表示形式は`展開` / `折りたたみ`の2種類とし、旧`プルダウン` / unknown
+  保存値は読込時に`展開`へ正規化する。追加先と固定列はauthoritative Ready catalogだけでorder-preserving dedupe / prune
+  し、Starting / Failed / 一時的なcatalog欠落では消さない。renameはUUIDで追従し、削除時の追加先fallbackは1か所で行う。
+- import preview、Grid Remove確認、分類・export進捗はmanagerを開かず表示できる。managerを閉じてもGrid / Toolbar起点workerを
+  cancelせず、明示取消だけがそのoriginのworkerを止める。classification完了時もexact Grid stampを再検証し、別surfaceへ
+  移った後のlate resultをactorへ送らない。actor成功後のGrid / Remote収束は既存revision watchを維持する。
+- 本棚はページ画像を本フォルダへコピーする製本機能、Collectionは既存file / folder / book / ZIP / PDFへの参照であり、
+  データモデルは統合しない。virtual pageを親pathへ丸めず、未対応対象は理由付きで無効にする。import / export / relink、
+  manual order、履歴、再生、Remote read-onlyの既存契約を維持する。
+- 検証は`collections` 63件、collection toolbar 8件、menu layout 13件、旧menu補完1件、追加のpin順2件と
+  modal input gate 1件をfocusedで通した。`test-full.ps1 -SuppressCrashDialogs`は本体8613件成功・0失敗・45 ignored、
+  vendor egui / egui-wgpu / eframeは25 / 9 / 15件成功し`[test-full] PASS`だった。初回fullで既存navigation testが
+  subscribe時のbaseline noticeをrename noticeと誤認するraceを1件検出したため、baselineを明示検証・消費するfixtureへ
+  修正し、focusedと再fullで成功を確認した。fmt、UI glyph、viewer-context audit、対象pathのdiff checkもexit 0。
+  manager / import preview / manager非表示のGrid Remove確認snapshot 3枚は親が目視受入し、独立reviewerはtyped origin、
+  latest/full actor snapshot、manager / global add target / current Gridの分離、stable pin順、modal input gateを確認して
+  重要指摘なしとした。`build-dev.ps1 -PreserveRuntime`はresident不在を確認してcore / Remote serviceとVCRT PE検査を
+  exit 0で完了した。通常profile、real data、GUIアプリは起動・操作していない。

@@ -3212,6 +3212,18 @@ mod tests {
             resolved_kind: CollectionResolvedKind::Image,
         };
         let watch = client.subscribe().unwrap();
+        let baseline = watch
+            .take_latest()
+            .expect("new watch carries the current catalog baseline");
+        assert_eq!(
+            baseline
+                .collection_revisions
+                .iter()
+                .find_map(|(id, revision)| {
+                    (*id == prepared.collection_id).then_some(*revision)
+                }),
+            Some(prepared.collection_revision)
+        );
         let renamed = recv(
             client
                 .rename_collection(

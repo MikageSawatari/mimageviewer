@@ -18362,6 +18362,7 @@ impl App {
             // (2026-09-02)。
             self.external_tool_materialize_progress_visible() => "external_tool_materialize_progress",
             self.show_settings_restore => "settings_restore",
+            self.collection_operation_modal_visible() => "collection_operation_modal",
             self.collection_manager_open() => "collection_manager",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",

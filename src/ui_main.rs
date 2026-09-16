@@ -1588,7 +1588,6 @@ pub(crate) enum CollectionToolbarIntent {
     SelectTarget(crate::collection_store::CollectionId),
     Add(crate::collection_store::CollectionId),
     Open(crate::collection_store::CollectionId),
-    Manage,
 }
 
 #[derive(Debug, Default)]
@@ -1603,6 +1602,7 @@ fn draw_collection_toolbar_controls(
     ctx: &egui::Context,
     status: crate::ui_dialogs::collections::CollectionToolbarStatus,
     rows: &[(crate::collection_store::CollectionId, String)],
+    pinned: &[crate::collection_store::CollectionId],
     target_id: Option<crate::collection_store::CollectionId>,
     mode: crate::settings::ToolbarSectionDisplay,
     collapsed: bool,
@@ -1680,9 +1680,7 @@ fn draw_collection_toolbar_controls(
             }
             !collapsed
         }
-        Display::Buttons => true,
-        Display::Dropdown => false,
-        Display::Unknown => true,
+        Display::Buttons | Display::Dropdown | Display::Unknown => true,
     };
     if show_shortcuts {
         if !ready {
@@ -1690,7 +1688,10 @@ fn draw_collection_toolbar_controls(
         } else if rows.is_empty() {
             ui.label(egui::RichText::new("（なし）").weak());
         } else {
-            for (id, name) in rows {
+            for pinned_id in pinned {
+                let Some((id, name)) = rows.iter().find(|(id, _)| id == pinned_id) else {
+                    continue;
+                };
                 let response = ui
                     .button(name)
                     .on_hover_text("左: このコレクションを開く / 右: 選択した項目を追加");
@@ -1701,13 +1702,6 @@ fn draw_collection_toolbar_controls(
                 }
             }
         }
-    }
-    if ui
-        .button("管理…")
-        .on_hover_text("コレクションの作成・編集・インポート・エクスポート")
-        .clicked()
-    {
-        result.intent = Some(CollectionToolbarIntent::Manage);
     }
     result
 }
@@ -5629,6 +5623,30 @@ impl App {
             .keymap
             .menu_command_label(MenuCommandId::BooksReorderCurrentBook);
         let book_manage_menu_label = self.keymap.menu_command_label(MenuCommandId::BooksManage);
+        let collection_add_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsAddSelectionToTarget);
+        let collection_open_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsOpenTarget);
+        let collection_import_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsImportCurrent);
+        let collection_export_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsExportCurrent);
+        let collection_order_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsSetOrderCurrent);
+        let collection_relink_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsRelinkCurrent);
+        let collection_reorder_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsReorderCurrent);
+        let collection_manage_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsManage);
         let convert_to_zip_menu_label = self.keymap.menu_command_label(MenuCommandId::ConvertToZip);
         let video_register_upscale_menu_label = self
             .keymap
@@ -6062,6 +6080,213 @@ impl App {
                                         ui.label(egui::RichText::new("本棚を読み込み中…").weak());
                                     }
                                 }
+                            });
+                            top_menu_responses.push(response.response);
+                        }
+                        TopMenuId::Collections => {
+                            let commands = &resolved_top_menu.commands;
+                            let (add_target, collection_rows, collection_status) =
+                                self.collection_toolbar_catalog();
+                            let current_target = self.collection_grid_content_target().ok();
+                            let current_definition = current_target
+                                .as_ref()
+                                .and_then(|target| self.collection_definition(target.stamp.collection_id));
+                            let add_target_name = add_target.and_then(|target| {
+                                collection_rows
+                                    .iter()
+                                    .find(|(id, _)| *id == target)
+                                    .map(|(_, name)| name.clone())
+                            });
+                            let response = ui.menu_button(TopMenuId::Collections.label(), |ui| {
+                                ui.label(format!(
+                                    "追加先: {}",
+                                    add_target_name.as_deref().unwrap_or("（なし）")
+                                ));
+                                for &command in commands {
+                                    match command {
+                                        MenuCommandId::CollectionsAddSelectionToTarget => {
+                                            let enabled = add_target.is_some()
+                                                && (self.selected.is_some() || !self.checked.is_empty());
+                                            if ui
+                                                .add_enabled(enabled, egui::Button::new(&collection_add_menu_label))
+                                                .on_disabled_hover_text("追加先と項目を選択してください")
+                                                .clicked()
+                                            {
+                                                self.add_grid_selection_to_collection(add_target.unwrap());
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsOpenTarget => {
+                                            if ui
+                                                .add_enabled(add_target.is_some(), egui::Button::new(&collection_open_menu_label))
+                                                .clicked()
+                                            {
+                                                self.open_collection_grid_from_navigation(add_target.unwrap());
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsImportCurrent => {
+                                            if ui
+                                                .add_enabled(current_target.is_some(), egui::Button::new(&collection_import_menu_label))
+                                                .on_disabled_hover_text("コレクション直下を開くと使用できます")
+                                                .clicked()
+                                            {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .add_filter("テキスト", &["txt"])
+                                                    .pick_file()
+                                                {
+                                                    self.start_collection_grid_content_action(
+                                                        current_target.unwrap(),
+                                                        crate::ui_dialogs::collections::CollectionGridSnapshotAction::Import(path),
+                                                    );
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsExportCurrent => {
+                                            if ui
+                                                .add_enabled(current_target.is_some(), egui::Button::new(&collection_export_menu_label))
+                                                .on_disabled_hover_text("コレクション直下を開くと使用できます")
+                                                .clicked()
+                                            {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .add_filter("テキスト", &["txt"])
+                                                    .set_file_name("collection.txt")
+                                                    .save_file()
+                                                {
+                                                    self.start_collection_grid_content_action(
+                                                        current_target.unwrap(),
+                                                        crate::ui_dialogs::collections::CollectionGridSnapshotAction::Export(path),
+                                                    );
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsSetOrderCurrent => {
+                                            ui.add_enabled_ui(current_target.is_some(), |ui| {
+                                                ui.menu_button(&collection_order_menu_label, |ui| {
+                                                    let current = current_definition.as_ref();
+                                                    if ui
+                                                        .selectable_label(
+                                                            current.is_some_and(|d| d.order_mode == crate::collection_store::CollectionOrderMode::Manual),
+                                                            "手動順",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        let target = current_target.unwrap();
+                                                        let sort = current.map_or(crate::settings::SortOrder::FileName, |d| d.standard_sort);
+                                                        self.start_collection_grid_content_action(
+                                                            target,
+                                                            crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                                mode: crate::collection_store::CollectionOrderMode::Manual,
+                                                                sort,
+                                                            },
+                                                        );
+                                                        ui.close();
+                                                    }
+                                                    ui.menu_button("通常ソート", |ui| {
+                                                        for &sort in crate::settings::SortOrder::all() {
+                                                            if ui
+                                                                .selectable_label(
+                                                                    current.is_some_and(|d| d.order_mode == crate::collection_store::CollectionOrderMode::Standard && d.standard_sort == sort),
+                                                                    sort.label(),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.start_collection_grid_content_action(
+                                                                    current_target.unwrap(),
+                                                                    crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
+                                                                        sort,
+                                                                    },
+                                                                );
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        }
+                                        MenuCommandId::CollectionsRelinkCurrent => {
+                                            let selected = current_target.and_then(|target| target.selected_entry_id);
+                                            ui.add_enabled_ui(selected.is_some(), |ui| {
+                                                ui.menu_button(&collection_relink_menu_label, |ui| {
+                                                    if ui.button("ファイルへ再リンク…").clicked() {
+                                                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                                            self.start_collection_grid_content_action(
+                                                                current_target.unwrap(),
+                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Relink {
+                                                                    path,
+                                                                },
+                                                            );
+                                                        }
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("フォルダへ再リンク…").clicked() {
+                                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                            self.start_collection_grid_content_action(
+                                                                current_target.unwrap(),
+                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Relink {
+                                                                    path,
+                                                                },
+                                                            );
+                                                        }
+                                                        ui.close();
+                                                    }
+                                                });
+                                            });
+                                        }
+                                        MenuCommandId::CollectionsReorderCurrent => {
+                                            let selected = current_target.and_then(|target| target.selected_entry_id);
+                                            let manual = current_definition.as_ref().is_some_and(|d| {
+                                                d.order_mode == crate::collection_store::CollectionOrderMode::Manual
+                                            });
+                                            ui.add_enabled_ui(selected.is_some() && manual, |ui| {
+                                                ui.menu_button(&collection_reorder_menu_label, |ui| {
+                                                    for (label, direction) in [
+                                                        ("先頭へ", crate::ui_dialogs::collections::MoveEntry::First),
+                                                        ("上へ", crate::ui_dialogs::collections::MoveEntry::Up),
+                                                        ("下へ", crate::ui_dialogs::collections::MoveEntry::Down),
+                                                        ("末尾へ", crate::ui_dialogs::collections::MoveEntry::Last),
+                                                    ] {
+                                                        if ui.button(label).clicked() {
+                                                            self.start_collection_grid_content_action(
+                                                                current_target.unwrap(),
+                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Move {
+                                                                    direction,
+                                                                },
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                        }
+                                        MenuCommandId::CollectionsManage => {
+                                            ui.separator();
+                                            if ui.button(&collection_manage_menu_label).clicked() {
+                                                self.open_collection_manager(None);
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ui.separator();
+                                ui.menu_button("追加先のコレクションを選ぶ", |ui| {
+                                    if collection_status != crate::ui_dialogs::collections::CollectionToolbarStatus::Ready {
+                                        ui.weak(collection_status.label());
+                                    } else if collection_rows.is_empty() {
+                                        ui.weak("（コレクションはまだありません）");
+                                    } else {
+                                        for (id, name) in &collection_rows {
+                                            if ui.selectable_label(Some(*id) == add_target, name).clicked() {
+                                                self.select_collection_toolbar_target(*id);
+                                                ui.close();
+                                            }
+                                        }
+                                    }
+                                });
                             });
                             top_menu_responses.push(response.response);
                         }
@@ -8022,16 +8247,11 @@ impl App {
     /// Single product dispatch seam for toolbar pointer intents. Drawing only creates one typed
     /// intent; this boundary owns every resulting state transition and is exercised end-to-end by
     /// the raw pointer regression below.
-    fn dispatch_collection_toolbar_intent(
-        &mut self,
-        intent: CollectionToolbarIntent,
-        manager_target_id: Option<crate::collection_store::CollectionId>,
-    ) {
+    fn dispatch_collection_toolbar_intent(&mut self, intent: CollectionToolbarIntent) {
         match intent {
             CollectionToolbarIntent::SelectTarget(id) => self.select_collection_toolbar_target(id),
             CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
             CollectionToolbarIntent::Open(id) => self.open_collection_grid_from_navigation(id),
-            CollectionToolbarIntent::Manage => self.open_collection_manager(manager_target_id),
         }
     }
 
@@ -8066,6 +8286,13 @@ impl App {
         let show_collections = self.settings.show_toolbar_collections;
         let (toolbar_collection_target_id, toolbar_collections, collections_status) =
             self.collection_toolbar_catalog();
+        let toolbar_pinned_collections = self
+            .settings
+            .pinned_collections
+            .iter()
+            .copied()
+            .map(crate::collection_store::CollectionId::from_uuid)
+            .collect::<Vec<_>>();
         let sort_lock = self.grid_sort_lock_reason();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
@@ -8420,6 +8647,7 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         ctx,
                         collections_status,
                         &toolbar_collections,
+                        &toolbar_pinned_collections,
                         toolbar_collection_target_id,
                         self.settings.toolbar_collections_display,
                         self.settings.toolbar_collections_collapsed,
@@ -9291,7 +9519,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.add_grid_selection_to_named_book(ctx, name);
         }
         if let Some(intent) = toolbar_collection_intent {
-            self.dispatch_collection_toolbar_intent(intent, toolbar_collection_target_id);
+            self.dispatch_collection_toolbar_intent(intent);
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
@@ -9579,7 +9807,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.toolbar_smart_folders_display = ToolbarSectionDisplay::default();
         s.toolbar_tags_display = ToolbarSectionDisplay::default();
         s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
-        s.toolbar_collections_display = ToolbarSectionDisplay::Dropdown;
+        s.toolbar_collections_display = ToolbarSectionDisplay::Buttons;
         s.toolbar_favorites_collapsed = false;
         s.toolbar_smart_folders_collapsed = false;
         s.toolbar_tags_collapsed = false;
@@ -9640,10 +9868,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
             }
             TS::Collections => {
+                // 全件 ComboBox は常設し、固定したコレクションだけを本棚と同じボタンで出す。
                 display_radio(
                     ui,
                     &mut self.settings.toolbar_collections_display,
-                    TD::all_with_collapsible(),
+                    TD::all_collapsible_only(),
                     &mut changed,
                 );
                 ui.separator();
@@ -21918,6 +22147,7 @@ mod collection_toolbar_interaction_tests {
     struct ToolbarState {
         rows: Vec<(crate::collection_store::CollectionId, String)>,
         target: crate::collection_store::CollectionId,
+        pinned: Vec<crate::collection_store::CollectionId>,
         mode: crate::settings::ToolbarSectionDisplay,
         collapsed: bool,
         intent: Option<CollectionToolbarIntent>,
@@ -21948,6 +22178,7 @@ mod collection_toolbar_interaction_tests {
                                 ctx,
                                 crate::ui_dialogs::collections::CollectionToolbarStatus::Ready,
                                 &state.rows,
+                                &state.pinned,
                                 Some(state.target),
                                 state.mode,
                                 state.collapsed,
@@ -21969,6 +22200,7 @@ mod collection_toolbar_interaction_tests {
                         (second, "Second target".into()),
                     ],
                     target: first,
+                    pinned: vec![first, second],
                     mode,
                     collapsed,
                     intent: None,
@@ -22072,13 +22304,67 @@ mod collection_toolbar_interaction_tests {
     }
 
     #[test]
-    fn dropdown_keeps_explicit_actions_and_hides_inline_name_shortcuts() {
+    fn legacy_dropdown_keeps_explicit_actions_and_renders_pins_like_buttons() {
         let mut harness = harness(crate::settings::ToolbarSectionDisplay::Dropdown, false);
         harness.run();
 
         assert!(harness.query_by_label("追加").is_some());
         assert!(harness.query_by_label("開く").is_some());
-        assert!(harness.query_by_label("Second target").is_none());
+        assert!(harness.query_by_label("Second target").is_some());
+    }
+
+    #[test]
+    fn shortcut_rows_render_only_stable_pins_while_combo_keeps_the_full_catalog() {
+        let mut harness = harness(crate::settings::ToolbarSectionDisplay::Buttons, false);
+        let first = harness.state().rows[0].0;
+        harness.state_mut().pinned = vec![first];
+        harness.run();
+
+        assert!(harness.query_by_label("First target").is_some());
+        assert!(
+            harness.query_by_label("Second target").is_none(),
+            "an unpinned catalog row must stay in the closed combo instead of becoming a shortcut"
+        );
+        let combo = harness
+            .get_by_role(egui::accesskit::Role::ComboBox)
+            .rect()
+            .center();
+        raw_click_at(&mut harness, combo, egui::PointerButton::Primary);
+        assert!(
+            harness.query_by_label("Second target").is_some(),
+            "the full catalog remains available as an Add target"
+        );
+    }
+
+    #[test]
+    fn shortcut_rows_keep_the_saved_pin_order_instead_of_catalog_order() {
+        let mut harness = harness(crate::settings::ToolbarSectionDisplay::Buttons, false);
+        let first = harness.state().rows[0].0;
+        let second = harness.state().rows[1].0;
+        harness.state_mut().pinned = vec![second, first];
+        harness.run();
+
+        let first_left = harness.get_by_label("First target").rect().left();
+        let second_left = harness.get_by_label("Second target").rect().left();
+        assert!(
+            second_left < first_left,
+            "shortcut layout must preserve the user's stable pin order"
+        );
+    }
+
+    #[test]
+    fn collection_target_and_pins_survive_an_isolated_settings_restart() {
+        let mut app = crate::app::setup_app_for_test();
+        let target = uuid::Uuid::new_v4();
+        let first_pin = uuid::Uuid::new_v4();
+        let second_pin = uuid::Uuid::new_v4();
+        app.settings.toolbar_collection_target_id = Some(target);
+        app.settings.pinned_collections = vec![first_pin, second_pin];
+        app.settings.save();
+
+        let loaded = crate::settings::Settings::load();
+        assert_eq!(loaded.toolbar_collection_target_id, Some(target));
+        assert_eq!(loaded.pinned_collections, vec![first_pin, second_pin]);
     }
 
     #[test]
@@ -22180,7 +22466,7 @@ mod collection_toolbar_interaction_tests {
         );
         raw_click(&mut add, "追加", egui::PointerButton::Primary);
         let add_intent = add.state().intent.expect("raw Add intent");
-        app.dispatch_collection_toolbar_intent(add_intent, Some(created.collection_id()));
+        app.dispatch_collection_toolbar_intent(add_intent);
         while !app.collection_toolbar_add_settled_after_revision_for_test(
             created.collection_id(),
             created.revision(),
@@ -22225,7 +22511,7 @@ mod collection_toolbar_interaction_tests {
         );
         raw_click(&mut open, "開く", egui::PointerButton::Primary);
         let open_intent = open.state().intent.expect("raw Open intent");
-        app.dispatch_collection_toolbar_intent(open_intent, Some(created.collection_id()));
+        app.dispatch_collection_toolbar_intent(open_intent);
         assert!(matches!(
             app.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Collection(identity)

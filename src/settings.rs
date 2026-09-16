@@ -4787,6 +4787,10 @@ pub struct Settings {
     /// catalog Ready時に存在確認し、削除済みなら先頭へ正規化する。
     #[serde(default)]
     pub toolbar_collection_target_id: Option<Uuid>,
+    /// ツールバーへ固定表示するコレクション。名前変更に追従するため安定 UUID を保持する。
+    /// authoritative な catalog Ready 時だけ重複・削除済み ID を整理する。
+    #[serde(default)]
+    pub pinned_collections: Vec<Uuid>,
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
@@ -6521,7 +6525,7 @@ pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
     true
 }
 fn default_toolbar_collections_display() -> ToolbarSectionDisplay {
-    ToolbarSectionDisplay::Dropdown
+    ToolbarSectionDisplay::Buttons
 }
 pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
@@ -6878,6 +6882,7 @@ impl Default for Settings {
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
             toolbar_collections_display: default_toolbar_collections_display(),
             toolbar_collection_target_id: None,
+            pinned_collections: Vec::new(),
             toolbar_favorites_collapsed: false,
             toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
@@ -8696,6 +8701,14 @@ impl Settings {
         );
         self.sns_split_frame_ratio = Some(sns_split_frame_ratio.stable_key().to_owned());
         self.grid_display_order.normalize();
+        // Collection は本棚と同じく全件 ComboBox を常設し、固定分だけをボタン表示する。
+        // 旧 compact Dropdown と将来値は読み込めるまま、Buttons 表示へ正規化する。
+        if matches!(
+            self.toolbar_collections_display,
+            ToolbarSectionDisplay::Dropdown | ToolbarSectionDisplay::Unknown
+        ) {
+            self.toolbar_collections_display = ToolbarSectionDisplay::Buttons;
+        }
         self.subfolder_expansion_filter_kinds.retain(|kind| {
             matches!(
                 kind,
@@ -9155,6 +9168,7 @@ impl Settings {
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
         self.toolbar_collections_display = src.toolbar_collections_display;
         self.toolbar_collection_target_id = src.toolbar_collection_target_id;
+        self.pinned_collections = std::mem::take(&mut src.pinned_collections);
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
         self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
@@ -12168,7 +12182,7 @@ mod tests {
         assert!(defaults.show_toolbar_collections);
         assert_eq!(
             defaults.toolbar_collections_display,
-            ToolbarSectionDisplay::Dropdown
+            ToolbarSectionDisplay::Buttons
         );
         assert!(!defaults.toolbar_collections_collapsed);
         assert_eq!(
@@ -12190,6 +12204,8 @@ mod tests {
         customized.toolbar_collections_display = ToolbarSectionDisplay::Collapsible;
         let target = Uuid::new_v4();
         customized.toolbar_collection_target_id = Some(target);
+        let pinned = Uuid::new_v4();
+        customized.pinned_collections = vec![pinned];
         customized.toolbar_collections_collapsed = true;
         let json = serde_json::to_string(&customized).unwrap();
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
@@ -12200,6 +12216,7 @@ mod tests {
             ToolbarSectionDisplay::Collapsible
         );
         assert_eq!(loaded.toolbar_collection_target_id, Some(target));
+        assert_eq!(loaded.pinned_collections, vec![pinned]);
         assert!(loaded.toolbar_collections_collapsed);
 
         let mut compact = Settings::default();
@@ -12207,8 +12224,8 @@ mod tests {
         compact.sanitize();
         assert_eq!(
             compact.toolbar_collections_display,
-            ToolbarSectionDisplay::Dropdown,
-            "the saved compact collection-toolbar preference must remain available"
+            ToolbarSectionDisplay::Buttons,
+            "legacy compact collection toolbar values normalize to the bookshelf layout"
         );
     }
 
