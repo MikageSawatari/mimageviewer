@@ -452,10 +452,13 @@ unit anchor と role で区別する。保持対象は残存 unit の source の
 Remote は navigation の `PageGroup.anchor/pages/slice` を維持し、補助のある group だけに
 role 付き `presentation` を付加する。仕様・検証状況は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。
 
-端の単ページを本来の側へ置く設定では、同じ `SpreadDisplayComposition` が
-`Center / Left / Right` の layout projection を所有する。末尾表紙補助を解決した後も実 1 page で、
-全ページを含む本であることを証明できる先頭・末尾 unit だけが対象になる。先頭側は cover 位相を含む
-見開き mode、末尾側は綴じ方向から決まり、1 page 本は先頭規則を優先する。空き側は同じ page 寸法を
+端の単ページを本来の側へ置く設定では、canonical `SpreadDisplayUnit` がpage列と
+`Paired / Singleton(UnpairedSlot | LandscapeBoundary | NonPairableBoundary)`の形成理由を一体で持ち、
+同じ `SpreadDisplayComposition` が `Center / Left / Right` の layout projection を所有する。
+末尾表紙補助を解決した後も実 1 page で、全ページを含む本であることを証明でき、かつ本当に相方slotが
+無い `UnpairedSlot` の先頭・末尾 unit だけが対象になる。現在または相方候補が横長で単独になったunitは、
+回転後判定を含め端でも `Center`。先頭側は cover 位相を含む見開き mode、末尾側は綴じ方向から決まり、
+1 page のportrait本は先頭規則を優先する。空き側は同じ page 寸法を
 使う仮想 slot であり、`SpreadPair`、navigation、occurrence、page count、source request は増やさない。
 paged / Z / 連結読み / Remote は composition の placement と物理 pixel 量子化済み gap を共用する。
 `FullscreenPageLayout` は実際に描いた側を transform に残し、navigator・範囲選択・edit hit はその値を読む。

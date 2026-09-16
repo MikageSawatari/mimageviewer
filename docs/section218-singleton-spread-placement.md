@@ -2,14 +2,16 @@
 
 ## 状態
 
-2026-09-13 に構造合意し、同日製品実装と focused 検証まで完了した設計・検証記録。仕様正本は
+2026-09-13 に構造合意し、同日製品実装と focused 検証まで完了した設計・検証記録。
+2026-09-16 の追加仕様では、端にある横長ページも中央へ置き、本当に相方 slot が不足した単ページだけを
+片側へ置くよう形成理由の所有境界を補強した。仕様正本は
 [next-release-backlog.md §1.218](next-release-backlog.md#1218-見開きの先頭末尾にある単ページを本来の側へ配置する--384-386-2026-09-11)。
 親担当と独立レビュー担当が確認した見開き構成・描画・保存・Remote の所有境界を正本として残す。
 
 ## 確認した現行境界
 
 - `SpreadDisplayUnitsCache` が、現在の item 世代、読書順、見開き mode、ずらし位置、
-  横長判定 epoch に対応する canonical な表示単位列を所有する。同じ token は、現在の列が
+  横長判定 epoch に対応する canonical な表示単位列と、その各 unit の形成理由を所有する。同じ token は、現在の列が
   Folder surface の全 page を一意に含むことを示す complete-page-permutation も memoize する。
 - `resolve_spread_display_composition` は canonical unit の位置から
   `SpreadDisplayComposition` を作り、末尾表紙補助を加えた後の実 presentation を返す。
@@ -50,22 +52,32 @@ placement は navigation demand ではなく layout projection であり、`Spre
 occurrence、anchor、page count は変えない。Remote 向け group と連結読みも、この field を
 コピーするだけで caller ごとの端判定を行わない。
 
+`SpreadDisplayUnit` はページ列と `Paired / Singleton(cause)` を同じ値に保持する。singleton の
+`cause` は `UnpairedSlot / LandscapeBoundary / NonPairableBoundary` のいずれかで、unit builder だけが
+決める。現在ページまたは本来の相方候補が横長なら `LandscapeBoundary`、現在ページまたは相方候補が
+ペア化不能なら `NonPairableBoundary`、cover 位相、ずらし segment 端、本末尾で相方 slot 自体が無い場合だけ
+`UnpairedSlot` になる。cover 先頭も先に回転後横長を評価し、横長なら cover 位相より
+`LandscapeBoundary` を優先する。形成理由は unit と同じ cache token に属し、寸法確定や保存回転の変更で
+横長判定 epoch が進むと unit と一緒に再構築する。
+
 判定は `resolve_spread_display_composition` 内で、末尾表紙補助を解決した後に一度だけ行う。
 
 1. 設定が無効、`SpreadMode::is_spread()` が偽、または complete-book proof が偽なら `Center`。
    検索、stack、部分的な visible 列、synthetic surface の先頭・末尾を本の端と誤認しない。
 2. 最終 presentation が実 1 page でなければ `Center`。したがって末尾表紙補助で実 2 page に
    なった末尾へ重ねて適用しない。
-3. canonical `unit_pos == 0` なら先頭規則を優先する。既存 unit phase に従い、
+3. canonical unit の形成理由が `Singleton(UnpairedSlot)` でなければ `Center`。横長ページと、その横長を
+   相方候補に持った縦長ページ、ペア化不能 item の境界は、先頭・末尾でも中央のままにする。
+4. canonical `unit_pos == 0` なら先頭規則を優先する。既存 unit phase に従い、
    `Ltr=Left / LtrCover=Right / Rtl=Right / RtlCover=Left`。
-4. 先頭でなく `unit_pos + 1 == units.len()` なら末尾規則。LTR は `Left`、RTL は `Right`。
-5. それ以外は `Center`。
+5. 先頭でなく `unit_pos + 1 == units.len()` なら末尾規則。LTR は `Left`、RTL は `Right`。
+6. それ以外は `Center`。
 
 先頭側は `Right iff spread_mode.is_rtl() XOR spread_mode.has_cover()` と同値で、末尾側は
 `Right iff spread_mode.is_rtl()`。この順序により、1 unit だけの本は常に先頭規則になり、
-cover有無で自然な側が変わる。途中の横長・回転後横長・読込不能で
-単独になった unit は中央のまま。先頭または末尾の横長 singleton は、端 unit であるため
-片側配置の対象になる。端判定に `idx == 0` や `items.len() - 1` を使わず、filter、自然順、
+cover有無で自然な側が変わる。ただしこの規則を使うのは `UnpairedSlot` だけである。横長・回転後横長、
+横長の相方候補によって単独になった縦長、非ペア対象の境界は、端 unit でも中央のままにする。
+端判定に `idx == 0` や `items.len() - 1` を使わず、filter、自然順、
 見開きずらし、ZIP 内 book、Remote でも同じ canonical unit position を使う。
 
 `Single`、`SplitLtr`、`SplitRtl` は見開き presentation ではないため常に `Center`。
@@ -262,7 +274,8 @@ keymap は変更しない。自動 sidecar restore の source も変更対象に
 - `Ltr / LtrCover / Rtl / RtlCover` × first / last、奇数 / 偶数、1 page first-priority。
   side表を4 modeごとに固定し、cover phaseをreading directionだけへ潰さない。
 - cover / non-cover mode、末尾表紙補助 ON/OFF。補助後 2 page は `Center` / placement 不適用。
-- middle landscape singleton は `Center`、endpoint landscape singleton は natural side。
+- middle / endpoint の横長 singleton と、横長の相方候補により単独になった縦長は `Center`。
+  片側になるのは `UnpairedSlot` の first / last だけ。
 - setting OFF、book Center、Single / split mode は現行同値。
 - filter / reorder / shift anchor を含む canonical `unit_pos` で判定し、raw idx 端を使わない。
   partial visible/search/stack/syntheticはcomplete-book proofが偽で全てCenter。
@@ -277,6 +290,7 @@ keymap は変更しない。自動 sidecar restore の source も変更対象に
 - actual painter / snapshot で4 modeのfirst/last side表、空き側 background、1 pageだけ描画を確認。
 - zoom/pan、Z zoom、navigator、edit/crop/loupe/capture/PDF hitが同じ stored transform を使用。
 - capture-time Left/Right holdoverを4経路で再描画し、folder replace / resize後も中央へ戻らない。
+- landscape singleton のpainted transformとcapture-time holdoverは `Center` を維持する。
 - preference変更でlive/final-effect geometryを更新し、previous navigation holdoverはcapture表示を維持。
 
 ### continuous / context
@@ -292,6 +306,7 @@ keymap は変更しない。自動 sidecar restore の source も変更対象に
 - `spread.db` の既存mode/flow/direction/final-cover row不変、count/clear。
 - rename/move/delete/hard-purge、metadata export/import/delete、nested ZIP、metadata refresh。
 - Remote image-folder / ZIP / PDF server group placement、collection/truncated center、serde old fallback。
+- Remote の endpoint landscape / 回転後 landscape は本体と同じ `Center`、portrait の相方不足だけ片側。
 - Web `Page / Width / Original` layout、resize/refit、single decode reuse。DOM image/request/page numberは1。
 - Remote per-book write後のanchor/slice/history保持、live global更新、protocol/frame budget。
 
@@ -320,6 +335,18 @@ Remote protocol/Webを横断するため規模は Medium。暫定 bool、caller�
 - 項目追加で高さが増えた fullscreen の表示モード popup は、利用可能高へ clamp した ScrollArea が
   見出しと全行の paint / interaction rect を所有する。576 / 720 pt でもスクロール後に本別 3 状態を
   選択できる。
+
+### 2026-09-16 追加修正
+
+- `SpreadDisplayUnit` にページ列と形成理由を一体で保持し、builder が
+  `Paired / UnpairedSlot / LandscapeBoundary / NonPairableBoundary` を一度だけ確定する。
+  cover 先頭も回転後横長なら `LandscapeBoundary` となる。
+- 共通 composition は末尾表紙補助を従来どおり先に解決し、実1pageかつ
+  `Singleton(UnpairedSlot)` のfirst / lastだけを片側へ置く。横長境界と非ペア境界は端でも`Center`。
+- paged / F12 / 複数window / 縦横連結 / holdover / Remote はtyped placementをそのまま使い、
+  caller別の縦横再判定、wire変更、detached predicateやviewport変更を追加しない。
+- unit pages、anchor、occurrence、navigation demand、seek、history、bookmark、page count、edit target、
+  末尾表紙補助、設定値の意味は変更しない。
 
 focused 検証では singleton 関連 Rust 19 件、Z の左右・active/inactive・90°回転+trim、popup の
 576 / 720 pt 実 egui 操作、DB / metadata / context / rename 境界、Remote IPC 55 件を確認した。
@@ -357,3 +384,19 @@ verification build の証拠は、この文書の最終検証節へ追記する�
   2026-09-12 18:16:07 UTC）。agent はアプリを起動・停止していない。
 - 2026-09-13、後続§1.212を含む確認buildで利用者が本体・Remoteの見開き配置を確認し、
   両方「大丈夫そう」と報告した。利用者確認済みとする。
+
+### 2026-09-16 追加修正の検証
+
+- 横長singletonの形成理由を固定する追加回帰9件と、既存の `spread_display` 3件、
+  `spread_seek` 8件、`singleton_placement` 1件、`remote_spread` 3件、`final_cover` 30件が成功した。
+  `cargo check -p mimageviewer --bin mimageviewer-core` も成功した。
+- `scripts/test-full.ps1 -SuppressCrashDialogs` は main 8585 / 0（45 ignored）を含む workspace、
+  integration、UI snapshot 52件、IPC 57件、Remote 122件（1 ignored）、doc、vendor 全体で成功した。
+- `cargo fmt --all -- --check`、`python scripts/check_ui_glyphs.py`、
+  `cargo run --locked -p viewer_context_audit --quiet`、対象pathの `git diff --check` はすべて成功した。
+- 同じsourceで `scripts/build-dev.ps1 -PreserveRuntime` が exit 0。成果物は
+  `target/dev-runtime/mimageviewer-core.exe`（SHA-256
+  `93463AF2AE96DED25AE6A21E96ADC565CFCA3E077FF2536974BA57CE9A2DA0F9`）と
+  `mimageviewer-remote.exe`（SHA-256
+  `8ABADDA66BC570D269ABB22439C2A6CA90964A5C2DF2239124CD81B01AEED0AD`）。agent はresidentを停止せず、
+  アプリも起動していない。

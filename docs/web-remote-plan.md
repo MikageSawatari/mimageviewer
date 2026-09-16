@@ -2833,8 +2833,10 @@ ZIP の中身が 1 つのフォルダにまとまっていると、本体は `co
 
 ## 16. 見開き端の単ページ配置 (§1.218、2026-09-13)
 
-coreの共通`SpreadDisplayComposition`が、complete-book proofとcanonical unit位置から
-`Center / Left / Right`を解決する。Remote serverはその値を`PageGroup.singleton_spread_placement`へ
+coreのcanonical `SpreadDisplayUnit`がpage列とtyped形成理由を同じcache tokenで持ち、共通
+`SpreadDisplayComposition`がcomplete-book proof、unit位置、形成理由から`Center / Left / Right`を解決する。
+本当に相方slotが無い`UnpairedSlot`だけがfirst / lastで片側になり、現在または相方候補が回転後横長の
+`LandscapeBoundary`と非ペア境界は端でも`Center`。Remote serverはその値を`PageGroup.singleton_spread_placement`へ
 写すだけで、container / ZIP / PDFごとの端判定を複製しない。旧payloadでfieldが無い場合は
 `Center`。collection、truncated、syntheticなど本全体を証明できない列も`Center`である。
 

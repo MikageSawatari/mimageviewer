@@ -1543,6 +1543,16 @@ Remoteも同じcompositionからserde default `Center`のplacementを受け取�
 source、page occurrence、request、DOM imageを増やさない。詳細と回帰は
 [§1.218設計・検証記録](section218-singleton-spread-placement.md)に残す。
 
+**2026-09-16 §1.218 横長singletonの端配置訂正（親Codex／独立Sol構造合意）**
+
+端unitという位置だけでは横長によるsingletonと本当に相方slotが無いsingletonを区別できなかったため、
+既存のcanonical `SpreadDisplayUnit`へpage列とtyped形成理由を一体で保持する。保存回転または寸法確定で
+横長判定epochが進むとunitと理由を同じcache tokenから再構築し、共通compositionだけが
+`UnpairedSlot`のfirst / lastを片側へ置く。main / linked F12 / 複数window / 縦横連結 / holdover / Remoteは
+同じtyped placementをコピーし、caller別の縦横判定を追加しない。detached predicate、viewport runtime、
+host identity、focus、geometry、context registryのmount / swap / park / retire規則は変更しないため、
+§2が禁じるdetached専用の症状patchではない。
+
 **2026-09-12 旧XMPタグ自動seedのcontext owner撤去（利用者了承・親Codex／独立Sol合意）**
 
 フォルダ通常load、prepared subfolder、明示metadata import終端refreshから起動していた

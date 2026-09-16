@@ -13251,10 +13251,27 @@ pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpreadDisplaySingletonCause {
+    /// The canonical segment ended before a partner slot could be filled.
+    UnpairedSlot,
+    /// This page, or the page that would otherwise partner it, is landscape.
+    LandscapeBoundary,
+    /// This page, or the page that would otherwise partner it, cannot be paired.
+    NonPairableBoundary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpreadDisplayUnitFormation {
+    Paired,
+    Singleton(SpreadDisplaySingletonCause),
+}
+
 #[derive(Clone, Debug)]
 struct SpreadDisplayUnit {
     nav_start: usize,
     pages: Vec<usize>,
+    formation: SpreadDisplayUnitFormation,
 }
 
 /// A page's role inside one visible reading unit. Navigation is projected only
@@ -13423,16 +13440,19 @@ impl SpreadDisplayComposition {
 /// same canonical unit list and token; callers may not derive a different sort
 /// or treat a truncated list as the end of a book.
 fn compose_spread_navigation_unit(
-    navigation_anchor_idx: usize,
-    navigation_pages: &[usize],
-    first_unit_pages: &[usize],
-    last_unit_pages: &[usize],
+    unit: &SpreadDisplayUnit,
+    first_unit: &SpreadDisplayUnit,
+    last_unit: &SpreadDisplayUnit,
     is_last_unit: bool,
     spread_mode: SpreadMode,
     final_cover_enabled: bool,
     singleton_placement_enabled: bool,
     complete_book_eligible: bool,
 ) -> Option<SpreadDisplayComposition> {
+    let navigation_anchor_idx = unit.anchor_idx();
+    let navigation_pages = unit.pages.as_slice();
+    let first_unit_pages = first_unit.pages.as_slice();
+    let last_unit_pages = last_unit.pages.as_slice();
     let mut base =
         SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, navigation_pages)?;
     if final_cover_enabled
@@ -13456,6 +13476,8 @@ fn compose_spread_navigation_unit(
         && singleton_placement_enabled
         && complete_book_eligible
         && base.pages.len() == 1
+        && unit.formation
+            == SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
     {
         let first = navigation_pages == first_unit_pages;
         base.singleton_placement = if first {
@@ -13494,10 +13516,9 @@ fn resolve_spread_display_composition(
     let first = units.first()?;
     let last = units.last()?;
     compose_spread_navigation_unit(
-        unit.anchor_idx(),
-        &unit.pages,
-        &first.pages,
-        &last.pages,
+        unit,
+        first,
+        last,
         unit_pos + 1 == units.len(),
         spread_mode,
         final_cover_enabled,
@@ -13726,7 +13747,28 @@ impl SpreadDisplayUnitsCache {
 }
 
 impl SpreadDisplayUnit {
+    fn paired(nav_start: usize, first: usize, second: usize) -> Self {
+        debug_assert_ne!(first, second, "a spread pair must contain distinct pages");
+        Self {
+            nav_start,
+            pages: vec![first, second],
+            formation: SpreadDisplayUnitFormation::Paired,
+        }
+    }
+
+    fn singleton(nav_start: usize, page: usize, cause: SpreadDisplaySingletonCause) -> Self {
+        Self {
+            nav_start,
+            pages: vec![page],
+            formation: SpreadDisplayUnitFormation::Singleton(cause),
+        }
+    }
+
     fn anchor_idx(&self) -> usize {
+        debug_assert!(matches!(
+            (self.formation, self.pages.len()),
+            (SpreadDisplayUnitFormation::Paired, 2) | (SpreadDisplayUnitFormation::Singleton(_), 1)
+        ));
         self.pages[0]
     }
 
@@ -13844,10 +13886,15 @@ fn build_spread_display_units_with_predicates(
     let prefix_end = shift_anchor_pos.unwrap_or(nav.len());
 
     if spread_mode.has_cover() && prefix_end > 0 {
-        units.push(SpreadDisplayUnit {
-            nav_start: 0,
-            pages: vec![nav[0]],
-        });
+        let first = nav[0];
+        let cause = if !is_pairable_idx(first) {
+            SpreadDisplaySingletonCause::NonPairableBoundary
+        } else if is_landscape_idx(0, first) {
+            SpreadDisplaySingletonCause::LandscapeBoundary
+        } else {
+            SpreadDisplaySingletonCause::UnpairedSlot
+        };
+        units.push(SpreadDisplayUnit::singleton(0, first, cause));
         pos = 1;
     }
 
@@ -14075,31 +14122,51 @@ fn append_spread_display_units_until(
 ) {
     while *pos < end_pos {
         let current = nav[*pos];
-        if !is_pairable_idx(current) || is_landscape_idx(*pos, current) {
-            units.push(SpreadDisplayUnit {
-                nav_start: *pos,
-                pages: vec![current],
-            });
+        if !is_pairable_idx(current) {
+            units.push(SpreadDisplayUnit::singleton(
+                *pos,
+                current,
+                SpreadDisplaySingletonCause::NonPairableBoundary,
+            ));
+            *pos += 1;
+            continue;
+        }
+        if is_landscape_idx(*pos, current) {
+            units.push(SpreadDisplayUnit::singleton(
+                *pos,
+                current,
+                SpreadDisplaySingletonCause::LandscapeBoundary,
+            ));
             *pos += 1;
             continue;
         }
 
         if *pos + 1 < end_pos {
             let partner = nav[*pos + 1];
-            if is_pairable_idx(partner) && !is_landscape_idx(*pos + 1, partner) {
-                units.push(SpreadDisplayUnit {
-                    nav_start: *pos,
-                    pages: vec![current, partner],
-                });
+            if !is_pairable_idx(partner) {
+                units.push(SpreadDisplayUnit::singleton(
+                    *pos,
+                    current,
+                    SpreadDisplaySingletonCause::NonPairableBoundary,
+                ));
+            } else if is_landscape_idx(*pos + 1, partner) {
+                units.push(SpreadDisplayUnit::singleton(
+                    *pos,
+                    current,
+                    SpreadDisplaySingletonCause::LandscapeBoundary,
+                ));
+            } else {
+                units.push(SpreadDisplayUnit::paired(*pos, current, partner));
                 *pos += 2;
                 continue;
             }
+        } else {
+            units.push(SpreadDisplayUnit::singleton(
+                *pos,
+                current,
+                SpreadDisplaySingletonCause::UnpairedSlot,
+            ));
         }
-
-        units.push(SpreadDisplayUnit {
-            nav_start: *pos,
-            pages: vec![current],
-        });
         *pos += 1;
     }
 }
@@ -51735,6 +51802,55 @@ mod tests {
     }
 
     #[test]
+    fn navigation_capture_keeps_a_painted_landscape_singleton_centered() {
+        let ctx = egui::Context::default();
+        let mut app = final_cover_local_test_app(1);
+        app.spread_mode = SpreadMode::Ltr;
+        app.fullscreen_idx = Some(0);
+        app.settings.singleton_spread_placement_enabled = true;
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        let pixels =
+            std::sync::Arc::new(egui::ColorImage::filled([12, 8], egui::Color32::LIGHT_BLUE));
+        let texture = ctx.load_texture(
+            "painted-landscape-singleton-capture",
+            pixels.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([12, 8]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        app.fullscreen_page_layout.push_occurrence(
+            navigator_test_transform(
+                0,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            ),
+            SpreadPageOccurrence::navigation(0, 0),
+        );
+
+        let captured = app.capture_fs_display_unit(0).unwrap();
+        assert_eq!(
+            captured.singleton_placement,
+            SingletonSpreadPlacement::Center
+        );
+    }
+
+    #[test]
     fn rtl_navigation_demand_keeps_canonical_identity_and_exact_screen_presentation() {
         let screen = vec![
             SpreadPageOccurrence::navigation(2, 2),
@@ -51947,6 +52063,112 @@ mod tests {
         app.resolve_fs_navigation_sequence_target(&ctx, 1, false);
 
         assert_eq!(navigation_target_phase(&app), navigation_awaiting(vec![1]));
+    }
+
+    #[test]
+    fn singleton_cause_and_placement_rebuild_after_late_dimensions_and_saved_rotation() {
+        let mut app = final_cover_local_test_app(1);
+        app.spread_mode = SpreadMode::Ltr;
+        app.settings.singleton_spread_placement_enabled = true;
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        let nav = app.current_grid_order().to_vec();
+        reset_spread_display_units_build_count_for_test();
+
+        let unknown_formation = app.build_spread_display_units_for_nav(&nav)[0].formation;
+        assert_eq!(
+            unknown_formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Left
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 1);
+
+        app.record_page_dims_for_spread(0, (1600, 900));
+        let landscape_formation = app.build_spread_display_units_for_nav(&nav)[0].formation;
+        assert_eq!(
+            landscape_formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::LandscapeBoundary)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 2);
+
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::Cw90);
+        app.reconcile_spread_landscape_with_rotation(0, crate::rotation_db::Rotation::Cw90);
+        let rotated_formation = app.build_spread_display_units_for_nav(&nav)[0].formation;
+        assert_eq!(
+            rotated_formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Left
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 3);
+
+        // A portrait source rotated by a saved quarter-turn becomes landscape. This is the
+        // user-visible direction of the regression, and must rebuild both the canonical cause
+        // and its composition without changing the one-page navigation topology.
+        app.record_page_dims_for_spread(0, (900, 1600));
+        let portrait_source_rotated_units = app.build_spread_display_units_for_nav(&nav);
+        assert_eq!(
+            spread_unit_summary(&portrait_source_rotated_units),
+            vec![(0, vec![0])]
+        );
+        assert_eq!(
+            portrait_source_rotated_units[0].formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::LandscapeBoundary)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 4);
+
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        app.reconcile_spread_landscape_with_rotation(0, crate::rotation_db::Rotation::None);
+        let portrait_units = app.build_spread_display_units_for_nav(&nav);
+        assert_eq!(spread_unit_summary(&portrait_units), vec![(0, vec![0])]);
+        assert_eq!(
+            portrait_units[0].formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Left
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 5);
+
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::Cw90);
+        app.reconcile_spread_landscape_with_rotation(0, crate::rotation_db::Rotation::Cw90);
+        let saved_rotation_units = app.build_spread_display_units_for_nav(&nav);
+        assert_eq!(
+            spread_unit_summary(&saved_rotation_units),
+            vec![(0, vec![0])]
+        );
+        assert_eq!(
+            saved_rotation_units[0].formation,
+            SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::LandscapeBoundary)
+        );
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(spread_display_units_build_count_for_test(), 6);
     }
 
     #[test]
@@ -64725,14 +64947,8 @@ mod tests {
     fn still_seek_track_and_source_cells_share_spread_landing_resolution() {
         let images = [4, 5, 6, 7];
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![4, 5],
-            },
-            SpreadDisplayUnit {
-                nav_start: 2,
-                pages: vec![6, 7],
-            },
+            SpreadDisplayUnit::paired(0, 4, 5),
+            SpreadDisplayUnit::paired(2, 6, 7),
         ];
         let track = resolve_still_seek_target(
             &images,
@@ -64760,14 +64976,8 @@ mod tests {
     fn still_seek_continuous_spread_highlight_and_preview_use_the_same_display_unit() {
         let images = [4, 5, 6, 7];
         let preview_units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![4, 5],
-            },
-            SpreadDisplayUnit {
-                nav_start: 2,
-                pages: vec![6, 7],
-            },
+            SpreadDisplayUnit::paired(0, 4, 5),
+            SpreadDisplayUnit::paired(2, 6, 7),
         ];
         let highlighted = pages_on_screen_with(6, Some(&preview_units));
         let resolved = resolve_still_seek_target(
@@ -64796,14 +65006,8 @@ mod tests {
     fn a_trailing_single_page_spread_unit_previews_one_page() {
         let images = [4, 5, 6];
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![4, 5],
-            },
-            SpreadDisplayUnit {
-                nav_start: 2,
-                pages: vec![6],
-            },
+            SpreadDisplayUnit::paired(0, 4, 5),
+            SpreadDisplayUnit::singleton(2, 6, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
         let resolved = resolve_still_seek_target(
             &images,
@@ -65909,14 +66113,8 @@ mod tests {
     #[test]
     fn role_composition_preserves_existing_spread_pairs_when_supplement_is_disabled() {
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![0, 1],
-            },
-            SpreadDisplayUnit {
-                nav_start: 2,
-                pages: vec![2],
-            },
+            SpreadDisplayUnit::paired(0, 0, 1),
+            SpreadDisplayUnit::singleton(2, 2, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
         for mode in [
             SpreadMode::Ltr,
@@ -65951,18 +66149,9 @@ mod tests {
     #[test]
     fn final_cover_composition_adds_a_non_navigation_occurrence_only_to_the_last_unit() {
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![0],
-            },
-            SpreadDisplayUnit {
-                nav_start: 1,
-                pages: vec![1, 2],
-            },
-            SpreadDisplayUnit {
-                nav_start: 3,
-                pages: vec![3],
-            },
+            SpreadDisplayUnit::singleton(0, 0, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::paired(1, 1, 2),
+            SpreadDisplayUnit::singleton(3, 3, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
 
         let leading =
@@ -66010,14 +66199,8 @@ mod tests {
     #[test]
     fn final_cover_composition_requires_cover_mode_complete_book_and_singleton_endpoints() {
         let singleton_endpoints = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![0],
-            },
-            SpreadDisplayUnit {
-                nav_start: 1,
-                pages: vec![1],
-            },
+            SpreadDisplayUnit::singleton(0, 0, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::singleton(1, 1, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
         for (mode, enabled, eligible) in [
             (SpreadMode::Ltr, true, true),
@@ -66037,14 +66220,8 @@ mod tests {
         }
 
         let paired_last = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![0],
-            },
-            SpreadDisplayUnit {
-                nav_start: 1,
-                pages: vec![1, 2],
-            },
+            SpreadDisplayUnit::singleton(0, 0, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::paired(1, 1, 2),
         ];
         let composition = resolve_spread_display_composition(
             &paired_last,
@@ -66066,7 +66243,11 @@ mod tests {
 
     #[test]
     fn singleton_endpoint_placement_is_owned_only_by_spread_modes() {
-        let singleton = [0usize];
+        let singleton = [SpreadDisplayUnit::singleton(
+            0,
+            0,
+            SpreadDisplaySingletonCause::UnpairedSlot,
+        )];
         for mode in [
             SpreadMode::Single,
             SpreadMode::Vertical,
@@ -66074,7 +66255,14 @@ mod tests {
             SpreadMode::SplitRtl,
         ] {
             let composition = compose_spread_navigation_unit(
-                0, &singleton, &singleton, &singleton, true, mode, false, true, true,
+                &singleton[0],
+                &singleton[0],
+                &singleton[0],
+                true,
+                mode,
+                false,
+                true,
+                true,
             )
             .unwrap();
             assert_eq!(
@@ -66088,18 +66276,9 @@ mod tests {
     #[test]
     fn singleton_endpoint_sides_follow_spread_phase_and_one_page_uses_first_priority() {
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![10],
-            },
-            SpreadDisplayUnit {
-                nav_start: 1,
-                pages: vec![20],
-            },
-            SpreadDisplayUnit {
-                nav_start: 2,
-                pages: vec![30],
-            },
+            SpreadDisplayUnit::singleton(0, 10, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::singleton(1, 20, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::singleton(2, 30, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
         for (mode, first_side, last_side) in [
             (
@@ -66145,10 +66324,11 @@ mod tests {
                 "{mode:?} last endpoint"
             );
 
-            let one_page = [SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![10],
-            }];
+            let one_page = [SpreadDisplayUnit::singleton(
+                0,
+                10,
+                SpreadDisplaySingletonCause::UnpairedSlot,
+            )];
             assert_eq!(
                 resolve_spread_display_composition(&one_page, 0, mode, false, true, true)
                     .unwrap()
@@ -66160,16 +66340,155 @@ mod tests {
     }
 
     #[test]
+    fn landscape_singletons_at_book_endpoints_stay_centered_in_every_spread_mode() {
+        let nav = [0, 1, 2, 3, 4, 5];
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+        ] {
+            for landscape_idx in [0, nav.len() - 1] {
+                let units = build_spread_display_units_with_landscape(&nav, mode, None, |idx| {
+                    idx == landscape_idx
+                });
+                let unit_pos = units
+                    .iter()
+                    .position(|unit| unit.contains_idx(landscape_idx))
+                    .unwrap();
+                assert_eq!(
+                    units[unit_pos].formation,
+                    SpreadDisplayUnitFormation::Singleton(
+                        SpreadDisplaySingletonCause::LandscapeBoundary
+                    ),
+                    "{mode:?} page {landscape_idx} formation"
+                );
+                assert_eq!(
+                    resolve_spread_display_composition(&units, unit_pos, mode, false, true, true)
+                        .unwrap()
+                        .singleton_placement(),
+                    SingletonSpreadPlacement::Center,
+                    "{mode:?} page {landscape_idx} placement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_landscape_pair_candidate_centers_the_portrait_it_leaves_single() {
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+        ] {
+            let (nav, portrait_idx, landscape_idx) = if mode.has_cover() {
+                (vec![0, 1, 2], 1, 2)
+            } else {
+                (vec![0, 1], 0, 1)
+            };
+            let units = build_spread_display_units_with_landscape(&nav, mode, None, |idx| {
+                idx == landscape_idx
+            });
+            let portrait_pos = units
+                .iter()
+                .position(|unit| unit.contains_idx(portrait_idx))
+                .unwrap();
+            assert_eq!(
+                units[portrait_pos].formation,
+                SpreadDisplayUnitFormation::Singleton(
+                    SpreadDisplaySingletonCause::LandscapeBoundary
+                ),
+                "{mode:?} portrait formation"
+            );
+            assert_eq!(
+                resolve_spread_display_composition(&units, portrait_pos, mode, false, true, true,)
+                    .unwrap()
+                    .singleton_placement(),
+                SingletonSpreadPlacement::Center,
+                "{mode:?} portrait placement"
+            );
+        }
+    }
+
+    #[test]
+    fn non_pairable_boundaries_do_not_masquerade_as_missing_partner_slots() {
+        let nav = [0, 1];
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+        ] {
+            let units = build_spread_display_units_with_predicates(
+                &nav,
+                mode,
+                None,
+                |_, _| false,
+                |idx| !mode.has_cover() && idx == 0,
+            );
+            assert!(units.iter().all(|unit| {
+                unit.formation
+                    == SpreadDisplayUnitFormation::Singleton(
+                        SpreadDisplaySingletonCause::NonPairableBoundary,
+                    )
+            }));
+            for unit_pos in 0..units.len() {
+                assert_eq!(
+                    resolve_spread_display_composition(&units, unit_pos, mode, false, true, true,)
+                        .unwrap()
+                        .singleton_placement(),
+                    SingletonSpreadPlacement::Center,
+                    "{mode:?} unit {unit_pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_page_portrait_uses_first_phase_but_one_page_landscape_stays_centered() {
+        let nav = [0];
+        for (mode, portrait_side) in [
+            (SpreadMode::Ltr, SingletonSpreadPlacement::Left),
+            (SpreadMode::LtrCover, SingletonSpreadPlacement::Right),
+            (SpreadMode::Rtl, SingletonSpreadPlacement::Right),
+            (SpreadMode::RtlCover, SingletonSpreadPlacement::Left),
+        ] {
+            let portrait = build_spread_display_units_with_landscape(&nav, mode, None, |_| false);
+            assert_eq!(
+                portrait[0].formation,
+                SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
+            );
+            assert_eq!(
+                resolve_spread_display_composition(&portrait, 0, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                portrait_side,
+                "{mode:?} one-page portrait"
+            );
+
+            let landscape = build_spread_display_units_with_landscape(&nav, mode, None, |_| true);
+            assert_eq!(
+                landscape[0].formation,
+                SpreadDisplayUnitFormation::Singleton(
+                    SpreadDisplaySingletonCause::LandscapeBoundary
+                )
+            );
+            assert_eq!(
+                resolve_spread_display_composition(&landscape, 0, mode, false, true, true)
+                    .unwrap()
+                    .singleton_placement(),
+                SingletonSpreadPlacement::Center,
+                "{mode:?} one-page landscape"
+            );
+        }
+    }
+
+    #[test]
     fn singleton_placement_requires_complete_book_and_a_real_single_page_presentation() {
         let units = vec![
-            SpreadDisplayUnit {
-                nav_start: 0,
-                pages: vec![0],
-            },
-            SpreadDisplayUnit {
-                nav_start: 1,
-                pages: vec![1],
-            },
+            SpreadDisplayUnit::singleton(0, 0, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::singleton(1, 1, SpreadDisplaySingletonCause::UnpairedSlot),
         ];
         assert_eq!(
             resolve_spread_display_composition(&units, 0, SpreadMode::Ltr, false, true, false,)
@@ -66186,6 +66505,29 @@ mod tests {
             supplemented.singleton_placement(),
             SingletonSpreadPlacement::Center
         );
+    }
+
+    #[test]
+    fn final_cover_supplement_keeps_priority_over_landscape_endpoint_placement() {
+        let nav = [0, 1, 2, 3];
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let units = build_spread_display_units_with_landscape(&nav, mode, None, |idx| idx == 3);
+            let last_pos = units.len() - 1;
+            assert_eq!(
+                units[last_pos].formation,
+                SpreadDisplayUnitFormation::Singleton(
+                    SpreadDisplaySingletonCause::LandscapeBoundary
+                )
+            );
+            let composition =
+                resolve_spread_display_composition(&units, last_pos, mode, true, true, true)
+                    .unwrap();
+            assert_eq!(composition.pages_in_reading_order().len(), 2);
+            assert_eq!(
+                composition.singleton_placement(),
+                SingletonSpreadPlacement::Center
+            );
+        }
     }
 
     #[test]
@@ -66559,6 +66901,27 @@ mod tests {
     }
 
     #[test]
+    fn vertical_and_horizontal_continuous_units_keep_landscape_singletons_centered() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            let mut app = final_cover_local_test_app(1);
+            app.spread_mode = SpreadMode::Ltr;
+            app.reading_flow = flow;
+            app.settings.singleton_spread_placement_enabled = true;
+            app.rotation_cache
+                .insert(0, crate::rotation_db::Rotation::None);
+            app.record_page_dims_for_spread(0, (1600, 900));
+
+            let (units, current_pos) = app.continuous_reading_units_and_pos(0).unwrap();
+            assert_eq!(units[current_pos].presentation.len(), 1);
+            assert_eq!(
+                units[current_pos].singleton_placement,
+                SingletonSpreadPlacement::Center,
+                "{flow:?}"
+            );
+        }
+    }
+
+    #[test]
     fn continuous_keep_rebuild_preserves_a_cover_source_needed_by_the_final_occurrence() {
         let units = vec![
             ContinuousReadingUnitSpec::pages(0, vec![0]),
@@ -66823,6 +67186,49 @@ mod tests {
                 .iter()
                 .all(|group| group.singleton_placement == SingletonSpreadPlacement::Center)
         );
+    }
+
+    #[test]
+    fn remote_endpoint_placement_matches_landscape_and_unpaired_slot_causes() {
+        let items = (0..6)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/book/{idx}.png"))))
+            .collect::<Vec<_>>();
+        for (mode, one_page_portrait_side) in [
+            (SpreadMode::Ltr, SingletonSpreadPlacement::Left),
+            (SpreadMode::LtrCover, SingletonSpreadPlacement::Right),
+            (SpreadMode::Rtl, SingletonSpreadPlacement::Right),
+            (SpreadMode::RtlCover, SingletonSpreadPlacement::Left),
+        ] {
+            for landscape_idx in [0, items.len() - 1] {
+                let mut flags = vec![false; items.len()];
+                flags[landscape_idx] = true;
+                let groups = build_remote_spread_page_groups_with_composition(
+                    &items, mode, &flags, false, true, true,
+                );
+                let group = groups
+                    .iter()
+                    .find(|group| group.indices.contains(&landscape_idx))
+                    .unwrap();
+                assert_eq!(
+                    group.singleton_placement,
+                    SingletonSpreadPlacement::Center,
+                    "{mode:?} landscape page {landscape_idx}"
+                );
+            }
+
+            let portrait = build_remote_spread_page_groups_with_composition(
+                &items[..1],
+                mode,
+                &[false],
+                false,
+                true,
+                true,
+            );
+            assert_eq!(
+                portrait[0].singleton_placement, one_page_portrait_side,
+                "{mode:?} one-page portrait"
+            );
+        }
     }
 
     #[test]
