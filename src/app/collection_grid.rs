@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::top_level_grid_view::{
-    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPhysicalLoadOrigin,
-    CollectionGridPhysicalLoadOwner, CollectionGridPosition, CollectionGridPreparedInstall,
+    CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
+    CollectionGridPhysicalLoadOrigin, CollectionGridPhysicalLoadOwner, CollectionGridPosition,
+    CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources,
     CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
-    CollectionGridSourceOpenOwner, CollectionGridThumbnailSources, CollectionGridViewportAnchor,
-    TopLevelGridRestore, TopLevelGridSurface,
+    CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
+    CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
+    TopLevelGridSurface,
 };
 use super::{App, GridItem, ViewerContextId};
 use crate::collection_store::{
@@ -53,6 +55,76 @@ impl CollectionRootDeleteResolution {
             Self::Unavailable(_) | Self::NotCollectionRoot => None,
         }
     }
+}
+
+fn hash_collection_thumbnail_identity_part(digest: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest as _;
+
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
+    sources: CollectionGridThumbnailSources,
+    cancel: &AtomicBool,
+) -> Result<CollectionGridPreparedThumbnailSources, CollectionPrepareError> {
+    use sha2::Digest as _;
+
+    if sources.video_sidecars.is_empty() && sources.video_pin_blobs.is_empty() {
+        return Ok(CollectionGridPreparedThumbnailSources::default());
+    }
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"miv.collection-thumbnail-sources.v1\0");
+
+    let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();
+    sidecars.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    digest.update((sidecars.len() as u64).to_le_bytes());
+    for (video_key, sidecar_path) in sidecars {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionPrepareError::Cancelled);
+        }
+        digest.update(b"sidecar\0");
+        hash_collection_thumbnail_identity_part(&mut digest, video_key.as_bytes());
+        let sidecar_key = crate::path_key::normalize_keep_drive(sidecar_path);
+        hash_collection_thumbnail_identity_part(&mut digest, sidecar_key.as_bytes());
+        match std::fs::metadata(sidecar_path) {
+            Ok(metadata) => {
+                digest.update([1, u8::from(metadata.is_file())]);
+                digest.update(metadata.len().to_le_bytes());
+                match metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                {
+                    Some(modified) => {
+                        digest.update([1]);
+                        digest.update(modified.as_secs().to_le_bytes());
+                        digest.update(modified.subsec_nanos().to_le_bytes());
+                    }
+                    None => digest.update([0]),
+                }
+            }
+            Err(_) => digest.update([0]),
+        }
+    }
+
+    let mut pins = sources.video_pin_blobs.iter().collect::<Vec<_>>();
+    pins.sort_unstable_by_key(|(path, _)| crate::path_key::normalize_keep_drive(path));
+    digest.update((pins.len() as u64).to_le_bytes());
+    for (video_path, webp) in pins {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionPrepareError::Cancelled);
+        }
+        digest.update(b"pin\0");
+        let video_key = crate::path_key::normalize_keep_drive(video_path);
+        hash_collection_thumbnail_identity_part(&mut digest, video_key.as_bytes());
+        digest.update(sha2::Sha256::digest(webp));
+    }
+
+    Ok(CollectionGridPreparedThumbnailSources {
+        identity: CollectionGridThumbnailSourceIdentity(digest.finalize().into()),
+        payload: sources,
+    })
 }
 
 pub(in crate::app) fn prepare_collection_grid_install(
@@ -100,12 +172,16 @@ pub(in crate::app) fn prepare_collection_grid_install(
     if cancel.load(Ordering::Acquire) {
         return Err(CollectionPrepareError::Cancelled);
     }
-    Ok(CollectionGridPreparedInstall {
-        prepared,
-        thumbnail_sources: CollectionGridThumbnailSources {
+    let thumbnail_sources = prepare_collection_grid_thumbnail_sources(
+        CollectionGridThumbnailSources {
             video_sidecars: sidecars.by_video_path,
             video_pin_blobs,
         },
+        cancel,
+    )?;
+    Ok(CollectionGridPreparedInstall {
+        prepared,
+        thumbnail_sources,
     })
 }
 
@@ -679,10 +755,14 @@ impl App {
         {
             session.accepted_revision = prepared.collection_revision;
             session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
-            session.load = if prepared.entries.is_empty() {
-                CollectionGridLoadState::Empty(prepared)
+            let presentation = Arc::new(CollectionGridInstalledPresentation::new(
+                prepared,
+                CollectionGridThumbnailSourceIdentity::default(),
+            ));
+            session.load = if presentation.prepared.entries.is_empty() {
+                CollectionGridLoadState::Empty(presentation)
             } else {
-                CollectionGridLoadState::Ready(prepared)
+                CollectionGridLoadState::Ready(presentation)
             };
             session.installed_items_generation = None;
         }
@@ -1211,9 +1291,13 @@ impl App {
             prepared,
             thumbnail_sources,
         } = install;
-        let CollectionGridThumbnailSources {
-            video_sidecars,
-            video_pin_blobs,
+        let CollectionGridPreparedThumbnailSources {
+            identity: thumbnail_source_identity,
+            payload:
+                CollectionGridThumbnailSources {
+                    video_sidecars,
+                    video_pin_blobs,
+                },
         } = thumbnail_sources;
         let prepared = Arc::new(prepared);
         let old_binding_is_current =
@@ -1337,10 +1421,14 @@ impl App {
             session.accepted_revision = prepared.collection_revision;
             session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
             session.installed_items_generation = Some(installed_generation);
-            session.load = if prepared.entries.is_empty() {
-                CollectionGridLoadState::Empty(prepared)
+            let presentation = Arc::new(CollectionGridInstalledPresentation::new(
+                prepared,
+                thumbnail_source_identity,
+            ));
+            session.load = if presentation.prepared.entries.is_empty() {
+                CollectionGridLoadState::Empty(presentation)
             } else {
-                CollectionGridLoadState::Ready(prepared)
+                CollectionGridLoadState::Ready(presentation)
             };
         }
     }
@@ -1354,7 +1442,7 @@ impl App {
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
-                thumbnail_sources: CollectionGridThumbnailSources::default(),
+                thumbnail_sources: CollectionGridPreparedThumbnailSources::default(),
             },
             previous,
         );
@@ -3013,7 +3101,9 @@ mod tests {
                 .unwrap();
             session.accepted_revision = prepared.collection_revision;
             session.wanted_revision = prepared.collection_revision;
-            session.load = CollectionGridLoadState::Ready(prepared);
+            session.load = CollectionGridLoadState::Ready(
+                CollectionGridInstalledPresentation::without_thumbnail_sources(prepared),
+            );
             session.installed_items_generation = Some(generation);
         });
         let target = app
@@ -3082,7 +3172,9 @@ mod tests {
                 .unwrap();
             session.accepted_revision = parked_prepared.collection_revision;
             session.wanted_revision = parked_prepared.collection_revision;
-            session.load = CollectionGridLoadState::Ready(parked_prepared);
+            session.load = CollectionGridLoadState::Ready(
+                CollectionGridInstalledPresentation::without_thumbnail_sources(parked_prepared),
+            );
             session.installed_items_generation = Some(generation);
         });
 

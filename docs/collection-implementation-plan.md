@@ -1046,9 +1046,9 @@ focused / full / static / verification build保留証跡は
   名前変更、追加先指定、固定、削除、開くを同じ列で提供する。entry一覧は置かず、内容はメインGridを正本とする。
   definition削除は参照だけを削除し、source file / folderを変更しない。
 - 上部に`コレクション`メニューを`製本`の隣へ追加した。保存済みの旧menu orderへは`製本`直後に補完する。
-  メニューの`追加` / `開く`はglobalな追加先を対象とし、import / export、order mode / sort、再リンク、手動移動は
-  現在表示中のexact Collection rootだけを対象とする。Grid requestはsurface stampとentry IDを運び、latest/full actor
-  snapshotを読んでからmutationする。Standard表示中の手動移動、stale surface、対象なしは理由付きで無効にする。
+  メニューの`追加` / `開く`はglobalな追加先を対象とし、import / export、order mode / sort、専用並べ替え画面は
+  現在表示中のexact Collection rootだけを対象とする。Grid requestはsurface stampとrevisionを運び、latest/full actor
+  snapshotを読んでから専用画面を開く。Standard表示中、stale surface、対象なしは理由付きで無効にする。
 - toolbarは本棚と同じく全catalogの追加先comboと明示的な`追加` / `開く`を常設し、固定したstable UUIDだけを
   左Open / 右Addのshortcutとして表示する。表示形式は`展開` / `折りたたみ`の2種類とし、旧`プルダウン` / unknown
   保存値は読込時に`展開`へ正規化する。追加先と固定列はauthoritative Ready catalogだけでorder-preserving dedupe / prune
@@ -1057,8 +1057,8 @@ focused / full / static / verification build保留証跡は
   cancelせず、明示取消だけがそのoriginのworkerを止める。classification完了時もexact Grid stampを再検証し、別surfaceへ
   移った後のlate resultをactorへ送らない。actor成功後のGrid / Remote収束は既存revision watchを維持する。
 - 本棚はページ画像を本フォルダへコピーする製本機能、Collectionは既存file / folder / book / ZIP / PDFへの参照であり、
-  データモデルは統合しない。virtual pageを親pathへ丸めず、未対応対象は理由付きで無効にする。import / export / relink、
-  manual order、履歴、再生、Remote read-onlyの既存契約を維持する。
+  データモデルは統合しない。virtual pageを親pathへ丸めず、未対応対象は理由付きで無効にする。import / export、
+  manual order、履歴、再生、Remote read-onlyの既存契約を維持する。参照再リンクはUIから撤去し、登録解除→再追加を案内する。
 - 検証は`collections` 63件、collection toolbar 8件、menu layout 13件、旧menu補完1件、追加のpin順2件と
   modal input gate 1件をfocusedで通した。`test-full.ps1 -SuppressCrashDialogs`は本体8613件成功・0失敗・45 ignored、
   vendor egui / egui-wgpu / eframeは25 / 9 / 15件成功し`[test-full] PASS`だった。初回fullで既存navigation testが
@@ -1068,3 +1068,33 @@ focused / full / static / verification build保留証跡は
   latest/full actor snapshot、manager / global add target / current Gridの分離、stable pin順、modal input gateを確認して
   重要指摘なしとした。`build-dev.ps1 -PreserveRuntime`はresident不在を確認してcore / Remote serviceとVCRT PE検査を
   exit 0で完了した。通常profile、real data、GUIアプリは起動・操作していない。
+
+## 22. 再生navigationの同一root再利用と専用並べ替え画面（2026-09-16）
+
+- linked別窓のnext / prev / EOFでactor prepareが既存rootと完全一致するとき、target / originだけをinstalled binding上で
+  解決し、Gridを再installしない。presentation identityはordered entry ID / source key / path / availability / item /
+  display metadataと、prepare workerがsidecar path・metadataおよびpin blob SHA-256から作る固定長identityを一つに所有する。
+  pin blob payloadはinstalled bindingへ複製せずthumbnail workerへmoveする。filesystem facts、thumbnail source、revision、順序、sourceが
+  変わった場合は従来どおり再installし、latestを採用する。これによりmain一覧のgeneration、Autoサムネ比率、scroll、
+  thumbnail worker / queue / cacheをviewer cursor移動で初期化しない。
+- 手動順は上部`コレクション`メニューの「現在のコレクションを並べ替え…」から専用サムネイルwindowを開く。本棚と
+  同じ単一 / Ctrl / Shift複数選択、group drag、挿入marker、edge auto-scroll、左右移動、thumb size、hover previewを
+  提供する。actor snapshotのfull manual entry列を正本とし、filter / Standard表示順やEntryId sortから順序を作らない。
+  dirty closeは保存完了までwindow ownerを保持し、Conflict / errorでは編集中の順を保持する。Conflictは再試行せず、
+  「最新内容を読み直す（変更破棄）」または「変更を破棄して閉じる」で明示的に回復する。
+- `選択中の参照を再リンク`はメニュー / dispatch UIから撤去した。legacy saved menu IDは読取互換のためparseできるが
+  描画しない。既存entry / missing表示、store migration、import / export、remove→add、source非変更、Remote read-onlyは
+  維持する。参照先を変える利用者操作は登録解除→再追加とする。
+- focusedはcollection navigation 20 / 20、collection Grid 22 / 22、専用並べ替え・管理 27 / 27、legacy relink
+  menu互換 1 / 1が成功した。`scripts/test-full.ps1 -SuppressCrashDialogs`は本体8625件成功・0失敗・45 ignored、
+  UI snapshot 52 / 52、IPC 57 / 57、Remote 122件成功（1 ignored）、vendor egui / egui-wgpu / eframe
+  25 / 9 / 15で`[test-full] PASS`、exit 0だった。core check、fmt、UI glyph（0件）、viewer-context audit、
+  diff checkもexit 0。独立reviewerはcomplete presentation / thumbnail source identity、payload move、actual poll、
+  split context、D&D conflict回復を再確認し、重要指摘なしで承認した。
+- resident mImageViewer / core / Remote processが見えないことを確認し、`scripts/build-dev.ps1 -PreserveRuntime`を実行した。
+  core / RemoteとVCRT PE検査（runtime 4 / PE 2）はexit 0。core SHA-256は
+  `B9B6EB86FAEDB00124AB8E0B111A432B08285DA707080EED04DFC608D77B9FE6`、Remoteは
+  `8ABADDA66BC570D269ABB22439C2A6CA90964A5C2DF2239124CD81B01AEED0AD`。通常profile / real data / GUIは起動・
+  操作していない。専用並べ替えwindowの実動画サムネイル、実ドラッグ、linked別窓動画nextは利用者確認へ引き渡した。
+- 2026-09-16、上記確認用ビルドの引き渡し後、利用者から「治りました。コミットお願いします。」との実機確認・
+  コミット承認を受領した。個々の操作項目についての詳細な結果は未採取であり、agentによる実機検証とは区別する。

@@ -1454,6 +1454,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-16 collection root再生navigationの表示binding再利用（親Codex／独立Sol構造合意）**
+
+linked別窓のnext / prev / EOFが同一collection rootを解決するたびにGridを再installし、main一覧の
+items generation、thumbnail worker / queue、Autoサムネ比率、scrollを初期化していた。viewer cursorの移動と
+Grid presentationの更新を分け、同じcontextのinstalled rootとactor prepareが、ordered entry ID / source key /
+path / availability / item kind・identity / display metadataに加え、video sidecar / pin blobのthumbnail sourceまで
+prepare workerが作る固定長identityで完全一致するときだけ既存bindingを再利用する。identityはsidecar path・metadataと
+pin blob SHA-256を含み、blob payloadはinstalled bindingへ複製せずworkerへmoveする。filesystem factsまたはthumbnail sourceが変わった場合は従来どおり
+再installし、latestを採用する。splitされた別bundleは自分のgeneration / workerを作り、main bundleのitems、cache、
+queue、Auto比率、scrollを変更しない。detached固有predicate、viewport、host identity、focus、geometry、window
+lifecycle、新しいbool / delay / retryは追加していない。actual poll→commitのmanual nextとsplit bundle回帰で所有境界を固定した。
+
 **2026-09-16 collection physical owner / thumbnail worker寿命（親Codex／独立Sol構造合意）**
 
 collection rootからFolder / ZIP / PDFへ開く要求は、source anchor、surface stamp、revision、

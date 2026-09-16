@@ -42305,7 +42305,9 @@ fn install_collection_item_for_detached_plan(
     let session = app.top_level_grid_view.collection_session_mut().unwrap();
     session.accepted_revision = 7;
     session.wanted_revision = 7;
-    session.load = CollectionGridLoadState::Ready(prepared);
+    session.load = CollectionGridLoadState::Ready(
+        crate::app::top_level_grid_view::CollectionGridInstalledPresentation::without_thumbnail_sources(prepared),
+    );
     session.installed_items_generation = Some(generation);
     crate::app::top_level_grid_view::CollectionGridRestore {
         identity: CollectionGridIdentity { collection_id },

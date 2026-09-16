@@ -29,7 +29,7 @@ fn path_display_name(path: &Path) -> Cow<'_, str> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),

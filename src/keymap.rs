@@ -2828,7 +2828,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
         id: MenuCommandId::CollectionsReorderCurrent,
         parent: TopMenuId::Collections,
-        label: "選択中の参照を手動で移動",
+        label: "現在のコレクションを並べ替え…",
         action: None,
     },
     MenuCommandSpec {
@@ -2958,10 +2958,13 @@ pub fn menu_command_catalog() -> &'static [MenuCommandSpec] {
 }
 
 fn menu_command_is_available_in_build(id: MenuCommandId) -> bool {
-    !matches!(
-        id,
-        MenuCommandId::FileMetadataExport | MenuCommandId::FileMetadataImport
-    ) || crate::metadata_transfer::UI_ENABLED
+    match id {
+        MenuCommandId::CollectionsRelinkCurrent => false,
+        MenuCommandId::FileMetadataExport | MenuCommandId::FileMetadataImport => {
+            crate::metadata_transfer::UI_ENABLED
+        }
+        _ => true,
+    }
 }
 
 pub fn menu_commands_for_parent(parent: TopMenuId) -> impl Iterator<Item = MenuCommandSpec> {
@@ -9940,6 +9943,47 @@ mod tests {
             assert_eq!(MenuCommandId::parse_stable_name(id.stable_name()), Some(id));
         }
         assert_eq!(MenuCommandId::parse_stable_name("FutureCommand"), None);
+    }
+
+    #[test]
+    fn legacy_collection_relink_id_remains_readable_but_is_not_rendered() {
+        assert_eq!(
+            MenuCommandId::parse_stable_name("CollectionsRelinkCurrent"),
+            Some(MenuCommandId::CollectionsRelinkCurrent)
+        );
+        let visible = menu_commands_for_parent(TopMenuId::Collections)
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        assert!(!visible.contains(&MenuCommandId::CollectionsRelinkCurrent));
+        assert!(visible.contains(&MenuCommandId::CollectionsReorderCurrent));
+        assert_eq!(
+            menu_command_spec(MenuCommandId::CollectionsReorderCurrent)
+                .unwrap()
+                .label,
+            "現在のコレクションを並べ替え…"
+        );
+
+        let saved = MenuLayoutSettings {
+            top_menu_order: vec!["Collections".into()],
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Collections".into(),
+                commands: vec![
+                    "CollectionsRelinkCurrent".into(),
+                    "CollectionsReorderCurrent".into(),
+                ],
+            }],
+            hidden_commands: Vec::new(),
+        };
+        let resolved = resolve_menu_layout(&saved);
+        let commands = resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Collections)
+            .unwrap()
+            .commands
+            .clone();
+        assert!(!commands.contains(&MenuCommandId::CollectionsRelinkCurrent));
+        assert!(commands.contains(&MenuCommandId::CollectionsReorderCurrent));
     }
 
     #[test]

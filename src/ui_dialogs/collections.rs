@@ -14,14 +14,25 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::collection_store::{
-    CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntryId, CollectionId,
-    CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
+    CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntry, CollectionEntryId,
+    CollectionId, CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
     CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
     CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
     CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime, parse_collection_text,
     prepare_collection_export, prepare_collection_registrations, serialize_collection_paths,
     write_collection_export_atomic,
 };
+
+const COLLECTION_REORDER_DEFAULT_WINDOW_W: f32 = 880.0;
+const COLLECTION_REORDER_DEFAULT_WINDOW_H: f32 = 640.0;
+const COLLECTION_REORDER_MIN_WINDOW_W: f32 = 560.0;
+const COLLECTION_REORDER_MIN_WINDOW_H: f32 = 360.0;
+const COLLECTION_REORDER_DEFAULT_TILE_PX: f32 = 128.0;
+const COLLECTION_REORDER_MIN_TILE_PX: f32 = 72.0;
+const COLLECTION_REORDER_MAX_TILE_PX: f32 = 240.0;
+const COLLECTION_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 48.0;
+const COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 18.0;
+const COLLECTION_REORDER_SCROLLBAR_RESERVE_PX: f32 = 24.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CollectionRuntimePhase {
@@ -260,18 +271,62 @@ pub(crate) enum CollectionGridSnapshotAction {
         mode: CollectionOrderMode,
         sort: crate::settings::SortOrder,
     },
-    Relink {
-        path: PathBuf,
-    },
-    Move {
-        direction: MoveEntry,
-    },
+    OpenReorder,
+}
+
+impl CollectionGridSnapshotAction {
+    fn requires_exact_root_revision(&self) -> bool {
+        matches!(self, Self::OpenReorder)
+    }
 }
 
 struct CollectionGridSnapshotRequest {
     target: crate::app::collection_grid::CollectionGridContentTarget,
     action: CollectionGridSnapshotAction,
     receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+}
+
+#[derive(Clone)]
+struct CollectionReorderEntry {
+    entry: CollectionEntry,
+    texture: Option<egui::TextureHandle>,
+}
+
+enum CollectionReorderPhase {
+    Ready,
+    Saving {
+        receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+    },
+    Refreshing {
+        receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+    },
+    Error {
+        message: String,
+        conflict: bool,
+    },
+}
+
+impl CollectionReorderPhase {
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Saving { .. } | Self::Refreshing { .. })
+    }
+}
+
+struct CollectionReorderState {
+    collection_id: CollectionId,
+    collection_name: String,
+    base_revision: u64,
+    entries: Vec<CollectionReorderEntry>,
+    selected: Option<usize>,
+    selected_ids: HashSet<CollectionEntryId>,
+    selection_anchor: Option<usize>,
+    dragging: Option<usize>,
+    drag_auto_scroll_enabled: bool,
+    drag_insert_index: Option<usize>,
+    scroll_offset_y: f32,
+    thumb_tile_px: f32,
+    dirty: bool,
+    phase: CollectionReorderPhase,
 }
 
 enum CollectionDialogOperation {
@@ -438,6 +493,7 @@ pub(crate) struct CollectionUiState {
     message: Option<(bool, String)>,
     manager_new_name: String,
     manager_rename_inputs: HashMap<CollectionId, String>,
+    reorder: Option<CollectionReorderState>,
 }
 
 impl Default for CollectionUiState {
@@ -462,6 +518,7 @@ impl Default for CollectionUiState {
             message: None,
             manager_new_name: String::new(),
             manager_rename_inputs: HashMap::new(),
+            reorder: None,
         }
     }
 }
@@ -469,6 +526,10 @@ impl Default for CollectionUiState {
 impl CollectionUiState {
     fn can_edit(&self) -> bool {
         matches!(self.phase, CollectionRuntimePhase::Ready)
+            && self
+                .reorder
+                .as_ref()
+                .is_none_or(|state| !state.phase.is_busy())
     }
 
     fn install_runtime(&mut self, runtime: CollectionStoreRuntime) {
@@ -658,7 +719,530 @@ fn collection_error_message(error: &CollectionStoreError) -> String {
     }
 }
 
+fn collection_reorder_select_single(state: &mut CollectionReorderState, index: usize) {
+    state.selected_ids.clear();
+    if let Some(entry) = state.entries.get(index) {
+        state.selected_ids.insert(entry.entry.id);
+        state.selected = Some(index);
+        state.selection_anchor = Some(index);
+    }
+}
+
+fn collection_reorder_toggle_selection(state: &mut CollectionReorderState, index: usize) {
+    let Some(entry_id) = state.entries.get(index).map(|entry| entry.entry.id) else {
+        return;
+    };
+    if !state.selected_ids.remove(&entry_id) {
+        state.selected_ids.insert(entry_id);
+    }
+    if state.selected_ids.is_empty() {
+        state.selected_ids.insert(entry_id);
+    }
+    state.selected = Some(index);
+    state.selection_anchor = Some(index);
+}
+
+fn collection_reorder_select_range(state: &mut CollectionReorderState, index: usize) {
+    if state.entries.is_empty() {
+        return;
+    }
+    let anchor = state
+        .selection_anchor
+        .unwrap_or_else(|| state.selected.unwrap_or(index))
+        .min(state.entries.len() - 1);
+    let start = anchor.min(index);
+    let end = anchor.max(index).min(state.entries.len() - 1);
+    state.selected_ids.clear();
+    for entry in &state.entries[start..=end] {
+        state.selected_ids.insert(entry.entry.id);
+    }
+    state.selected = Some(index.min(state.entries.len() - 1));
+}
+
+fn ensure_collection_reorder_selection(state: &mut CollectionReorderState) {
+    let live_ids = state
+        .entries
+        .iter()
+        .map(|entry| entry.entry.id)
+        .collect::<HashSet<_>>();
+    state.selected_ids.retain(|id| live_ids.contains(id));
+    if state.entries.is_empty() {
+        state.selected = None;
+        state.selection_anchor = None;
+        return;
+    }
+    let selected = state
+        .selected
+        .unwrap_or(0)
+        .min(state.entries.len().saturating_sub(1));
+    if state.selected_ids.is_empty() {
+        collection_reorder_select_single(state, selected);
+        return;
+    }
+    state.selected = Some(selected);
+    state.selection_anchor = state
+        .selection_anchor
+        .map(|anchor| anchor.min(state.entries.len().saturating_sub(1)))
+        .or(Some(selected));
+}
+
+fn selected_collection_reorder_indices(state: &CollectionReorderState) -> Vec<usize> {
+    state
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            state
+                .selected_ids
+                .contains(&entry.entry.id)
+                .then_some(index)
+        })
+        .collect()
+}
+
+fn move_selected_collection_reorder_group(
+    state: &mut CollectionReorderState,
+    insert_index: usize,
+) -> bool {
+    let selected_indices = selected_collection_reorder_indices(state);
+    if selected_indices.is_empty() {
+        return false;
+    }
+    let before = state
+        .entries
+        .iter()
+        .map(|entry| entry.entry.id)
+        .collect::<Vec<_>>();
+    let focus_id = state
+        .selected
+        .and_then(|index| state.entries.get(index))
+        .map(|entry| entry.entry.id);
+    let removed_before = selected_indices
+        .iter()
+        .filter(|index| **index < insert_index.min(state.entries.len()))
+        .count();
+    let destination = insert_index
+        .min(state.entries.len())
+        .saturating_sub(removed_before);
+    let selected_ids = state.selected_ids.clone();
+    let mut moving = Vec::with_capacity(selected_indices.len());
+    let mut remaining = Vec::with_capacity(state.entries.len() - selected_indices.len());
+    for entry in state.entries.drain(..) {
+        if selected_ids.contains(&entry.entry.id) {
+            moving.push(entry);
+        } else {
+            remaining.push(entry);
+        }
+    }
+    let destination = destination.min(remaining.len());
+    remaining.splice(destination..destination, moving);
+    state.entries = remaining;
+    state.selected =
+        focus_id.and_then(|id| state.entries.iter().position(|entry| entry.entry.id == id));
+    let after = state
+        .entries
+        .iter()
+        .map(|entry| entry.entry.id)
+        .collect::<Vec<_>>();
+    before != after
+}
+
+fn move_selected_collection_reorder_by(state: &mut CollectionReorderState, delta: i32) -> bool {
+    let before = state
+        .entries
+        .iter()
+        .map(|entry| entry.entry.id)
+        .collect::<Vec<_>>();
+    if delta < 0 {
+        for index in 1..state.entries.len() {
+            let selected = state.selected_ids.contains(&state.entries[index].entry.id);
+            let previous_selected = state
+                .selected_ids
+                .contains(&state.entries[index - 1].entry.id);
+            if selected && !previous_selected {
+                state.entries.swap(index, index - 1);
+            }
+        }
+    } else if delta > 0 {
+        for index in (0..state.entries.len().saturating_sub(1)).rev() {
+            let selected = state.selected_ids.contains(&state.entries[index].entry.id);
+            let next_selected = state
+                .selected_ids
+                .contains(&state.entries[index + 1].entry.id);
+            if selected && !next_selected {
+                state.entries.swap(index, index + 1);
+            }
+        }
+    }
+    let focus_id = state.selected.and_then(|index| before.get(index)).copied();
+    state.selected =
+        focus_id.and_then(|id| state.entries.iter().position(|entry| entry.entry.id == id));
+    before
+        != state
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>()
+}
+
+fn collection_reorder_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
+    let content_width = (available_width - COLLECTION_REORDER_SCROLLBAR_RESERVE_PX).max(tile_width);
+    (((content_width + gap) / (tile_width + gap))
+        .floor()
+        .max(4.0)) as usize
+}
+
+fn collection_reorder_scroll_height(available_height: f32, rows: usize, row_height: f32) -> f32 {
+    let content_height = rows.max(1) as f32 * row_height;
+    content_height
+        .min(available_height.max(row_height))
+        .max(row_height)
+}
+
+fn collection_reorder_auto_scroll_delta(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> f32 {
+    let height = (viewport_bottom - viewport_top).max(0.0);
+    if height <= 1.0 {
+        return 0.0;
+    }
+    let edge = COLLECTION_REORDER_AUTO_SCROLL_EDGE_PX
+        .min(height * 0.45)
+        .max(1.0);
+    if pointer_y < viewport_top + edge {
+        -((viewport_top + edge - pointer_y) / edge).clamp(0.0, 1.0)
+            * COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX
+    } else if pointer_y > viewport_bottom - edge {
+        ((pointer_y - (viewport_bottom - edge)) / edge).clamp(0.0, 1.0)
+            * COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX
+    } else {
+        0.0
+    }
+}
+
+fn collection_reorder_drop_target_for_pos(
+    rect: egui::Rect,
+    item_index: usize,
+    len: usize,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<(usize, f32)> {
+    let pos = pointer_pos?;
+    if !rect.contains(pos) {
+        return None;
+    }
+    let insert_after = pos.x >= rect.center().x;
+    Some((
+        if insert_after {
+            item_index + 1
+        } else {
+            item_index
+        }
+        .min(len),
+        if insert_after {
+            rect.right() + 4.0
+        } else {
+            rect.left() - 4.0
+        },
+    ))
+}
+
+fn draw_collection_reorder_insert_indicator(ui: &egui::Ui, x: f32, rect: egui::Rect) {
+    let y0 = rect.top() + 5.0;
+    let y1 = rect.bottom() - 5.0;
+    if y1 <= y0 {
+        return;
+    }
+    let stroke = egui::Stroke::new(3.0, ui.visuals().selection.stroke.color);
+    let painter = ui.painter();
+    painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
+    painter.line_segment([egui::pos2(x - 6.0, y0), egui::pos2(x + 6.0, y0)], stroke);
+    painter.line_segment([egui::pos2(x - 6.0, y1), egui::pos2(x + 6.0, y1)], stroke);
+}
+
 impl App {
+    fn collection_reorder_textures_for(
+        &self,
+        collection_id: CollectionId,
+        revision: u64,
+    ) -> HashMap<CollectionEntryId, egui::TextureHandle> {
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return HashMap::new();
+        };
+        if session.identity.collection_id != collection_id
+            || !matches!(
+                session.position,
+                crate::app::top_level_grid_view::CollectionGridPosition::Root
+            )
+            || session.accepted_revision != revision
+            || session.installed_items_generation != Some(self.items_generation)
+        {
+            return HashMap::new();
+        }
+        let Some(prepared) = session.prepared() else {
+            return HashMap::new();
+        };
+        if prepared.collection_revision != revision || prepared.entries.len() != self.items.len() {
+            return HashMap::new();
+        }
+        prepared
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let texture =
+                    self.thumb_adjust_tex.get(&index).cloned().or_else(|| {
+                        match self.thumbnails.get(index) {
+                            Some(crate::grid_item::ThumbnailState::Loaded { tex, .. }) => {
+                                Some(tex.clone())
+                            }
+                            _ => None,
+                        }
+                    })?;
+                Some((entry.entry_id, texture))
+            })
+            .collect()
+    }
+
+    fn open_collection_reorder(
+        &mut self,
+        snapshot: CollectionSnapshot,
+        selected_entry_id: Option<CollectionEntryId>,
+    ) {
+        let textures =
+            self.collection_reorder_textures_for(snapshot.collection_id(), snapshot.revision());
+        let entries = snapshot
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| CollectionReorderEntry {
+                texture: textures.get(&entry.id).cloned(),
+                entry,
+            })
+            .collect::<Vec<_>>();
+        let selected = selected_entry_id
+            .and_then(|id| entries.iter().position(|entry| entry.entry.id == id))
+            .or((!entries.is_empty()).then_some(0));
+        let selected_ids = selected
+            .and_then(|index| entries.get(index))
+            .map(|entry| HashSet::from([entry.entry.id]))
+            .unwrap_or_default();
+        let base_revision = snapshot.revision();
+        self.collection_ui.reorder = Some(CollectionReorderState {
+            collection_id: snapshot.collection_id(),
+            collection_name: snapshot.definition.name,
+            base_revision,
+            entries,
+            selected,
+            selected_ids,
+            selection_anchor: selected,
+            dragging: None,
+            drag_auto_scroll_enabled: false,
+            drag_insert_index: None,
+            scroll_offset_y: 0.0,
+            thumb_tile_px: COLLECTION_REORDER_DEFAULT_TILE_PX,
+            dirty: false,
+            phase: CollectionReorderPhase::Ready,
+        });
+    }
+
+    fn refresh_collection_reorder_textures(&mut self) {
+        let Some(state) = self.collection_ui.reorder.as_ref() else {
+            return;
+        };
+        let collection_id = state.collection_id;
+        let revision = state.base_revision;
+        let textures = self.collection_reorder_textures_for(collection_id, revision);
+        if textures.is_empty() {
+            return;
+        }
+        if let Some(state) = self.collection_ui.reorder.as_mut()
+            && state.collection_id == collection_id
+            && state.base_revision == revision
+        {
+            for entry in &mut state.entries {
+                if entry.texture.is_none() {
+                    entry.texture = textures.get(&entry.entry.id).cloned();
+                }
+            }
+        }
+    }
+
+    fn start_collection_reorder_save(&mut self) {
+        let Some(state) = self.collection_ui.reorder.as_mut() else {
+            return;
+        };
+        if state.phase.is_busy() || !state.dirty {
+            return;
+        }
+        let Some(client) = self.collection_ui.client.clone() else {
+            state.phase = CollectionReorderPhase::Error {
+                message: "コレクションを利用できません。".into(),
+                conflict: false,
+            };
+            return;
+        };
+        let order = state
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+        match client.reorder_manual(state.collection_id, state.base_revision, order) {
+            Ok(receiver) => state.phase = CollectionReorderPhase::Saving { receiver },
+            Err(error) => {
+                state.phase = CollectionReorderPhase::Error {
+                    message: collection_error_message(&error),
+                    conflict: matches!(error, CollectionStoreError::Conflict { .. }),
+                };
+            }
+        }
+    }
+
+    fn start_collection_reorder_refresh(&mut self) {
+        let Some(state) = self.collection_ui.reorder.as_mut() else {
+            return;
+        };
+        if state.phase.is_busy() {
+            return;
+        }
+        let Some(client) = self.collection_ui.client.clone() else {
+            state.phase = CollectionReorderPhase::Error {
+                message: "コレクションを利用できません。".into(),
+                conflict: false,
+            };
+            return;
+        };
+        match client.load_collection(state.collection_id) {
+            Ok(receiver) => state.phase = CollectionReorderPhase::Refreshing { receiver },
+            Err(error) => {
+                state.phase = CollectionReorderPhase::Error {
+                    message: collection_error_message(&error),
+                    conflict: matches!(error, CollectionStoreError::Conflict { .. }),
+                };
+            }
+        }
+    }
+
+    fn poll_collection_reorder(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.collection_ui.reorder.as_mut() else {
+            return;
+        };
+        let phase = std::mem::replace(&mut state.phase, CollectionReorderPhase::Ready);
+        match phase {
+            CollectionReorderPhase::Ready | CollectionReorderPhase::Error { .. } => {
+                state.phase = phase;
+            }
+            CollectionReorderPhase::Saving { receiver } => match receiver.try_recv() {
+                Ok(Ok(snapshot)) if snapshot.collection_id() == state.collection_id => {
+                    let collection_id = state.collection_id;
+                    self.collection_ui.reorder = None;
+                    self.collection_ui
+                        .request_catalog(self.collection_ui.wanted_catalog_revision);
+                    if self.collection_ui.selected_id == Some(collection_id) {
+                        self.collection_ui.install_snapshot(snapshot);
+                    }
+                    self.collection_ui.message =
+                        Some((false, "コレクションの順序を保存しました。".into()));
+                    self.show_feedback_toast("コレクションの順序を保存しました。".into());
+                }
+                Ok(Ok(_)) => {
+                    state.phase = CollectionReorderPhase::Error {
+                        message: "保存先のコレクション応答が一致しませんでした。".into(),
+                        conflict: true,
+                    };
+                }
+                Ok(Err(error)) => {
+                    let conflict = matches!(error, CollectionStoreError::Conflict { .. });
+                    let message = collection_error_message(&error);
+                    state.phase = CollectionReorderPhase::Error {
+                        message: message.clone(),
+                        conflict,
+                    };
+                    self.collection_ui.message = Some((true, message));
+                    if conflict {
+                        self.collection_ui
+                            .request_catalog(self.collection_ui.wanted_catalog_revision);
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    state.phase = CollectionReorderPhase::Saving { receiver };
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    state.phase = CollectionReorderPhase::Error {
+                        message: "コレクション保存の応答が失われました。".into(),
+                        conflict: false,
+                    };
+                }
+            },
+            CollectionReorderPhase::Refreshing { receiver } => match receiver.try_recv() {
+                Ok(Ok(snapshot))
+                    if snapshot.collection_id() == state.collection_id
+                        && snapshot.definition.order_mode == CollectionOrderMode::Manual =>
+                {
+                    let revision = snapshot.revision();
+                    let old_textures = state
+                        .entries
+                        .iter()
+                        .filter_map(|entry| {
+                            entry
+                                .texture
+                                .clone()
+                                .map(|texture| (entry.entry.id, texture))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    state.collection_name = snapshot.definition.name;
+                    state.base_revision = revision;
+                    state.entries = snapshot
+                        .entries
+                        .iter()
+                        .cloned()
+                        .map(|entry| CollectionReorderEntry {
+                            texture: old_textures.get(&entry.id).cloned(),
+                            entry,
+                        })
+                        .collect();
+                    state.selected = (!state.entries.is_empty()).then_some(0);
+                    state.selected_ids.clear();
+                    state.selection_anchor = state.selected;
+                    state.dragging = None;
+                    state.drag_auto_scroll_enabled = false;
+                    state.drag_insert_index = None;
+                    state.dirty = false;
+                    state.phase = CollectionReorderPhase::Ready;
+                    ensure_collection_reorder_selection(state);
+                }
+                Ok(Ok(_)) => {
+                    state.phase = CollectionReorderPhase::Error {
+                        message: "最新内容は手動順ではないため、並べ替えを続けられません。".into(),
+                        conflict: true,
+                    };
+                }
+                Ok(Err(error)) => {
+                    state.phase = CollectionReorderPhase::Error {
+                        message: collection_error_message(&error),
+                        conflict: matches!(error, CollectionStoreError::Conflict { .. }),
+                    };
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    state.phase = CollectionReorderPhase::Refreshing { receiver };
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    state.phase = CollectionReorderPhase::Error {
+                        message: "最新内容の応答が失われました。".into(),
+                        conflict: false,
+                    };
+                }
+            },
+        }
+    }
+
+    pub(crate) fn collection_reorder_open(&self) -> bool {
+        self.collection_ui.reorder.is_some()
+    }
+
     pub(crate) fn collection_definition(
         &self,
         collection_id: CollectionId,
@@ -1211,6 +1795,7 @@ impl App {
         }
 
         self.poll_collection_operation(ctx);
+        self.poll_collection_reorder(ctx);
         self.reconcile_collection_toolbar_target();
         if matches!(self.collection_ui.phase, CollectionRuntimePhase::Starting)
             || self.collection_ui.catalog_request.is_some()
@@ -1335,7 +1920,12 @@ impl App {
                 Ok(Ok(snapshot))
                     if snapshot.collection_id() == request.target.stamp.collection_id
                         && snapshot.revision() >= request.target.expected_revision
-                        && self.collection_grid_request_stamp_is_current(request.target.stamp) =>
+                        && self.collection_grid_content_target().is_ok_and(|current| {
+                            current.stamp == request.target.stamp
+                                && current.expected_revision == request.target.expected_revision
+                        })
+                        && (!request.action.requires_exact_root_revision()
+                            || snapshot.revision() == request.target.expected_revision) =>
                 {
                     self.continue_collection_grid_snapshot(request.target, request.action, snapshot)
                 }
@@ -1515,33 +2105,17 @@ impl App {
                     }
                 }
             }
-            CollectionGridSnapshotAction::Relink { path } => {
-                let Some(entry_id) = target.selected_entry_id else {
-                    self.show_feedback_toast("再リンクする参照を選択してください。".into());
-                    return CollectionDialogOperation::Idle;
-                };
-                if !snapshot.entries.iter().any(|entry| entry.id == entry_id) {
-                    self.show_feedback_toast(
-                        "選択した参照が更新されたため、再リンクできません。".into(),
-                    );
+            CollectionGridSnapshotAction::OpenReorder => {
+                if snapshot.definition.order_mode != CollectionOrderMode::Manual {
+                    self.show_feedback_toast("手動順のコレクションだけを並べ替えられます。".into());
                     return CollectionDialogOperation::Idle;
                 }
-                self.collection_classification_operation(
-                    vec![path],
-                    ClassificationTarget::Relink {
-                        collection_id: snapshot.collection_id(),
-                        expected_revision: snapshot.revision(),
-                        entry_id,
-                        origin,
-                    },
-                )
-            }
-            CollectionGridSnapshotAction::Move { direction } => {
-                let Some(entry_id) = target.selected_entry_id else {
-                    self.show_feedback_toast("並べ替える参照を選択してください。".into());
+                if snapshot.entries.is_empty() {
+                    self.show_feedback_toast("並べ替える参照がありません。".into());
                     return CollectionDialogOperation::Idle;
-                };
-                self.reorder_collection_entry(&snapshot, entry_id, direction, origin)
+                }
+                self.open_collection_reorder(snapshot, target.selected_entry_id);
+                CollectionDialogOperation::Idle
             }
         }
     }
@@ -2284,53 +2858,6 @@ impl App {
         }
     }
 
-    fn reorder_collection_entry(
-        &mut self,
-        snapshot: &CollectionSnapshot,
-        selected: CollectionEntryId,
-        direction: MoveEntry,
-        origin: CollectionOperationOrigin,
-    ) -> CollectionDialogOperation {
-        if snapshot.definition.order_mode != CollectionOrderMode::Manual {
-            self.show_feedback_toast("手動順のときだけ並べ替えられます。".into());
-            return CollectionDialogOperation::Idle;
-        }
-        let mut order = snapshot
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        let Some(from) = order.iter().position(|id| *id == selected) else {
-            self.show_feedback_toast("選択した参照が更新されました。".into());
-            return CollectionDialogOperation::Idle;
-        };
-        let to = match direction {
-            MoveEntry::First => 0,
-            MoveEntry::Up => from.saturating_sub(1),
-            MoveEntry::Down => (from + 1).min(order.len().saturating_sub(1)),
-            MoveEntry::Last => order.len().saturating_sub(1),
-        };
-        if from == to {
-            return CollectionDialogOperation::Idle;
-        }
-        let entry = order.remove(from);
-        order.insert(to, entry);
-        let Some(client) = &self.collection_ui.client else {
-            return CollectionDialogOperation::Idle;
-        };
-        match client.reorder_manual(snapshot.collection_id(), snapshot.revision(), order) {
-            Ok(receiver) => CollectionDialogOperation::Submitting(ActorTask::SnapshotMutation {
-                collection_id: snapshot.collection_id(),
-                origin,
-                receiver,
-            }),
-            Err(error) => {
-                self.show_feedback_toast(collection_error_message(&error));
-                CollectionDialogOperation::Idle
-            }
-        }
-    }
-
     fn start_collection_import_read(
         &mut self,
         collection_id: CollectionId,
@@ -2713,6 +3240,445 @@ impl App {
         }
     }
 
+    pub(crate) fn draw_collection_reorder(&mut self, ctx: &egui::Context) {
+        if self.collection_ui.reorder.is_none() {
+            return;
+        }
+        self.refresh_collection_reorder_textures();
+        let title = self
+            .collection_ui
+            .reorder
+            .as_ref()
+            .map(|state| format!("コレクション並べ替え: {}", state.collection_name))
+            .unwrap_or_else(|| "コレクション並べ替え".into());
+        let mut window_open = true;
+        let mut close = false;
+        let mut save = false;
+        let mut refresh = false;
+        let mut discard = false;
+        egui::Window::new(title)
+            .id(egui::Id::new("collection_reorder_window"))
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(
+                COLLECTION_REORDER_DEFAULT_WINDOW_W,
+                COLLECTION_REORDER_DEFAULT_WINDOW_H,
+            ))
+            .min_size(egui::vec2(
+                COLLECTION_REORDER_MIN_WINDOW_W,
+                COLLECTION_REORDER_MIN_WINDOW_H,
+            ))
+            .show(ctx, |ui| {
+                let Some(state) = self.collection_ui.reorder.as_mut() else {
+                    return;
+                };
+                ensure_collection_reorder_selection(state);
+                let busy = state.phase.is_busy();
+                if let CollectionReorderPhase::Error { message, conflict } = &state.phase {
+                    let conflict = *conflict;
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                    if conflict {
+                        ui.label(
+                            egui::RichText::new(
+                                "外部更新は自動で混ぜません。編集中の順序を保持しています。",
+                            )
+                            .weak(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if !conflict {
+                            if ui
+                                .add_enabled(state.dirty, egui::Button::new("この順序で再試行"))
+                                .clicked()
+                            {
+                                save = true;
+                            }
+                        }
+                        if ui.button("最新内容を読み直す（変更破棄）").clicked() {
+                            refresh = true;
+                        }
+                        if ui.button("変更を破棄して閉じる").clicked() {
+                            discard = true;
+                        }
+                    });
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    let selected_indices = selected_collection_reorder_indices(state);
+                    let selected_count = selected_indices.len();
+                    let selected_set = selected_indices.iter().copied().collect::<HashSet<_>>();
+                    let can_left = !busy
+                        && selected_indices
+                            .iter()
+                            .any(|index| *index > 0 && !selected_set.contains(&(*index - 1)));
+                    let can_right = !busy
+                        && selected_indices.iter().any(|index| {
+                            *index + 1 < state.entries.len()
+                                && !selected_set.contains(&(*index + 1))
+                        });
+                    if ui
+                        .add_enabled(can_left, egui::Button::new("←"))
+                        .on_hover_text("左へ移動")
+                        .clicked()
+                        && move_selected_collection_reorder_by(state, -1)
+                    {
+                        state.dirty = true;
+                    }
+                    if ui
+                        .add_enabled(can_right, egui::Button::new("→"))
+                        .on_hover_text("右へ移動")
+                        .clicked()
+                        && move_selected_collection_reorder_by(state, 1)
+                    {
+                        state.dirty = true;
+                    }
+                    let selected_response = ui
+                        .add_enabled(
+                            !busy && selected_count > 0,
+                            egui::Label::new(format!(
+                                "選択 {selected_count} 件（ここをドラッグして移動）"
+                            ))
+                            .sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text("選択した参照全体をドラッグして移動");
+                    if !busy
+                        && selected_response.drag_started()
+                        && let Some(source) = selected_indices.first().copied()
+                    {
+                        state.selected = Some(source);
+                        state.dragging = Some(source);
+                        state.drag_auto_scroll_enabled = false;
+                        state.drag_insert_index = Some(source);
+                    }
+                    ui.separator();
+                    ui.add_enabled(
+                        !busy,
+                        egui::Slider::new(
+                            &mut state.thumb_tile_px,
+                            COLLECTION_REORDER_MIN_TILE_PX..=COLLECTION_REORDER_MAX_TILE_PX,
+                        )
+                        .text("サムネ"),
+                    );
+                    ui.separator();
+                    if ui.add_enabled(!busy, egui::Button::new("閉じる")).clicked() {
+                        if state.dirty {
+                            save = true;
+                        } else {
+                            close = true;
+                        }
+                    }
+                    if busy {
+                        ui.spinner();
+                        let label = match &state.phase {
+                            CollectionReorderPhase::Saving { .. } => "保存中…",
+                            CollectionReorderPhase::Refreshing { .. } => "再読込中…",
+                            _ => "処理中…",
+                        };
+                        ui.label(egui::RichText::new(label).weak());
+                    }
+                });
+                ui.separator();
+
+                state.thumb_tile_px = state.thumb_tile_px.clamp(
+                    COLLECTION_REORDER_MIN_TILE_PX,
+                    COLLECTION_REORDER_MAX_TILE_PX,
+                );
+                let tile = egui::vec2(state.thumb_tile_px, state.thumb_tile_px + 20.0);
+                let gap = 8.0;
+                let scroll_width = ui.available_width().max(tile.x + gap);
+                let columns = collection_reorder_grid_columns(scroll_width, tile.x, gap);
+                let rows = state.entries.len().div_ceil(columns).max(1);
+                let row_height = tile.y + gap;
+                let scroll_height =
+                    collection_reorder_scroll_height(ui.available_height(), rows, row_height);
+                if state.dragging.is_none() {
+                    let max_offset = (rows as f32 * row_height - scroll_height).max(0.0);
+                    if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Home)
+                    }) {
+                        state.scroll_offset_y = 0.0;
+                    } else if ui
+                        .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::End))
+                    {
+                        state.scroll_offset_y = max_offset;
+                    } else if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)
+                    }) {
+                        state.scroll_offset_y = (state.scroll_offset_y - scroll_height
+                            + row_height)
+                            .clamp(0.0, max_offset);
+                    } else if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)
+                    }) {
+                        state.scroll_offset_y = (state.scroll_offset_y + scroll_height
+                            - row_height)
+                            .clamp(0.0, max_offset);
+                    }
+                }
+                let pointer_released = ui.input(|input| input.pointer.any_released());
+                let pointer_pos = ui.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .or_else(|| input.pointer.interact_pos())
+                });
+                let mut move_request = None;
+                state.drag_insert_index = None;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(scroll_width, scroll_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        let scroll_output = egui::ScrollArea::vertical()
+                            .id_salt("collection_reorder_thumb_scroll")
+                            .vertical_scroll_offset(state.scroll_offset_y)
+                            .max_height(scroll_height)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, row_height, rows, |ui, row_range| {
+                                egui::Grid::new("collection_reorder_thumb_grid")
+                                    .num_columns(columns)
+                                    .spacing(egui::vec2(gap, gap))
+                                    .show(ui, |ui| {
+                                        for row in row_range {
+                                            for column in 0..columns {
+                                                let index = row * columns + column;
+                                                let Some(entry) = state.entries.get(index) else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        tile,
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    if !busy
+                                                        && state.dragging.is_some()
+                                                        && pointer_pos
+                                                            .is_some_and(|pos| rect.contains(pos))
+                                                    {
+                                                        state.drag_insert_index =
+                                                            Some(state.entries.len());
+                                                        draw_collection_reorder_insert_indicator(
+                                                            ui,
+                                                            rect.left(),
+                                                            rect,
+                                                        );
+                                                        if pointer_released {
+                                                            move_request =
+                                                                Some(state.entries.len());
+                                                        }
+                                                    }
+                                                    continue;
+                                                };
+                                                let entry_id = entry.entry.id;
+                                                let path = entry.entry.source_path.clone();
+                                                let kind = entry.entry.resolved_kind;
+                                                let texture = entry.texture.clone();
+                                                let selected =
+                                                    state.selected_ids.contains(&entry_id);
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    tile,
+                                                    egui::Sense::click_and_drag(),
+                                                );
+                                                let fill = if state.dragging.is_some() && selected {
+                                                    ui.visuals().selection.bg_fill
+                                                } else if selected {
+                                                    ui.visuals().widgets.active.bg_fill
+                                                } else {
+                                                    ui.visuals().extreme_bg_color
+                                                };
+                                                ui.painter().rect_filled(rect, 4.0, fill);
+                                                ui.painter().rect_stroke(
+                                                    rect,
+                                                    4.0,
+                                                    egui::Stroke::new(
+                                                        1.0,
+                                                        if selected {
+                                                            ui.visuals().selection.stroke.color
+                                                        } else {
+                                                            ui.visuals()
+                                                                .widgets
+                                                                .noninteractive
+                                                                .bg_stroke
+                                                                .color
+                                                        },
+                                                    ),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                                let image_rect =
+                                                    rect.shrink2(egui::vec2(6.0, 18.0));
+                                                if let Some(texture) = texture.as_ref() {
+                                                    let size = texture.size_vec2();
+                                                    let scale = (image_rect.width() / size.x)
+                                                        .min(image_rect.height() / size.y)
+                                                        .min(1.0);
+                                                    let paint_rect = egui::Rect::from_center_size(
+                                                        image_rect.center(),
+                                                        size * scale,
+                                                    );
+                                                    ui.painter().image(
+                                                        texture.id(),
+                                                        paint_rect,
+                                                        egui::Rect::from_min_max(
+                                                            egui::Pos2::ZERO,
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                } else {
+                                                    ui.painter().text(
+                                                        image_rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        kind.as_str(),
+                                                        egui::FontId::proportional(11.0),
+                                                        ui.visuals().weak_text_color(),
+                                                    );
+                                                }
+                                                ui.painter().text(
+                                                    rect.left_bottom() + egui::vec2(6.0, -5.0),
+                                                    egui::Align2::LEFT_BOTTOM,
+                                                    format!("{:04}", index + 1),
+                                                    egui::FontId::monospace(11.0),
+                                                    ui.visuals().text_color(),
+                                                );
+                                                let response = response.on_hover_ui(|ui| {
+                                                    if let Some(texture) = texture.as_ref() {
+                                                        let size = texture.size_vec2();
+                                                        let scale = (360.0 / size.x)
+                                                            .min(360.0 / size.y)
+                                                            .min(2.5);
+                                                        let (preview_rect, _) = ui
+                                                            .allocate_exact_size(
+                                                                size * scale,
+                                                                egui::Sense::hover(),
+                                                            );
+                                                        ui.painter().image(
+                                                            texture.id(),
+                                                            preview_rect,
+                                                            egui::Rect::from_min_max(
+                                                                egui::Pos2::ZERO,
+                                                                egui::pos2(1.0, 1.0),
+                                                            ),
+                                                            egui::Color32::WHITE,
+                                                        );
+                                                    } else {
+                                                        ui.label("サムネイルを準備中");
+                                                    }
+                                                    ui.label(path.display().to_string());
+                                                    ui.weak(kind.as_str());
+                                                });
+                                                if !busy && response.clicked() {
+                                                    let (ctrl, shift) = ui.input(|input| {
+                                                        (
+                                                            input.modifiers.ctrl
+                                                                || input.modifiers.command,
+                                                            input.modifiers.shift,
+                                                        )
+                                                    });
+                                                    if shift {
+                                                        collection_reorder_select_range(
+                                                            state, index,
+                                                        );
+                                                    } else if ctrl {
+                                                        collection_reorder_toggle_selection(
+                                                            state, index,
+                                                        );
+                                                    } else {
+                                                        collection_reorder_select_single(
+                                                            state, index,
+                                                        );
+                                                    }
+                                                }
+                                                if !busy && response.drag_started() {
+                                                    if !state.selected_ids.contains(&entry_id) {
+                                                        collection_reorder_select_single(
+                                                            state, index,
+                                                        );
+                                                    } else {
+                                                        state.selected = Some(index);
+                                                    }
+                                                    state.dragging = Some(index);
+                                                    state.drag_auto_scroll_enabled = true;
+                                                    state.drag_insert_index = Some(index);
+                                                }
+                                                if !busy
+                                                    && state.dragging.is_some()
+                                                    && let Some((insert_index, indicator_x)) =
+                                                        collection_reorder_drop_target_for_pos(
+                                                            rect,
+                                                            index,
+                                                            state.entries.len(),
+                                                            pointer_pos,
+                                                        )
+                                                {
+                                                    state.drag_insert_index = Some(insert_index);
+                                                    draw_collection_reorder_insert_indicator(
+                                                        ui,
+                                                        indicator_x,
+                                                        rect,
+                                                    );
+                                                    if pointer_released {
+                                                        move_request = Some(insert_index);
+                                                    }
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                        state.scroll_offset_y = scroll_output.state.offset.y;
+                        if !busy
+                            && !pointer_released
+                            && state.dragging.is_some()
+                            && state.drag_auto_scroll_enabled
+                            && let Some(pos) = pointer_pos
+                        {
+                            let delta = collection_reorder_auto_scroll_delta(
+                                pos.y,
+                                scroll_output.inner_rect.top(),
+                                scroll_output.inner_rect.bottom(),
+                            );
+                            if delta.abs() > f32::EPSILON {
+                                let max_offset = (scroll_output.content_size.y
+                                    - scroll_output.inner_rect.height())
+                                .max(0.0);
+                                state.scroll_offset_y =
+                                    (state.scroll_offset_y + delta).clamp(0.0, max_offset);
+                                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                            }
+                        }
+                    },
+                );
+                if let Some(insert_index) = move_request {
+                    if move_selected_collection_reorder_group(state, insert_index) {
+                        state.dirty = true;
+                    }
+                    state.dragging = None;
+                    state.drag_auto_scroll_enabled = false;
+                    state.drag_insert_index = None;
+                } else if pointer_released {
+                    state.dragging = None;
+                    state.drag_auto_scroll_enabled = false;
+                    state.drag_insert_index = None;
+                }
+            });
+
+        if !window_open
+            && let Some(state) = self.collection_ui.reorder.as_ref()
+            && !state.phase.is_busy()
+        {
+            if state.dirty {
+                save = true;
+            } else {
+                close = true;
+            }
+        }
+        if discard || close {
+            self.collection_ui.reorder = None;
+        } else if refresh {
+            self.start_collection_reorder_refresh();
+        } else if save {
+            self.start_collection_reorder_save();
+        }
+    }
+
     pub(crate) fn request_collection_grid_remove(
         &mut self,
         request: crate::app::collection_grid::CollectionGridRemoveTarget,
@@ -2728,14 +3694,6 @@ impl App {
             origin: CollectionOperationOrigin::Grid(request.stamp),
         };
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MoveEntry {
-    First,
-    Up,
-    Down,
-    Last,
 }
 
 enum CollectionUiAction {
@@ -2949,6 +3907,126 @@ mod tests {
             app.poll_collection_grid(&ctx);
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn reorder_test_state(names: &[&str]) -> CollectionReorderState {
+        let collection_id = CollectionId::new();
+        let entries = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| CollectionReorderEntry {
+                entry: CollectionEntry {
+                    id: CollectionEntryId::new(),
+                    collection_id,
+                    source_path: PathBuf::from(format!(r"C:\reorder\{name}.png")),
+                    source_key: CollectionSourcePath::from_trusted(PathBuf::from(format!(
+                        r"C:\reorder\{name}.png"
+                    )))
+                    .unwrap()
+                    .key()
+                    .clone(),
+                    resolved_kind: CollectionResolvedKind::Image,
+                    manual_position: index as u64,
+                },
+                texture: None,
+            })
+            .collect::<Vec<_>>();
+        let first_id = entries.first().map(|entry| entry.entry.id);
+        CollectionReorderState {
+            collection_id,
+            collection_name: "Reorder fixture".into(),
+            base_revision: 7,
+            entries,
+            selected: first_id.map(|_| 0),
+            selected_ids: first_id.into_iter().collect(),
+            selection_anchor: first_id.map(|_| 0),
+            dragging: None,
+            drag_auto_scroll_enabled: false,
+            drag_insert_index: None,
+            scroll_offset_y: 0.0,
+            thumb_tile_px: COLLECTION_REORDER_DEFAULT_TILE_PX,
+            dirty: false,
+            phase: CollectionReorderPhase::Ready,
+        }
+    }
+
+    #[test]
+    fn collection_reorder_group_drag_preserves_internal_order_and_stable_selection() {
+        let mut state = reorder_test_state(&["A", "B", "C", "D", "E"]);
+        let ids = state
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+        state.selected = Some(3);
+        state.selection_anchor = Some(1);
+        state.selected_ids = HashSet::from([ids[1], ids[3]]);
+
+        assert!(move_selected_collection_reorder_group(
+            &mut state,
+            ids.len()
+        ));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[4], ids[1], ids[3]],
+            "non-contiguous selected entries move as one group without changing their order"
+        );
+        assert_eq!(state.selected, Some(4));
+        assert_eq!(state.selected_ids, HashSet::from([ids[1], ids[3]]));
+
+        assert!(move_selected_collection_reorder_by(&mut state, -1));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[1], ids[3], ids[4]],
+        );
+    }
+
+    #[test]
+    fn collection_reorder_drop_marker_tracks_the_pointer_side_and_rejects_blank_space() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
+
+        assert_eq!(
+            collection_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(20.0, 80.0))),
+            Some((4, rect.left() - 4.0))
+        );
+        assert_eq!(
+            collection_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(95.0, 80.0))),
+            Some((5, rect.right() + 4.0))
+        );
+        assert_eq!(
+            collection_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(9.0, 80.0))),
+            None
+        );
+        assert_eq!(
+            collection_reorder_drop_target_for_pos(rect, 4, 10, None),
+            None
+        );
+    }
+
+    #[test]
+    fn collection_reorder_auto_scroll_activates_only_near_viewport_edges() {
+        assert_eq!(
+            collection_reorder_auto_scroll_delta(200.0, 100.0, 500.0),
+            0.0
+        );
+        assert!(collection_reorder_auto_scroll_delta(112.0, 100.0, 500.0) < 0.0);
+        assert!(collection_reorder_auto_scroll_delta(488.0, 100.0, 500.0) > 0.0);
+        assert_eq!(
+            collection_reorder_auto_scroll_delta(100.0, 100.0, 500.0),
+            -COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX
+        );
+        assert_eq!(
+            collection_reorder_auto_scroll_delta(500.0, 100.0, 500.0),
+            COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX
+        );
     }
 
     #[test]
@@ -3394,6 +4472,40 @@ mod tests {
         harness.snapshot(name);
     }
 
+    fn snapshot_collection_reorder(name: &str) {
+        use egui_kittest::Harness;
+
+        let mut app = snapshot_app(false);
+        app.collection_ui.show_manager = false;
+        let snapshot = app.collection_ui.snapshot.clone().unwrap();
+        app.open_collection_reorder(snapshot.clone(), Some(snapshot.entries[0].id));
+        if let Some(state) = app.collection_ui.reorder.as_mut() {
+            state.selected_ids = HashSet::from([snapshot.entries[0].id, snapshot.entries[2].id]);
+            state.selected = Some(2);
+            state.selection_anchor = Some(0);
+        }
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1040.0, 760.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("画像一覧");
+                    ui.label("コレクションの参照順を編集中です。");
+                });
+                app.draw_collection_reorder(ctx);
+            });
+        harness.run();
+        harness.get_by_label("閉じる");
+        harness.snapshot(name);
+    }
+
     #[test]
     fn app_runtime_catalog_conflict_refresh_and_final_shutdown_use_one_owner() {
         let temp = tempfile::tempdir().unwrap();
@@ -3574,7 +4686,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_handlers_commit_crud_relink_remove_and_import_only_after_confirmation() {
+    fn actual_handlers_commit_crud_reorder_relink_remove_and_import_only_after_confirmation() {
         let temp = tempfile::tempdir().unwrap();
         let (mut app, _client) = start_ready_app(&temp);
         let created = create_collection(&mut app, "Handler lifecycle");
@@ -3619,14 +4731,17 @@ mod tests {
             .find(|entry| entry.source_path == second)
             .unwrap()
             .id;
-        app.collection_ui.selected_entry = Some(first_id);
-        app.collection_ui.operation = app.reorder_collection_entry(
-            &added,
-            first_id,
-            MoveEntry::Last,
-            CollectionOperationOrigin::Manager,
-        );
-        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        app.open_collection_reorder(added.clone(), Some(first_id));
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            assert!(move_selected_collection_reorder_group(
+                state,
+                state.entries.len()
+            ));
+            state.dirty = true;
+        }
+        app.start_collection_reorder_save();
+        wait_for(&mut app, |app| app.collection_ui.reorder.is_none());
         let reordered = app.collection_ui.snapshot.clone().unwrap();
         assert_eq!(reordered.entries[0].id, second_id);
         assert_eq!(reordered.entries[1].id, first_id);
@@ -3755,15 +4870,13 @@ mod tests {
     }
 
     #[test]
-    fn grid_content_actions_use_latest_full_snapshot_and_preserve_separate_owners() {
+    fn grid_reorder_uses_exact_latest_root_and_preserves_separate_owners() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ["first.png", "second.png", "third.png", "fourth.png"]
             .map(|name| temp.path().join(name));
-        let replacement = temp.path().join("second-relinked.png");
         for (index, path) in paths.iter().enumerate() {
             std::fs::write(path, format!("source-{index}")).unwrap();
         }
-        std::fs::write(&replacement, b"replacement-source").unwrap();
 
         let (mut app, client) = start_ready_app(&temp);
         let manager = create_collection(&mut app, "Manager owner");
@@ -3816,10 +4929,10 @@ mod tests {
             .position(|entry| entry.entry_id == selected_id)
             .unwrap();
         app.selected = Some(selected_index);
-        let move_target = app.collection_grid_content_target().unwrap();
+        let stale_target = app.collection_grid_content_target().unwrap();
 
-        // Advance the actor after the click-time target was captured. The Grid operation must
-        // reorder the latest full actor snapshot, including the newly added fourth entry.
+        // Reorder opens only from an exact installed Root. An actor update after the
+        // click-time target is captured must fail closed instead of editing a stale list.
         let external = client
             .add_batch(
                 surface.collection_id(),
@@ -3838,46 +4951,18 @@ mod tests {
             .unwrap()
             .snapshot;
         app.start_collection_grid_content_action(
-            move_target,
-            CollectionGridSnapshotAction::Move {
-                direction: MoveEntry::Last,
-            },
+            stale_target,
+            CollectionGridSnapshotAction::OpenReorder,
         );
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
-        let moved = client
-            .load_collection(surface.collection_id())
-            .unwrap()
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
-        let mut expected_order = external
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        let from = expected_order
-            .iter()
-            .position(|id| *id == selected_id)
-            .unwrap();
-        let selected = expected_order.remove(from);
-        expected_order.push(selected);
-        assert_eq!(
-            moved
-                .entries
-                .iter()
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>(),
-            expected_order
+        assert!(app.collection_ui.reorder.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| { text.contains("切り替わった") })
         );
-        assert_eq!(app.collection_ui.selected_id, Some(manager.collection_id()));
-        assert_eq!(
-            app.settings.toolbar_collection_target_id,
-            Some(manager.collection_id().as_uuid())
-        );
-        assert!(!app.collection_ui.show_manager);
-        assert!(app.collection_grid_request_stamp_is_current(move_target.stamp));
 
-        wait_for_collection_grid_revision(&mut app, surface.collection_id(), moved.revision());
+        wait_for_collection_grid_revision(&mut app, surface.collection_id(), external.revision());
         let selected_index = app
             .top_level_grid_view
             .collection_session()
@@ -3888,33 +4973,60 @@ mod tests {
             .position(|entry| entry.entry_id == selected_id)
             .unwrap();
         app.selected = Some(selected_index);
-        let relink_target = app.collection_grid_content_target().unwrap();
+        let reorder_target = app.collection_grid_content_target().unwrap();
         app.start_collection_grid_content_action(
-            relink_target,
-            CollectionGridSnapshotAction::Relink {
-                path: replacement.clone(),
-            },
+            reorder_target,
+            CollectionGridSnapshotAction::OpenReorder,
         );
-        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
-        let relinked = client
+        wait_for(&mut app, |app| {
+            app.collection_ui.operation.is_idle() && app.collection_ui.reorder.is_some()
+        });
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            assert_eq!(
+                state
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry.id)
+                    .collect::<Vec<_>>(),
+                external
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                "the actor's complete manual sequence is the editor source"
+            );
+            let end = state.entries.len();
+            assert!(move_selected_collection_reorder_group(state, end));
+            state.dirty = true;
+        }
+        app.start_collection_reorder_save();
+        wait_for(&mut app, |app| app.collection_ui.reorder.is_none());
+        let moved = client
             .load_collection(surface.collection_id())
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        assert!(
-            relinked
-                .entries
-                .iter()
-                .any(|entry| { entry.id == selected_id && entry.source_path == replacement })
+        let moved_ids = moved
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(moved_ids.last(), Some(&selected_id));
+        assert_eq!(app.collection_ui.selected_id, Some(manager.collection_id()));
+        assert_eq!(
+            app.settings.toolbar_collection_target_id,
+            Some(manager.collection_id().as_uuid())
         );
-        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"source-1");
-        assert_eq!(std::fs::read(&replacement).unwrap(), b"replacement-source");
+        assert!(!app.collection_ui.show_manager);
+        assert!(app.collection_grid_request_stamp_is_current(reorder_target.stamp));
 
+        wait_for_collection_grid_revision(&mut app, surface.collection_id(), moved.revision());
         let standard = client
             .set_order(
                 surface.collection_id(),
-                relinked.revision(),
+                moved.revision(),
                 CollectionOrderMode::Standard,
                 SortOrder::FileName,
             )
@@ -3926,18 +5038,17 @@ mod tests {
         let standard_target = app.collection_grid_content_target().unwrap();
         app.start_collection_grid_content_action(
             standard_target,
-            CollectionGridSnapshotAction::Move {
-                direction: MoveEntry::First,
-            },
+            CollectionGridSnapshotAction::OpenReorder,
         );
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
-        let after_disabled_move = client
+        assert!(app.collection_ui.reorder.is_none());
+        let after_disabled_reorder = client
             .load_collection(surface.collection_id())
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        assert_eq!(after_disabled_move.revision(), standard.revision());
+        assert_eq!(after_disabled_reorder.revision(), standard.revision());
         assert!(
             app.fs_feedback_toast
                 .as_ref()
@@ -3947,9 +5058,7 @@ mod tests {
         app.open_collection_grid(manager.collection_id(), None);
         app.start_collection_grid_content_action(
             standard_target,
-            CollectionGridSnapshotAction::Move {
-                direction: MoveEntry::Last,
-            },
+            CollectionGridSnapshotAction::OpenReorder,
         );
         assert!(app.collection_ui.operation.is_idle());
         assert!(
@@ -3963,8 +5072,209 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        assert_eq!(after_stale_target, after_disabled_move);
+        assert_eq!(after_stale_target, after_disabled_reorder);
 
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn reorder_conflict_keeps_edits_until_explicit_refresh_or_discard() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["first.png", "second.png", "external.png"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Conflict recovery");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                paths[..2]
+                    .iter()
+                    .map(|path| {
+                        CollectionRegistration::from_trusted_path(
+                            path,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            let end = state.entries.len();
+            assert!(move_selected_collection_reorder_group(state, end));
+            state.dirty = true;
+        }
+        let edited_order = app
+            .collection_ui
+            .reorder
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+
+        let external = client
+            .add_batch(
+                added.collection_id(),
+                added.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &paths[2],
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.start_collection_reorder_save();
+        wait_for(&mut app, |app| {
+            app.collection_ui.reorder.as_ref().is_some_and(|state| {
+                matches!(
+                    state.phase,
+                    CollectionReorderPhase::Error { conflict: true, .. }
+                )
+            })
+        });
+        let state = app.collection_ui.reorder.as_ref().unwrap();
+        assert!(state.dirty);
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            edited_order,
+            "a conflict keeps the user's unsaved order"
+        );
+
+        app.start_collection_reorder_refresh();
+        wait_for(&mut app, |app| {
+            app.collection_ui.reorder.as_ref().is_some_and(|state| {
+                matches!(state.phase, CollectionReorderPhase::Ready)
+                    && state.base_revision == external.revision()
+            })
+        });
+        let state = app.collection_ui.reorder.as_ref().unwrap();
+        assert!(!state.dirty);
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            external
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            "explicit refresh discards edits and adopts the latest actor order"
+        );
+
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            state.dirty = true;
+            state.phase = CollectionReorderPhase::Error {
+                message: "競合".into(),
+                conflict: true,
+            };
+        }
+        let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
+        let render_app = std::rc::Rc::clone(&ui_app);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1040.0, 760.0))
+            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+        harness.step();
+        harness.get_by_label("変更を破棄して閉じる").click();
+        harness.step();
+        assert!(ui_app.borrow().collection_ui.reorder.is_none());
+        drop(harness);
+        let mut app = match std::rc::Rc::try_unwrap(ui_app) {
+            Ok(app) => app.into_inner(),
+            Err(_) => panic!("discard harness retained the App fixture"),
+        };
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn dirty_reorder_close_autosaves_before_the_window_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["first.png", "second.png"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Close autosave");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                paths
+                    .iter()
+                    .map(|path| {
+                        CollectionRegistration::from_trusted_path(
+                            path,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            let end = state.entries.len();
+            assert!(move_selected_collection_reorder_group(state, end));
+            state.dirty = true;
+        }
+
+        let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
+        let render_app = std::rc::Rc::clone(&ui_app);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1040.0, 760.0))
+            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+        harness.step();
+        harness.get_by_label("閉じる").click();
+        harness.step();
+        assert!(
+            ui_app
+                .borrow()
+                .collection_ui
+                .reorder
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, CollectionReorderPhase::Saving { .. }))
+        );
+        drop(harness);
+        let mut app = match std::rc::Rc::try_unwrap(ui_app) {
+            Ok(app) => app.into_inner(),
+            Err(_) => panic!("autosave harness retained the App fixture"),
+        };
+        wait_for(&mut app, |app| app.collection_ui.reorder.is_none());
+        let saved = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.entries[1].id, added.entries[0].id);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -4790,5 +6100,10 @@ mod tests {
     #[test]
     fn collection_grid_remove_confirm_light_snapshot() {
         snapshot_collection_remove_confirm("collection_grid_remove_confirm_light");
+    }
+
+    #[test]
+    fn collection_reorder_dark_snapshot() {
+        snapshot_collection_reorder("collection_reorder_dark");
     }
 }

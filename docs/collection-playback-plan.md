@@ -410,3 +410,21 @@ exit 0でprocess error modeを`0x00008001`へ復元した。ログは
 `target/dev-runtime`には2026-09-15 12:23開始のcore 8 processとRemote 1 processがresidentしていたため、
 それらを停止せず`build-dev.ps1 -PreserveRuntime`は保留した。アプリ起動、GUI操作、通常profile / real dataへの
 アクセスは行っていない。
+
+### 11.3 同一root再生時のpresentation再利用（2026-09-16）
+
+linked別窓の通常next / prev / EOFは、actorのlatest snapshotをprepareしてtargetを解決する一方、同じimmutable
+rootを毎回Gridへinstallしない。installed rootとprepared rootのordered entry ID / source key / path / availability /
+item identity / display metadata、およびprepare workerがsidecar path・metadata / pin blob SHA-256から作る固定長の
+thumbnail source identityが完全一致する場合は、installed
+binding上でtarget / originだけを解決する。main一覧のitems generation、Autoサムネ比率、scroll、thumbnail cache /
+queue / cancel tokenを変更しない。filesystem factsまたはthumbnail sourceが変わった場合は同revisionでも再installし、
+actor revision / order / source変更も従来どおりlatestを採用する。
+
+thumbnail payloadのWebP bytesはinstalled bindingへ保持・複製せず、再install時にthumbnail workerへmoveする。commit時の
+source比較は固定長identityだけを比較し、大量動画のbytes走査をUI threadへ持ち込まない。同じsidecar pathの内容更新も
+size / modified metadataでidentityが変わり、pin更新はblob SHA-256で変化する。
+
+actual `start_collection_manual_navigation`→snapshot→prepare→preflight→commit回帰で各poll frameのGrid generation /
+cache owner / Auto比率を固定し、split bundleはdetached側だけを再installしてmainを変えないことを固定した。これは
+auto-aspect値の退避復元ではなく、viewer cursor移動とGrid presentation更新の所有を分ける変更である。

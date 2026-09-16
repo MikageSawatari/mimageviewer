@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::folder_scan::ScannedDir;
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition,
-    CollectionGridPreparedInstall, CollectionGridSession, CollectionGridThumbnailSources,
-    CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
+    CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources, CollectionGridSession,
+    CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
+    TopLevelGridSurface,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
 use crate::collection_store::{
@@ -176,7 +177,7 @@ impl CollectionNavigationRequest {
 pub(in crate::app) struct CollectionNavigationRequest {
     origin: CollectionNavigationOrigin,
     action: CollectionNavigationAction,
-    root_thumbnail_sources: Option<Arc<CollectionGridThumbnailSources>>,
+    root_thumbnail_sources: Option<Arc<CollectionGridPreparedThumbnailSources>>,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -204,6 +205,16 @@ struct CollectionNavigationRootLanding {
     target_idx: usize,
     remapped_origin_idx: Option<usize>,
     transient_origin: bool,
+}
+
+/// Whether a prepared root is the exact Grid presentation already installed in this viewer
+/// context. The actor revision alone is not enough: filesystem classification and display facts
+/// may change without a collection mutation.
+fn collection_root_presentation_is_identical(
+    installed: &CollectionPreparedSnapshot,
+    prepared: &CollectionPreparedSnapshot,
+) -> bool {
+    installed == prepared
 }
 
 #[derive(Clone, Debug)]
@@ -1489,12 +1500,13 @@ impl App {
                     {
                         let mut request = request;
                         request.root_thumbnail_sources = Some(Arc::new(install.thumbnail_sources));
+                        let target_kind = request.action.target_kind();
                         self.spawn_collection_navigation_preflight(
                             ctx,
-                            request.clone(),
+                            request,
                             watch,
                             Arc::new(install.prepared),
-                            request.action.target_kind(),
+                            target_kind,
                         );
                     }
                     Ok(Ok(_)) | Ok(Err(CollectionPrepareError::Cancelled)) => {}
@@ -2074,7 +2086,7 @@ impl App {
 
     fn install_collection_navigation_root(
         &mut self,
-        request: &CollectionNavigationRequest,
+        request: &mut CollectionNavigationRequest,
         prepared: Arc<CollectionPreparedSnapshot>,
         target: &CollectionPreparedNavigationTarget,
         preserve_active_media: bool,
@@ -2090,6 +2102,74 @@ impl App {
                 }),
                 None,
             );
+        }
+        let prepared_thumbnail_source_identity = request
+            .root_thumbnail_sources
+            .as_deref()
+            .map(|sources| sources.identity)
+            .unwrap_or_default();
+        // A linked detached viewer and the visible main Grid may intentionally share the same
+        // mounted collection context. Moving between entries in an unchanged immutable root must
+        // therefore move only the viewer cursor. Reinstalling the identical root bumps the Grid
+        // items generation, tears down thumbnail workers and resets auto-aspect to its 1:1 seed.
+        //
+        // Revision equality alone is insufficient: filesystem preparation can change while the
+        // actor revision remains stable. Reuse only the complete, ordered presentation binding.
+        let installed = self
+            .top_level_grid_view
+            .collection_session()
+            .filter(|session| {
+                matches!(session.position, CollectionGridPosition::Root)
+                    && session.installed_items_generation == Some(self.items_generation)
+                    && session.accepted_revision == prepared.collection_revision
+                    && matches!(
+                        &session.load,
+                        CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+                    )
+            })
+            .and_then(CollectionGridSession::installed_presentation)
+            .filter(|installed| {
+                collection_root_presentation_is_identical(
+                    installed.prepared.as_ref(),
+                    prepared.as_ref(),
+                ) && installed.thumbnail_source_identity == prepared_thumbnail_source_identity
+            })
+            .cloned();
+        if let Some(installed) = installed {
+            let remapped_origin_idx = request.origin.anchor.as_ref().and_then(|anchor| {
+                installed
+                    .prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == anchor.primary.entry_id)
+                    .or_else(|| {
+                        installed
+                            .prepared
+                            .entries
+                            .iter()
+                            .position(|entry| entry.source_key == anchor.primary.source_key)
+                    })
+            });
+            let target_idx = installed
+                .prepared
+                .entries
+                .iter()
+                .position(|entry| entry.entry_id == target.entry_id)
+                .or_else(|| {
+                    installed
+                        .prepared
+                        .entries
+                        .iter()
+                        .position(|entry| entry.source_key == target.source_key)
+                })?;
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
+            }
+            return Some(CollectionNavigationRootLanding {
+                target_idx,
+                remapped_origin_idx,
+                transient_origin: false,
+            });
         }
         let previous = self
             .top_level_grid_view
@@ -2141,14 +2221,22 @@ impl App {
             (request.action.is_media_eof() && preserved_player.is_some())
                 .then_some(prepared.entries.len())
         });
+        let thumbnail_sources = match request.root_thumbnail_sources.take() {
+            Some(sources) => match Arc::try_unwrap(sources) {
+                Ok(sources) => sources,
+                Err(_) => {
+                    crate::logger::log(
+                        "[collection-nav] prepared thumbnail payload still has another owner at root commit",
+                    );
+                    return None;
+                }
+            },
+            None => CollectionGridPreparedThumbnailSources::default(),
+        };
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
-                thumbnail_sources: request
-                    .root_thumbnail_sources
-                    .as_deref()
-                    .cloned()
-                    .unwrap_or_default(),
+                thumbnail_sources,
             },
             previous,
         );
@@ -2240,7 +2328,7 @@ impl App {
     fn commit_collection_navigation(
         &mut self,
         ctx: &egui::Context,
-        request: CollectionNavigationRequest,
+        mut request: CollectionNavigationRequest,
         watch: CollectionRevisionWatch,
         prepared: Arc<CollectionPreparedSnapshot>,
         ready: CollectionNavigationPreflightReady,
@@ -2428,7 +2516,7 @@ impl App {
             self.close_fullscreen_for_folder_nav_reopen();
         }
         let Some(landing) = self.install_collection_navigation_root(
-            &request,
+            &mut request,
             Arc::clone(&prepared),
             &ready.target,
             !is_outer_target,
@@ -2784,6 +2872,7 @@ impl CollectionResolvedKindExt for CollectionResolvedKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -2796,12 +2885,15 @@ mod tests {
 
     fn start_ready_app(
         db_path: &std::path::Path,
-    ) -> (App, crate::collection_store::CollectionStoreClient) {
+    ) -> (
+        AppTestEnvForTest,
+        crate::collection_store::CollectionStoreClient,
+    ) {
         let runtime =
             crate::collection_store::CollectionStoreRuntime::start_at(db_path.to_path_buf())
                 .expect("collection runtime");
         let client = runtime.client();
-        let mut app = App::new_from_settings(crate::settings::Settings::default());
+        let mut app = setup_app_for_test();
         app.install_collection_runtime(runtime);
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -2826,6 +2918,57 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn prepared_thumbnail_sources(
+        sources: CollectionGridThumbnailSources,
+    ) -> CollectionGridPreparedThumbnailSources {
+        super::super::collection_grid::prepare_collection_grid_thumbnail_sources(
+            sources,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
+
+    fn manual_navigation_request(app: &mut App, origin_idx: usize) -> CollectionNavigationRequest {
+        CollectionNavigationRequest {
+            origin: app
+                .collection_root_navigation_origin(origin_idx, false)
+                .unwrap(),
+            action: CollectionNavigationAction::Manual {
+                fs_idx: origin_idx,
+                delta: 1,
+                queued_steps: 0,
+                display_unit_step: false,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+                still_only: false,
+            },
+            root_thumbnail_sources: None,
+        }
+    }
+
+    fn prepared_target(
+        entry: &crate::collection_store::PreparedCollectionEntry,
+        resolved_kind: CollectionResolvedKind,
+    ) -> CollectionPreparedNavigationTarget {
+        CollectionPreparedNavigationTarget {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key.clone(),
+            source_path: entry.source_path.clone(),
+            resolved_kind,
+        }
+    }
+
+    fn thumbnail_state_kinds(app: &App) -> Vec<&'static str> {
+        app.thumbnails
+            .iter()
+            .map(|thumbnail| match thumbnail {
+                crate::grid_item::ThumbnailState::Pending => "pending",
+                crate::grid_item::ThumbnailState::Loaded { .. } => "loaded",
+                crate::grid_item::ThumbnailState::Failed => "failed",
+                crate::grid_item::ThumbnailState::Evicted => "evicted",
+            })
+            .collect()
     }
 
     #[test]
@@ -2860,6 +3003,12 @@ mod tests {
             None,
         );
         app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        // This test exercises the reinstall branch: the identical-root fast path is covered
+        // separately below.
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .accepted_revision = prepared.collection_revision.saturating_sub(1);
         let target_entry = prepared.entries[0].clone();
         let target = CollectionPreparedNavigationTarget {
             entry_id: target_entry.entry_id,
@@ -2867,7 +3016,7 @@ mod tests {
             source_path: target_entry.source_path,
             resolved_kind: CollectionResolvedKind::Image,
         };
-        let request = CollectionNavigationRequest {
+        let mut request = CollectionNavigationRequest {
             origin: app.collection_root_navigation_origin(0, false).unwrap(),
             action: CollectionNavigationAction::Manual {
                 fs_idx: 0,
@@ -2877,23 +3026,517 @@ mod tests {
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
             },
-            root_thumbnail_sources: Some(Arc::new(CollectionGridThumbnailSources {
-                video_sidecars: std::collections::HashMap::from([(
-                    "full-video-key".into(),
-                    sidecar.clone(),
-                )]),
-                video_pin_blobs: std::collections::HashMap::new(),
-            })),
+            root_thumbnail_sources: Some(Arc::new(prepared_thumbnail_sources(
+                CollectionGridThumbnailSources {
+                    video_sidecars: std::collections::HashMap::from([(
+                        "full-video-key".into(),
+                        sidecar.clone(),
+                    )]),
+                    video_pin_blobs: std::collections::HashMap::new(),
+                },
+            ))),
         };
 
         assert!(
-            app.install_collection_navigation_root(&request, prepared, &target, false)
+            app.install_collection_navigation_root(&mut request, prepared, &target, false)
                 .is_some()
         );
         assert_eq!(
             app.video_thumb_overrides.get("full-video-key"),
             Some(&sidecar)
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn identical_navigation_root_reuses_the_complete_grid_presentation() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.mp3");
+        let second = temp.path().join("second.mp3");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("linked".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &second,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+
+        app.settings.thumb_aspect_auto = true;
+        app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
+        app.last_cell_h = 112.5;
+        app.scroll_offset_y = 480.0;
+        app.selected = Some(0);
+        app.checked.insert(1);
+        app.requested.insert(0, true);
+
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        let image_metas = app.image_metas.clone();
+        let thumbnail_kinds = thumbnail_state_kinds(&app);
+        let requested = app.requested.clone();
+        let cancel = Arc::clone(&app.cancel_token);
+        let reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
+        let heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
+        let color_cache = app
+            .current_color_cache_map
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap();
+        let mut request = manual_navigation_request(&mut app, 0);
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Audio);
+
+        let landing = app
+            .install_collection_navigation_root(&mut request, Arc::clone(&prepared), &target, false)
+            .expect("unchanged root landing");
+
+        assert_eq!(landing.target_idx, 1);
+        assert_eq!(landing.remapped_origin_idx, Some(0));
+        assert!(!landing.transient_origin);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, items);
+        assert_eq!(app.image_metas, image_metas);
+        assert_eq!(thumbnail_state_kinds(&app), thumbnail_kinds);
+        assert_eq!(app.requested, requested);
+        assert_eq!(
+            app.auto_aspect.current,
+            Some(crate::settings::ThumbAspect::Landscape16x9)
+        );
+        assert_eq!(app.last_cell_h, 112.5);
+        assert_eq!(app.scroll_offset_y, 480.0);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.checked, std::collections::HashSet::from([1]));
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert!(Arc::ptr_eq(
+            app.reload_queue.as_ref().unwrap(),
+            &reload_queue
+        ));
+        assert!(Arc::ptr_eq(
+            app.heavy_io_queue.as_ref().unwrap(),
+            &heavy_io_queue
+        ));
+        assert!(Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &color_cache
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn actual_manual_navigation_poll_keeps_the_unchanged_root_generation_and_grid_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let second = temp.path().join("second.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("actual next".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &second,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.settings.thumb_aspect_auto = true;
+        app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
+        app.last_cell_h = 109.0;
+        app.scroll_offset_y = 288.0;
+        app.selected = Some(0);
+        app.checked.insert(1);
+        app.requested.insert(0, true);
+        app.fullscreen_idx = Some(0);
+
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        let thumbnail_kinds = thumbnail_state_kinds(&app);
+        let requested = app.requested.clone();
+        let cancel = Arc::clone(&app.cancel_token);
+        let reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
+        let heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
+        let ctx = egui::Context::default();
+        assert!(app.start_collection_manual_navigation(
+            &ctx,
+            0,
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.fullscreen_idx != Some(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual collection next did not land"
+            );
+            app.poll_collection_navigation(&ctx);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.items, items);
+            assert_eq!(thumbnail_state_kinds(&app), thumbnail_kinds);
+            assert_eq!(app.requested, requested);
+            assert_eq!(
+                app.auto_aspect.current,
+                Some(crate::settings::ThumbAspect::Landscape16x9)
+            );
+            assert_eq!(app.last_cell_h, 109.0);
+            assert_eq!(app.scroll_offset_y, 288.0);
+            assert_eq!(
+                app.selected,
+                if app.fullscreen_idx == Some(1) {
+                    Some(1)
+                } else {
+                    Some(0)
+                },
+                "selection changes only at the intended navigation landing"
+            );
+            assert_eq!(app.checked, std::collections::HashSet::from([1]));
+            assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+            assert!(Arc::ptr_eq(
+                app.reload_queue.as_ref().unwrap(),
+                &reload_queue
+            ));
+            assert!(Arc::ptr_eq(
+                app.heavy_io_queue.as_ref().unwrap(),
+                &heavy_io_queue
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn navigation_root_reuses_only_when_thumbnail_sources_are_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.mp4");
+        let second = temp.path().join("second.mp4");
+        let sidecar_a = temp.path().join("a.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        std::fs::write(&sidecar_a, b"a").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("thumb sources".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Video,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &second,
+                            CollectionResolvedKind::Video,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        let sources_a = CollectionGridThumbnailSources {
+            video_sidecars: std::collections::HashMap::from([(
+                "video-key".into(),
+                sidecar_a.clone(),
+            )]),
+            video_pin_blobs: std::collections::HashMap::from([(first.clone(), vec![1, 2, 3])]),
+        };
+        let prepared_sources_a = prepared_thumbnail_sources(sources_a.clone());
+        let identity_a = prepared_sources_a.identity;
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                prepared: (*prepared).clone(),
+                thumbnail_sources: prepared_sources_a,
+            },
+            None,
+        );
+        app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
+        let generation = app.items_generation;
+        let mut request = manual_navigation_request(&mut app, 0);
+        request.root_thumbnail_sources = Some(Arc::new(prepared_thumbnail_sources(sources_a)));
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Video);
+        assert!(
+            app.install_collection_navigation_root(
+                &mut request,
+                Arc::clone(&prepared),
+                &target,
+                false,
+            )
+            .is_some()
+        );
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(
+            app.auto_aspect.current,
+            Some(crate::settings::ThumbAspect::Landscape16x9)
+        );
+
+        std::fs::write(&sidecar_a, b"same-path-sidecar-updated").unwrap();
+        let sidecar_changed = CollectionGridThumbnailSources {
+            video_sidecars: std::collections::HashMap::from([(
+                "video-key".into(),
+                sidecar_a.clone(),
+            )]),
+            video_pin_blobs: std::collections::HashMap::from([(first.clone(), vec![1, 2, 3])]),
+        };
+        let prepared_sidecar_changed = prepared_thumbnail_sources(sidecar_changed);
+        let sidecar_changed_identity = prepared_sidecar_changed.identity;
+        request.root_thumbnail_sources = Some(Arc::new(prepared_sidecar_changed));
+        assert!(
+            app.install_collection_navigation_root(
+                &mut request,
+                Arc::clone(&prepared),
+                &target,
+                false,
+            )
+            .is_some()
+        );
+        assert!(app.items_generation > generation);
+        let sidecar_generation = app.items_generation;
+        assert_ne!(sidecar_changed_identity, identity_a);
+        assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar_a));
+
+        let pin_changed = CollectionGridThumbnailSources {
+            video_sidecars: std::collections::HashMap::from([(
+                "video-key".into(),
+                sidecar_a.clone(),
+            )]),
+            video_pin_blobs: std::collections::HashMap::from([(first, vec![4, 5, 6])]),
+        };
+        let prepared_pin_changed = prepared_thumbnail_sources(pin_changed);
+        let pin_changed_identity = prepared_pin_changed.identity;
+        request.root_thumbnail_sources = Some(Arc::new(prepared_pin_changed));
+        assert!(
+            app.install_collection_navigation_root(&mut request, prepared, &target, false)
+                .is_some()
+        );
+        assert!(app.items_generation > sidecar_generation);
+        assert_ne!(pin_changed_identity, sidecar_changed_identity);
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::installed_presentation)
+                .map(|installed| installed.thumbnail_source_identity),
+            Some(pin_changed_identity),
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn split_detached_collection_navigation_and_close_leave_the_main_grid_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.mp3");
+        let second = temp.path().join("second.mp3");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("detached".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &second,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.settings.thumb_aspect_auto = true;
+        app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
+        app.last_cell_h = 111.0;
+        app.scroll_offset_y = 360.0;
+        app.selected = Some(0);
+        app.checked.insert(1);
+        app.requested.insert(0, true);
+        app.fullscreen_idx = Some(0);
+
+        let mut detached = app.split_current_context_preserving_main_grid();
+        let main_generation = app.items_generation;
+        let main_items = app.items.clone();
+        let main_thumbnail_kinds = thumbnail_state_kinds(&app);
+        let main_requested = app.requested.clone();
+        let main_cancel = Arc::clone(&app.cancel_token);
+        let main_reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
+        let main_heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
+        let main_color_cache = app
+            .current_color_cache_map
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap();
+
+        app.swap_viewer_context_bundle(&mut detached);
+        let mut request = manual_navigation_request(&mut app, 0);
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Audio);
+        let landing = app
+            .install_collection_navigation_root(&mut request, Arc::clone(&prepared), &target, false)
+            .expect("detached navigation landing");
+        app.fullscreen_idx = Some(landing.target_idx);
+        let detached_generation = app.items_generation;
+        assert!(detached_generation > main_generation);
+        app.swap_viewer_context_bundle(&mut detached);
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.items_generation, main_generation);
+        assert_eq!(app.items, main_items);
+        assert_eq!(thumbnail_state_kinds(&app), main_thumbnail_kinds);
+        assert_eq!(app.requested, main_requested);
+        assert_eq!(
+            app.auto_aspect.current,
+            Some(crate::settings::ThumbAspect::Landscape16x9)
+        );
+        assert_eq!(app.last_cell_h, 111.0);
+        assert_eq!(app.scroll_offset_y, 360.0);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.checked, std::collections::HashSet::from([1]));
+        assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
+        assert!(Arc::ptr_eq(
+            app.reload_queue.as_ref().unwrap(),
+            &main_reload_queue
+        ));
+        assert!(Arc::ptr_eq(
+            app.heavy_io_queue.as_ref().unwrap(),
+            &main_heavy_io_queue
+        ));
+        assert!(Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &main_color_cache
+        ));
+        app.swap_viewer_context_bundle(&mut detached);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.items_generation, detached_generation);
+        app.swap_viewer_context_bundle(&mut detached);
+
+        drop(detached);
+        assert_eq!(app.items_generation, main_generation);
+        assert_eq!(
+            app.auto_aspect.current,
+            Some(crate::settings::ThumbAspect::Landscape16x9)
+        );
+        assert_eq!(app.scroll_offset_y, 360.0);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn same_revision_changed_presentation_reinstalls_the_collection_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("page.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("changed".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
+        let generation = app.items_generation;
+        let old_cancel = Arc::clone(&app.cancel_token);
+        let mut request = manual_navigation_request(&mut app, 0);
+
+        let mut changed_entries = prepared.entries.to_vec();
+        changed_entries[0].display_meta = Some((1234, 5678));
+        let changed = Arc::new(CollectionPreparedSnapshot {
+            collection_id: prepared.collection_id,
+            collection_revision: prepared.collection_revision,
+            collection_name: prepared.collection_name.clone(),
+            entries: Arc::from(changed_entries),
+        });
+        let target = prepared_target(&changed.entries[0], CollectionResolvedKind::Image);
+
+        assert!(
+            app.install_collection_navigation_root(&mut request, changed, &target, false)
+                .is_some()
+        );
+        assert!(app.items_generation > generation);
+        assert!(!Arc::ptr_eq(&app.cancel_token, &old_cancel));
+        assert_eq!(app.image_metas, vec![Some((1234, 5678))]);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -3092,6 +3735,9 @@ mod tests {
             entry_id: prepared.entries[0].entry_id,
             source_key: prepared.entries[0].source_key.clone(),
         };
+        let context_id = app.collection_grid_context_id();
+        let surface_generation = app.top_level_grid_view.generation();
+        let items_generation = app.items_generation;
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
                 CollectionNavigationPending::AwaitingManualContinuation {
@@ -3100,10 +3746,10 @@ mod tests {
                     display_unit_step: false,
                     still_only: false,
                     stamp: CollectionNavigationContinuationStamp {
-                        context_id: app.collection_grid_context_id(),
+                        context_id,
                         collection_id: prepared.collection_id,
-                        surface_generation: app.top_level_grid_view.generation(),
-                        items_generation: app.items_generation,
+                        surface_generation,
+                        items_generation,
                         intent_sequence: sequence,
                         target_idx: 0,
                         target,

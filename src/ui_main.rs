@@ -5638,9 +5638,6 @@ impl App {
         let collection_order_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsSetOrderCurrent);
-        let collection_relink_menu_label = self
-            .keymap
-            .menu_command_label(MenuCommandId::CollectionsRelinkCurrent);
         let collection_reorder_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsReorderCurrent);
@@ -6208,59 +6205,30 @@ impl App {
                                             });
                                         }
                                         MenuCommandId::CollectionsRelinkCurrent => {
-                                            let selected = current_target.and_then(|target| target.selected_entry_id);
-                                            ui.add_enabled_ui(selected.is_some(), |ui| {
-                                                ui.menu_button(&collection_relink_menu_label, |ui| {
-                                                    if ui.button("ファイルへ再リンク…").clicked() {
-                                                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                                            self.start_collection_grid_content_action(
-                                                                current_target.unwrap(),
-                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Relink {
-                                                                    path,
-                                                                },
-                                                            );
-                                                        }
-                                                        ui.close();
-                                                    }
-                                                    if ui.button("フォルダへ再リンク…").clicked() {
-                                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                                            self.start_collection_grid_content_action(
-                                                                current_target.unwrap(),
-                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Relink {
-                                                                    path,
-                                                                },
-                                                            );
-                                                        }
-                                                        ui.close();
-                                                    }
-                                                });
-                                            });
+                                            // Kept as a stable saved-menu command ID for settings
+                                            // migration. It is filtered from all rendered menus.
                                         }
                                         MenuCommandId::CollectionsReorderCurrent => {
-                                            let selected = current_target.and_then(|target| target.selected_entry_id);
                                             let manual = current_definition.as_ref().is_some_and(|d| {
                                                 d.order_mode == crate::collection_store::CollectionOrderMode::Manual
                                             });
-                                            ui.add_enabled_ui(selected.is_some() && manual, |ui| {
-                                                ui.menu_button(&collection_reorder_menu_label, |ui| {
-                                                    for (label, direction) in [
-                                                        ("先頭へ", crate::ui_dialogs::collections::MoveEntry::First),
-                                                        ("上へ", crate::ui_dialogs::collections::MoveEntry::Up),
-                                                        ("下へ", crate::ui_dialogs::collections::MoveEntry::Down),
-                                                        ("末尾へ", crate::ui_dialogs::collections::MoveEntry::Last),
-                                                    ] {
-                                                        if ui.button(label).clicked() {
-                                                            self.start_collection_grid_content_action(
-                                                                current_target.unwrap(),
-                                                                crate::ui_dialogs::collections::CollectionGridSnapshotAction::Move {
-                                                                    direction,
-                                                                },
-                                                            );
-                                                            ui.close();
-                                                        }
-                                                    }
+                                            let response = ui
+                                                .add_enabled(
+                                                    current_target.is_some() && manual,
+                                                    egui::Button::new(&collection_reorder_menu_label),
+                                                )
+                                                .on_disabled_hover_text(if current_target.is_none() {
+                                                    "コレクション直下を開くと使用できます"
+                                                } else {
+                                                    "手動順のコレクションだけを並べ替えられます"
                                                 });
-                                            });
+                                            if response.clicked() {
+                                                self.start_collection_grid_content_action(
+                                                    current_target.unwrap(),
+                                                    crate::ui_dialogs::collections::CollectionGridSnapshotAction::OpenReorder,
+                                                );
+                                                ui.close();
+                                            }
                                         }
                                         MenuCommandId::CollectionsManage => {
                                             ui.separator();

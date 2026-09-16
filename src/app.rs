@@ -18364,6 +18364,7 @@ impl App {
             self.show_settings_restore => "settings_restore",
             self.collection_operation_modal_visible() => "collection_operation_modal",
             self.collection_manager_open() => "collection_manager",
+            self.collection_reorder_open() => "collection_reorder",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
             self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
@@ -73167,6 +73168,7 @@ impl App {
         self.show_rename_dialog_window(ctx);
         self.draw_book_manager(ctx);
         self.draw_book_reorder(ctx);
+        self.draw_collection_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
         self.show_metadata_transfer_dialog(ctx);

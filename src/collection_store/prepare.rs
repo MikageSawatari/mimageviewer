@@ -53,7 +53,7 @@ pub(crate) struct CollectionExportPreparation {
 
 /// Immutable, fully classified collection listing shared by the Grid and text export. Every
 /// source remains present even when it cannot currently be opened.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) collection_id: super::CollectionId,
     pub(crate) collection_revision: u64,
@@ -61,7 +61,7 @@ pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCollectionEntry {
     pub(crate) entry_id: CollectionEntryId,
     pub(crate) source_key: super::CollectionSourcePathKey,

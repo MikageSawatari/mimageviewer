@@ -409,8 +409,8 @@ pub(crate) enum CollectionGridLoadState {
             Result<CollectionGridPreparedInstall, crate::collection_store::CollectionPrepareError>,
         >,
     },
-    Ready(std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>),
-    Empty(std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>),
+    Ready(std::sync::Arc<CollectionGridInstalledPresentation>),
+    Empty(std::sync::Arc<CollectionGridInstalledPresentation>),
     Failed {
         message: String,
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
@@ -420,13 +420,67 @@ pub(crate) enum CollectionGridLoadState {
 
 pub(crate) struct CollectionGridPreparedInstall {
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
-    pub(crate) thumbnail_sources: CollectionGridThumbnailSources,
+    pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailSources,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CollectionGridThumbnailSources {
     pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
     pub(crate) video_pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectionGridThumbnailSourceIdentity(pub(crate) [u8; 32]);
+
+#[derive(Debug)]
+pub(crate) struct CollectionGridPreparedThumbnailSources {
+    pub(crate) identity: CollectionGridThumbnailSourceIdentity,
+    pub(crate) payload: CollectionGridThumbnailSources,
+}
+
+impl PartialEq for CollectionGridPreparedThumbnailSources {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for CollectionGridPreparedThumbnailSources {}
+
+impl Default for CollectionGridPreparedThumbnailSources {
+    fn default() -> Self {
+        Self {
+            identity: CollectionGridThumbnailSourceIdentity::default(),
+            payload: CollectionGridThumbnailSources::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridInstalledPresentation {
+    pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+    pub(crate) thumbnail_source_identity: CollectionGridThumbnailSourceIdentity,
+}
+
+impl CollectionGridInstalledPresentation {
+    pub(crate) fn new(
+        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+        thumbnail_source_identity: CollectionGridThumbnailSourceIdentity,
+    ) -> Self {
+        Self {
+            prepared,
+            thumbnail_source_identity,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_thumbnail_sources(
+        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new(
+            prepared,
+            CollectionGridThumbnailSourceIdentity::default(),
+        ))
+    }
 }
 
 impl CollectionGridLoadState {
@@ -438,8 +492,17 @@ impl CollectionGridLoadState {
             | Self::Snapshot { installed, .. }
             | Self::Preparing { installed, .. }
             | Self::Failed { installed, .. } => installed.as_ref(),
-            Self::Ready(prepared) | Self::Empty(prepared) => Some(prepared),
+            Self::Ready(presentation) | Self::Empty(presentation) => Some(&presentation.prepared),
             Self::Deleted => None,
+        }
+    }
+
+    pub(crate) fn installed_presentation(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridInstalledPresentation>> {
+        match self {
+            Self::Ready(presentation) | Self::Empty(presentation) => Some(presentation),
+            _ => None,
         }
     }
 }
@@ -491,8 +554,9 @@ impl CollectionGridSession {
                 cancel.store(true, std::sync::atomic::Ordering::Release);
                 installed
             }
-            CollectionGridLoadState::Ready(prepared) | CollectionGridLoadState::Empty(prepared) => {
-                Some(prepared)
+            CollectionGridLoadState::Ready(presentation)
+            | CollectionGridLoadState::Empty(presentation) => {
+                Some(std::sync::Arc::clone(&presentation.prepared))
             }
             CollectionGridLoadState::Deleted => None,
         };
@@ -503,6 +567,12 @@ impl CollectionGridSession {
         &self,
     ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
         self.load.installed()
+    }
+
+    pub(crate) fn installed_presentation(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridInstalledPresentation>> {
+        self.load.installed_presentation()
     }
 }
 
