@@ -86,6 +86,7 @@
             <li><a href="#archive-7z-lzh">RAR / 7z / LZH アーカイブに対応していますか？</a></li>
             <li><a href="#archive-direct-rar">RAR / 7z / LZH を ZIP 変換せず直接開けますか？</a></li>
             <li><a href="#archive-rar">RAR アーカイブには対応していますか？</a></li>
+            <li><a href="#format-epub">EPUB に対応していますか？</a></li>
             <li><a href="#archive-game">ゲーム独自のアーカイブ（xp3、arc、tlg、g00 等）には対応していますか？</a></li>
             <li><a href="#format-retro">古い PC の画像形式（MAG、PI 等）には対応していますか？</a></li>
             <li><a href="#susie-plugin">Susie プラグインは 32bit / 64bit どちらに対応していますか？</a></li>
@@ -162,6 +163,15 @@
     <p>RAR 展開には RARLAB 社の UnRAR ソースコードを使用します。UnRAR は RAR アーカイブを扱う用途では
     利用できますが、RAR 互換アーカイバの開発や RAR 圧縮アルゴリズムの再作成には使用できません。
     mImageViewer では展開・一覧専用として利用し、RAR ファイルの作成機能は提供しません。</p>
+
+    <h3 id="format-epub">EPUB に対応していますか？</h3>
+    <p>対応していません。</p>
+    <p>mImageViewer は、画像や PDF のようにページ数と各ページの位置が固定された形式を前提としています。
+    一般的な EPUB は画面幅や文字サイズによって改ページ位置が変わるため、表示だけでなく、
+    読書位置・ブックマーク・見開き・サムネイルなども EPUB 専用に実装する必要があります。
+    対応規模が大きいため、現在は対応を見送っています。</p>
+    <p>EPUB 専用ビューアを利用するか、日本語表示に対応した
+    <a href="https://manual.calibre-ebook.com/ja/conversion.html">Calibre</a> などで PDF へ変換してご利用ください。</p>
 
     <h3 id="archive-game">ゲーム独自のアーカイブ（xp3、arc、tlg、g00 等）には対応していますか？</h3>
     <p>ゲーム固有のアーカイブ形式・独自画像形式には対応していません。</p>
