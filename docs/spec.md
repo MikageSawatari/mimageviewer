@@ -361,14 +361,19 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 - 実ファイル・実フォルダ・ZIP / PDF / 変換対象アーカイブへの参照を、名前付きの一覧として保存する。
   元ファイルをコピー、移動、変更せず、同じ参照は同じコレクションへ重複登録しない。
-- ツールバーのコレクション名は、左クリックでそのコレクションを一覧表示し、右クリックでメイン一覧の
-  選択項目を追加する。チェック済み項目が 1 件でもあればチェック済みを優先し、無ければカーソル位置を
-  使う。右クリック時点の選択を捕捉し、追加中に一覧の選択が変わっても対象を差し替えない。
+- コレクションセクションは全表示形式で、追加先を選ぶコンボと `追加` / `開く` を表示する。コンボの
+  選択だけでは一覧を開かず、追加先は管理画面の選択や現在表示中の一覧と独立して保存する。`展開` と
+  展開中の `折りたたみ` では名前ショートカットも表示し、左クリックで開き、右クリックで追加する。
+  `プルダウン` は名前ショートカットを隠すコンパクト表示とする。
+- メイン一覧のチェック済み項目が 1 件でもあればチェック済みを優先し、無ければカーソル位置を使う。
+  `追加` または名前の右クリック時点の選択を捕捉し、追加中に一覧の選択が変わっても対象を差し替えない。
+  追加後も元一覧、カーソル、チェック、スクロール位置を維持し、`開く` 操作だけが表示先を切り替える。
 - ZIP / PDF 内ページ、ZIP 内フォルダ、スタック、検索集約セル、利用不能なコレクション項目は単独の
   物理参照ではないため登録しない。対応項目と混在する場合も一括追加全体を拒否し、親アーカイブや代表画像へ
   勝手に置き換えない。
 - 管理画面では作成、名前変更、削除、手動順 / 通常ソート、テキスト import / export、参照外し、再リンクを
-  行う。ファイル / フォルダの追加ピッカーは置かず、メイン一覧とツールバーの右クリックを使う。
+  行う。ファイル / フォルダの追加ピッカーは置かず、メイン一覧とツールバーの `追加` または名前の
+  右クリックを使う。
 - 追加は collection actor の最新 revision を非同期で取得してから分類・保存する。管理画面の選択対象や
   進行中の import / export / relink を toolbar 操作で切り替えず、保存結果は revision watch で PC の各一覧と
   認証済み mIV Remote の読み取り専用表示へ反映する。Remote からの作成・編集・追加は提供しない。
@@ -2005,7 +2010,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `show_toolbar_folder` | bool | true | フォルダバーを表示 |
 | `show_toolbar_folder_tree_button` | bool | true | ツールバーにフォルダツリー表示切り替えの `ツリー` ボタンを表示 |
 | `show_toolbar_bookshelf` | bool | true | ツールバーに本棚セクション (追加先の本の切り替え / 追加 / 開く) を表示 |
-| `show_toolbar_collections` | bool | true | ツールバーに名前付きコレクションセクション (左クリックで開く / 右クリックで選択を追加 / 管理) を表示 |
+| `show_toolbar_collections` | bool | true | ツールバーに名前付きコレクションセクション (追加先コンボ / 追加 / 開く / 管理 / 名前ショートカット) を表示 |
 | `show_address_bar_history_nav` | bool | true | フォルダバーに履歴の戻る/進む (←/→) を表示 |
 | `show_address_bar_quick_folders` | bool | true | フォルダバーに A/B クイックフォルダボタンを表示 |
 | `show_toolbar_parent_button` | bool | true | フォルダバーに親フォルダ (⬆) を表示 |
@@ -2024,7 +2029,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_section_order` | Vec\<ToolbarSectionId\> | [] (=既定順) | ツールバーセクションの並び順 (v2.0.0、ラベルのドラッグで変更)。未登録は既定順で末尾補完、未知の variant は描画前に除外 |
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
-| `toolbar_collections_display` | ToolbarSectionDisplay | Dropdown | コレクションセクションの表示形式。展開 / 折りたたみ / プルダウンから選ぶ |
+| `toolbar_collections_display` | ToolbarSectionDisplay | Dropdown | コレクションの名前ショートカットの表示形式。展開 / 折りたたみ / プルダウンから選ぶ。追加先コンボと追加 / 開く / 管理は常時表示し、プルダウンは名前ショートカットを隠す |
+| `toolbar_collection_target_id` | Option\<Uuid\> | None | コレクションツールバーの追加 / 開く対象。管理画面の選択と現在の Grid 表示先から独立して保存し、Ready catalog で削除済みと確定したときだけ先頭または None へ補正する |
 | `toolbar_{favorites,smart_folders,tags,bookshelf,collections}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → 通常メニュー」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |
 | `context_menu_layout` | ContextMenuLayoutSettings | 空 (=既定順) | Grid / Fullscreen 共通の mIV 右クリック静的 leaf を stable ID で表示・同一階層内並べ替えし、各leaf直前のseparatorを内部では継承 / 表示 / 非表示で保存する。環境設定「表示 → 右クリックメニュー」は固定場面をproduction builderへ通し、継承値を実際の表示 / 非表示として示す。明示値はactual itemへ追従し、継承値は移動先slotのsectionを使う。利用不能項目は復活させず、未知 / 重複 / 親違い ID は無視し、欠落した新項目は canonical 位置へ補完する。外部ツール群、Open With submenu、関連付けアプリ群、Windows Shell 群は表示と位置を変えない固定枠。欠落時や空設定は従来の内容・section・順序を保つ |

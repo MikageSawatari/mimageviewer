@@ -914,9 +914,15 @@ focused / full / static / verification build保留証跡は
 
 ## 19. PC toolbarからの参照追加と管理picker撤去（2026-09-16）
 
-- メイン一覧のコレクション名を、本棚のピン留め本と同じく左クリックで開く、右クリックで現在の
-  Grid選択を追加する操作へ揃えた。`grid_selection_indices()`を共用し、checkedがあればcheckedを優先、
-  無ければselectedを使い、クリック時にpathを捕捉する。管理windowの`selected_id`は切り替えない。
+- 本棚と同じく、全表示形式で追加先コンボと明示的な`追加` / `開く`を常設した。コンボは追加先の
+  選択だけを行い、一覧を開かない。`展開`と展開中の`折りたたみ`では名前shortcutを表示し、左クリックで
+  開く、右クリックで現在のGrid選択を追加する。`プルダウン`はshortcut列だけを隠す既存compact表示として
+  保持する。`grid_selection_indices()`を共用し、checkedがあればcheckedを優先、無ければselectedを使い、
+  追加操作時にpathを捕捉する。
+- toolbar targetは設定に永続化し、管理windowの`selected_id`、現在のGrid surfaceと別ownerにした。
+  authoritativeなReady catalogだけで存在を検証し、削除済みなら先頭、空ならNoneへ補正する。Starting /
+  Unavailableと一時的なsnapshot欠落では保持する。追加完了でも元surface / address / items generation / selected /
+  checked / scrollを変えず、明示的な`開く`または名前の左クリックだけがsurfaceを切り替える。
 - 追加対象は`GridItem::drag_source_path()`を持つ物理sourceだけとする。仮想page / archive directory / Stack /
   SearchContainer / CollectionPlaceholderを混在させたbatchは全体を保存前に拒否し、親archive・代表画像へ
   丸めない。分類は既存worker、保存はactorの`add_batch`を使い、source bytesは変更しない。
@@ -928,12 +934,15 @@ focused / full / static / verification build保留証跡は
   manager windowを閉じてもcancelせず、明示的な「取り消す」だけがclassify workerを止める。
 - handler回帰はchecked優先 / selected fallback、latest revision、duplicate、実folder、source無変更、仮想項目と
   placeholderの全体拒否、import / export / relink owner保持、manager close 3段階detach、Conflict terminalと
-  watch/catalog refreshを固定する。管理windowのdark / light snapshotは旧picker撤去とtoolbar誘導文を固定する。
-- focusedはcollection handler / snapshot 15/15、core checkがpassした。final
-  `scripts/test-full.ps1 -SuppressCrashDialogs`はmain 8576 / 0 / 45、UI snapshot 52/52、IPC 57/57、
+  watch/catalog refreshを固定する。さらにeguiのprimary / secondary press-releaseを通して、コンボ選択、明示的な
+  追加 / 開く、名前shortcutが相互発火しないことと、プルダウンでも追加 / 開くが残ることを固定する。
+  管理windowのdark / light snapshotは旧picker撤去とtoolbar誘導文を固定する。
+- focusedはcollection toolbar 5/5、toolbar add 5/5、target reconcile 1/1、collection handler / snapshot
+  16/16、core checkがpassした。final `scripts/test-full.ps1 -SuppressCrashDialogs`はmain 8590 / 0 / 45、
+  UI snapshot 52/52、IPC 57/57、
   Remote 122/122（1 ignored）、vendor egui / egui-wgpu / eframe 25 / 9 / 15、`[test-full] PASS`、exit 0で、
   process error modeを`0x00008001`へ復元した。fmt、UI glyph、viewer-context audit、diff checkもexit 0である。
 - 独立Sol / xhigh reviewerはselection捕捉、latest revision、manager owner / close lifecycle、physical-onlyの
   全体拒否、source不変、actor terminal / watch収束、Remote非変更を再照合し、重要指摘なしで承認した。
-  resident PID 4708はbuild開始前に既に不在で、停止操作は行っていない。`scripts/build-dev.ps1 -PreserveRuntime`は
-  exit 0で、`target/dev-runtime/mimageviewer-core.exe`と`mimageviewer-remote.exe`を更新した。アプリは起動していない。
+  `scripts/build-dev.ps1 -PreserveRuntime`はexit 0で、動作中アプリを停止せず
+  `target/dev-runtime/mimageviewer-core.exe`と`mimageviewer-remote.exe`を更新した。アプリは起動していない。

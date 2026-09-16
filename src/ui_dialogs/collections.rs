@@ -50,14 +50,14 @@ impl CollectionToolbarStatus {
 
     pub(crate) fn selected_text(
         self,
-        active_id: Option<CollectionId>,
+        target_id: Option<CollectionId>,
         rows: &[(CollectionId, String)],
     ) -> String {
         if self != Self::Ready {
             return self.label().to_owned();
         }
         rows.iter()
-            .find(|(id, _)| Some(*id) == active_id)
+            .find(|(id, _)| Some(*id) == target_id)
             .map(|(_, name)| name.clone())
             .unwrap_or_else(|| self.label().to_owned())
     }
@@ -568,6 +568,14 @@ fn collection_error_message(error: &CollectionStoreError) -> String {
 }
 
 impl App {
+    fn persist_collection_toolbar_target(&self) {
+        // Unit tests construct many Apps against process-global settings test databases in
+        // parallel. The Settings round-trip test covers this field's persistence; handler tests
+        // must not write through another test's temporary global database.
+        #[cfg(not(test))]
+        self.settings.save();
+    }
+
     pub(crate) fn install_collection_runtime(&mut self, runtime: CollectionStoreRuntime) {
         self.collection_ui.install_runtime(runtime);
     }
@@ -609,7 +617,7 @@ impl App {
         Vec<(CollectionId, String)>,
         CollectionToolbarStatus,
     ) {
-        let rows = self
+        let rows: Vec<(CollectionId, String)> = self
             .collection_ui
             .catalog
             .as_ref()
@@ -621,8 +629,13 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let target_id = self
+            .settings
+            .toolbar_collection_target_id
+            .map(CollectionId::from_uuid)
+            .filter(|target| rows.iter().any(|(id, _)| id == target));
         (
-            self.collection_ui.selected_id,
+            target_id,
             rows,
             match self.collection_ui.phase {
                 CollectionRuntimePhase::Starting => CollectionToolbarStatus::Starting,
@@ -632,6 +645,54 @@ impl App {
                 | CollectionRuntimePhase::Closed => CollectionToolbarStatus::Unavailable,
             },
         )
+    }
+
+    /// Changes only the toolbar's durable add/open target. Manager selection, pending operations,
+    /// collection Grid ownership, and navigation are deliberately outside this transition.
+    pub(crate) fn select_collection_toolbar_target(&mut self, id: CollectionId) {
+        if !matches!(self.collection_ui.phase, CollectionRuntimePhase::Ready)
+            || !self.collection_ui.catalog.as_ref().is_some_and(|catalog| {
+                catalog
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.id == id)
+            })
+        {
+            return;
+        }
+        let id = Some(id.as_uuid());
+        if self.settings.toolbar_collection_target_id != id {
+            self.settings.toolbar_collection_target_id = id;
+            self.persist_collection_toolbar_target();
+        }
+    }
+
+    /// An authoritative Ready catalog is the only owner allowed to repair a missing toolbar
+    /// target. Starting/unavailable phases and transient snapshot gaps retain the saved choice.
+    fn reconcile_collection_toolbar_target(&mut self) {
+        if !matches!(self.collection_ui.phase, CollectionRuntimePhase::Ready) {
+            return;
+        }
+        let Some(catalog) = self.collection_ui.catalog.as_ref() else {
+            return;
+        };
+        let saved = self
+            .settings
+            .toolbar_collection_target_id
+            .map(CollectionId::from_uuid);
+        let target = saved
+            .filter(|id| {
+                catalog
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.id == *id)
+            })
+            .or_else(|| catalog.definitions.first().map(|definition| definition.id));
+        let target = target.map(CollectionId::as_uuid);
+        if self.settings.toolbar_collection_target_id != target {
+            self.settings.toolbar_collection_target_id = target;
+            self.persist_collection_toolbar_target();
+        }
     }
 
     /// Adds the current main-Grid selection to a toolbar collection without changing the
@@ -876,6 +937,7 @@ impl App {
         }
 
         self.poll_collection_operation(ctx);
+        self.reconcile_collection_toolbar_target();
         if matches!(self.collection_ui.phase, CollectionRuntimePhase::Starting)
             || self.collection_ui.catalog_request.is_some()
             || self.collection_ui.snapshot_request.is_some()
@@ -2773,6 +2835,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.collection_id() == manager.collection_id())
         });
+        app.select_collection_toolbar_target(target.collection_id());
+        assert_eq!(
+            app.settings.toolbar_collection_target_id,
+            Some(target.collection_id().as_uuid())
+        );
+        assert_eq!(app.collection_ui.selected_id, Some(manager.collection_id()));
 
         let external = client
             .add_batch(
@@ -2799,6 +2867,16 @@ mod tests {
         ];
         app.selected = Some(0);
         app.checked.insert(1);
+        app.address = "source-folder".into();
+        app.scroll_offset_y = 417.5;
+        app.pending_grid_scroll = Some(crate::app::GridScrollIntent::Bottom);
+        let source_surface = app.top_level_grid_view.surface().clone();
+        let source_address = app.address.clone();
+        let source_generation = app.items_generation;
+        let source_selected = app.selected;
+        let source_checked = app.checked.clone();
+        let source_scroll = app.scroll_offset_y;
+        let source_pending_scroll = app.pending_grid_scroll;
         app.add_grid_selection_to_collection(target.collection_id());
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
 
@@ -2832,6 +2910,18 @@ mod tests {
             Some(manager.collection_id()),
             "toolbar add must not switch or cancel the manager selection owner"
         );
+        assert_eq!(
+            app.settings.toolbar_collection_target_id,
+            Some(target.collection_id().as_uuid()),
+            "manager selection and actor completion must not replace the toolbar target"
+        );
+        assert_eq!(app.top_level_grid_view.surface(), &source_surface);
+        assert_eq!(app.address, source_address);
+        assert_eq!(app.items_generation, source_generation);
+        assert_eq!(app.selected, source_selected);
+        assert_eq!(app.checked, source_checked);
+        assert_eq!(app.scroll_offset_y, source_scroll);
+        assert_eq!(app.pending_grid_scroll, source_pending_scroll);
         assert_eq!(std::fs::read(&ignored).unwrap(), b"ignored-source");
         assert_eq!(std::fs::read(&checked).unwrap(), b"checked-source");
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing-source");
@@ -2878,6 +2968,67 @@ mod tests {
                 })
         });
 
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn toolbar_target_reconciles_only_from_an_authoritative_ready_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let first = create_collection(&mut app, "First");
+        let second = create_collection(&mut app, "Second");
+        app.collection_ui
+            .select_collection(Some(first.collection_id()));
+        wait_for(&mut app, |app| {
+            app.collection_ui
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.collection_id() == first.collection_id())
+        });
+
+        app.select_collection_toolbar_target(second.collection_id());
+        let second_target = Some(second.collection_id().as_uuid());
+        assert_eq!(app.settings.toolbar_collection_target_id, second_target);
+        assert_eq!(app.collection_ui.selected_id, Some(first.collection_id()));
+
+        app.select_collection_toolbar_target(CollectionId::new());
+        assert_eq!(app.settings.toolbar_collection_target_id, second_target);
+
+        let retained_catalog = app.collection_ui.catalog.take();
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.reconcile_collection_toolbar_target();
+        assert_eq!(app.settings.toolbar_collection_target_id, second_target);
+        app.collection_ui.phase = CollectionRuntimePhase::Ready;
+        app.reconcile_collection_toolbar_target();
+        assert_eq!(
+            app.settings.toolbar_collection_target_id, second_target,
+            "a transient missing snapshot must not erase the durable target"
+        );
+        app.collection_ui.catalog = retained_catalog;
+
+        let without_second = client
+            .delete_collection(second.collection_id(), second.revision())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        app.collection_ui.catalog = Some(without_second);
+        app.reconcile_collection_toolbar_target();
+        assert_eq!(
+            app.settings.toolbar_collection_target_id,
+            Some(first.collection_id().as_uuid())
+        );
+        assert_eq!(app.collection_ui.selected_id, Some(first.collection_id()));
+
+        let empty = client
+            .delete_collection(first.collection_id(), first.revision())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        app.collection_ui.catalog = Some(empty);
+        app.reconcile_collection_toolbar_target();
+        assert_eq!(app.settings.toolbar_collection_target_id, None);
         app.shutdown_collection_runtime_for_exit();
     }
 

@@ -4783,6 +4783,10 @@ pub struct Settings {
     pub toolbar_bookshelf_display: ToolbarSectionDisplay,
     #[serde(default = "default_toolbar_collections_display")]
     pub toolbar_collections_display: ToolbarSectionDisplay,
+    /// コレクションツールバーの追加先。管理windowの選択や現在表示中のcollectionとは独立。
+    /// catalog Ready時に存在確認し、削除済みなら先頭へ正規化する。
+    #[serde(default)]
+    pub toolbar_collection_target_id: Option<Uuid>,
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
@@ -6873,6 +6877,7 @@ impl Default for Settings {
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
             toolbar_collections_display: default_toolbar_collections_display(),
+            toolbar_collection_target_id: None,
             toolbar_favorites_collapsed: false,
             toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
@@ -9149,6 +9154,7 @@ impl Settings {
         self.toolbar_tags_display = src.toolbar_tags_display;
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
         self.toolbar_collections_display = src.toolbar_collections_display;
+        self.toolbar_collection_target_id = src.toolbar_collection_target_id;
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
         self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
@@ -12182,15 +12188,28 @@ mod tests {
         let mut customized = Settings::default();
         customized.show_toolbar_collections = false;
         customized.toolbar_collections_display = ToolbarSectionDisplay::Collapsible;
+        let target = Uuid::new_v4();
+        customized.toolbar_collection_target_id = Some(target);
         customized.toolbar_collections_collapsed = true;
         let json = serde_json::to_string(&customized).unwrap();
-        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        let mut loaded: Settings = serde_json::from_str(&json).unwrap();
+        loaded.sanitize();
         assert!(!loaded.show_toolbar_collections);
         assert_eq!(
             loaded.toolbar_collections_display,
             ToolbarSectionDisplay::Collapsible
         );
+        assert_eq!(loaded.toolbar_collection_target_id, Some(target));
         assert!(loaded.toolbar_collections_collapsed);
+
+        let mut compact = Settings::default();
+        compact.toolbar_collections_display = ToolbarSectionDisplay::Dropdown;
+        compact.sanitize();
+        assert_eq!(
+            compact.toolbar_collections_display,
+            ToolbarSectionDisplay::Dropdown,
+            "the saved compact collection-toolbar preference must remain available"
+        );
     }
 
     #[test]

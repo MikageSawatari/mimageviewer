@@ -1579,6 +1579,135 @@ fn toolbar_combo_slot<R>(
     .inner
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionToolbarIntent {
+    SelectTarget(crate::collection_store::CollectionId),
+    Add(crate::collection_store::CollectionId),
+    Open(crate::collection_store::CollectionId),
+    Manage,
+}
+
+#[derive(Debug, Default)]
+struct CollectionToolbarDrawResult {
+    intent: Option<CollectionToolbarIntent>,
+    popup_open: bool,
+    collapsed: Option<bool>,
+}
+
+fn draw_collection_toolbar_controls(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    status: crate::ui_dialogs::collections::CollectionToolbarStatus,
+    rows: &[(crate::collection_store::CollectionId, String)],
+    target_id: Option<crate::collection_store::CollectionId>,
+    mode: crate::settings::ToolbarSectionDisplay,
+    collapsed: bool,
+    has_add_target: bool,
+    apply_popup_style: impl Fn(&mut egui::Ui),
+) -> CollectionToolbarDrawResult {
+    use crate::settings::ToolbarSectionDisplay as Display;
+
+    let mut result = CollectionToolbarDrawResult::default();
+    let ready = status == crate::ui_dialogs::collections::CollectionToolbarStatus::Ready;
+    let selected_text = status.selected_text(target_id, rows);
+    let combo = toolbar_combo_slot(ui, ready, 180.0, selected_text, |ui, text| {
+        egui::ComboBox::from_id_salt("toolbar_collection_target_combo")
+            .width(180.0)
+            .height(320.0)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                apply_popup_style(ui);
+                if rows.is_empty() {
+                    ui.label(egui::RichText::new("コレクションはまだありません").weak());
+                }
+                for (id, name) in rows {
+                    if ui
+                        .selectable_label(Some(*id) == target_id, name)
+                        .on_hover_text("追加・開く対象に選択")
+                        .clicked()
+                    {
+                        result.intent = Some(CollectionToolbarIntent::SelectTarget(*id));
+                        ui.close();
+                    }
+                }
+            })
+    });
+    result.popup_open = egui::ComboBox::is_open(ctx, combo.response.id);
+
+    let target_name = target_id.and_then(|target| {
+        rows.iter()
+            .find(|(id, _)| *id == target)
+            .map(|(_, name)| name.as_str())
+    });
+    let add_enabled = ready && target_id.is_some() && has_add_target;
+    let add = ui
+        .add_enabled(add_enabled, egui::Button::new("追加"))
+        .hover_tip(match (has_add_target, target_name) {
+            (true, Some(name)) => format!("選択中またはチェック済みの項目を「{name}」へ追加"),
+            (false, _) => "追加する項目を選択してください".to_owned(),
+            _ => "追加先のコレクションを選択してください".to_owned(),
+        });
+    if add.clicked()
+        && let Some(id) = target_id
+    {
+        result.intent = Some(CollectionToolbarIntent::Add(id));
+    }
+    let open = ui
+        .add_enabled(ready && target_id.is_some(), egui::Button::new("開く"))
+        .hover_tip(target_name.map_or_else(
+            || "開くコレクションを選択してください".to_owned(),
+            |name| format!("「{name}」を開く"),
+        ));
+    if open.clicked()
+        && let Some(id) = target_id
+    {
+        result.intent = Some(CollectionToolbarIntent::Open(id));
+    }
+
+    let show_shortcuts = match mode {
+        Display::Collapsible => {
+            let arrow = if collapsed { "▶" } else { "▼" };
+            if ui
+                .button(arrow)
+                .on_hover_text("コレクション一覧の折りたたみ")
+                .clicked()
+            {
+                result.collapsed = Some(!collapsed);
+            }
+            !collapsed
+        }
+        Display::Buttons => true,
+        Display::Dropdown => false,
+        Display::Unknown => true,
+    };
+    if show_shortcuts {
+        if !ready {
+            ui.label(egui::RichText::new(status.label()).weak());
+        } else if rows.is_empty() {
+            ui.label(egui::RichText::new("（なし）").weak());
+        } else {
+            for (id, name) in rows {
+                let response = ui
+                    .button(name)
+                    .on_hover_text("左: このコレクションを開く / 右: 選択した項目を追加");
+                if response.clicked() {
+                    result.intent = Some(CollectionToolbarIntent::Open(*id));
+                } else if response.secondary_clicked() {
+                    result.intent = Some(CollectionToolbarIntent::Add(*id));
+                }
+            }
+        }
+    }
+    if ui
+        .button("管理…")
+        .on_hover_text("コレクションの作成・編集・インポート・エクスポート")
+        .clicked()
+    {
+        result.intent = Some(CollectionToolbarIntent::Manage);
+    }
+    result
+}
+
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -7915,10 +8044,8 @@ impl App {
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
         let show_collections = self.settings.show_toolbar_collections;
-        let (active_collection_id, toolbar_collections, collections_status) =
+        let (toolbar_collection_target_id, toolbar_collections, collections_status) =
             self.collection_toolbar_catalog();
-        let collections_ready =
-            collections_status == crate::ui_dialogs::collections::CollectionToolbarStatus::Ready;
         let sort_lock = self.grid_sort_lock_reason();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
@@ -7962,9 +8089,7 @@ impl App {
         let mut toolbar_book_target_name: Option<String> = None;
         let mut toolbar_book_pin_open: Option<String> = None;
         let mut toolbar_book_pin_add: Option<String> = None;
-        let mut toolbar_collection_target: Option<crate::collection_store::CollectionId> = None;
-        let mut toolbar_collection_add_target: Option<crate::collection_store::CollectionId> = None;
-        let mut toolbar_collection_manage = false;
+        let mut toolbar_collection_intent: Option<CollectionToolbarIntent> = None;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_tag_container: Option<String> = None;
@@ -8270,95 +8395,24 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
-                    let mode = self.settings.toolbar_collections_display;
-                    let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
+                    let drawn = draw_collection_toolbar_controls(
                         ui,
-                        mode,
+                        ctx,
+                        collections_status,
+                        &toolbar_collections,
+                        toolbar_collection_target_id,
+                        self.settings.toolbar_collections_display,
                         self.settings.toolbar_collections_collapsed,
+                        has_book_add_target,
+                        apply_toolbar_style,
                     );
-                    if let Some(collapsed) = new_collapsed {
+                    toolbar_combo_popup_open |= drawn.popup_open;
+                    if let Some(collapsed) = drawn.collapsed {
                         self.settings.toolbar_collections_collapsed = collapsed;
                         self.settings.save();
                     }
-                    if mode == crate::settings::ToolbarSectionDisplay::Dropdown {
-                        let selected_text = collections_status
-                            .selected_text(active_collection_id, &toolbar_collections);
-                        let combo = toolbar_combo_slot(
-                            ui,
-                            collections_ready,
-                            180.0,
-                            selected_text,
-                            |ui, text| {
-                                egui::ComboBox::from_id_salt("toolbar_collection_target_combo")
-                                    .width(180.0)
-                                    .height(320.0)
-                                    .selected_text(text)
-                                    .show_ui(ui, |ui| {
-                                        apply_toolbar_style(ui);
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "左クリック: 開く / 右クリック: 選択を追加",
-                                            )
-                                            .weak(),
-                                        );
-                                        if toolbar_collections.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "コレクションはまだありません",
-                                                )
-                                                .weak(),
-                                            );
-                                        }
-                                        for (id, name) in &toolbar_collections {
-                                            let response = ui
-                                                .selectable_label(
-                                                    Some(*id) == active_collection_id,
-                                                    name,
-                                                )
-                                                .on_hover_text(
-                                                    "左: このコレクションを開く / 右: 選択した項目を追加",
-                                                );
-                                            if response.clicked() {
-                                                toolbar_collection_target = Some(*id);
-                                                ui.close();
-                                            }
-                                            if response.secondary_clicked() {
-                                                toolbar_collection_add_target = Some(*id);
-                                                ui.close();
-                                            }
-                                        }
-                                    })
-                            },
-                        );
-                        toolbar_combo_popup_open |=
-                            egui::ComboBox::is_open(ctx, combo.response.id);
-                    } else if show_inline {
-                        if !collections_ready {
-                            ui.label(egui::RichText::new(collections_status.label()).weak());
-                        } else if toolbar_collections.is_empty() {
-                            ui.label(egui::RichText::new("（なし）").weak());
-                        } else {
-                            for (id, name) in &toolbar_collections {
-                                let response = ui
-                                    .selectable_label(Some(*id) == active_collection_id, name)
-                                    .on_hover_text(
-                                        "左: このコレクションを開く / 右: 選択した項目を追加",
-                                    );
-                                if response.clicked() {
-                                    toolbar_collection_target = Some(*id);
-                                }
-                                if response.secondary_clicked() {
-                                    toolbar_collection_add_target = Some(*id);
-                                }
-                            }
-                        }
-                    }
-                    if ui
-                        .button("管理…")
-                        .on_hover_text("コレクションの作成・編集・インポート・エクスポート")
-                        .clicked()
-                    {
-                        toolbar_collection_manage = true;
+                    if drawn.intent.is_some() {
+                        toolbar_collection_intent = drawn.intent;
                     }
                 }
                 TS::Cols => {
@@ -9216,14 +9270,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if let Some(name) = toolbar_book_pin_add {
             self.add_grid_selection_to_named_book(ctx, name);
         }
-        if let Some(id) = toolbar_collection_add_target {
-            self.add_grid_selection_to_collection(id);
-        }
-        if let Some(id) = toolbar_collection_target {
-            self.open_collection_grid(id, None);
-        }
-        if toolbar_collection_manage {
-            self.open_collection_manager(active_collection_id);
+        if let Some(intent) = toolbar_collection_intent {
+            match intent {
+                CollectionToolbarIntent::SelectTarget(id) => {
+                    self.select_collection_toolbar_target(id)
+                }
+                CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
+                CollectionToolbarIntent::Open(id) => self.open_collection_grid(id, None),
+                CollectionToolbarIntent::Manage => {
+                    self.open_collection_manager(toolbar_collection_target_id)
+                }
+            }
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
@@ -21832,6 +21889,170 @@ mod toolbar_reorder_tests {
         let order = vec![TS::Cols, TS::Aspect, TS::Sort, TS::Tags];
         let got = reorder_toolbar_section(&order, TS::Sort, Some(TS::Cols), None).unwrap();
         assert_eq!(got, vec![TS::Sort, TS::Cols, TS::Aspect, TS::Tags]);
+    }
+}
+
+#[cfg(test)]
+mod collection_toolbar_interaction_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    struct ToolbarState {
+        rows: Vec<(crate::collection_store::CollectionId, String)>,
+        target: crate::collection_store::CollectionId,
+        mode: crate::settings::ToolbarSectionDisplay,
+        collapsed: bool,
+        intent: Option<CollectionToolbarIntent>,
+    }
+
+    fn harness(
+        mode: crate::settings::ToolbarSectionDisplay,
+        collapsed: bool,
+    ) -> Harness<'static, ToolbarState> {
+        let first = crate::collection_store::CollectionId::new();
+        let second = crate::collection_store::CollectionId::new();
+        Harness::builder()
+            .with_size(egui::vec2(900.0, 240.0))
+            .build_state(
+                |ctx, state| {
+                    egui::TopBottomPanel::top("collection-toolbar-test").show(ctx, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let drawn = draw_collection_toolbar_controls(
+                                ui,
+                                ctx,
+                                crate::ui_dialogs::collections::CollectionToolbarStatus::Ready,
+                                &state.rows,
+                                Some(state.target),
+                                state.mode,
+                                state.collapsed,
+                                true,
+                                |_| {},
+                            );
+                            if let Some(collapsed) = drawn.collapsed {
+                                state.collapsed = collapsed;
+                            }
+                            if drawn.intent.is_some() {
+                                state.intent = drawn.intent;
+                            }
+                        });
+                    });
+                },
+                ToolbarState {
+                    rows: vec![
+                        (first, "First target".into()),
+                        (second, "Second target".into()),
+                    ],
+                    target: first,
+                    mode,
+                    collapsed,
+                    intent: None,
+                },
+            )
+    }
+
+    fn raw_click(
+        harness: &mut Harness<'static, ToolbarState>,
+        label: &str,
+        button: egui::PointerButton,
+    ) {
+        harness.run();
+        let pos = harness.get_by_label(label).rect().center();
+        raw_click_at(harness, pos, button);
+    }
+
+    fn raw_click_at(
+        harness: &mut Harness<'static, ToolbarState>,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+    ) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+    }
+
+    #[test]
+    fn combo_primary_press_release_selects_target_without_open_or_add() {
+        let mut harness = harness(crate::settings::ToolbarSectionDisplay::Collapsible, true);
+        harness.run();
+        let combo = harness
+            .get_by_role(egui::accesskit::Role::ComboBox)
+            .rect()
+            .center();
+        raw_click_at(&mut harness, combo, egui::PointerButton::Primary);
+        assert!(harness.query_by_label("Second target").is_some());
+        raw_click(&mut harness, "Second target", egui::PointerButton::Primary);
+        assert_eq!(
+            harness.state().intent,
+            Some(CollectionToolbarIntent::SelectTarget(
+                harness.state().rows[1].0
+            ))
+        );
+    }
+
+    #[test]
+    fn explicit_add_and_open_buttons_emit_only_their_typed_intent_in_every_saved_mode() {
+        use crate::settings::ToolbarSectionDisplay as Display;
+        for mode in [
+            Display::Buttons,
+            Display::Collapsible,
+            Display::Dropdown,
+            Display::Unknown,
+        ] {
+            let mut add = harness(mode, true);
+            raw_click(&mut add, "追加", egui::PointerButton::Primary);
+            assert_eq!(
+                add.state().intent,
+                Some(CollectionToolbarIntent::Add(add.state().target)),
+                "{mode:?} add"
+            );
+
+            let mut open = harness(mode, true);
+            raw_click(&mut open, "開く", egui::PointerButton::Primary);
+            assert_eq!(
+                open.state().intent,
+                Some(CollectionToolbarIntent::Open(open.state().target)),
+                "{mode:?} open"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_primary_and_secondary_press_release_never_cofire_when_shortcuts_are_visible() {
+        use crate::settings::ToolbarSectionDisplay as Display;
+        for mode in [Display::Buttons, Display::Collapsible, Display::Unknown] {
+            let mut open = harness(mode, false);
+            raw_click(&mut open, "Second target", egui::PointerButton::Primary);
+            assert_eq!(
+                open.state().intent,
+                Some(CollectionToolbarIntent::Open(open.state().rows[1].0)),
+                "{mode:?} primary"
+            );
+
+            let mut add = harness(mode, false);
+            raw_click(&mut add, "Second target", egui::PointerButton::Secondary);
+            assert_eq!(
+                add.state().intent,
+                Some(CollectionToolbarIntent::Add(add.state().rows[1].0)),
+                "{mode:?} secondary"
+            );
+        }
+    }
+
+    #[test]
+    fn dropdown_keeps_explicit_actions_and_hides_inline_name_shortcuts() {
+        let mut harness = harness(crate::settings::ToolbarSectionDisplay::Dropdown, false);
+        harness.run();
+
+        assert!(harness.query_by_label("追加").is_some());
+        assert!(harness.query_by_label("開く").is_some());
+        assert!(harness.query_by_label("Second target").is_none());
     }
 }
 
