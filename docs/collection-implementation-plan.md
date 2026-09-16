@@ -733,6 +733,18 @@ viewer-context 境界へ collection surface を追加する。
 
 ### 16.3 open、戻り先、context menu
 
+- toolbarの明示Openとcollection間の明示切替は、folder Back/Forwardと共通のtyped history
+  `FolderNavHistoryTarget`へ`CollectionGridRestore`を積む。履歴entryはPath / Rating / SmartFolder /
+  Collectionのいずれか一つを所有し、collectionをfilesystem風のsynthetic pathへ変換しない。
+  A→collection C→BはBackでC→A、ForwardでCへ戻り、C1/C2はstable CollectionIdで区別する。
+  rename後は同じIDからlatest snapshotへ収束し、Ready catalogで削除済みと確定したIDだけをnormal+A/Bの
+  back/forwardからpruneする。rollback snapshotのinstall時も同じReady catalogで再pruneし、Starting / Failed /
+  一時的なcatalog不在では履歴を捨てない。Add、manager選択、watch refresh、collection-owned child/reloadは履歴を積まない。
+- collection rootから独立したphysical navigationへ出る時は、scan / archive adoptionがvisible結果を採用した境界で
+  collection restoreを履歴へcommitする。scan失敗、scope拒否、stale completion、sidecar restoreではroot surfaceと
+  履歴を維持する。collection-owned child / descendant / same-folder reloadは従来どおりsessionを保持し、root復帰に
+  folder historyを使わない。
+
 - collection rootのphysical leafは既存fullscreen openへ渡し、そのviewer contextのcollection originを
   `{collection_id, revision_at_open, entry_id, source_key}`として保持する。folder / book / ZIP / PDF /
   convertible containerは既存loaderへ渡す直前に同じoriginを`TopLevelGridRestore::Collection`へ保存する。
@@ -748,9 +760,10 @@ viewer-context 境界へ collection surface を追加する。
   entry ID+source keyを一つのownerで照合し、処理中にcontextまたはcollectionが切り替わった旧completionを新sessionへ
   commitしない。
 - context menuへstable command「コレクションから外す」を追加し、collection bindingが現在cellを所有する時だけ
-  表示する。複数checkedは同じcollection / generationに属すentry IDだけを一transactionの`remove_entries`へ渡す。
-  commandは元file、folder、book、archive、metadataを変更しない。missing cellはこのremoveと既存managerのrelink
-  導線だけを有効にする。
+  表示する。collection rootの通常Deleteも同じhandlerへ入り、複数checkedは同じcollection / generationに属す
+  entry IDだけを一transactionの`remove_entries`へ渡す。checkedがなければselectedを使う。stale / 未install bindingは
+  fail closedで通知し、元ファイル削除へfallbackしない。commandは元file、folder、book、archive、metadataを変更しない。
+  missing cellも参照解除でき、既存managerのrelink導線を維持する。PhysicalSource childのDeleteは従来のfile deleteである。
 - removeをactorへenqueueした後のresponseは、surfaceを閉じても「取消済み」にはできない。process-global
   `CollectionUiState`のtyped mutation ownerが
   `{request token, origin ViewerContextId, surface generation, CollectionId, expected revision, entry IDs, receiver}`を
@@ -758,8 +771,10 @@ viewer-context 境界へ collection surface を追加する。
   generationの時だけselection等のlocal補助stateを更新する。surface退出、context retire、兄弟context、新generationへ
   responseを直接applyしない。Conflict / persistence errorは失わず管理windowの該当collectionへ再読込 / retry可能な
   resultとして残し、actorへenqueue済みtransactionをUI cancelと表示しない。
-- available physical sourceの「ごみ箱へ移動」は既存確認 / delete workerをそのまま使い、menu文言で
-  source実体を消す操作だと区別する。成功してもcollection entryを消さず、前節のsource変化invalidateで
+- available physical sourceの「元ファイルをゴミ箱へ移動…」は既存確認 / delete workerをそのまま使い、menu文言で
+  source実体を消す操作だと区別する。collection rootのWindows dynamic menuはglobal Inline設定にかかわらず
+  「元ファイルのWindowsメニュー」submenuへ置き、Shellの削除、関連付け、プロパティ、拡張commandを元ファイルへ
+  従来どおり適用する。PhysicalSourceと通常Folderはglobal Inline/Submenu設定を維持する。成功してもcollection entryを消さず、前節のsource変化invalidateで
   placeholderへ更新する。failure / cancelではcollection listingを変更しない。collection removeとsource deleteの
   handlerを相互に呼び出さない。
 
@@ -982,3 +997,38 @@ focused / full / static / verification build保留証跡は
   修正版portableの実機再確認では、cold / 再訪時のcollection動画thumb、collection訪問後に物理folderへ戻って
   Addした場合のsurface / selection / scroll維持、Openだけのcollection遷移、別親にある同basename動画の各sidecar、
   collection内folderから親rootへの復帰、sidecarなし動画の実frame thumbがすべてpassした。
+
+## 20. Collection履歴とroot参照解除（2026-09-16）
+
+- folder履歴の正本を`FolderNavHistoryTarget`へ統合し、物理path、Rating、Smart Folder、Collectionを
+  相互排他的なtyped entryとしてnormal / A / Bのback・forward stack、rollback snapshot、dispatchで共有した。
+  Collectionはsynthetic pathへ投影せずstable IDとrestore hintを保持し、明示的なCollection Openだけを履歴へ
+  記録する。物理loadはvisible adoption成功時だけ元Collectionを記録し、scan失敗、stale result、scope拒否では
+  back / forwardを変更しない。Collection-owned child、reload、toolbar Add、管理window selectionは履歴を積まない。
+- Back / ForwardでCollectionへ戻る時はIDからauthoritativeな最新catalogへ収束する。Ready catalogで削除済みのIDは
+  normal / A / B stackとrollback installから除き、削除済みrootを表示中でもcurrent targetの再捕捉から履歴へ戻さない。
+  Starting / Failed / Inert中の一時的なcatalog不在では履歴を消さず、renameはID一致で復元する。
+- Collection rootの通常`Delete`、通常の「コレクションから外す」は、checked優先 / selected fallbackの参照を
+  collection actorへRemoveとして送る。source file / folderのbytesは変更しない。root bindingが未installまたはstaleなら
+  toastを出してfail closedとし、物理削除へfallbackしない。CollectionのPhysicalSource childと通常Folderは従来どおり
+  実ファイル操作を使う。明示的なsource操作は「元ファイルをゴミ箱へ移動…」として区別した。
+- Collection rootのWindows Shell機能は削除せず、global Inline設定にかかわらず
+  「元ファイルのWindowsメニュー」submenuへ配置する。submenu内のProperties、関連付け、Shell Delete等は参照先sourceへ
+  従来どおり作用し、collection actorへ誤routeしない。PhysicalSource childと通常Folderはglobal Inline / Submenu設定を
+  維持する。definition delete、manager remove、import / export / relink、Remote read-onlyは変更していない。
+- 回帰はphysical A→Collection C→physical BのBack / Forward、C1 / C2 identity、rename、Ready delete prune、
+  snapshot rollback、failed load、normal / A / B、Rating / Smart restore、root checked / selected / unavailable、
+  child physical delete、source bytes不変、root shell submenu、Shell Invoke非actorを固定した。直接`App` fixtureは
+  crate-wideの`AppTestEnvForTest + setup_app_for_test`へ統一し、並列testがprocess-global settings DB / data-dir leaseを
+  競合しないようにした。
+- 検証正本は`target/collection-history-*.log`である。focused collectionは144 passed / 0 failed / 8508 filtered。
+  final `scripts/test-full.ps1 -SuppressCrashDialogs`はmain / lib 8607 passed / 0 failed / 45 ignored、UI snapshot
+  52/52、IPC 57/57、Remote 122 passed（1 ignored）、vendor egui / egui-wgpu / eframe 25 / 9 / 15、
+  `[test-full] PASS`、exit 0で、process error modeを`0x00008001`へ復元した。fmt、UI glyph、
+  viewer-context audit、core checkもexit 0で、UI glyphは0件だった。独立Sol / xhigh reviewerはtyped history、
+  deleted-ID再混入防止、root delete / Shell owner、fixture lifetimeを限定再確認し、重要指摘なしで承認した。
+- mImageViewer processが見えないことを`Get-Process`で確認した後、`scripts/build-dev.ps1 -PreserveRuntime`を実行し、
+  exit 0、VCRT PE check 4 runtime / 2 PE passだった。core SHA-256は
+  `5E2E0D9C8407B800D4C93574F3AF56898FC51FAF5274721FE8A2E682C873C12E`、Remoteは
+  `8ABADDA66BC570D269ABB22439C2A6CA90964A5C2DF2239124CD81B01AEED0AD`。アプリ、通常profile、real dataは
+  起動・操作していない。履歴 / Delete key / Windows submenuの実機確認は親の手動検収として未実施である。

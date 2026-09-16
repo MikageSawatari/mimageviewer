@@ -26,6 +26,28 @@ pub(crate) struct CollectionGridRemoveTarget {
     pub(crate) entry_ids: Vec<CollectionEntryId>,
 }
 
+/// Delete-key/context-menu resolution for the mounted collection surface. Root is fail-closed:
+/// an unavailable immutable binding must never fall through to a source-file deletion.
+#[derive(Clone, Debug)]
+pub(crate) enum CollectionRootDeleteResolution {
+    Ready(CollectionGridRemoveTarget),
+    Unavailable(&'static str),
+    NotCollectionRoot,
+}
+
+impl CollectionRootDeleteResolution {
+    pub(crate) fn is_collection_root(&self) -> bool {
+        !matches!(self, Self::NotCollectionRoot)
+    }
+
+    pub(crate) fn ready_target(&self) -> Option<&CollectionGridRemoveTarget> {
+        match self {
+            Self::Ready(target) => Some(target),
+            Self::Unavailable(_) | Self::NotCollectionRoot => None,
+        }
+    }
+}
+
 pub(in crate::app) fn prepare_collection_grid_install(
     snapshot: &crate::collection_store::CollectionSnapshot,
     display_order: &crate::settings::GridDisplayOrder,
@@ -207,34 +229,80 @@ impl App {
         item_index: Option<usize>,
         has_checked: bool,
     ) -> Option<CollectionGridRemoveTarget> {
-        let stamp = self.collection_grid_stamp()?;
-        let session = self.top_level_grid_view.collection_session()?;
+        match self.collection_root_delete_resolution(item_index, has_checked) {
+            CollectionRootDeleteResolution::Ready(target) => Some(target),
+            CollectionRootDeleteResolution::Unavailable(_)
+            | CollectionRootDeleteResolution::NotCollectionRoot => None,
+        }
+    }
+
+    pub(crate) fn collection_root_delete_resolution(
+        &self,
+        item_index: Option<usize>,
+        has_checked: bool,
+    ) -> CollectionRootDeleteResolution {
+        let TopLevelGridSurface::Collection(_) = self.top_level_grid_view.surface() else {
+            return CollectionRootDeleteResolution::NotCollectionRoot;
+        };
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
+        };
+        if !matches!(session.position, CollectionGridPosition::Root) {
+            return CollectionRootDeleteResolution::NotCollectionRoot;
+        }
+        let Some(stamp) = self.collection_grid_stamp() else {
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
+        };
         if !matches!(session.position, CollectionGridPosition::Root)
             || session.installed_items_generation != Some(self.items_generation)
         {
-            return None;
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
         }
-        let prepared = session.prepared()?;
+        let Some(prepared) = session.prepared() else {
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
+        };
         if prepared.collection_revision != session.accepted_revision
             || prepared.entries.len() != self.items.len()
         {
-            return None;
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
         }
         let mut indices: Vec<usize> = if has_checked {
             self.checked.iter().copied().collect()
         } else {
-            vec![item_index?]
+            let Some(item_index) = item_index else {
+                return CollectionRootDeleteResolution::Unavailable(
+                    "登録解除する項目を選択してください",
+                );
+            };
+            vec![item_index]
         };
         indices.sort_unstable();
         indices.dedup();
         if indices.is_empty() {
-            return None;
+            return CollectionRootDeleteResolution::Unavailable(
+                "登録解除する項目を選択してください",
+            );
         }
-        let entry_ids = indices
+        let Some(entry_ids) = indices
             .into_iter()
             .map(|index| prepared.entries.get(index).map(|entry| entry.entry_id))
-            .collect::<Option<Vec<_>>>()?;
-        Some(CollectionGridRemoveTarget {
+            .collect::<Option<Vec<_>>>()
+        else {
+            return CollectionRootDeleteResolution::Unavailable(
+                "コレクション一覧を更新中のため、登録解除できません",
+            );
+        };
+        CollectionRootDeleteResolution::Ready(CollectionGridRemoveTarget {
             stamp,
             expected_revision: prepared.collection_revision,
             entry_ids,
@@ -686,6 +754,20 @@ impl App {
         self.install_collection_grid_items(Vec::new(), Vec::new(), None);
         self.address = "コレクションを読み込み中…".into();
         self.schedule_collection_grid_snapshot();
+    }
+
+    /// Explicit user navigation into a collection participates in the same Back/Forward history
+    /// as physical folders. Actor refreshes, toolbar Add, and collection-owned child navigation
+    /// continue to call `open_collection_grid` directly and therefore do not create entries.
+    pub(crate) fn open_collection_grid_from_navigation(&mut self, collection_id: CollectionId) {
+        let revision_at_open = self.collection_catalog_revision(collection_id).unwrap_or(0);
+        let restore = CollectionGridRestore {
+            identity: CollectionGridIdentity { collection_id },
+            revision_at_open,
+            viewport_anchor: None,
+        };
+        self.record_collection_nav_transition(restore);
+        self.open_collection_grid(collection_id, None);
     }
 
     fn schedule_collection_grid_snapshot(&mut self) {
@@ -1394,7 +1476,6 @@ mod tests {
     use crate::collection_store::{
         CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
     };
-    use crate::settings::Settings;
 
     fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
         receiver
@@ -1403,11 +1484,16 @@ mod tests {
             .expect("collection actor operation")
     }
 
-    fn start_ready_app(db_path: &Path) -> (App, crate::collection_store::CollectionStoreClient) {
+    fn start_ready_app(
+        db_path: &Path,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        crate::collection_store::CollectionStoreClient,
+    ) {
         let runtime =
             CollectionStoreRuntime::start_at(db_path.to_path_buf()).expect("collection runtime");
         let client = runtime.client();
-        let mut app = App::new_from_settings(Settings::default());
+        let mut app = crate::app::setup_app_for_test();
         app.install_collection_runtime(runtime);
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1479,6 +1565,285 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    #[test]
+    fn explicit_collection_open_participates_in_typed_back_forward_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let physical_a = temp.path().join("physical-a");
+        let physical_b = temp.path().join("physical-b");
+        std::fs::create_dir(&physical_a).unwrap();
+        std::fs::create_dir(&physical_b).unwrap();
+        std::fs::write(physical_b.join("page.jpg"), b"page").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(physical_a.clone());
+
+        let first = recv(
+            client
+                .create_collection("First".into())
+                .expect("create first"),
+        );
+        let second = recv(
+            client
+                .create_collection("Second".into())
+                .expect("create second"),
+        );
+        app.open_collection_grid_from_navigation(first.collection_id());
+        wait_for_grid(&mut app, first.collection_id());
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path))
+                if crate::folder_tree::path_eq(path, &physical_a)
+        ));
+
+        app.open_collection_grid_from_navigation(second.collection_id());
+        wait_for_grid(&mut app, second.collection_id());
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(restore))
+                if restore.identity.collection_id == first.collection_id()
+        ));
+
+        let renamed_first = recv(
+            client
+                .rename_collection(
+                    first.collection_id(),
+                    first.revision(),
+                    "First renamed".into(),
+                )
+                .expect("rename first while its history entry is parked"),
+        );
+
+        let back = app.navigate_folder_history_back().expect("back to first");
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&back),
+            super::super::SyntheticFolderHistoryDispatch::Restored
+        );
+        wait_for_grid(&mut app, first.collection_id());
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .accepted_revision,
+            renamed_first.revision(),
+            "history owns the stable collection id and reloads its latest revision",
+        );
+        assert_eq!(app.address, "コレクション: First renamed");
+        assert!(matches!(
+            app.folder_history_forward_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(restore))
+                if restore.identity.collection_id == second.collection_id()
+        ));
+
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&physical_b, &app.settings)
+                .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            physical_b.clone(),
+            Some(scan),
+            super::super::OpenRequestOwner::Navigation,
+        ));
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(restore))
+                if restore.identity.collection_id == first.collection_id()
+        ));
+        let back = app
+            .navigate_folder_history_back()
+            .expect("back to first again");
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&back),
+            super::super::SyntheticFolderHistoryDispatch::Restored
+        );
+        wait_for_grid(&mut app, first.collection_id());
+        assert!(matches!(
+            app.folder_history_forward_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path))
+                if crate::folder_tree::path_eq(path, &physical_b)
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn failed_independent_folder_load_keeps_collection_surface_and_history_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, b"source").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.open_collection_grid_from_navigation(snapshot.collection_id());
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let before = app.folder_nav_history_snapshot();
+
+        assert!(!app.load_folder_with_scan_owned(
+            temp.path().join("missing-folder"),
+            None,
+            super::super::OpenRequestOwner::Navigation,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity)
+                if identity.collection_id == snapshot.collection_id()
+        ));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn deleted_mounted_root_is_not_recaptured_by_back_or_physical_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        let physical_a = temp.path().join("physical-a");
+        let physical_b = temp.path().join("physical-b");
+        std::fs::create_dir(&physical_a).unwrap();
+        std::fs::create_dir(&physical_b).unwrap();
+        std::fs::write(physical_b.join("page.jpg"), b"page").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(physical_a.clone());
+        let snapshot = recv(
+            client
+                .create_collection("Deleted while mounted".into())
+                .expect("create collection"),
+        );
+        app.open_collection_grid_from_navigation(snapshot.collection_id());
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path))
+                if crate::folder_tree::path_eq(path, &physical_a)
+        ));
+
+        recv(
+            client
+                .delete_collection(snapshot.collection_id(), snapshot.revision())
+                .expect("delete collection"),
+        );
+        poll_until(&mut app, "deleted root did not settle", |app| {
+            !app.collection_catalog_contains(snapshot.collection_id())
+                && app
+                    .top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| matches!(session.load, CollectionGridLoadState::Deleted))
+        });
+
+        let back = app
+            .navigate_folder_history_back()
+            .expect("physical A remains the valid Back target");
+        assert!(matches!(
+            back,
+            super::super::FolderNavHistoryTarget::Path(ref path)
+                if crate::folder_tree::path_eq(path, &physical_a)
+        ));
+        assert!(
+            app.folder_nav_forward_stack
+                .iter()
+                .all(|target| target.collection_id() != Some(snapshot.collection_id())),
+            "the mounted Deleted presentation is feedback, not a Forward destination",
+        );
+
+        // The Back target is only selected above; until dispatch, the Deleted root remains the
+        // visible surface. Recreate that valid physical target and verify a successful independent
+        // load cannot capture the deleted collection as its origin either.
+        app.set_active_folder_nav_suppress_record_once(false);
+        app.folder_nav_back_stack = vec![super::super::FolderNavHistoryTarget::Path(
+            physical_a.clone(),
+        )];
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&physical_b, &app.settings)
+                .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            physical_b.clone(),
+            Some(scan),
+            super::super::OpenRequestOwner::Navigation,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(physical_b.as_path()));
+        assert!(
+            app.folder_nav_back_stack
+                .iter()
+                .all(|target| target.collection_id() != Some(snapshot.collection_id())),
+            "successful physical adoption must not reinsert an authoritatively deleted ID",
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn root_delete_resolution_is_checked_first_fail_closed_and_child_physical() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        let folder = temp.path().join("folder");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (first.clone(), CollectionResolvedKind::Image),
+                (second.clone(), CollectionResolvedKind::Image),
+                (folder.clone(), CollectionResolvedKind::Folder),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        let first_index = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.source_path == first)
+            .unwrap();
+        let second_index = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.source_path == second)
+            .unwrap();
+        let folder_index = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.source_path == folder)
+            .unwrap();
+        app.selected = Some(first_index);
+        app.checked.insert(second_index);
+        let CollectionRootDeleteResolution::Ready(target) =
+            app.collection_root_delete_resolution(app.selected, true)
+        else {
+            panic!("installed root binding must resolve")
+        };
+        assert_eq!(
+            target.entry_ids,
+            vec![prepared.entries[second_index].entry_id]
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = None;
+        assert!(matches!(
+            app.collection_root_delete_resolution(Some(first_index), false),
+            CollectionRootDeleteResolution::Unavailable(_)
+        ));
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = Some(app.items_generation);
+        let owner = app
+            .collection_grid_physical_load_owner(folder_index, &folder)
+            .expect("folder owner");
+        assert!(app.commit_collection_grid_physical_load(&owner, &folder));
+        assert!(matches!(
+            app.collection_root_delete_resolution(Some(folder_index), false),
+            CollectionRootDeleteResolution::NotCollectionRoot
+        ));
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

@@ -337,7 +337,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | <kbd>Alt</kbd>+<kbd>-</kbd> | サムネイル表示 / 詳細表示を切り替え |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> | `GridCopyFiles` / `GridCutFiles`。チェック済み、または選択中の実ファイル / 実フォルダを Windows Shell のコピー / カット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合は実ファイルだけを部分コピーせず、トーストで通知して中止する。右クリック最上位の「コピー」「切り取り」も同じ対象解決と Shell 実行経路を使う |
 | <kbd>Ctrl</kbd>+<kbd>V</kbd> | Windows Shell の背景ペースト verb で、クリップボードのファイル / フォルダを現在の実フォルダへペースト。ZIP/PDF/検索結果グリッドなど実フォルダ以外では無効 |
-| <kbd>Delete</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを削除 (通常はゴミ箱。ZIP/PDF 内ページなど仮想項目は対象外) |
+| <kbd>Delete</kbd> | 通常一覧とコレクション内の物理 child では、チェック済みまたは選択中の実ファイル / 実フォルダを削除する (通常はゴミ箱。ZIP/PDF 内ページなど仮想項目は対象外)。コレクション直下では checked 優先、なければ selected の参照登録を「コレクションから外す」確認へ渡し、元ファイル / 元フォルダは変更しない |
 | <kbd>F11</kbd> | メインウィンドウを最大化 ⇔ 元のサイズに復元する (`toggle_main_window_maximized` → `ViewportCommand::Maximized`)。Action: `GridToggleMaximize`。フルスクリーン中は F11 が window/全画面切替 (フルスクリーン共通表参照) なので、この最大化トグルは通常 (グリッド) 表示時のみ |
 | 標準キーなし（リング / ジェスチャ / マウス / X リング専用） | `CloseMainWindow` はグリッド文脈だけで、メインウィンドウの [×] と同じ close request を送り、タスクトレイ常駐設定が有効ならトレイへ格納する。`QuitApplication` はグリッド / 画像フルスクリーン / 動画フルスクリーンで割り当て可能で、明示終了フラグを立て、常駐設定にかかわらず通常の保存・終了処理を通ってアプリを終了する。次回起動時は一覧へ戻る。画像 / 動画の `CloseFullscreen` とは別操作。通常キーへは割り当てず、操作カスタマイズのリング系候補として提供する |
 | 標準キーなし（リング / ジェスチャ / マウス / X リング専用） | `GridScrollTop` / `GridScrollBottom` は、選択・チェック・最後に選択した画像を変えず、現在の一覧だけを先頭 / 末尾へスクロールする。`GridMoveFirst` / `GridMoveLast`（既定 Home / End）の選択移動とは別操作。実行時は pending intent を立て、サムネイル / 詳細表示の同フレームの行高と viewport から最大 offset が確定した後に適用する |

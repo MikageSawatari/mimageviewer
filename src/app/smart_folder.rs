@@ -2915,14 +2915,9 @@ impl App {
     fn close_transient_views_before_smart_folder(
         &mut self,
     ) -> super::top_level_grid_view::TopLevelGridRestore {
-        let path = self.folder_nav_current_location();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let mut return_context = self
-            .top_level_grid_view
-            .smart_folder()
-            .cloned()
-            .map(super::top_level_grid_view::TopLevelGridRestore::SmartFolder)
-            .unwrap_or_else(|| self.view_return_context_from_parts(path, None, rating_view_stars));
+            .current_top_level_restore_snapshot()
+            .unwrap_or(super::top_level_grid_view::TopLevelGridRestore::Unavailable);
         if self.is_snapshot_active() {
             if let Some(snapshot_origin) = self.dismiss_snapshot_without_restore() {
                 return_context = snapshot_origin;

@@ -568,6 +568,92 @@ fn collection_error_message(error: &CollectionStoreError) -> String {
 }
 
 impl App {
+    pub(crate) fn collection_catalog_revision(&self, collection_id: CollectionId) -> Option<u64> {
+        self.collection_ui
+            .catalog
+            .as_ref()?
+            .definitions
+            .iter()
+            .find(|definition| definition.id == collection_id)
+            .map(|definition| definition.revision)
+    }
+
+    pub(crate) fn collection_catalog_contains(&self, collection_id: CollectionId) -> bool {
+        match self.collection_ui.phase {
+            CollectionRuntimePhase::Ready => {
+                self.collection_ui.catalog.as_ref().is_some_and(|catalog| {
+                    catalog
+                        .definitions
+                        .iter()
+                        .any(|definition| definition.id == collection_id)
+                })
+            }
+            CollectionRuntimePhase::Starting
+            | CollectionRuntimePhase::Inert
+            | CollectionRuntimePhase::Failed(_)
+            | CollectionRuntimePhase::Closed => true,
+        }
+    }
+
+    pub(crate) fn folder_nav_history_target_label(
+        &self,
+        target: &crate::app::FolderNavHistoryTarget,
+    ) -> String {
+        match target {
+            crate::app::FolderNavHistoryTarget::Path(path) => path.to_string_lossy().into_owned(),
+            crate::app::FolderNavHistoryTarget::Rating { stars } => {
+                format!("レーティング: {}", "★".repeat(usize::from(*stars)))
+            }
+            crate::app::FolderNavHistoryTarget::SmartFolder(state) => {
+                format!("スマートフォルダ: {}", state.definition_id)
+            }
+            crate::app::FolderNavHistoryTarget::Collection(restore) => {
+                let id = restore.identity.collection_id;
+                self.collection_ui
+                    .catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog
+                            .definitions
+                            .iter()
+                            .find(|definition| definition.id == id)
+                    })
+                    .map_or_else(
+                        || format!("コレクション: {id:?}"),
+                        |definition| format!("コレクション: {}", definition.name),
+                    )
+            }
+        }
+    }
+
+    /// Removes history destinations only when a Ready catalog authoritatively proves that their
+    /// stable collection ID no longer exists. The same filter runs after rollback restore so an
+    /// older snapshot cannot resurrect a deleted collection destination.
+    pub(crate) fn prune_collection_folder_history_from_ready_catalog(&mut self) {
+        if !matches!(self.collection_ui.phase, CollectionRuntimePhase::Ready) {
+            return;
+        }
+        let Some(catalog) = self.collection_ui.catalog.as_ref() else {
+            return;
+        };
+        let available: HashSet<CollectionId> = catalog
+            .definitions
+            .iter()
+            .map(|definition| definition.id)
+            .collect();
+        let retain = |target: &crate::app::FolderNavHistoryTarget| {
+            target
+                .collection_id()
+                .is_none_or(|collection_id| available.contains(&collection_id))
+        };
+        self.folder_nav_back_stack.retain(&retain);
+        self.folder_nav_forward_stack.retain(&retain);
+        for workspace in &mut self.quick_folder_workspaces {
+            workspace.history.back_stack.retain(&retain);
+            workspace.history.forward_stack.retain(&retain);
+        }
+    }
+
     fn persist_collection_toolbar_target(&self) {
         // Unit tests construct many Apps against process-global settings test databases in
         // parallel. The Settings round-trip test covers this field's persistence; handler tests
@@ -845,6 +931,7 @@ impl App {
                         .as_ref()
                         .and_then(|client| client.subscribe().ok());
                     self.collection_ui.install_catalog(catalog);
+                    self.prune_collection_folder_history_from_ready_catalog();
                 }
                 CollectionRuntimeEvent::Failed(error) => {
                     self.collection_ui.phase =
@@ -885,7 +972,10 @@ impl App {
         if let Some(request) = self.collection_ui.catalog_request.take() {
             let minimum_revision = request.minimum_revision;
             match request.receiver.try_recv() {
-                Ok(Ok(catalog)) => self.collection_ui.install_catalog(catalog),
+                Ok(Ok(catalog)) => {
+                    self.collection_ui.install_catalog(catalog);
+                    self.prune_collection_folder_history_from_ready_catalog();
+                }
                 Ok(Err(error)) => {
                     self.collection_ui.message = Some((true, collection_error_message(&error)))
                 }
@@ -1321,6 +1411,7 @@ impl App {
                         self.collection_ui.snapshot = None;
                     }
                     self.collection_ui.install_catalog(catalog);
+                    self.prune_collection_folder_history_from_ready_catalog();
                     self.collection_ui.message = Some((
                         false,
                         "コレクションを削除しました。元ファイルは変更していません。".into(),
@@ -2370,7 +2461,7 @@ mod tests {
         CollectionDefinition, CollectionEntry, CollectionRegistration, CollectionResolvedKind,
         CollectionSourcePath,
     };
-    use crate::settings::{Settings, SortOrder};
+    use crate::settings::SortOrder;
 
     fn wait_for(app: &mut App, mut predicate: impl FnMut(&App) -> bool) {
         let ctx = egui::Context::default();
@@ -2383,10 +2474,12 @@ mod tests {
         app.poll_collection_ui(&ctx);
     }
 
-    fn start_ready_app(temp: &tempfile::TempDir) -> (App, CollectionStoreClient) {
+    fn start_ready_app(
+        temp: &tempfile::TempDir,
+    ) -> (crate::app::AppTestEnvForTest, CollectionStoreClient) {
         let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
         let client = runtime.client();
-        let mut app = App::new_from_settings(Settings::default());
+        let mut app = crate::app::setup_app_for_test();
         app.install_collection_runtime(runtime);
         wait_for(&mut app, |app| {
             matches!(app.collection_ui.phase, CollectionRuntimePhase::Ready)
@@ -2403,8 +2496,262 @@ mod tests {
         app.collection_ui.snapshot.clone().unwrap()
     }
 
-    fn snapshot_app(preview_import: bool) -> App {
-        let mut app = App::new_from_settings(Settings::default());
+    fn press_delete(app: &mut App) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        app.handle_delete_key(&ctx);
+        let _ = ctx.end_pass();
+    }
+
+    fn wait_for_collection_grid(app: &mut App, collection_id: CollectionId) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .collection_session()
+            .is_none_or(|session| {
+                session.identity.collection_id != collection_id
+                    || session.installed_items_generation != Some(app.items_generation)
+                    || session.prepared().is_none()
+            })
+        {
+            assert!(Instant::now() < deadline, "collection Grid did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn delete_key_on_collection_root_removes_checked_references_without_deleting_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, b"first-bytes").unwrap();
+        std::fs::write(&second, b"second-bytes").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Delete key");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &first,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                    CollectionRegistration::from_trusted_path(
+                        &second,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_grid(added.collection_id(), None);
+        wait_for_collection_grid(&mut app, added.collection_id());
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(crate::app::top_level_grid_view::CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        let first_index = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.source_path == first)
+            .unwrap();
+        let second_index = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.source_path == second)
+            .unwrap();
+        app.selected = Some(first_index);
+        app.checked.insert(second_index);
+
+        press_delete(&mut app);
+        assert!(
+            !app.show_delete_confirm,
+            "root Delete must not start file deletion"
+        );
+        let (collection_id, expected_revision, entry_ids, origin) = match std::mem::replace(
+            &mut app.collection_ui.operation,
+            CollectionDialogOperation::Idle,
+        ) {
+            CollectionDialogOperation::ConfirmRemove {
+                collection_id,
+                expected_revision,
+                entry_ids,
+                origin,
+            } => (collection_id, expected_revision, entry_ids, origin),
+            _ => panic!("Delete must open reference-removal confirmation"),
+        };
+        assert_eq!(entry_ids, vec![prepared.entries[second_index].entry_id]);
+        app.collection_ui.operation =
+            app.submit_collection_remove(collection_id, expected_revision, entry_ids, origin);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+
+        let latest = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.entries.len(), 1);
+        assert_eq!(latest.entries[0].source_path, first);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first-bytes");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second-bytes");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn delete_key_on_stale_collection_root_fails_closed_without_file_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, b"source-bytes").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Stale root");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &source,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_grid(added.collection_id(), None);
+        wait_for_collection_grid(&mut app, added.collection_id());
+        app.selected = Some(0);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = None;
+
+        press_delete(&mut app);
+        assert!(!app.show_delete_confirm);
+        assert!(app.collection_ui.operation.is_idle());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source-bytes");
+        assert!(app.fs_feedback_toast.is_some());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn ready_catalog_prunes_deleted_collection_history_and_snapshot_rollback_cannot_restore_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        app.active_quick_folder_slot = None;
+        let deleted = create_collection(&mut app, "Deleted history target");
+        let retained = create_collection(&mut app, "Retained history target");
+        let deleted_target = crate::app::FolderNavHistoryTarget::Collection(
+            crate::app::top_level_grid_view::CollectionGridRestore {
+                identity: crate::app::top_level_grid_view::CollectionGridIdentity {
+                    collection_id: deleted.collection_id(),
+                },
+                revision_at_open: deleted.revision(),
+                viewport_anchor: None,
+            },
+        );
+        let retained_target = crate::app::FolderNavHistoryTarget::Collection(
+            crate::app::top_level_grid_view::CollectionGridRestore {
+                identity: crate::app::top_level_grid_view::CollectionGridIdentity {
+                    collection_id: retained.collection_id(),
+                },
+                revision_at_open: retained.revision(),
+                viewport_anchor: None,
+            },
+        );
+        app.folder_nav_back_stack = vec![deleted_target.clone(), retained_target.clone()];
+        app.folder_nav_forward_stack = vec![deleted_target.clone()];
+        app.quick_folder_workspaces[0].history.back_stack = vec![deleted_target.clone()];
+        app.quick_folder_workspaces[1].history.forward_stack = vec![deleted_target.clone()];
+        let rollback = app.folder_nav_history_snapshot();
+
+        client
+            .delete_collection(deleted.collection_id(), deleted.revision())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        wait_for(&mut app, |app| {
+            !app.collection_catalog_contains(deleted.collection_id())
+        });
+        assert_eq!(app.folder_nav_back_stack, vec![retained_target]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert!(app.quick_folder_workspaces[0].history.back_stack.is_empty());
+        assert!(
+            app.quick_folder_workspaces[1]
+                .history
+                .forward_stack
+                .is_empty()
+        );
+
+        app.restore_folder_nav_history(rollback);
+        assert!(
+            app.folder_nav_back_stack
+                .iter()
+                .all(|target| target.collection_id() != Some(deleted.collection_id()))
+        );
+        assert!(
+            app.folder_nav_forward_stack
+                .iter()
+                .all(|target| target.collection_id() != Some(deleted.collection_id()))
+        );
+        assert!(app.quick_folder_workspaces.iter().all(|workspace| {
+            workspace
+                .history
+                .back_stack
+                .iter()
+                .chain(&workspace.history.forward_stack)
+                .all(|target| target.collection_id() != Some(deleted.collection_id()))
+        }));
+
+        let held_surface = app.top_level_grid_view.surface().clone();
+        let held_folder = app.current_folder.clone();
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&deleted_target),
+            crate::app::SyntheticFolderHistoryDispatch::Unavailable,
+            "a deleted collection id is rejected as typed history, never treated as a path",
+        );
+        assert_eq!(app.top_level_grid_view.surface(), &held_surface);
+        assert_eq!(app.current_folder, held_folder);
+
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.folder_nav_back_stack.push(deleted_target);
+        app.prune_collection_folder_history_from_ready_catalog();
+        assert!(
+            app.folder_nav_back_stack
+                .iter()
+                .any(|target| target.collection_id() == Some(deleted.collection_id()))
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    fn snapshot_app(preview_import: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
         let collection_id = CollectionId::new();
         let definition = CollectionDefinition {
             id: collection_id,
@@ -2517,12 +2864,14 @@ mod tests {
     #[test]
     fn app_runtime_catalog_conflict_refresh_and_final_shutdown_use_one_owner() {
         let temp = tempfile::tempdir().unwrap();
-        let mut inert = App::new_from_settings(Settings::default());
-        assert!(matches!(
-            inert.collection_ui.phase,
-            CollectionRuntimePhase::Inert
-        ));
-        inert.shutdown_collection_runtime_for_exit();
+        {
+            let mut inert = crate::app::setup_app_for_test();
+            assert!(matches!(
+                inert.collection_ui.phase,
+                CollectionRuntimePhase::Inert
+            ));
+            inert.shutdown_collection_runtime_for_exit();
+        }
 
         let (mut app, client) = start_ready_app(&temp);
         let old_snapshot = create_collection(&mut app, "Alpha");

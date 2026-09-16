@@ -124,6 +124,12 @@ prepare済みthumbnail source snapshotをinstallする。
 
 ## 3. 更新と失効
 
+folder Back/Forwardは`PathBuf`と並行metadataを別々に持たず、`FolderNavHistoryTarget`の
+Path / Rating / SmartFolder / Collection variantをnormalとA/Bの各stackで共有する。Collectionはstable ID、
+revision hint、viewport anchorを一entryで保持し、synthetic filesystem pathへ変換しない。明示Openだけが
+history transitionを作り、Add、watch refresh、rootからの正規child閲覧は作らない。authoritativeなReady catalogで
+削除済みIDが判明した時だけ全stackから除き、rollback snapshotを戻す時にも同じcatalogを適用する。
+
 明示的な一覧更新は `reload_top_level_grid` を唯一の router とし、
 `TopLevelGridSurface` の網羅 match から通常フォルダ、各検索、スマートフォルダ、サブ展開、
 レーティング、履歴、ブックマーク、ドライブ一覧の既存再入場経路へ振り分ける。★固定は凍結を

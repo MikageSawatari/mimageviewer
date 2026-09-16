@@ -388,7 +388,7 @@ struct NativeGridContextMenuTarget {
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
-    collection_remove: Option<crate::app::collection_grid::CollectionGridRemoveTarget>,
+    collection_root_delete: crate::app::collection_grid::CollectionRootDeleteResolution,
 }
 
 impl NativeGridContextMenuTarget {
@@ -408,6 +408,19 @@ fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) ->
         "virtual_item"
     } else {
         "item_path"
+    }
+}
+
+fn native_grid_shell_menu_placement(
+    target: &NativeGridContextMenuTarget,
+    show_windows_context_menu_inline: bool,
+) -> ShellMenuPlacement {
+    if target.collection_root_delete.is_collection_root() {
+        ShellMenuPlacement::CollectionSourceSubmenu
+    } else if show_windows_context_menu_inline {
+        ShellMenuPlacement::Inline
+    } else {
+        ShellMenuPlacement::Submenu
     }
 }
 
@@ -1138,11 +1151,10 @@ impl crate::app::App {
                 shell_paths
             },
             miv_items,
-            shell_menu_placement: if self.settings.show_windows_context_menu_inline {
-                ShellMenuPlacement::Inline
-            } else {
-                ShellMenuPlacement::Submenu
-            },
+            shell_menu_placement: native_grid_shell_menu_placement(
+                &target,
+                self.settings.show_windows_context_menu_inline,
+            ),
         };
         let native_result = crate::native_context_menu::show_native_context_menu(request);
         Self::resync_egui_modifiers_from_os(ctx);
@@ -1267,8 +1279,8 @@ impl crate::app::App {
                 source,
             )
         };
-        let collection_remove =
-            self.collection_grid_remove_target((!is_folder_context).then_some(idx), has_checked);
+        let collection_root_delete = self
+            .collection_root_delete_resolution((!is_folder_context).then_some(idx), has_checked);
         NativeGridContextMenuTarget {
             shell_paths,
             real_paths,
@@ -1283,7 +1295,7 @@ impl crate::app::App {
             surface,
             explorer_folder,
             folder_command_target,
-            collection_remove,
+            collection_root_delete,
         }
     }
 
@@ -1336,7 +1348,8 @@ impl crate::app::App {
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
-            collection_reference: target.collection_remove.is_some(),
+            collection_reference: target.collection_root_delete.ready_target().is_some(),
+            collection_source_context: target.collection_root_delete.is_collection_root(),
             view,
             pin: self.context_menu_pin_state(target, view),
             external_tools,
@@ -1745,7 +1758,7 @@ impl crate::app::App {
                 None
             }
             MenuCommand::RemoveFromCollection => {
-                if let Some(request) = target.collection_remove.clone() {
+                if let Some(request) = target.collection_root_delete.ready_target().cloned() {
                     self.request_collection_grid_remove(request);
                 }
                 None
@@ -2075,6 +2088,18 @@ impl crate::app::App {
         if self.items_are_bookmark_view {
             self.delete_selected_bookmarks();
             return;
+        }
+
+        match self.collection_root_delete_resolution(self.selected, !self.checked.is_empty()) {
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(request) => {
+                self.request_collection_grid_remove(request);
+                return;
+            }
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(reason) => {
+                self.show_feedback_toast(reason.to_string());
+                return;
+            }
+            crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {}
         }
 
         if !self.checked.is_empty() {
@@ -2725,7 +2750,8 @@ mod delete_confirm_tests {
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
-            collection_remove: None,
+            collection_root_delete:
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         }
     }
 
@@ -3139,7 +3165,8 @@ mod delete_confirm_tests {
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
-            collection_remove: None,
+            collection_root_delete:
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         };
 
         let items = app.context_menu_nodes(&target, false);
@@ -3325,6 +3352,47 @@ mod delete_confirm_tests {
                 .unwrap();
             assert!(right < left, "surface={surface:?}, commands={commands:?}");
         }
+    }
+
+    #[test]
+    fn collection_root_forces_an_explicit_source_shell_submenu_even_when_inline_is_enabled() {
+        let mut root = target(
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                "binding refresh",
+            );
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::CollectionSourceSubmenu
+        );
+
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                crate::app::collection_grid::CollectionGridRemoveTarget {
+                    stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                        context_id: crate::app::ViewerContextId::for_test(1),
+                        surface_generation: 2,
+                        collection_id: crate::collection_store::CollectionId::new(),
+                    },
+                    expected_revision: 3,
+                    entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                },
+            );
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::CollectionSourceSubmenu
+        );
+
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot;
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::Inline,
+            "Collection PhysicalSource and ordinary folders keep the global Inline setting"
+        );
     }
 
     #[test]

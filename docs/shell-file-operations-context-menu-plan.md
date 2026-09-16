@@ -66,16 +66,20 @@ Useful existing facts:
   dropped-file copy. The old egui file copy/cut/paste clipboard helpers have
   been removed; folders remain skipped in the drop path until `IFileOperation`
   supplies Explorer-grade collision handling and recursive-copy safety.
-- `src/app.rs` currently keeps one folder navigation back stack, one forward
-  stack, one global recent-folder list, and one `suppress_folder_nav_record_once`
-  flag. A/B quick folders should factor this into reusable history state rather
-  than duplicating ad hoc path stacks.
+- `src/app.rs` keeps normal and A/B folder-navigation stacks as reusable typed
+  `FolderNavHistoryTarget` state. Path, rating, smart-folder, and collection
+  destinations own their restore payload in one entry; recent folders remain
+  physical paths only.
 - `GridItem::file_operation_path()` excludes folders, while
   `GridItem::drag_source_path()` includes folders. Shell clipboard / native menu / delete の
   checked 対象解決は `collect_checked_indexed_paths()` と後者へ統一済み。
 - 実ファイル / 実フォルダの右クリック先頭には mIV の「切り取り」「コピー」を常に出し、
   `GridCutFiles` / `GridCopyFiles` と同じ Shell clipboard helper を使う。仮想単一では隠し、
   仮想だけまたは実 / 仮想混在の checked では理由付き disabled にする。
+- コレクション直下だけはglobalのWindows menu Inline設定を上書きし、dynamic Shell menuを
+  「元ファイルのWindowsメニュー」submenuへ置く。通常Delete / 先頭の「コレクションから外す」は参照登録解除、
+  submenu内の削除・関連付け・プロパティ・Shell拡張はリンク先の元ファイル操作である。コレクションの物理childと
+  通常folderはglobal Inline/Submenu設定をそのまま使う。
 - ZIP/PDF virtual items (`ZipImage`, `ZipDir`, `PdfPage`) have stable mIV
   identity keys but not independent filesystem paths.
 

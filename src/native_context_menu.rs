@@ -50,6 +50,9 @@ pub struct NativeContextMenuRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellMenuPlacement {
     Submenu,
+    /// Collection root sources remain available, but their destructive Shell verbs are placed
+    /// behind an explicit source-file label instead of looking like reference operations.
+    CollectionSourceSubmenu,
     Inline,
 }
 
@@ -91,11 +94,19 @@ fn leaf_commands(nodes: &[MenuNode]) -> Vec<&MenuCommand> {
 
 fn shell_menu_insert_position(placement: ShellMenuPlacement, nodes: &[MenuNode]) -> Option<u32> {
     match placement {
-        ShellMenuPlacement::Submenu => Some(0),
+        ShellMenuPlacement::Submenu | ShellMenuPlacement::CollectionSourceSubmenu => Some(0),
         ShellMenuPlacement::Inline => {
             let top_level_positions = u32::try_from(nodes.len()).ok()?;
             top_level_positions.checked_add(u32::from(!nodes.is_empty()))
         }
+    }
+}
+
+fn shell_submenu_label(placement: ShellMenuPlacement) -> Option<&'static str> {
+    match placement {
+        ShellMenuPlacement::Submenu => Some("Windows のメニュー"),
+        ShellMenuPlacement::CollectionSourceSubmenu => Some("元ファイルのWindowsメニュー"),
+        ShellMenuPlacement::Inline => None,
     }
 }
 
@@ -491,8 +502,10 @@ mod windows_impl {
                         return NativeContextMenuResult::Fallback { reason };
                     }
                 }
-                ShellMenuPlacement::Submenu => {
-                    let submenu = match append_lazy_shell_submenu(menu.handle()) {
+                ShellMenuPlacement::Submenu | ShellMenuPlacement::CollectionSourceSubmenu => {
+                    let label = shell_submenu_label(request.shell_menu_placement)
+                        .expect("submenu placement has an explicit label");
+                    let submenu = match append_lazy_shell_submenu(menu.handle(), label) {
                         Ok(submenu) => submenu,
                         Err(reason) => return NativeContextMenuResult::Fallback { reason },
                     };
@@ -1015,14 +1028,14 @@ mod windows_impl {
             .map_err(|error| format!("AppendMenuW(separator) failed: {error}"))
     }
 
-    fn append_lazy_shell_submenu(menu: HMENU) -> Result<HMENU, String> {
+    fn append_lazy_shell_submenu(menu: HMENU, submenu_label: &str) -> Result<HMENU, String> {
         let mut submenu = MenuGuard::new(
             unsafe { CreatePopupMenu() }
                 .map_err(|error| format!("CreatePopupMenu(Windows submenu) failed: {error}"))?,
         );
         append_menu_string(submenu.handle(), 0, "読み込み中…", false)
             .map_err(|error| format!("AppendMenuW(Windows placeholder) failed: {error}"))?;
-        let label = wide_null("Windows のメニュー");
+        let label = wide_null(submenu_label);
         unsafe {
             AppendMenuW(
                 menu,
@@ -2042,6 +2055,23 @@ mod tests {
             shell_menu_insert_position(ShellMenuPlacement::Submenu, &nodes),
             Some(0)
         );
+    }
+
+    #[test]
+    fn collection_source_submenu_has_an_explicit_source_file_label() {
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::CollectionSourceSubmenu, &[]),
+            Some(0)
+        );
+        assert_eq!(
+            shell_submenu_label(ShellMenuPlacement::CollectionSourceSubmenu),
+            Some("元ファイルのWindowsメニュー")
+        );
+        assert_eq!(
+            shell_submenu_label(ShellMenuPlacement::Submenu),
+            Some("Windows のメニュー")
+        );
+        assert_eq!(shell_submenu_label(ShellMenuPlacement::Inline), None);
     }
 
     #[test]

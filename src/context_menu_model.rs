@@ -475,6 +475,7 @@ impl ContextMenuPreviewScenario {
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
+            collection_source_context: collection_reference,
             view: ContextMenuViewFlags {
                 in_search,
                 search: in_search,
@@ -867,6 +868,8 @@ pub struct ContextMenuInput {
     pub has_explorer_folder: bool,
     /// 現在のcellまたはchecked集合が同じcollection bindingに属する参照か。
     pub collection_reference: bool,
+    /// Collection root の参照項目。元ファイル操作には明示ラベルを付ける。
+    pub collection_source_context: bool,
     pub view: ContextMenuViewFlags,
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
@@ -1201,15 +1204,20 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             push_group(&mut nodes, [open_with]);
         }
         if input.surface == ContextMenuSurface::Grid {
+            let delete_label = if input.collection_source_context {
+                format!(
+                    "元ファイルをゴミ箱へ移動 (タグ・評価も整理) [{}件]",
+                    input.checked_count
+                )
+            } else {
+                format!(
+                    "ゴミ箱へ移動 (タグ・評価も整理) [{}件]",
+                    input.checked_count
+                )
+            };
             push_group(
                 &mut nodes,
-                [item(
-                    MenuCommand::MoveToRecycleBin,
-                    format!(
-                        "ゴミ箱へ移動 (タグ・評価も整理) [{}件]",
-                        input.checked_count
-                    ),
-                )],
+                [item(MenuCommand::MoveToRecycleBin, delete_label)],
             );
         }
         if input.surface == ContextMenuSurface::Grid {
@@ -1418,19 +1426,6 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
 
     if input.surface == ContextMenuSurface::Grid
         && !input.is_folder_context
-        && input.kind.supports_delete()
-    {
-        push_group(
-            &mut nodes,
-            [item(
-                MenuCommand::MoveToRecycleBin,
-                "ゴミ箱へ移動 (タグ・評価も整理)",
-            )],
-        );
-    }
-
-    if input.surface == ContextMenuSurface::Grid
-        && !input.is_folder_context
         && input.collection_reference
     {
         push_group(
@@ -1438,6 +1433,23 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             [item(
                 MenuCommand::RemoveFromCollection,
                 "コレクションから外す",
+            )],
+        );
+    }
+
+    if input.surface == ContextMenuSurface::Grid
+        && !input.is_folder_context
+        && input.kind.supports_delete()
+    {
+        push_group(
+            &mut nodes,
+            [item(
+                MenuCommand::MoveToRecycleBin,
+                if input.collection_source_context {
+                    "元ファイルをゴミ箱へ移動 (タグ・評価も整理)"
+                } else {
+                    "ゴミ箱へ移動 (タグ・評価も整理)"
+                },
             )],
         );
     }
@@ -1498,6 +1510,7 @@ mod tests {
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: false,
+            collection_source_context: false,
             view: ContextMenuViewFlags::default(),
             pin: None,
             external_tools: Vec::new(),
@@ -2381,6 +2394,45 @@ mod tests {
                 "Deselect",
             ]
         );
+    }
+
+    #[test]
+    fn collection_root_lists_reference_remove_before_explicit_source_delete() {
+        let mut collection = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        collection.collection_reference = true;
+        collection.collection_source_context = true;
+        let nodes = build_context_menu(&collection);
+        let commands = menu_shape(&nodes);
+        let remove = commands
+            .iter()
+            .position(|command| *command == "RemoveFromCollection")
+            .expect("reference remove command");
+        let source_delete = commands
+            .iter()
+            .position(|command| *command == "MoveToRecycleBin")
+            .expect("source delete command");
+        assert!(remove < source_delete);
+        assert!(nodes.iter().any(|node| matches!(
+            node,
+            MenuNode::Item {
+                command: MenuCommand::MoveToRecycleBin,
+                label,
+                ..
+            } if label == "元ファイルをゴミ箱へ移動 (タグ・評価も整理)"
+        )));
+
+        collection.has_checked = true;
+        collection.checked_count = 2;
+        collection.checked_file_operation_selection = CheckedFileOperationSelection::RealOnly;
+        let nodes = build_context_menu(&collection);
+        assert!(nodes.iter().any(|node| matches!(
+            node,
+            MenuNode::Item {
+                command: MenuCommand::MoveToRecycleBin,
+                label,
+                ..
+            } if label == "元ファイルをゴミ箱へ移動 (タグ・評価も整理) [2件]"
+        )));
     }
 
     #[test]

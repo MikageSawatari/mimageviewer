@@ -9632,7 +9632,7 @@ mod folder_pane_open_nav_tests {
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
-        App, FolderNavHistoryState, FolderOpenOutcome, FolderPaneOpenReady,
+        App, FolderNavHistoryState, FolderNavHistoryTarget, FolderOpenOutcome, FolderPaneOpenReady,
         GridClickSelectionAnchor, GridScrollIntent, QuickFolderSlotId, QuickFolderSwitchTarget,
         ScannedDir, drive_current_key_for_letter, drive_current_key_for_path,
         drive_root_path_for_letter, location_root_for_path, scan_directory,
@@ -9674,7 +9674,10 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.recent_folder_entries().first(), Some(&b));
         assert_eq!(app.settings.quick_folder_slots[0], Some(b.clone()));
 
-        assert_eq!(app.navigate_folder_history_back(), Some(a.clone()));
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(a.clone()))
+        );
         app.record_folder_nav_transition(&a);
         app.current_folder = Some(a.clone());
 
@@ -9692,7 +9695,10 @@ mod phase_c_folder_nav_history_tests {
         );
         assert_eq!(app.recent_folder_entries().first(), Some(&a));
 
-        assert_eq!(app.navigate_folder_history_forward(), Some(b.clone()));
+        assert_eq!(
+            app.navigate_folder_history_forward(),
+            Some(FolderNavHistoryTarget::Path(b.clone()))
+        );
         app.record_folder_nav_transition(&b);
         app.current_folder = Some(b.clone());
 
@@ -9817,10 +9823,12 @@ mod phase_c_folder_nav_history_tests {
         app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
         app.remember_recent_folder(&PathBuf::from(r"D:\miv-test\recent-b"));
         for (index, workspace) in app.quick_folder_workspaces.iter_mut().enumerate() {
-            workspace.history.back_stack =
-                vec![PathBuf::from(format!(r"C:\miv-test\slot-{index}-back"))];
-            workspace.history.forward_stack =
-                vec![PathBuf::from(format!(r"C:\miv-test\slot-{index}-forward"))];
+            workspace.history.back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
+                format!(r"C:\miv-test\slot-{index}-back"),
+            ))];
+            workspace.history.forward_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
+                format!(r"C:\miv-test\slot-{index}-forward"),
+            ))];
             workspace.history.suppress_record_once = true;
         }
         app.folder_history.insert(current.clone(), (420.0, Some(3)));
@@ -10168,7 +10176,10 @@ mod phase_c_folder_nav_history_tests {
 
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         app.current_folder = Some(a_child.clone());
-        assert_eq!(app.navigate_folder_history_back(), Some(a.clone()));
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(a.clone()))
+        );
         assert!(
             app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
                 .history
@@ -10268,11 +10279,13 @@ mod phase_c_folder_nav_history_tests {
         let normal_prev = PathBuf::from(r"C:\miv-test\normal-prev");
         let a = PathBuf::from(r"C:\miv-test\a");
         let b = PathBuf::from(r"C:\miv-test\b");
-        app.folder_nav_back_stack = vec![normal_prev.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal_prev.clone())];
         app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
         app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
             .history
-            .back_stack = vec![PathBuf::from(r"C:\miv-test\a-prev")];
+            .back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
+            r"C:\miv-test\a-prev",
+        ))];
         app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
 
@@ -10409,8 +10422,8 @@ mod phase_c_folder_nav_history_tests {
 
         app.current_folder = Some(cached_zip.clone());
         app.archive_source_override = Some(source);
-        app.folder_nav_back_stack = vec![previous.clone()];
-        app.folder_nav_forward_stack = vec![forward.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous.clone())];
+        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(forward.clone())];
         app.recent_folders = vec![recent.clone()];
 
         app.record_folder_nav_transition(&cached_zip);
@@ -10430,15 +10443,20 @@ mod phase_c_folder_nav_history_tests {
         let slot = QuickFolderSlotId::A;
 
         app.current_folder = Some(current.clone());
-        app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![a.clone(), archive.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![
+            FolderNavHistoryTarget::Path(a.clone()),
+            FolderNavHistoryTarget::Path(archive.clone()),
+        ];
         app.quick_folder_workspaces[slot.index()]
             .history
             .forward_stack = Vec::new();
         app.recent_folders = vec![current.clone()];
 
         let snapshot = app.folder_nav_history_snapshot();
-        assert_eq!(app.navigate_folder_history_back(), Some(archive.clone()));
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(archive.clone()))
+        );
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
             vec![a.clone()]
@@ -10557,7 +10575,7 @@ mod phase_c_folder_nav_history_tests {
     fn successful_navigation_clears_stale_archive_convert_rollback() {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\miv-test\previous");
-        app.folder_nav_back_stack = vec![previous];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous)];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -10603,7 +10621,9 @@ mod phase_c_folder_nav_history_tests {
         std::fs::create_dir_all(&current).unwrap();
 
         app.current_folder = Some(current.clone());
-        app.folder_nav_back_stack = vec![PathBuf::from(r"C:\miv-test\previous")];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
+            r"C:\miv-test\previous",
+        ))];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -10685,7 +10705,7 @@ mod phase_c_folder_nav_history_tests {
         let b = PathBuf::from(r"C:\miv-test\b");
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
         app.current_folder = Some(a.clone());
-        app.folder_nav_back_stack = vec![a.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone())];
         app.folder_nav_forward_stack = Vec::new();
         app.recent_folders = vec![recent0.clone()];
         app.global_search.active = true;
@@ -10704,7 +10724,7 @@ mod phase_c_folder_nav_history_tests {
         let b = PathBuf::from(r"C:\miv-test\b");
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
         app.current_folder = Some(a.clone());
-        app.folder_nav_back_stack = vec![a.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone())];
         app.folder_nav_forward_stack = Vec::new();
         app.recent_folders = vec![recent0.clone()];
         app.favsearch.active = true;
@@ -10731,7 +10751,10 @@ mod phase_c_folder_nav_history_tests {
         app.enter_reading_history_from_menu();
 
         assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
-        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(real.clone()))
+        );
         assert_eq!(
             app.current_folder.as_ref(),
             Some(&super::reading_history_synthetic_path())
@@ -10765,8 +10788,7 @@ mod phase_c_folder_nav_history_tests {
         app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
         app.settings.details_sort_ascending = true;
 
-        let target = super::rating_view_synthetic_path();
-        app.pending_folder_nav_rating_view_stars = Some(2);
+        let target = FolderNavHistoryTarget::Rating { stars: 2 };
         app.dispatch_synthetic_folder_history_target(&target);
 
         assert_eq!(
@@ -10786,7 +10808,7 @@ mod phase_c_folder_nav_history_tests {
         app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
         app.settings.details_sort_ascending = false;
 
-        let target = super::bookmark_view_synthetic_path();
+        let target = FolderNavHistoryTarget::Path(super::bookmark_view_synthetic_path());
         app.dispatch_synthetic_folder_history_target(&target);
         if let Some(pending) = app.bookmark_browser_pending.take() {
             pending.cancel();
@@ -10917,7 +10939,10 @@ mod phase_c_folder_nav_history_tests {
         app.install_rating_view_rows();
 
         assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
-        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(real.clone()))
+        );
         assert_eq!(
             app.current_folder.as_ref(),
             Some(&super::rating_view_synthetic_path())
@@ -10950,12 +10975,14 @@ mod phase_c_folder_nav_history_tests {
 
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![real, super::rating_view_synthetic_path()]
+            vec![
+                FolderNavHistoryTarget::Path(real),
+                FolderNavHistoryTarget::Rating { stars: 3 },
+            ]
         );
-        assert_eq!(app.folder_nav_back_rating_view_stars, vec![None, Some(3)]);
 
         let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, super::rating_view_synthetic_path());
+        assert_eq!(target, FolderNavHistoryTarget::Rating { stars: 3 });
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -10963,9 +10990,8 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_stars, 3);
         assert_eq!(
             app.folder_nav_forward_stack,
-            vec![super::rating_view_synthetic_path()]
+            vec![FolderNavHistoryTarget::Rating { stars: 5 }]
         );
-        assert_eq!(app.folder_nav_forward_rating_view_stars, vec![Some(5)]);
 
         // ☆3 の再構築完了前にさらに ← で実フォルダへ戻り、→ で ☆3 へ進んでも、
         // 空 rows を正規結果と誤認せず worker を再起動する。
@@ -10974,10 +11000,10 @@ mod phase_c_folder_nav_history_tests {
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        app.load_folder(target);
+        app.load_folder(target.into_path().expect("real folder target"));
         assert!(app.rating_view_pending.is_none());
         let target = app.navigate_folder_history_forward().unwrap();
-        assert_eq!(target, super::rating_view_synthetic_path());
+        assert_eq!(target, FolderNavHistoryTarget::Rating { stars: 3 });
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -11002,7 +11028,10 @@ mod phase_c_folder_nav_history_tests {
 
         assert!(app.items_are_drive_list);
         assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
-        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(real.clone()))
+        );
         assert_eq!(
             app.current_folder.as_ref(),
             Some(&super::drive_list_synthetic_path())
@@ -11014,8 +11043,9 @@ mod phase_c_folder_nav_history_tests {
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        app.load_folder(target.clone());
-        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        let target_path = target.clone().into_path().expect("real folder target");
+        app.load_folder(target_path.clone());
+        assert_eq!(app.current_folder.as_ref(), Some(&target_path));
         assert_eq!(
             app.folder_nav_forward_stack,
             vec![super::drive_list_synthetic_path()]
@@ -11039,7 +11069,9 @@ mod phase_c_folder_nav_history_tests {
         app.load_folder(opened);
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&super::drive_list_synthetic_path())
+            Some(&FolderNavHistoryTarget::Path(
+                super::drive_list_synthetic_path()
+            ))
         );
         let target = app.navigate_folder_history_back().unwrap();
         assert_eq!(target, super::drive_list_synthetic_path());
@@ -11057,11 +11089,14 @@ mod phase_c_folder_nav_history_tests {
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::reading_history_synthetic_path());
-        app.folder_nav_back_stack = vec![real.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(real.clone())];
         app.folder_nav_forward_stack = Vec::new();
 
         // 戻るで実フォルダへは戻れる。
-        assert_eq!(app.navigate_folder_history_back(), Some(real));
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(real))
+        );
         // 現在地だった合成パスを forward に残し、ビューへ戻せる。
         assert_eq!(
             app.folder_nav_forward_stack,
@@ -11075,14 +11110,22 @@ mod phase_c_folder_nav_history_tests {
         let real = PathBuf::from(r"C:\miv-test\real-folder");
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
         app.active_quick_folder_slot = None;
+        app.rating_view_stars = 4;
         app.current_folder = Some(super::rating_view_synthetic_path());
-        app.folder_nav_forward_stack = vec![real.clone()];
+        app.top_level_grid_view.begin(
+            super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 4 },
+            None,
+        );
+        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(real.clone())];
         app.folder_nav_back_stack = Vec::new();
 
-        assert_eq!(app.navigate_folder_history_forward(), Some(real));
+        assert_eq!(
+            app.navigate_folder_history_forward(),
+            Some(FolderNavHistoryTarget::Path(real))
+        );
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![super::rating_view_synthetic_path()]
+            vec![FolderNavHistoryTarget::Rating { stars: 4 }]
         );
     }
 
@@ -11106,7 +11149,9 @@ mod phase_c_folder_nav_history_tests {
         app.load_folder(after.clone());
         assert_eq!(
             app.folder_nav_back_stack.last(),
-            Some(&super::reading_history_synthetic_path())
+            Some(&FolderNavHistoryTarget::Path(
+                super::reading_history_synthetic_path()
+            ))
         );
 
         let target = app.navigate_folder_history_back().unwrap();
@@ -11120,7 +11165,10 @@ mod phase_c_folder_nav_history_tests {
             app.current_folder.as_ref(),
             Some(&super::reading_history_synthetic_path())
         );
-        assert_eq!(app.folder_nav_forward_stack.last(), Some(&after));
+        assert_eq!(
+            app.folder_nav_forward_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(after.clone()))
+        );
         assert!(!app.suppress_folder_nav_record_once);
 
         let target = app.navigate_folder_history_forward().unwrap();
@@ -11129,7 +11177,7 @@ mod phase_c_folder_nav_history_tests {
             app.dispatch_synthetic_folder_history_target(&target),
             super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        app.load_folder(target);
+        app.load_folder(target.into_path().expect("real folder target"));
 
         let target = app.navigate_folder_history_back().unwrap();
         assert_eq!(target, super::reading_history_synthetic_path());
@@ -11148,8 +11196,9 @@ mod phase_c_folder_nav_history_tests {
         rating_app.rating_view_rows_stars = Some(4);
         rating_app.set_active_folder_nav_suppress_record_once(true);
         assert_eq!(
-            rating_app
-                .dispatch_synthetic_folder_history_target(&super::rating_view_synthetic_path()),
+            rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating {
+                stars: 4
+            }),
             super::SyntheticFolderHistoryDispatch::Restored
         );
         assert!(rating_app.items_are_rating_view);
@@ -11223,7 +11272,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(real.clone());
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![super::rating_view_synthetic_path()];
+            vec![FolderNavHistoryTarget::Rating { stars: 0 }];
         let snapshot = app.folder_nav_history_snapshot();
 
         let target = app.navigate_folder_history_back().unwrap();
@@ -11236,7 +11285,7 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_folder.as_ref(), Some(&real));
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![super::rating_view_synthetic_path()]
+            vec![FolderNavHistoryTarget::Rating { stars: 0 }]
         );
         assert!(
             app.quick_folder_workspaces[slot.index()]
@@ -11257,7 +11306,7 @@ mod phase_c_folder_nav_history_tests {
         let saved = app.tmp.path().join("saved");
         std::fs::create_dir_all(&saved).unwrap();
         let prev = PathBuf::from(r"C:\miv-test\prev");
-        app.folder_nav_back_stack = vec![prev.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone())];
         app.folder_nav_forward_stack = Vec::new();
         // 検索中に ZIP を開いて current_folder が saved とずれている状態を模擬。
         app.current_folder = Some(PathBuf::from(r"C:\miv-test\opened-in-search.zip"));
@@ -11279,7 +11328,7 @@ mod phase_c_folder_nav_history_tests {
         let saved = app.tmp.path().join("fav-saved");
         std::fs::create_dir_all(&saved).unwrap();
         let prev = PathBuf::from(r"C:\miv-test\prev");
-        app.folder_nav_back_stack = vec![prev.clone()];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone())];
         // favsearch 結果一覧中は current_folder が合成パス。
         app.current_folder = Some(crate::app::search_results_synthetic_path());
         app.favsearch.active = true;
@@ -11393,10 +11442,11 @@ mod phase_c_folder_nav_history_tests {
         let forward = PathBuf::from(r"C:\miv-test\forward");
         let c = PathBuf::from(r"C:\miv-test\pre-search");
         let slot = QuickFolderSlotId::A;
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![FolderNavHistoryTarget::Path(older.clone())];
         app.quick_folder_workspaces[slot.index()]
             .history
-            .forward_stack = vec![forward];
+            .forward_stack = vec![FolderNavHistoryTarget::Path(forward)];
 
         app.push_nav_history_entry(c.clone());
 
@@ -11479,7 +11529,8 @@ mod phase_c_folder_nav_history_tests {
         std::fs::write(&selected_path, b"not-an-image").unwrap();
         let older = PathBuf::from(r"C:\miv-test\older");
         let slot = QuickFolderSlotId::A;
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![FolderNavHistoryTarget::Path(older.clone())];
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Tag,
@@ -11645,7 +11696,8 @@ mod phase_c_folder_nav_history_tests {
         let mut app = setup_app();
         let slot = QuickFolderSlotId::A;
         let older = app.tmp.path().join("older");
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![FolderNavHistoryTarget::Path(older.clone())];
         let origin = app.tmp.path().join("legacy-folder-fallback");
         let destination = app.tmp.path().join("destination");
         std::fs::create_dir_all(&destination).unwrap();
@@ -66276,7 +66328,8 @@ mod smart_folder_transition_tests {
         let generation_n = app.snapshot.as_ref().unwrap().generation_id;
 
         let slot = QuickFolderSlotId::A;
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![stale_source.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![FolderNavHistoryTarget::Path(stale_source.clone())];
         app.quick_folder_workspaces[slot.index()]
             .history
             .forward_stack
@@ -66284,7 +66337,7 @@ mod smart_folder_transition_tests {
         let rollback = app.folder_nav_history_snapshot();
         assert_eq!(
             app.navigate_folder_history_back(),
-            Some(stale_source.clone())
+            Some(FolderNavHistoryTarget::Path(stale_source.clone()))
         );
         assert!(
             app.quick_folder_workspaces[slot.index()]
@@ -66359,13 +66412,17 @@ mod smart_folder_transition_tests {
         assert_eq!(app.snapshot_owner_entry(&source), Some(0));
 
         let slot = QuickFolderSlotId::A;
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![source.clone()];
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![FolderNavHistoryTarget::Path(source.clone())];
         app.quick_folder_workspaces[slot.index()]
             .history
             .forward_stack
             .clear();
         let rollback = app.folder_nav_history_snapshot();
-        assert_eq!(app.navigate_folder_history_back(), Some(source.clone()));
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(source.clone()))
+        );
         assert!(
             app.quick_folder_workspaces[slot.index()]
                 .history
@@ -66547,6 +66604,7 @@ mod smart_folder_transition_tests {
         std::fs::write(grandchild.join("nested.jpg"), []).unwrap();
         let definition = definition("Smart Scope", source);
         let id = definition.id;
+        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         app.settings.smart_folders = vec![definition];
         app.current_folder = Some(normal.clone());
         let ctx = egui::Context::default();
@@ -66571,7 +66629,6 @@ mod smart_folder_transition_tests {
                 if crate::folder_tree::path_eq(&path, &entry)
         ));
         app.load_folder(entry.clone());
-        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         assert!(matches!(
             app.resolve_grid_parent_nav(),
             Some(crate::ui_main::AddressBarNav::Direct(path))
@@ -66613,16 +66670,14 @@ mod smart_folder_transition_tests {
         );
         app.load_folder(child.clone());
 
-        app.folder_nav_back_stack = vec![normal.clone()];
-        app.folder_nav_back_rating_view_stars = vec![None];
-        app.folder_nav_back_smart_folder_states = vec![None];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal.clone())];
         let back = app.navigate_folder_history_back().expect("history back");
         assert_eq!(back, normal);
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&back),
             super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        app.load_folder(back);
+        app.load_folder(back.into_path().expect("real folder target"));
         let forward = app
             .navigate_folder_history_forward()
             .expect("history forward");
@@ -66630,7 +66685,7 @@ mod smart_folder_transition_tests {
             app.dispatch_synthetic_folder_history_target(&forward),
             super::SyntheticFolderHistoryDispatch::NotSynthetic
         );
-        app.load_folder(forward);
+        app.load_folder(forward.into_path().expect("real folder target"));
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
         assert!(app.top_level_grid_view.smart_folder().is_none());
     }
@@ -67185,7 +67240,6 @@ mod smart_folder_transition_tests {
         let definition = definition("Smart History", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
-        let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         let origin = app.tmp.path().join("smart-history-origin");
         std::fs::create_dir_all(&origin).unwrap();
         app.current_folder = Some(origin);
@@ -67195,10 +67249,18 @@ mod smart_folder_transition_tests {
 
         assert!(app.begin_smart_folder_drill(&entry));
         app.load_folder(entry.clone());
-        assert_eq!(app.folder_history_back_target(), Some(&synthetic));
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == id
+        ));
 
         let back = app.navigate_folder_history_back().expect("history back");
-        assert_eq!(back, synthetic);
+        assert!(matches!(
+            &back,
+            FolderNavHistoryTarget::SmartFolder(state)
+                if state.definition_id == id
+                    && matches!(state.position, super::top_level_grid_view::SmartFolderPosition::Root)
+        ));
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&back),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -67213,7 +67275,11 @@ mod smart_folder_transition_tests {
         let forward = app
             .navigate_folder_history_forward()
             .expect("history forward");
-        assert_eq!(forward, synthetic);
+        assert!(matches!(
+            &forward,
+            FolderNavHistoryTarget::SmartFolder(state)
+                if state.definition_id == id && state.scoped_current() == Some(entry.as_path())
+        ));
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&forward),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -67232,7 +67298,11 @@ mod smart_folder_transition_tests {
         let _ = app.begin_smart_folder_drill(&child);
         app.load_folder(child);
         let back_to_entry = app.navigate_folder_history_back().expect("back to entry");
-        assert_eq!(back_to_entry, synthetic);
+        assert!(matches!(
+            &back_to_entry,
+            FolderNavHistoryTarget::SmartFolder(state)
+                if state.definition_id == id && state.scoped_current() == Some(entry.as_path())
+        ));
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&back_to_entry),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -67476,7 +67546,7 @@ mod smart_folder_transition_tests {
 
                 assert_eq!(
                     app.folder_history_back_target(),
-                    Some(&normal),
+                    Some(&FolderNavHistoryTarget::Path(normal.clone())),
                     "{mode:?} drilled={drilled} must return before the search"
                 );
             }
@@ -67702,7 +67772,10 @@ mod smart_folder_transition_tests {
             Some(normal.clone())
         );
         wait_for_smart_folder_idle(&mut app, &ctx, b_id);
-        assert_eq!(app.folder_history_back_target(), Some(&normal));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(normal.clone()))
+        );
     }
 
     #[test]
@@ -67850,7 +67923,6 @@ mod smart_folder_transition_tests {
             let a_id = a.id;
             let b_id = b.id;
             let a_path = crate::app::smart_folder::smart_folder_synthetic_path(a_id);
-            let b_path = crate::app::smart_folder::smart_folder_synthetic_path(b_id);
             app.settings.smart_folders = vec![a, b];
             let ctx = egui::Context::default();
 
@@ -67904,10 +67976,16 @@ mod smart_folder_transition_tests {
 
             app.open_smart_folder(b_id, false);
             wait_for_smart_folder_idle(&mut app, &ctx, b_id);
-            assert_eq!(app.folder_history_back_target(), Some(&a_path));
+            assert!(matches!(
+                app.folder_history_back_target(),
+                Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == a_id
+            ));
 
             let back = app.navigate_folder_history_back().unwrap();
-            assert_eq!(back, a_path);
+            assert!(matches!(
+                &back,
+                FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == a_id
+            ));
             assert_eq!(
                 app.dispatch_synthetic_folder_history_target(&back),
                 super::SyntheticFolderHistoryDispatch::Restored
@@ -67915,7 +67993,10 @@ mod smart_folder_transition_tests {
             wait_for_smart_folder_idle(&mut app, &ctx, a_id);
 
             let forward = app.navigate_folder_history_forward().unwrap();
-            assert_eq!(forward, b_path);
+            assert!(matches!(
+                &forward,
+                FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == b_id
+            ));
             assert_eq!(
                 app.dispatch_synthetic_folder_history_target(&forward),
                 super::SyntheticFolderHistoryDispatch::Restored
@@ -68087,7 +68168,6 @@ mod smart_folder_transition_tests {
         });
         let definition = definition("Smart", smart_source);
         let id = definition.id;
-        let smart_path = crate::app::smart_folder::smart_folder_synthetic_path(id);
         app.settings.smart_folders = vec![definition];
         let ctx = egui::Context::default();
 
@@ -68111,7 +68191,10 @@ mod smart_folder_transition_tests {
         );
 
         let forward = app.navigate_folder_history_forward().unwrap();
-        assert_eq!(forward, smart_path);
+        assert!(matches!(
+            &forward,
+            FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == id
+        ));
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&forward),
             super::SyntheticFolderHistoryDispatch::Restored
@@ -68146,7 +68229,10 @@ mod smart_folder_transition_tests {
 
         app.open_smart_folder(a_id, false);
         wait_for_smart_folder(&mut app, &ctx, a_id);
-        assert_eq!(app.folder_history_back_target(), Some(&normal));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(normal.clone()))
+        );
         assert!(app.facet_filter_suppressed());
         assert_eq!(
             app.facet_filter_suppression_stack.last().map(|s| &s.anchor),
@@ -68161,7 +68247,10 @@ mod smart_folder_transition_tests {
 
         app.open_smart_folder(b_id, false);
         wait_for_smart_folder(&mut app, &ctx, b_id);
-        assert_eq!(app.folder_history_back_target(), Some(&a_path));
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == a_id
+        ));
         assert!(!app.settings.facet_filter.is_active());
         assert_eq!(
             app.facet_filter_suppression_stack.last().map(|s| &s.anchor),

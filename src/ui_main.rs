@@ -8030,7 +8030,7 @@ impl App {
         match intent {
             CollectionToolbarIntent::SelectTarget(id) => self.select_collection_toolbar_target(id),
             CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
-            CollectionToolbarIntent::Open(id) => self.open_collection_grid(id, None),
+            CollectionToolbarIntent::Open(id) => self.open_collection_grid_from_navigation(id),
             CollectionToolbarIntent::Manage => self.open_collection_manager(manager_target_id),
         }
     }
@@ -11961,6 +11961,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let parent_nav_target = self.grid_parent_nav_target();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
+        let back_target_label = back_target
+            .as_ref()
+            .map(|target| self.folder_nav_history_target_label(target));
+        let forward_target_label = forward_target
+            .as_ref()
+            .map(|target| self.folder_nav_history_target_label(target));
         let rating_counts = self.rating_counts();
         let quick_folder_targets: [Option<PathBuf>; 2] =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
@@ -12064,9 +12070,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
                         } else {
-                            back_target
+                            back_target_label
                                 .as_ref()
-                                .map(|p| format!("フォルダ履歴を戻る\n{}", p.to_string_lossy()))
+                                .map(|label| format!("フォルダ履歴を戻る\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を戻る".to_string())
                         };
                         if ui
@@ -12084,9 +12090,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
                         } else {
-                            forward_target
+                            forward_target_label
                                 .as_ref()
-                                .map(|p| format!("フォルダ履歴を進む\n{}", p.to_string_lossy()))
+                                .map(|label| format!("フォルダ履歴を進む\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を進む".to_string())
                         };
                         if ui
@@ -22090,9 +22096,7 @@ mod collection_toolbar_interaction_tests {
         )
         .unwrap();
         let client = runtime.client();
-        let mut app = App::new_from_settings(crate::settings::Settings::default());
-        app.settings.sidecar_backup_enabled = false;
-        app.settings.tag_sidecar_backup_enabled = false;
+        let mut app = crate::app::setup_app_for_test();
         app.install_collection_runtime(runtime);
         let ctx = egui::Context::default();
         let mut deadline = Instant::now() + Duration::from_secs(5);
@@ -22166,6 +22170,8 @@ mod collection_toolbar_interaction_tests {
         let held_selected = app.selected;
         let held_checked = app.checked.clone();
         let held_scroll = app.scroll_offset_y;
+        let held_history_back = app.folder_history_back_target().cloned();
+        let held_history_forward = app.folder_history_forward_target().cloned();
 
         let mut add = harness_with_target(
             crate::settings::ToolbarSectionDisplay::Dropdown,
@@ -22197,6 +22203,12 @@ mod collection_toolbar_interaction_tests {
         assert_eq!(app.selected, held_selected);
         assert_eq!(app.checked, held_checked);
         assert_eq!(app.scroll_offset_y, held_scroll);
+        assert_eq!(app.folder_history_back_target(), held_history_back.as_ref());
+        assert_eq!(
+            app.folder_history_forward_target(),
+            held_history_forward.as_ref(),
+            "Add changes the collection catalog, not the visible navigation history",
+        );
         assert!(app.top_level_grid_view.collection_session().is_none());
         let added = client
             .load_collection(created.collection_id())
@@ -22218,6 +22230,11 @@ mod collection_toolbar_interaction_tests {
             app.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Collection(identity)
                 if identity.collection_id == created.collection_id()
+        ));
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(crate::app::FolderNavHistoryTarget::Path(path))
+                if crate::folder_tree::path_eq(path, &physical)
         ));
         app.shutdown_collection_runtime_for_exit();
     }
