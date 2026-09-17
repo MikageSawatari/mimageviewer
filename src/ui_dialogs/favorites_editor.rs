@@ -122,6 +122,60 @@ pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
     }
 }
 
+/// 進捗が動いている間の再描画間隔。進捗行・残り時間・件数は 100ms で流す。
+const FAVORITES_EDITOR_ACTIVE_REPAINT: Duration = Duration::from_millis(100);
+/// 何も動いていない間の再描画間隔。
+///
+/// トレードオフ: **バックグラウンド索引が動き出してから最初の行が出るまで最大 1 秒遅れる**。
+/// 利用者は起動後の索引作成が終わるのを見るためにこのダイアログを数分開いたままにするので、
+/// その間ずっと 10fps で起き続ける方 (ノート PC / タブレットの電池) が実害が大きい。
+/// この遅れは backlog §1.62 で許容と判断した。
+const FAVORITES_EDITOR_IDLE_REPAINT: Duration = Duration::from_secs(1);
+
+/// 「お気に入り」ダイアログの中で、いま動いている (= 秒未満で見た目が変わる) もの。
+///
+/// ここに挙がっているものだけが速い再描画を要求できる。判断材料を 1 つの値にまとめて
+/// おくことで、再描画間隔の決定者をこの module に 1 人だけにする。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FavoritesEditorActivity {
+    /// メタ / 名前索引 supervisor の進捗行、または全体の残り時間が出ている。
+    indexer_progress_visible: bool,
+    /// 別バージョン索引が進行中 (走査 / 一覧反映待ち / 監視準備待ち)。
+    similar_index_running: bool,
+    /// 別バージョン索引の要約を worker が読込中 (`Preparing`、spinner 表示)。
+    similar_summary_loading: bool,
+}
+
+impl FavoritesEditorActivity {
+    fn any(self) -> bool {
+        self.indexer_progress_visible || self.similar_index_running || self.similar_summary_loading
+    }
+}
+
+/// 「お気に入り」ダイアログを開いている間の再描画間隔を決める。
+fn favorites_editor_repaint_interval(activity: FavoritesEditorActivity) -> Duration {
+    if activity.any() {
+        FAVORITES_EDITOR_ACTIVE_REPAINT
+    } else {
+        FAVORITES_EDITOR_IDLE_REPAINT
+    }
+}
+
+/// 別バージョン索引が進行中か。
+///
+/// `Degraded` / `Failed` は活動行を出すが、次の走査が始まるまで文言が変わらない終端状態
+/// なので進行中には数えない (数えると、そのお気に入りがある限り速い再描画が止まらない)。
+/// `Idle` は「まだ動き出していない」であって進行中ではない。
+fn similar_index_is_running(progress: &crate::similar_index::IndexProgress) -> bool {
+    use crate::similar_index::IndexProgress;
+    matches!(
+        progress,
+        IndexProgress::Running(_)
+            | IndexProgress::AwaitingArray(_)
+            | IndexProgress::AwaitingWatch(_)
+    )
+}
+
 impl App {
     pub(crate) fn show_favorites_editor_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_favorites_editor {
@@ -259,12 +313,16 @@ impl App {
             .as_ref()
             .filter(|_| similar_feature_enabled)
             .map(crate::similar_index::SimilarIndexManager::summary);
-        if matches!(
-            similar_summary,
-            Some(crate::similar_index::IndexSummaryStatus::Preparing)
-        ) {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+        // このダイアログの再描画間隔は 1 箇所でだけ決める (`Window::show` の後で 1 回だけ
+        // `request_repaint_after` を呼ぶ)。ここで分かるのは「別バージョン索引の要約を
+        // worker が読込中か」だけなので、それを記録して残りは描画中に埋める。
+        let mut activity = FavoritesEditorActivity {
+            similar_summary_loading: matches!(
+                similar_summary,
+                Some(crate::similar_index::IndexSummaryStatus::Preparing)
+            ),
+            ..FavoritesEditorActivity::default()
+        };
 
         egui::Window::new("お気に入り")
             .open(&mut open)
@@ -774,7 +832,14 @@ impl App {
                             }
                         }
                     }
+                    // 進捗行または残り時間が出ている間は「動いている」とみなす。`eta` は
+                    // 削除 / 取込フェーズでだけ入るので、行が無くても進行中のことがある。
+                    activity.indexer_progress_visible = !active.is_empty() || !all_etas.is_empty();
                     if let Some(similar_progress) = similar_progress.as_ref() {
+                        // 別バージョン索引は「進行中か」で判定する。行の有無では判定しない
+                        // (`Degraded` / `Failed` は文言が止まったまま残る終端状態なので、
+                        //  行の有無で見るとダイアログを開いている限り速い再描画が続く)。
+                        activity.similar_index_running = similar_index_is_running(similar_progress);
                         if let Some(message) =
                             similar_index_progress_presentation(true, similar_progress).activity
                         {
@@ -840,9 +905,9 @@ impl App {
                     {
                         draw_similar_index_summary(ui, summary, progress);
                     }
-                    // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
-                    // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
-                    ctx.request_repaint_after(Duration::from_millis(100));
+                    // ライブ更新の再描画要求はここでは出さない。間隔は
+                    // `favorites_editor_repaint_interval` が決め、`Window::show` の後で
+                    // 1 フレームに 1 回だけ要求する。
                 }
 
                 if escape_pressed && self.favorite_delete_confirm.is_none() {
@@ -859,6 +924,12 @@ impl App {
                 });
                     });
             });
+
+        // ライブ更新: このダイアログが開いている間の再描画要求は、ここ 1 箇所だけで出す。
+        // 進捗が動いている間は従来どおり 100ms。何も動いていない間は 1 秒へ落とす。
+        // 「active が空でも notify-rs が動き出した瞬間に拾う」という元の意図は保つが、
+        // 動き出しに気付くまで最大 1 秒遅れることは許容する (backlog §1.62)。
+        ctx.request_repaint_after(favorites_editor_repaint_interval(activity));
 
         // お気に入り編集には「現在のページ」が無い。ON の種と OFF 後の比較先は
         // どちらも共通標準に固定する。
@@ -1402,6 +1473,79 @@ mod tests {
             current_path: current_path.map(std::path::PathBuf::from),
             report: report(),
         })
+    }
+
+    #[test]
+    fn favorites_editor_repaint_interval_is_slow_only_when_nothing_progresses() {
+        use super::{
+            FAVORITES_EDITOR_ACTIVE_REPAINT, FAVORITES_EDITOR_IDLE_REPAINT,
+            FavoritesEditorActivity, favorites_editor_repaint_interval,
+        };
+        use std::time::Duration;
+
+        assert_eq!(FAVORITES_EDITOR_ACTIVE_REPAINT, Duration::from_millis(100));
+        assert_eq!(FAVORITES_EDITOR_IDLE_REPAINT, Duration::from_secs(1));
+        assert_eq!(
+            favorites_editor_repaint_interval(FavoritesEditorActivity::default()),
+            FAVORITES_EDITOR_IDLE_REPAINT,
+            "何も動いていなければ 1 秒まで落とす"
+        );
+
+        // 単独の理由 3 つと、その全組み合わせ。1 つでも立っていれば 100ms。
+        for indexer_progress_visible in [false, true] {
+            for similar_index_running in [false, true] {
+                for similar_summary_loading in [false, true] {
+                    let activity = FavoritesEditorActivity {
+                        indexer_progress_visible,
+                        similar_index_running,
+                        similar_summary_loading,
+                    };
+                    let expected = if indexer_progress_visible
+                        || similar_index_running
+                        || similar_summary_loading
+                    {
+                        FAVORITES_EDITOR_ACTIVE_REPAINT
+                    } else {
+                        FAVORITES_EDITOR_IDLE_REPAINT
+                    };
+                    assert_eq!(
+                        favorites_editor_repaint_interval(activity),
+                        expected,
+                        "{activity:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn similar_index_running_excludes_terminal_states() {
+        use super::similar_index_is_running;
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+
+        for progress in [
+            running(IndexStage::Opening, None),
+            running(IndexStage::Scanning, Some("book.jpg")),
+            running(IndexStage::Pruning, None),
+            IndexProgress::AwaitingArray(report()),
+            IndexProgress::AwaitingWatch(report()),
+        ] {
+            assert!(similar_index_is_running(&progress), "{progress:?}");
+        }
+
+        // 終端状態。`Degraded` / `Failed` は活動行を出し続けるが文言は変わらない。
+        for progress in [
+            IndexProgress::Idle,
+            IndexProgress::Complete(report()),
+            IndexProgress::Cancelled(report()),
+            IndexProgress::Degraded {
+                report: report(),
+                reason: IndexDegradedReason::WatchUnavailable,
+            },
+            IndexProgress::Failed("DBを開けません".to_owned()),
+        ] {
+            assert!(!similar_index_is_running(&progress), "{progress:?}");
+        }
     }
 
     #[test]

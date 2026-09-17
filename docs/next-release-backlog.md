@@ -918,23 +918,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
   key を 1 回作って使い回す形にできるかは見ておく。
 - 規模 / 優先度: Small / P3。
 
-### 1.62 お気に入り編集を開いている間、進捗が動いていなくても 100ms ごとに repaint する
-
-- 出典: v2.13.0 の idle health 測定中に判明 (2026-08-11)。退行ではなく既存仕様。
-- 観測: `favorites_editor.rs:752` が `ctx.request_repaint_after(100ms)` を**無条件で**呼ぶため、
-  ダイアログを開いている間ずっと 11〜12 fps で `App::update` が回る。perf log で
-  `prev_frame_causes=['src\\ui_dialogs\\favorites_editor.rs:752']` が連続して確認できる。
-- 実害: 利用者は**起動後の索引作成が終わるのを確認するためにこのダイアログを開いたままにする**
-  運用をしており、索引作成は 5 分ほどかかる。その間ずっと起きている。ノート PC やタブレットの
-  電池には無視できない。v2.13.0 でタッチ対応を入れた以上、タブレット運用は増える。
-- 現行コードのコメントは「active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ」と
-  理由を書いており、**意図的**である。直すなら意図を保ったまま頻度を落とす:
-  - active が空の間は 100ms ではなく 500ms〜1s へ落とす (動き出しの検出遅れは許容範囲)
-  - または watcher 側から `ctx.request_repaint()` を呼び、ポーリング自体をやめる (構造的)
-- 同型の確認: 他にも「進捗表示のために無条件 `request_repaint_after`」を持つダイアログが
-  無いか探すこと。あれば同じ方針で揃える。
-- 規模 / 優先度: Small / P2。
-
 ### 1.69 変換対象アーカイブのキャッシュパスが未解決のとき、ZipDir タイルだけ黙って失敗し得る
 
 - 出典: §1.66 の修正 (`ff56abea`) の周辺を洗って見つけた。**利用者報告ではなく、
@@ -2449,7 +2432,7 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
   - `cargo test`
   - 検索 bench 回帰
   - perf smoke
-  - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
+  - `scripts/check-vcrt-pe-dependencies.ps1` (全配布 PE の import と app-local VC runtime の gate。`build-dist.ps1` が必須実行する)
 
 ### 5.9 リリース手順: 配布ビルド前に core / remote の存在が要る
 
