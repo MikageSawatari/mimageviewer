@@ -386,16 +386,6 @@
 
 - 規模 / 優先度: Small / P2。
 
-### 1.222 viewer context audit の CI 2 件 — 解消済み、残りは同じビルドで出る警告 1 件 (2026-09-12)
-
-- A2b (`resume_loading_items_after_sidecar`) と A4 (`video_seek_strip_test_script_snapshot`) は、所有境界を検収したうえで
-  `a7b0504fa` で exact 登録して解消した。v3.10.0 のタグ commit の CI は緑 (`gh run list` で確認、2026-09-17)。
-- 残り: `clashing_extern_declarations`。`GetProcessMemoryInfo` が [similar_index.rs](../src/similar_index.rs) では
-  `ProcessMemoryCounters`、[full_inventory_benchmark_tests.rs](../src/similar_db/full_inventory_benchmark_tests.rs) と
-  [similar_book_query_bench.rs](../src/bin/similar_book_query_bench.rs) では `ProcessMemoryCountersEx` を取る別シグネチャで、
-  計 3 か所に宣言されている。配布物には影響しない。宣言を 1 か所へ寄せると消える。
-- 規模 / 優先度: Small / P3。
-
 ### 1.218 見開きの先頭・末尾にある単ページを本来の側へ配置する — 残りは公開時の記載と実機確認だけ (2026-09-11)
 
 - 正本: [設計と検証記録](section218-singleton-spread-placement.md)。基本機能は v3.10.0 で出荷済み (`e35b12a89`)。
@@ -2460,16 +2450,6 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
   - 検索 bench 回帰
   - perf smoke
   - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
-- **quick-xml の非推奨 API 追随** (v3.0.0 で 0.39 → 0.41、advisory 対応)。
-  `src/xmp_reader.rs` の 4 箇所が非推奨警告を出す:
-  `decode_and_unescape_value` → `decoded_and_normalized_value`、
-  `unescape_value` → `normalized_value`。
-  **0.41 では非推奨側が新実装へ委譲済み**なので、いま呼んでいる限り挙動は
-  `normalized_*` と同じ (= XML 仕様どおり属性値の改行 / タブが空白になる)。
-  影響するのは**属性値だけ**で、`xtw:*` (ツイート情報の表示用テキスト) と
-  `rdf:resource` / `xmp:Rating` / GPano (いずれも URI か数値) にとどまる。
-  **タグ (`dc:subject`) は `Event::Text` 経由**で非推奨メソッドを通らないため無関係。
-  次の更新で削除される前に呼び出しを置き換える。
 
 ### 5.9 リリース手順: 配布ビルド前に core / remote の存在が要る
 

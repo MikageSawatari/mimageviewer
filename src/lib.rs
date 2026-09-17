@@ -194,6 +194,10 @@ mod pipeline_debug;
 pub mod png_metadata;
 pub mod post_filter;
 pub mod post_operation_selection;
+// `GetProcessMemoryInfo` の宣言を 1 つに保つためのテスト専用ヘルパー
+// (`clashing_extern_declarations` 対策)。
+#[cfg(all(test, windows))]
+mod process_memory_test_support;
 pub mod rar_loader;
 pub mod rating_db;
 pub mod rating_view;

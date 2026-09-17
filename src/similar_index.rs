@@ -6659,56 +6659,7 @@ mod tests {
 
     #[cfg(windows)]
     fn current_working_set_bytes() -> usize {
-        use std::ffi::c_void;
-
-        #[repr(C)]
-        struct ProcessMemoryCounters {
-            cb: u32,
-            page_fault_count: u32,
-            peak_working_set_size: usize,
-            working_set_size: usize,
-            quota_peak_paged_pool_usage: usize,
-            quota_paged_pool_usage: usize,
-            quota_peak_non_paged_pool_usage: usize,
-            quota_non_paged_pool_usage: usize,
-            pagefile_usage: usize,
-            peak_pagefile_usage: usize,
-        }
-
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentProcess() -> *mut c_void;
-        }
-        #[link(name = "psapi")]
-        unsafe extern "system" {
-            fn GetProcessMemoryInfo(
-                process: *mut c_void,
-                counters: *mut ProcessMemoryCounters,
-                size: u32,
-            ) -> i32;
-        }
-
-        let mut counters = ProcessMemoryCounters {
-            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
-            page_fault_count: 0,
-            peak_working_set_size: 0,
-            working_set_size: 0,
-            quota_peak_paged_pool_usage: 0,
-            quota_paged_pool_usage: 0,
-            quota_peak_non_paged_pool_usage: 0,
-            quota_non_paged_pool_usage: 0,
-            pagefile_usage: 0,
-            peak_pagefile_usage: 0,
-        };
-        let ok = unsafe {
-            GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                &mut counters,
-                std::mem::size_of::<ProcessMemoryCounters>() as u32,
-            )
-        };
-        assert_ne!(ok, 0, "GetProcessMemoryInfo failed");
-        counters.working_set_size
+        crate::process_memory_test_support::sample_process_memory().working_set_size
     }
 
     #[cfg(not(windows))]
