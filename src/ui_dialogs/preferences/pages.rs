@@ -5,9 +5,9 @@ use crate::context_menu_model::{
 };
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
-    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind, TopMenuId,
-    menu_command_can_be_hidden, menu_command_spec, menu_commands_for_parent,
-    parse_chord_for_action,
+    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind,
+    ReservedBindingKind, TopMenuId, menu_command_can_be_hidden, menu_command_spec,
+    menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
@@ -2585,7 +2585,7 @@ pub(super) fn page_command_settings(
     _ime_active: bool,
 ) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
-    ui.small("Esc / Enter / 修飾なし矢印など、文脈依存が強い固定操作は現在の対象外です。");
+    ui.small("Esc / 修飾なし矢印 / サムネイル一覧の Shift+矢印は解除できない固定操作です。競合をなくすには、割り当てた側を変更または解除してください。");
     ui.add_space(8.0);
 
     let keymap = Keymap::from_settings(&state.settings.keymap);
@@ -3866,7 +3866,11 @@ fn command_conflict_summary(
                             open_command_editor_dialog(state, other, Some(conflict.chord));
                         }
                     } else {
-                        ui.label(conflict.reserved_name.unwrap_or("固定キー"));
+                        ui.label(
+                            conflict
+                                .reserved_kind
+                                .map_or("固定キー", ReservedBindingKind::label),
+                        );
                     }
                     ui.end_row();
                 }
@@ -4166,8 +4170,8 @@ fn command_editor_for_action(
                     {
                         select_command_action(state, other);
                     }
-                } else if let Some(name) = conflict.reserved_name {
-                    ui.label(name);
+                } else if let Some(kind) = conflict.reserved_kind {
+                    ui.label(kind.label());
                 }
             });
         }
@@ -4233,7 +4237,7 @@ fn command_slot_conflict_label(
             conflict
                 .other_action
                 .map(compact_key_action_label)
-                .or_else(|| conflict.reserved_name.map(str::to_string))
+                .or_else(|| conflict.reserved_kind.map(|kind| kind.label().to_string()))
         } else {
             Some(compact_key_action_label(conflict.action))
         };
@@ -4513,7 +4517,7 @@ fn binding_conflict_kind_help(kind: BindingConflictKind) -> &'static str {
             "同じキーが、押下・長押し・修飾キー長押しなど別の種類の入力に割り当てられています。意図しない反応になる場合があります。"
         }
         BindingConflictKind::Reserved => {
-            "Esc / Enter / 修飾なし矢印など、固定操作として扱うキーへの割り当てです。固定操作が優先される場合があります。"
+            "解除できない固定操作と同じキーへの割り当てです。競合をなくすには、割り当てた側を変更または解除してください。競合したまま使う場合、どちらが動くかは処理順で決まり、画面によって異なります。"
         }
     }
 }

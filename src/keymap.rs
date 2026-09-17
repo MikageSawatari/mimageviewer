@@ -6263,7 +6263,7 @@ pub struct BindingConflict {
     pub other_scope: CommandScope,
     pub trigger: KeyTrigger,
     pub other_trigger: KeyTrigger,
-    pub reserved_name: Option<&'static str>,
+    pub reserved_kind: Option<ReservedBindingKind>,
 }
 
 impl BindingConflict {
@@ -6274,7 +6274,8 @@ impl BindingConflict {
                 "binding warning: '{}' uses reserved shortcut {} ({}) in overlapping scope [{}]",
                 self.action.ini_name(),
                 chord,
-                self.reserved_name.unwrap_or("reserved input"),
+                self.reserved_kind
+                    .map_or("固定入力", ReservedBindingKind::label),
                 self.scope.ini_name()
             ),
             BindingConflictKind::Hard
@@ -6313,12 +6314,32 @@ struct EffectiveBinding {
     customized: bool,
 }
 
+/// 固定入力の種別。表示名の所有者はこの enum だけにし、判定は表示文字列ではなく種別で行う。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ReservedBindingKind {
+    EscapeNavigation,
+    PlainArrowNavigation,
+    GridRangeSelection,
+}
+
+impl ReservedBindingKind {
+    /// 操作カスタマイズ画面と警告ログに出す表示名。
+    /// 固定側は keymap から解除できないので、その事実を名前自体に含める。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EscapeNavigation => "Esc の固定操作（戻る / キャンセル、解除不可）",
+            Self::PlainArrowNavigation => "修飾なし矢印の固定ナビゲーション（解除不可）",
+            Self::GridRangeSelection => "サムネイル一覧の Shift+矢印範囲選択（解除不可）",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ReservedBinding {
     scope: CommandScope,
     trigger: KeyTrigger,
     chord: Chord,
-    name: &'static str,
+    kind: ReservedBindingKind,
 }
 
 const RESERVED_BINDINGS: &[ReservedBinding] = &[
@@ -6326,55 +6347,55 @@ const RESERVED_BINDINGS: &[ReservedBinding] = &[
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Esc),
-        name: "Escape navigation / cancel",
+        kind: ReservedBindingKind::EscapeNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Left),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Right),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Up),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Down),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Left),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Right),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Up),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Down),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
 ];
 
@@ -6784,7 +6805,7 @@ impl Keymap {
                     other_scope: second.scope,
                     trigger: first.trigger,
                     other_trigger: second.trigger,
-                    reserved_name: None,
+                    reserved_kind: None,
                 });
             }
         }
@@ -6807,7 +6828,7 @@ impl Keymap {
                         other_scope: reserved.scope,
                         trigger: binding.trigger,
                         other_trigger: reserved.trigger,
-                        reserved_name: Some(reserved.name),
+                        reserved_kind: Some(reserved.kind),
                     });
                 }
             }
@@ -12752,13 +12773,13 @@ mod tests {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::EraseToolBrush
                 && conflict.chord == Chord::key(KeyName::Left)
-                && conflict.reserved_name == Some("plain arrow navigation")
+                && conflict.reserved_kind == Some(ReservedBindingKind::PlainArrowNavigation)
         }));
         assert!(keymap.binding_conflicts().iter().any(|conflict| {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::TextConfirm
                 && conflict.chord == Chord::key(KeyName::Esc)
-                && conflict.reserved_name == Some("Escape navigation / cancel")
+                && conflict.reserved_kind == Some(ReservedBindingKind::EscapeNavigation)
         }));
     }
 
@@ -12774,12 +12795,12 @@ mod tests {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::GridToggleStackMode
                 && conflict.chord == Chord::shift(KeyName::Left)
-                && conflict.reserved_name == Some("grid range selection")
+                && conflict.reserved_kind == Some(ReservedBindingKind::GridRangeSelection)
         }));
         assert!(keymap.warnings().iter().any(|warning| {
             warning.contains("GridToggleStackMode")
                 && warning.contains("reserved shortcut Shift+Left")
-                && warning.contains("grid range selection")
+                && warning.contains(ReservedBindingKind::GridRangeSelection.label())
         }));
 
         let keymap = Keymap::from_ini_str(
@@ -12796,6 +12817,27 @@ mod tests {
             "grid-only Shift+arrow reservation must not warn in text context: {:?}",
             keymap.binding_conflicts()
         );
+    }
+
+    /// 固定入力の表示名は、利用者が「どこで解除できるか」を探さずに済む形でなければならない。
+    /// 新しい予約項目を追加したとき、説明のない名前のまま出荷されないようにする。
+    #[test]
+    fn every_reserved_binding_label_says_it_cannot_be_unbound() {
+        for reserved in RESERVED_BINDINGS {
+            let label = reserved.kind.label();
+            assert!(
+                label.contains("解除不可"),
+                "reserved label must state that the fixed side cannot be unbound: {:?} -> {:?}",
+                reserved.kind,
+                label
+            );
+            assert!(
+                !label.is_empty() && !label.is_ascii(),
+                "reserved label must be Japanese user-facing text: {:?} -> {:?}",
+                reserved.kind,
+                label
+            );
+        }
     }
 
     #[test]
