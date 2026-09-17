@@ -4667,11 +4667,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn poisoned_pointer_catalog_fails_the_actual_show_and_releases_its_exact_step() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
 
         let ctx = egui::Context::default();
         let viewport = egui::ViewportId::from_hash_of("poisoned-pointer-catalog");
@@ -4845,11 +4841,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pointer_terminal_ack_cannot_be_masked_by_same_frame_success() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
         let handle = crate::key_input::SyntheticPointerCancelHandle {
             transaction_id: 73,
             step_id: 73_u64 << 32 | 1,

@@ -439,28 +439,6 @@ fn plain_key_press(key: egui::Key) -> egui::Event {
 }
 
 #[cfg(windows)]
-struct SimilarNavigationKeyInputGuard {
-    _serial: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(windows)]
-impl Drop for SimilarNavigationKeyInputGuard {
-    fn drop(&mut self) {
-        crate::key_input::clear_test_frame();
-    }
-}
-
-#[cfg(windows)]
-fn similar_navigation_key_input_guard() -> SimilarNavigationKeyInputGuard {
-    let serial = crate::key_input::TEST_INPUT_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("fullscreen key-input test lock poisoned");
-    crate::key_input::clear_test_frame();
-    SimilarNavigationKeyInputGuard { _serial: serial }
-}
-
-#[cfg(windows)]
 fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[PathBuf]) {
     app.startup_done = true;
     app.startup_init = None;
@@ -670,7 +648,7 @@ fn embedded_similar_move_update_pump_materializes_controlled_physical_scan() {
 #[cfg(windows)]
 #[test]
 fn embedded_similar_move_update_pump_gives_same_frame_escape_priority() {
-    let _input_guard = similar_navigation_key_input_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
     let mut app = setup_app_for_test();
@@ -709,7 +687,7 @@ fn embedded_similar_move_update_pump_gives_same_frame_escape_priority() {
 #[cfg(windows)]
 #[test]
 fn embedded_similar_move_update_pump_gives_same_frame_page_navigation_priority() {
-    let _input_guard = similar_navigation_key_input_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
     let mut app = setup_app_for_test();

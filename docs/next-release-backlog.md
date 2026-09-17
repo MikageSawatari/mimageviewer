@@ -2556,25 +2556,6 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
   判定はログの `timed out; falling back to detach+attach+seek` の有無で機械的にできる。
 - 規模 / 優先度: 中 / P2 (音が途切れるので体感は悪いが、連打しない通常操作では出ない)。
 
-### 5.10 入力テストの共有ロックが poison して、失敗 1 件が全滅に見える
-
-- 出典: 動画補正スロットの入力 parity 確認 (2026-08-19) の mutation 確認中。可視性ガードを外して
-  1 件だけ落とすつもりが、
-  同じフィルタの 5 件すべてが FAILED になった。実際に落ちたのは 1 件で、残り 4 件は
-  `fullscreen fixed-key test lock poisoned: PoisonError { .. }` だった。
-- 機構: `crate::key_input::TEST_INPUT_LOCK` は入力テストを直列化するためだけの
-  `Mutex<()>` だが、12 箇所すべてが `.expect(...)` / `.unwrap()` で取得している。1 件が
-  panic するとロックが poison し、以降このロックを使う全テストが**本来の失敗とは無関係な
-  理由で**落ちる。**最初の 1 件を読まないと原因が分からない状態**になり、CI ログでも
-  mutation 確認でも切り分けの手間が増える。
-- 直す方向: 取得を 1 つの helper に集約し、`unwrap_or_else(|e| e.into_inner())` で poison から
-  回復する。この Mutex はデータを保護しておらず、panic で壊れる不変条件を持たないので
-  回復が正しい。**ただし共有フレーム状態の後始末は別問題**なので、helper 化のときに
-  「各 call site が取得直後に `clear_test_frame()` するか、guard の Drop で戻すか」を
-  揃えて確認する (現在は `FullscreenFixedKeyTestGuard` だけが Drop で戻している)。
-- 対象: `src/key_input.rs` (定義 + 6 箇所)、`src/app/tests.rs` (5 箇所)、`src/keymap.rs` (1 箇所)。
-- 規模 / 優先度: Small / P3。製品には影響しないテスト基盤の可読性問題。
-
 ## 6. 着手時に読み直す関連ドキュメント
 
 | 領域 | ドキュメント |

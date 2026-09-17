@@ -8886,14 +8886,6 @@ mod tests {
         assert_eq!(KeyName::IntlYen.egui_key_for_hold_edges(), None);
     }
 
-    #[cfg(windows)]
-    fn native_video_shortcut_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("native video shortcut test lock poisoned")
-    }
-
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -8916,11 +8908,9 @@ mod tests {
     #[test]
     fn mask_redo_ctrl_shift_z_is_consumed_before_undo() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let modifiers = egui::Modifiers {
@@ -9122,7 +9112,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn frame_active_viewport_without_the_edge_does_not_match_enter_from_egui() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
 
         let keymap = Keymap::from_settings(&KeymapSettings::default());
@@ -9169,7 +9159,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn numpad_enter_hold_claims_its_egui_twin_so_enter_close_does_not_fire() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
 
         let mut settings = KeymapSettings::default();
@@ -9233,10 +9223,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enter_hold_stays_false_before_and_after_viewport_routing_without_owned_input() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let viewport = egui::ViewportId::from_hash_of(1_u64);
-        crate::key_input::clear_test_frame();
 
         let before_registration = key_held_from_os_sources(
             KeyName::Enter,
@@ -9258,7 +9247,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn key_hold_state_distinguishes_both_enter_directions() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let viewport = egui::ViewportId::from_hash_of(2_u64);
         crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
@@ -11590,7 +11579,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_consumes_two_same_frame_physical_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11612,7 +11601,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_consumes_three_same_frame_physical_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11634,7 +11623,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_coalesces_same_frame_auto_repeats() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11702,7 +11691,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_initial_press_survives_focus_loss_after_routing() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11730,7 +11719,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_auto_repeat_without_focused_level_permit_is_dropped() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11755,7 +11744,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_edge_from_sibling_viewport_is_no_match() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11777,7 +11766,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_reports_first_press_with_owning_viewport() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11807,7 +11796,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_promotes_repeat_while_chord_is_held() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11837,7 +11826,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_drops_repeat_released_in_the_same_frame() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11868,7 +11857,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_keeps_same_frame_tap_as_one_navigation() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11898,7 +11887,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn no_repeat_action_does_not_retrigger_from_repeat_edges() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11914,7 +11903,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn single_dispatch_action_stays_once_with_two_same_frame_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11963,11 +11952,9 @@ mod tests {
     #[test]
     fn consume_action_keeps_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11990,7 +11977,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn consume_action_keeps_win32_and_egui_input_when_keyboard_is_owned() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12019,7 +12006,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn diagnostic_snapshot_exposes_cross_viewport_z_without_consuming_it() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12048,11 +12035,9 @@ mod tests {
     #[test]
     fn consume_action_still_consumes_egui_event_without_keyboard_owner() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12067,11 +12052,9 @@ mod tests {
     #[test]
     fn pressed_action_ignores_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12094,11 +12077,9 @@ mod tests {
     #[test]
     fn key_hold_edges_keep_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12123,7 +12104,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn no_repeat_tab_claims_win32_and_egui_events_without_focus_traversal_leak() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12172,7 +12153,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tab_does_not_block_following_metadata_rating_or_navigation_shortcuts() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12204,7 +12185,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tab_reassigned_to_another_action_survives_focus_traversal_policy() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::from_ini_str(
             r#"
@@ -12227,7 +12208,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn focused_text_edit_keeps_tab_from_keymap_and_focus_on_current_field() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12268,7 +12249,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn focused_non_text_modal_widget_still_blocks_application_tab_shortcut() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -12295,9 +12276,9 @@ mod tests {
         // consume_action consults the process-global Win32 key frame on Windows;
         // serialize against the native-frame tests and clear the frame so a
         // concurrent test cannot divert our egui-only key events to the KeySlot
-        // path. Same idiom as the native_video_shortcut_test_guard tests above.
+        // path. Same idiom as the other lock_test_input tests above.
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
@@ -12923,7 +12904,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_context_help_keydown_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
@@ -12992,7 +12973,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_window_mode_shortcut_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
@@ -13031,7 +13012,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_side_panel_shortcut_follows_effective_chords() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
@@ -13055,7 +13036,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_fs_common_shortcuts_follow_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
@@ -13113,7 +13094,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_close_fullscreen_shortcut_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,

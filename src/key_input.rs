@@ -3254,8 +3254,67 @@ fn materialize_test_synthetic_input(
         .unwrap_or_else(|_| SyntheticMaterialization::disarmed())
 }
 
+/// Serializes every test that shares the process-global key-input state.
+///
+/// Private on purpose: [`lock_test_input`] is the only way to take it, so no test can bypass
+/// the poison recovery and the state reset that come with it.
 #[cfg(test)]
-pub(crate) static TEST_INPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEST_INPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Drop every piece of process-global key-input state that tests write.
+///
+/// This is the whole `KeyInputState`, not just the current frame: tests also arm the synthetic
+/// timeline, register HWNDs and latch Return-key levels, and all of that has to be gone before
+/// the next test starts.
+#[cfg(test)]
+fn reset_test_input_state() {
+    // Every accessor in this module treats a poisoned state lock as "do nothing", so a test that
+    // panicked while holding it would silently leave the state dirty for everyone after it.
+    // Recover and clear the flag; the state is overwritten with a default on the next line anyway.
+    let mut guard = state().lock().unwrap_or_else(|poisoned| {
+        state().clear_poison();
+        poisoned.into_inner()
+    });
+    *guard = KeyInputState::default();
+}
+
+/// Serialization token for one input test. See [`lock_test_input`].
+#[cfg(test)]
+pub(crate) struct TestInputGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestInputGuard {
+    fn drop(&mut self) {
+        // Still holding the lock here, so the reset cannot race the next holder. This keeps the
+        // state from leaking into tests that read it without taking the lock at all.
+        reset_test_input_state();
+    }
+}
+
+/// Serialize this test against every other test that shares the process-global key-input state,
+/// and hand it a clean state.
+///
+/// Recovering from a poisoned lock is correct here because the mutex guards no data (`Mutex<()>`);
+/// it only orders tests, so a panic while it is held cannot leave a broken invariant behind it.
+/// Without the recovery, one genuinely failing test turns into N failures — every later test that
+/// takes the lock dies with `PoisonError` instead of running — and the real failure has to be dug
+/// out of the first entry of the log.
+///
+/// The shared state is reset on acquisition as well as on `Drop` because recovering the lock alone
+/// would not be enough: a test that panicked mid-way can leave edges, HWND registrations or an
+/// armed synthetic timeline behind, and the next test would then fail for a reason that has
+/// nothing to do with it — exactly the confusion the recovery is meant to remove.
+#[cfg(test)]
+pub(crate) fn lock_test_input() -> TestInputGuard {
+    let serial = TEST_INPUT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_test_input_state();
+    TestInputGuard { _serial: serial }
+}
 
 pub fn pressed_key_down<F>(viewport: egui::ViewportId, predicate: F) -> bool
 where
@@ -3417,10 +3476,10 @@ mod tests {
         arm_test_synthetic_input, arm_test_synthetic_input_without_registration, begin_frame,
         clear_test_synthetic_input, consume_all_key_down_with_result, consume_key_down,
         consume_key_edges, diagnostic_pressed_key_down_any_viewport,
-        enqueue_test_synthetic_command, materialize_test_synthetic_input, physical_key_down,
-        physical_key_down_from, pressed_key_down, register_test_synthetic_target,
-        resolve_synthetic_routing_target, set_test_frame, set_test_routed_frame,
-        set_test_synthetic_repeat, state,
+        enqueue_test_synthetic_command, lock_test_input, materialize_test_synthetic_input,
+        physical_key_down, physical_key_down_from, pressed_key_down,
+        register_test_synthetic_target, resolve_synthetic_routing_target, set_test_frame,
+        set_test_frame_for_viewport, set_test_routed_frame, set_test_synthetic_repeat, state,
     };
     #[cfg(windows)]
     use super::{
@@ -3485,6 +3544,75 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_input_test_neither_poisons_the_lock_nor_dirties_the_next_one() {
+        const POISON_TEST_HWND: u64 = 0x7357;
+
+        let outcome = std::thread::spawn(|| {
+            let _serial = lock_test_input();
+            panic!(
+                "intentional panic (this one is expected): proving that a test dying while it \
+                 holds the input lock does not take the tests after it down with it"
+            );
+        })
+        .join();
+        assert!(
+            outcome.is_err(),
+            "the helper thread was supposed to panic while holding the input lock"
+        );
+        assert!(
+            TEST_INPUT_LOCK
+                .get()
+                .expect("the helper thread initialized the lock")
+                .is_poisoned(),
+            "the panic was supposed to poison the lock; without that this test proves nothing"
+        );
+
+        // Play the part of a holder whose cleanup never ran. Taking the raw mutex instead of
+        // `lock_test_input` is deliberate and this is the one place allowed to do it: the whole
+        // point is to leave the shared state dirty with no reset behind it. Every write still
+        // happens with the lock held, so no concurrent test can observe this mess.
+        {
+            let viewport = egui::ViewportId::from_hash_of("intentionally-poisoned-input-test");
+            let _raw = TEST_INPUT_LOCK
+                .get()
+                .expect("the helper thread initialized the lock")
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            register_test_synthetic_target(POISON_TEST_HWND, viewport);
+            set_test_frame_for_viewport(
+                viewport,
+                vec![raw_edge(0x5A, true).with_source(POISON_TEST_HWND, viewport)],
+            );
+        }
+
+        // The point: taking the lock still works although it is poisoned, and the state it hands
+        // over is clean although the previous holder left a frame, an active viewport and an HWND
+        // registration behind.
+        //
+        // Honest limitation: if another test acquires the lock between the block above and this
+        // line, its own acquire-reset cleans the state first, and the assertions below then hold
+        // because of that reset rather than this one. The property is the same either way —
+        // whoever takes the lock gets a clean state — and the dirt cannot reach that test, since
+        // it reset on acquisition before running.
+        let _serial = lock_test_input();
+        let guard = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.installed_hwnds.is_empty(),
+            "the HWND registration left by the previous holder survived into this test"
+        );
+        assert!(
+            guard.frame_active_viewports.is_empty(),
+            "the frame-active viewport left by the previous holder survived into this test"
+        );
+        assert!(
+            guard.frame.is_empty(),
+            "the key frame left by the previous holder survived into this test"
+        );
+    }
+
+    #[test]
     fn return_key_latch_distinguishes_main_and_numpad_enter() {
         let mut state = ReturnKeyState::default();
 
@@ -3536,10 +3664,7 @@ mod tests {
 
     #[test]
     fn unconsumed_frame_edges_expire_at_next_begin_frame() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         set_test_frame(vec![
             KeyEdge {
                 source_hwnd: 1,
@@ -3583,10 +3708,7 @@ mod tests {
 
     #[test]
     fn different_viewport_cannot_consume_source_edge() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let source = egui::ViewportId::from_hash_of("key-source");
         let sibling = egui::ViewportId::from_hash_of("key-sibling");
         let edge = raw_edge(0x25, true).with_source(0x101, source);
@@ -3599,10 +3721,7 @@ mod tests {
 
     #[test]
     fn cross_viewport_diagnostic_scan_does_not_consume() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _serial = lock_test_input();
         let source = egui::ViewportId::from_hash_of(51_u64);
         let sibling = egui::ViewportId::from_hash_of(52_u64);
         set_test_routed_frame(vec![raw_edge(0x5A, true).with_source(0x102, source)]);
@@ -3658,10 +3777,7 @@ mod tests {
 
     #[test]
     fn synthetic_timeline_fans_out_the_same_order_to_win32_and_egui() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let viewport = egui::ViewportId::from_hash_of("synthetic-child");
         let hwnd = 0x401;
@@ -3737,12 +3853,8 @@ mod tests {
         // describe the message being processed, while held-key readers want
         // `GetAsyncKeyState`. Routing both through one hard-coded OS call would
         // silently give queued edges the modifier state at drain time instead.
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
-        clear_test_synthetic_input();
 
         let mut consulted = 0_u32;
         let level = physical_key_down_from(PhysicalKeySlot::new(0x27, true), || {
@@ -3768,10 +3880,7 @@ mod tests {
 
     #[test]
     fn synthetic_level_stays_down_between_edges_and_across_frames() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         arm_test_synthetic_input(0x402, egui::ViewportId::ROOT);
         let start = Instant::now();
@@ -3816,10 +3925,7 @@ mod tests {
 
     #[test]
     fn synthetic_materialize_catches_up_all_repeats_after_a_long_sleep() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
         let start = Instant::now();
@@ -3847,10 +3953,7 @@ mod tests {
 
     #[test]
     fn synthetic_hold_facts_report_levels_edges_and_accumulated_repeats() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let viewport = egui::ViewportId::from_hash_of("synthetic-facts");
         arm_test_synthetic_input(0x409, viewport);
@@ -3943,10 +4046,7 @@ mod tests {
 
     #[test]
     fn synthetic_unregistered_foreground_is_typed_and_retryable() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let hwnd = 0x404;
         let viewport = egui::ViewportId::from_hash_of("late-synthetic-target");
@@ -3978,10 +4078,7 @@ mod tests {
 
     #[test]
     fn synthetic_plugin_reinjects_without_double_materializing_same_time() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         arm_test_synthetic_input(0x405, egui::ViewportId::ROOT);
         enqueue_test_synthetic_command(SyntheticKeyCommand::down(
@@ -4031,10 +4128,7 @@ mod tests {
 
     #[test]
     fn synthetic_pending_cap_preserves_repeat_folding_and_release() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let viewport = egui::ViewportId::from_hash_of("synthetic-cap");
         arm_test_synthetic_input(0x406, viewport);
@@ -4074,10 +4168,7 @@ mod tests {
 
     #[test]
     fn synthetic_plugin_records_undrawn_child_and_cancels_on_focus_loss() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let viewport = egui::ViewportId::from_hash_of("synthetic-focus-child");
         arm_test_synthetic_input(0x407, viewport);
@@ -4231,10 +4322,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cancelled_down_transport_is_stale_in_a_different_live_show() {
-        let _serial = TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = lock_test_input();
         let _cleanup = ClearSyntheticInput;
         let viewport = egui::ViewportId::from_hash_of("pointer-stale-transport");
         let old_step = pointer_step(

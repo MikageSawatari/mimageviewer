@@ -1737,11 +1737,7 @@ mod tests {
 
     #[test]
     fn completion_revision_rejects_its_own_show_and_accepts_only_a_following_paint() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let viewport = egui::ViewportId::ROOT;
         let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();

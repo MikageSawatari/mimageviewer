@@ -48533,10 +48533,7 @@ mod tests {
     #[test]
     fn fs_cursor_zoom_aim_start_hides_cursor() {
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let mut app = setup_zoom_cursor_app();
         let ctx = egui::Context::default();
         #[cfg(windows)]
@@ -48570,10 +48567,7 @@ mod tests {
     #[test]
     fn fs_cursor_zoom_aim_falling_edge_restores_cursor() {
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let mut app = setup_zoom_cursor_app();
         let ctx = egui::Context::default();
         #[cfg(windows)]
@@ -48719,10 +48713,7 @@ mod tests {
         // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
         // against every test that takes it before, and the two deadlock under a parallel run.
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let mut outcomes = Vec::new();
         for (label, item) in [
             ("Video", GridItem::Video(PathBuf::from("clip.mp4"))),
@@ -48766,10 +48757,7 @@ mod tests {
         // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
         // against every test that takes it before, and the two deadlock under a parallel run.
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Video(PathBuf::from("clip.mp4"))];
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
@@ -48829,10 +48817,7 @@ mod tests {
         // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
         // against every test that takes it before, and the two deadlock under a parallel run.
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
@@ -49454,10 +49439,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn original_preview_hold_is_inactive_while_navigation_sequence_is_in_flight() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("test input lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
@@ -49479,10 +49461,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn original_preview_hold_remains_active_without_navigation_in_flight() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("test input lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
@@ -49502,10 +49481,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn original_preview_hold_is_inactive_while_page_turn_input_is_held() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("test input lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
@@ -49525,10 +49501,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_unfocused_viewport_still_names_itself_in_the_page_turn_reason() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("test input lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
@@ -49550,10 +49523,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn held_page_turn_does_not_create_an_original_preview_context_blocker() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("test input lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
@@ -55985,12 +55955,8 @@ mod tests {
         // `Keymap::consume_action` gives the process-global Win32 test frame precedence over
         // egui input. Keep this real Shift+S fixture isolated from key-input tests so a foreign
         // active ROOT frame cannot hide the egui edge under the full parallel lib suite.
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
-        crate::key_input::clear_test_frame();
         for still_seek_strip_visible in [false, true] {
             for (case, spread_mode, origin_page_count) in [
                 ("ltr_wide", crate::settings::SpreadMode::Ltr, 4),
@@ -56022,12 +55988,8 @@ mod tests {
     fn second_page_image_folder_strip_preview_survives_loaded_shift_s_strip() {
         // See the companion wide/compressed fixture: the production Shift+S edge is egui-owned,
         // so process-global native test input must stay empty for this test's whole lifetime.
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
-        crate::key_input::clear_test_frame();
         for still_seek_strip_visible in [false, true] {
             run_real_book_strip_preview_spread_case(RealBookStripPreviewCase {
                 name: "image_folder_second_page",
@@ -68440,10 +68402,7 @@ mod tests {
         }
 
         #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _cleanup = ClearTestKeyFrame;
         let ctx = egui::Context::default();

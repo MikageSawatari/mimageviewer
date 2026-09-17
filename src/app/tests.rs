@@ -8867,12 +8867,8 @@ mod phase_c_key_tests {
     #[cfg(windows)]
     #[test]
     fn root_routed_tap_moves_grid_once_after_focus_loss() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _serial = crate::key_input::lock_test_input();
         let _cleanup = MainKeyFrameCleanup;
-        crate::key_input::clear_test_frame();
         let mut app = setup_grid_cursor_wrap_app();
         app.settings.grid_cols = 3;
         app.settings.grid_cursor_wrap = false;
@@ -31011,10 +31007,7 @@ mod favorite_adjustment_defaults_tests {
     #[cfg(windows)]
     #[test]
     fn same_frame_second_ctrl_down_edge_is_dropped_until_target_is_presented() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearFolderNavTestKeyFrame;
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -35342,11 +35335,7 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     fn panorama_blocks_edit_mode_shortcuts_at_the_shared_entry_gate() {
-        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_frame();
+        let _key_input_guard = crate::key_input::lock_test_input();
 
         for (key, ctrl_pressed) in [
             (egui::Key::E, false),
@@ -41394,7 +41383,7 @@ mod native_video_display_mode_input_tests {
 
     #[test]
     fn ordinary_video_v_reaches_zoom_from_generic_and_native_inputs_once() {
-        let _input_guard = fullscreen_fixed_key_test_guard();
+        let _input_guard = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = insert_video(&mut app, "C:/clips/v-generic-native.mp4", 1920, 1080);
@@ -41480,7 +41469,7 @@ mod native_video_display_mode_input_tests {
 
     #[test]
     fn generic_video_v_prefers_panorama_when_the_current_video_is_360() {
-        let _input_guard = fullscreen_fixed_key_test_guard();
+        let _input_guard = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = insert_video(&mut app, "C:/clips/v-panorama.mp4", 3840, 1920);
@@ -69103,25 +69092,6 @@ fn fullscreen_z_edge(pressed: bool, repeat: bool) -> crate::key_input::KeyEdge {
     fullscreen_test_key_edge(0x5a, 0x2c, false, pressed, repeat)
 }
 
-struct FullscreenFixedKeyTestGuard {
-    _serial: std::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for FullscreenFixedKeyTestGuard {
-    fn drop(&mut self) {
-        crate::key_input::clear_test_frame();
-    }
-}
-
-fn fullscreen_fixed_key_test_guard() -> FullscreenFixedKeyTestGuard {
-    let serial = crate::key_input::TEST_INPUT_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("fullscreen fixed-key test lock poisoned");
-    crate::key_input::clear_test_frame();
-    FullscreenFixedKeyTestGuard { _serial: serial }
-}
-
 fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egui::Context) {
     let mut app = phase_c_support::setup_app();
     app.items.extend([
@@ -69239,7 +69209,7 @@ fn run_bookmark_title_key_pass(
 
 #[test]
 fn focused_bookmark_title_escape_does_not_close_fullscreen() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
     focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
@@ -69251,7 +69221,7 @@ fn focused_bookmark_title_escape_does_not_close_fullscreen() {
 
 #[test]
 fn focused_bookmark_title_arrows_do_not_navigate_fullscreen() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
     focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
@@ -69270,7 +69240,7 @@ fn focused_bookmark_title_arrows_do_not_navigate_fullscreen() {
 
 #[test]
 fn pending_bookmark_title_focus_blocks_escape_and_arrows_before_request_focus_lands() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     for key in [
         egui::Key::Escape,
         egui::Key::ArrowLeft,
@@ -69289,7 +69259,7 @@ fn pending_bookmark_title_focus_blocks_escape_and_arrows_before_request_focus_la
 
 #[test]
 fn focused_slider_still_allows_fullscreen_arrow_navigation() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let mut value = 0.5_f32;
     ctx.begin_pass(Default::default());
@@ -69317,7 +69287,7 @@ fn focused_slider_still_allows_fullscreen_arrow_navigation() {
 
 #[test]
 fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
         id: 42,
@@ -69363,7 +69333,7 @@ fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> e
 #[cfg(windows)]
 #[test]
 fn fullscreen_routed_tap_is_consumed_once_after_focus_loss() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport = egui::ViewportId::from_hash_of(101_u64);
     ctx.begin_pass(viewport_raw_input_with_focus(
@@ -69393,7 +69363,7 @@ fn fullscreen_routed_tap_is_consumed_once_after_focus_loss() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_sibling_edge_does_not_authorize_unfocused_egui_event() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport = egui::ViewportId::from_hash_of(102_u64);
     let sibling = egui::ViewportId::from_hash_of(103_u64);
@@ -69417,7 +69387,7 @@ fn fullscreen_sibling_edge_does_not_authorize_unfocused_egui_event() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_unfocused_pass_without_edge_or_event_does_nothing() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport = egui::ViewportId::from_hash_of(104_u64);
     ctx.begin_pass(viewport_raw_input_with_focus(viewport, false, Vec::new()));
@@ -69432,7 +69402,7 @@ fn fullscreen_unfocused_pass_without_edge_or_event_does_nothing() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_modal_owner_blocks_routed_edge_after_focus_loss() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     app.show_preferences = true;
     let viewport = egui::ViewportId::from_hash_of(105_u64);
@@ -69455,7 +69425,7 @@ fn fullscreen_modal_owner_blocks_routed_edge_after_focus_loss() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_text_input_owner_blocks_routed_edge_after_focus_loss() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
     focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
@@ -69486,7 +69456,7 @@ fn fullscreen_text_input_owner_blocks_routed_edge_after_focus_loss() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_released_auto_repeat_is_dropped_after_focus_loss() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport = egui::ViewportId::from_hash_of(106_u64);
     ctx.begin_pass(viewport_raw_input_with_focus(
@@ -69514,7 +69484,7 @@ fn fullscreen_released_auto_repeat_is_dropped_after_focus_loss() {
 #[cfg(windows)]
 #[test]
 fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     app.fs_zoom_aiming = true;
     app.fs_zoom_exit_pending = true;
@@ -69538,7 +69508,7 @@ fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
 
 #[test]
 fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport_a = egui::ViewportId::from_hash_of("ime-owner-a");
     let viewport_b = egui::ViewportId::from_hash_of("ime-owner-b");
@@ -69563,7 +69533,7 @@ fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
 
 #[test]
 fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, _fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let viewport_a = egui::ViewportId::from_hash_of("ime-recovery-a");
     let viewport_b = egui::ViewportId::from_hash_of("ime-recovery-b");
@@ -69584,11 +69554,7 @@ fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event
 
 #[test]
 fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
-    let _input_guard = crate::key_input::TEST_INPUT_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("IME focus regression test lock poisoned");
-    crate::key_input::clear_test_frame();
+    let _input_guard = crate::key_input::lock_test_input();
 
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
@@ -69822,7 +69788,7 @@ fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
 #[cfg(windows)]
 #[test]
 fn video_audio_toggle_normal_video_egui_requests_enter() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items
@@ -69853,7 +69819,7 @@ fn video_audio_toggle_normal_video_egui_requests_enter() {
 #[cfg(windows)]
 #[test]
 fn video_adjust_slot_egui_loads_saved_slot_when_video_is_visible() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items.push(GridItem::Video(PathBuf::from(
@@ -69933,7 +69899,7 @@ fn setup_video_adjust_slot_app(path: &str) -> (phase_c_support::AppTestEnv, usiz
 #[cfg(windows)]
 #[test]
 fn video_adjust_slot_egui_does_not_load_when_presenter_is_hidden() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/hidden-adjust-slot.mp4");
     let saved = saved_video_adjustments(42.0);
     install_video_adjust_slot(&mut app, 0, "Hidden", saved);
@@ -69950,7 +69916,7 @@ fn video_adjust_slot_egui_does_not_load_when_presenter_is_hidden() {
 #[cfg(windows)]
 #[test]
 fn video_adjust_slot_egui_loads_when_audio_mode_vst_makes_video_visible() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/vst-adjust-slot.mp4");
     let saved = saved_video_adjustments(37.0);
     install_video_adjust_slot(&mut app, 0, "VST visible", saved.clone());
@@ -69970,7 +69936,7 @@ fn video_adjust_slot_egui_loads_when_audio_mode_vst_makes_video_visible() {
 #[cfg(windows)]
 #[test]
 fn video_adjust_slot_egui_empty_slot_keeps_current_adjustments() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/empty-adjust-slot.mp4");
     app.settings.video_adjustments = saved_video_adjustments(-18.0);
     let before = app.settings.video_adjustments.clone();
@@ -69985,7 +69951,7 @@ fn video_adjust_slot_egui_empty_slot_keeps_current_adjustments() {
 #[cfg(windows)]
 #[test]
 fn video_adjust_slot_egui_modal_guard_leaves_key_unconsumed() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/modal-adjust-slot.mp4");
     let saved = saved_video_adjustments(29.0);
     install_video_adjust_slot(&mut app, 0, "Modal", saved);
@@ -70052,7 +70018,7 @@ fn video_audio_toggle_normal_video_native_still_requests_enter() {
 #[cfg(windows)]
 #[test]
 fn video_audio_toggle_audio_mode_egui_requests_exit() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items.push(GridItem::Video(PathBuf::from(
@@ -70111,7 +70077,7 @@ fn video_audio_toggle_vst_native_exits_vst_without_enter_fallback() {
 #[cfg(windows)]
 #[test]
 fn video_audio_toggle_repeat_egui_does_not_request_transition() {
-    let _input_guard = fullscreen_fixed_key_test_guard();
+    let _input_guard = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items

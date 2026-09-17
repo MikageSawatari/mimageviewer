@@ -2056,11 +2056,7 @@ mod tests {
 
     #[test]
     fn default_ctrl_e_uses_normal_export_guard_and_guides_to_panel_button() {
-        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_frame();
+        let _key_input_guard = crate::key_input::lock_test_input();
 
         let image_size = [3, 3];
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
@@ -2155,11 +2151,7 @@ mod tests {
 
     #[test]
     fn custom_execute_shortcut_opens_numbered_single_page_export_from_spread() {
-        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_frame();
+        let _key_input_guard = crate::key_input::lock_test_input();
 
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
