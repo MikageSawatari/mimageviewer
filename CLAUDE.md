@@ -1833,8 +1833,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
-   - 既存 baseline と比較して **+30% 超の劣化**で exit 1。原因を切り分けてから先に進む。
+   - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。
      Tantivy 等の依存更新で正当な変動なら `--save` で baseline を更新する。
+     比率だけ超えたミリ秒未満のクエリは `NOISE` と表示されるだけで失敗にならない (計測ばらつきのほうが大きいため)。
+   - 1 回きりの計測は外れ値を引く。失敗したら同じバイナリで 2〜3 回測り、JSON を並べて渡すと query ごとの最良値で判定する:
+     `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
+     **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
 9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
    ```powershell
