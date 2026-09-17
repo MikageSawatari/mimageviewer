@@ -908,37 +908,6 @@ Reconfigure、修復、手動Full、Deltaは従来どおり開く。これによ
   - 通常ページ表示、縦連結、F12別ウィンドウ・複数ウィンドウ、mIV Remoteで配置が一致すること。
 - 規模: **Medium**。画像読み込みは増えないが、表示経路を横断するためレイアウトの回帰確認が必要。優先度P2。
 
-### 1.213 通常動画のナビゲーターを出せるか — 描画経路が静止画と違う (2026-09-11)
-
-- 出典: 利用者要望 (2026-09-11)。v3.7.0 の通常動画ズームを使ってみて、静止画のナビゲーター
-  (拡大中に全体と現在位置を示す小窓) が動画にも欲しくなった。「負荷が高くなりそうですかね？」
-- **利用者が心配していた「OS 側で拡大する設定があるから重ねられないのでは」は当たらない (確認済み)。**
-  ズーム中は OS 任せの設定が自動的に上書きされる:
-
-  ```rust
-  fn effective_video_scale_filter(filter: VideoScaleFilter, video_zoom_active: bool) -> VideoScaleFilter {
-      if video_zoom_active && filter == VideoScaleFilter::OsDefault {
-          VideoScaleFilter::Standard
-  ```
-  ([render_core.rs:2104](../src/video/native_presenter/render_core.rs:2104))
-
-  サーフェスも表示領域全体を取る (`full_display_region = panorama_active || video_zoom_active`、
-  [surface_policy.rs:177](../src/video/native_presenter/surface_policy.rs:177))。
-  テスト `video_zoom_uses_the_full_display_region_even_with_os_default` あり。
-  **ズーム中は必ず mIV のシェーダが表示領域いっぱいのサーフェスへ解決している。**
-
-- **本当の論点は「どこに描くか」。**
-  - **presenter (D3D11) 側**: フレームは既に手元にあるので、いま拡大表示で出している矩形の
-    隣にもう 1 枚描くだけ。**毎フレームのコストは小さい見込み**。ただし静止画のナビは egui 実装
-    (`fs_navigator_*` 群、[ui_fullscreen.rs:2356](../src/ui_fullscreen.rs:2356) 以降) なので、
-    枠・ドラッグ・表示根拠 (Fixed / Hold) を**別実装で作り直す**ことになる
-  - **egui overlay 側**: UI はそのまま使えるが、**動画のフレームは egui のテクスチャではない**。
-    毎フレーム渡す経路が要る。**安くない**
-- **未確認**: presenter 側に描いた場合の実コスト。上は構造からの見込みで、測っていない。
-- **関連**: §1.224 (一時表示ナビゲーターの未開始クリックが消える) は静止画側の既知の不具合。
-  動画へ広げるなら、その所有境界の整理を先に済ませたほうがよい。
-- 規模 / 優先度: Medium / P3。**どちらに描くかを決めるまで見積もらない。**
-
 ### 1.212 通常動画をウィンドウより小さく縮小できない — 見送り判断の記録 (2026-09-11)
 
 - 2026-09-13実機確認: 縮小動作は確認できたが中心固定によりドラッグ不可。利用者指定により、
@@ -1167,78 +1136,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 (`ui_adjustment_panel.rs` ほか) は **0 件**。唯一重なるのは `app.rs` だが、向こうのハンクは
 10701〜15786 / 26212 / 60220〜60549 / 66930〜67594 で、注釈ベイク (59300 台) とは重ならない。
 他の 3 worktree (pano / r2e / video-strip) は master に対して `src/` の差分が無い (= マージ済み)。
-
-### 1.0f 実機確認で見つかった 3 件 (2026-08-30)
-
-**(a) F12 連打で動画再生が止まり、別ウィンドウが閉じる。** 利用者報告。
-**v3.3.0 でも起きる (連打を続けると再現)。退行ではなく、起きやすくなった。**
-
-**原因はログで確定した。私が最初に立てた仮説 (`push_detached_release` が移譲した lease を
-畳む) は外れ。**実際は **自分で送った `ViewportCommand::Close` が、再利用された同じ
-ViewportId の新しい viewport に届き、利用者が × を押したのと同じ扱いになる**。
-
-実ログ (`mimageviewer.log`、transition 29 → 30):
-
-```
-1545.452  transition=29 target=fullscreen action=Destroy ... viewport_command=Close  ← 自分で送る
-1545.532  F12 → transition=30 target=detached phase=begin host=0x0
-1545.564  [detached-viewer] show viewport: ... host=hwnd=0        ← 同じ ViewportId を再表示
-1545.564  [detached-viewer] viewport close_requested: presentation=None host=hwnd=0  ← ★
-1545.566  active-detached-session action=clear reason=handle_fullscreen_close_request
-1545.575  presentation-transition id=30 target=DetachedWindow effect=Destroy hwnd=0x0
-1545.594  [decoder-lifecycle] video-decode thread exit: live_count=0                 ← 再生停止
-```
-
-★ の行は **`presentation=None` かつ `host=hwnd=0`** — まだ窓が無い viewport なので、
-**利用者が閉じられるはずがない**。112ms 前に自分が送った Close が届いている。
-
-[ui_fullscreen.rs:14591](../src/ui_fullscreen.rs) は
-`ctx.input(|i| i.viewport().close_requested())` を無条件に `close_fs = true` にしており、
-**自分が送った Close と利用者の × を区別できない**。
-
-**なぜ v3.3.0 より起きやすいか**: R-27 の lease 移譲で同じ window_id / ViewportId が
-そのまま後継へ渡るため、viewport の再表示が早く・同一 id で起きる。stale な Close が
-新しい viewer に当たる確率が上がる。**Codex が案 B を否定したときに挙げた危険
-(「`ViewportEvent::Close` を利用者の close と解釈して後継ごと閉じる」) が、
-現行経路にも存在していた**ということ。
-
-**v3.3.1 で修正済み** (`edf1c5ed`)。方針は Codex と合意 ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
-
-**(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
-利用者報告 (2026-08-30、v3.2.0 / v3.3.0 で同じなので退行ではない)。静止画では動く。
-
-- **当初の見立て「動画面の分岐に入っていない」は否定済み** (`75cdfd9b0`、v3.4.0)。十字キーの
-  配り先を `DpadRoute` の 1 値へ集約したうえで計装したところ、mount 済みの detached context が
-  動画を `fullscreen_idx` に持つ状態では、判定は正しく `Video` を返していた。
-  **この前提で調べると空振りする。**
-- **2026-09-04 の実機ログでは、右キーでシークできている**。利用者が「今は効く」と報告し、
-  `mimageviewer.log` に裏付けがあった:
-
-  ```
-  [gamepad] dpad route: Video(10) surface=Viewer fs_idx=Some(10) is_music=false
-            detached_context_at_rest=false session_detached_or_switching=true
-  [native-video-key] seq=1 virtual_key=0x27 ... fs_idx=10 presentation=detached
-            outcome=action:seek_forward_5s
-  ```
-
-  **`session_detached_or_switching=true` かつ `at_rest=false`** — root projection が
-  `fullscreen_idx` を持ったまま detached 表示している側では、配り先も下流も通っている。
-- **残る疑いは `at_rest=true` の側**。active viewer context が AtRest のとき、batch は root では
-  配られず、`gamepad_batch_goes_to_active_context()` (= `at_rest && surface == Viewer`) を通って
-  `update_active_viewer_context` が mount した中で配られる。**この経路を通ったときの
-  `dpad route:` 行は、まだ 1 度も記録されていない。**
-- **次にやること**: 効かない状況を再現し、`[gamepad] dpad route:` を見る。Video 行が出なければ
-  batch が mount 済み context へ届いていない (行に並ぶ述語が、どれで落ちたかを示す)。Video 行が
-  出ていれば下流で、`[native-video-key]` の `outcome=` が続きを語る。**どちらか分かるまで
-  直さない。** 窓が 2 つ以上あるとき / 直前にメインを触ったとき / F12 直後かどうかで
-  `at_rest` は変わるので、再現時はその条件も記録する。
-
-**(c) R-02 の症状は利用者環境では再現しなかった。** 別ウィンドウを開いたままメインを
-前面にして十字キーを押すと、**v3.3.0 でもメイン一覧が動いて見えた**との報告。
-§10.2 で確認したのは「配り先と面の判定が別の情報源を使っており、食い違い得る」ことまでで、
-`active_detached_context_is_at_rest()` が真になる条件は限られる。修正 (`7f064a57`) は
-2 つの判定を 1 つにするもので構造的には正しいが、**利用者に見えていた症状の説明としては
-私の記述が証拠より強かった**。§10.2 の書き方を弱める。
 
 ### 1.0 v3.3.0 レビューからの持ち越し (2026-08-29 に判断)
 
@@ -1821,60 +1718,6 @@ closure の外へ出し、`mutate` は変更の有無だけを返す純粋な編
   挙動は穏当だが、**ギャップの表し方を揃えるなら一緒に見る**。
 - 規模 / 優先度: 小 / P3 (実害は一瞬の見た目。所有権の方が先)。
 
-### 1.111 フルスクリーンで動画へ入る瞬間に前面を失い、押しっぱなしのキーが他アプリへ流れる — 利用者報告
-
-- 出典: 利用者報告 (2026-08-21、v3.1.2 で確認)。
-  - 全画面モードで静止画を表示し、**上下キーを押しっぱなしで高速送り**している最中、
-    次が動画だと**一瞬ウィンドウが消え、フォーカスが別のウィンドウへ移り**、押しっぱなしの
-    上下キーがそのウィンドウへ入力される。
-  - **ウィンドウモード / 別ウィンドウモード / 別ウィンドウのフルスクリーンでは起きない。**
-  - 併発: ランダムに**カーソルが mIV 上で非表示のまま**になる。次の画像 / 動画へ移ると戻る。
-- 原因の見当 (コード確認済み、未確定):
-  - フルスクリーン表示では静止画が **egui フルスクリーンビューポート**、動画が
-    **別 HWND の native presenter** (D3D11 + DirectComposition)。静止画→動画の遷移で
-    前者を `ViewportCommand::Visible(false)` で隠し ([ui_fullscreen.rs:12739](../src/ui_fullscreen.rs:12739))、
-    後者を別途 materialize する。
-  - **この症状は既に疑われていて計装がある**。同じ場所の直前に
-    `log_main_flash_probe("fs_visible_false", …)` ([ui_fullscreen.rs:12735](../src/ui_fullscreen.rs:12735))。
-  - [native_video.rs:2842](../src/app/native_video.rs:2842) のコメントが症状そのものを書いている:
-    「foreground 奪還まで 80ms 待つと、**その間だけ外部ウィンドウが見えることがある**」。
-  - つまり **viewport を隠してから presenter が foreground を取るまで、mIV のどのウィンドウも
-    前面を持っていない**。Windows は z-order 上の次のウィンドウへ前面を渡すので、キーリピートが
-    そちらへ流れる。報告と一致する。
-  - 他モードで起きない説明も付く。ウィンドウ内動画はメインウィンドウの子として扱われ
-    (`set_in_window_video_child`、[native_window_host.rs:536](../src/video/native_window_host.rs:536))、
-    専用フルスクリーンビューポートと presenter HWND を入れ替える構造になっていない。
-  - **カーソル非表示の固着も同根**。`cursor_hidden` はラッチで、解除は (a) egui フルスクリーン
-    フレーム内で観測したポインタ操作、(b) HUD が出て `clean` が false になったとき、の 2 つだけ。
-    presenter 側は `update_cursor_icon` で別経路の解決をしており、**カーソルの所有者が 2 つある**。
-    次の項目へ移ると直るのは、そこで `open_fullscreen` がラッチを落とすため。
-- **2026-08-27 追試: 再現しなかった (利用者、v3.3.0 開発版)。** 単一ウィンドウの通常
-  フルスクリーン、動画は全画面再生、背後にエディタを置いて ↓ 押しっぱなしで高速送り。
-  **動画の再生がすぐ始まり、背後のエディタへキーは 1 つも入らなかった。**
-  Windows のキーリピートは初回遅延の後およそ 30ms 間隔なので、1 つも漏れないということは
-  前面の空白がほぼ無いことを意味する。
-  - main window の cloaking (`native_video_main_cloaked`) は `f2215fd2` (2026-05-13) で
-    **v3.1.2 に既に入っている**ので、これが後から効いたわけではない。
-  - 未確定なもの: (a) v3.1.2 以降のどこかで解消した (b) より遅く開く動画 (大きい 4K/HEVC、
-    低速ドライブ、起動後 1 本目) が必要 (c) 報告者の環境依存。
-  - **確かめる手段は既にある**。`MIV_DETACHED_WINDOW_DEBUG=1` で起動すると
-    `main_flash_probe stage=fs_visible_false` が窓の状態ごと出る
-    ([app.rs](../src/app.rs) `log_main_flash_probe`)。抑制条件は
-    `fullscreen_idx.is_some()` を含む広いものなので、この経路なら必ず出る。
-    1 回の再現で前面の空白の有無が確定する。
-  - **既知の問題ページには載せない** (見せられないものは載せない)。再現を取れたら載せる。
-- **着手条件: 複数ウィンドウ / キー入力所有権の整理 (別 worktree、`docs/briefs/modifier-ownership-design.md`) の完了待ち。**
-  症状パッチ (遷移前後の追加 `SetForegroundWindow`、遅延、キーリピート抑止) を入れない。
-  問われているのは「viewer の遷移中、どのウィンドウが前面と入力とカーソルを所有するか」であり、
-  1.100 や過去のキー所有権報告と同型。整理後に、遷移を**所有権の受け渡しが切れない 1 手**として
-  設計し直す。
-- 回帰確認の観点: 静止画→動画・動画→静止画の双方向、キー押しっぱなし中と単発、
-  4 表示モード (フルスクリーン / ウィンドウ / 別ウィンドウ / 別ウィンドウのフルスクリーン)、
-  遷移後のカーソル可視状態。
-- 規模 / 優先度: Medium / P1 (実害あり)。**整理待ち**。
-- **v3.2.0 からは外すと確定 (利用者判断 2026-08-22)。** 着手条件 (キー入力所有権の整理) が
-  未達で、症状パッチを入れれば整理時に解きほぐす手間が増えるため。次リリースの筆頭候補として残す。
-
 ### 1.114 PDF の表示解像度合わせが毎フレーム自分を殺し合ってライブロックする
 
 - 出典: 2026-08-21 の実機確認中に遭遇 (別ウィンドウで PDF の先頭 / 末尾へジャンプ)。
@@ -2027,55 +1870,6 @@ closure の外へ出し、`mutate` は変更の有無だけを返す純粋な編
   ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
 
-### 1.128 ★固定で範囲外になった別窓を、閉じず自前の一覧へ切り出す — 仕様提案
-
-- 出典: 2026-08-26、§1.125 の実機確認。複数ウィンドウモードで動画再生中に
-  ★固定を押し、**そのファイルが固定範囲外だったため動画窓が閉じた**。
-  **§1.125 の設計どおりの動作**であり、不具合ではない。ただし体験としては
-  **グリッドのボタンを押したら別の窓が消えた**に見える。
-- 利用者の希望: **再生はなるべく継続**し、前後移動も納得できる形で残す。
-
-#### 前提の確認 (2026-08-26、コードで裏取り済み)
-
-「★固定していないときは実 FS 順で前後移動する」という想定は **実装と違う**。
-
-```rust
-fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize>
-```
-
-`get_nav_indices()` は `current_grid_order()` (= `visible_indices`、Details なら `details_order`)
-を渡す ([ui_fullscreen.rs:7621](../src/ui_fullscreen.rs:7621) /
-[app.rs:46141](../src/app.rs:46141))。つまり **★固定の有無にかかわらず、
-前後移動は常にグリッドの表示順・絞り込み結果を辿る**。実 FS 順を辿るモードは存在しない。
-
-したがって ★固定は「別の並びに切り替える」操作ではなく、
-**その時点の並びを凍結する**操作である。
-
-#### 提案 — 別窓を自前の context へ切り出す
-
-現状、複数ウィンドウモードの動画窓は **同じ context を別の窓で描いている**
-(実機ログ: `main_fs_idx=Some(121) mounted=true`)。だから親のグリッド操作が直撃する。
-
-**器は既にある**:
-
-- 2026-08-26 に `snapshot` を `ViewerContextBundle` の field にしたので、
-  **context ごとに別の並び・別の凍結状態を持てる**
-- `fork_mounted_live_media_context` が「再生中メディアを自前の context へ切り出す」既存の仕組み
-
-よって §1.125 の miss 経路を「閉じる」から「**切り出す**」へ変えることで、
-窓は自分の items を持ち続け、再生も前後移動も維持される。
-
-#### 詰めるべき点
-
-- 切り出した context の一覧は **固定前の並び** を保持する。それを利用者にどう示すか
-  (窓のタイトル / HUD に何か出すか、無言でよいか)
-- 親が ★固定を**解除**したとき、切り出した窓を親へ戻すのか、独立のままにするのか
-- 切り出した context の寿命 (窓を閉じるまで / 親のフォルダ移動まで)
-- 静止画でも同じにするか、メディア限定にするか
-- ⚠ detached 述語に触れるので §2 の手続きが必要
-
-- 規模 \\ 優先度: Medium / P3 (不具合ではなく仕様改善)。
-
 ### 1.135 動画レンダースレッドがパニックすると、以後どの動画も再生できなくなる
 
 - 出典: 2026-08-27 実機。シークバーのストリップを開いた直後に
@@ -2169,46 +1963,6 @@ placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, pl
 
 - 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
   **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
-
-### 1.141 Susie のクラッシュ対象 ID が「エントリ名 + 長さ」止まり
-
-- 出典: 2026-08-27 の出荷前レビュー (Codex、機能別評価の Susie 行)。
-- 機構: [susie_loader.rs](../src/susie_loader.rs) の `decode_bytes` は、クラッシュした
-  入力を二度と同じプラグインへ渡さないための識別子を
-  `format!("{filename_hint}#{}", bytes.len())` で作る。ZIP 内画像はパスを持たないため、
-  名前だけでは別書庫の同名エントリを巻き添えにする — その対策として長さを足した経緯が
-  コメントに残っている。
-- 残る穴: **同名かつ同サイズで中身が違う**エントリは、まだ同一視される。
-  片方でプラグインが落ちると、もう片方も開かれなくなる。
-- 実害の大きさ: 落ちるのは既にクラッシュした後の話で、結果は「開けたはずの 1 枚が
-  開かれない」。クラッシュや破損ではない。**同名同サイズは再配布された同一ファイルである
-  ことが多く、その場合は巻き添えではなく正しい判断**になる。
-- 直し方の候補: バイト列のハッシュを識別子に含める。全体ハッシュは decode 経路 (数 MB) に
-  数ミリ秒を足す。先頭 + 末尾の固定長だけを混ぜる案なら実質ゼロだが、**どちらも実際の
-  クラッシュを再現できないと検証できない**。
-- 2026-08-27 の判断: **出荷前には入れない。** 失敗は限定的で自己修復可能 (再起動で解除)、
-  一方で修正は decode のホットパスに触れ、実機で確かめる手段が無い。
-- 規模 / 優先度: 小 / **P3**。
-
-### 1.140 超広幅ウィンドウで波形ストリップの鮮鋭さが落ちる (分割描画の検討)
-
-- 出典: 2026-08-27 の出荷前レビュー (Codex P2) をきっかけに判明。
-- 経緯: `WaveSpanRequest::pixel_width` は「可視幅そのものが GPU 上限 (8192px) を超えても
-  丸めない」を明示的な設計としており、コメントは**「テクスチャ生成側の責務として残す」**と
-  書いていた。しかし [render_core.rs](../src/video/native_presenter/render_core.rs) の
-  `sync_seek_strip_textures` は分割も縮小もせず `load_texture` を呼ぶだけで、
-  **その責務は実装されないまま残っていた**。到達すれば必ずレンダースレッドが
-  パニックし、以後どの動画も再生できなくなる (§1.135 と同じ終わり方)。
-- 2026-08-27 の対応: 上限を要求側で無条件に効かせた
-  (`an_oversized_visible_width_is_capped_at_the_texture_ceiling`)。
-  **パニックは消えるが、可視幅が 8192px を超える構成では波形がわずかにぼやける** (伸縮のため)。
-  位置は時刻由来の UV で決まるのでずれない。
-- 残っていること: 鮮鋭さを取り戻すなら**分割描画**しかない。RGBA を N 枚のテクスチャへ分け、
-  `waveform_texture_slice` の UV をタイル境界で割り、N 回 `painter.image` する。
-  継ぎ目と、raster revision ごとの N 枚アップロードのコストを見る必要がある。
-- 到達条件: 可視ストリップ幅 (物理ピクセル) が 8192 を超える構成。4K 2 面 (7680) では届かず、
-  3 面またぎや 8K で届く。**開発機の仮想デスクトップ幅は 6001px なので、ここでは再現しない。**
-- 規模 / 優先度: 中 / **P3** (パニックは解消済み。残るのは限られた構成での画質)。
 
 ### 1.169 360 を保持したまま通常画像を経由すると、衝突モードが同時に開く (2026-09-02)
 
@@ -2967,15 +2721,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   (§1.242 の下準備と同じ作業。先にこちらだけ単独で直してもよい)。
 - 規模 / 優先度: Small-Medium / P3 (混在階層かつ行配置の組み合わせ次第)。
 
-### 2.1 folder pane scan worker の thread 構成判断
-
-- 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
-- 現状: `folder_pane/scan_subfolders` perf event で ms / entry 数 / dir 数 / cancel / error を記録済み。
-  cancel 付きで thread leak は見えていない。
-- 方針:
-  - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
-- 優先度: P3。
-
 ### 2.2 サムネイルバッジのレーン配置共通化
 
 - 背景 / 現象:
@@ -3436,15 +3181,6 @@ emote-web-log.jsonl`):
 - 規模 / 優先度: Small〜Medium / P2。
 
 ## 3. 補正 / AI
-
-### 3.1 local-adjust layers の入場時同期 DB 読み
-
-- 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
-- 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。
-- 方針:
-  - 数十 MB 級ページで hitch が報告 / 計測された場合に worker 化する。
-  - read-only 経路の not-loaded は現状どおり None 返しを維持する。
-- 優先度: P3 monitor。
 
 ### 3.3 ページ送り中の AI アップスケールを待たない / 打ち切る
 
