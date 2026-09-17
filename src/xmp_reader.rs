@@ -9,6 +9,7 @@
 //! フル機能の汎用 XMP パーサーではない。詳細仕様は
 //! `C:/home/mxdownloader/docs/miv-integration.md` 参照。
 
+use quick_xml::XmlVersion;
 use quick_xml::events::Event;
 use quick_xml::reader::NsReader;
 use std::collections::HashMap;
@@ -489,11 +490,15 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
                     let ns_is = |uri: &[u8]| matches!(&attr_ns, quick_xml::name::ResolveResult::Bound(ns) if ns.as_ref() == uri);
                     if ns_is(XTW_NAMESPACE) {
                         let k = String::from_utf8_lossy(attr_local.as_ref()).into_owned();
-                        if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+                        if let Ok(v) =
+                            attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                        {
                             xtw_attrs.push((k, v.into_owned()));
                         }
                     } else if ns_is(RDF_NS) && attr_local.as_ref() == b"resource" {
-                        if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+                        if let Ok(v) =
+                            attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                        {
                             resource = Some(v.into_owned());
                         }
                     }
@@ -808,7 +813,7 @@ fn scan_attributes_for_rating(e: &quick_xml::events::BytesStart<'_>, found: &mut
             .unwrap_or(false);
         let local = key.rsplit(|&c| c == b':').next().unwrap_or(key);
         if local == b"Rating" && (prefix_is_xmp || !key.contains(&b':')) {
-            if let Ok(v) = attr.unescape_value() {
+            if let Ok(v) = attr.normalized_value(XmlVersion::Implicit1_0) {
                 if let Some(n) = parse_rating_value(v.as_ref()) {
                     *found = Some(n);
                 }
@@ -996,7 +1001,9 @@ pub(crate) fn parse_gpano(xml: &[u8]) -> Option<XmpPanoramaInfo> {
                     if !is_gpano_attr {
                         continue;
                     }
-                    let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+                    let Ok(value) =
+                        attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                    else {
                         continue;
                     };
                     gpano_attrs.push((attr_local.as_ref().to_vec(), value.into_owned()));
@@ -1651,6 +1658,73 @@ mod tests {
         assert_eq!(parse_xmp_bool("0"), Some(false));
         assert_eq!(parse_xmp_bool("maybe"), None);
         assert_eq!(parse_xmp_bool(""), None);
+    }
+
+    // ---- 属性値の正規化 (XML 1.0) ----
+
+    /// 属性値を読む 4 箇所 (xtw 属性 / `rdf:resource` / `xmp:Rating` / GPano 属性) が
+    /// XML 1.0 の属性値正規化を通していることを固定する。すなわち
+    /// 実体参照・文字参照は展開され、値の中の `\t` と `\n` は空白 1 個になる。
+    ///
+    /// quick-xml の属性値取得 API を差し替えるときに XML バージョンを取り違えると
+    /// ここが壊れる (1.1 を選ぶと `\u{85}` / `\u{2028}` も空白化されてしまう)。
+    #[test]
+    fn attribute_values_expand_entities_and_normalize_whitespace() {
+        // xtw の属性形式は要素形式と違い trim しないので、正規化結果がそのまま残る。
+        // `rdf:resource` も同じ decoder 経路を通る。
+        let xtw = "<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'
+              xtw:TweetId='111'
+              xtw:AuthorScreenName='a'
+              xtw:AuthorDisplayName='A&amp;B\tC\nD'>
+              <xtw:AuthorUrl rdf:resource='https://x.com/a?b=1&amp;c=2'/>
+            </rdf:Description>
+          </rdf:RDF>
+        </x:xmpmeta>";
+        let info = parse_xmp(xtw.as_bytes()).expect("should parse");
+        assert_eq!(
+            info.author_display_name.as_deref(),
+            Some("A&B C D"),
+            "xtw 属性: &amp; は & へ、値中の \\t と \\n は空白 1 個へ"
+        );
+        assert_eq!(
+            info.author_url.as_deref(),
+            Some("https://x.com/a?b=1&c=2"),
+            "rdf:resource も同じ正規化を通る"
+        );
+
+        // xmp:Rating は数値文字参照 `&#52;` = '4'。末尾 \n は空白になり trim で落ちる。
+        let rating = "<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+              xmp:Rating='&#52;\n'/>
+          </rdf:RDF>
+        </x:xmpmeta>";
+        assert_eq!(
+            parse_xmp_rating(rating.as_bytes()),
+            Some(4),
+            "xmp:Rating: 文字参照が展開され、空白化された \\n は trim で落ちる"
+        );
+
+        // GPano は `&#114;` = 'r'、`&#84;` = 'T'。前後の \n / \t は空白化後に trim される。
+        let gpano = "<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'
+              GPano:ProjectionType='\nequi&#114;ectangular\t'
+              GPano:UsePanoramaViewer='&#84;rue'/>
+          </rdf:RDF>
+        </x:xmpmeta>";
+        let pano = parse_gpano(gpano.as_bytes()).expect("should parse");
+        assert_eq!(
+            pano.projection_type.as_deref(),
+            Some("equirectangular"),
+            "GPano 属性: 文字参照が展開され、前後の空白は trim される"
+        );
+        assert_eq!(pano.use_panorama_viewer, Some(true));
     }
 
     // ---- read_xmp_bundle: 統合経路の同居テスト (Codex P3 第 20 ラウンド) ----
