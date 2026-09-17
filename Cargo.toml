@@ -454,8 +454,11 @@ egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
 winresource = "0.1"
 naga = { version = "27", features = ["wgsl-in", "hlsl-out"] }
 
-# 通常テストでは行番号付きバックトレースを保ちつつ、型情報を含む巨大な PDB を避ける。
-[profile.test]
+# 行番号付きバックトレース (panic / cdb のスタック) を保ちつつ、型情報を含む巨大な PDB と
+# rlib を避ける。test profile は dev を継承するので、ここだけに書く。dev と test で設定が
+# 分かれると、依存クレートが target/debug に 2 通りビルドされて容量もビルド時間も倍になる。
+# 変数・型情報が要るときだけ、そのビルドで `$env:CARGO_PROFILE_DEV_DEBUG = "full"` を指定する。
+[profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "packed"
 

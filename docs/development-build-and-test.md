@@ -76,10 +76,24 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
 削除前に絶対パスが当該repositoryの対象profile配下であることとreparse pointを確認し、
 他系統のビルドや証跡・利用者データに触れない。実施前後の容量と削除対象を記録する。
 
-### テストプロファイル
+実施記録 (2026-09-17): C: の空き 531 GiB → 1,728 GiB。削除対象は `target/debug` (622 GB、
+うち `deps` 394 GB / `incremental` 197 GB)、`target-codex`、`target-portable`、
+`target-portable-test-script`、調査用の入れ子 cargo 出力 3 つ (`codex-v330-p1/debug`、
+`section243-focused-20260915/debug`、`v370-work/debug`)、`mimageviewer-musicvideo` と
+`mimageviewer-xpost` の `target`、統合済み worktree `mimageviewer-dupe` 一式。reparse point は 0 件。
+`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト実行体の隣の
+FFmpeg DLL も消えるので、`vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へ置き直す。
 
-`[profile.test]` は `debug = "line-tables-only"` としている。失敗時の関数名・ソース行付き
-バックトレースは維持し、完全な型デバッグ情報を含む巨大な PDB の生成量を抑える。
+### dev / test プロファイル
+
+`[profile.dev]` は `debug = "line-tables-only"` + `split-debuginfo = "packed"` としている。
+test profile は dev を継承するので、設定は `[profile.dev]` だけに書く。失敗時の関数名・
+ソース行付きバックトレース (panic、cdb のスタック) は維持し、完全な型デバッグ情報を含む
+巨大な PDB / rlib の生成量を抑える。dev と test で設定を分けると、依存クレートが
+`target/debug` に 2 通りビルドされるため、分けない。
+
+デバッガでローカル変数・型情報を見る必要があるときだけ、そのビルドで
+`$env:CARGO_PROFILE_DEV_DEBUG = "full"` を指定する。
 
 ### 実アプリの開発ビルド
 
