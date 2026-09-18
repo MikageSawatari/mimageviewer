@@ -143,6 +143,7 @@
 | [keymap-spec.md](keymap-spec.md) | キー / マウス操作仕様。フルスクリーン横断の詳細は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) も参照 |
 | [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
 | [search-container-item-redesign.md](search-container-item-redesign.md) | 検索を「コンテナ検索 (Ctrl+S) / アイテム検索 (Ctrl+G)」モデルへ整理する再設計案。Ctrl+G 一覧/集約ビュー・動画索引除外・mtime 追加・Ctrl+F の構造アイテム絞り込み |
+| [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) | **設計確定 / 未実装 (Codex リセット待ち)**。Ctrl+G の走査件数表示・デバウンス起床の再武装・検索中の描画間引き (§1.252) と、ComfyUI のワイルドカードテンプレートを索引しない AI プロンプト出所ルール + INDEX_VERSION 10 再索引 (§1.253)。perf ログと索引実測 (58 GB / 79 万件) の出どころ付き |
 | [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) | `tags.db`、タグ facet、メタデータ転送を含む現行タグ機能の正本 |
 | [sidecar-metadata-ingest.md](sidecar-metadata-ingest.md) | サイドカー経由のメタデータ取り込み。**`tags.db` 移行前の記述が残っており内容更新待ち**。現行のタグ正本は上の tag-catalog-redesign-plan.md |
 | [video-architecture.md](video-architecture.md) | 動画サブシステムの恒久正本。D3D11VA + native presenter、channel/pacing、current module responsibility、ownership 負債を記載。行数 snapshot は監査記録へ分離 |

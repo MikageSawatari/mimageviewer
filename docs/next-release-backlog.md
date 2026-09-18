@@ -29,6 +29,35 @@
 
 ## 1. 優先候補
 
+### 1.253 AI プロンプトの出所ルール: ワイルドカードのテンプレートを索引しない (INDEX_VERSION 10) — 設計確定 (2026-09-18)
+
+- 出典: 利用者の報告 (Ctrl+G `glasses -genshin` が数分「検索中」)。正本は
+  [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) §3。
+- 観測: サンプル PNG 4 枚 (別フォルダ・別月) の全部で、CLIPTextEncode の `text` がリンクで
+  `DPRandomGenerator` を指し、その 266,470 バイト・1,371 行のテンプレートを `extract_text_from_ref_node`
+  がプロンプト本文として索引・保存していた。`fts_index` は 58 GB (`.store` 60.8 GB、790,864 doc)。
+  同じファイルの A1111 形式 `parameters` チャンクには生成後のプロンプトが揃っていた。
+- 直す方向: 特定ノード名の禁止リストではなく出所ルール。リテラルと素通しノード経由だけを解決済みとし、
+  変換ノード経由は未解決入力として `parameters` などの解決済みソースで置き換える。代替が無いときは
+  テンプレート構文とサイズ・行数の安全弁を通す。メタデータパネルもテンプレートを「プロンプト」と
+  表示しない。INDEX_VERSION 9 → 10 で自動再構築 (約 79 万件、PNG 全読みでおよそ 4 TB。IDAT までの
+  打ち切り読みは計測してから採否)。
+- 規模 / 優先度: Medium / P1 (索引サイズと検索精度の両方に効く)。実装は Codex Sol、リセット待ち。
+
+### 1.252 Ctrl+G の走査件数表示、デバウンス起床の再武装、検索中の描画間引き — 設計確定 (2026-09-18)
+
+- 出典: 同上。正本は
+  [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) §2。
+- 観測 (perf ログ): Enter から 4.4 秒は UI が update の外で寝ていた (デバウンスの `request_repaint_after` が
+  同パスの即時要求に負けて backend へ届かず、次パスで消えた)。その後 5 分 44 秒、候補 2,000 件ごとの
+  空バッチだけが届き、アドレス欄は `(0 件 / 検索中)` のまま。検索中は毎フレーム `request_repaint` で
+  約 5 ms 間隔の描画が続いた。
+- 直す方向: ワーカーが既に送っている `scanned_candidates` をアドレス欄と空グリッドに出す。空バッチは
+  1 ページごと (または 300 ms) に送る。`poll_global_search_debounce` が期限まで毎パス
+  `request_repaint_after` を再要求する。検索中はワーカーが UI を起こす方式に変え、毎フレーム即時要求を
+  やめる。1 回きり `request_repaint_after` の同型を `grep` で列挙して報告する。
+- 規模 / 優先度: Small / P1。再索引なし。実装は Codex Sol、リセット待ち。
+
 ### 1.251 動画の複数音声トラックを選択できるようにする — >>429 (2026-09-17)
 
 - 出典: >>429。動画に複数の音声トラックが入っている場合に、再生するトラックを切り替えたいとの要望。
