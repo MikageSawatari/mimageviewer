@@ -1,6 +1,6 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=9)
+//! ## 役割 (INDEX_VERSION=10)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタと
 //!   音声ファイル名を転置索引化
@@ -14,7 +14,7 @@
 //!   通常タグ操作は tags.db のみを書き、Tantivy へ投影しない。
 //!   詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=9)
+//! ## スキーマ (INDEX_VERSION=10)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み

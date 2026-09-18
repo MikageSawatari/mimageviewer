@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=9)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=10)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -42,7 +42,10 @@ use crate::search_index_db::normalize_path;
 /// - 7: 動画メタデータ検索 (IndexKind::Video + video_meta_text) を追加。
 /// - 8: 外部メタデータサイドカー検索 (SourceKind::Sidecar + sidecar_text) を追加。
 /// - 9: AI 生成メタデータの対応形式拡充と EXIF UserComment の Negative 除外。
-pub const INDEX_VERSION: i64 = 9;
+/// - 10: ComfyUI prompt provenance を分離し、未解決 template / Negative の索引混入を防止。
+pub const INDEX_VERSION: i64 = 10;
+
+const TANTIVY_REBUILD_PENDING_KEY: &str = "tantivy_rebuild_pending";
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -94,8 +97,8 @@ impl FileStatus {
 pub struct FtsMetaDb {
     conn: Mutex<Connection>,
     /// この open で `files` テーブルが drop → 再作成された (スキーマ古い / INDEX_VERSION 不一致)。
-    /// `true` なら Tantivy 側インデックスも wipe すべき (古い separator / 古い key 形式で
-    /// 作られた Tantivy docs を残すと orphan として残留するため)。
+    /// durable な wipe 判断は `index_state` の pending marker が正本。これは診断用に、
+    /// files を今回の open で作り直した事実だけを保持する。
     rebuilt_on_open: bool,
 }
 
@@ -111,7 +114,20 @@ impl FtsMetaDb {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(db_path)?;
+        Self::open_at_with_tantivy_rebuild_requirement(db_path, false)
+    }
+
+    /// `fts_meta.db` が無い一方で `fts_index/` だけ残っている場合など、cross-store owner が
+    /// Tantivy wipe を要求して開く。要求は files schema / user_version と同じ transaction で
+    /// durable marker にするため、途中終了しても次回起動で再試行できる。
+    pub(crate) fn open_at_with_tantivy_rebuild_requirement(
+        db_path: &Path,
+        force_tantivy_rebuild: bool,
+    ) -> rusqlite::Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let mut conn = Connection::open(db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -133,17 +149,19 @@ impl FtsMetaDb {
         // (sidecar_text) を足し `schema_is_stale` が Tantivy を wipe するため、pre-8 の DB は
         // fts_meta も drop して walker に全再 ingest させる必要がある (fts_meta だけ残ると
         // 「FS=unchanged」と判定され空の Tantivy が埋まらず検索が壊れる)。そのため特例を撤去。
-        let rebuild_needed = match user_version {
-            INDEX_VERSION => false,
-            _ => needs_rebuild(&conn)?,
+        // v9→v10 は SQLite 列構造ではなく Tantivy 本文の意味変更なので、files が空でも
+        // wipe が必要。既知の旧 version は行の MIN に依存せず semantic rebuild とする。
+        let version_requires_rebuild = user_version > 0 && user_version < INDEX_VERSION;
+        let rebuild_needed = if user_version == INDEX_VERSION {
+            false
+        } else {
+            version_requires_rebuild || needs_rebuild(&conn)?
         };
         if rebuild_needed {
             crate::logger::log(format!(
                 "fts_meta: detected old schema (index_version < {INDEX_VERSION}) — dropping `files` table for rebuild"
             ));
-            conn.execute_batch("DROP TABLE IF EXISTS files;")?;
         }
-        init_schema(&conn)?;
 
         // v5 → v6 データマイグレーション: status を Ok(0) と Failed(2) の 2 値に正規化。
         // Pending(1) と Tombstone(3) はどちらも Failed に倒す。
@@ -152,10 +170,23 @@ impl FtsMetaDb {
         //   される。物理 DELETE してしまうと Tantivy 側に対応 doc が残った場合に
         //   検索結果に出続ける regression になるので、Failed 経由で reconciliation に
         //   委ねる。
-        // 1 トランザクションでまとめ、user_version の bump も同じ tx に含める。
+        // schema DROP / recreate、durable Tantivy pending、user_version bump を 1 transaction に
+        // まとめる。DROP だけ済んで marker が無い crash state を作らない。
+        let tx = conn.transaction()?;
+        if rebuild_needed {
+            tx.execute_batch("DROP TABLE IF EXISTS files;")?;
+        }
+        init_schema(&tx)?;
+        init_index_state_schema(&tx)?;
+        if rebuild_needed || force_tantivy_rebuild {
+            tx.execute(
+                "INSERT INTO index_state(key, value) VALUES (?1, 1)
+                 ON CONFLICT(key) DO UPDATE SET value = 1",
+                params![TANTIVY_REBUILD_PENDING_KEY],
+            )?;
+        }
         if user_version != INDEX_VERSION {
-            let tx = conn.unchecked_transaction()?;
-            if user_version != 0 && user_version < INDEX_VERSION {
+            if !rebuild_needed && user_version != 0 && user_version < INDEX_VERSION {
                 let pending = tx.execute("UPDATE files SET status = 2 WHERE status = 1", [])?;
                 let tombstones = tx.execute("UPDATE files SET status = 2 WHERE status = 3", [])?;
                 if pending > 0 || tombstones > 0 {
@@ -166,8 +197,8 @@ impl FtsMetaDb {
                 }
             }
             tx.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
-            tx.commit()?;
         }
+        tx.commit()?;
         // 後始末 (VACUUM) は起動経路から外し、`maybe_run_housekeeping_async` で起動後に
         // バックグラウンド実行する。数 GB で数分かかりうるので起動 overlay を止めない方針。
         Ok(Self {
@@ -177,10 +208,34 @@ impl FtsMetaDb {
     }
 
     /// 直近の `open_at` で `files` テーブルが再作成されたか。
-    /// IndexerManager はこのフラグを見て Tantivy index dir を wipe する
-    /// (旧 key 形式の orphan doc が残らないようにするため)。
+    /// wipe owner は再起動を跨ぐ `tantivy_rebuild_pending()` を使う。
     pub fn rebuilt_on_open(&self) -> bool {
         self.rebuilt_on_open
+    }
+
+    /// Tantivy wipe が成功するまで残る durable state。`rebuilt_on_open` は直近 open の診断値、
+    /// manager の再構築判断はこちらを正本にする。
+    pub(crate) fn tantivy_rebuild_pending(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT value FROM index_state WHERE key = ?1",
+                params![TANTIVY_REBUILD_PENDING_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.is_some_and(|value| value != 0))
+    }
+
+    /// Cross-store owner (`open_stores_with_rebuild_sync`) だけが、旧 directory の wipe と
+    /// 新 Tantivy index の open 成功後に呼ぶ。失敗時は marker を残して次回再試行する。
+    pub(crate) fn complete_tantivy_rebuild(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM index_state WHERE key = ?1",
+            params![TANTIVY_REBUILD_PENDING_KEY],
+        )?;
+        Ok(())
     }
 
     /// 起動後に呼ぶ housekeeping。`application_id != HOUSEKEEPING_VERSION` の場合のみ
@@ -635,6 +690,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
          CREATE INDEX IF NOT EXISTS idx_files_fav_kind  ON files(favorite_id, kind);
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",
+    )?;
+    Ok(())
+}
+
+fn init_index_state_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS index_state (
+            key   TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }

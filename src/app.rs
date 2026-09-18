@@ -3224,14 +3224,12 @@ impl Drop for StartupOpenPathResolvePending {
 /// バックグラウンドで走らせる `IndexerManager::new` の状態。
 /// 起動フェーズ判定は `App::startup_init.is_some()` で行う (Loading の間だけ Some)。
 pub(crate) struct StartupInitPending {
-    rx: mpsc::Receiver<Option<crate::indexer_manager::IndexerManager>>,
+    rx: mpsc::Receiver<crate::indexer_manager::StartupInitOutcome>,
     started_at: std::time::Instant,
 }
 
 impl StartupInitPending {
-    fn try_recv(
-        &self,
-    ) -> Result<Option<crate::indexer_manager::IndexerManager>, mpsc::TryRecvError> {
+    fn try_recv(&self) -> Result<crate::indexer_manager::StartupInitOutcome, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
     fn elapsed_ms(&self) -> f64 {
@@ -22248,7 +22246,7 @@ impl App {
                 let hook = Arc::clone(&hook);
                 move || {
                     let t = std::time::Instant::now();
-                    let mgr = crate::indexer_manager::IndexerManager::new(
+                    let outcome = crate::indexer_manager::IndexerManager::new(
                         &favorites,
                         speed,
                         activity_gate,
@@ -22256,13 +22254,16 @@ impl App {
                         similar_notifier.clone(),
                         Some(hook),
                     );
-                    if mgr.is_none() {
+                    if !matches!(
+                        &outcome,
+                        crate::indexer_manager::StartupInitOutcome::Ready(_)
+                    ) {
                         if let Some(similar_notifier) = similar_notifier.as_ref() {
                             similar_notifier.finish_watch_bootstrap();
                         }
                     }
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
-                    let _ = tx.send(mgr);
+                    let _ = tx.send(outcome);
                 }
             });
         if let Err(e) = spawn_result {
@@ -22271,7 +22272,7 @@ impl App {
             crate::logger::log(format!(
                 "startup-init spawn failed: {e} — running synchronously"
             ));
-            self.indexer_manager = crate::indexer_manager::IndexerManager::new(
+            let outcome = crate::indexer_manager::IndexerManager::new(
                 &self.settings.favorites,
                 self.settings.indexer_speed_profile,
                 Arc::clone(&self.activity_gate),
@@ -22281,6 +22282,14 @@ impl App {
                     .map(crate::similar_index::SimilarIndexManager::notifier),
                 Some(hook),
             );
+            self.indexer_manager = match outcome {
+                crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
+                crate::indexer_manager::StartupInitOutcome::Unavailable => None,
+                crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
+                    self.show_feedback_toast(user_message);
+                    None
+                }
+            };
             if self.indexer_manager.is_none() {
                 if let Some(similar_index) = self.similar_index.as_ref() {
                     similar_index.notifier().finish_watch_bootstrap();
@@ -22752,12 +22761,19 @@ impl App {
             return;
         };
         match pending.try_recv() {
-            Ok(mgr) => {
+            Ok(outcome) => {
                 crate::logger::log(format!(
                     "startup: IndexerManager init completed in {:.0} ms",
                     pending.elapsed_ms()
                 ));
-                self.indexer_manager = mgr;
+                self.indexer_manager = match outcome {
+                    crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
+                    crate::indexer_manager::StartupInitOutcome::Unavailable => None,
+                    crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
+                        self.show_feedback_toast(user_message);
+                        None
+                    }
+                };
                 self.startup_init = None;
                 self.startup_done = true;
                 self.housekeeping_armed = true;

@@ -6854,6 +6854,43 @@ mod paused_similar_feature_tests {
             (2, 0)
         );
     }
+
+    #[test]
+    fn startup_rebuild_failure_is_notified_once_without_persistent_error_state() {
+        let mut app = setup_app();
+        let (tx, rx) = mpsc::channel();
+        tx.send(crate::indexer_manager::StartupInitOutcome::Failed {
+            user_message: "全文検索索引を再構築できませんでした。次回起動時に再試行します"
+                .to_string(),
+        })
+        .unwrap();
+        app.startup_init = Some(StartupInitPending {
+            rx,
+            started_at: std::time::Instant::now(),
+        });
+        app.startup_done = false;
+
+        app.poll_startup_init();
+        assert!(app.startup_done);
+        assert!(app.startup_init.is_none());
+        assert!(app.indexer_manager.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("全文検索索引を再構築できませんでした。次回起動時に再試行します")
+        );
+
+        let shown_at = app
+            .fs_feedback_toast
+            .as_ref()
+            .map(|toast| toast.1)
+            .expect("failure toast");
+        app.poll_startup_init();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.1),
+            Some(shown_at),
+            "completed outcome must not notify again"
+        );
+    }
 }
 
 #[cfg(test)]

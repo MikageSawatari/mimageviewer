@@ -349,7 +349,8 @@
       <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
       <li><strong>XMP ツイート情報</strong>: ローカルファイルに埋め込まれたツイート本文・投稿者・URL</li>
       <li><strong>AI プロンプト (PNG)</strong>: Stable Diffusion などが PNG tEXt に埋め込んだプロンプト
-          (Negative Prompt は自動で除外)</li>
+          (Negative Prompt は自動で除外)。ComfyUI 画像では生成に使われたと確認できる文を優先し、
+          ワイルドカードの候補一覧など生成前のテンプレートは検索対象から除外します</li>
       <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
       <li><strong>動画メタ情報</strong>: FFmpeg が読める動画のタイトル / 作者 / 説明 / URL / チャプター名</li>
       <li><strong>サイドカー</strong>: 画像と同じ場所に置かれた<strong>同名の JSON / テキストファイル</strong>

@@ -315,6 +315,17 @@ fn metadata_panel_information_tab_dark() {
 }
 
 #[test]
+fn metadata_panel_comfyui_provenance_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_comfyui_provenance_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 390.0),
+        None,
+        mimageviewer::draw_comfyui_provenance_snapshot_fixture,
+    );
+}
+
+#[test]
 fn metadata_panel_similar_results_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_similar_results_dark",

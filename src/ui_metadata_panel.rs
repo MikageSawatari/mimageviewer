@@ -8,7 +8,9 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::exif_reader::{self, ExifInfo};
-use crate::png_metadata::{A1111Metadata, AiMetadata, ComfyUIMetadata};
+use crate::png_metadata::{
+    A1111Metadata, AiMetadata, ComfyPromptRole, ComfyUIMetadata, UnresolvedInputSafety,
+};
 use crate::tag_ops::TagTarget;
 use crate::xmp_reader::{self, XmpTweetInfo};
 
@@ -5503,17 +5505,67 @@ fn draw_comfyui_panel(
     });
     ui.add_space(8.0);
 
-    // Extracted prompts
-    if !meta.extracted_prompts.is_empty() {
-        let combined = meta.extracted_prompts.join("\n---\n");
+    // 生成時文字列として解決できた prompt だけを通常セクションへ出す。
+    let resolved_positive = meta
+        .resolved_prompts
+        .iter()
+        .filter(|prompt| prompt.role == ComfyPromptRole::Positive)
+        .map(|prompt| prompt.text.as_str())
+        .collect::<Vec<_>>();
+    if !resolved_positive.is_empty() {
+        let combined = resolved_positive.join("\n---\n");
         draw_text_section(ui, ctx, "Prompt", &combined);
     }
 
-    // Extracted negatives
-    if !meta.extracted_negatives.is_empty() {
+    let resolved_negative = meta
+        .resolved_prompts
+        .iter()
+        .filter(|prompt| prompt.role == ComfyPromptRole::Negative)
+        .map(|prompt| prompt.text.as_str())
+        .collect::<Vec<_>>();
+    if !resolved_negative.is_empty() {
         ui.add_space(6.0);
-        let combined = meta.extracted_negatives.join("\n---\n");
+        let combined = resolved_negative.join("\n---\n");
         draw_text_section(ui, ctx, "Negative Prompt", &combined);
+    }
+
+    // 変換 node の入力は最終 prompt と断定せず、既定閉じの別区画で provenance を保つ。
+    if !meta.unresolved_inputs.is_empty() {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(format!(
+            "未解決の入力 ({} 件)",
+            meta.unresolved_inputs.len()
+        ))
+        .id_salt("comfyui_unresolved_inputs")
+        .default_open(false)
+        .show(ui, |ui| {
+            for input in &meta.unresolved_inputs {
+                let role = match input.role {
+                    ComfyPromptRole::Positive => "Positive",
+                    ComfyPromptRole::Negative => "Negative",
+                };
+                let source_class = if input.source_class.is_empty() {
+                    "(class 不明)"
+                } else {
+                    input.source_class.as_str()
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{role} · {source_class}.{} / output {} · {}",
+                        input.input_key,
+                        input.output_index,
+                        input.safety.label()
+                    ))
+                    .color(match input.safety {
+                        UnresolvedInputSafety::SearchablePlain => LABEL_COLOR,
+                        _ => egui::Color32::from_rgb(210, 160, 80),
+                    })
+                    .size(SECTION_FONT),
+                );
+                draw_user_text_with_links(ui, &input.text, BODY_FONT);
+                ui.add_space(4.0);
+            }
+        });
     }
 
     // Sampler parameters
@@ -5544,6 +5596,44 @@ fn draw_comfyui_panel(
     }
 
     (rp, rw)
+}
+
+/// ComfyUI の resolved / unresolved provenance 表示を固定する headless snapshot fixture。
+#[doc(hidden)]
+pub fn draw_comfyui_provenance_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.set_width(360.0);
+    apply_metadata_panel_dark_widget_style(ui);
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(28, 30, 36))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            let meta = ComfyUIMetadata {
+                prompt_json: serde_json::json!({"fixture": "provenance"}),
+                workflow_json: None,
+                resolved_prompts: vec![crate::png_metadata::ResolvedComfyPrompt {
+                    text: "夕暮れの海辺、静かな波".to_string(),
+                    role: ComfyPromptRole::Positive,
+                    provenance: crate::png_metadata::ComfyPromptProvenance::ClipLiteral {
+                        node_id: "12".to_string(),
+                    },
+                }],
+                unresolved_inputs: vec![crate::png_metadata::UnresolvedComfyInput {
+                    text: "{sunset|night} __weather__".to_string(),
+                    role: ComfyPromptRole::Positive,
+                    source_node_id: "7".to_string(),
+                    source_class: "PromptTransform".to_string(),
+                    input_key: "text".to_string(),
+                    output_index: 0,
+                    safety: UnresolvedInputSafety::TemplateSyntax,
+                }],
+                sampler_params: vec![
+                    ("steps".to_string(), "28".to_string()),
+                    ("sampler_name".to_string(), "euler".to_string()),
+                ],
+            };
+            let ctx = ui.ctx().clone();
+            let _ = draw_comfyui_panel(ui, &ctx, &meta, false, false);
+        });
 }
 
 fn draw_unknown_panel(ui: &mut egui::Ui, chunks: &[(String, String)]) {

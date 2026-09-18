@@ -284,8 +284,8 @@ pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
-    draw_paused_metadata_panel_snapshot_fixture, draw_similar_panel_snapshot_fixture,
-    draw_similar_states_snapshot_fixture,
+    draw_comfyui_provenance_snapshot_fixture, draw_paused_metadata_panel_snapshot_fixture,
+    draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
 };
 pub mod ui_music_panels;
 pub mod ui_music_spectrum;

@@ -120,8 +120,8 @@ pub struct StartupDiag {
 /// fts_meta が INDEX_VERSION bump / 旧スキーマを検出して `files` テーブルを drop した場合、
 /// Tantivy 側も一緒に wipe しないと旧 key 形式 (例: `!` separator) で書かれた orphan doc が
 /// 残り続ける (post-filter で弾かれるが容量を食う、かつ将来リカバリ経路が増えたら顕在化し得る)。
-/// このため fts_meta open → 旧 STORED tags を tags.db へ移行 → `rebuilt_on_open`
-/// チェック → 必要なら `fts_index` 削除 → fts open の順で実行する。
+/// このため fts_meta open → 旧 STORED tags を tags.db へ移行 → durable rebuild pending
+/// チェック → 必要なら `fts_index` 削除 → fts open → pending clear の順で実行する。
 ///
 /// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
 /// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
@@ -131,6 +131,20 @@ pub struct StartupDiag {
 /// `IndexerManager::new` 内部で各 sub-step の前に呼ばれる。
 /// `None` を渡せば従来の挙動。`Some` の場合は文字列を Mutex に書き込む。
 pub type StartupProgressHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// App の既存 startup completion channel に載せる typed outcome。状態を App field に
+/// 重複保持せず、migration failure の user message を poll owner が 1 回だけ通知する。
+pub enum StartupInitOutcome {
+    Ready(IndexerManager),
+    Unavailable,
+    Failed { user_message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreOpenFailure {
+    Unavailable,
+    RebuildDeferred,
+}
 
 fn run_legacy_tantivy_tag_import(
     data_dir: &std::path::Path,
@@ -196,37 +210,64 @@ fn open_stores_with_rebuild_sync(
     data_dir: &std::path::Path,
     log_tag: &str,
     progress: Option<&StartupProgressHook>,
-) -> Option<(Arc<FtsMetaDb>, Arc<FtsIndex>)> {
+) -> Result<(Arc<FtsMetaDb>, Arc<FtsIndex>), StoreOpenFailure> {
+    open_stores_with_rebuild_sync_using(data_dir, log_tag, progress, |path| {
+        std::fs::remove_dir_all(path)
+    })
+}
+
+fn open_stores_with_rebuild_sync_using(
+    data_dir: &std::path::Path,
+    log_tag: &str,
+    progress: Option<&StartupProgressHook>,
+    remove_fts_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(Arc<FtsMetaDb>, Arc<FtsIndex>), StoreOpenFailure> {
     if let Some(p) = progress {
         p("アイテム索引データベースを開いています…");
     }
+    let meta_path = data_dir.join("fts_meta.db");
+    let fts_dir = data_dir.join("fts_index");
+    // meta DB を失ったのに Tantivy だけ残った場合、files inventory が無いので旧 docs を
+    // 公開できない。marker は DB 初期化 transaction 内で立て、crash gap を作らない。
+    let force_tantivy_rebuild = !meta_path.exists() && fts_dir.exists();
     let t_meta = std::time::Instant::now();
-    let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
+    let meta_db = match FtsMetaDb::open_at_with_tantivy_rebuild_requirement(
+        &meta_path,
+        force_tantivy_rebuild,
+    ) {
         Ok(db) => db,
         Err(e) => {
             crate::logger::log(format!("{log_tag}: FtsMetaDb open failed: {e}"));
-            return None;
+            return Err(StoreOpenFailure::Unavailable);
         }
     };
     crate::perf::emit_ms("startup", "fts_meta_open", 0, t_meta);
-    let fts_dir = data_dir.join("fts_index");
     run_legacy_tantivy_tag_import(data_dir, &fts_dir, log_tag, progress);
-    if meta_db.rebuilt_on_open() {
+    let rebuild_pending = match meta_db.tantivy_rebuild_pending() {
+        Ok(pending) => pending,
+        Err(e) => {
+            crate::logger::log(format!(
+                "{log_tag}: read Tantivy rebuild marker failed: {e}"
+            ));
+            return Err(StoreOpenFailure::Unavailable);
+        }
+    };
+    if rebuild_pending {
         if let Some(p) = progress {
             p("古いインデックスを削除しています…");
         }
         crate::logger::log(format!(
-            "{log_tag}: fts_meta rebuilt → wiping Tantivy index dir {}",
+            "{log_tag}: durable rebuild pending → wiping Tantivy index dir {}",
             fts_dir.display()
         ));
         let t_wipe = std::time::Instant::now();
-        if let Err(e) = std::fs::remove_dir_all(&fts_dir) {
-            // Not-found は想定内。他は warn してそのまま続行 (次の open で
-            // schema_is_stale 経路で再 wipe されることを期待)。
+        if let Err(e) = remove_fts_dir(&fts_dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 crate::logger::log(format!(
-                    "{log_tag}: wipe fts_index failed: {e} (continuing)"
+                    "{log_tag}: wipe fts_index failed for {}: {e}; old index will not be opened, rebuild remains pending",
+                    fts_dir.display()
                 ));
+                return Err(StoreOpenFailure::RebuildDeferred);
             }
         }
         crate::perf::emit_ms("startup", "fts_index_wipe", 0, t_wipe);
@@ -240,18 +281,28 @@ fn open_stores_with_rebuild_sync(
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             crate::logger::log(format!("{log_tag}: FtsIndex open failed: {e}"));
-            return None;
+            return Err(if rebuild_pending {
+                StoreOpenFailure::RebuildDeferred
+            } else {
+                StoreOpenFailure::Unavailable
+            });
         }
     };
     crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts);
-    Some((meta_db, fts))
+    if rebuild_pending && let Err(e) = meta_db.complete_tantivy_rebuild() {
+        crate::logger::log(format!(
+            "{log_tag}: clear Tantivy rebuild marker failed: {e}; rebuild remains pending"
+        ));
+        return Err(StoreOpenFailure::RebuildDeferred);
+    }
+    Ok((meta_db, fts))
 }
 
 impl IndexerManager {
     /// DB/index を開き、起動時 reconciliation → 自動索引が有効なお気に入りに
     /// 共有 Supervisor を spawn する。
     ///
-    /// DB 初期化に失敗したら None (App 側は fts 機能なしで動作継続する)。
+    /// DB 初期化結果を startup completion channel 用の typed outcome で返す。
     ///
     /// **Codex round-8 Must-fix #1 反映**: 起動時 reconciliation は
     /// supervisors spawn の **前** に同期実行する。旧実装はバックグラウンド化していたが、
@@ -269,14 +320,21 @@ impl IndexerManager {
         excluded_roots: Vec<std::path::PathBuf>,
         similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
         progress: Option<StartupProgressHook>,
-    ) -> Option<Self> {
+    ) -> StartupInitOutcome {
         let data_dir = crate::data_dir::get();
         let (meta_db, fts) =
             match open_stores_with_rebuild_sync(&data_dir, "IndexerManager", progress.as_ref()) {
-                Some(stores) => stores,
-                None => return None,
+                Ok(stores) => stores,
+                Err(StoreOpenFailure::RebuildDeferred) => {
+                    return StartupInitOutcome::Failed {
+                        user_message:
+                            "全文検索索引を再構築できませんでした。次回起動時に再試行します"
+                                .to_string(),
+                    };
+                }
+                Err(StoreOpenFailure::Unavailable) => return StartupInitOutcome::Unavailable,
             };
-        Self::new_with_stores(
+        match Self::new_with_stores(
             meta_db,
             fts,
             favorites,
@@ -285,7 +343,10 @@ impl IndexerManager {
             excluded_roots,
             similar_notifier,
             progress,
-        )
+        ) {
+            Some(manager) => StartupInitOutcome::Ready(manager),
+            None => StartupInitOutcome::Unavailable,
+        }
     }
 
     /// テスト用コンストラクタ: `data_dir` 配下に `fts_meta.db` / `fts_index/` を作って初期化する。
@@ -303,8 +364,8 @@ impl IndexerManager {
         std::fs::create_dir_all(data_dir).ok();
         let (meta_db, fts) =
             match open_stores_with_rebuild_sync(data_dir, "IndexerManager(test)", None) {
-                Some(stores) => stores,
-                None => return None,
+                Ok(stores) => stores,
+                Err(_) => return None,
             };
         Self::new_with_stores(
             meta_db,
@@ -953,6 +1014,107 @@ mod tests {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());
         fav.auto_index_metadata = metadata;
         fav
+    }
+
+    fn seed_v9_meta(data_dir: &std::path::Path, with_row: bool) {
+        let db_path = data_dir.join("fts_meta.db");
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        if with_row {
+            db.upsert_meta_ok(
+                "c:/legacy.png",
+                Uuid::new_v4(),
+                std::path::Path::new("C:/"),
+                IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE files SET index_version = 9", [])
+            .unwrap();
+        conn.execute_batch("DROP TABLE index_state; PRAGMA user_version = 9;")
+            .unwrap();
+    }
+
+    fn seed_valid_fts_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+        let fts_dir = data_dir.join("fts_index");
+        drop(FtsIndex::open_at(&fts_dir).unwrap());
+        let sentinel = fts_dir.join("v9-sentinel.txt");
+        std::fs::write(&sentinel, b"old-index").unwrap();
+        sentinel
+    }
+
+    #[test]
+    fn v9_to_v10_rebuild_wipes_tantivy_and_clears_pending_even_when_files_empty() {
+        for with_row in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            seed_v9_meta(tmp.path(), with_row);
+            let sentinel = seed_valid_fts_dir(tmp.path());
+
+            let (meta, fts) =
+                open_stores_with_rebuild_sync(tmp.path(), "IndexerManager(migration-test)", None)
+                    .expect("v9 migration succeeds");
+            assert!(!sentinel.exists(), "old Tantivy directory must be wiped");
+            assert!(meta.get("c:/legacy.png").unwrap().is_none());
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert_eq!(fts.searcher().num_docs(), 0);
+
+            let conn = rusqlite::Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, crate::fts_meta::INDEX_VERSION);
+        }
+    }
+
+    #[test]
+    fn missing_meta_with_existing_tantivy_is_wiped_before_open() {
+        let tmp = TempDir::new().unwrap();
+        let sentinel = seed_valid_fts_dir(tmp.path());
+        assert!(!tmp.path().join("fts_meta.db").exists());
+
+        let (meta, _fts) =
+            open_stores_with_rebuild_sync(tmp.path(), "IndexerManager(orphan-index-test)", None)
+                .expect("orphan Tantivy migration succeeds");
+        assert!(!sentinel.exists());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+    }
+
+    #[test]
+    fn failed_wipe_keeps_pending_and_retry_clears_it_without_opening_old_index() {
+        let tmp = TempDir::new().unwrap();
+        seed_v9_meta(tmp.path(), true);
+        let sentinel = seed_valid_fts_dir(tmp.path());
+
+        let first = open_stores_with_rebuild_sync_using(
+            tmp.path(),
+            "IndexerManager(wipe-failure-test)",
+            None,
+            |_path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected wipe failure",
+                ))
+            },
+        );
+        assert!(matches!(first, Err(StoreOpenFailure::RebuildDeferred)));
+        assert!(
+            sentinel.exists(),
+            "failed wipe must not open/mutate old index"
+        );
+
+        let after_failure = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        assert!(after_failure.tantivy_rebuild_pending().unwrap());
+        assert!(after_failure.get("c:/legacy.png").unwrap().is_none());
+        drop(after_failure);
+
+        let (meta, _fts) =
+            open_stores_with_rebuild_sync(tmp.path(), "IndexerManager(wipe-retry-test)", None)
+                .expect("next startup retries the pending wipe");
+        assert!(!sentinel.exists());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
     }
 
     #[test]

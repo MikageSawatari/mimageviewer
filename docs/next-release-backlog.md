@@ -29,21 +29,6 @@
 
 ## 1. 優先候補
 
-### 1.253 AI プロンプトの出所ルール: ワイルドカードのテンプレートを索引しない (INDEX_VERSION 10) — 設計確定 (2026-09-18)
-
-- 出典: 利用者の報告 (Ctrl+G `glasses -genshin` が数分「検索中」)。正本は
-  [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) §3。
-- 観測: サンプル PNG 4 枚 (別フォルダ・別月) の全部で、CLIPTextEncode の `text` がリンクで
-  `DPRandomGenerator` を指し、その 266,470 バイト・1,371 行のテンプレートを `extract_text_from_ref_node`
-  がプロンプト本文として索引・保存していた。`fts_index` は 58 GB (`.store` 60.8 GB、790,864 doc)。
-  同じファイルの A1111 形式 `parameters` チャンクには生成後のプロンプトが揃っていた。
-- 直す方向: 特定ノード名の禁止リストではなく出所ルール。リテラルと素通しノード経由だけを解決済みとし、
-  変換ノード経由は未解決入力として `parameters` などの解決済みソースで置き換える。代替が無いときは
-  テンプレート構文とサイズ・行数の安全弁を通す。メタデータパネルもテンプレートを「プロンプト」と
-  表示しない。INDEX_VERSION 9 → 10 で自動再構築 (約 79 万件、PNG 全読みでおよそ 4 TB。IDAT までの
-  打ち切り読みは計測してから採否)。
-- 規模 / 優先度: Medium / P1 (索引サイズと検索精度の両方に効く)。実装は Codex Sol、リセット待ち。
-
 ### 1.252 `request_repaint_after` 同型残件: UI フォントプレビューの debounce 起床再武装 — 未実装 (2026-09-19)
 
 - 出典: Ctrl+G 進捗表示の実装時監査。正本は

@@ -11,6 +11,11 @@ comfyui_nan.png	ComfyUI with NaN (DPRandomGenerator) -> strict JSON parse fails 
 comfyui_infinity.png	ComfyUI with Infinity token (invalid JSON)
 comfyui_multi_ckpt.png	ComfyUI base + refiner checkpoints
 comfyui_unet_loader.png	ComfyUI UNETLoader (flux-style, unet_name, no ckpt_name)
+comfyui_linked_template_with_parameters.png	Linked transform template + A1111 parameters positive fallback
+comfyui_linked_template_without_parameters.png	Linked transform template without parameters, plus literal positive
+comfyui_parameters_comfyui_version.png	A1111 parameters fallback with Version: ComfyUI and empty Model hash
+comfyui_primitive_passthrough.png	PrimitiveNode value/output 0 passthrough contract
+comfyui_unresolved_plain.png	Unknown transform with a short plain-text input
 novelai_basic.png	NovelAI (Software/Source/Comment/Description/Title) -> '(NovelAI)' label
 invokeai_new.png	InvokeAI new invokeai_metadata JSON (model is nested object)
 invokeai_legacy_sdmeta.png	InvokeAI legacy sd-metadata JSON (model_weights) + Dream

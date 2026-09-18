@@ -375,6 +375,25 @@ impl<'a> IngestSession<'a> {
         kind: IndexKind,
         norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
+        if crate::perf::is_enabled() {
+            let (stored_total_bytes, png_prompt_bytes) = norms.stored_text_byte_sizes();
+            crate::perf::event(
+                "index",
+                "stored_text_bytes",
+                Some(&cand.key),
+                0,
+                &[
+                    (
+                        "stored_total_bytes",
+                        serde_json::Value::from(stored_total_bytes as u64),
+                    ),
+                    (
+                        "png_prompt_bytes",
+                        serde_json::Value::from(png_prompt_bytes as u64),
+                    ),
+                ],
+            );
+        }
         Ok(IndexDoc {
             path: cand.key.clone(),
             container,

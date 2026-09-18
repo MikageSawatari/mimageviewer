@@ -1,6 +1,6 @@
 # Ctrl+G 検索の進捗表示と AI プロンプトの出所ルール — 計画
 
-- 状態: **作業 1 は実装・自動検証・独立レビュー済み / 作業 2 は未実装** (2026-09-19)。
+- 状態: **作業 1 / 作業 2 とも実装・自動検証・独立レビュー済み** (2026-09-19)。
 - 担当: 作業 1 の実装・テストは Codex Sol xhigh。2026-09-09 の役割決定後に着手したため、
   旧記載の ClaudeCode ブリーフ・レビュー・統合は `AGENTS.md` に従い Codex 親の設計主導・統合と
   実装担当とは別の Codex reviewer による独立レビューへ読み替え、編集前に構造合意を得た。
@@ -201,74 +201,109 @@ pending owner が毎パス残り時間を再要求している。残件は
 
 ### 3.1 原則
 
-**ファイルが「生成に使われた」と証明できるテキストだけを索引する。ノードが変換する前の入力は
-索引しない。** ComfyUI の `prompt` JSON はノードの入力しか記録せず出力は残らない。
+**ファイルが「生成に使われた」と証明できるテキストを優先して索引する。ノードが変換する前の入力は
+解決済みプロンプトへ格上げしない。** ComfyUI の `prompt` JSON はノードの入力しか記録せず出力は残らない。
 CLIPTextEncode の `text` がリンクなら、そこにあるのは上流ノードの入力 (テンプレート、seed、
 ファイル名) であって生成に使われた文字列ではない。これはワイルドカード、結合、置換、翻訳、
 ファイル読み込みなど**テキストを変換するノード全部に共通**の性質で、特定ノード名の問題ではない。
 乱数ノードを名指しで除く設計は採らない (禁止リストは際限がなく、利用者のテンプレートに依存する)。
 
+ただし、既存の短い平文 fallback を失わないため、positive topology から到達した未解決入力のうち
+§3.4 の安全弁を通ったものは、**未解決という出所を保ったまま**検索だけに採用する。UI では必ず
+「未解決の入力」として折りたたみ、解決済みの「プロンプト」には表示しない。
+
 ### 3.2 出所ルール (グラフ構造だけで判定)
 
-`extract_text_from_node` / `extract_text_from_ref_node` の結果に出所を付ける。
+`extract_text_from_node` / `extract_text_from_ref_node` の文字列 `Vec` を、次の typed result へ置き換える。
+
+- `resolved_prompts`: text、positive / negative role、`CLIPTextEncode` の直接 literal・許可済み
+  passthrough・`parameters` positive fallback のいずれかを示す provenance を持つ。
+- `unresolved_inputs`: text、positive / negative role、参照元 node class、実際に候補文字列を読んだ
+  input key、CLIP `text` link の output index、§3.4 の内容 safety 判定 (検索採用 / template / 過大等) を
+  持つ。topology 外の link は収集せず、存在しない unknown role 状態を safety に重ねて表現しない。
+- 検索本文は positive の `resolved_prompts` を優先する。positive resolved が 1 件もなく、
+  `parameters` fallback も無い場合だけ、positive かつ safety-accepted な `unresolved_inputs` を
+  最後の砦として使う。negative は表示用に保持しても検索へ入れない。
 
 | 出所 | 扱い |
 | --- | --- |
 | CLIPTextEncode の `text` がリテラル | **解決済み**。従来どおり索引 |
-| リンク先が素通しノード (許可リスト: `PrimitiveNode`、文字列リテラル系。実装時に fixture と現物で確定) | 解決済み |
+| リンク先が素通しノード (許可契約: node class + input key + link output index を fixture で固定) | 解決済み |
 | リンク先がそれ以外 (未知を含む) | **未解決入力**。3.3 の代替があればそちらを使い、無ければ 3.4 の安全弁を通す |
 
 許可リストは「素通し」だけなので小さく安定する。未知ノードは安全側 (未解決) に倒れる。
+`populated_text` のようなキー名だけ、または任意ノードの `text` / `string` / `value` だけでは
+解決済みにしない。今回 fixture で契約を固定できる `PrimitiveNode` の class / `value` / output 0 だけを
+許可し、保存済み出力を持つ別ノードは class・key・output の実例を追加できるまで未解決のままにする。
+
+KSampler class を認識した `saw_supported_sampler_topology` と「参照配列が有効か」「抽出文字列が空か」を
+別に持つ。positive / negative が欠落・不正配列・未解決のどれでも、既知 KSampler topology がある限り、
+空 `Vec` を根拠に全 `CLIPTextEncode` を positive として拾わない。topology 自体が無い従来 fallback だけは、
+直接 literal の `CLIPTextEncode` に限定して解決済みとする。これにより既知 negative と無関係ノードを
+positive へ救済しない。循環は role ごと (または root traversal ごと) の visited node と深さ上限で止め、
+同じ node が positive / negative の両方から到達しても一方の role を潰さない。重複排除も
+role + provenance + source 契約を保つ。
 既存 fixture (`tests/fixtures/ai_metadata/comfyui_*.png`、`sd_parsers_upstream/ComfyUI/*.png` の 9 枚) は
 CLIPTextEncode が全部リテラルなので (スクリプトで確認済み)、このルールで抽出結果は変わらない。
 
 ### 3.3 解決済みソースの優先 (ファイル単位)
 
-- ComfyUI の正側プロンプトが解決済みで取れない場合、同じファイルの A1111 形式 `parameters`
-  チャンクがあれば、その正側プロンプトを `png_prompt_text` の本文にする。Negative は従来どおり
-  索引しない。モデル名 / サンプラーなどの facet 用パラメータは ComfyUI JSON から従来どおり取る
-  (`parameters` の `Model:` と重複しても害はない)。
-- 現状 `parameters` は「消費されなかったチャンク」として ComfyUI 本文の後ろに生で足されている。
-  順序と役割を入れ替える (主本文 = 解決済みソース、ComfyUI JSON = パラメータ)。
-- ワイルドカード系で出力を保存するノード (キー名が `populated_text` のような出力を表すもの) は、
-  そのキーを解決済みとして扱う。キーの一覧は許可リスト同様に小さく保つ。
+- ComfyUI を認識したファイルでは、同居する `parameters` を parse 成否にかかわらず必ず consumed key に
+  する。これを「未使用の非 AI チャンク」として生で再混入させない。
+- ComfyUI の正側プロンプトが解決済みで取れず、同じファイルの `parameters` が A1111 形式として
+  parse できた場合だけ、その **positive prompt** を resolved fallback にする。Negative と raw 本文は
+  索引しない。ComfyUI 側に resolved positive が既にある場合も `parameters` は consumed のままで、
+  positive / negative / raw を追加しない。
+- モデル名 / サンプラーなどの facet 用パラメータは ComfyUI JSON から従来どおり取る。
 
 利用者の現物はこの節だけで解決し、ノード名の知識は要らない。
 
 ### 3.4 安全弁 (内容で判定、最後の砦)
 
-3.3 の代替が無い未解決入力を索引に入れる条件:
+positive topology から到達した未解決入力を、未解決のまま検索に入れる条件:
 
 - テンプレート構文を含まない。Dynamic Prompts の variant ブロック `{ … | … }` (改行を挟む形を含む) と
   `__name__`。**`{word}` 単独は NovelAI の強調構文なので弾かない**。`(word:1.2)` も弾かない。
 - サイズ・行数の上限内 (初期値 8 KiB / 64 行。実装時に fixture と現物の分布から決め、定数に理由を書く)。
 - 「消費されなかったチャンクを全部足す」経路にもチャンク単位の上限 (初期値 16 KiB) を付ける。
+- negative 入力は、内容が短くても検索へ入れない。topology 外の link は収集しない。
 
 上限で落ちたテキストは索引に入らないだけで、ファイルからは消えない。
 
 ### 3.5 データ構造と表示
 
-- `ComfyUIMetadata` に「解決済みプロンプト」と「未解決入力 (出所付き)」を分けて持つ。
-  `build_searchable_text` は解決済みだけを使う。
-- メタデータパネル ([ui_metadata_panel.rs](../src/ui_metadata_panel.rs) は `extracted_prompts` を
-  そのまま表示している) は、解決済みプロンプト (3.3 の代替を含む) を「プロンプト」として出し、
-  未解決入力は「未解決の入力 (テンプレート、N KB)」のような見出しで折りたたむ。
+- `ComfyUIMetadata` に `resolved_prompts` と `unresolved_inputs` を分けて持つ。
+  `build_searchable_text` は positive resolved があればそれだけを使い、0 件の場合だけ
+  safety-accepted な positive unresolved を使う。
+- メタデータパネル ([ui_metadata_panel.rs](../src/ui_metadata_panel.rs)) は typed provenance を role 別に描き、
+  positive の解決済みプロンプト (3.3 の代替を含む) を「プロンプト」として出し、
+  未解決入力は「未解決の入力 (テンプレート、N KB)」のような見出しで既定閉じにする。
   **テンプレートを「プロンプト」と表示しない**ことが要件。折りたたみの詳細は実装時に決める。
-- Ctrl+F (フォルダ内検索) も同じ判別器を使うので、挙動が揃う。
+- `detect_and_parse_outcome` を path / bytes / UI / Ctrl+F / Ctrl+G の単一判別境界に保つ。
+  Ctrl+F と Ctrl+G は同じ `build_searchable_*` を通し、UI も同じ typed metadata を描画する。
 
 ### 3.6 再索引
 
-- `fts_meta.rs` の `INDEX_VERSION` を 10 にする。起動時に `files` テーブルが落ちて自動で全件
-  作り直しになる (既存の移行機構)。リリース済みデータの形式変更なので、この自動再構築が移行手段。
+- `fts_meta.rs` の `INDEX_VERSION` を 10 にする。v9 → v10 は `files` が空でも semantic rebuild を要求する。
+  `files` の drop / 再作成、`user_version=10`、SQLite 内の durable `tantivy_rebuild_pending=1` を
+  **単一 transaction** で確定し、DROP だけ済んだ crash 状態を作らない。`rebuilt_on_open()` は
+  「この open で files を再作成した」という診断値に限定し、manager の判断は再起動後も残る pending を
+  正本にする。meta DB が無い一方で旧 `fts_index` がある場合も、同じ transaction で pending を立てる。
+- `open_stores_with_rebuild_sync` は legacy tag import 後、pending なら旧 `fts_index` directory を
+  `remove_dir_all` する。NotFound は成功とし、それ以外の失敗では旧索引を開かない。空索引の open に
+  成功した後だけ pending を clear する。clear 失敗も manager を生成せず marker を残す。したがって
+  wipe/open/clear の途中終了は次回起動で再 wipe でき、旧文書を新しい検索意味で公開しない。
+- startup は `StartupInitPending` の完了 payload を typed outcome にし、pending migration の失敗を
+  `App::poll_startup_init` へ返す。既存 `show_feedback_toast` owner で「全文検索索引を再構築できず、
+  次回起動時に再試行する」旨を 1 回表示して通常 UI へ進む。App に別の error field は足さず、
+  その後の Ctrl+G は既存の generic unavailable 表示を使う。全面的な startup state 再設計は行わない。
 - コスト: 取り込みは PNG を丸ごと読む ([ingest_text.rs](../src/ingest_text.rs) `read_metadata_bytes`)。
   利用者の索引は約 79 万件、1 枚約 5 MB なので**およそ 4 TB の読み取り**。
-- 軽くする案 (別件として計測してから採否): PNG は最初の `IDAT` までで打ち切る。tEXt/iTXt/zTXt は
-  通常 `IDAT` より前にあるが、XMP (`iTXt XML:com.adobe.xmp`) を後ろに置くツールが無いとは言えない。
-  採用前に、利用者のコレクションからサンプルして「`IDAT` の後にテキストチャンクがある PNG の割合」を
-  スクリプトで測る。0 でなければ「先頭で見つからなかったときだけ全読み」の 2 段にする。
-- ディスク: 旧セグメント 60 GB は再構築中も残り、Tantivy のマージ / GC で消える。ピークは
-  旧 + 新 (新は 1 GB 級の見込み)。README の更新履歴に「初回起動時に索引を作り直す」注意を書く
-  (⚠️ プレフィックスの対象)。
+- **IDAT 打ち切りは不採用**。read-only sample 48 枚 / 14 folder では IDAT 後の text chunk は 0 件だったが、
+  これは一般保証にならず、repository に `enc_a1111_text_after_idat.png` の既知 fixture がある。
+  path reader が IDAT payload を seek で飛ばしつつ後置 chunk を読む契約と、ingest の full read を維持する。
+- ディスク: 旧 60 GB と新索引は併存しない。通常移行は旧 directory の wipe を先に行ってから再構築する。
+  wipe 失敗時は旧索引の open / 検索を止め、durable pending により次回起動で再試行する。
 
 ### 3.7 テスト
 
@@ -282,8 +317,23 @@ CLIPTextEncode が全部リテラルなので (スクリプトで確認済み)�
   5. `parameters` が A1111 形式で `Version: ComfyUI`、`Model hash:` 空。期待: A1111 パーサが通る。
 - 既存 9 枚の ComfyUI fixture の抽出結果が変わらないこと (回帰)。
 - 安全弁の単体テスト: NovelAI の `{word}` は弾かない、`{a|b}` と `__x__` は弾く、行数上限。
-- `search/ingest` 側: 1 文書の STORED 本文サイズを perf イベントか統計に出し、再索引後に
-  `fts_index` の `.store` 合計が 1 桁 GB 未満に落ちたことを利用者環境で確認する。
+- topology の単体テスト: 既知 positive が未解決でも全 CLIP fallback を発火せず、known negative /
+  無関係 CLIP を positive にしない。`parameters` は parse 失敗時も consumed、成功時は positive だけを
+  fallback に使い、resolved Comfy positive がある場合も raw / negative を混入させない。
+- 既存の不正画像、非標準 JSON 数値、循環参照、巨大 JSON / zlib 上限の安全性を維持する。
+- NovelAI `{word}` 強調は検索に残り、negative は ComfyUI / `parameters` / NovelAI の全経路で混入しない。
+  同じ fixture から UI metadata、Ctrl+F 用 `PerSourceText`、Ctrl+G の STORED `png_prompt_text` が
+  同じ判定結果を使うことを固定する。
+- v9 → v10 移行は tempdir 内に旧 `user_version` / `files` 行と有効な Tantivy directory marker を作り、
+  `open_stores_with_rebuild_sync` を通して files drop、version bump、directory wipe + reopen、pending clear を
+  確認する。files が空でも v9 は wipe すること、meta DB 不在 + 旧 index も wipe することを固定する。
+  wipe 失敗は注入可能な小さい state transition で決定的に作り、manager / index を公開せず pending を維持し、
+  次回成功時だけ clear することを確認する。typed startup failure は既存 toast owner に 1 回だけ表示され、
+  worker の send 失敗 / disconnect / 同期 fallback の終了契約を壊さないことも固定する。
+- `search/ingest` 側は 1 文書の STORED 本文 byte 数 (総量と png prompt) を perf 計測へ出し、fixture で
+  巨大テンプレートが STORED text に残らないことを確認する。利用者環境での再索引後サイズ確認は別途行う。
+- メタデータパネルに、resolved prompt と既定閉じの「未解決の入力」が同時に出る headless snapshot を足し、
+  画像を目視確認する。
 
 ### 3.8 更新する文書
 
@@ -291,9 +341,37 @@ CLIPTextEncode が全部リテラルなので (スクリプトで確認済み)�
 - [spec.md](spec.md) 2143 行付近 (KSampler の positive / negative を辿る記述): リンク先の扱いを追記。
 - `htdocs/mimageviewer/manual/` のメタデータ / 検索ページ: 「検索対象になるのは生成に使われた
   プロンプトで、ワイルドカードのテンプレートは対象外」の趣旨を実装用語なしで 1〜2 行。
-- README 更新履歴 (リリース時): 索引作り直しの注意と、検索精度・索引サイズの改善。
+- release lead 向け引き継ぎ: README 更新履歴へ「初回起動時に索引を作り直す」注意 (⚠️ 対象) と
+  検索精度・索引サイズの改善を書く。今回の開発作業では version / README 更新や公開は行わない。
 
-### 3.9 非対象 / 将来
+### 3.9 実装記録 (2026-09-19)
+
+- ComfyUI の抽出結果を `resolved_prompts` / `unresolved_inputs` に分け、role、node class / id、
+  実際に読んだ input key、link output index、内容 safety を保持した。検索本文は resolved positive、
+  A1111 `parameters` の positive 代替、短い平文の unresolved positive の順で選び、Negative、raw
+  `parameters`、テンプレート、過大入力を混入させない。
+- KSampler topology の有無と抽出結果の空を分離し、既知 topology の欠落・不正参照で全 CLIP fallback を
+  発火させない。直接 literal と fixture で固定した `PrimitiveNode.value` / output 0 だけを resolved とした。
+  5 枚の新 fixture と既存 9 枚、不正 / 循環 / 巨大 JSON、NovelAI 強調、path / bytes の共通判定で固定した。
+- v9→v10 は `files` 再作成、version bump、durable pending marker を単一 SQLite transaction で確定する。
+  cross-store owner は legacy tag import 後に旧 Tantivy directory を wipe し、新 index の open 成功後だけ
+  marker を clear する。wipe / open / clear 失敗では旧 index を公開せず、startup の typed outcome から既存
+  toast を 1 回表示して次回起動へ再試行を残す。
+- ingest の perf event `stored_text_bytes` は文書ごとの STORED 原文総 byte 数と PNG prompt byte 数を出す。
+  PNG full read と IDAT 後方の text 対応は維持した。read-only sample 48 枚 / 14 folder で後置 text 0 件でも
+  一般保証にはせず、既存 post-IDAT fixture を理由に IDAT 打ち切りを採用していない。
+- メタデータパネルは resolved prompt を通常表示し、未解決入力を既定閉じの別区画にした。headless golden は
+  実装担当と親が目視確認し、独立 reviewer も typed provenance、検索優先順、negative 非混入、移行の
+  fail-closed、startup 通知、STORED 計測、full-read、文書を確認して blocking / should-fix 指摘なし。
+- focused は parser 56 件、ingest 16 件、indexer manager 11 件、fts meta 16 件、startup toast 1 件、
+  UI snapshot 1 件が成功。`test-full.ps1 -SuppressCrashDialogs` は本体 8,653 件成功・失敗 0・ignored 45、
+  UI snapshot 53 件、検索 E2E 12 件、IPC 57 件、Remote 122 件、vendor egui / egui-wgpu / eframe
+  25 / 9 / 15 件を含め `[test-full] PASS`。fmt、UI glyph、viewer-context audit、diff check と
+  `build-dev.ps1 -PreserveRuntime` も exit 0。証跡は `target/search253-logs/` に保存した。
+- アプリ、元画像、通常設定、実索引は起動・変更していない。利用者環境での再索引時間と新しい index size は
+  未測定。リリース lead は README 更新履歴へ初回再索引の注意と検索精度・索引サイズ改善を記載する。
+
+### 3.10 非対象 / 将来
 
 - 除外語の Tantivy 側評価 (E)。位置情報を持つ索引に変えない限り扱わない。
 - `TopDocs` の offset ページングの二次コスト。候補集合が正しくなれば実害は小さい。
@@ -303,11 +381,11 @@ CLIPTextEncode が全部リテラルなので (スクリプトで確認済み)�
 ## 4. 実施順と Codex への渡し方
 
 1. 作業 1 を 1 コミット群で出す (2.1〜2.7)。再索引なし。実機確認は利用者。
-2. 作業 2 は 3.6 の計測 (IDAT 後のテキストチャンクの割合) を先に済ませ、fixture を揃えてから
-   INDEX_VERSION を上げる。Codex に出す前に作業 1 をコミットしておく
-   (CLAUDE.md「区切りごとに小さくコミットする」)。
+2. 作業 2 は read-only sample 48 枚 / 14 folder と既存 post-IDAT fixture を照合し、full read 維持を
+   確定した。5 fixture と v9 → v10 の isolated migration test を揃えてから INDEX_VERSION を上げる。
+   作業 1 は `abeb513d9` として先にコミット済み。
 3. Codex ブリーフは本書を正本にし、`codex exec --model gpt-5.6-sol -c 'model_reasoning_effort="xhigh"'`
    で「本書 §2 を実装、§2.6 のテストを追加、§2.7 の文書を更新」と指示する。作業 2 も同様に §3。
-4. レビュー観点 (ClaudeCode): 0.5 の各経路が計画どおり変わったか、症状パッチ (guard / retry /
-   一括 reset) が混ざっていないか、`IndexerManager` が egui に依存していないか、
-   fixture 5 種と既存 9 枚の期待値、`request_repaint_after` 同型の一覧報告。
+4. レビュー観点: `AGENTS.md` の役割対応により Codex 親 + 実装担当とは別の reviewer が、typed provenance、
+   positive / negative topology、parameters consumed、fixture 5 種と既存 9 枚、共通判別境界、
+   v9 → v10 wipe 移行、full-read 維持、UI snapshot を確認する。

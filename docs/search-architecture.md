@@ -132,8 +132,8 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
-| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。semantic version 移行は `fts_meta.db` の durable marker に従い、旧 directory を消してから開く。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
+| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` + `index_state` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | v9→v10 では files 再作成・version bump・`tantivy_rebuild_pending=1` を同じ transaction で確定。新 Tantivy index の open 成功後だけ marker を消す |
 | `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy一回移行フラグ、既存の歴史的XMP移行状態、任意のタグsidecar backup import同期状態もここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
@@ -158,7 +158,8 @@ App 起動
   └─ IndexerManager::new
        ├─ FtsMetaDb を open
        ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
-       ├─ FtsIndex を open (schema 不一致なら全再構築)
+       ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
+       ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
        ├─ 起動時 reconciliation (§4.3) を **同期** で実行
        └─ auto_index_metadata=true のお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
@@ -239,7 +240,10 @@ v2.3.0第12弾では次を不変条件とする。
 
 - `status=Failed` の行 → Tantivy delete_term + SQLite delete_paths
   (legacy v5 DB から migrate された Pending/Tombstone もここに集約される)
-- `index_version` 不一致 or `fts_index/` schema 不一致 → 全再構築
+- `index_version` 不一致 → SQLite transaction で `files` 再作成と durable rebuild marker を確定し、
+  旧 `fts_index/` を wipe してから新 index を開く。wipe / open / marker clear の失敗時は旧 index を
+  公開せず、marker を残して次回起動で再試行する
+- `fts_index/` schema 不一致 → Tantivy の既存 schema 判定で全再構築
 
 通常は数十〜数百行程度で 100ms 以下。大量なら supervisor 起動は待たされるが、
 writer 競合防止のため同期実行する方が安全 (非同期化すると supervisor と
@@ -422,7 +426,7 @@ Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待�
   `purge_favorite_metadata` で `sidecar_text` ごと消える。
 - **動画 / ZIP 内 / PDF ページは対象外** (動画は既存 `.xmp` サイドカーの mIV タグ経路を維持)。
 
-### 4.11 AI 生成メタデータ (INDEX_VERSION=9)
+### 4.11 AI 生成メタデータ (INDEX_VERSION=10)
 
 PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた生成メタデータを
 `png_prompt_text` フィールドへ正規化して入れる。実装は
@@ -430,6 +434,16 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 の 3 経路で同じ判別器を使う。
 
 - `prompt` が JSON object の場合は ComfyUI として扱う。
+- ComfyUI の KSampler topology は positive / negative を別々に辿る。CLIPTextEncode の直接 literal と、
+  fixture で契約を固定した `PrimitiveNode.value` / output 0 だけを解決済みプロンプトにする。
+  変換ノード経由の文字列は出所付きの未解決入力として保持し、メタデータパネルでは既定閉じの
+  「未解決の入力」に表示する。任意ノードの `populated_text` 等をキー名だけで解決済みにしない。
+- 検索本文は解決済み positive を優先する。無い場合は同居する A1111 形式 `parameters` の positive
+  だけを代替にし、それも無い場合だけ、8 KiB / 64 行以内でテンプレート構文を含まない未解決 positive
+  を検索へ採用する。`{word}` と `(word:1.2)` は強調表現として残し、`{a|b}` と `__name__` は除外する。
+  Negative は検索へ入れず、topology 外の link は収集しない。
+- ComfyUI と認識したファイルの `parameters` は parse 成否にかかわらず consumed とし、生チャンクや
+  Negative が後段から再混入しないようにする。未消費チャンクも 1 chunk 16 KiB を超えたら索引しない。
 - `parameters` が JSON object の場合は SwarmUI / Fooocus 系などの生成メタデータとして
   先に分岐し、未知の生成 JSON は生 JSON をプロンプト扱いしない。
 - NovelAI は `Description` 分岐より前に判別し、`Comment.uc` などの Negative を
@@ -439,6 +453,10 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 - 検索テキスト構築は静的な AI キー一覧ではなく、判別器が実際に消費したキー
   (`consumed_keys`) を素通し除外に使う。新フォーマット追加時のキー追加漏れで
   Negative が混入する事故を防ぐため。
+- path / bytes / メタデータパネル / Ctrl+F / Ctrl+G は `detect_and_parse_outcome` を共通境界にする。
+  PNG の path scanner は IDAT payload を seek して後置 text chunk も読む。ingest の full read も維持する。
+- ingest は perf log 有効時、文書ごとの `stored_text_bytes` event に STORED 原文の総 byte 数と
+  `png_prompt_bytes` を記録する。巨大テンプレートが索引へ残っていないことを再索引後に確認できる。
 
 ---
 

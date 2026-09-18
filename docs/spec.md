@@ -2140,8 +2140,14 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   が、検出したフォーマットに応じて正プロンプト + サンプラ/モデル等のパラメータだけを
   連結した検索用テキストを生成する
 - JSON 形式の生成メタデータは汎用 JSON より AI メタデータリーダーを優先する
-- ComfyUI では KSampler ノードの `positive` / `negative` 入力先を辿って正側の
-  CLIPTextEncode のテキストのみを採用
+- ComfyUI では KSampler ノードの `positive` / `negative` 入力先を別々に辿る。正側の
+  CLIPTextEncode が直接持つ文字列と、検証済みの素通しノード経由の文字列を解決済みとして採用する
+- 変換ノードへ渡されたワイルドカード等は生成後の文字列と断定せず、出所付きの「未解決の入力」として
+  表示する。同居する A1111 形式 `parameters` があればその positive だけを検索本文の代替に使う。
+  代替が無い短い平文は検索互換のため残すが、テンプレート構文・過大入力・Negative は除外する
+- 既知 KSampler の参照が欠落・不正・循環・未解決でも、無関係な CLIPTextEncode や Negative を
+  positive として救済しない。ComfyUI と認識したファイルの `parameters` は必ず消費済みとし、raw 本文を
+  後段から再混入させない
 - フォーマット検出に成功した場合は、判別器が実際に消費したキー (`consumed_keys`) を
   生 tEXt の素通し追加から除外し、Negative を含む原文が再混入しないようにする
 - フォーマット検出に失敗した場合は Unknown 扱いで非 AI tEXt チャンクの値を含める
