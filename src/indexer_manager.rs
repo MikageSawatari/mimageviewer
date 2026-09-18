@@ -591,6 +591,7 @@ impl IndexerManager {
         query: String,
         favorite_ids: Vec<Uuid>,
         scope: crate::global_search::SearchScope,
+        wake: Option<crate::global_search::SearchWake>,
     ) -> SearchHandle {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx): (Sender<SearchStreamEvent>, Receiver<SearchStreamEvent>) =
@@ -601,7 +602,15 @@ impl IndexerManager {
         std::thread::Builder::new()
             .name("ctrl-g-search".to_string())
             .spawn(move || {
-                crate::global_search::run(&query, &favorite_ids, &scope, &fts, &cancel_cl, &tx);
+                crate::global_search::run(
+                    &query,
+                    &favorite_ids,
+                    &scope,
+                    &fts,
+                    &cancel_cl,
+                    &tx,
+                    wake.as_deref(),
+                );
             })
             .ok();
 
@@ -1086,7 +1095,7 @@ mod tests {
         let cancel_cl = Arc::clone(&cancel);
         std::thread::spawn(move || {
             let scope = crate::global_search::SearchScope::default();
-            crate::global_search::run("dummy", &[fav_id], &scope, &fts_cl, &cancel_cl, &tx);
+            crate::global_search::run("dummy", &[fav_id], &scope, &fts_cl, &cancel_cl, &tx, None);
         });
         // 何らかの SearchStreamEvent が返ることを確認
         let ev = rx.recv_timeout(Duration::from_secs(10)).unwrap();

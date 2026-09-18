@@ -16321,24 +16321,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // 空になった理由が付いていればそれを出す (§1.68)。理由の無い空だけが
                     // 「本当に 0 件」で、読み込みの失敗と同じ文言にはしない。
                     let failure = self.empty_items_reason().map(|reason| reason.message());
+                    let global_search_progress =
+                        global_searching.then(|| self.global_search_progress_message());
                     let msg = if let Some(message) = collection_message.as_deref() {
-                        message
+                        message.to_owned()
                     } else if self.items_are_bookmark_view
                         && self.bookmark_browser_pending.is_some()
                     {
-                        "ブックマークを読み込み中…"
+                        "ブックマークを読み込み中…".to_owned()
                     } else if self.items_are_bookmark_view {
-                        "ブックマークはありません"
-                    } else if global_searching {
-                        "検索中"
+                        "ブックマークはありません".to_owned()
+                    } else if let Some(progress) = global_search_progress {
+                        progress
                     } else if loading {
-                        "読み込み中…"
+                        "読み込み中…".to_owned()
                     } else if let Some(failure) = failure {
-                        failure
+                        failure.to_owned()
                     } else if self.current_folder.is_some() {
-                        "表示するファイルがありません"
+                        "表示するファイルがありません".to_owned()
                     } else {
-                        "フォルダを入力して Enter キーを押してください"
+                        "フォルダを入力して Enter キーを押してください".to_owned()
                     };
                     ui.centered_and_justified(|ui| ui.label(msg));
                     self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
@@ -16403,13 +16405,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.visible_indices.is_empty() {
                     self.pending_grid_scroll = None;
                     ui.centered_and_justified(|ui| {
-                        ui.label(if self.items_are_bookmark_view {
-                            "条件に一致するブックマークはありません"
+                        let message = if self.items_are_bookmark_view {
+                            "条件に一致するブックマークはありません".to_owned()
                         } else if global_searching {
-                            "検索中"
+                            self.global_search_progress_message()
                         } else {
-                            "検索結果なし"
-                        });
+                            "検索結果なし".to_owned()
+                        };
+                        ui.label(message);
                     });
                     self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
                     self.finish_grid_pointer_trace(ctx);

@@ -1606,7 +1606,7 @@ impl App {
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。
-    pub(crate) fn poll_global_search_debounce(&mut self) {
+    pub(crate) fn poll_global_search_debounce(&mut self, ctx: &egui::Context) {
         if !self.global_search.active {
             return;
         }
@@ -1618,14 +1618,19 @@ impl App {
         let Some(t) = self.global_search.last_change_at else {
             return;
         };
-        if t.elapsed() < Duration::from_millis(DEBOUNCE_MS) {
+        let debounce = Duration::from_millis(DEBOUNCE_MS);
+        let elapsed = t.elapsed();
+        if elapsed < debounce {
+            // request_repaint_after はこの pass だけの要求なので、期限に達するまで
+            // poll owner が毎 pass 再武装する。
+            ctx.request_repaint_after(debounce - elapsed);
             return;
         }
-        self.spawn_global_search();
+        self.spawn_global_search(ctx);
     }
 
     /// 現在のクエリで検索を spawn する。
-    pub(crate) fn spawn_global_search(&mut self) {
+    pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
         self.global_search.reset_for_new_query();
         self.global_search.last_executed = self.global_search.query.clone();
         if let Some(db) = self.tags_db.as_ref() {
@@ -1671,7 +1676,13 @@ impl App {
             mode: self.global_search.filters.or_mode.into(),
         };
 
-        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope);
+        let repaint_ctx = ctx.clone();
+        let wake: crate::global_search::SearchWake = Arc::new(move || {
+            // Ctrl+G の owner は main/root grid。worker 完了時に別 viewport の pass が
+            // 進行中でも、current viewport ではなく ROOT を明示して起こす。
+            repaint_ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope, Some(wake));
         self.global_search.pending = Some(handle);
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
@@ -1738,6 +1749,7 @@ impl App {
         let mut events_processed = 0;
         let mut changed = false;
         let mut stats_changed = false;
+        let mut drain_incomplete = false;
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
@@ -1751,7 +1763,9 @@ impl App {
                     // 1 発、warm SQLite で 1-3ms 程度。
                     // perf::event で span を取り、cold sqlite で重くなったら
                     // analyze_perf.py で検知できるようにしておく。
-                    let did_rating_lookup = if let Some(db) = self.rating_db.as_ref() {
+                    let did_rating_lookup = if hits.is_empty() {
+                        false
+                    } else if let Some(db) = self.rating_db.as_ref() {
                         let perf_enabled = crate::perf::is_enabled();
                         let t0 = std::time::Instant::now();
                         let keys: Vec<String> =
@@ -1793,6 +1807,7 @@ impl App {
                     // 1 フレーム 1 件に制限する (Codex P2)。8 batch 同時着 → ~24ms
                     // を回避し、次フレームに残りを回す (request_repaint 済み)。
                     if did_rating_lookup {
+                        drain_incomplete = true;
                         break;
                     }
                 }
@@ -1847,8 +1862,15 @@ impl App {
             }
         }
         if !self.global_search.done {
-            // 次イベントを拾うため再描画を要求
-            ctx.request_repaint();
+            // worker event は callback が ROOT を起こす。即時 repaint は、この frame の
+            // drain 予算で channel に event が残った可能性がある場合だけ要求する。
+            if drain_incomplete || events_processed >= MAX_EVENTS_PER_FRAME {
+                ctx.request_repaint();
+            } else {
+                // callback 取りこぼし時の保険。delayed request は pass ごとに消えるため、
+                // pending 中は poll owner が毎 pass 再武装する。
+                ctx.request_repaint_after(Duration::from_millis(1000));
+            }
         }
     }
 
@@ -2214,10 +2236,15 @@ impl App {
                 } else {
                     self.global_search.all_hits.len()
                 };
+                let n = crate::ui_helpers::format_count(n as u64);
                 if query.is_empty() {
                     self.address = "🌐 アイテム検索".to_string();
                 } else if self.global_search.is_searching() {
-                    self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中)");
+                    let scanned =
+                        crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
+                    self.address = format!(
+                        "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · {scanned} 件を確認)"
+                    );
                 } else {
                     self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件)");
                 }
@@ -2248,9 +2275,13 @@ impl App {
                 let mut segs = vec![root_name];
                 segs.extend(rel);
                 let suffix = if self.global_search.is_searching() {
-                    "  (検索中)"
+                    let hits =
+                        crate::ui_helpers::format_count(self.global_search.total_valid as u64);
+                    let scanned =
+                        crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
+                    format!("  ({hits} 件 / 検索中 · {scanned} 件を確認)")
                 } else {
-                    ""
+                    String::new()
                 };
                 self.address = format!(
                     "🌐 アイテム検索: \"{query}\" > {}{suffix}",
@@ -2258,6 +2289,15 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Ctrl+G の空グリッドに出す進捗文言。
+    pub(crate) fn global_search_progress_message(&self) -> String {
+        format!(
+            "検索中… {} 件を確認 (ヒット {} 件)",
+            crate::ui_helpers::format_count(self.global_search.total_scanned as u64),
+            crate::ui_helpers::format_count(self.global_search.total_valid as u64),
+        )
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
@@ -2479,11 +2519,16 @@ impl App {
                     Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
                 } else if self.global_search.is_searching() {
                     Some((
-                        format!("ヒット {} 件（検索中）", self.global_search.total_valid),
+                        format!(
+                            "ヒット {} 件（検索中）",
+                            crate::ui_helpers::format_count(self.global_search.total_valid as u64)
+                        ),
                         egui::Color32::from_rgb(180, 180, 80),
                         Some(format!(
                             "候補 {} 件を確認済み。アドレス欄の件数はヒットを含むコンテナ数です。",
-                            self.global_search.total_scanned
+                            crate::ui_helpers::format_count(
+                                self.global_search.total_scanned as u64
+                            )
                         )),
                     ))
                 } else if self.global_search.done {
@@ -2567,7 +2612,7 @@ impl App {
             // (ユーザーの操作は明示的なので待つ必要がない)
             if !self.global_search.query.trim().is_empty() {
                 self.global_search.last_executed.clear(); // 強制再実行
-                self.spawn_global_search();
+                self.spawn_global_search(ctx);
             }
         }
         if query_changed {

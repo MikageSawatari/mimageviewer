@@ -721,7 +721,7 @@ impl super::App {
                 }
             }
             TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
-                self.spawn_global_search();
+                self.spawn_global_search(ctx);
             }
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
                 self.execute_favsearch();

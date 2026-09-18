@@ -355,6 +355,10 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 - [ ] **測定**: 追加後に実機で `--perf-log` を取り、`python scripts/analyze_perf.py
       <path> nav hitches` で悪化してないか確認。
 
+`egui::Context::request_repaint_after` の遅延要求は 1 pass だけで、別の即時 repaint が先に入ると
+次の pass 開始時に失われる。deadline / debounce / backstop の owner は期限に達するまで毎 pass
+残り時間を再要求し、入力イベント時の 1 回だけの呼び出しに起床責任を持たせない。
+
 ### 4.1 オーバーレイパネルの ScrollArea
 
 `egui::Area + Frame::popup + ScrollArea` でフルスクリーン左パネルを作る場合は、

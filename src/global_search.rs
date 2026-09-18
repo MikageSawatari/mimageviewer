@@ -22,6 +22,7 @@
 //! 結果を受け取る。UI 側は毎フレーム `try_recv` で取り出して items に append する。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
@@ -34,6 +35,11 @@ use crate::search_query::{self, Token};
 pub const HARD_MAX: usize = 10_000;
 /// ページサイズは Tantivy 側の定数と揃える。
 pub use crate::fts_index::PAGE_SIZE;
+
+/// 検索イベント到着時に UI owner を起こす callback。
+///
+/// 検索層は egui に依存せず、呼び出し側が必要な viewport への wake を投影する。
+pub type SearchWake = Arc<dyn Fn() + Send + Sync>;
 
 /// Ctrl+G ワーカーが UI へ送るイベント。
 #[derive(Debug, Clone)]
@@ -50,6 +56,24 @@ pub enum SearchStreamEvent {
     Done { truncated: bool, reason: DoneReason },
     /// エラー
     Error(String),
+}
+
+/// event を送信し、receiver がまだ生きているときだけ UI を起こす。
+///
+/// cancel 済み検索の receiver drop 後まで wake すると、旧 worker が検索 owner を
+/// 不要に起こすため、send 成功を callback の前提にする。
+fn send_event(
+    tx: &Sender<SearchStreamEvent>,
+    wake: Option<&(dyn Fn() + Send + Sync)>,
+    event: SearchStreamEvent,
+) -> bool {
+    if tx.send(event).is_err() {
+        return false;
+    }
+    if let Some(wake) = wake {
+        wake();
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +138,7 @@ pub struct SearchScope {
 /// - `scope`: タイプ / 検索対象フィルタ (§19)。初期値は `SearchScope::default()` で全開放
 /// - `cancel`: ユーザ操作や新しい入力で true にされたら速やかに中断する
 /// - `tx`: UI へ events を送るチャネル
+/// - `wake`: event 到着時に UI owner を起こす callback。headless caller は `None`
 pub fn run(
     query_text: &str,
     favorite_ids: &[Uuid],
@@ -121,26 +146,35 @@ pub fn run(
     fts: &FtsIndex,
     cancel: &AtomicBool,
     tx: &Sender<SearchStreamEvent>,
+    wake: Option<&(dyn Fn() + Send + Sync)>,
 ) {
     // 1. クエリパース
     let tokens = search_query::parse(query_text);
 
     // 2. 早期 return ポリシー
     if let Err(reason) = validate_query(query_text, &tokens) {
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::RejectedQuery(reason),
-        });
+        let _ = send_event(
+            tx,
+            wake,
+            SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::RejectedQuery(reason),
+            },
+        );
         return;
     }
 
     // 3. 対象 favorite が 0 件なら空結果で即完了 (Codex 6 回目指摘 #3)
     // 旧実装は None を fts_index に渡して "favorite filter なし = 全件検索" となる事故があった。
     if favorite_ids.is_empty() {
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::Complete,
-        });
+        let _ = send_event(
+            tx,
+            wake,
+            SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            },
+        );
         return;
     }
 
@@ -153,10 +187,14 @@ pub fn run(
         .collect();
     if include_tokens.is_empty() {
         // validate_query で NOT-only は弾かれるはず
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::RejectedQuery(RejectReason::NotOnly),
-        });
+        let _ = send_event(
+            tx,
+            wake,
+            SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::RejectedQuery(RejectReason::NotOnly),
+            },
+        );
         return;
     }
 
@@ -169,10 +207,14 @@ pub fn run(
     let Some(query) = fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
     else {
         // bigram が作れない (どこかのトークンが 1 文字等) → early return
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::RejectedQuery(RejectReason::TooShort),
-        });
+        let _ = send_event(
+            tx,
+            wake,
+            SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::RejectedQuery(RejectReason::TooShort),
+            },
+        );
         return;
     };
 
@@ -195,9 +237,11 @@ pub fn run(
         {
             Ok(p) => p,
             Err(e) => {
-                let _ = tx.send(SearchStreamEvent::Error(format!(
-                    "tantivy search_page: {e}"
-                )));
+                let _ = send_event(
+                    tx,
+                    wake,
+                    SearchStreamEvent::Error(format!("tantivy search_page: {e}")),
+                );
                 return;
             }
         };
@@ -247,13 +291,18 @@ pub fn run(
             }
         }
 
-        if !batch.is_empty() || offset % (PAGE_SIZE * 4) == 0 {
-            // 進捗だけでも定期的に投げる (空バッチでも 4 ページ毎に 1 回)
-            let _ = tx.send(SearchStreamEvent::Batch {
+        // 1 ページごとに累計を通知する。除外語の post-filter で全滅する検索でも
+        // PAGE_SIZE 件ずつ進捗が見え、UI 側は 1 frame の drain 上限で負荷を抑える。
+        if !send_event(
+            tx,
+            wake,
+            SearchStreamEvent::Batch {
                 hits: batch,
                 scanned_candidates: scanned,
                 valid_hits: valid,
-            });
+            },
+        ) {
+            return;
         }
 
         if inner_truncated {
@@ -265,10 +314,14 @@ pub fn run(
         offset += PAGE_SIZE;
     };
 
-    let _ = tx.send(SearchStreamEvent::Done {
-        truncated,
-        reason: final_reason,
-    });
+    let _ = send_event(
+        tx,
+        wake,
+        SearchStreamEvent::Done {
+            truncated,
+            reason: final_reason,
+        },
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -365,7 +418,7 @@ mod tests {
     use crate::ingest_text::PerSourceText;
     use crate::search_index_db::normalize_path;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tempfile::TempDir;
 
     fn is_transient_tantivy_permission_error(error: &tantivy::TantivyError) -> bool {
@@ -474,7 +527,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(false);
         let scope = SearchScope::default();
-        run(query, favs, &scope, fts, &cancel, &tx);
+        run(query, favs, &scope, fts, &cancel, &tx, None);
         drop(tx);
         let mut all_hits = Vec::new();
         let mut reason = DoneReason::Complete;
@@ -493,6 +546,109 @@ mod tests {
             }
         }
         (all_hits, reason, truncated)
+    }
+
+    fn ingest_many_for_progress(fts: &FtsIndex, fav: Uuid, count: usize, text: &str) {
+        retry_tantivy_permission_denied(|| {
+            let mut writer = fts.writer()?;
+            for index in 0..count {
+                let path = format!("c:/progress/{index:04}.jpg");
+                let doc = IndexDoc {
+                    path: normalize_path(&PathBuf::from(&path)),
+                    container: Container::Fs,
+                    zip_entry: String::new(),
+                    favorite_id: fav,
+                    kind: IndexKind::Image,
+                    mtime: 0,
+                    file_size: 0,
+                    norms: PerSourceText {
+                        name: crate::search_norm::normalize_for_match(text),
+                        ..PerSourceText::default()
+                    },
+                };
+                upsert_doc(&writer, fts.fields(), &doc)?;
+            }
+            writer.commit()?;
+            fts.reload_reader()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn progress_batch_is_sent_for_every_candidate_page_even_when_excluded() {
+        let (_tmp, _meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        ingest_many_for_progress(&fts, fav, PAGE_SIZE + 1, "sunset genshin");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = AtomicBool::new(false);
+        run(
+            "sunset -genshin",
+            &[fav],
+            &SearchScope::default(),
+            &fts,
+            &cancel,
+            &tx,
+            None,
+        );
+        drop(tx);
+
+        let progress: Vec<(usize, usize, usize)> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                SearchStreamEvent::Batch {
+                    hits,
+                    scanned_candidates,
+                    valid_hits,
+                } => Some((hits.len(), scanned_candidates, valid_hits)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progress,
+            vec![(0, PAGE_SIZE, 0), (0, PAGE_SIZE + 1, 0)],
+            "post-filter で全滅しても各 candidate page の進捗を通知する"
+        );
+    }
+
+    #[test]
+    fn event_wake_runs_only_after_successful_send() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake_count_cl = Arc::clone(&wake_count);
+        let wake: SearchWake = Arc::new(move || {
+            wake_count_cl.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(send_event(
+            &tx,
+            Some(wake.as_ref()),
+            SearchStreamEvent::Batch {
+                hits: Vec::new(),
+                scanned_candidates: PAGE_SIZE,
+                valid_hits: 0,
+            },
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            SearchStreamEvent::Batch { .. }
+        ));
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+
+        drop(rx);
+        assert!(!send_event(
+            &tx,
+            Some(wake.as_ref()),
+            SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Cancelled,
+            },
+        ));
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            1,
+            "receiver drop 後の旧 worker は UI owner を起こさない"
+        );
     }
 
     #[test]
@@ -628,7 +784,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(true);
         let scope = SearchScope::default();
-        run("夕焼け", &[fav], &scope, &fts, &cancel, &tx);
+        run("夕焼け", &[fav], &scope, &fts, &cancel, &tx, None);
         drop(tx);
         let mut reason = None;
         while let Ok(ev) = rx.recv() {

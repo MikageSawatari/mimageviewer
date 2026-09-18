@@ -470,6 +470,7 @@ fn search_hits_arrive_as_batch_event_before_done() {
         "sunset".to_string(),
         vec![fav.id],
         mimageviewer::global_search::SearchScope::default(),
+        None,
     );
     let mut batches_before_done: usize = 0;
     let mut total_hits: usize = 0;
@@ -527,6 +528,7 @@ fn cancel_after_spawn_terminates_with_done_event() {
         "lightning".to_string(),
         vec![fav.id],
         mimageviewer::global_search::SearchScope::default(),
+        None,
     );
     handle
         .cancel

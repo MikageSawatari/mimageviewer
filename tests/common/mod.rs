@@ -367,6 +367,7 @@ pub fn collect_search_hits(
         query.to_string(),
         favorite_ids.to_vec(),
         mimageviewer::global_search::SearchScope::default(),
+        None,
     );
     drain_rx(&handle.rx, &handle.cancel)
 }
@@ -434,6 +435,7 @@ pub fn run_search_expecting_done(
         query.to_string(),
         favorite_ids.to_vec(),
         mimageviewer::global_search::SearchScope::default(),
+        None,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

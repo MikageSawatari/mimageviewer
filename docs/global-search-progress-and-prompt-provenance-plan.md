@@ -1,8 +1,9 @@
 # Ctrl+G 検索の進捗表示と AI プロンプトの出所ルール — 計画
 
-- 状態: **設計確定 / 未実装** (2026-09-18)。
-- 担当: 実装・テストは Codex Sol xhigh、ブリーフ・レビュー・統合は ClaudeCode。
-  Codex のトークン上限がリセットされてから着手する。
+- 状態: **作業 1 は実装・自動検証・独立レビュー済み / 作業 2 は未実装** (2026-09-19)。
+- 担当: 作業 1 の実装・テストは Codex Sol xhigh。2026-09-09 の役割決定後に着手したため、
+  旧記載の ClaudeCode ブリーフ・レビュー・統合は `AGENTS.md` に従い Codex 親の設計主導・統合と
+  実装担当とは別の Codex reviewer による独立レビューへ読み替え、編集前に構造合意を得た。
 - 関連: [search-architecture.md](search-architecture.md) §4.11 / §5.3、
   [search-container-item-redesign.md](search-container-item-redesign.md)、
   [next-release-backlog.md](next-release-backlog.md) §1.252 / §1.253。
@@ -112,6 +113,10 @@ E について: `NgramTokenizer` は position を常に 0 で吐くため、NOT 
 - 分母は「Tantivy の候補数」であり最終ヒット数ではない。表示は「件を確認」で統一し、
   「件中」のような残件表現は使わない。
 
+**作業 1 の採否 (2026-09-19)**: 分母は不採用。利用者の実索引を起動・変更せず、候補数十万件で
+`Count` が 200 ms 以内かを安全に実測できないため。再索引を伴わない既存の累計
+`scanned_candidates` だけを表示し、分母追加は実索引で条件を測れる別の検証枠へ残す。
+
 ### 2.4 デバウンス起床の再武装
 
 - `poll_global_search_debounce(&mut self, ctx: &egui::Context)` にし、変更が pending で期限前なら
@@ -122,6 +127,13 @@ E について: `NgramTokenizer` は position を常に 0 で吐くため、NOT 
   一覧にして報告する (この作業で全部直す必要はない。§1.252 に残す)。
 - CLAUDE.md の「UI / スクロール」節または [ui-responsiveness.md](ui-responsiveness.md) に
   「egui の `request_repaint_after` は 1 パス限り。期限まで毎パス再要求する」を 3 行で追記する。
+
+**同型監査 (2026-09-19)**: `src/` の `request_repaint_after` 215 出現を関数単位で照合した。
+今回直した Ctrl+G debounce のほか、facet 名フィルターの debounce と native video の遅延状態機械は
+pending owner が毎パス残り時間を再要求している。残件は
+`PreferencesState::mark_ui_font_changed` の UI フォントプレビュー 1 件。変更時の 160 ms 要求が
+1 回きりで、`poll_ui_font_tasks` は 150 ms 未満のパスで残り時間を再要求しない。この作業では
+検索外の挙動を変えず、[next-release-backlog.md](next-release-backlog.md) §1.252 に残した。
 
 ### 2.5 検索中の描画間引き
 
@@ -161,6 +173,29 @@ E について: `NgramTokenizer` は position を常に 0 で吐くため、NOT 
 - [spec.md](spec.md) の Ctrl+G 節: 検索中の表示文言。
 - `htdocs/mimageviewer/manual/` の検索ページ: 「検索中は確認済み件数が表示されます」の 1 行。
 - CLAUDE.md または ui-responsiveness.md: 2.4 の規律。
+
+### 2.8 実装記録 (2026-09-19)
+
+- `Batch` は候補ページごとに累計確認件数を送り、空ヒットでは rating DB lookup を行わない。
+  worker の全イベントは channel send 成功後だけ UI wake callback を呼ぶ。callback は UI 層で
+  ROOT viewport を明示し、`IndexerManager` は egui 非依存を保つ。
+- debounce owner は期限まで毎パス再武装する。stream receiver は drain 残りがあり得るときだけ
+  即時 repaint、それ以外の pending 中は 1 秒 backstop を毎パス再武装する。terminal 後は
+  repaint を継続しない。
+- アドレス欄は一覧・集約・ドリルダウンの検索中にヒット数と確認済み件数を表示し、空グリッドにも
+  同じ進捗を表示する。Done 後は確認済み件数を外す。
+- headless snapshot は追加していない。既存 snapshot harness に Ctrl+G streaming fixture がなく、
+  今回の可視差分は App の address 文字列と `egui::FullOutput` の repaint deadline を直接確認する
+  headless 回帰テストで固定した。
+- focused は global search 20 件、address / repaint 8 件、metadata E2E 12 件が成功し、core check も
+  exit 0。`scripts/test-full.ps1 -SuppressCrashDialogs` は本体 8,637 件成功・失敗 0・ignored 45、
+  UI snapshot 52 件、IPC 57 件、Remote 122 件、vendor egui / egui-wgpu / eframe 25 / 9 / 15 件を含め
+  `[test-full] PASS`、exit 0。fmt、UI glyph (0 件)、viewer-context audit、diff check も exit 0。
+  証跡は `target/search-progress-252-logs/` に保存した。
+- 独立 reviewer は worker / receiver / ROOT viewport の所有、drain と backstop、空 Batch、
+  debounce 再武装、一覧・集約・ドリル表示、terminal 後の停止、同型監査を確認し、
+  blocking / should-fix 指摘なし。確認用 build は作業 2 と同じ依頼内でまとめて 1 回行うため、
+  作業 1 の checkpoint では実行していない。アプリと実索引は起動・変更していない。
 
 ## 3. 作業 2: AI プロンプトの出所ルール (INDEX_VERSION 9 → 10)
 

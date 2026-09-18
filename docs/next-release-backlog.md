@@ -44,19 +44,17 @@
   打ち切り読みは計測してから採否)。
 - 規模 / 優先度: Medium / P1 (索引サイズと検索精度の両方に効く)。実装は Codex Sol、リセット待ち。
 
-### 1.252 Ctrl+G の走査件数表示、デバウンス起床の再武装、検索中の描画間引き — 設計確定 (2026-09-18)
+### 1.252 `request_repaint_after` 同型残件: UI フォントプレビューの debounce 起床再武装 — 未実装 (2026-09-19)
 
-- 出典: 同上。正本は
-  [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) §2。
-- 観測 (perf ログ): Enter から 4.4 秒は UI が update の外で寝ていた (デバウンスの `request_repaint_after` が
-  同パスの即時要求に負けて backend へ届かず、次パスで消えた)。その後 5 分 44 秒、候補 2,000 件ごとの
-  空バッチだけが届き、アドレス欄は `(0 件 / 検索中)` のまま。検索中は毎フレーム `request_repaint` で
-  約 5 ms 間隔の描画が続いた。
-- 直す方向: ワーカーが既に送っている `scanned_candidates` をアドレス欄と空グリッドに出す。空バッチは
-  1 ページごと (または 300 ms) に送る。`poll_global_search_debounce` が期限まで毎パス
-  `request_repaint_after` を再要求する。検索中はワーカーが UI を起こす方式に変え、毎フレーム即時要求を
-  やめる。1 回きり `request_repaint_after` の同型を `grep` で列挙して報告する。
-- 規模 / 優先度: Small / P1。再索引なし。実装は Codex Sol、リセット待ち。
+- 出典: Ctrl+G 進捗表示の実装時監査。正本は
+  [global-search-progress-and-prompt-provenance-plan.md](global-search-progress-and-prompt-provenance-plan.md) §2.4。
+- Ctrl+G の走査件数表示、候補ページごとの進捗、debounce 再武装、worker wake、描画間引きは
+  2026-09-19 に実装済み。元の §1.252 を完了項目のまま残さず、監査で見つかった実作業だけを置く。
+- 残件: `PreferencesState::mark_ui_font_changed` は変更時に 160 ms の repaint を 1 回だけ要求する。
+  `poll_ui_font_tasks` が 150 ms 未満で呼ばれたときに残り時間を再要求しないため、そのパスが先に来ると
+  プレビュー生成が次の外部入力まで止まる可能性がある。deadline owner が pending 中は毎パス残り時間を
+  再要求する形へ直し、deadline 前の別パスを挟む回帰テストを追加する。
+- 規模 / 優先度: Small / P2。Ctrl+G 本体や検索 worker は触らない。
 
 ### 1.251 動画の複数音声トラックを選択できるようにする — >>429 (2026-09-17)
 

@@ -549,12 +549,14 @@ UI (global_search_ui::render_global_search_bar)
        b. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
           (target で取り出すフィールドを切り替え)
        c. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
-       d. Batch 送信 (path と hit 情報を streaming)
+       d. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
+          post-filter で全滅した page も空 Batch として進捗を送る
        e. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
        f. 候補使い切りで Complete、cancel で Cancelled
     4. Done 送信
 
   [UI] 毎フレーム:
+    → worker は Batch / Done / Error の送信成功後、egui 非依存 callback で ROOT viewport を起こす
     → poll_global_search が try_recv ループで Batch を受信
     → 検索中は ActivityGate を bump し続け、背景インデクサの walker/ingest を
       次の処理単位で待機させる
@@ -566,8 +568,14 @@ UI (global_search_ui::render_global_search_bar)
       ビューは GlobalSearchState の drill / aggregate / aggregate_auto から
       導出される。ヒット数が閾値を超えると一覧 → 集約へ自動切替する
       (ユーザーが結果を操作した後はロックして勝手に切り替えない)。
-    → pending が残っていれば ctx.request_repaint()
+    → 1 frame の drain 上限到達または rating lookup 後に event が残り得るときだけ即時 repaint。
+      通常の待機中は worker wake を主経路とし、1 秒 backstop を毎 pass 再武装する
 ```
+
+検索中はアドレス欄へヒット件数と累計確認件数を 3 桁区切りで表示し、結果が空の間は
+グリッド中央にも `検索中… 412,000 件を確認 (ヒット 3 件)` の形で表示する。完了後は
+確認件数を外し、従来どおり確定件数だけに戻す。候補総数の分母は実索引での事前 Count が
+200 ms 以内と確認できていないため持たず、索引再構築を伴わない累計値だけを使う。
 
 検索結果はフォルダバー履歴の ←/→ 復帰対象にしない。検索は透明な一時オーバーレイであり、
 検索中の移動は back/forward stack に記録せず、検索中は履歴ボタン自体を無効化する。

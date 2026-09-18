@@ -72523,7 +72523,7 @@ impl App {
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
-        self.poll_global_search_debounce();
+        self.poll_global_search_debounce(ctx);
         self.poll_global_search_events(ctx);
         if self.global_search.is_searching() {
             // Ctrl+G の検索そのものもインタラクティブ操作として扱う。

@@ -9458,7 +9458,7 @@ mod phase_c_key_tests {
         app.global_search.query = "x".to_string();
         // spawn_global_search は indexer_manager が None のときに reject_message を出して早期 return するが、
         // その前に filter の健全化は行う (コードは filter 正規化 → manager 存在確認 → spawn の順)。
-        app.spawn_global_search();
+        app.spawn_global_search(&egui::Context::default());
         assert_eq!(
             app.global_search.filters.favorite, None,
             "無効 filter は None に戻さないと UI ラベルと検索スコープが食い違う"
@@ -16629,7 +16629,39 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
 #[cfg(test)]
 mod phase_c_drill_address_tests {
     use super::phase_c_support::setup_app;
-    use crate::global_search::GlobalHit;
+    use crate::global_search::{DoneReason, GlobalHit, SearchStreamEvent};
+    use crate::indexer_manager::SearchHandle;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn root_repaint_delay(output: &egui::FullOutput) -> std::time::Duration {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("ROOT viewport output")
+            .repaint_delay
+    }
+
+    fn settle_repaint_state(ctx: &egui::Context) {
+        for _ in 0..4 {
+            let output = ctx.run(egui::RawInput::default(), |_| {});
+            if root_repaint_delay(&output) == std::time::Duration::MAX {
+                return;
+            }
+        }
+        panic!("egui repaint state did not settle");
+    }
+
+    fn install_search_receiver(
+        app: &mut crate::app::App,
+    ) -> crossbeam_channel::Sender<SearchStreamEvent> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        tx
+    }
 
     /// Ctrl+G drill-in → PDF を開いた時点で address がブレッドクラム表示
     /// (`🌐 アイテム検索: "query" > container > filename.pdf`) になること。
@@ -16757,6 +16789,152 @@ mod phase_c_drill_address_tests {
             app.address.contains("検索中"),
             "未確定の Ctrl+G 検索は address に検索中を出す: {}",
             app.address
+        );
+    }
+
+    #[test]
+    fn streaming_progress_is_grouped_in_address_and_removed_after_done() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        app.global_search.query = "glasses -genshin".to_string();
+        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.done = false;
+        app.items_are_global_search_view = true;
+        let tx = install_search_receiver(&mut app);
+        let hits = (0..3)
+            .map(|index| GlobalHit {
+                path: format!("c:/search/{index}.jpg"),
+                score: 1.0,
+                stars: 0,
+                mtime: 0,
+                file_size: None,
+            })
+            .collect();
+        tx.send(SearchStreamEvent::Batch {
+            hits,
+            scanned_candidates: 412_000,
+            valid_hits: 3,
+        })
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        settle_repaint_state(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_events(ctx);
+        });
+        assert!(
+            app.address.contains("3 件 / 検索中 · 412,000 件を確認"),
+            "streaming progress must be visible in the address: {}",
+            app.address
+        );
+        assert_eq!(
+            app.global_search_progress_message(),
+            "検索中… 412,000 件を確認 (ヒット 3 件)"
+        );
+
+        app.drill_into_container(std::path::PathBuf::from("c:/search"), false);
+        app.update_global_search_address();
+        assert!(
+            app.address.contains("3 件 / 検索中 · 412,000 件を確認"),
+            "drilled streaming progress must keep the hit count: {}",
+            app.address
+        );
+
+        tx.send(SearchStreamEvent::Done {
+            truncated: false,
+            reason: DoneReason::Complete,
+        })
+        .unwrap();
+        settle_repaint_state(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_events(ctx);
+        });
+        assert!(app.global_search.done);
+        assert!(!app.address.contains("件を確認"), "{}", app.address);
+        assert!(!app.address.contains("検索中"), "{}", app.address);
+        assert_ne!(
+            root_repaint_delay(&output),
+            std::time::Duration::ZERO,
+            "terminal event 後に即時 repaint を継続しない"
+        );
+    }
+
+    #[test]
+    fn debounce_owner_rearms_a_delayed_repaint_each_pass() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        app.global_search.query = "glasses".to_string();
+        app.global_search.last_executed.clear();
+        app.global_search.last_change_at = Some(std::time::Instant::now());
+
+        let ctx = egui::Context::default();
+        settle_repaint_state(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_debounce(ctx);
+        });
+        let delay = root_repaint_delay(&output);
+        assert!(delay > std::time::Duration::ZERO, "delay={delay:?}");
+        assert!(
+            delay <= std::time::Duration::from_millis(300),
+            "delay={delay:?}"
+        );
+    }
+
+    #[test]
+    fn pending_search_without_events_uses_delayed_backstop() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        app.global_search.query = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.done = false;
+        let _tx = install_search_receiver(&mut app);
+
+        let ctx = egui::Context::default();
+        settle_repaint_state(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_events(ctx);
+        });
+        let delay = root_repaint_delay(&output);
+        assert!(
+            delay > std::time::Duration::ZERO,
+            "event が無い pending frame は即時 repaint しない: {delay:?}"
+        );
+        assert!(
+            delay <= std::time::Duration::from_secs(1),
+            "backstop は最大1秒: {delay:?}"
+        );
+    }
+
+    #[test]
+    fn search_event_backlog_requests_immediate_drain_continuation() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        app.global_search.query = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.done = false;
+        let tx = install_search_receiver(&mut app);
+        for page in 1..=8 {
+            tx.send(SearchStreamEvent::Batch {
+                hits: Vec::new(),
+                scanned_candidates: page * crate::global_search::PAGE_SIZE,
+                valid_hits: 0,
+            })
+            .unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        settle_repaint_state(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_events(ctx);
+        });
+        assert_eq!(
+            root_repaint_delay(&output),
+            std::time::Duration::ZERO,
+            "frame drain 上限到達時だけ即時継続する"
+        );
+        assert_eq!(
+            app.global_search.total_scanned,
+            8 * crate::global_search::PAGE_SIZE
         );
     }
 }
