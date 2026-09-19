@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: 未着手。実装は Codex（制限回復後）、レビューは ClaudeCode。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1 計装実装・focused 検証・Codex独立レビュー完了、§23.2 以降は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1111,6 +1111,23 @@ focused / full / static / verification build保留証跡は
 
 `open_collection_grid` / prepare / navigation / import 解析・分類 / export / source migration の各区間に
 `perf::event` を差し、修正前後を `--perf-log` の同じ指標で測れるようにする。
+
+#### §23.1 実装記録（2026-09-19）
+
+`cat="collection"` を追加した。`open` は選択と context、`actor_rtt` は manager / Grid /
+Remote の catalog または snapshot 応答（enqueue から受信まで）、`prepare` は Grid の
+`classify` / `sidecar_scan` / `pin_db` / `identity` 各段階、`install` は UI 適用を計る。
+`navigation_begin` / `navigation_decision` / `navigation_root_install` / `navigation_prepare` /
+`preflight` は既存 intent sequence と collection ID / revision で関連を追う。再試行は同じ
+intent sequence に複数の開始があり、完了が無い開始を成功や滞留と断定しない。
+`navigation_decision` は対象を選んだ段階、`navigation_root_install` は root の採用段階を表す。
+`import_parse` / `import_classify` / `export_prepare` /
+`export` / `migrate` はそれぞれ件数、所要 ms、結果を記録する。`remote_prepare` は Remote
+の同じ分類区間を記録する。結果には `ok`、`cancelled`、`stale`、`error`、`disconnected`、
+`timeout` 等の区別を入れ、個々の source path は記録しない。Remote の `actor_rtt.reply_ok` は
+受信成功で、revision 採用は `remote_exact` に分ける。計測専用の開始時刻以外に
+request ownership、worker の配置、deadline、取消、表示順は変更しない。`--perf-log` 無効時は
+時計取得と JSON 構築を避ける。
 
 ### 23.2 ソート UI（A-1 / A-2、案 C。仕様判断 1）
 

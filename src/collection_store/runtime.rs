@@ -986,14 +986,19 @@ fn process_command(
             let _ = reply.send(result);
         }
         Command::MigrateSources { migration, reply } => {
+            let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
             let result = db.migrate_sources(migration);
+            collection_migration_perf_event(perf_start, 1, &result);
             mutated = result
                 .as_ref()
                 .is_ok_and(|outcome| outcome.updated_entries != 0);
             let _ = reply.send(result);
         }
         Command::MigrateSourceBatch { batch, reply } => {
+            let mappings = batch.migrations.len();
+            let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
             let result = db.migrate_source_batch(batch);
+            collection_migration_perf_event(perf_start, mappings, &result);
             mutated = result
                 .as_ref()
                 .is_ok_and(|outcome| outcome.updated_entries != 0);
@@ -1021,6 +1026,34 @@ fn process_command(
             CollectionRevisionNotice::from_catalog(&catalog),
         );
     }
+}
+
+fn collection_migration_perf_event(
+    start: Option<std::time::Instant>,
+    mappings: usize,
+    result: &Result<CollectionMigrationOutcome, CollectionStoreError>,
+) {
+    let Some(start) = start else { return };
+    let (entries, affected, outcome) = match result {
+        Ok(value) => (value.updated_entries, value.affected.len(), "ok"),
+        Err(_) => (0, 0, "error"),
+    };
+    crate::perf::event(
+        "collection",
+        "migrate",
+        None,
+        0,
+        &[
+            ("mappings", serde_json::Value::from(mappings)),
+            ("entries", serde_json::Value::from(entries)),
+            ("affected", serde_json::Value::from(affected)),
+            (
+                "ms",
+                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("outcome", serde_json::Value::from(outcome)),
+        ],
+    );
 }
 
 fn publish_revision(hub: &Arc<Mutex<RevisionHub>>, notice: CollectionRevisionNotice) {

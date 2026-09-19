@@ -678,18 +678,58 @@ fn exact_catalog(
             return Err(busy_error());
         }
         let watch = lease.client().subscribe().map_err(map_store_error)?;
+        let perf_start = crate::perf::is_enabled().then(Instant::now);
         let reply = lease.client().list_catalog().map_err(map_store_error)?;
-        let catalog = wait_actor_reply(reply, lease, cancellation, deadline)??;
+        let actor_result = wait_actor_reply(reply, lease, cancellation, deadline);
+        if let Some(start) = perf_start {
+            let entries = actor_result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |catalog| catalog.definitions.len());
+            remote_actor_rtt_event(
+                "list_catalog",
+                None,
+                entries,
+                start,
+                &actor_result,
+                lease,
+                cancellation,
+                deadline,
+            );
+        }
+        let catalog = actor_result??;
         let latest = watch.take_latest();
         if latest
             .as_ref()
             .is_some_and(|notice| notice.catalog_revision > catalog.catalog_revision)
         {
+            remote_exact_perf_event(
+                "catalog",
+                None,
+                catalog.definitions.len(),
+                catalog.catalog_revision,
+                "stale",
+            );
             continue;
         }
         if !request_is_current(lease, cancellation, deadline) {
+            remote_exact_perf_event(
+                "catalog",
+                None,
+                catalog.definitions.len(),
+                catalog.catalog_revision,
+                "cancelled",
+            );
             return Err(request_interrupted_error(cancellation, deadline));
         }
+        remote_exact_perf_event(
+            "catalog",
+            None,
+            catalog.definitions.len(),
+            catalog.catalog_revision,
+            "accepted",
+        );
         return Ok(ExactCatalog { catalog, watch });
     }
     Err(busy_error())
@@ -707,12 +747,32 @@ fn exact_prepared(
             return Err(busy_error());
         }
         let watch = lease.client().subscribe().map_err(map_store_error)?;
+        let perf_start = crate::perf::is_enabled().then(Instant::now);
         let reply = lease
             .client()
             .load_collection(collection_id)
             .map_err(map_store_error)?;
-        let loaded = wait_actor_reply(reply, lease, cancellation, deadline)??;
+        let actor_result = wait_actor_reply(reply, lease, cancellation, deadline);
+        if let Some(start) = perf_start {
+            let entries = actor_result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |snapshot| snapshot.entries.len());
+            remote_actor_rtt_event(
+                "load_collection",
+                Some(collection_id),
+                entries,
+                start,
+                &actor_result,
+                lease,
+                cancellation,
+                deadline,
+            );
+        }
+        let loaded = actor_result??;
         let mut observed = watch.take_latest();
+        let prepare_start = crate::perf::is_enabled().then(Instant::now);
         let prepared = prepare_collection_snapshot_while(
             &loaded,
             &settings.grid_display_order,
@@ -723,8 +783,38 @@ fn exact_prepared(
                 !cancellation.is_cancelled() && lease.is_current() && Instant::now() < deadline
             },
             |_, _| {},
-        )
-        .map_err(|value| match value {
+        );
+        if let Some(start) = prepare_start {
+            crate::perf::event(
+                "collection",
+                "remote_prepare",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(collection_id.as_uuid().to_string()),
+                    ),
+                    ("revision", serde_json::Value::from(loaded.revision())),
+                    ("entries", serde_json::Value::from(loaded.entries.len())),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "outcome",
+                        serde_json::Value::from(match &prepared {
+                            Ok(_) => "ok",
+                            Err(crate::collection_store::CollectionPrepareError::Cancelled) => {
+                                "cancelled"
+                            }
+                            Err(_) => "error",
+                        }),
+                    ),
+                ],
+            );
+        }
+        let prepared = prepared.map_err(|value| match value {
             crate::collection_store::CollectionPrepareError::Cancelled => cancelled_error(),
             _ => error(
                 PersistentCollectionErrorCode::PrepareFailed,
@@ -735,11 +825,32 @@ fn exact_prepared(
             observed = Some(notice);
         }
         if notice_invalidates(&loaded, observed.as_ref()) {
+            remote_exact_perf_event(
+                "snapshot",
+                Some(collection_id),
+                loaded.entries.len(),
+                loaded.revision(),
+                "stale",
+            );
             continue;
         }
         if !request_is_current(lease, cancellation, deadline) {
+            remote_exact_perf_event(
+                "snapshot",
+                Some(collection_id),
+                loaded.entries.len(),
+                loaded.revision(),
+                "cancelled",
+            );
             return Err(request_interrupted_error(cancellation, deadline));
         }
+        remote_exact_perf_event(
+            "snapshot",
+            Some(collection_id),
+            loaded.entries.len(),
+            loaded.revision(),
+            "accepted",
+        );
         return Ok(ExactPrepared {
             loaded,
             prepared,
@@ -747,6 +858,77 @@ fn exact_prepared(
         });
     }
     Err(busy_error())
+}
+
+fn remote_actor_rtt_event<T>(
+    operation: &'static str,
+    collection_id: Option<CollectionId>,
+    entries: usize,
+    start: Instant,
+    result: &Result<Result<T, PersistentCollectionError>, PersistentCollectionError>,
+    lease: &CollectionRemoteRequestLease,
+    cancellation: &RemoteOperationCancellation,
+    deadline: Instant,
+) {
+    let outcome = if matches!(result, Ok(Ok(_))) {
+        "reply_ok"
+    } else if matches!(result, Ok(Err(_))) {
+        "store_error"
+    } else if cancellation.is_cancelled() || !lease.is_current() {
+        "cancelled"
+    } else if Instant::now() >= deadline {
+        "timeout"
+    } else {
+        "error"
+    };
+    crate::perf::event(
+        "collection",
+        "actor_rtt",
+        None,
+        0,
+        &[
+            ("source", serde_json::Value::from("remote")),
+            ("operation", serde_json::Value::from(operation)),
+            (
+                "collection_id",
+                serde_json::Value::from(collection_id.map(|id| id.as_uuid().to_string())),
+            ),
+            ("entries", serde_json::Value::from(entries)),
+            (
+                "ms",
+                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("outcome", serde_json::Value::from(outcome)),
+        ],
+    );
+}
+
+fn remote_exact_perf_event(
+    operation: &'static str,
+    collection_id: Option<CollectionId>,
+    entries: usize,
+    revision: u64,
+    outcome: &'static str,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "collection",
+        "remote_exact",
+        None,
+        0,
+        &[
+            ("operation", serde_json::Value::from(operation)),
+            (
+                "collection_id",
+                serde_json::Value::from(collection_id.map(|id| id.as_uuid().to_string())),
+            ),
+            ("entries", serde_json::Value::from(entries)),
+            ("revision", serde_json::Value::from(revision)),
+            ("outcome", serde_json::Value::from(outcome)),
+        ],
+    );
 }
 
 fn wait_actor_reply<T>(

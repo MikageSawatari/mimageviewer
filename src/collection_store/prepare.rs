@@ -290,6 +290,7 @@ pub(crate) fn prepare_collection_registrations(
     cancel: &AtomicBool,
     mut progress: impl FnMut(usize, usize),
 ) -> Vec<CollectionPreparedRegistration> {
+    let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
     let total = paths.len();
     let mut prepared = Vec::with_capacity(total);
     for (index, path) in paths.iter().enumerate() {
@@ -321,6 +322,30 @@ pub(crate) fn prepare_collection_registrations(
         });
         progress(index + 1, total);
     }
+    if let Some(start) = perf_start {
+        crate::perf::event(
+            "collection",
+            "classify",
+            None,
+            0,
+            &[
+                (
+                    "ms",
+                    serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("candidates", serde_json::Value::from(total)),
+                ("completed", serde_json::Value::from(prepared.len())),
+                (
+                    "outcome",
+                    serde_json::Value::from(if cancel.load(Ordering::Acquire) {
+                        "cancelled"
+                    } else {
+                        "ok"
+                    }),
+                ),
+            ],
+        );
+    }
     prepared
 }
 
@@ -331,25 +356,57 @@ pub(crate) fn prepare_collection_export(
     cancel: &AtomicBool,
     progress: impl FnMut(usize, usize),
 ) -> Result<CollectionExportPreparation, CollectionPrepareError> {
-    let prepared = prepare_collection_snapshot(snapshot, display_order, cancel, progress)?;
-    Ok(CollectionExportPreparation {
-        collection_id: prepared.collection_id,
-        collection_revision: prepared.collection_revision,
-        ordered_paths: Arc::from(
-            prepared
-                .entries
-                .iter()
-                .map(|entry| entry.source_path.clone())
-                .collect::<Vec<_>>(),
-        ),
-        source_states: Arc::from(
-            prepared
-                .entries
-                .iter()
-                .map(|entry| (entry.entry_id, entry.availability.clone()))
-                .collect::<Vec<_>>(),
-        ),
-    })
+    let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
+    let result = (|| {
+        let prepared = prepare_collection_snapshot(snapshot, display_order, cancel, progress)?;
+        Ok(CollectionExportPreparation {
+            collection_id: prepared.collection_id,
+            collection_revision: prepared.collection_revision,
+            ordered_paths: Arc::from(
+                prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.source_path.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            source_states: Arc::from(
+                prepared
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.entry_id, entry.availability.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    })();
+    if let Some(start) = perf_start {
+        crate::perf::event(
+            "collection",
+            "export_prepare",
+            None,
+            0,
+            &[
+                (
+                    "collection_id",
+                    serde_json::Value::from(snapshot.collection_id().as_uuid().to_string()),
+                ),
+                ("revision", serde_json::Value::from(snapshot.revision())),
+                ("entries", serde_json::Value::from(snapshot.entries.len())),
+                (
+                    "ms",
+                    serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "outcome",
+                    serde_json::Value::from(match &result {
+                        Ok(_) => "ok",
+                        Err(CollectionPrepareError::Cancelled) => "cancelled",
+                        Err(_) => "error",
+                    }),
+                ),
+            ],
+        );
+    }
+    result
 }
 
 /// Inspect and order one actor snapshot without consulting UI state. This is the single

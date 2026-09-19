@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use eframe::egui;
@@ -76,13 +77,79 @@ impl CollectionToolbarStatus {
 
 struct CatalogRequest {
     minimum_revision: u64,
+    queued_at: Option<Instant>,
     receiver: Receiver<Result<CollectionCatalogSnapshot, CollectionStoreError>>,
 }
 
 struct SnapshotRequest {
     collection_id: CollectionId,
     minimum_revision: u64,
+    queued_at: Option<Instant>,
     receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+}
+
+impl Drop for CatalogRequest {
+    fn drop(&mut self) {
+        if let Some(start) = self.queued_at {
+            collection_ui_actor_rtt(
+                "list_catalog",
+                None,
+                self.minimum_revision,
+                0,
+                "cancelled",
+                start,
+            );
+        }
+    }
+}
+
+impl Drop for SnapshotRequest {
+    fn drop(&mut self) {
+        if let Some(start) = self.queued_at {
+            collection_ui_actor_rtt(
+                "load_collection",
+                Some(self.collection_id),
+                self.minimum_revision,
+                0,
+                "cancelled",
+                start,
+            );
+        }
+    }
+}
+
+fn collection_ui_actor_rtt(
+    operation: &'static str,
+    collection_id: Option<CollectionId>,
+    minimum_revision: u64,
+    entries: usize,
+    outcome: &'static str,
+    start: Instant,
+) {
+    crate::perf::event(
+        "collection",
+        "actor_rtt",
+        None,
+        0,
+        &[
+            ("source", serde_json::Value::from("manager")),
+            ("operation", serde_json::Value::from(operation)),
+            (
+                "collection_id",
+                serde_json::Value::from(collection_id.map(|id| id.as_uuid().to_string())),
+            ),
+            (
+                "minimum_revision",
+                serde_json::Value::from(minimum_revision),
+            ),
+            ("entries", serde_json::Value::from(entries)),
+            (
+                "ms",
+                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("outcome", serde_json::Value::from(outcome)),
+        ],
+    );
 }
 
 struct WorkerTask<T> {
@@ -582,10 +649,12 @@ impl CollectionUiState {
         let Some(client) = &self.client else {
             return;
         };
+        let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.list_catalog() {
             Ok(receiver) => {
                 self.catalog_request = Some(CatalogRequest {
                     minimum_revision: self.wanted_catalog_revision,
+                    queued_at,
                     receiver,
                 });
             }
@@ -622,11 +691,13 @@ impl CollectionUiState {
         let Some(client) = &self.client else {
             return;
         };
+        let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.load_collection(collection_id) {
             Ok(receiver) => {
                 self.snapshot_request = Some(SnapshotRequest {
                     collection_id,
                     minimum_revision: self.wanted_collection_revision,
+                    queued_at,
                     receiver,
                 });
             }
@@ -1723,9 +1794,36 @@ impl App {
             }
         }
 
-        if let Some(request) = self.collection_ui.catalog_request.take() {
+        if let Some(mut request) = self.collection_ui.catalog_request.take() {
             let minimum_revision = request.minimum_revision;
-            match request.receiver.try_recv() {
+            let reply = request.receiver.try_recv();
+            if !matches!(&reply, Err(crossbeam_channel::TryRecvError::Empty))
+                && let Some(start) = request.queued_at.take()
+            {
+                let (entries, outcome) = match &reply {
+                    Ok(Ok(catalog))
+                        if catalog.catalog_revision
+                            < self
+                                .collection_ui
+                                .wanted_catalog_revision
+                                .max(minimum_revision) =>
+                    {
+                        (catalog.definitions.len(), "stale")
+                    }
+                    Ok(Ok(catalog)) => (catalog.definitions.len(), "ok"),
+                    Ok(Err(_)) => (0, "error"),
+                    Err(_) => (0, "disconnected"),
+                };
+                collection_ui_actor_rtt(
+                    "list_catalog",
+                    None,
+                    minimum_revision,
+                    entries,
+                    outcome,
+                    start,
+                );
+            }
+            match reply {
                 Ok(Ok(catalog)) => {
                     self.collection_ui.install_catalog(catalog);
                     self.prune_collection_folder_history_from_ready_catalog();
@@ -1757,10 +1855,39 @@ impl App {
             }
         }
 
-        if let Some(request) = self.collection_ui.snapshot_request.take() {
+        if let Some(mut request) = self.collection_ui.snapshot_request.take() {
             let collection_id = request.collection_id;
             let minimum_revision = request.minimum_revision;
-            match request.receiver.try_recv() {
+            let reply = request.receiver.try_recv();
+            if !matches!(&reply, Err(crossbeam_channel::TryRecvError::Empty))
+                && let Some(start) = request.queued_at.take()
+            {
+                let (entries, outcome) = match &reply {
+                    Ok(Ok(snapshot))
+                        if self.collection_ui.selected_id != Some(collection_id)
+                            || snapshot.collection_id() != collection_id
+                            || snapshot.revision()
+                                < self
+                                    .collection_ui
+                                    .wanted_collection_revision
+                                    .max(minimum_revision) =>
+                    {
+                        (snapshot.entries.len(), "stale")
+                    }
+                    Ok(Ok(snapshot)) => (snapshot.entries.len(), "ok"),
+                    Ok(Err(_)) => (0, "error"),
+                    Err(_) => (0, "disconnected"),
+                };
+                collection_ui_actor_rtt(
+                    "load_collection",
+                    Some(collection_id),
+                    minimum_revision,
+                    entries,
+                    outcome,
+                    start,
+                );
+            }
+            match reply {
                 Ok(Ok(snapshot)) => self.collection_ui.install_snapshot(snapshot),
                 Ok(Err(CollectionStoreError::NotFound)) => {
                     self.collection_ui
@@ -2495,14 +2622,50 @@ impl App {
         let collection_revision = snapshot.revision();
         let worker_destination = destination.clone();
         let task = WorkerTask::spawn("collection-export", move |cancel| {
-            let prepared =
-                prepare_collection_export(&snapshot, &display_order, &cancel, |done, total| {
-                    worker_progress.0.store(done, Ordering::Release);
-                    worker_progress.1.store(total, Ordering::Release);
-                })?;
-            let contents =
-                serialize_collection_paths(prepared.ordered_paths.iter().map(PathBuf::as_path));
-            write_collection_export_atomic(&worker_destination, contents.as_bytes(), &cancel)
+            let perf_start = crate::perf::is_enabled().then(Instant::now);
+            let result = (|| {
+                let prepared = prepare_collection_export(
+                    &snapshot,
+                    &display_order,
+                    &cancel,
+                    |done, total| {
+                        worker_progress.0.store(done, Ordering::Release);
+                        worker_progress.1.store(total, Ordering::Release);
+                    },
+                )?;
+                let contents =
+                    serialize_collection_paths(prepared.ordered_paths.iter().map(PathBuf::as_path));
+                write_collection_export_atomic(&worker_destination, contents.as_bytes(), &cancel)
+            })();
+            if let Some(start) = perf_start {
+                crate::perf::event(
+                    "collection",
+                    "export",
+                    None,
+                    0,
+                    &[
+                        (
+                            "collection_id",
+                            serde_json::Value::from(collection_id.as_uuid().to_string()),
+                        ),
+                        ("revision", serde_json::Value::from(collection_revision)),
+                        ("entries", serde_json::Value::from(snapshot.entries.len())),
+                        (
+                            "ms",
+                            serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        (
+                            "outcome",
+                            serde_json::Value::from(match &result {
+                                Ok(_) => "ok",
+                                Err(CollectionPrepareError::Cancelled) => "cancelled",
+                                Err(_) => "error",
+                            }),
+                        ),
+                    ],
+                );
+            }
+            result
         });
         match task {
             Ok(task) => CollectionDialogOperation::ExportWriting {
@@ -2880,10 +3043,50 @@ impl App {
         origin: CollectionAddOrigin,
     ) -> CollectionDialogOperation {
         let worker_path = source_path.clone();
-        match WorkerTask::spawn("collection-import-read", move |_| {
-            std::fs::read_to_string(&worker_path)
+        match WorkerTask::spawn("collection-import-read", move |cancel| {
+            let perf_start = crate::perf::is_enabled().then(Instant::now);
+            let read = std::fs::read_to_string(&worker_path);
+            let bytes = read.as_ref().map_or(0, String::len);
+            let result = read
                 .map(|text| parse_collection_text(&text, &worker_path))
-                .map_err(|error| format!("インポートファイルを読めませんでした: {error}"))
+                .map_err(|error| format!("インポートファイルを読めませんでした: {error}"));
+            if let Some(start) = perf_start {
+                crate::perf::event(
+                    "collection",
+                    "import_parse",
+                    None,
+                    0,
+                    &[
+                        (
+                            "collection_id",
+                            serde_json::Value::from(collection_id.as_uuid().to_string()),
+                        ),
+                        ("revision", serde_json::Value::from(expected_revision)),
+                        ("bytes", serde_json::Value::from(bytes)),
+                        (
+                            "lines",
+                            serde_json::Value::from(
+                                result.as_ref().map_or(0, |preview| preview.lines.len()),
+                            ),
+                        ),
+                        (
+                            "ms",
+                            serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        (
+                            "outcome",
+                            serde_json::Value::from(if cancel.load(Ordering::Acquire) {
+                                "cancelled"
+                            } else if result.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            }),
+                        ),
+                    ],
+                );
+            }
+            result
         }) {
             Ok(task) => CollectionDialogOperation::ReadingImport {
                 collection_id,
@@ -2914,11 +3117,53 @@ impl App {
     ) -> CollectionDialogOperation {
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(paths.len())));
         let worker_progress = Arc::clone(&progress);
+        let (collection_id, revision) = match &target {
+            ClassificationTarget::Add {
+                collection_id,
+                expected_revision,
+                ..
+            }
+            | ClassificationTarget::Relink {
+                collection_id,
+                expected_revision,
+                ..
+            } => (*collection_id, *expected_revision),
+        };
         match WorkerTask::spawn("collection-source-prepare", move |cancel| {
+            let perf_start = crate::perf::is_enabled().then(Instant::now);
             let prepared = prepare_collection_registrations(&paths, &cancel, |done, total| {
                 worker_progress.0.store(done, Ordering::Release);
                 worker_progress.1.store(total, Ordering::Release);
             });
+            if let Some(start) = perf_start {
+                crate::perf::event(
+                    "collection",
+                    "import_classify",
+                    None,
+                    0,
+                    &[
+                        (
+                            "collection_id",
+                            serde_json::Value::from(collection_id.as_uuid().to_string()),
+                        ),
+                        ("revision", serde_json::Value::from(revision)),
+                        ("candidates", serde_json::Value::from(paths.len())),
+                        ("completed", serde_json::Value::from(prepared.len())),
+                        (
+                            "ms",
+                            serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        (
+                            "outcome",
+                            serde_json::Value::from(if cancel.load(Ordering::Acquire) {
+                                "cancelled"
+                            } else {
+                                "ok"
+                            }),
+                        ),
+                    ],
+                );
+            }
             ClassificationResult {
                 prepared,
                 cancelled: cancel.load(Ordering::Acquire),

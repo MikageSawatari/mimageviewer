@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
@@ -133,7 +134,18 @@ pub(in crate::app) fn prepare_collection_grid_install(
     settings: &crate::settings::Settings,
     cancel: &AtomicBool,
 ) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
-    let prepared = prepare_collection_snapshot(snapshot, display_order, cancel, |_, _| {})?;
+    let perf_start = crate::perf::is_enabled().then(Instant::now);
+    let classify_start = crate::perf::is_enabled().then(Instant::now);
+    let classified = prepare_collection_snapshot(snapshot, display_order, cancel, |_, _| {});
+    collection_prepare_stage_event(
+        snapshot,
+        "classify",
+        classify_start,
+        snapshot.entries.len(),
+        0,
+        &classified,
+    );
+    let prepared = classified?;
     let videos = prepared
         .entries
         .iter()
@@ -142,11 +154,22 @@ pub(in crate::app) fn prepare_collection_grid_install(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let Some(sidecars) =
+    let sidecar_start = crate::perf::is_enabled().then(Instant::now);
+    let sidecars =
         super::folder_scan::discover_aggregate_video_sidecars_while(settings, &videos, 64, || {
             !cancel.load(Ordering::Acquire)
-        })
-    else {
+        });
+    if let Some(start) = sidecar_start {
+        collection_prepare_stage_event(
+            snapshot,
+            "sidecar_scan",
+            Some(start),
+            videos.len(),
+            sidecars.as_ref().map_or(0, |value| value.scanned_parents),
+            &sidecars.as_ref().ok_or(CollectionPrepareError::Cancelled),
+        );
+    }
+    let Some(sidecars) = sidecars else {
         return Err(CollectionPrepareError::Cancelled);
     };
     if sidecars.skipped_parents > 0 {
@@ -164,25 +187,124 @@ pub(in crate::app) fn prepare_collection_grid_install(
     if cancel.load(Ordering::Acquire) {
         return Err(CollectionPrepareError::Cancelled);
     }
-    let video_pin_blobs =
-        crate::video_pins::VideoPinDb::open_readonly(&crate::video_pins::VideoPinDb::db_path())
-            .ok()
-            .map(|db| db.lookup_webps_many(videos.iter()))
-            .unwrap_or_default();
+    let pin_start = crate::perf::is_enabled().then(Instant::now);
+    let pin_db =
+        crate::video_pins::VideoPinDb::open_readonly(&crate::video_pins::VideoPinDb::db_path());
+    let pin_db_available = pin_db.is_ok();
+    let video_pin_blobs = pin_db
+        .ok()
+        .map(|db| db.lookup_webps_many(videos.iter()))
+        .unwrap_or_default();
+    if let Some(start) = pin_start {
+        crate::perf::event(
+            "collection",
+            "prepare",
+            None,
+            0,
+            &[
+                (
+                    "collection_id",
+                    serde_json::Value::from(snapshot.collection_id().as_uuid().to_string()),
+                ),
+                ("revision", serde_json::Value::from(snapshot.revision())),
+                ("stage", serde_json::Value::from("pin_db")),
+                ("entries", serde_json::Value::from(videos.len())),
+                (
+                    "ms",
+                    serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "outcome",
+                    serde_json::Value::from(if pin_db_available { "ok" } else { "fallback" }),
+                ),
+            ],
+        );
+    }
     if cancel.load(Ordering::Acquire) {
         return Err(CollectionPrepareError::Cancelled);
     }
+    let identity_start = crate::perf::is_enabled().then(Instant::now);
     let thumbnail_sources = prepare_collection_grid_thumbnail_sources(
         CollectionGridThumbnailSources {
             video_sidecars: sidecars.by_video_path,
             video_pin_blobs,
         },
         cancel,
-    )?;
+    );
+    collection_prepare_stage_event(
+        snapshot,
+        "identity",
+        identity_start,
+        videos.len(),
+        0,
+        &thumbnail_sources,
+    );
+    let thumbnail_sources = thumbnail_sources?;
+    if let Some(start) = perf_start {
+        crate::perf::event(
+            "collection",
+            "prepare",
+            None,
+            0,
+            &[
+                (
+                    "collection_id",
+                    serde_json::Value::from(snapshot.collection_id().as_uuid().to_string()),
+                ),
+                ("revision", serde_json::Value::from(snapshot.revision())),
+                ("entries", serde_json::Value::from(snapshot.entries.len())),
+                ("videos", serde_json::Value::from(videos.len())),
+                (
+                    "ms",
+                    serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("outcome", serde_json::Value::from("ok")),
+            ],
+        );
+    }
     Ok(CollectionGridPreparedInstall {
         prepared,
         thumbnail_sources,
     })
+}
+
+fn collection_prepare_stage_event<T>(
+    snapshot: &crate::collection_store::CollectionSnapshot,
+    stage: &'static str,
+    start: Option<Instant>,
+    entries: usize,
+    parents: usize,
+    result: &Result<T, CollectionPrepareError>,
+) {
+    let Some(start) = start else { return };
+    crate::perf::event(
+        "collection",
+        "prepare",
+        None,
+        0,
+        &[
+            (
+                "collection_id",
+                serde_json::Value::from(snapshot.collection_id().as_uuid().to_string()),
+            ),
+            ("revision", serde_json::Value::from(snapshot.revision())),
+            ("stage", serde_json::Value::from(stage)),
+            ("entries", serde_json::Value::from(entries)),
+            ("parents", serde_json::Value::from(parents)),
+            (
+                "ms",
+                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+            ),
+            (
+                "outcome",
+                serde_json::Value::from(match result {
+                    Ok(_) => "ok",
+                    Err(CollectionPrepareError::Cancelled) => "cancelled",
+                    Err(_) => "error",
+                }),
+            ),
+        ],
+    );
 }
 
 impl App {
@@ -861,6 +983,8 @@ impl App {
         collection_id: CollectionId,
         restore: Option<CollectionGridRestore>,
     ) {
+        let perf_start = crate::perf::is_enabled().then(Instant::now);
+        let restoring = restore.is_some();
         let return_to = if restore.is_some() {
             None
         } else if matches!(
@@ -888,6 +1012,29 @@ impl App {
         self.install_collection_grid_items(Vec::new(), Vec::new(), None);
         self.address = "コレクションを読み込み中…".into();
         self.schedule_collection_grid_snapshot();
+        if let Some(start) = perf_start {
+            crate::perf::event(
+                "collection",
+                "open",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "context",
+                        serde_json::Value::from(format!("{:?}", self.collection_grid_context_id())),
+                    ),
+                    ("restore", serde_json::Value::from(restoring)),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
     }
 
     /// Explicit user navigation into a collection participates in the same Back/Forward history
@@ -928,12 +1075,14 @@ impl App {
             }
             return;
         };
+        let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.load_collection(stamp.collection_id) {
             Ok(receiver) => {
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                     session.load = CollectionGridLoadState::Snapshot {
                         stamp,
                         minimum_revision,
+                        queued_at,
                         installed,
                         receiver,
                     };
@@ -1143,70 +1292,122 @@ impl App {
             Some(CollectionGridLoadState::Snapshot {
                 stamp,
                 minimum_revision,
+                queued_at,
                 installed,
                 receiver,
-            }) => match receiver.try_recv() {
-                Ok(Ok(snapshot)) => {
-                    if self.collection_grid_stamp_is_current(stamp) {
-                        let wanted = self
-                            .top_level_grid_view
-                            .collection_session()
-                            .map_or(minimum_revision, |session| session.wanted_revision);
-                        if snapshot.collection_id() == stamp.collection_id
-                            && snapshot.revision() >= minimum_revision
-                            && snapshot.revision() >= wanted
+            }) => {
+                let reply = receiver.try_recv();
+                if let Some(start) = queued_at
+                    && !matches!(&reply, Err(crossbeam_channel::TryRecvError::Empty))
+                {
+                    let (outcome, entries) = match &reply {
+                        Ok(Ok(snapshot))
+                            if !self.collection_grid_stamp_is_current(stamp)
+                                || snapshot.collection_id() != stamp.collection_id
+                                || snapshot.revision() < minimum_revision
+                                || self.top_level_grid_view.collection_session().is_some_and(
+                                    |session| snapshot.revision() < session.wanted_revision,
+                                ) =>
                         {
-                            if let Some(session) = self.top_level_grid_view.collection_session_mut()
+                            ("stale", snapshot.entries.len())
+                        }
+                        Ok(Ok(snapshot)) => ("ok", snapshot.entries.len()),
+                        Ok(Err(_)) => ("error", 0),
+                        Err(_) => ("disconnected", 0),
+                    };
+                    crate::perf::event(
+                        "collection",
+                        "actor_rtt",
+                        None,
+                        0,
+                        &[
+                            ("operation", serde_json::Value::from("load_collection")),
+                            (
+                                "collection_id",
+                                serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+                            ),
+                            (
+                                "request_generation",
+                                serde_json::Value::from(stamp.surface_generation),
+                            ),
+                            (
+                                "context",
+                                serde_json::Value::from(format!("{:?}", stamp.context_id)),
+                            ),
+                            ("entries", serde_json::Value::from(entries)),
+                            (
+                                "ms",
+                                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                            ("outcome", serde_json::Value::from(outcome)),
+                        ],
+                    );
+                }
+                match reply {
+                    Ok(Ok(snapshot)) => {
+                        if self.collection_grid_stamp_is_current(stamp) {
+                            let wanted = self
+                                .top_level_grid_view
+                                .collection_session()
+                                .map_or(minimum_revision, |session| session.wanted_revision);
+                            if snapshot.collection_id() == stamp.collection_id
+                                && snapshot.revision() >= minimum_revision
+                                && snapshot.revision() >= wanted
                             {
-                                session.observed_catalog_revision = session
-                                    .observed_catalog_revision
-                                    .max(snapshot.catalog_revision);
+                                if let Some(session) =
+                                    self.top_level_grid_view.collection_session_mut()
+                                {
+                                    session.observed_catalog_revision = session
+                                        .observed_catalog_revision
+                                        .max(snapshot.catalog_revision);
+                                }
+                                self.spawn_collection_grid_prepare(stamp, snapshot, installed);
+                            } else if let Some(session) =
+                                self.top_level_grid_view.collection_session_mut()
+                            {
+                                session.load = CollectionGridLoadState::RequestNeeded { installed };
                             }
-                            self.spawn_collection_grid_prepare(stamp, snapshot, installed);
-                        } else if let Some(session) =
-                            self.top_level_grid_view.collection_session_mut()
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if self.collection_grid_stamp_is_current(stamp)
+                            && let Some(session) = self.top_level_grid_view.collection_session_mut()
                         {
-                            session.load = CollectionGridLoadState::RequestNeeded { installed };
+                            session.load = if matches!(error, CollectionStoreError::NotFound) {
+                                CollectionGridLoadState::Deleted
+                            } else {
+                                CollectionGridLoadState::Failed {
+                                    message: collection_grid_error(&error),
+                                    installed,
+                                }
+                            };
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        if self.collection_grid_stamp_is_current(stamp)
+                            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                        {
+                            session.load = CollectionGridLoadState::Snapshot {
+                                stamp,
+                                minimum_revision,
+                                queued_at,
+                                installed,
+                                receiver,
+                            };
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        if self.collection_grid_stamp_is_current(stamp)
+                            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                        {
+                            session.load = CollectionGridLoadState::Failed {
+                                message: "コレクション一覧の応答が失われました".into(),
+                                installed,
+                            };
                         }
                     }
                 }
-                Ok(Err(error)) => {
-                    if self.collection_grid_stamp_is_current(stamp)
-                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
-                    {
-                        session.load = if matches!(error, CollectionStoreError::NotFound) {
-                            CollectionGridLoadState::Deleted
-                        } else {
-                            CollectionGridLoadState::Failed {
-                                message: collection_grid_error(&error),
-                                installed,
-                            }
-                        };
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    if self.collection_grid_stamp_is_current(stamp)
-                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
-                    {
-                        session.load = CollectionGridLoadState::Snapshot {
-                            stamp,
-                            minimum_revision,
-                            installed,
-                            receiver,
-                        };
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    if self.collection_grid_stamp_is_current(stamp)
-                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
-                    {
-                        session.load = CollectionGridLoadState::Failed {
-                            message: "コレクション一覧の応答が失われました".into(),
-                            installed,
-                        };
-                    }
-                }
-            },
+            }
             Some(CollectionGridLoadState::Preparing {
                 stamp,
                 exact_revision,
@@ -1222,12 +1423,39 @@ impl App {
                             .top_level_grid_view
                             .collection_session()
                             .is_some_and(|session| session.wanted_revision <= exact_revision);
+                    if !accepts && crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "collection",
+                            "prepare_result",
+                            None,
+                            0,
+                            &[
+                                (
+                                    "collection_id",
+                                    serde_json::Value::from(
+                                        stamp.collection_id.as_uuid().to_string(),
+                                    ),
+                                ),
+                                (
+                                    "request_generation",
+                                    serde_json::Value::from(stamp.surface_generation),
+                                ),
+                                ("revision", serde_json::Value::from(exact_revision)),
+                                (
+                                    "entries",
+                                    serde_json::Value::from(prepared.prepared.entries.len()),
+                                ),
+                                ("outcome", serde_json::Value::from("stale")),
+                            ],
+                        );
+                    }
                     if accepts {
                         self.apply_collection_grid_prepared_install(prepared, installed);
                         ctx.request_repaint();
                     }
                 }
                 Ok(Err(CollectionPrepareError::Cancelled)) => {
+                    collection_grid_prepare_result_event(stamp, exact_revision, "cancelled");
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
@@ -1235,6 +1463,7 @@ impl App {
                     }
                 }
                 Ok(Err(error)) => {
+                    collection_grid_prepare_result_event(stamp, exact_revision, "error");
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
@@ -1260,6 +1489,7 @@ impl App {
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    collection_grid_prepare_result_event(stamp, exact_revision, "disconnected");
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
@@ -1287,6 +1517,7 @@ impl App {
         install: CollectionGridPreparedInstall,
         previous: Option<Arc<CollectionPreparedSnapshot>>,
     ) {
+        let perf_start = crate::perf::is_enabled().then(Instant::now);
         let CollectionGridPreparedInstall {
             prepared,
             thumbnail_sources,
@@ -1430,6 +1661,36 @@ impl App {
             } else {
                 CollectionGridLoadState::Ready(presentation)
             };
+        }
+        if let Some(start) = perf_start {
+            crate::perf::event(
+                "collection",
+                "install",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(
+                            self.top_level_grid_view
+                                .collection_session()
+                                .map(|session| {
+                                    session.identity.collection_id.as_uuid().to_string()
+                                }),
+                        ),
+                    ),
+                    (
+                        "request_generation",
+                        serde_json::Value::from(self.top_level_grid_view.generation()),
+                    ),
+                    ("entries", serde_json::Value::from(self.items.len())),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("reused", serde_json::Value::from(false)),
+                ],
+            );
         }
     }
 
@@ -1597,6 +1858,34 @@ fn source_scope_contains(
             && source_key
                 .strip_prefix(root.trim_end_matches('/'))
                 .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn collection_grid_prepare_result_event(
+    stamp: CollectionGridRequestStamp,
+    revision: u64,
+    outcome: &'static str,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "collection",
+        "prepare_result",
+        None,
+        0,
+        &[
+            (
+                "collection_id",
+                serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+            ),
+            (
+                "request_generation",
+                serde_json::Value::from(stamp.surface_generation),
+            ),
+            ("revision", serde_json::Value::from(revision)),
+            ("outcome", serde_json::Value::from(outcome)),
+        ],
+    );
 }
 
 fn collection_grid_error(error: &CollectionStoreError) -> String {

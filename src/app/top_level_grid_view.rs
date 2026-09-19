@@ -392,6 +392,8 @@ pub(crate) enum CollectionGridLoadState {
     Snapshot {
         stamp: CollectionGridRequestStamp,
         minimum_revision: u64,
+        /// Perf-only enqueue time; no effect on request ownership or scheduling.
+        queued_at: Option<std::time::Instant>,
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
         receiver: crossbeam_channel::Receiver<
             Result<
@@ -544,10 +546,11 @@ impl CollectionGridSession {
             &mut self.load,
             CollectionGridLoadState::RequestNeeded { installed: None },
         );
+        log_collection_grid_pending_cancel(&previous);
         let installed = match previous {
             CollectionGridLoadState::RequestNeeded { installed }
-            | CollectionGridLoadState::Snapshot { installed, .. }
             | CollectionGridLoadState::Failed { installed, .. } => installed,
+            CollectionGridLoadState::Snapshot { installed, .. } => installed,
             CollectionGridLoadState::Preparing {
                 installed, cancel, ..
             } => {
@@ -578,12 +581,74 @@ impl CollectionGridSession {
 
 impl Drop for CollectionGridSession {
     fn drop(&mut self) {
+        log_collection_grid_pending_cancel(&self.load);
         if let CollectionGridLoadState::Preparing { cancel, .. } = &self.load {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(cancel) = self.video_worker_cancel.take() {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+}
+
+fn log_collection_grid_pending_cancel(load: &CollectionGridLoadState) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    match load {
+        CollectionGridLoadState::Snapshot {
+            stamp,
+            queued_at: Some(start),
+            ..
+        } => {
+            crate::perf::event(
+                "collection",
+                "actor_rtt",
+                None,
+                0,
+                &[
+                    ("operation", serde_json::Value::from("load_collection")),
+                    (
+                        "collection_id",
+                        serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_generation",
+                        serde_json::Value::from(stamp.surface_generation),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("outcome", serde_json::Value::from("cancelled")),
+                ],
+            );
+        }
+        CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision,
+            ..
+        } => {
+            crate::perf::event(
+                "collection",
+                "prepare_result",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_generation",
+                        serde_json::Value::from(stamp.surface_generation),
+                    ),
+                    ("revision", serde_json::Value::from(*exact_revision)),
+                    ("outcome", serde_json::Value::from("cancelled")),
+                ],
+            );
+        }
+        _ => {}
     }
 }
 

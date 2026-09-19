@@ -148,12 +148,14 @@ Sol/xhigh独立担当と親が以下の境界を照合した。製品実装は�
    候補（自動書き出しは終了 drain 境界に乗せる必要があり、初回は手動に留める）。
 6. **確定: マニュアルに `collections.html` と `tut-collections.html` を新設する。** サイドバーは 29 → 30
    リンクへ全ページ同期し、`changelog.html` は再生成で追随させる。
-7. **バックログ §1.118 の扱いは判断待ち**（レビュー報告書 §9 の詳細を参照）。
+7. **バックログ §1.118 は残作業への短い状態行へ整理する**。2026-09-19 の引き継ぎ既定案に従い、
+   実装計画 §23 を作業台帳とし、v4.0.0 公開後にバックログの節を削除する。
 
 ### シャッフル順の設計（2026-09-16 提案、2026-09-17 確定）
 
-- `CollectionOrderMode` に `Shuffle` を加え、定義に `shuffle_seed: u64` を持つ。手動 position は変更しない
-  （未リリース機能なので schema の migration は不要）。
+- `CollectionOrderMode` に `Shuffle` を加え、定義に `shuffle_seed: u64` を持つ。手動 position は変更しない。
+  **2026-09-19 設計補正**: 未リリースでも試用中の DB があるため、移行前バックアップと既存データを保持する
+  原子的な schema migration を行う。seed は u64 全域を往復できる保存形式を固定する。
 - 有効順は prepare worker が `hash(shuffle_seed, entry_id)` の昇順で作る。entry ID は stable UUID なので、
   登録・解除・名前変更・再生中の編集があっても残る entry の相対順は変わらず、新規 entry は seed で決まる位置へ
   入る。旧 index に依存しない。
@@ -163,6 +165,11 @@ Sol/xhigh独立担当と親が以下の境界を照合した。製品実装は�
   再選択すると seed を引き直す（「並び直す」）。手動順 / 通常ソートへ戻すと seed は保持したまま無視する。
 - 一覧はシャッフル順で表示するので次の曲が見える。専用並べ替え画面は手動順のときだけ（現行どおり）。
 - Remote は prepared snapshot の有効順を読むだけで追従する。wire に order mode を載せる箇所は Shuffle を通す。
+  Web の表示分岐と IPC の版も更新する。hash の方式と同値時の entry ID tie-break を明示し、実行間で順序を保つ。
+- Manual / Shuffle は詳細表示の列ヘッダによる一時並べ替えを無効にするが、ツールバー / メニューでの
+  並び順選択は有効に保つ。Standard の列ヘッダソートは表示限定で、再生・書き出し・Remote の有効順は変えない。
+  表示と選択 target は同じ採用 revision に束ね、読み込み中・更新待ちは理由付きで無効化する。
+  同一 root の order 切替でも列ソートを戻し、新 order と items の採用後に詳細表示順を整合させる。
 - 将来候補: ループ折り返し時に seed を引き直す設定（毎周違う順にしたい場合）。
 - 回帰: seed 固定で順序が決定的、entry 追加 / 削除後も残りの相対順が不変、再選択で seed が変わる、
   Remote と PC の順序一致、Off / Continuous / ContinuousLoop の終端規則。

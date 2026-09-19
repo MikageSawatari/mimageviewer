@@ -406,6 +406,20 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
   `target_scan_done`（session 総件数 / slice 数 / wall ms）、`priority_update`（可視 target 件数）を
   記録する。scroll のたびに `target_scan_done.items=500000` が増えていないことを確認する。
 
+### 4.4 コレクションの区間計測
+
+`--perf-log` の `cat="collection"` は、Grid / 管理画面 / Remote の `actor_rtt`、
+Grid `prepare` の `stage=classify/sidecar_scan/pin_db/identity`、UI `install`、
+navigation の `preflight`、import / export、source migration を記録する。
+記録された区間では `collection_id` / revision、Grid の surface generation または navigation の
+intent sequence で関連する操作を照合する。navigation の再試行は同じ intent sequence の
+複数 attempt になるため、時刻と worker thread も合わせて見る。`ms` は各区間の経過時間、
+`entries` / `candidates` / `parents` / `mappings`
+は区間ごとの仕事量である。`outcome` で成功、取消、stale、失敗を分ける。source path 一覧は
+記録しない。Remote `actor_rtt` の `reply_ok` は actor 応答の成功であり、revision の採用結果は
+`remote_exact` を見る。completion の無い `navigation_begin` は取消・破棄などの可能性があり、
+成功や滞留と断定しない。比較時は同じ操作・同程度の件数と cold/warm 条件で各 `ms` を見る。
+
 ---
 
 ## 5. 既知のパターン: Ctrl+↑↓ 引っかかり (2026-04 解決済み)

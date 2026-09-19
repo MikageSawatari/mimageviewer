@@ -178,6 +178,7 @@ pub(in crate::app) struct CollectionNavigationRequest {
     origin: CollectionNavigationOrigin,
     action: CollectionNavigationAction,
     root_thumbnail_sources: Option<Arc<CollectionGridPreparedThumbnailSources>>,
+    perf_started_at: Option<std::time::Instant>,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -505,64 +506,74 @@ fn preflight_candidates(
     tree_options: crate::folder_tree::FolderTreeOptions,
     show_hidden_files: bool,
     cancel: &Arc<AtomicBool>,
+    collection_id: CollectionId,
+    request_sequence: u64,
 ) -> Result<Option<CollectionNavigationPreflightReady>, CollectionPrepareError> {
-    let mut accepted = 0usize;
-    let mut rejected = Vec::new();
-    for candidate in candidates {
-        if cancel.load(Ordering::Acquire) {
-            return Err(CollectionPrepareError::Cancelled);
-        }
-        let path = &candidate.target.source_path;
-        let payload = match candidate.target.resolved_kind {
-            CollectionResolvedKind::Image
-            | CollectionResolvedKind::Video
-            | CollectionResolvedKind::Audio => std::fs::metadata(path)
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .map(|_| CollectionNavigationPreflightPayload::Media),
-            CollectionResolvedKind::Folder => {
-                let qualifies = if still_only {
-                    crate::folder_tree::folder_has_still_image_with_options(
-                        path,
-                        Some(cancel),
-                        tree_options,
-                    )
-                } else {
-                    crate::folder_tree::folder_should_stop_with_options(
-                        path,
-                        Some(cancel),
-                        tree_options,
-                    )
-                };
-                if qualifies && !cancel.load(Ordering::Acquire) {
-                    super::folder_scan::scan_directory_with_convertible_archives_cancel(
-                        path,
-                        tree_options.include_convertible_archives,
-                        show_hidden_files,
-                        Some(cancel),
-                    )
-                    .ok()
-                    .filter(|scan| {
-                        scan.all_media.iter().any(|entry| {
-                            if still_only {
-                                entry.kind == super::folder_scan::ScanMediaKind::Image
-                            } else {
-                                matches!(
-                                    entry.kind,
-                                    super::folder_scan::ScanMediaKind::Image
-                                        | super::folder_scan::ScanMediaKind::Video
-                                        | super::folder_scan::ScanMediaKind::Audio
-                                )
-                            }
-                        })
-                    })
-                    .map(CollectionNavigationPreflightPayload::Folder)
-                } else {
-                    None
-                }
+    let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
+    let candidates_count = candidates.len();
+    let mut inspected = 0usize;
+    let result = (|| {
+        let mut accepted = 0usize;
+        let mut rejected = Vec::new();
+        for candidate in candidates {
+            if cancel.load(Ordering::Acquire) {
+                return Err(CollectionPrepareError::Cancelled);
             }
-            CollectionResolvedKind::Zip => {
-                crate::zip_loader::enumerate_image_entries_detailed_with_cancel(path, Some(cancel))
+            inspected += 1;
+            let path = &candidate.target.source_path;
+            let payload = match candidate.target.resolved_kind {
+                CollectionResolvedKind::Image
+                | CollectionResolvedKind::Video
+                | CollectionResolvedKind::Audio => std::fs::metadata(path)
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)
+                    .map(|_| CollectionNavigationPreflightPayload::Media),
+                CollectionResolvedKind::Folder => {
+                    let qualifies = if still_only {
+                        crate::folder_tree::folder_has_still_image_with_options(
+                            path,
+                            Some(cancel),
+                            tree_options,
+                        )
+                    } else {
+                        crate::folder_tree::folder_should_stop_with_options(
+                            path,
+                            Some(cancel),
+                            tree_options,
+                        )
+                    };
+                    if qualifies && !cancel.load(Ordering::Acquire) {
+                        super::folder_scan::scan_directory_with_convertible_archives_cancel(
+                            path,
+                            tree_options.include_convertible_archives,
+                            show_hidden_files,
+                            Some(cancel),
+                        )
+                        .ok()
+                        .filter(|scan| {
+                            scan.all_media.iter().any(|entry| {
+                                if still_only {
+                                    entry.kind == super::folder_scan::ScanMediaKind::Image
+                                } else {
+                                    matches!(
+                                        entry.kind,
+                                        super::folder_scan::ScanMediaKind::Image
+                                            | super::folder_scan::ScanMediaKind::Video
+                                            | super::folder_scan::ScanMediaKind::Audio
+                                    )
+                                }
+                            })
+                        })
+                        .map(CollectionNavigationPreflightPayload::Folder)
+                    } else {
+                        None
+                    }
+                }
+                CollectionResolvedKind::Zip => {
+                    crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
+                        path,
+                        Some(cancel),
+                    )
                     .ok()
                     .filter(|enumeration| !enumeration.entries.is_empty())
                     .inspect(|enumeration| {
@@ -572,63 +583,102 @@ fn preflight_candidates(
                         );
                     })
                     .map(CollectionNavigationPreflightPayload::Zip)
-            }
-            CollectionResolvedKind::Pdf => match crate::pdf_loader::enumerate_pages_with_cancel(
-                path,
-                candidate.pdf_password.as_deref(),
-                Some(Arc::clone(cancel)),
-            ) {
-                Ok(pages) if !pages.is_empty() => {
-                    Some(CollectionNavigationPreflightPayload::PdfPages(pages))
                 }
-                Err(error) if crate::pdf_loader::is_password_required_error(&error) => {
-                    Some(CollectionNavigationPreflightPayload::PdfPasswordRequired)
-                }
-                _ => None,
-            },
-            CollectionResolvedKind::ConvertibleArchive => {
-                if !tree_options.include_convertible_archives {
-                    rejected.push(candidate.target.entry_id);
-                    continue;
-                }
-                let format = path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .and_then(crate::archive_converter::ArchiveFormat::from_extension);
-                format.and_then(|format| {
-                    match crate::archive_converter::scan_summary_with_password_cancelable(
-                        path, format, None, cancel,
+                CollectionResolvedKind::Pdf => {
+                    match crate::pdf_loader::enumerate_pages_with_cancel(
+                        path,
+                        candidate.pdf_password.as_deref(),
+                        Some(Arc::clone(cancel)),
                     ) {
-                        Ok(summary)
-                            if summary.image_count != 0 || summary.nested_archive_count != 0 =>
-                        {
-                            Some(CollectionNavigationPreflightPayload::ConvertibleArchive(
-                                summary,
-                            ))
+                        Ok(pages) if !pages.is_empty() => {
+                            Some(CollectionNavigationPreflightPayload::PdfPages(pages))
                         }
-                        Err(crate::archive_converter::ConvertError::PasswordRequired) => {
-                            Some(CollectionNavigationPreflightPayload::ConvertiblePasswordRequired)
+                        Err(error) if crate::pdf_loader::is_password_required_error(&error) => {
+                            Some(CollectionNavigationPreflightPayload::PdfPasswordRequired)
                         }
                         _ => None,
                     }
-                })
+                }
+                CollectionResolvedKind::ConvertibleArchive => {
+                    if !tree_options.include_convertible_archives {
+                        rejected.push(candidate.target.entry_id);
+                        continue;
+                    }
+                    let format = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .and_then(crate::archive_converter::ArchiveFormat::from_extension);
+                    format.and_then(|format| {
+                        match crate::archive_converter::scan_summary_with_password_cancelable(
+                            path, format, None, cancel,
+                        ) {
+                            Ok(summary)
+                                if summary.image_count != 0
+                                    || summary.nested_archive_count != 0 =>
+                            {
+                                Some(CollectionNavigationPreflightPayload::ConvertibleArchive(
+                                    summary,
+                                ))
+                            }
+                            Err(crate::archive_converter::ConvertError::PasswordRequired) => Some(
+                                CollectionNavigationPreflightPayload::ConvertiblePasswordRequired,
+                            ),
+                            _ => None,
+                        }
+                    })
+                }
+                CollectionResolvedKind::Unresolved => None,
+            };
+            let Some(payload) = payload else {
+                rejected.push(candidate.target.entry_id);
+                continue;
+            };
+            accepted += 1;
+            if accepted >= required_matches {
+                return Ok(Some(CollectionNavigationPreflightReady {
+                    target: candidate.target,
+                    payload,
+                    rejected,
+                }));
             }
-            CollectionResolvedKind::Unresolved => None,
-        };
-        let Some(payload) = payload else {
-            rejected.push(candidate.target.entry_id);
-            continue;
-        };
-        accepted += 1;
-        if accepted >= required_matches {
-            return Ok(Some(CollectionNavigationPreflightReady {
-                target: candidate.target,
-                payload,
-                rejected,
-            }));
         }
+        Ok(None)
+    })();
+    if let Some(start) = perf_start {
+        crate::perf::event(
+            "collection",
+            "preflight",
+            None,
+            0,
+            &[
+                (
+                    "collection_id",
+                    serde_json::Value::from(collection_id.as_uuid().to_string()),
+                ),
+                (
+                    "request_sequence",
+                    serde_json::Value::from(request_sequence),
+                ),
+                ("candidates", serde_json::Value::from(candidates_count)),
+                ("inspected", serde_json::Value::from(inspected)),
+                ("required", serde_json::Value::from(required_matches)),
+                (
+                    "ms",
+                    serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "outcome",
+                    serde_json::Value::from(match &result {
+                        Ok(Some(_)) => "ready",
+                        Ok(None) => "exhausted",
+                        Err(CollectionPrepareError::Cancelled) => "cancelled",
+                        Err(_) => "error",
+                    }),
+                ),
+            ],
+        );
     }
-    Ok(None)
+    result
 }
 
 impl App {
@@ -847,6 +897,7 @@ impl App {
             origin,
             action,
             root_thumbnail_sources: None,
+            perf_started_at: crate::perf::is_enabled().then(std::time::Instant::now),
         };
         self.top_level_grid_view
             .set_collection_navigation_pending(None);
@@ -864,6 +915,28 @@ impl App {
             self.finish_collection_navigation_without_target(ctx, &request.action);
             return true;
         };
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "collection",
+                "navigation_begin",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(request.origin.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_sequence",
+                        serde_json::Value::from(request.origin.intent_sequence),
+                    ),
+                    (
+                        "surface_generation",
+                        serde_json::Value::from(request.origin.surface_generation),
+                    ),
+                ],
+            );
+        }
         self.top_level_grid_view
             .set_collection_navigation_pending(Some(CollectionNavigationPending::Snapshot {
                 request,
@@ -1292,15 +1365,50 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
+        let collection_id = request.origin.collection_id;
+        let request_sequence = request.origin.intent_sequence;
         let spawn = std::thread::Builder::new()
             .name("collection-navigation-prepare".into())
             .spawn(move || {
+                let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
                 let result = super::collection_grid::prepare_collection_grid_install(
                     &snapshot,
                     &display_order,
                     &settings,
                     &worker_cancel,
                 );
+                if let Some(start) = perf_start {
+                    crate::perf::event(
+                        "collection",
+                        "navigation_prepare",
+                        None,
+                        0,
+                        &[
+                            (
+                                "collection_id",
+                                serde_json::Value::from(collection_id.as_uuid().to_string()),
+                            ),
+                            (
+                                "request_sequence",
+                                serde_json::Value::from(request_sequence),
+                            ),
+                            ("revision", serde_json::Value::from(exact_revision)),
+                            ("entries", serde_json::Value::from(snapshot.entries.len())),
+                            (
+                                "ms",
+                                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                            (
+                                "outcome",
+                                serde_json::Value::from(match &result {
+                                    Ok(_) => "ok",
+                                    Err(CollectionPrepareError::Cancelled) => "cancelled",
+                                    Err(_) => "error",
+                                }),
+                            ),
+                        ],
+                    );
+                }
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
@@ -1383,6 +1491,8 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
+        let collection_id = request.origin.collection_id;
+        let request_sequence = request.origin.intent_sequence;
         let spawn = std::thread::Builder::new()
             .name("collection-navigation-preflight".into())
             .spawn(move || {
@@ -1393,6 +1503,8 @@ impl App {
                     tree_options,
                     show_hidden_files,
                     &worker_cancel,
+                    collection_id,
+                    request_sequence,
                 );
                 let _ = sender.send(result);
             });
@@ -2165,6 +2277,7 @@ impl App {
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
             }
+            collection_navigation_root_install_event(request, &prepared, true);
             return Some(CollectionNavigationRootLanding {
                 target_idx,
                 remapped_origin_idx,
@@ -2265,6 +2378,7 @@ impl App {
                 self.video_continuous_last_eof = Some((new_idx, serial));
             }
         }
+        collection_navigation_root_install_event(request, &prepared, false);
         Some(CollectionNavigationRootLanding {
             target_idx,
             remapped_origin_idx: landing_origin_idx,
@@ -2414,6 +2528,35 @@ impl App {
             prepared.collection_revision,
             ready.target.source_path.display()
         ));
+        if let Some(start) = request.perf_started_at {
+            crate::perf::event(
+                "collection",
+                "navigation_decision",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(request.origin.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_sequence",
+                        serde_json::Value::from(request.origin.intent_sequence),
+                    ),
+                    (
+                        "revision",
+                        serde_json::Value::from(prepared.collection_revision),
+                    ),
+                    ("entries", serde_json::Value::from(prepared.entries.len())),
+                    ("rejected", serde_json::Value::from(ready.rejected.len())),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("outcome", serde_json::Value::from("eligible")),
+                ],
+            );
+        }
 
         let action = request.action.clone();
         let history_trigger = action.history_trigger();
@@ -2853,6 +2996,43 @@ impl App {
     }
 }
 
+fn collection_navigation_root_install_event(
+    request: &CollectionNavigationRequest,
+    prepared: &CollectionPreparedSnapshot,
+    reused: bool,
+) {
+    let Some(start) = request.perf_started_at else {
+        return;
+    };
+    crate::perf::event(
+        "collection",
+        "navigation_root_install",
+        None,
+        0,
+        &[
+            (
+                "collection_id",
+                serde_json::Value::from(request.origin.collection_id.as_uuid().to_string()),
+            ),
+            (
+                "request_sequence",
+                serde_json::Value::from(request.origin.intent_sequence),
+            ),
+            (
+                "revision",
+                serde_json::Value::from(prepared.collection_revision),
+            ),
+            ("entries", serde_json::Value::from(prepared.entries.len())),
+            ("reused", serde_json::Value::from(reused)),
+            (
+                "ms",
+                serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("outcome", serde_json::Value::from("installed")),
+        ],
+    );
+}
+
 trait CollectionResolvedKindExt {
     fn is_container(self) -> bool;
 }
@@ -2944,6 +3124,7 @@ mod tests {
                 still_only: false,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         }
     }
 
@@ -3035,6 +3216,7 @@ mod tests {
                     video_pin_blobs: std::collections::HashMap::new(),
                 },
             ))),
+            perf_started_at: None,
         };
 
         assert!(
@@ -3592,6 +3774,8 @@ mod tests {
             crate::folder_tree::FolderTreeOptions::default(),
             false,
             &Arc::new(AtomicBool::new(false)),
+            CollectionId::new(),
+            1,
         )
         .unwrap()
         .expect("second existing candidate");
@@ -3615,6 +3799,8 @@ mod tests {
             crate::folder_tree::FolderTreeOptions::default(),
             false,
             &cancel,
+            CollectionId::new(),
+            1,
         );
         assert!(matches!(result, Err(CollectionPrepareError::Cancelled)));
     }
@@ -3849,6 +4035,7 @@ mod tests {
                 still_only: false,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         };
         let target_entry = prepared.entries[1].clone();
         let target = CollectionPreparedNavigationTarget {
@@ -3943,6 +4130,7 @@ mod tests {
                 still_only: false,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -4004,6 +4192,7 @@ mod tests {
                 queued_steps: 0,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -4083,6 +4272,7 @@ mod tests {
                 queued_steps: 0,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         };
         let watch = client.subscribe().unwrap();
         let target_entry = &prepared.entries[1];
@@ -4163,6 +4353,7 @@ mod tests {
                 queued_steps: 0,
             },
             root_thumbnail_sources: None,
+            perf_started_at: None,
         };
         let target_entry = &prepared.entries[1];
         let target = CollectionPreparedNavigationTarget {
