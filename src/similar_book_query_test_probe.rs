@@ -11,6 +11,7 @@ use std::time::Duration;
 pub(crate) enum BookQueryTestPhase {
     MihPostingScan,
     SqlProgress,
+    AfterOriginDiscovery,
     DirectCandidateSlot,
 }
 

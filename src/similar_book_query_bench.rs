@@ -16,7 +16,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::dupe::book::Relation;
-use crate::similar_book_engine::{EngineObservation, SimilarBookQueryEngine};
+use crate::similar_book_engine::{BookQueryStats, EngineObservation, SimilarBookQueryEngine};
 use crate::similar_db::{BookReadMetadata, SimilarBookReader, key_is_under_any};
 use crate::similar_index::{BookPageBaseline, BookPageMatchState, BookQuery, SimilarItemTarget};
 use crate::similar_search_array::{SearchSnapshot, read_book_query_benchmark_base};
@@ -78,6 +78,19 @@ pub struct BenchQuerySummary {
     pub hit_count: u64,
     pub override_count: u64,
     pub result_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct BenchQueryStats {
+    pub origin_page_count: u64,
+    pub origin_unique_signature_count: u64,
+    pub candidate_book_count_discovered: u64,
+    pub candidate_book_count_retained: u64,
+    pub retained_candidate_page_count: u64,
+    pub origin_neighborhood_lookup_count: u64,
+    pub candidate_neighborhood_lookup_count: u64,
+    pub origin_discovery_ms: Option<f64>,
+    pub candidate_verification_ms: Option<f64>,
 }
 
 /// Owned product result used by the independent real-book verifier.
@@ -513,11 +526,12 @@ impl BenchEngine {
     pub fn query(&mut self, origin: &str) -> Result<BenchQueryRun, String> {
         let observation = self
             .engine
-            .query(
+            .query_with_timing(
                 origin,
                 &self.immutable_roots,
                 &self.active_snapshots,
                 Arc::new(AtomicBool::new(false)),
+                true,
             )
             .map_err(|error| error.to_string())?;
         Ok(BenchQueryRun { observation })
@@ -549,6 +563,13 @@ impl BenchQueryRun {
         summarize_observation(&self.observation)
     }
 
+    pub fn into_summary_and_stats(self) -> (BenchQuerySummary, BenchQueryStats) {
+        (
+            summarize_observation(&self.observation),
+            summarize_stats(&self.observation.stats),
+        )
+    }
+
     pub fn into_certificate(self) -> BenchQueryCertificate {
         let summary = summarize_observation(&self.observation);
         let metadata = BenchBookReadMetadata {
@@ -562,6 +583,24 @@ impl BenchQueryRun {
             summary,
             outcome,
         }
+    }
+}
+
+fn summarize_stats(stats: &BookQueryStats) -> BenchQueryStats {
+    BenchQueryStats {
+        origin_page_count: stats.origin_page_count,
+        origin_unique_signature_count: stats.origin_unique_signature_count,
+        candidate_book_count_discovered: stats.candidate_book_count_discovered,
+        candidate_book_count_retained: stats.candidate_book_count_retained,
+        retained_candidate_page_count: stats.retained_candidate_page_count,
+        origin_neighborhood_lookup_count: stats.origin_neighborhood_lookup_count,
+        candidate_neighborhood_lookup_count: stats.candidate_neighborhood_lookup_count,
+        origin_discovery_ms: stats
+            .origin_discovery_elapsed
+            .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+        candidate_verification_ms: stats
+            .candidate_verification_elapsed
+            .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
     }
 }
 

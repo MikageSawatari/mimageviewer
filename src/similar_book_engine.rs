@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use crate::dupe::book::{
     AnalyzeError, EdgeVisitCompletion, EdgeVisitControl, PreparedBookSide, ReenumeratedBookEdges,
@@ -43,7 +44,50 @@ pub(crate) struct SimilarBookQueryEngine {
 #[derive(Debug)]
 pub(crate) struct EngineObservation {
     pub(crate) metadata: BookReadMetadata,
+    pub(crate) stats: BookQueryStats,
     pub(crate) outcome: Result<BookQuery, EngineError>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BookQueryStats {
+    /// Current-hash page rows loaded for the origin, including rows excluded from matching.
+    pub(crate) origin_page_count: u64,
+    /// Distinct eligible origin signatures whose neighborhood resolution was started.
+    pub(crate) origin_unique_signature_count: u64,
+    /// Candidate books seen before applying `BOOK_MIN_MATCHED_PAGES`.
+    pub(crate) candidate_book_count_discovered: u64,
+    /// Candidate books remaining after applying `BOOK_MIN_MATCHED_PAGES`.
+    pub(crate) candidate_book_count_retained: u64,
+    /// Pages loaded from retained candidates before the query reached its terminal.
+    pub(crate) retained_candidate_page_count: u64,
+    /// Origin-side `resolve_signature_neighborhood` calls; memo hits are excluded.
+    pub(crate) origin_neighborhood_lookup_count: u64,
+    /// Candidate-side `resolve_signature_neighborhood` calls; memo hits are excluded.
+    pub(crate) candidate_neighborhood_lookup_count: u64,
+    /// Origin load, MIH preparation, discovery, and candidate filtering time when enabled.
+    pub(crate) origin_discovery_elapsed: Option<Duration>,
+    /// Post-filter preparation, retained-candidate load, verification, and classification time.
+    pub(crate) candidate_verification_elapsed: Option<Duration>,
+}
+
+struct StageTimer<'a> {
+    started: Option<Instant>,
+    elapsed: &'a mut Option<Duration>,
+}
+
+impl<'a> StageTimer<'a> {
+    fn new(enabled: bool, elapsed: &'a mut Option<Duration>) -> Self {
+        Self {
+            started: enabled.then(Instant::now),
+            elapsed,
+        }
+    }
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        *self.elapsed = self.started.map(|started| started.elapsed());
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +185,7 @@ impl SimilarBookQueryEngine {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn query(
         &mut self,
         container_key: &str,
@@ -148,11 +193,29 @@ impl SimilarBookQueryEngine {
         shared_snapshot_candidates: &[Arc<SearchSnapshot>],
         cancel: Arc<AtomicBool>,
     ) -> Result<EngineObservation, BookReadError> {
+        self.query_with_timing(
+            container_key,
+            immutable_roots,
+            shared_snapshot_candidates,
+            cancel,
+            false,
+        )
+    }
+
+    pub(crate) fn query_with_timing(
+        &mut self,
+        container_key: &str,
+        immutable_roots: &[String],
+        shared_snapshot_candidates: &[Arc<SearchSnapshot>],
+        cancel: Arc<AtomicBool>,
+        measure_stage_elapsed: bool,
+    ) -> Result<EngineObservation, BookReadError> {
         self.query_after_metadata(
             container_key,
             immutable_roots,
             shared_snapshot_candidates,
             cancel,
+            measure_stage_elapsed,
             |_| {},
         )
     }
@@ -172,6 +235,7 @@ impl SimilarBookQueryEngine {
         immutable_roots: &[String],
         shared_snapshot_candidates: &[Arc<SearchSnapshot>],
         cancel: Arc<AtomicBool>,
+        measure_stage_elapsed: bool,
         after_metadata: F,
     ) -> Result<EngineObservation, BookReadError>
     where
@@ -195,6 +259,7 @@ impl SimilarBookQueryEngine {
                 mih.clear();
             }
 
+            let mut stats = BookQueryStats::default();
             let outcome = match query_snapshot(
                 read,
                 mih,
@@ -202,6 +267,8 @@ impl SimilarBookQueryEngine {
                 immutable_roots,
                 shared_snapshot_candidates,
                 cancel.as_ref(),
+                measure_stage_elapsed,
+                &mut stats,
             ) {
                 Ok(query) => Ok(query),
                 Err(BodyError::Database(error)) => {
@@ -212,7 +279,11 @@ impl SimilarBookQueryEngine {
             // The closure itself succeeds even when the query body fails. The read-only TX can
             // then close normally while C still receives the store metadata observed by its first
             // SELECT and the typed body failure as one value.
-            Ok(EngineObservation { metadata, outcome })
+            Ok(EngineObservation {
+                metadata,
+                stats,
+                outcome,
+            })
         })
     }
 
@@ -233,15 +304,19 @@ fn query_snapshot(
     immutable_roots: &[String],
     shared_snapshot_candidates: &[Arc<SearchSnapshot>],
     cancel: &AtomicBool,
+    measure_stage_elapsed: bool,
+    stats: &mut BookQueryStats,
 ) -> BodyResult<BookQuery> {
     check_cancelled(cancel)?;
     if !key_is_under_any(container_key, immutable_roots) {
         return Ok(BookQuery::NotIndexed);
     }
 
+    let origin_stage = StageTimer::new(measure_stage_elapsed, &mut stats.origin_discovery_elapsed);
     let origin_pages = read
         .page_order_resolver(compare_book_pages)
         .load_book_pages(container_key, current_hash_version())?;
+    stats.origin_page_count = u64::try_from(origin_pages.len()).unwrap_or(u64::MAX);
     if origin_pages.is_empty() {
         return Ok(BookQuery::NotBook);
     }
@@ -289,6 +364,10 @@ fn query_snapshot(
         }
         let signature = row.item.pdq256;
         if !origin_memo.contains_key(&signature) {
+            stats.origin_unique_signature_count =
+                stats.origin_unique_signature_count.saturating_add(1);
+            stats.origin_neighborhood_lookup_count =
+                stats.origin_neighborhood_lookup_count.saturating_add(1);
             let neighborhood = resolve_signature_neighborhood(
                 read,
                 mih,
@@ -311,7 +390,14 @@ fn query_snapshot(
                     if candidate_key == container_key {
                         continue;
                     }
-                    let discovery = discoveries.entry(candidate_key.clone()).or_default();
+                    let discovery = match discoveries.entry(candidate_key.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            stats.candidate_book_count_discovered =
+                                stats.candidate_book_count_discovered.saturating_add(1);
+                            entry.insert(CandidateDiscovery::default())
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    };
                     discovery.matched_edges = discovery
                         .matched_edges
                         .saturating_add(u32::from(*count))
@@ -322,6 +408,21 @@ fn query_snapshot(
         }
     }
     discoveries.retain(|_, discovery| discovery.matched_edges >= BOOK_MIN_MATCHED_PAGES);
+    stats.candidate_book_count_retained = u64::try_from(discoveries.len()).unwrap_or(u64::MAX);
+    drop(origin_stage);
+
+    #[cfg(test)]
+    if let Some(probe) = mih.test_phase_probe() {
+        probe.checkpoint(
+            crate::similar_book_query_test_probe::BookQueryTestPhase::AfterOriginDiscovery,
+        );
+    }
+    check_cancelled(cancel)?;
+
+    let candidate_stage = StageTimer::new(
+        measure_stage_elapsed,
+        &mut stats.candidate_verification_elapsed,
+    );
 
     let prepared_origin = PreparedBookSide::new(
         BOOK_ORIGIN,
@@ -343,6 +444,9 @@ fn query_snapshot(
             ))
             .into());
         }
+        stats.retained_candidate_page_count = stats
+            .retained_candidate_page_count
+            .saturating_add(u64::try_from(candidate_pages.len()).unwrap_or(u64::MAX));
         let mut candidate_indexed_rows = candidate_pages
             .iter()
             .filter(|row| row.item.page_index.is_some())
@@ -364,6 +468,8 @@ fn query_snapshot(
                 matches!(neighborhood, SignatureNeighborhood::Common)
             } else {
                 if !candidate_local_memo.contains_key(&signature) {
+                    stats.candidate_neighborhood_lookup_count =
+                        stats.candidate_neighborhood_lookup_count.saturating_add(1);
                     let neighborhood = resolve_signature_neighborhood(
                         read,
                         mih,
@@ -425,6 +531,7 @@ fn query_snapshot(
         );
     }
 
+    drop(candidate_stage);
     Ok(BookQuery::Ready(BookRelations { origin, hits }))
 }
 
@@ -1127,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_same_transaction_mih_identity_is_an_invariant_failure() {
+    fn missing_same_transaction_mih_identity_is_an_invariant_failure_with_stats() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("similar.db");
         let db = SimilarDb::open_at(&path).unwrap();
@@ -1151,6 +1258,10 @@ mod tests {
         let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
 
         let observation = query(&mut engine, &origin_key, &[fabricated]);
+        assert_eq!(observation.stats.origin_page_count, 3);
+        assert_eq!(observation.stats.origin_unique_signature_count, 1);
+        assert_eq!(observation.stats.origin_neighborhood_lookup_count, 1);
+        assert_eq!(observation.stats.candidate_neighborhood_lookup_count, 0);
         assert!(matches!(
             observation.outcome,
             Err(EngineError::Invariant(message))
@@ -1359,9 +1470,14 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_from_body = Arc::clone(&cancelled);
         let observation = engine
-            .query_after_metadata(&origin_key, &[ROOT.to_owned()], &[], cancelled, move |_| {
-                cancel_from_body.store(true, Ordering::Release)
-            })
+            .query_after_metadata(
+                &origin_key,
+                &[ROOT.to_owned()],
+                &[],
+                cancelled,
+                false,
+                move |_| cancel_from_body.store(true, Ordering::Release),
+            )
             .unwrap();
         assert!(matches!(observation.outcome, Err(EngineError::Cancelled)));
 
@@ -1446,6 +1562,97 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_origin_discovery_preserves_partial_query_stats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let candidate_key = format!("{ROOT}/candidate");
+        let origin = vec![signature(0); 3];
+        let candidate = [signature(0), signature(0xff), signature(0xff)];
+        publish_book(&db, &origin_key, &origin, current_hash_version());
+        publish_book(&db, &candidate_key, &candidate, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (probe, mut phase_control) =
+            crate::similar_book_query_test_probe::BookQueryTestPhaseProbe::new(
+                crate::similar_book_query_test_probe::BookQueryTestPhase::AfterOriginDiscovery,
+            );
+        engine.set_test_phase_probe(probe);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            engine.query_with_timing(
+                &origin_key,
+                &[ROOT.to_owned()],
+                &[shared],
+                worker_cancel,
+                true,
+            )
+        });
+
+        phase_control.wait_reached();
+        cancel.store(true, Ordering::Release);
+        phase_control.release();
+        let observation = worker.join().unwrap().unwrap();
+
+        assert!(matches!(observation.outcome, Err(EngineError::Cancelled)));
+        assert_eq!(observation.stats.origin_page_count, 3);
+        assert_eq!(observation.stats.origin_unique_signature_count, 1);
+        assert_eq!(observation.stats.candidate_book_count_discovered, 1);
+        assert_eq!(observation.stats.candidate_book_count_retained, 1);
+        assert_eq!(observation.stats.retained_candidate_page_count, 0);
+        assert_eq!(observation.stats.origin_neighborhood_lookup_count, 1);
+        assert_eq!(observation.stats.candidate_neighborhood_lookup_count, 0);
+        assert!(observation.stats.origin_discovery_elapsed.is_some());
+        assert!(observation.stats.candidate_verification_elapsed.is_none());
+    }
+
+    #[test]
+    fn completed_query_stats_count_resolver_calls_but_not_memo_hits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let candidate_key = format!("{ROOT}/candidate");
+        let origin = vec![signature(0); 3];
+        let candidate = [
+            signature(0),
+            signature(0xff),
+            signature(0xff),
+            signature(0xff),
+        ];
+        publish_book(&db, &origin_key, &origin, current_hash_version());
+        publish_book(&db, &candidate_key, &candidate, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let observation = engine
+            .query_with_timing(
+                &origin_key,
+                &[ROOT.to_owned()],
+                &[shared],
+                Arc::new(AtomicBool::new(false)),
+                true,
+            )
+            .unwrap();
+
+        assert!(matches!(observation.outcome, Ok(BookQuery::Ready(_))));
+        assert_eq!(observation.stats.origin_page_count, 3);
+        assert_eq!(observation.stats.origin_unique_signature_count, 1);
+        assert_eq!(observation.stats.candidate_book_count_discovered, 1);
+        assert_eq!(observation.stats.candidate_book_count_retained, 1);
+        assert_eq!(observation.stats.retained_candidate_page_count, 4);
+        assert_eq!(observation.stats.origin_neighborhood_lookup_count, 1);
+        assert_eq!(observation.stats.candidate_neighborhood_lookup_count, 1);
+        assert!(observation.stats.origin_discovery_elapsed.is_some());
+        assert!(observation.stats.candidate_verification_elapsed.is_some());
+    }
+
+    #[test]
     fn metadata_read_fixes_the_database_snapshot_before_a_writer_update() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("similar.db");
@@ -1465,6 +1672,7 @@ mod tests {
                 &[ROOT.to_owned()],
                 &[Arc::clone(&shared_before_update)],
                 Arc::new(AtomicBool::new(false)),
+                false,
                 |_| publish_book(&db, &candidate_key, &unrelated, current_hash_version()),
             )
             .unwrap();

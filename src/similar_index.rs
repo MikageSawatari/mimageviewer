@@ -9,7 +9,9 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::dupe::{self, Algo, Sig};
-use crate::similar_book_engine::{EngineError as BookEngineError, SimilarBookQueryEngine};
+use crate::similar_book_engine::{
+    BookQueryStats, EngineError as BookEngineError, SimilarBookQueryEngine,
+};
 use crate::similar_book_query::{
     BookQueryClient, BookQueryDispatchDecision, BookQueryExecutor, BookQueryPoll, BookQueryRequest,
     BookQueryRuntime, BookQueryTerminal,
@@ -1952,6 +1954,20 @@ struct SchedulerBookQueryRuntime {
     engine: BookEngineSlot,
 }
 
+struct SchedulerBookQueryObservation {
+    terminal: BookQueryTerminal<Arc<BookQuery>>,
+    stats: BookQueryStats,
+}
+
+impl SchedulerBookQueryObservation {
+    fn without_body(terminal: BookQueryTerminal<Arc<BookQuery>>) -> Self {
+        Self {
+            terminal,
+            stats: BookQueryStats::default(),
+        }
+    }
+}
+
 impl BookQueryRuntime<Arc<BookQuery>> for SchedulerBookQueryRuntime {
     fn execute(
         &mut self,
@@ -1973,7 +1989,8 @@ impl BookQueryRuntime<Arc<BookQuery>> for SchedulerBookQueryRuntime {
                 )],
             );
         }
-        let terminal = self.execute_inner(&request, Arc::clone(&cancel));
+        let SchedulerBookQueryObservation { terminal, stats } =
+            self.execute_inner(&request, Arc::clone(&cancel), perf_started.is_some());
         if let Some(started) = perf_started {
             let (hit_count, override_count) = book_query_result_counts(&terminal);
             let cancelled = cancel.load(Ordering::Acquire);
@@ -2010,6 +2027,42 @@ impl BookQueryRuntime<Arc<BookQuery>> for SchedulerBookQueryRuntime {
                         "override_count",
                         serde_json::Value::from(override_count as u64),
                     ),
+                    (
+                        "origin_page_count",
+                        serde_json::Value::from(stats.origin_page_count),
+                    ),
+                    (
+                        "origin_unique_signature_count",
+                        serde_json::Value::from(stats.origin_unique_signature_count),
+                    ),
+                    (
+                        "candidate_book_count_discovered",
+                        serde_json::Value::from(stats.candidate_book_count_discovered),
+                    ),
+                    (
+                        "candidate_book_count_retained",
+                        serde_json::Value::from(stats.candidate_book_count_retained),
+                    ),
+                    (
+                        "retained_candidate_page_count",
+                        serde_json::Value::from(stats.retained_candidate_page_count),
+                    ),
+                    (
+                        "origin_neighborhood_lookup_count",
+                        serde_json::Value::from(stats.origin_neighborhood_lookup_count),
+                    ),
+                    (
+                        "candidate_neighborhood_lookup_count",
+                        serde_json::Value::from(stats.candidate_neighborhood_lookup_count),
+                    ),
+                    (
+                        "origin_discovery_ms",
+                        book_query_elapsed_ms(stats.origin_discovery_elapsed),
+                    ),
+                    (
+                        "candidate_verification_ms",
+                        book_query_elapsed_ms(stats.candidate_verification_elapsed),
+                    ),
                 ],
             );
         }
@@ -2022,11 +2075,12 @@ impl SchedulerBookQueryRuntime {
         &mut self,
         request: &BookQueryRequest,
         cancel: Arc<AtomicBool>,
-    ) -> BookQueryTerminal<Arc<BookQuery>> {
+        measure_stage_elapsed: bool,
+    ) -> SchedulerBookQueryObservation {
         let Some(scheduler) = self.scheduler.upgrade() else {
-            return BookQueryTerminal::Failed(
+            return SchedulerBookQueryObservation::without_body(BookQueryTerminal::Failed(
                 "similar book query scheduler is unavailable".to_owned(),
-            );
+            ));
         };
         let shared_snapshot = {
             let memory = scheduler.memory.lock().unwrap_or_else(|e| e.into_inner());
@@ -2049,12 +2103,16 @@ impl SchedulerBookQueryRuntime {
             match SimilarBookQueryEngine::open_at(&db_path) {
                 Ok(Some(engine)) => self.engine = BookEngineSlot::Ready(engine),
                 Ok(None) => {
-                    return BookQueryTerminal::Ready(Arc::new(BookQuery::NotIndexed));
+                    return SchedulerBookQueryObservation::without_body(BookQueryTerminal::Ready(
+                        Arc::new(BookQuery::NotIndexed),
+                    ));
                 }
                 Err(error) => {
-                    return BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(format!(
-                        "similar book query database open failed: {error}"
-                    ))));
+                    return SchedulerBookQueryObservation::without_body(BookQueryTerminal::Ready(
+                        Arc::new(BookQuery::Failed(format!(
+                            "similar book query database open failed: {error}"
+                        ))),
+                    ));
                 }
             }
         }
@@ -2072,22 +2130,40 @@ impl SchedulerBookQueryRuntime {
             engine.set_test_phase_probe(probe);
         }
         let candidates = shared_snapshot.into_iter().collect::<Vec<_>>();
-        let result = engine.query(request.container_key(), &roots, &candidates, cancel);
+        let result = engine.query_with_timing(
+            request.container_key(),
+            &roots,
+            &candidates,
+            cancel,
+            measure_stage_elapsed,
+        );
         match result {
             Ok(observation) => {
                 scheduler.observe_book_store(observation.metadata.store_id);
-                match observation.outcome {
+                let terminal = match observation.outcome {
                     Ok(query) => BookQueryTerminal::Ready(Arc::new(query)),
                     Err(error) => BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(
                         book_engine_error(error),
                     ))),
+                };
+                SchedulerBookQueryObservation {
+                    terminal,
+                    stats: observation.stats,
                 }
             }
-            Err(error) => BookQueryTerminal::Ready(Arc::new(BookQuery::Failed(format!(
-                "similar book query database read failed: {error}"
-            )))),
+            Err(error) => {
+                SchedulerBookQueryObservation::without_body(BookQueryTerminal::Ready(Arc::new(
+                    BookQuery::Failed(format!("similar book query database read failed: {error}")),
+                )))
+            }
         }
     }
+}
+
+fn book_query_elapsed_ms(elapsed: Option<std::time::Duration>) -> serde_json::Value {
+    elapsed.map_or(serde_json::Value::Null, |elapsed| {
+        serde_json::Value::from(elapsed.as_secs_f64() * 1000.0)
+    })
 }
 
 fn item_query_terminal_label(query: &ItemQuery) -> &'static str {

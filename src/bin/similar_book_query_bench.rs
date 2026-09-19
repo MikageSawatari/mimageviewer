@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use mimageviewer::similar_book_query_bench::{
     BenchBaseInfo, BenchCacheObservation, BenchEngine, BenchInputFingerprint, BenchInputSpec,
-    BenchQuerySummary, GuardedBenchInputs, expected_product_book_query_worker_priority,
-    lower_product_book_query_worker_priority, product_book_query_worker_priority,
+    BenchQueryStats, BenchQuerySummary, GuardedBenchInputs,
+    expected_product_book_query_worker_priority, lower_product_book_query_worker_priority,
+    product_book_query_worker_priority,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 fn main() {
     if let Err(error) = run() {
@@ -227,7 +228,7 @@ fn run_worker(
         let query = query_result?;
         let cache = engine.cache_observation();
         let summary_started = Instant::now();
-        let summary = query.into_summary();
+        let (summary, stats) = query.into_summary_and_stats();
         let summary_wall_ns = duration_ns(summary_started.elapsed());
         let record = QueryRecord {
             record: "query",
@@ -242,6 +243,7 @@ fn run_worker(
             },
             summary_wall_ns,
             cache,
+            stats,
             summary,
         };
         if phase == "warmup" {
@@ -447,6 +449,8 @@ struct QueryRecord {
     first_query_from_worker_spawn_ns: Option<u64>,
     summary_wall_ns: u64,
     cache: Option<BenchCacheObservation>,
+    #[serde(flatten)]
+    stats: BenchQueryStats,
     summary: BenchQuerySummary,
 }
 
