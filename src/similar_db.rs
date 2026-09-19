@@ -972,6 +972,14 @@ impl BookReadSnapshot<'_> {
         load_book_pages_connection(self.conn, container_key, hash_version, Some(self.cancel))
     }
 
+    pub(crate) fn count_book_pages(
+        &self,
+        container_key: &str,
+        hash_version: i64,
+    ) -> rusqlite::Result<u64> {
+        count_book_pages_connection(self.conn, container_key, hash_version, Some(self.cancel))
+    }
+
     pub(crate) fn resolve_pages_by_item_id(
         &self,
         item_ids: &[u64],
@@ -4495,6 +4503,23 @@ fn load_book_pages_connection(
     drop(statement);
     check_book_read_cancelled(cancel)?;
     Ok(pages)
+}
+
+fn count_book_pages_connection(
+    conn: &Connection,
+    container_key: &str,
+    hash_version: i64,
+    cancel: Option<&AtomicBool>,
+) -> rusqlite::Result<u64> {
+    check_book_read_cancelled(cancel)?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM item i JOIN container c ON c.container_key = i.container_key
+         WHERE i.container_key = ?1 AND i.hash_version = ?2 AND c.scan_state = ?3",
+        params![container_key, hash_version, ScanState::Complete as i64],
+        |row| row.get(0),
+    )?;
+    check_book_read_cancelled(cancel)?;
+    Ok(count)
 }
 
 fn resolve_pages_by_item_id_connection(

@@ -41,6 +41,21 @@ pub(crate) struct SimilarBookQueryEngine {
     mih: BookMihRuntime,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BookQueryLimits {
+    max_pages_per_book: u64,
+    candidate_page_budget: u64,
+}
+
+impl BookQueryLimits {
+    pub(crate) const fn new(max_pages_per_book: u64, candidate_page_budget: u64) -> Self {
+        Self {
+            max_pages_per_book,
+            candidate_page_budget,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EngineObservation {
     pub(crate) metadata: BookReadMetadata,
@@ -56,9 +71,9 @@ pub(crate) struct BookQueryStats {
     pub(crate) origin_unique_signature_count: u64,
     /// Candidate books seen before applying `BOOK_MIN_MATCHED_PAGES`.
     pub(crate) candidate_book_count_discovered: u64,
-    /// Candidate books remaining after applying `BOOK_MIN_MATCHED_PAGES`.
+    /// Candidate books remaining after the matched-page threshold and per-book page cap.
     pub(crate) candidate_book_count_retained: u64,
-    /// Pages loaded from retained candidates before the query reached its terminal.
+    /// Current-hash page rows counted for retained candidates before the query reached its terminal.
     pub(crate) retained_candidate_page_count: u64,
     /// Origin-side `resolve_signature_neighborhood` calls; memo hits are excluded.
     pub(crate) origin_neighborhood_lookup_count: u64,
@@ -171,10 +186,32 @@ enum SignatureNeighborhood {
     Rare(Box<[(String, u8)]>),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CandidateDiscovery {
-    matched_edges: u32,
+    threshold: CandidateThreshold,
     origin_slots: Vec<usize>,
+}
+
+impl Default for CandidateDiscovery {
+    fn default() -> Self {
+        Self {
+            threshold: CandidateThreshold::Below { matched_edges: 0 },
+            origin_slots: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CandidateThreshold {
+    Below { matched_edges: u32 },
+    Reached { page_count: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateBudgetCheck {
+    DuringDiscovery,
+    #[cfg(test)]
+    AfterDiscovery,
 }
 
 impl SimilarBookQueryEngine {
@@ -191,12 +228,14 @@ impl SimilarBookQueryEngine {
         container_key: &str,
         immutable_roots: &[String],
         shared_snapshot_candidates: &[Arc<SearchSnapshot>],
+        limits: BookQueryLimits,
         cancel: Arc<AtomicBool>,
     ) -> Result<EngineObservation, BookReadError> {
         self.query_with_timing(
             container_key,
             immutable_roots,
             shared_snapshot_candidates,
+            limits,
             cancel,
             false,
         )
@@ -207,6 +246,7 @@ impl SimilarBookQueryEngine {
         container_key: &str,
         immutable_roots: &[String],
         shared_snapshot_candidates: &[Arc<SearchSnapshot>],
+        limits: BookQueryLimits,
         cancel: Arc<AtomicBool>,
         measure_stage_elapsed: bool,
     ) -> Result<EngineObservation, BookReadError> {
@@ -214,8 +254,10 @@ impl SimilarBookQueryEngine {
             container_key,
             immutable_roots,
             shared_snapshot_candidates,
+            limits,
             cancel,
             measure_stage_elapsed,
+            CandidateBudgetCheck::DuringDiscovery,
             |_| {},
         )
     }
@@ -234,8 +276,10 @@ impl SimilarBookQueryEngine {
         container_key: &str,
         immutable_roots: &[String],
         shared_snapshot_candidates: &[Arc<SearchSnapshot>],
+        limits: BookQueryLimits,
         cancel: Arc<AtomicBool>,
         measure_stage_elapsed: bool,
+        candidate_budget_check: CandidateBudgetCheck,
         after_metadata: F,
     ) -> Result<EngineObservation, BookReadError>
     where
@@ -266,8 +310,10 @@ impl SimilarBookQueryEngine {
                 container_key,
                 immutable_roots,
                 shared_snapshot_candidates,
+                limits,
                 cancel.as_ref(),
                 measure_stage_elapsed,
+                candidate_budget_check,
                 &mut stats,
             ) {
                 Ok(query) => Ok(query),
@@ -303,8 +349,10 @@ fn query_snapshot(
     container_key: &str,
     immutable_roots: &[String],
     shared_snapshot_candidates: &[Arc<SearchSnapshot>],
+    limits: BookQueryLimits,
     cancel: &AtomicBool,
     measure_stage_elapsed: bool,
+    candidate_budget_check: CandidateBudgetCheck,
     stats: &mut BookQueryStats,
 ) -> BodyResult<BookQuery> {
     check_cancelled(cancel)?;
@@ -317,6 +365,9 @@ fn query_snapshot(
         .page_order_resolver(compare_book_pages)
         .load_book_pages(container_key, current_hash_version())?;
     stats.origin_page_count = u64::try_from(origin_pages.len()).unwrap_or(u64::MAX);
+    if stats.origin_page_count > limits.max_pages_per_book {
+        return Ok(BookQuery::TooLarge);
+    }
     if origin_pages.is_empty() {
         return Ok(BookQuery::NotBook);
     }
@@ -357,6 +408,7 @@ fn query_snapshot(
     let mut origin_memo = HashMap::<[u8; 32], SignatureNeighborhood>::new();
     let mut origin_common_items = HashSet::new();
     let mut discoveries = BTreeMap::<String, CandidateDiscovery>::new();
+    let mut retained_candidate_page_count = 0u64;
     for (origin_slot, row) in origin_indexed_rows.iter().enumerate() {
         check_cancelled(cancel)?;
         if row.item.quality < BOOK_MIN_QUALITY {
@@ -398,17 +450,51 @@ fn query_snapshot(
                         }
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     };
-                    discovery.matched_edges = discovery
-                        .matched_edges
-                        .saturating_add(u32::from(*count))
-                        .min(BOOK_MIN_MATCHED_PAGES);
                     discovery.origin_slots.push(origin_slot);
+                    let reached_threshold = match &mut discovery.threshold {
+                        CandidateThreshold::Below { matched_edges } => {
+                            *matched_edges = matched_edges
+                                .saturating_add(u32::from(*count))
+                                .min(BOOK_MIN_MATCHED_PAGES);
+                            *matched_edges >= BOOK_MIN_MATCHED_PAGES
+                        }
+                        CandidateThreshold::Reached { .. } => false,
+                    };
+                    if reached_threshold {
+                        let page_count =
+                            read.count_book_pages(candidate_key, current_hash_version())?;
+                        discovery.threshold = CandidateThreshold::Reached { page_count };
+                        if page_count <= limits.max_pages_per_book {
+                            stats.candidate_book_count_retained =
+                                stats.candidate_book_count_retained.saturating_add(1);
+                            retained_candidate_page_count =
+                                retained_candidate_page_count.saturating_add(page_count);
+                            stats.retained_candidate_page_count = retained_candidate_page_count;
+                            if candidate_budget_check == CandidateBudgetCheck::DuringDiscovery
+                                && retained_candidate_page_count > limits.candidate_page_budget
+                            {
+                                return Ok(BookQuery::TooManyCandidates);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    discoveries.retain(|_, discovery| discovery.matched_edges >= BOOK_MIN_MATCHED_PAGES);
-    stats.candidate_book_count_retained = u64::try_from(discoveries.len()).unwrap_or(u64::MAX);
+    discoveries.retain(|_, discovery| {
+        matches!(
+            discovery.threshold,
+            CandidateThreshold::Reached { page_count }
+                if page_count <= limits.max_pages_per_book
+        )
+    });
+    debug_assert_eq!(
+        stats.candidate_book_count_retained,
+        u64::try_from(discoveries.len()).unwrap_or(u64::MAX)
+    );
+    if retained_candidate_page_count > limits.candidate_page_budget {
+        return Ok(BookQuery::TooManyCandidates);
+    }
     drop(origin_stage);
 
     #[cfg(test)]
@@ -444,9 +530,19 @@ fn query_snapshot(
             ))
             .into());
         }
-        stats.retained_candidate_page_count = stats
-            .retained_candidate_page_count
-            .saturating_add(u64::try_from(candidate_pages.len()).unwrap_or(u64::MAX));
+        let loaded_page_count = u64::try_from(candidate_pages.len()).unwrap_or(u64::MAX);
+        let CandidateThreshold::Reached { page_count } = discovery.threshold else {
+            return Err(EngineError::Invariant(format!(
+                "candidate {candidate_key} reached verification below the discovery threshold"
+            ))
+            .into());
+        };
+        if page_count != loaded_page_count {
+            return Err(EngineError::Invariant(format!(
+                "candidate {candidate_key} page count changed inside one read transaction"
+            ))
+            .into());
+        }
         let mut candidate_indexed_rows = candidate_pages
             .iter()
             .filter(|row| row.item.page_index.is_some())
@@ -818,7 +914,9 @@ mod tests {
     use super::*;
     use crate::dupe::{self, Sig};
     use crate::similar_db::{ContainerKind, ItemKind, SimilarDb, StoredItem};
-    use crate::similar_index::{BookPageMatch, BookPageMatchState, SimilarItemTarget};
+    use crate::similar_index::{
+        BookPageMatch, BookPageMatchState, PRODUCT_BOOK_QUERY_LIMITS, SimilarItemTarget,
+    };
     use crate::similar_search_array::{BaseArray, SearchRecord};
 
     const ROOT: &str = "c:/library";
@@ -929,12 +1027,43 @@ mod tests {
         container_key: &str,
         candidates: &[Arc<SearchSnapshot>],
     ) -> EngineObservation {
+        query_with_limits(engine, container_key, candidates, PRODUCT_BOOK_QUERY_LIMITS)
+    }
+
+    fn query_with_limits(
+        engine: &mut SimilarBookQueryEngine,
+        container_key: &str,
+        candidates: &[Arc<SearchSnapshot>],
+        limits: BookQueryLimits,
+    ) -> EngineObservation {
         engine
             .query(
                 container_key,
                 &[ROOT.to_owned()],
                 candidates,
+                limits,
                 Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+    }
+
+    fn query_with_budget_check(
+        engine: &mut SimilarBookQueryEngine,
+        container_key: &str,
+        candidates: &[Arc<SearchSnapshot>],
+        limits: BookQueryLimits,
+        candidate_budget_check: CandidateBudgetCheck,
+    ) -> EngineObservation {
+        engine
+            .query_after_metadata(
+                container_key,
+                &[ROOT.to_owned()],
+                candidates,
+                limits,
+                Arc::new(AtomicBool::new(false)),
+                false,
+                candidate_budget_check,
+                |_| {},
             )
             .unwrap()
     }
@@ -958,6 +1087,7 @@ mod tests {
                 &worker_key,
                 &[ROOT.to_owned()],
                 &worker_candidates,
+                PRODUCT_BOOK_QUERY_LIMITS,
                 worker_cancel,
             );
             let _ = completed_tx.send((engine, result));
@@ -1474,8 +1604,10 @@ mod tests {
                 &origin_key,
                 &[ROOT.to_owned()],
                 &[],
+                PRODUCT_BOOK_QUERY_LIMITS,
                 cancelled,
                 false,
+                CandidateBudgetCheck::DuringDiscovery,
                 move |_| cancel_from_body.store(true, Ordering::Release),
             )
             .unwrap();
@@ -1588,6 +1720,7 @@ mod tests {
                 &origin_key,
                 &[ROOT.to_owned()],
                 &[shared],
+                PRODUCT_BOOK_QUERY_LIMITS,
                 worker_cancel,
                 true,
             )
@@ -1603,7 +1736,7 @@ mod tests {
         assert_eq!(observation.stats.origin_unique_signature_count, 1);
         assert_eq!(observation.stats.candidate_book_count_discovered, 1);
         assert_eq!(observation.stats.candidate_book_count_retained, 1);
-        assert_eq!(observation.stats.retained_candidate_page_count, 0);
+        assert_eq!(observation.stats.retained_candidate_page_count, 3);
         assert_eq!(observation.stats.origin_neighborhood_lookup_count, 1);
         assert_eq!(observation.stats.candidate_neighborhood_lookup_count, 0);
         assert!(observation.stats.origin_discovery_elapsed.is_some());
@@ -1635,6 +1768,7 @@ mod tests {
                 &origin_key,
                 &[ROOT.to_owned()],
                 &[shared],
+                PRODUCT_BOOK_QUERY_LIMITS,
                 Arc::new(AtomicBool::new(false)),
                 true,
             )
@@ -1650,6 +1784,281 @@ mod tests {
         assert_eq!(observation.stats.candidate_neighborhood_lookup_count, 1);
         assert!(observation.stats.origin_discovery_elapsed.is_some());
         assert!(observation.stats.candidate_verification_elapsed.is_some());
+    }
+
+    #[test]
+    fn origin_page_limit_allows_exact_boundary_and_rejects_boundary_plus_one_without_lookups() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let exact_key = format!("{ROOT}/exact-origin");
+        let too_large_key = format!("{ROOT}/too-large-origin");
+        let exact = [signature(0x03), signature(0x0c), signature(0x30)];
+        let too_large = [
+            signature(0x03),
+            signature(0x0c),
+            signature(0x30),
+            signature(0xc0),
+        ];
+        publish_book(&db, &exact_key, &exact, current_hash_version());
+        publish_book(&db, &too_large_key, &too_large, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+        let limits = BookQueryLimits::new(3, 100);
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+
+        let exact_observation =
+            query_with_limits(&mut engine, &exact_key, &[Arc::clone(&shared)], limits);
+        assert!(matches!(exact_observation.outcome, Ok(BookQuery::Ready(_))));
+        assert_eq!(exact_observation.stats.origin_page_count, 3);
+
+        let too_large_observation =
+            query_with_limits(&mut engine, &too_large_key, &[shared], limits);
+        assert!(matches!(
+            too_large_observation.outcome,
+            Ok(BookQuery::TooLarge)
+        ));
+        assert_eq!(too_large_observation.stats.origin_page_count, 4);
+        assert_eq!(
+            too_large_observation.stats.origin_neighborhood_lookup_count,
+            0
+        );
+        assert_eq!(
+            too_large_observation
+                .stats
+                .candidate_neighborhood_lookup_count,
+            0
+        );
+    }
+
+    fn candidate_cap_fixture(include_oversize: bool) -> (BookRelationHit, BookQueryStats) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let within_key = format!("{ROOT}/within");
+        let oversize_key = format!("{ROOT}/oversize");
+        let matching = [signature(0x03), signature(0x0c), signature(0x30)];
+        publish_book(&db, &origin_key, &matching, current_hash_version());
+        publish_book(
+            &db,
+            &within_key,
+            &[
+                signature(0x03),
+                signature(0x0c),
+                signature(0x30),
+                signature(0xc0),
+            ],
+            current_hash_version(),
+        );
+        if include_oversize {
+            publish_book(
+                &db,
+                &oversize_key,
+                &[
+                    signature(0x03),
+                    signature(0x0c),
+                    signature(0x30),
+                    signature(0xc3),
+                    signature(0xc5),
+                ],
+                current_hash_version(),
+            );
+        }
+        let shared = snapshot(&db);
+        drop(db);
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let observation = query_with_limits(
+            &mut engine,
+            &origin_key,
+            &[shared],
+            BookQueryLimits::new(4, 4),
+        );
+        let stats = observation.stats;
+        let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
+            panic!("candidate cap fixture must complete normally");
+        };
+        assert_eq!(relations.hits.len(), 1);
+        assert_eq!(relations.hits[0].other_container_key, within_key);
+        (relations.hits[0].clone(), stats)
+    }
+
+    #[test]
+    fn oversize_candidate_is_skipped_without_changing_within_limit_hit_or_budget() {
+        let (baseline_hit, baseline_stats) = candidate_cap_fixture(false);
+        let (hit_with_oversize, stats_with_oversize) = candidate_cap_fixture(true);
+
+        assert_eq!(hit_with_oversize, baseline_hit);
+        assert_eq!(stats_with_oversize.candidate_book_count_discovered, 2);
+        assert_eq!(stats_with_oversize.candidate_book_count_retained, 1);
+        assert_eq!(stats_with_oversize.retained_candidate_page_count, 4);
+        assert_eq!(
+            stats_with_oversize.candidate_neighborhood_lookup_count,
+            baseline_stats.candidate_neighborhood_lookup_count,
+            "the limit+1 candidate must receive no candidate-side neighborhood lookup"
+        );
+    }
+
+    #[test]
+    fn oversize_candidate_still_counts_at_common_book_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/common-boundary-origin");
+        let oversize_key = format!("{ROOT}/common-boundary-oversize");
+        let common = affine_signature(0);
+        let within_count = BOOK_MAX_BOOKS_PER_PAGE as usize - 1;
+        let mut origin = vec![common];
+        for book in 0..within_count {
+            let first_code = 1 + book * BOOK_MIN_MATCHED_PAGES as usize;
+            let distinctive = (first_code..first_code + BOOK_MIN_MATCHED_PAGES as usize)
+                .map(affine_signature)
+                .collect::<Vec<_>>();
+            origin.extend_from_slice(&distinctive);
+            let mut candidate = vec![common];
+            candidate.extend_from_slice(&distinctive);
+            publish_book(
+                &db,
+                &format!("{ROOT}/common-boundary-within-{book}"),
+                &candidate,
+                current_hash_version(),
+            );
+        }
+        publish_book(&db, &origin_key, &origin, current_hash_version());
+        let mut oversize = vec![common];
+        oversize.extend((100..122).map(affine_signature));
+        assert_eq!(oversize.len(), origin.len() + 1);
+        publish_book(&db, &oversize_key, &oversize, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+
+        let mut loose_engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let loose = query_with_limits(
+            &mut loose_engine,
+            &origin_key,
+            &[Arc::clone(&shared)],
+            BookQueryLimits::new(oversize.len() as u64, 1_000),
+        );
+        let BookQuery::Ready(loose_relations) = loose.outcome.unwrap() else {
+            panic!("loose common-boundary query must be Ready");
+        };
+        assert_eq!(loose_relations.hits.len(), within_count);
+        assert_eq!(
+            loose_relations.origin.pages[0].baseline,
+            BookPageBaseline::Excluded,
+            "the origin plus seven within-limit books and the oversize book must make the shared page Common"
+        );
+
+        let mut capped_engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let capped = query_with_limits(
+            &mut capped_engine,
+            &origin_key,
+            &[shared],
+            BookQueryLimits::new(origin.len() as u64, 1_000),
+        );
+        let BookQuery::Ready(capped_relations) = capped.outcome.unwrap() else {
+            panic!("capped common-boundary query must be Ready");
+        };
+        assert_eq!(
+            capped_relations, loose_relations,
+            "making the ninth book oversize must not remove it from the per-page Common count"
+        );
+    }
+
+    fn budget_fixture(candidate_pages: &[[u8; 32]]) -> EngineObservation {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let candidate_key = format!("{ROOT}/candidate");
+        publish_book(
+            &db,
+            &origin_key,
+            &[signature(0x03), signature(0x0c), signature(0x30)],
+            current_hash_version(),
+        );
+        publish_book(&db, &candidate_key, candidate_pages, current_hash_version());
+        let shared = snapshot(&db);
+        drop(db);
+        let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        query_with_limits(
+            &mut engine,
+            &origin_key,
+            &[shared],
+            BookQueryLimits::new(10, 3),
+        )
+    }
+
+    #[test]
+    fn candidate_page_budget_allows_exact_boundary_and_rejects_boundary_plus_one() {
+        let exact = budget_fixture(&[signature(0x03), signature(0x0c), signature(0x30)]);
+        assert!(matches!(exact.outcome, Ok(BookQuery::Ready(_))));
+        assert_eq!(exact.stats.retained_candidate_page_count, 3);
+
+        let exceeded = budget_fixture(&[
+            signature(0x03),
+            signature(0x0c),
+            signature(0x30),
+            signature(0xc0),
+        ]);
+        assert!(matches!(exceeded.outcome, Ok(BookQuery::TooManyCandidates)));
+        assert_eq!(exceeded.stats.retained_candidate_page_count, 4);
+        assert_eq!(exceeded.stats.candidate_neighborhood_lookup_count, 0);
+    }
+
+    #[test]
+    fn candidate_budget_early_stop_matches_full_discovery_and_uses_fewer_origin_lookups() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let origin_key = format!("{ROOT}/origin");
+        let origin = [
+            signature(0x03),
+            signature(0x0c),
+            signature(0x30),
+            signature(0xc0),
+        ];
+        publish_book(&db, &origin_key, &origin, current_hash_version());
+        for candidate in 0..2 {
+            publish_book(
+                &db,
+                &format!("{ROOT}/candidate-{candidate}"),
+                &origin[..3],
+                current_hash_version(),
+            );
+        }
+        let shared = snapshot(&db);
+        drop(db);
+        let limits = BookQueryLimits::new(4, 5);
+        let mut early_engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let early = query_with_budget_check(
+            &mut early_engine,
+            &origin_key,
+            &[Arc::clone(&shared)],
+            limits,
+            CandidateBudgetCheck::DuringDiscovery,
+        );
+        let mut full_engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
+        let full = query_with_budget_check(
+            &mut full_engine,
+            &origin_key,
+            &[shared],
+            limits,
+            CandidateBudgetCheck::AfterDiscovery,
+        );
+
+        assert!(matches!(early.outcome, Ok(BookQuery::TooManyCandidates)));
+        assert!(matches!(full.outcome, Ok(BookQuery::TooManyCandidates)));
+        assert_eq!(
+            early.stats.retained_candidate_page_count,
+            full.stats.retained_candidate_page_count
+        );
+        assert_eq!(early.stats.candidate_neighborhood_lookup_count, 0);
+        assert_eq!(full.stats.candidate_neighborhood_lookup_count, 0);
+        assert!(
+            early.stats.origin_neighborhood_lookup_count
+                < full.stats.origin_neighborhood_lookup_count
+        );
     }
 
     #[test]
@@ -1671,8 +2080,10 @@ mod tests {
                 &origin_key,
                 &[ROOT.to_owned()],
                 &[Arc::clone(&shared_before_update)],
+                PRODUCT_BOOK_QUERY_LIMITS,
                 Arc::new(AtomicBool::new(false)),
                 false,
+                CandidateBudgetCheck::DuringDiscovery,
                 |_| publish_book(&db, &candidate_key, &unrelated, current_hash_version()),
             )
             .unwrap();
@@ -1950,6 +2361,7 @@ mod tests {
     #[test]
     #[ignore = "generates persistent 7N and 10,000-page scale stores in a prepared fresh directory"]
     fn generate_and_verify_large_book_engine_fixtures() {
+        let fixture_limits = BookQueryLimits::new(10_000, 10_000);
         let signatures = (0..400).map(affine_signature).collect::<Vec<_>>();
 
         let directory = prepared_scale_fixture_dir("affine-7n-400");
@@ -1974,7 +2386,7 @@ mod tests {
         );
         drop(db);
         let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
-        let observation = query(&mut engine, &origin_key, &[snapshot]);
+        let observation = query_with_limits(&mut engine, &origin_key, &[snapshot], fixture_limits);
         let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
             panic!("affine 7N fixture must be Ready");
         };
@@ -2050,7 +2462,8 @@ mod tests {
             );
             drop(db);
             let mut engine = SimilarBookQueryEngine::open_at(&path).unwrap().unwrap();
-            let observation = query(&mut engine, &origin_key, &[snapshot]);
+            let observation =
+                query_with_limits(&mut engine, &origin_key, &[snapshot], fixture_limits);
             let BookQuery::Ready(relations) = observation.outcome.unwrap() else {
                 panic!("{name} fixture must be Ready");
             };

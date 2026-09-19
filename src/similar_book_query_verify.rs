@@ -24,8 +24,9 @@ use crate::similar_book_query_bench::{
 };
 use crate::similar_db::{PAGE_ORDER_VERSION, current_hash_version};
 use crate::similar_index::{
-    BOOK_COVERAGE, BOOK_MAX_BOOKS_PER_PAGE, BOOK_MIN_MATCHED_PAGES, BOOK_MIN_QUALITY, BOOK_RADIUS,
-    NEARLY_IDENTICAL_MAX_DISTANCE, compare_book_pages,
+    BOOK_CANDIDATE_PAGE_BUDGET, BOOK_COVERAGE, BOOK_MAX_BOOKS_PER_PAGE, BOOK_MAX_PAGES_PER_BOOK,
+    BOOK_MIN_MATCHED_PAGES, BOOK_MIN_QUALITY, BOOK_RADIUS, NEARLY_IDENTICAL_MAX_DISTANCE,
+    compare_book_pages,
 };
 
 const BOOK_ORIGIN: u32 = 1;
@@ -466,9 +467,42 @@ fn verify_with_direct_sql(
     }
     let product_relations = match &product.outcome {
         BenchBookQueryOutcome::Ready { relations } => relations,
-        outcome => {
+        BenchBookQueryOutcome::Preparing => {
+            return Err(
+                "real-book certificate cannot verify a Preparing product result".to_owned(),
+            );
+        }
+        BenchBookQueryOutcome::Featureless => {
+            return Err(
+                "real-book certificate cannot verify a Featureless product result".to_owned(),
+            );
+        }
+        BenchBookQueryOutcome::TooLarge => {
             return Err(format!(
-                "real-book certificate requires a Ready product result, got {outcome:?}"
+                "real-book certificate cannot verify an origin above the {BOOK_MAX_PAGES_PER_BOOK}-page product limit"
+            ));
+        }
+        BenchBookQueryOutcome::TooManyCandidates => {
+            return Err(format!(
+                "real-book certificate cannot verify a query above the {BOOK_CANDIDATE_PAGE_BUDGET}-page product candidate limit"
+            ));
+        }
+        BenchBookQueryOutcome::NotIndexed => {
+            return Err(
+                "real-book certificate cannot verify a NotIndexed product result".to_owned(),
+            );
+        }
+        BenchBookQueryOutcome::NotBook => {
+            return Err("real-book certificate cannot verify a NotBook product result".to_owned());
+        }
+        BenchBookQueryOutcome::Failed { message } => {
+            return Err(format!(
+                "real-book certificate cannot verify a failed product result: {message}"
+            ));
+        }
+        BenchBookQueryOutcome::EngineError { message } => {
+            return Err(format!(
+                "real-book certificate cannot verify a product engine error: {message}"
             ));
         }
     };
@@ -481,6 +515,13 @@ fn verify_with_direct_sql(
     }
     if origin.eligible_pages.is_empty() {
         return Err("oracle origin has no current-hash Complete pages".to_owned());
+    }
+    let origin_page_count = u64::try_from(origin.eligible_pages.len())
+        .map_err(|_| "oracle origin page count exceeds u64".to_owned())?;
+    if origin_page_count > BOOK_MAX_PAGES_PER_BOOK {
+        return Err(format!(
+            "Ready product result has {origin_page_count} origin pages, above the {BOOK_MAX_PAGES_PER_BOOK}-page product limit"
+        ));
     }
 
     let origin_indexed = indexed_pages(&origin.eligible_pages)?;
@@ -526,8 +567,25 @@ fn verify_with_direct_sql(
         }
     }
     discoveries.retain(|_, (edges, _)| *edges >= BOOK_MIN_MATCHED_PAGES);
-    let candidate_count =
-        u64::try_from(discoveries.len()).map_err(|_| "candidate count exceeds u64".to_owned())?;
+    let mut retained_candidates = Vec::with_capacity(discoveries.len());
+    let mut retained_candidate_page_count = 0u64;
+    for (candidate_key, (discovery_edges, slots)) in discoveries {
+        let page_count = count_current_hash_book_pages(&tx, &candidate_key)?;
+        if page_count > BOOK_MAX_PAGES_PER_BOOK {
+            continue;
+        }
+        retained_candidate_page_count = retained_candidate_page_count
+            .checked_add(page_count)
+            .ok_or_else(|| "oracle retained candidate page count overflow".to_owned())?;
+        retained_candidates.push((candidate_key, discovery_edges, slots));
+    }
+    if retained_candidate_page_count > BOOK_CANDIDATE_PAGE_BUDGET {
+        return Err(format!(
+            "Ready product result retained {retained_candidate_page_count} candidate pages, above the {BOOK_CANDIDATE_PAGE_BUDGET}-page product limit"
+        ));
+    }
+    let candidate_count = u64::try_from(retained_candidates.len())
+        .map_err(|_| "candidate count exceeds u64".to_owned())?;
     if candidate_count > spec.budgets.max_candidates {
         return Err(format!(
             "oracle discovered {candidate_count} candidates, limit is {}",
@@ -540,7 +598,10 @@ fn verify_with_direct_sql(
         .iter()
         .map(|hit| hit.other_container_key.clone())
         .collect::<Vec<_>>();
-    let oracle_candidate_keys = discoveries.keys().cloned().collect::<Vec<_>>();
+    let oracle_candidate_keys = retained_candidates
+        .iter()
+        .map(|(key, _, _)| key.clone())
+        .collect::<Vec<_>>();
     if oracle_candidate_keys != product_candidate_keys {
         return Err(format!(
             "oracle candidate keys differ from product: oracle={oracle_candidate_keys:?}, product={product_candidate_keys:?}"
@@ -552,12 +613,12 @@ fn verify_with_direct_sql(
         return Err("oracle origin strip differs from the product result".to_owned());
     }
 
-    let mut candidate_certificates = Vec::with_capacity(discoveries.len());
-    let mut expected_hits = Vec::with_capacity(discoveries.len());
+    let mut candidate_certificates = Vec::with_capacity(retained_candidates.len());
+    let mut expected_hits = Vec::with_capacity(retained_candidates.len());
     let mut legacy_eligible_total = 0u64;
     let mut legacy_pair_total = 0u64;
-    for ((candidate_key, (discovery_edges, _)), product_hit) in
-        discoveries.into_iter().zip(&product_relations.hits)
+    for ((candidate_key, discovery_edges, _), product_hit) in
+        retained_candidates.into_iter().zip(&product_relations.hits)
     {
         let candidate = load_book(
             &tx,
@@ -692,6 +753,19 @@ fn complete_current_hash_row_upper_bound(conn: &Connection) -> Result<u64, Strin
         )
         .map_err(|error| format!("oracle corpus count failed: {error}"))?;
     u64::try_from(count).map_err(|_| format!("oracle corpus count is negative: {count}"))
+}
+
+fn count_current_hash_book_pages(conn: &Connection, container_key: &str) -> Result<u64, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM item i
+               JOIN container c ON c.container_key=i.container_key
+              WHERE i.container_key=?1 AND i.hash_version=?2 AND c.scan_state=?3",
+            params![container_key, current_hash_version(), SCAN_STATE_COMPLETE],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("oracle candidate page count failed: {error}"))?;
+    u64::try_from(count).map_err(|_| format!("oracle candidate page count is negative: {count}"))
 }
 
 fn load_book(

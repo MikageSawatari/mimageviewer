@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::dupe::{self, Algo, Sig};
 use crate::similar_book_engine::{
-    BookQueryStats, EngineError as BookEngineError, SimilarBookQueryEngine,
+    BookQueryLimits, BookQueryStats, EngineError as BookEngineError, SimilarBookQueryEngine,
 };
 use crate::similar_book_query::{
     BookQueryClient, BookQueryDispatchDecision, BookQueryExecutor, BookQueryPoll, BookQueryRequest,
@@ -56,6 +56,10 @@ pub const BOOK_COVERAGE: f32 = 0.5;
 pub const BOOK_MIN_MATCHED_PAGES: u32 = 3;
 pub const BOOK_MAX_BOOKS_PER_PAGE: u32 = 8;
 pub const BOOK_MIN_QUALITY: u8 = 1;
+pub const BOOK_MAX_PAGES_PER_BOOK: u64 = 3_000;
+pub const BOOK_CANDIDATE_PAGE_BUDGET: u64 = 10_000;
+pub(crate) const PRODUCT_BOOK_QUERY_LIMITS: BookQueryLimits =
+    BookQueryLimits::new(BOOK_MAX_PAGES_PER_BOOK, BOOK_CANDIDATE_PAGE_BUDGET);
 
 // 2026-09-05 の HDD 実測では 16 並列が E: 102.7 MB/s / D: 150.8 MB/s でピーク、
 // 32 並列では 85.2 / 111.7 MB/s へ低下した。複数ドライブが同時に走っても各 16 が
@@ -435,6 +439,8 @@ pub enum BookQuery {
     Preparing,
     Ready(BookRelations),
     Featureless,
+    TooLarge,
+    TooManyCandidates,
     NotIndexed,
     NotBook,
     Failed(String),
@@ -2134,6 +2140,7 @@ impl SchedulerBookQueryRuntime {
             request.container_key(),
             &roots,
             &candidates,
+            PRODUCT_BOOK_QUERY_LIMITS,
             cancel,
             measure_stage_elapsed,
         );
@@ -2183,6 +2190,8 @@ fn book_query_terminal_label(terminal: &BookQueryTerminal<Arc<BookQuery>>) -> &'
             BookQuery::Preparing => "preparing",
             BookQuery::Ready(_) => "ready",
             BookQuery::Featureless => "featureless",
+            BookQuery::TooLarge => "too_large",
+            BookQuery::TooManyCandidates => "too_many_candidates",
             BookQuery::NotIndexed => "not_indexed",
             BookQuery::NotBook => "not_book",
             BookQuery::Failed(_) => "failed",
@@ -7074,7 +7083,13 @@ mod tests {
         let resident_after = current_working_set_bytes();
         let summary = match &result {
             BookQuery::Ready(relations) => format!("Ready({})", relations.hits.len()),
-            other => format!("{other:?}"),
+            BookQuery::Preparing => "Preparing".to_owned(),
+            BookQuery::Featureless => "Featureless".to_owned(),
+            BookQuery::TooLarge => "TooLarge".to_owned(),
+            BookQuery::TooManyCandidates => "TooManyCandidates".to_owned(),
+            BookQuery::NotIndexed => "NotIndexed".to_owned(),
+            BookQuery::NotBook => "NotBook".to_owned(),
+            BookQuery::Failed(error) => format!("Failed({error})"),
         };
         eprintln!(
             "similar_book_query_measurement rows={rows} pages={} load_ms={load_ms:.1} query_ms={query_ms:.1} resident_before_bytes={resident_before} resident_loaded_bytes={resident_loaded} resident_after_bytes={resident_after} query_delta_bytes={} result={summary}",
@@ -9754,6 +9769,7 @@ mod tests {
                     &origin_key,
                     &[root.to_owned()],
                     &[snapshot],
+                    PRODUCT_BOOK_QUERY_LIMITS,
                     Arc::new(AtomicBool::new(false)),
                 )
                 .unwrap();

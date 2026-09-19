@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use crate::dupe::book::Relation;
 use crate::similar_book_engine::{BookQueryStats, EngineObservation, SimilarBookQueryEngine};
 use crate::similar_db::{BookReadMetadata, SimilarBookReader, key_is_under_any};
-use crate::similar_index::{BookPageBaseline, BookPageMatchState, BookQuery, SimilarItemTarget};
+use crate::similar_index::{
+    BookPageBaseline, BookPageMatchState, BookQuery, PRODUCT_BOOK_QUERY_LIMITS, SimilarItemTarget,
+};
 use crate::similar_search_array::{SearchSnapshot, read_book_query_benchmark_base};
 
 #[derive(Clone, Debug)]
@@ -116,6 +118,8 @@ pub struct BenchBookReadMetadata {
 pub enum BenchBookQueryOutcome {
     Preparing,
     Featureless,
+    TooLarge,
+    TooManyCandidates,
     NotIndexed,
     NotBook,
     Failed { message: String },
@@ -530,6 +534,7 @@ impl BenchEngine {
                 origin,
                 &self.immutable_roots,
                 &self.active_snapshots,
+                PRODUCT_BOOK_QUERY_LIMITS,
                 Arc::new(AtomicBool::new(false)),
                 true,
             )
@@ -610,6 +615,8 @@ fn certificate_outcome(
     match outcome {
         Ok(BookQuery::Preparing) => BenchBookQueryOutcome::Preparing,
         Ok(BookQuery::Featureless) => BenchBookQueryOutcome::Featureless,
+        Ok(BookQuery::TooLarge) => BenchBookQueryOutcome::TooLarge,
+        Ok(BookQuery::TooManyCandidates) => BenchBookQueryOutcome::TooManyCandidates,
         Ok(BookQuery::NotIndexed) => BenchBookQueryOutcome::NotIndexed,
         Ok(BookQuery::NotBook) => BenchBookQueryOutcome::NotBook,
         Ok(BookQuery::Failed(message)) => BenchBookQueryOutcome::Failed { message },
@@ -737,6 +744,14 @@ fn summarize_observation(observation: &EngineObservation) -> BenchQuerySummary {
         Ok(BookQuery::Featureless) => {
             put_bytes(&mut digest, b"featureless");
             ("featureless".to_owned(), 0, 0, 0)
+        }
+        Ok(BookQuery::TooLarge) => {
+            put_bytes(&mut digest, b"too_large");
+            ("too_large".to_owned(), 0, 0, 0)
+        }
+        Ok(BookQuery::TooManyCandidates) => {
+            put_bytes(&mut digest, b"too_many_candidates");
+            ("too_many_candidates".to_owned(), 0, 0, 0)
         }
         Ok(BookQuery::NotIndexed) => {
             put_bytes(&mut digest, b"not_indexed");

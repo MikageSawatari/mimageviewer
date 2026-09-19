@@ -16,7 +16,7 @@ use mimageviewer::similar_book_query_bench::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 fn main() {
     if let Err(error) = run() {

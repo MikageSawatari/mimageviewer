@@ -3994,6 +3994,9 @@ struct BookDrawProbe {
     visible_strip_folds: u64,
     origin_projections: u64,
     final_row_reached: bool,
+    heading_drawn: bool,
+    spinner_drawn: bool,
+    state_message: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -4070,6 +4073,9 @@ pub(crate) fn draw_book_move_action_for_test(
     actions.open_page.map(|action| action.value)
 }
 
+const BOOK_TOO_LARGE_MESSAGE: &str = "ページ数が多いため、重なる本の検索はできません";
+const BOOK_TOO_MANY_CANDIDATES_MESSAGE: &str = "重なる候補が多いため、検索を打ち切りました";
+
 /// 「この本と重なる本」。
 ///
 /// 本を開いていないときは何も出さない。`NotBook` は失敗ではなく「この画像は本のページでは
@@ -4101,11 +4107,16 @@ fn draw_book_relations(
             .strong(),
     );
     #[cfg(test)]
-    LAST_BOOK_SECTION_HEADING_RECT.with(|last| last.set(Some(_heading.rect)));
+    {
+        LAST_BOOK_SECTION_HEADING_RECT.with(|last| last.set(Some(_heading.rect)));
+        book_draw_probe_update(|probe| probe.heading_drawn = true);
+    }
     ui.add_space(4.0);
     match book {
         BookQuery::NotBook | BookQuery::NotIndexed => {}
         BookQuery::Preparing => {
+            #[cfg(test)]
+            book_draw_probe_update(|probe| probe.spinner_drawn = true);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("調べています");
@@ -4115,6 +4126,26 @@ fn draw_book_relations(
         BookQuery::Featureless => {
             ui.label(
                 egui::RichText::new("この本は特徴の少ないページばかりで判定できません")
+                    .color(DIM_COLOR)
+                    .size(11.0),
+            );
+        }
+        BookQuery::TooLarge => {
+            #[cfg(test)]
+            book_draw_probe_update(|probe| probe.state_message = Some(BOOK_TOO_LARGE_MESSAGE));
+            ui.label(
+                egui::RichText::new(BOOK_TOO_LARGE_MESSAGE)
+                    .color(DIM_COLOR)
+                    .size(11.0),
+            );
+        }
+        BookQuery::TooManyCandidates => {
+            #[cfg(test)]
+            book_draw_probe_update(|probe| {
+                probe.state_message = Some(BOOK_TOO_MANY_CANDIDATES_MESSAGE)
+            });
+            ui.label(
+                egui::RichText::new(BOOK_TOO_MANY_CANDIDATES_MESSAGE)
                     .color(DIM_COLOR)
                     .size(11.0),
             );
@@ -5026,6 +5057,24 @@ pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
                     &mut actions,
                 );
                 ui.add_space(10.0);
+            }
+            for book in [
+                crate::similar_index::BookQuery::TooLarge,
+                crate::similar_index::BookQuery::TooManyCandidates,
+            ] {
+                draw_book_relations(
+                    ui,
+                    &book,
+                    &[],
+                    &mut state,
+                    72,
+                    85,
+                    crate::thumb_loader::CacheDecision::without_thumbnail(),
+                    None,
+                    &ctx,
+                    &move_frame,
+                    &mut actions,
+                );
             }
         });
 }
@@ -6254,6 +6303,58 @@ mod similar_panel_tests {
             }),
             "missing 100 ms refresh poll in {requests:?}"
         );
+    }
+
+    #[test]
+    fn book_query_limit_terminals_draw_reason_without_spinner_or_repaint() {
+        for (book, expected_message) in [
+            (
+                crate::similar_index::BookQuery::TooLarge,
+                super::BOOK_TOO_LARGE_MESSAGE,
+            ),
+            (
+                crate::similar_index::BookQuery::TooManyCandidates,
+                super::BOOK_TOO_MANY_CANDIDATES_MESSAGE,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let requests_cb = std::sync::Arc::clone(&requests);
+            ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
+            let _ = ctx.run(Default::default(), |_| {});
+            requests.lock().unwrap().clear();
+
+            let mut state = SimilarPanelState::default();
+            super::book_draw_probe_begin();
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let move_frame = SimilarMoveFrameInput::capture(ctx, &state);
+                    let mut actions = super::SimilarPanelActions::default();
+                    super::draw_book_relations(
+                        ui,
+                        &book,
+                        &[],
+                        &mut state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &move_frame,
+                        &mut actions,
+                    );
+                });
+            });
+            let probe = super::book_draw_probe_finish();
+
+            assert!(probe.heading_drawn);
+            assert!(!probe.spinner_drawn);
+            assert_eq!(probe.state_message, Some(expected_message));
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "terminal {book:?} unexpectedly requested a repaint"
+            );
+        }
     }
 
     #[test]
