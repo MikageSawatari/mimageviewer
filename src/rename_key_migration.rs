@@ -230,26 +230,41 @@ impl StoreMutationEffects {
 /// per-store エラーの再試行はしない (通常経路と同じ best-effort)。
 pub const JOURNAL_FILE: &str = "rename_migration_journal.json";
 
-/// ジャーナルを読み込む (無い / 壊れている場合は空)。
-pub(crate) fn journal_load(data_dir: &Path) -> Vec<PathMigrationJob> {
+#[derive(Debug)]
+pub(crate) enum JournalLoadError {
+    Read(std::io::Error),
+    Parse(serde_json::Error),
+}
+
+impl std::fmt::Display for JournalLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "read failed: {error}"),
+            Self::Parse(error) => write!(formatter, "parse failed: {error}"),
+        }
+    }
+}
+
+/// A missing file means no recovery work. Any other read or format error must
+/// reach the App admission owner; treating it as empty would erase old bytes.
+pub(crate) fn journal_load(data_dir: &Path) -> Result<Vec<PathMigrationJob>, JournalLoadError> {
     let path = data_dir.join(JOURNAL_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(JournalLoadError::Read(error)),
     };
     if let Ok(entries) = serde_json::from_slice::<Vec<PathMigrationJob>>(&bytes) {
-        return entries;
+        return Ok(entries);
     }
     // v3.10 and earlier stored a bare list of pairs. A recovered legacy entry is treated as Tree:
     // exact sources still match, while a folder rename cannot strand collection descendants.
     match serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(&bytes) {
-        Ok(entries) => entries
+        Ok(entries) => Ok(entries
             .into_iter()
             .map(|(old_path, new_path)| PathMigrationJob::shell_rename(old_path, new_path, true))
-            .collect(),
-        Err(e) => {
-            crate::logger::log(format!("[RENAME-MIG] journal parse failed (discard): {e}"));
-            Vec::new()
-        }
+            .collect()),
+        Err(error) => Err(JournalLoadError::Parse(error)),
     }
 }
 
@@ -2301,14 +2316,14 @@ mod tests {
             .enqueue(dir.path().to_path_buf(), entries.clone())
             .unwrap();
         drop(writer);
-        assert_eq!(journal_load(dir.path()), entries);
+        assert_eq!(journal_load(dir.path()).unwrap(), entries);
     }
 
-    /// ジャーナルの往復と消し込み (空で削除・無ければ空・壊れていたら破棄)。
+    /// ジャーナルの往復と消し込み。壊れた記録は旧 bytes を保持する。
     #[test]
     fn journal_roundtrip_and_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(journal_load(dir.path()).is_empty(), "無ければ空");
+        assert!(journal_load(dir.path()).unwrap().is_empty(), "無ければ空");
         let entries = vec![
             PathMigrationJob::shell_rename(
                 PathBuf::from(r"D:\a.jpg"),
@@ -2322,14 +2337,43 @@ mod tests {
             ),
         ];
         journal_save(dir.path(), &entries).unwrap();
-        assert_eq!(journal_load(dir.path()), entries, "往復で一致");
+        assert_eq!(journal_load(dir.path()).unwrap(), entries, "往復で一致");
         journal_save(dir.path(), &[]).unwrap();
         assert!(
             !dir.path().join(JOURNAL_FILE).exists(),
             "空になったらファイルごと削除"
         );
         std::fs::write(dir.path().join(JOURNAL_FILE), b"broken json").unwrap();
-        assert!(journal_load(dir.path()).is_empty(), "壊れていたら空で続行");
+        assert!(matches!(
+            journal_load(dir.path()),
+            Err(JournalLoadError::Parse(_))
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap(),
+            b"broken json"
+        );
+    }
+
+    #[test]
+    fn journal_load_distinguishes_read_error_and_legacy_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join(JOURNAL_FILE);
+        std::fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            journal_load(dir.path()),
+            Err(JournalLoadError::Read(_))
+        ));
+        std::fs::remove_dir(&journal).unwrap();
+        let pairs = vec![(PathBuf::from("old"), PathBuf::from("new"))];
+        std::fs::write(&journal, serde_json::to_vec(&pairs).unwrap()).unwrap();
+        assert_eq!(
+            journal_load(dir.path()).unwrap(),
+            vec![PathMigrationJob::shell_rename(
+                PathBuf::from("old"),
+                PathBuf::from("new"),
+                true,
+            )]
+        );
     }
 
     #[test]
@@ -2406,7 +2450,7 @@ mod tests {
 
         assert_eq!(writer.status(retry_revision), JournalPersistStatus::Saved);
         assert_eq!(
-            journal_load(&blocked),
+            journal_load(&blocked).unwrap(),
             latest_entries,
             "retry writes the App's newest full snapshot, not the retained older failure"
         );
@@ -2427,7 +2471,7 @@ mod tests {
         )];
         journal_save(dir.path(), &first).unwrap();
         journal_save(dir.path(), &second).unwrap();
-        assert_eq!(journal_load(dir.path()), second);
+        assert_eq!(journal_load(dir.path()).unwrap(), second);
     }
 
     /// 連続リネーム A→B→C は **実行順どおり**なら C に集約される。逆順で実行すると

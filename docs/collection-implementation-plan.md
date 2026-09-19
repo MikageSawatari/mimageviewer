@@ -1244,6 +1244,11 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
 `rename_pending` に scope を同梱する。既存テストは `spawn_rename_key_migration` を直接呼び配線を迂回して
 いるので、dialog → poll を通す handler-level 回帰を 1 件足す。
 
+2026-09-20、M-2 と同じ Shell rename の所有境界で実装。`RenamePending` が receiver と
+開始時の Exact / Tree を所有し、ダイアログの消去や Empty poll で scope を失わない。
+焦点回帰と独立コードレビューは成功し、最終の本体全回帰・確認ビルドも成功した。
+検証の正本は [復旧記録の保護](collection-migration-journal-recovery.md)。
+
 ### 23.6 一過性状態の typed 化（C-1 / C-2 / C-3 / B-3）
 
 read 経路の入口を `collection_store_client_for_migration` と同じ `Result<Option<_>, CollectionStoreError>` へ揃え、
@@ -1303,3 +1308,14 @@ M-2 も 2026-09-20 に利用者が修正を承認し、出荷前対象へ戻し�
 本棚 Copy も元ページの番号変更を伴うため対象とし、純粋な追加コピーは維持する。
 同じ Shell rename の pending 所有境界を触るため、§23.5 の M-1（開始時の Exact / Tree 捕捉）も
 このまとまりで実装・検証する。初回読込は既存の一回から増やさず、明示再読込は非同期とする。
+実装・独立コードレビュー・自動検証・確認ビルドを完了した。実機確認は未実施。
+処理中の削除対象への generic migration の
+新規開始を既存の pending owner で保留し、完全成功した削除結果だけを invalidation する。
+本棚の部分削除失敗は別の設計を要するため、残件を保留バックログ §1.258 に記録した。
+検証結果・既存の保存失敗に関する範囲外事項は
+[復旧記録の保護](collection-migration-journal-recovery.md) を正本とする。
+全体 gate は成功し、最後の再読込開始時 repaint 追加後に本体全回帰 8,686 件成功 / 45 件除外、
+焦点 recovery 17 件成功で再検証した。無変更の workspace / vendor は直前の全体 gate を再利用。
+fmt / UI glyph / diff check と `scripts/build-dev.ps1 -PreserveRuntime` はすべて exit 0。
+core SHA-256: `F64B64B514E638D7F23F1AA7CB9B52F7AD07D464A3B5B35B57F553FF189D2F28`。
+Remote SHA-256: `60F4EFD348C5AD5A1963BD61B7D8DD79855CA4C707B275C901324C9247793AA9`。

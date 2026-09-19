@@ -86,6 +86,8 @@ pub enum BookOpResult {
     },
     Deleted {
         name: String,
+        /// Exact folder removed by this worker, independent of later settings changes.
+        path: PathBuf,
     },
     Reordered {
         folder: PathBuf,
@@ -200,6 +202,21 @@ impl Drop for PreparedBookmarkMigration {
 
 pub struct BookOpPending {
     pub rx: std::sync::mpsc::Receiver<Result<BookOpResult, String>>,
+    pub intent: BookOpIntent,
+}
+
+/// The physical operation owned by a pending book worker. A delete retains its
+/// exact requested root until the success result supplies the removed path.
+pub enum BookOpIntent {
+    Unrelated,
+    SourceMutation,
+    Delete { path: PathBuf },
+}
+
+impl BookOpIntent {
+    pub fn blocks_rename_migration(&self) -> bool {
+        !matches!(self, Self::Unrelated)
+    }
 }
 
 pub enum BookPageSource {
@@ -733,7 +750,7 @@ pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
     ensure_direct_book_target(root, &path)?;
     fs::remove_dir_all(&path)
         .map_err(|e| format!("本を削除できません: {}: {e}", path.display()))?;
-    Ok(BookOpResult::Deleted { name })
+    Ok(BookOpResult::Deleted { name, path })
 }
 
 pub fn append_pages(

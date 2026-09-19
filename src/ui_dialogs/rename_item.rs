@@ -10,6 +10,10 @@ use crate::native_name_dialog::{NameInputRequest, NamePromptOutcome};
 
 pub(crate) type RenameResult = crate::shell_file_ops::ShellRenameResult;
 pub(crate) type RenameReceiver = mpsc::Receiver<RenameResult>;
+pub(crate) struct RenamePending {
+    pub(crate) rx: RenameReceiver,
+    pub(crate) collection_scope: crate::collection_store::CollectionSourceMigrationScope,
+}
 
 const DIALOG_TITLE: &str = "名前の変更";
 
@@ -114,26 +118,43 @@ impl App {
                 }
             }
 
-            self.clear_rename_dialog_state();
-            self.rename_pending = Some(crate::shell_file_ops::rename_item_async(
-                owner, target, name,
-            ));
-            ctx.request_repaint();
+            self.start_rename_item_after_confirmation(ctx, owner, target, name, target_is_file);
             return;
         }
     }
 
+    /// The last boundary before the Shell worker can rename a real item.
+    pub(crate) fn start_rename_item_after_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        owner: Option<isize>,
+        target: PathBuf,
+        name: String,
+        target_is_file: bool,
+    ) {
+        if !self.admit_rename_migration_source_change(ctx) {
+            self.clear_rename_dialog_state();
+            return;
+        }
+        let collection_scope = if target_is_file {
+            crate::collection_store::CollectionSourceMigrationScope::Exact
+        } else {
+            crate::collection_store::CollectionSourceMigrationScope::Tree
+        };
+        self.clear_rename_dialog_state();
+        self.rename_pending = Some(RenamePending {
+            rx: crate::shell_file_ops::rename_item_async(owner, target, name),
+            collection_scope,
+        });
+        ctx.request_repaint();
+    }
+
     pub(crate) fn poll_rename_pending(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.rename_pending.take() else {
+        let Some(pending) = self.rename_pending.take() else {
             return;
         };
-        match rx.try_recv() {
+        match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
-                let collection_scope = if self.rename_target_is_file {
-                    crate::collection_store::CollectionSourceMigrationScope::Exact
-                } else {
-                    crate::collection_store::CollectionSourceMigrationScope::Tree
-                };
                 self.clear_rename_dialog_state();
                 if outcome.aborted {
                     self.show_feedback_toast("名前の変更をキャンセルしました".to_owned());
@@ -157,7 +178,7 @@ impl App {
                 self.spawn_rename_key_migration(
                     outcome.target.clone(),
                     outcome.new_path.clone(),
-                    collection_scope,
+                    pending.collection_scope,
                 );
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
                     self.current_folder
@@ -179,21 +200,24 @@ impl App {
             }
             Ok(Err(message)) => {
                 self.clear_rename_dialog_state();
-                crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, &message);
+                self.report_rename_worker_warning(&message);
             }
             Err(mpsc::TryRecvError::Empty) => {
-                self.rename_pending = Some(rx);
+                self.rename_pending = Some(pending);
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.clear_rename_dialog_state();
-                crate::native_name_dialog::show_warning(
-                    self.main_hwnd,
-                    DIALOG_TITLE,
-                    "名前変更 worker が終了しました",
-                );
+                self.report_rename_worker_warning("名前変更 worker が終了しました");
             }
         }
+    }
+
+    fn report_rename_worker_warning(&mut self, message: &str) {
+        #[cfg(not(test))]
+        crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, message);
+        #[cfg(test)]
+        self.show_feedback_toast(message.to_owned());
     }
 
     fn clear_rename_dialog_state(&mut self) {

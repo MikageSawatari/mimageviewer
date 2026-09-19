@@ -11231,8 +11231,25 @@ pub(crate) enum RenameMigrationInFlight {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum RenameMigrationJournalAdmission {
+    /// The one-time recovery read has not run yet.
+    Unloaded,
+    /// An explicit user retry is reading the old journal off the UI thread.
+    RecoveryRetrying {
+        rx: std::sync::mpsc::Receiver<
+            Result<
+                Vec<crate::rename_key_migration::PathMigrationJob>,
+                crate::rename_key_migration::JournalLoadError,
+            >,
+        >,
+        deferred_removed: Vec<std::path::PathBuf>,
+    },
+    /// Existing bytes could not be read or parsed. No snapshot may replace them.
+    RecoveryFailed {
+        message: String,
+        deferred_removed: Vec<std::path::PathBuf>,
+    },
     /// Boot-recovered entries are already represented by the journal on disk.
     Durable,
     /// A complete current queue snapshot is being written by the journal worker.
@@ -12616,7 +12633,7 @@ pub struct App {
     // ── 実ファイル/実フォルダの名前変更ダイアログ ───────────────
     pub(crate) show_rename_dialog: bool,
     pub(crate) rename_target: Option<PathBuf>,
-    pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenameReceiver>,
+    pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenamePending>,
     /// ダイアログ要求時点で対象が実ファイルだったか。
     pub(crate) rename_target_is_file: bool,
     /// リネーム移行 (`rename_key_migration`) のジョブキュー (FIFO)。連続リネーム
@@ -12631,10 +12648,6 @@ pub struct App {
     /// 実行中に worker が消息不明 (Disconnected) になったジョブ。セッション内では
     /// 再試行せず、ジャーナルに残して次回起動時に再実行する。
     pub(crate) rename_migration_boot_retry: Vec<crate::rename_key_migration::PathMigrationJob>,
-    /// ジャーナル (`rename_key_migration::JOURNAL_FILE`) を今セッションで読み込み済みか。
-    /// 最初の enqueue / poll の前に必ず読み込む (先に enqueue の persist が走ると
-    /// 前セッションの回復エントリを上書きしてしまうため)。
-    pub(crate) rename_migration_journal_loaded: bool,
     /// Filesystem writes are serialized and coalesced off the UI thread. Created lazily so an
     /// App that never changes a rename journal does not start another resident worker.
     pub(crate) rename_migration_journal_writer:
@@ -16215,9 +16228,8 @@ impl App {
             rename_migration_queue: std::collections::VecDeque::new(),
             rename_migration_in_flight: None,
             rename_migration_boot_retry: Vec::new(),
-            rename_migration_journal_loaded: false,
             rename_migration_journal_writer: None,
-            rename_migration_journal_admission: RenameMigrationJournalAdmission::Durable,
+            rename_migration_journal_admission: RenameMigrationJournalAdmission::Unloaded,
             rename_rehydrate_main_deferred: false,
             #[cfg(test)]
             rename_migration_data_dir_override: None,
@@ -31508,6 +31520,10 @@ impl App {
     }
 
     fn persist_rename_migration_journal_attempt(&mut self, retry_attempt: u8) {
+        if !self.ensure_rename_migration_journal_loaded() {
+            // An unreadable prior snapshot is never replaced, including by an empty one.
+            return;
+        }
         let mut entries: Vec<crate::rename_key_migration::PathMigrationJob> = Vec::new();
         if let Some(job) = &self.rename_migration_in_flight {
             entries.push(match job {
@@ -31564,74 +31580,89 @@ impl App {
     /// Nonblocking admission check. The UI thread only observes the journal worker's tiny state
     /// mutex; filesystem I/O and waiting remain on the worker/final-exit boundary.
     fn rename_migration_journal_allows_start(&mut self) -> bool {
-        let admission = self.rename_migration_journal_admission.clone();
-        match admission {
-            RenameMigrationJournalAdmission::Durable => true,
-            RenameMigrationJournalAdmission::Waiting {
-                revision,
-                retry_attempt,
-            } => {
-                let status = self
-                    .rename_migration_journal_writer
-                    .as_ref()
-                    .map(|writer| writer.status(revision))
-                    .unwrap_or_else(|| {
-                        crate::rename_key_migration::JournalPersistStatus::Failed(
-                            "journal writer missing".into(),
-                        )
-                    });
-                match status {
-                    crate::rename_key_migration::JournalPersistStatus::Pending => false,
-                    crate::rename_key_migration::JournalPersistStatus::Saved => {
-                        self.rename_migration_journal_admission =
-                            RenameMigrationJournalAdmission::Durable;
-                        true
-                    }
-                    crate::rename_key_migration::JournalPersistStatus::Failed(message) => {
-                        self.rename_migration_journal_admission = self
-                            .rename_migration_journal_failed(
-                                Some(revision),
-                                message,
-                                retry_attempt,
-                            );
-                        self.rename_migration_journal_allows_start()
-                    }
-                }
-            }
-            RenameMigrationJournalAdmission::Failed {
-                revision,
-                message,
-                reported,
-                retry_attempt,
-                retry_after,
-            } => {
-                if !reported {
-                    crate::logger::log(format!(
-                        "[RENAME-MIG] migration held because journal is not durable revision={revision:?}: {message}"
-                    ));
-                    self.show_feedback_toast(
-                        "名前変更に伴う設定の引き継ぎを保存できませんでした。移行は開始していません"
-                            .into(),
-                    );
-                    self.rename_migration_journal_admission =
-                        RenameMigrationJournalAdmission::Failed {
-                            revision,
-                            message: message.clone(),
-                            reported: true,
-                            retry_attempt,
-                            retry_after,
-                        };
-                }
-                if retry_after.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                    && let Some(retry_attempt) = retry_attempt
-                {
-                    // Rebuild the complete snapshot from the App owner. This supersedes the
-                    // writer's retained failed snapshot and cannot resurrect an older queue.
-                    self.persist_rename_migration_journal_attempt(retry_attempt);
-                }
-                false
-            }
+        if !self.ensure_rename_migration_journal_loaded() {
+            return false;
         }
+        if matches!(
+            self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Durable
+        ) {
+            return true;
+        }
+        if let RenameMigrationJournalAdmission::Waiting {
+            revision,
+            retry_attempt,
+        } = &self.rename_migration_journal_admission
+        {
+            let revision = *revision;
+            let retry_attempt = *retry_attempt;
+            let status = self
+                .rename_migration_journal_writer
+                .as_ref()
+                .map(|writer| writer.status(revision))
+                .unwrap_or_else(|| {
+                    crate::rename_key_migration::JournalPersistStatus::Failed(
+                        "journal writer missing".into(),
+                    )
+                });
+            return match status {
+                crate::rename_key_migration::JournalPersistStatus::Pending => false,
+                crate::rename_key_migration::JournalPersistStatus::Saved => {
+                    self.rename_migration_journal_admission =
+                        RenameMigrationJournalAdmission::Durable;
+                    true
+                }
+                crate::rename_key_migration::JournalPersistStatus::Failed(message) => {
+                    self.rename_migration_journal_admission = self.rename_migration_journal_failed(
+                        Some(revision),
+                        message,
+                        retry_attempt,
+                    );
+                    self.rename_migration_journal_allows_start()
+                }
+            };
+        }
+        if let RenameMigrationJournalAdmission::Failed {
+            revision,
+            message,
+            reported,
+            retry_attempt,
+            retry_after,
+        } = &self.rename_migration_journal_admission
+        {
+            let (revision, message, reported, retry_attempt, retry_after) = (
+                *revision,
+                message.clone(),
+                *reported,
+                *retry_attempt,
+                *retry_after,
+            );
+            if !reported {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] migration held because journal is not durable revision={revision:?}: {message}"
+                ));
+                self.show_feedback_toast(
+                    "名前変更に伴う設定の引き継ぎを保存できませんでした。移行は開始していません"
+                        .into(),
+                );
+                self.rename_migration_journal_admission = RenameMigrationJournalAdmission::Failed {
+                    revision,
+                    message: message.clone(),
+                    reported: true,
+                    retry_attempt,
+                    retry_after,
+                };
+            }
+            if retry_after.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                && let Some(retry_attempt) = retry_attempt
+            {
+                // Rebuild the complete snapshot from the App owner. This supersedes the
+                // writer's retained failed snapshot and cannot resurrect an older queue.
+                self.persist_rename_migration_journal_attempt(retry_attempt);
+            }
+            return false;
+        }
+        false
     }
 
     /// Final-exit fence for collection migration commands already admitted to the actor. Generic
@@ -31640,7 +31671,17 @@ impl App {
     fn resolve_collection_migration_for_exit(&mut self) {
         // Startup recovery is lazy, but exit is also a journal writer. Merge the prior durable
         // snapshot before publishing the current one so an immediate close cannot erase it.
-        self.ensure_rename_migration_journal_loaded();
+        if !self.ensure_rename_migration_journal_loaded() {
+            let warning = "名前変更の復旧記録を読み取れません。旧記録を保護したまま終了します。次回起動後に読み取れる状態へ戻してください";
+            crate::logger::log(format!("[RENAME-MIG] final recovery warning: {warning}"));
+            #[cfg(not(test))]
+            crate::native_name_dialog::show_warning(
+                self.main_hwnd,
+                "復旧記録を読み取れません",
+                warning,
+            );
+            return;
+        }
         let (job, rx) = match self.rename_migration_in_flight.take() {
             Some(RenameMigrationInFlight::Collection { job, rx }) => (job, rx),
             other => {
@@ -31678,20 +31719,166 @@ impl App {
     /// 前に必ず 1 回呼ばれる (先に enqueue の persist が走ると回復エントリを上書き
     /// してしまうため、lazy guard で担保する)。移行は冪等なので、クラッシュで途中まで
     /// 走ったジョブを再実行しても安全 (角度⑤ Sol/Terra P1)。
-    fn ensure_rename_migration_journal_loaded(&mut self) {
-        if self.rename_migration_journal_loaded {
-            return;
+    fn ensure_rename_migration_journal_loaded(&mut self) -> bool {
+        if matches!(
+            self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded
+        ) {
+            match crate::rename_key_migration::journal_load(&self.rename_migration_data_dir()) {
+                Ok(entries) => self.adopt_rename_migration_recovery(entries, false),
+                Err(error) => {
+                    crate::logger::log(format!("[RENAME-MIG] recovery read failed: {error}"));
+                    self.rename_migration_journal_admission =
+                        RenameMigrationJournalAdmission::RecoveryFailed {
+                            message: error.to_string(),
+                            deferred_removed: Vec::new(),
+                        };
+                }
+            }
         }
-        self.rename_migration_journal_loaded = true;
-        let entries = crate::rename_key_migration::journal_load(&self.rename_migration_data_dir());
-        if entries.is_empty() {
-            return;
+        self.poll_rename_migration_recovery_retry();
+        !matches!(
+            self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded
+                | RenameMigrationJournalAdmission::RecoveryRetrying { .. }
+                | RenameMigrationJournalAdmission::RecoveryFailed { .. }
+        )
+    }
+
+    fn adopt_rename_migration_recovery(
+        &mut self,
+        entries: Vec<crate::rename_key_migration::PathMigrationJob>,
+        publish_local_snapshot: bool,
+    ) {
+        if !entries.is_empty() {
+            crate::logger::log(format!(
+                "[RENAME-MIG] recovering {} unfinished migration(s) from journal",
+                entries.len()
+            ));
         }
-        crate::logger::log(format!(
-            "[RENAME-MIG] recovering {} unfinished migration(s) from journal",
-            entries.len()
-        ));
-        self.rename_migration_queue.extend(entries);
+        let mut restored = std::collections::VecDeque::from(entries);
+        restored.append(&mut self.rename_migration_queue);
+        self.rename_migration_queue = restored;
+        self.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        if publish_local_snapshot {
+            self.persist_rename_migration_journal();
+        }
+    }
+
+    fn poll_rename_migration_recovery_retry(&mut self) {
+        let result = match &self.rename_migration_journal_admission {
+            RenameMigrationJournalAdmission::RecoveryRetrying { rx, .. } => rx.try_recv(),
+            _ => return,
+        };
+        match result {
+            Ok(Ok(entries)) => {
+                // Work completed while the read was failing must join the old snapshot before
+                // any migration is admitted or the journal is replaced.
+                let local_work = self.rename_migration_in_flight.is_some()
+                    || !self.rename_migration_queue.is_empty()
+                    || !self.rename_migration_boot_retry.is_empty();
+                let deferred_removed = match &mut self.rename_migration_journal_admission {
+                    RenameMigrationJournalAdmission::RecoveryRetrying {
+                        deferred_removed, ..
+                    } => std::mem::take(deferred_removed),
+                    _ => unreachable!("retry result has its owner"),
+                };
+                self.adopt_rename_migration_recovery(entries, false);
+                if !deferred_removed.is_empty() {
+                    self.invalidate_rename_migrations_for_removed_paths(&deferred_removed);
+                }
+                if local_work {
+                    self.persist_rename_migration_journal();
+                }
+                self.show_feedback_toast(
+                    "復旧記録を読み取れました。操作をもう一度実行してください".into(),
+                );
+            }
+            Ok(Err(error)) => {
+                crate::logger::log(format!("[RENAME-MIG] recovery retry failed: {error}"));
+                let deferred_removed = match &mut self.rename_migration_journal_admission {
+                    RenameMigrationJournalAdmission::RecoveryRetrying {
+                        deferred_removed, ..
+                    } => std::mem::take(deferred_removed),
+                    _ => unreachable!("retry result has its owner"),
+                };
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        message: error.to_string(),
+                        deferred_removed,
+                    };
+                self.show_feedback_toast(
+                    "復旧記録をまだ読み取れません。元の記録を保護し、変更は実行していません。次の操作で再確認できます"
+                        .into(),
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let deferred_removed = match &mut self.rename_migration_journal_admission {
+                    RenameMigrationJournalAdmission::RecoveryRetrying {
+                        deferred_removed, ..
+                    } => std::mem::take(deferred_removed),
+                    _ => unreachable!("retry result has its owner"),
+                };
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        message: "復旧記録の読み取り worker が終了しました".into(),
+                        deferred_removed,
+                    };
+                self.show_feedback_toast(
+                    "復旧記録の再確認が中断されました。元の記録を保護し、変更は実行していません。次の操作で再確認できます"
+                        .into(),
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
+    pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
+        if self.ensure_rename_migration_journal_loaded() {
+            return true;
+        }
+        if let RenameMigrationJournalAdmission::RecoveryFailed { message, .. } =
+            &self.rename_migration_journal_admission
+        {
+            let failure = message.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let data_dir = self.rename_migration_data_dir();
+            match std::thread::Builder::new()
+                .name("rename-migration-recovery".into())
+                .spawn(move || {
+                    let _ = tx.send(crate::rename_key_migration::journal_load(&data_dir));
+                }) {
+                Ok(_) => {
+                    let deferred_removed = match &mut self.rename_migration_journal_admission {
+                        RenameMigrationJournalAdmission::RecoveryFailed {
+                            deferred_removed,
+                            ..
+                        } => std::mem::take(deferred_removed),
+                        _ => unreachable!("failed recovery owns deferred paths"),
+                    };
+                    self.rename_migration_journal_admission =
+                        RenameMigrationJournalAdmission::RecoveryRetrying {
+                            rx,
+                            deferred_removed,
+                        };
+                    self.show_feedback_toast(format!(
+                        "復旧記録を読み取れないため変更を保留しました ({failure})。再確認中です"
+                    ));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(error) => {
+                    self.show_feedback_toast(format!(
+                        "復旧記録を読み取れないため変更を保留しました ({failure})。再確認を開始できません: {error}"
+                    ));
+                }
+            }
+        } else {
+            self.show_feedback_toast(
+                "復旧記録を再確認中です。完了後に操作をもう一度実行してください".into(),
+            );
+        }
+        false
     }
 
     /// 削除に成功した path を**新側**に持つ未実行リネームの汎用 metadata 段だけを省略する
@@ -31708,7 +31895,18 @@ impl App {
             return;
         }
         // ジャーナル未読込のまま journal 書き戻しをすると回復エントリを失うので先に読む。
-        self.ensure_rename_migration_journal_loaded();
+        if !self.ensure_rename_migration_journal_loaded() {
+            match &mut self.rename_migration_journal_admission {
+                RenameMigrationJournalAdmission::RecoveryFailed {
+                    deferred_removed, ..
+                }
+                | RenameMigrationJournalAdmission::RecoveryRetrying {
+                    deferred_removed, ..
+                } => deferred_removed.extend_from_slice(removed),
+                _ => {}
+            }
+            return;
+        }
         let matches_key = removed_path_key_matcher(removed);
         let suppress_generic = |job: &crate::rename_key_migration::PathMigrationJob| {
             job.generic_pending
@@ -31818,6 +32016,27 @@ impl App {
             || !self.book_bookmark_pending_requests.is_empty()
     }
 
+    /// A delete or book path mutation may have changed the filesystem before App has consumed
+    /// its success result. Generic migration must not recreate metadata at a removed target in
+    /// that gap. The pending request owner, not poll ordering, closes the gap.
+    fn rename_migration_source_changes_pending(&self) -> bool {
+        self.delete_pending.is_some()
+            || self
+                .book_op_pending
+                .as_ref()
+                .is_some_and(|pending| pending.intent.blocks_rename_migration())
+            || self.book_reorder.as_ref().is_some_and(|state| {
+                state
+                    .flush_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.intent.blocks_rename_migration())
+                    || state
+                        .transfer_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.intent.blocks_rename_migration())
+            })
+    }
+
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
     /// 書込 worker が busy の間は開始せず、`poll_rename_migration_pending` が毎フレーム
     /// 再試行する。
@@ -31833,6 +32052,7 @@ impl App {
         };
         if job.generic_pending {
             if self.rename_migration_writers_busy()
+                || self.rename_migration_source_changes_pending()
                 || self.metadata_cleanup_pending.is_some()
                 || self.delete_purge_retry_pending.is_some()
             {
@@ -32115,7 +32335,13 @@ impl App {
             }
         }
         self.try_start_next_rename_migration();
-        if self.rename_migration_in_flight.is_some() || !self.rename_migration_queue.is_empty() {
+        if self.rename_migration_in_flight.is_some()
+            || !self.rename_migration_queue.is_empty()
+            || matches!(
+                self.rename_migration_journal_admission,
+                RenameMigrationJournalAdmission::RecoveryRetrying { .. }
+            )
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -32373,6 +32599,9 @@ impl App {
             || self.metadata_cleanup_pending.is_some()
             || self.delete_purge_retry_pending.is_some()
         {
+            return;
+        }
+        if !self.admit_rename_migration_source_change(ctx) {
             return;
         }
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
@@ -34543,7 +34772,10 @@ impl App {
                 let _ = tx.send(result);
             }) {
             Ok(_) => {
-                self.book_op_pending = Some(crate::books::BookOpPending { rx });
+                self.book_op_pending = Some(crate::books::BookOpPending {
+                    rx,
+                    intent: crate::books::BookOpIntent::Unrelated,
+                });
             }
             Err(err) => {
                 self.show_feedback_toast(format!("本棚一覧 worker を開始できません: {err}"));
@@ -34553,9 +34785,12 @@ impl App {
 
     pub(crate) fn start_book_create(&mut self, ctx: &egui::Context, name: String) {
         let root = self.book_root_path();
-        self.start_book_op(ctx, "book-create", move || {
-            crate::books::create_book(&root, &name)
-        });
+        self.start_book_op(
+            ctx,
+            "book-create",
+            crate::books::BookOpIntent::Unrelated,
+            move || crate::books::create_book(&root, &name),
+        );
     }
 
     pub(crate) fn start_book_rename(
@@ -34564,17 +34799,30 @@ impl App {
         old_name: String,
         new_name: String,
     ) {
+        if !self.admit_rename_migration_source_change(ctx) {
+            return;
+        }
         let root = self.book_root_path();
-        self.start_book_op(ctx, "book-rename", move || {
-            crate::books::rename_book(&root, &old_name, &new_name)
-        });
+        self.start_book_op(
+            ctx,
+            "book-rename",
+            crate::books::BookOpIntent::SourceMutation,
+            move || crate::books::rename_book(&root, &old_name, &new_name),
+        );
     }
 
     pub(crate) fn start_book_delete(&mut self, ctx: &egui::Context, name: String) {
+        if !self.admit_rename_migration_source_change(ctx) {
+            return;
+        }
         let root = self.book_root_path();
-        self.start_book_op(ctx, "book-delete", move || {
-            crate::books::delete_book(&root, &name)
-        });
+        let path = crate::books::book_folder(&root, &name);
+        self.start_book_op(
+            ctx,
+            "book-delete",
+            crate::books::BookOpIntent::Delete { path },
+            move || crate::books::delete_book(&root, &name),
+        );
     }
 
     pub(crate) fn start_book_append(
@@ -34599,9 +34847,12 @@ impl App {
         }
         let root = self.book_root_path();
         let data_dir = crate::data_dir::get();
-        self.start_book_op(ctx, "book-append", move || {
-            crate::books::append_pages_at(data_dir, root, book_name, sources)
-        });
+        self.start_book_op(
+            ctx,
+            "book-append",
+            crate::books::BookOpIntent::Unrelated,
+            move || crate::books::append_pages_at(data_dir, root, book_name, sources),
+        );
     }
 
     pub(crate) fn start_book_reorder_flush(
@@ -34610,6 +34861,9 @@ impl App {
         folder: PathBuf,
         ordered_paths: Vec<PathBuf>,
     ) -> Option<crate::books::BookOpPending> {
+        if !self.admit_rename_migration_source_change(ctx) {
+            return None;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
             .name("book-reorder".into())
@@ -34619,7 +34873,10 @@ impl App {
             }) {
             Ok(_) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                Some(crate::books::BookOpPending { rx })
+                Some(crate::books::BookOpPending {
+                    rx,
+                    intent: crate::books::BookOpIntent::SourceMutation,
+                })
             }
             Err(err) => {
                 self.show_feedback_toast(format!("並べ替え worker を開始できません: {err}"));
@@ -34637,6 +34894,9 @@ impl App {
         target_book_name: String,
         kind: crate::books::BookTransferKind,
     ) -> Option<crate::books::BookOpPending> {
+        if !self.admit_rename_migration_source_change(ctx) {
+            return None;
+        }
         let root = self.book_root_path();
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
@@ -34654,7 +34914,10 @@ impl App {
             }) {
             Ok(_) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                Some(crate::books::BookOpPending { rx })
+                Some(crate::books::BookOpPending {
+                    rx,
+                    intent: crate::books::BookOpIntent::SourceMutation,
+                })
             }
             Err(err) => {
                 self.show_feedback_toast(format!("ページ転送 worker を開始できません: {err}"));
@@ -34938,7 +35201,13 @@ impl App {
         ));
     }
 
-    fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F) -> bool
+    fn start_book_op<F>(
+        &mut self,
+        ctx: &egui::Context,
+        thread_name: &'static str,
+        intent: crate::books::BookOpIntent,
+        f: F,
+    ) -> bool
     where
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
     {
@@ -34953,7 +35222,7 @@ impl App {
                 let _ = tx.send(f());
             }) {
             Ok(_) => {
-                self.book_op_pending = Some(crate::books::BookOpPending { rx });
+                self.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 true
             }
@@ -34978,7 +35247,11 @@ impl App {
                 Err("製本処理が中断されました".to_string())
             }
         };
-        self.book_op_pending = None;
+        let intent = self
+            .book_op_pending
+            .take()
+            .expect("book pending is present")
+            .intent;
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
@@ -35102,7 +35375,17 @@ impl App {
                 self.pending_reload = true;
                 self.show_feedback_toast(format!("本名を変更しました: {old_name} → {new_name}"));
             }
-            Ok(crate::books::BookOpResult::Deleted { name }) => {
+            Ok(crate::books::BookOpResult::Deleted { name, path }) => {
+                if let crate::books::BookOpIntent::Delete { path: requested } = &intent
+                    && !crate::folder_tree::path_eq(requested, &path)
+                {
+                    crate::logger::log(format!(
+                        "[RENAME-MIG] book delete target changed between request and result: requested={} removed={}",
+                        requested.display(),
+                        path.display()
+                    ));
+                }
+                self.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&path));
                 if self.settings.active_book_name == name {
                     self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
                     self.settings.save();

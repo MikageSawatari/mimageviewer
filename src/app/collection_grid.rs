@@ -4021,7 +4021,9 @@ mod tests {
         ]);
         app.flush_rename_migration_journal().unwrap();
         assert_eq!(
-            crate::rename_key_migration::journal_load(temp.path()).len(),
+            crate::rename_key_migration::journal_load(temp.path())
+                .unwrap()
+                .len(),
             1,
             "admitted actor command remains durable until its result is consumed"
         );
@@ -4039,7 +4041,9 @@ mod tests {
         app.flush_rename_migration_journal().unwrap();
         assert!(app.rename_migration_boot_retry.is_empty());
         assert!(
-            crate::rename_key_migration::journal_load(temp.path()).is_empty(),
+            crate::rename_key_migration::journal_load(temp.path())
+                .unwrap()
+                .is_empty(),
             "exact actor acknowledgement retires the durable stage"
         );
         let migrated = recv(

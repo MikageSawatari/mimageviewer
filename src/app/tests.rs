@@ -23709,7 +23709,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.rename_migration_in_flight.is_none());
         assert_eq!(app.rename_migration_queue.len(), 1);
         assert_eq!(
-            crate::rename_key_migration::journal_load(&blocked_parent).len(),
+            crate::rename_key_migration::journal_load(&blocked_parent)
+                .unwrap()
+                .len(),
             1,
             "the migration stage is admitted only after the retry saved the full snapshot"
         );
@@ -23726,21 +23728,378 @@ mod favorite_adjustment_defaults_tests {
         );
         crate::rename_key_migration::journal_save(&data_dir, std::slice::from_ref(&prior)).unwrap();
         app.rename_migration_data_dir_override = Some(data_dir.clone());
-        app.rename_migration_journal_loaded = false;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Unloaded;
         app.rename_migration_queue.clear();
 
         app.resolve_collection_migration_for_exit();
 
-        assert!(app.rename_migration_journal_loaded);
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Waiting { .. }
+                | RenameMigrationJournalAdmission::Durable
+        ));
         assert_eq!(
             app.rename_migration_queue,
             std::collections::VecDeque::from([prior.clone()])
         );
         assert_eq!(
-            crate::rename_key_migration::journal_load(&data_dir),
+            crate::rename_key_migration::journal_load(&data_dir).unwrap(),
             vec![prior],
             "an immediate close must not replace an unread crash-recovery journal with empty"
         );
+    }
+
+    #[test]
+    fn unreadable_rename_journal_blocks_every_owned_mutation_before_worker_start() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("unreadable-rename-journal");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let old_bytes = b"not valid migration JSON";
+        std::fs::write(&journal, old_bytes).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed { .. }
+        ));
+        let old = app.tmp.path().join("old.jpg");
+        let new = app.tmp.path().join("new.jpg");
+        app.persist_rename_migration_journal(); // Empty must not remove the unreadable file.
+        app.spawn_rename_key_migration(
+            old.clone(),
+            new.clone(),
+            crate::collection_store::CollectionSourceMigrationScope::Exact,
+        ); // Simulate a completion already admitted before failure detection.
+        app.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&new));
+        assert_eq!(app.rename_migration_queue.len(), 1);
+        assert!(app.rename_migration_queue[0].generic_pending);
+        assert!(app.rename_migration_in_flight.is_none());
+
+        app.start_rename_item_after_confirmation(
+            &ctx,
+            None,
+            old.clone(),
+            "renamed.jpg".into(),
+            true,
+        );
+        assert!(app.rename_pending.is_none());
+        app.start_delete_files(&ctx, vec![old.clone()]);
+        assert!(app.delete_pending.is_none());
+        app.start_book_rename(&ctx, "Before".into(), "After".into());
+        app.start_book_delete(&ctx, "Before".into());
+        assert!(app.book_op_pending.is_none());
+        let book_folder = app.tmp.path().to_path_buf();
+        assert!(
+            app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()])
+                .is_none()
+        );
+        for kind in [
+            crate::books::BookTransferKind::Move,
+            crate::books::BookTransferKind::Copy,
+        ] {
+            assert!(
+                app.start_book_transfer(
+                    &ctx,
+                    book_folder.clone(),
+                    vec![old.clone()],
+                    vec![old.clone()],
+                    "Other".into(),
+                    kind,
+                )
+                .is_none()
+            );
+        }
+        app.resolve_collection_migration_for_exit();
+        assert_eq!(std::fs::read(&journal).unwrap(), old_bytes);
+        assert!(app.rename_migration_journal_writer.is_none());
+    }
+
+    #[test]
+    fn explicit_retry_merges_old_jobs_and_deferred_delete_before_save_ack() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-retry-merge");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        std::fs::write(&journal, b"bad").unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir.clone());
+        assert!(!app.ensure_rename_migration_journal_loaded());
+
+        let old = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("old-a"),
+            PathBuf::from("new-a"),
+            false,
+        );
+        let late = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("old-b"),
+            PathBuf::from("new-b"),
+            false,
+        );
+        app.rename_migration_queue.push_back(late.clone());
+        app.invalidate_rename_migrations_for_removed_paths(&[PathBuf::from("new-b")]);
+        assert_eq!(std::fs::read(&journal).unwrap(), b"bad");
+        crate::rename_key_migration::journal_save(&data_dir, std::slice::from_ref(&old)).unwrap();
+
+        assert!(!app.admit_rename_migration_source_change(&ctx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !app.ensure_rename_migration_journal_loaded() && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(app.ensure_rename_migration_journal_loaded());
+        assert!(app.rename_migration_in_flight.is_none());
+        assert_eq!(app.rename_migration_queue.len(), 2);
+        assert_eq!(app.rename_migration_queue[0], old);
+        assert_eq!(app.rename_migration_queue[1].mappings, late.mappings);
+        assert!(!app.rename_migration_queue[1].generic_pending);
+        app.flush_rename_migration_journal().unwrap();
+        assert_eq!(
+            crate::rename_key_migration::journal_load(&data_dir).unwrap(),
+            app.rename_migration_queue
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_recovery_retry_is_polled_without_migration_work() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-retry-empty");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        std::fs::write(&journal, b"bad").unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        std::fs::write(&journal, b"[]").unwrap();
+
+        assert!(!app.admit_rename_migration_source_change(&ctx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryRetrying { .. }
+        ) && std::time::Instant::now() < deadline
+        {
+            app.poll_rename_migration_pending(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Durable
+        ));
+        assert!(app.rename_migration_queue.is_empty());
+        assert!(app.admit_rename_migration_source_change(&ctx));
+    }
+
+    #[test]
+    fn late_migration_completion_and_exit_preserve_unreadable_prior_bytes() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("late-migration-unreadable");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let prior = b"older recovery record with an unknown format";
+        std::fs::write(&journal, prior).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+        assert!(!app.ensure_rename_migration_journal_loaded());
+
+        let job = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: job.clone(),
+            rx,
+        });
+        tx.send(crate::rename_key_migration::RenameMigrationReport {
+            rows: 0,
+            errors: Vec::new(),
+            store_mutations: Default::default(),
+            panicked: true,
+        })
+        .unwrap();
+        app.poll_rename_migration_pending(&ctx);
+        assert_eq!(app.rename_migration_boot_retry, vec![job]);
+        app.resolve_collection_migration_for_exit();
+        assert_eq!(std::fs::read(&journal).unwrap(), prior);
+        assert!(app.rename_migration_journal_writer.is_none());
+    }
+
+    #[test]
+    fn rename_pending_uses_captured_scope_after_empty_poll_and_dialog_clear() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.rename_migration_data_dir_override = Some(app.tmp.path().into());
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_pending = Some(crate::ui_dialogs::rename_item::RenamePending {
+            rx,
+            collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
+        });
+        app.rename_target_is_file = true;
+        app.poll_rename_pending(&ctx);
+        assert!(app.rename_pending.is_some());
+        app.show_rename_dialog = false;
+        app.rename_target = None;
+        app.rename_target_is_file = false;
+        tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            target: app.tmp.path().join("before.jpg"),
+            new_path: app.tmp.path().join("after.jpg"),
+            aborted: false,
+        }))
+        .unwrap();
+        app.poll_rename_pending(&ctx);
+        assert!(app.rename_pending.is_none());
+        assert_eq!(app.rename_migration_queue.len(), 1);
+        assert!(!app.rename_migration_queue[0].mappings[0].tree);
+    }
+
+    #[test]
+    fn rename_pending_tree_scope_and_abort_error_consume_request_once() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.rename_migration_data_dir_override = Some(app.tmp.path().into());
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_pending = Some(crate::ui_dialogs::rename_item::RenamePending {
+            rx,
+            collection_scope: crate::collection_store::CollectionSourceMigrationScope::Tree,
+        });
+        app.rename_target_is_file = true; // The dialog field must not override captured scope.
+        tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            target: app.tmp.path().join("old-folder"),
+            new_path: app.tmp.path().join("new-folder"),
+            aborted: false,
+        }))
+        .unwrap();
+        app.poll_rename_pending(&ctx);
+        assert!(app.rename_pending.is_none());
+        assert!(app.rename_migration_queue[0].mappings[0].tree);
+
+        for result in [
+            Ok(crate::shell_file_ops::ShellRenameOutcome {
+                target: app.tmp.path().join("cancelled"),
+                new_path: app.tmp.path().join("cancelled-new"),
+                aborted: true,
+            }),
+            Err("worker failed".to_string()),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.rename_pending = Some(crate::ui_dialogs::rename_item::RenamePending {
+                rx,
+                collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
+            });
+            tx.send(result).unwrap();
+            app.poll_rename_pending(&ctx);
+            assert!(app.rename_pending.is_none());
+            assert_eq!(app.rename_migration_queue.len(), 1);
+        }
+    }
+
+    #[test]
+    fn book_delete_completion_invalidates_by_worker_success_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("book-delete-journal");
+        app.rename_migration_data_dir_override = Some(data_dir.clone());
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        let actual_root = app.tmp.path().join("actual-books");
+        let actual_book = actual_root.join("Book");
+        std::fs::create_dir_all(&actual_book).unwrap();
+        let removed_page = actual_book.join("0001.jpg");
+        let job = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            app.tmp.path().join("old.jpg"),
+            removed_page,
+            false,
+        );
+        app.rename_migration_queue.push_back(job);
+        let result = crate::books::delete_book(&actual_root, "Book").unwrap();
+        app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::Delete {
+                path: actual_book.clone(),
+            },
+        });
+        tx.send(Ok(result)).unwrap();
+
+        app.poll_book_op_pending(&ctx);
+        assert!(!app.rename_migration_queue[0].generic_pending);
+        app.flush_rename_migration_journal().unwrap();
+        assert!(!crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].generic_pending);
+    }
+
+    #[test]
+    fn pending_delete_and_book_path_workers_hold_generic_migration_start() {
+        let mut app = setup_app();
+        app.rename_migration_data_dir_override = Some(app.tmp.path().into());
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        app.rename_migration_queue.push_back(
+            crate::rename_key_migration::PathMigrationJob::shell_rename(
+                PathBuf::from("old"),
+                PathBuf::from("new"),
+                false,
+            ),
+        );
+        let (_delete_tx, delete_rx) = std::sync::mpsc::channel();
+        app.delete_pending = Some(crate::delete_worker::DeletePending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx: delete_rx,
+            total: 1,
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            purged_pdf_password_paths: Vec::new(),
+            purge_deferred: false,
+            source_scopes: vec![crate::delete_worker::DeleteSourceScope::Exact(
+                PathBuf::from("new"),
+            )],
+        });
+        app.try_start_next_rename_migration();
+        assert!(app.rename_migration_in_flight.is_none());
+        app.delete_pending = None;
+
+        let (_book_tx, book_rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: book_rx,
+            intent: crate::books::BookOpIntent::Delete {
+                path: PathBuf::from("new"),
+            },
+        });
+        app.try_start_next_rename_migration();
+        assert!(app.rename_migration_in_flight.is_none());
+        app.book_op_pending = None;
+
+        let root = app.tmp.path().join("books");
+        let folder = root.join("Book");
+        app.settings.book_root = Some(root);
+        app.current_folder = Some(folder.clone());
+        app.items
+            .push(crate::grid_item::GridItem::Image(folder.join("0001.jpg")));
+        app.open_book_reorder_from_current();
+        let (_reorder_tx, reorder_rx) = std::sync::mpsc::channel();
+        app.book_reorder.as_mut().unwrap().flush_pending = Some(crate::books::BookOpPending {
+            rx: reorder_rx,
+            intent: crate::books::BookOpIntent::SourceMutation,
+        });
+        assert!(app.rename_migration_source_changes_pending());
+        app.try_start_next_rename_migration();
+        assert!(app.rename_migration_in_flight.is_none());
+        app.book_reorder.as_mut().unwrap().flush_pending = None;
+        let (_transfer_tx, transfer_rx) = std::sync::mpsc::channel();
+        app.book_reorder.as_mut().unwrap().transfer_pending = Some(crate::books::BookOpPending {
+            rx: transfer_rx,
+            intent: crate::books::BookOpIntent::SourceMutation,
+        });
+        assert!(app.rename_migration_source_changes_pending());
+        app.try_start_next_rename_migration();
+        assert!(app.rename_migration_in_flight.is_none());
     }
 
     #[test]
@@ -52651,7 +53010,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
         let (_tx, rx) = std::sync::mpsc::channel();
         let in_flight = crate::rename_key_migration::PathMigrationJob::shell_rename(
             PathBuf::from("a"),
@@ -52679,7 +53038,7 @@ mod still_window_mode_key_tests {
         app.flush_rename_migration_journal().unwrap();
 
         assert_eq!(
-            crate::rename_key_migration::journal_load(dir.path()),
+            crate::rename_key_migration::journal_load(dir.path()).unwrap(),
             vec![in_flight, queued, retry]
         );
     }
@@ -52730,7 +53089,9 @@ mod still_window_mode_key_tests {
         );
         app.flush_rename_migration_journal().unwrap();
         assert_eq!(
-            crate::rename_key_migration::journal_load(dir.path()).len(),
+            crate::rename_key_migration::journal_load(dir.path())
+                .unwrap()
+                .len(),
             2,
             "未完了ジョブがジャーナルに永続化される (終了 / クラッシュ回復用)"
         );
@@ -52764,7 +53125,9 @@ mod still_window_mode_key_tests {
         assert_eq!(angle, 90, "FIFO 直列実行で最終 path に集約される");
         app.flush_rename_migration_journal().unwrap();
         assert!(
-            crate::rename_key_migration::journal_load(dir.path()).is_empty(),
+            crate::rename_key_migration::journal_load(dir.path())
+                .unwrap()
+                .is_empty(),
             "完了したジョブはジャーナルから消し込まれる"
         );
     }
@@ -52777,7 +53140,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
 
         let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
         let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
@@ -52810,7 +53173,7 @@ mod still_window_mode_key_tests {
         assert_eq!(retained[0].mappings[0].new_path, b);
         assert_eq!(retained[1], keep_job);
         app.flush_rename_migration_journal().unwrap();
-        let journal = crate::rename_key_migration::journal_load(dir.path());
+        let journal = crate::rename_key_migration::journal_load(dir.path()).unwrap();
         assert_eq!(
             journal, retained,
             "worker flush 後も同じ typed stage が残る"
@@ -52826,7 +53189,7 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
 
         app.current_folder = Some(std::path::PathBuf::from(r"D:\unrelated"));
         app.mask_pages.insert(3);
@@ -52867,7 +53230,7 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
 
         app.current_folder = Some(std::path::PathBuf::from(r"D:\__search_view__"));
         let idx = push_video(&mut app, r"D:\pics\b.jpg");
@@ -52906,7 +53269,7 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
 
         let media_tex = ctx.load_texture(
             "rehydrate_parked",
@@ -52982,7 +53345,7 @@ mod still_window_mode_key_tests {
         let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
         let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
         let (tx, rx) = std::sync::mpsc::channel();
-        app.rename_migration_journal_loaded = true;
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
         let panic_job = crate::rename_key_migration::PathMigrationJob::shell_rename(
             a.clone(),
             b.clone(),
@@ -53005,7 +53368,7 @@ mod still_window_mode_key_tests {
         assert!(app.rename_migration_in_flight.is_none());
         app.flush_rename_migration_journal().unwrap();
         assert_eq!(
-            crate::rename_key_migration::journal_load(dir.path()),
+            crate::rename_key_migration::journal_load(dir.path()).unwrap(),
             vec![panic_job.clone()],
             "panic した移行はジャーナルに残る (次回起動で再実行)"
         );
@@ -53071,7 +53434,9 @@ mod still_window_mode_key_tests {
         app.flush_rename_migration_journal().unwrap();
         assert_eq!(angle, 270, "回復ジョブが移行を完走させる");
         assert!(
-            crate::rename_key_migration::journal_load(dir.path()).is_empty(),
+            crate::rename_key_migration::journal_load(dir.path())
+                .unwrap()
+                .is_empty(),
             "完了後はジャーナルが消える"
         );
     }
