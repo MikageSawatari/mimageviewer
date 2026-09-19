@@ -10021,6 +10021,11 @@ pub(crate) enum GridSortLockReason {
     CollectionDeleted,
 }
 
+enum AutoAspectCacheTarget {
+    Path(PathBuf),
+    CollectionRoot(crate::collection_store::CollectionId),
+}
+
 impl GridSortLockReason {
     /// 無効化中に現状を示す短い表示 (ツールバーのコンボ / メニュー項目)。
     ///
@@ -12026,6 +12031,9 @@ pub struct App {
     pub(crate) auto_aspect: crate::auto_aspect::AutoAspectState,
     /// フォルダごとの前回 auto-aspect 確定値。Auto モード再訪時の初期比率に使う。
     pub(crate) auto_aspect_cache_db: Option<crate::auto_aspect_cache::AutoAspectCacheDb>,
+    /// Process owner for Collection UUID cache; its SQLite connection lives on a worker.
+    pub(crate) collection_auto_aspect_cache:
+        Option<crate::auto_aspect_cache::CollectionAutoAspectCache>,
     /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
     pub(crate) last_viewport_h: f32,
     /// true のとき選択セルが見えるようにオフセットを調整する
@@ -15780,6 +15788,14 @@ impl App {
         let auto_aspect_cache_db = crate::auto_aspect_cache::AutoAspectCacheDb::open()
             .map_err(|e| crate::logger::log(format!("auto_aspect_cache_db open failed: {e}")))
             .ok();
+        let collection_auto_aspect_cache =
+            crate::auto_aspect_cache::CollectionAutoAspectCache::spawn_at(
+                crate::auto_aspect_cache::AutoAspectCacheDb::db_path(),
+            )
+            .map_err(|e| {
+                crate::logger::log(format!("collection auto-aspect cache spawn failed: {e}"))
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_auto_aspect_cache", 0, t);
 
         let t = std::time::Instant::now();
@@ -15993,6 +16009,7 @@ impl App {
             last_details_name_width: 140.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             auto_aspect_cache_db,
+            collection_auto_aspect_cache,
             last_viewport_h: 600.0,
             scroll_to_selected: false,
             pending_grid_scroll: None,
@@ -17452,14 +17469,55 @@ impl App {
         Some(path)
     }
 
-    fn restore_cached_auto_aspect(&mut self) {
-        let Some(path) = self.auto_aspect_cache_target_path() else {
-            return;
+    fn auto_aspect_cache_target(&self) -> Option<AutoAspectCacheTarget> {
+        if let Some(session) = self.top_level_grid_view.collection_session() {
+            if matches!(
+                session.position,
+                top_level_grid_view::CollectionGridPosition::Root
+            ) {
+                let top_level_grid_view::TopLevelGridSurface::Collection(identity) =
+                    self.top_level_grid_view.surface()
+                else {
+                    return None;
+                };
+                let prepared = session.prepared()?;
+                return (matches!(
+                    session.load,
+                    top_level_grid_view::CollectionGridLoadState::Ready(_)
+                ) && session.installed_items_generation == Some(self.items_generation)
+                    && session.identity.collection_id == identity.collection_id
+                    && prepared.collection_id == identity.collection_id
+                    && prepared.collection_revision == session.accepted_revision
+                    && session.wanted_revision == session.accepted_revision
+                    && prepared.entries.len() == self.items.len())
+                .then_some(AutoAspectCacheTarget::CollectionRoot(
+                    identity.collection_id,
+                ));
+            }
+        }
+        self.auto_aspect_cache_target_path()
+            .map(AutoAspectCacheTarget::Path)
+    }
+
+    fn restore_cached_auto_aspect(
+        &mut self,
+        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+    ) {
+        let cached = if let Some(entry) = collection_seed {
+            Some(entry)
+        } else {
+            match self.auto_aspect_cache_target() {
+                Some(AutoAspectCacheTarget::Path(path)) => self
+                    .auto_aspect_cache_db
+                    .as_ref()
+                    .and_then(|db| db.get(&path)),
+                Some(AutoAspectCacheTarget::CollectionRoot(id)) => self
+                    .collection_auto_aspect_cache
+                    .as_ref()
+                    .and_then(|cache| cache.cached(id)),
+                None => None,
+            }
         };
-        let cached = self
-            .auto_aspect_cache_db
-            .as_ref()
-            .and_then(|db| db.get(&path));
         let Some(entry) = cached else {
             return;
         };
@@ -17482,22 +17540,32 @@ impl App {
     }
 
     fn save_auto_aspect_cache(
-        &self,
+        &mut self,
         aspect: crate::settings::ThumbAspect,
         sample_count: usize,
         eligible_total: usize,
     ) {
-        let Some(path) = self.auto_aspect_cache_target_path() else {
-            return;
-        };
-        let Some(db) = self.auto_aspect_cache_db.as_ref() else {
-            return;
-        };
-        if let Err(e) = db.upsert(&path, aspect, sample_count, eligible_total) {
-            crate::logger::log(format!(
-                "  auto_aspect cache: save failed for {}: {e}",
-                path.display()
-            ));
+        match self.auto_aspect_cache_target() {
+            Some(AutoAspectCacheTarget::Path(path)) => {
+                if let Some(db) = self.auto_aspect_cache_db.as_ref()
+                    && let Err(e) = db.upsert(&path, aspect, sample_count, eligible_total)
+                {
+                    crate::logger::log(format!(
+                        "  auto_aspect cache: save failed for {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+            Some(AutoAspectCacheTarget::CollectionRoot(id)) => {
+                if let Some(cache) = self.collection_auto_aspect_cache.as_mut()
+                    && let Err(error) = cache.record(id, aspect, sample_count, eligible_total)
+                {
+                    crate::logger::log(format!(
+                        "  collection auto-aspect cache: save failed: {error}"
+                    ));
+                }
+            }
+            None => {}
         }
     }
 
@@ -17554,7 +17622,28 @@ impl App {
     /// Image / Video / ZipImage / PdfPage / Folder / ZipFile / PdfFile は代表サムネ経由で
     /// `source_dims` がいずれ来る可能性があるので分母に入れる。
     pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
-        self.items.len()
+        if self
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| {
+                matches!(
+                    session.position,
+                    top_level_grid_view::CollectionGridPosition::Root
+                )
+            })
+        {
+            self.items
+                .iter()
+                .filter(|item| {
+                    !matches!(
+                        item,
+                        GridItem::CollectionPlaceholder { .. } | GridItem::Audio(_)
+                    )
+                })
+                .count()
+        } else {
+            self.items.len()
+        }
     }
 
     /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
@@ -17571,6 +17660,16 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
     ) {
+        self.reset_and_seed_auto_aspect_with_collection_seed(cache_map, None);
+    }
+
+    pub(crate) fn reset_and_seed_auto_aspect_with_collection_seed(
+        &mut self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+    ) {
         let generation = self.items_generation;
         self.auto_aspect.reset_for_new_generation(generation);
 
@@ -17583,7 +17682,7 @@ impl App {
         // eligible_total==0 でもキャッシュを先に復元し、実 rows が届くまでのフレームで
         // Auto 未確定時の Square を描画しない。通常の空フォルダでも、セルが無いため
         // 前回値を楽観的に保持して問題はない。
-        self.restore_cached_auto_aspect();
+        self.restore_cached_auto_aspect(collection_seed);
 
         // 集計対象母数は items ベース (動画含む)。
         let eligible_total: usize = self.auto_aspect_eligible_total();
@@ -35113,6 +35212,36 @@ impl App {
 
     /// サムネイルキャッシュ管理ダイアログの集計 / 削除ワーカーの完了を拾う。
     /// 受信したら stats / result を反映してハンドルを drop。
+    pub(crate) fn spawn_cache_maintenance(
+        &mut self,
+        task: crate::cache_maintenance::CacheMaintTask,
+        cache_dir: PathBuf,
+    ) -> crate::cache_maintenance::CacheMaintPending {
+        use crate::auto_aspect_cache::CollectionAutoAspectMaintenance;
+        use crate::cache_maintenance::CacheMaintTask;
+
+        let operation = match &task {
+            CacheMaintTask::Stats | CacheMaintTask::DeleteFolder { .. } => {
+                CollectionAutoAspectMaintenance::Count
+            }
+            CacheMaintTask::DeleteOld { days } => {
+                CollectionAutoAspectMaintenance::DeleteOld { days: *days }
+            }
+            CacheMaintTask::DeleteAll => CollectionAutoAspectMaintenance::ClearAll,
+        };
+        let collection_reply = self
+            .collection_auto_aspect_cache
+            .as_mut()
+            .ok_or_else(|| "Collection Auto 比率 cache worker を利用できません".to_owned())
+            .and_then(|cache| cache.begin_maintenance(operation));
+        crate::cache_maintenance::spawn(
+            task,
+            cache_dir,
+            self.video_tile_cache.clone(),
+            collection_reply,
+        )
+    }
+
     pub(crate) fn poll_cache_maint_pending(&mut self) {
         let Some(pending) = self.cache_maint_pending.as_ref() else {
             return;
@@ -35134,27 +35263,42 @@ impl App {
                 bytes,
                 tile_thumb_bytes,
                 auto_aspect_entries,
+                collection_aspect,
             } => {
                 self.cache_manager_stats = Some((folders, bytes));
                 self.cache_manager_tile_bytes = Some(tile_thumb_bytes);
-                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
+                self.cache_manager_auto_aspect_entries =
+                    collection_aspect.combined_entries(auto_aspect_entries);
+                if let Some(error) = collection_aspect.error() {
+                    self.cache_manager_result = Some(format!(
+                        "Collection 比率キャッシュの件数を取得できませんでした: {error}"
+                    ));
+                }
             }
             crate::cache_maintenance::CacheMaintResult::DeleteOldDone {
                 deleted,
                 new_stats,
                 auto_aspect_deleted,
                 auto_aspect_entries,
+                collection_aspect,
             } => {
                 self.cache_manager_stats = Some(new_stats);
                 // tile cache は対象外なのでサイズを再取得 (= 削除しても変化なしのはず
                 // だが、別経路で書き込みが入っている可能性に備えて refresh)。
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
-                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
+                self.cache_manager_auto_aspect_entries =
+                    collection_aspect.combined_entries(auto_aspect_entries);
+                let auto_aspect_deleted = collection_aspect.combined_deleted(auto_aspect_deleted);
                 let mut msg = format!("{} 件のキャッシュを削除しました。", deleted);
                 if auto_aspect_deleted > 0 {
                     msg.push_str(&format!(
                         " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
+                    ));
+                }
+                if let Some(error) = collection_aspect.error() {
+                    msg.push_str(&format!(
+                        " Collection 比率キャッシュの期限整理は失敗しました: {error}"
                     ));
                 }
                 self.cache_manager_result = Some(msg);
@@ -35163,12 +35307,19 @@ impl App {
                 tile_thumb,
                 auto_aspect_deleted,
                 auto_aspect_entries,
+                collection_aspect,
             } => {
                 self.cache_manager_stats = Some((0, 0));
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
-                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
-                let mut msg = String::from("すべてのキャッシュを削除しました。");
+                self.cache_manager_auto_aspect_entries =
+                    collection_aspect.combined_entries(auto_aspect_entries);
+                let auto_aspect_deleted = collection_aspect.combined_deleted(auto_aspect_deleted);
+                let mut msg = if collection_aspect.error().is_some() {
+                    String::from("キャッシュを一部削除しました。")
+                } else {
+                    String::from("すべてのキャッシュを削除しました。")
+                };
                 match tile_thumb {
                     crate::cache_maintenance::TileThumbOutcome::Cleared { rows } if rows > 0 => {
                         msg.push_str(&format!(" (動画タイル サムネも {rows} 件削除)"));
@@ -35185,6 +35336,11 @@ impl App {
                         " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
                     ));
                 }
+                if let Some(error) = collection_aspect.error() {
+                    msg.push_str(&format!(
+                        " Collection 比率キャッシュの全削除は失敗しました: {error}"
+                    ));
+                }
                 self.cache_manager_result = Some(msg);
             }
             crate::cache_maintenance::CacheMaintResult::DeleteFolderDone {
@@ -35194,11 +35350,13 @@ impl App {
                 tile_thumb,
                 auto_aspect_deleted,
                 auto_aspect_entries,
+                collection_aspect,
             } => {
                 self.cache_manager_stats = Some(new_stats);
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
-                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
+                self.cache_manager_auto_aspect_entries =
+                    collection_aspect.combined_entries(auto_aspect_entries);
                 let tile_rows = match tile_thumb {
                     crate::cache_maintenance::TileThumbOutcome::Cleared { rows } => rows,
                     _ => 0,
@@ -35216,6 +35374,11 @@ impl App {
                 if auto_aspect_deleted > 0 {
                     msg.push_str(&format!(
                         " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
+                    ));
+                }
+                if let Some(error) = collection_aspect.error() {
+                    msg.push_str(&format!(
+                        " Collection 比率キャッシュの件数取得は失敗しました: {error}"
                     ));
                 }
                 self.cache_manager_result = Some(msg);

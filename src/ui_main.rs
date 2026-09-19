@@ -6644,10 +6644,9 @@ impl App {
                                                 self.cache_manager_result = None;
                                                 if self.cache_maint_pending.is_none() {
                                                     self.cache_maint_pending = Some(
-                                                        crate::cache_maintenance::spawn(
+                                                        self.spawn_cache_maintenance(
                                                             crate::cache_maintenance::CacheMaintTask::Stats,
                                                             cache_dir,
-                                                            self.video_tile_cache.clone(),
                                                         ),
                                                     );
                                                 }

@@ -1376,6 +1376,7 @@ impl App {
                     &display_order,
                     &settings,
                     &worker_cancel,
+                    None,
                 );
                 if let Some(start) = perf_start {
                     crate::perf::event(
@@ -2350,6 +2351,7 @@ impl App {
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources,
+                auto_aspect_lookup: None,
             },
             previous,
         );
@@ -3480,6 +3482,7 @@ mod tests {
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_sources_a,
+                auto_aspect_lookup: None,
             },
             None,
         );

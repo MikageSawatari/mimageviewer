@@ -423,6 +423,7 @@ pub(crate) enum CollectionGridLoadState {
 pub(crate) struct CollectionGridPreparedInstall {
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
     pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailSources,
+    pub(crate) auto_aspect_lookup: Option<crate::auto_aspect_cache::CollectionAutoAspectLookup>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -1205,9 +1205,31 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
   ScrollArea を作る。ソート popup の `popup_style` に既定 `menu_style` と scrollbar 最大幅分の
   局所 gutter を設定し、他の一覧・popup の style は変えない。
 - headless 回帰は fullscreen root の Shuffle notice→保留表示→close 後の採用と、Popup の
-  予約幅・既定メニュー装飾を対象とし、各 1/1 成功。core check、`cargo fmt --all --check`、
-  UI glyph check、`git diff --check` も成功した。full gate と確認 build は、別件の
-  Collection Auto 比率 cache 修正と集約するまで未実施。GUI と実データでの操作は未実施。
+  予約幅・既定メニュー装飾を対象とし、各 1/1 成功。Collection Auto 比率 cache と
+  集約した全体検証・確認 build の結果は以下へ記録する。
+- Collection root の Auto 比率は UUID 専用 table と App 全体のメモリ値から復元する。
+  空 install は同一プロセスの値を使い、初回起動時は prepare worker が 100 ms 上限の
+  actor Get 結果を accepted 実 rows install に渡す。確定値の非同期保存は exact Ready root
+  の ID・generation・revision・件数に限定する。音声と欠損 placeholder は root の
+  sample 可能母数から除外し、通常 folder / PhysicalSource 子の既存経路は変えない。
+  管理画面の件数・全件削除・期限整理は folder / Collection の結果を合算し、UUID 側の
+  read/write/cleanup は actor だけが扱う。actor 不調でも従来の folder/catalog/tile 処理は
+  続け、合算件数は不明、全件削除は部分失敗として表示する。Get と clear の受付・epoch は
+  短い lock 内で直列化し、clear 前に発行した遅着結果を採用しない。詳細は
+  `auto-thumb-aspect-plan.md` §13。
+- focused は Auto 比率関連 38/38、actor 不調時の既存 cache 管理継続 1/1、
+  上記 UI 回帰各 1/1 が成功した。`scripts/test-full.ps1 -SuppressCrashDialogs` は
+  `[test-full] PASS` / exit 0。core check、`cargo fmt --all --check`、UI glyph、
+  `git diff --check` も exit 0。証跡は
+  `target/collection-auto-aspect-verify-20260920/test-full.log`（PowerShell transcript は
+  native cargo 出力を省略するが、各 gate 名と PASS を記録）に保存した。
+  居残り mImageViewer プロセス不在を `Get-Process` で確認してから
+  `scripts/build-dev.ps1 -PreserveRuntime` を実行し、exit 0 で core / Remote を
+  `target/dev-runtime` に生成した。core SHA-256 は
+  `89C5FEAF0EFBC5BC560CF9A5A7A7FB40E647B1B13EAE277B067D2502851E5455`、
+  Remote は `60F4EFD348C5AD5A1963BD61B7D8DD79855CA4C707B275C901324C9247793AA9`。
+  独立 reviewer は UUID actor の順序・部分失敗と UI 差分に追加 blocking 所見なしと判断した。
+  GUI / 実データ操作は行っていない。
 
 ### 23.4 参照解除の非対称（A-3 / C-11）
 

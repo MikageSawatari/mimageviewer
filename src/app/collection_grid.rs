@@ -142,6 +142,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     display_order: &crate::settings::GridDisplayOrder,
     settings: &crate::settings::Settings,
     cancel: &AtomicBool,
+    auto_aspect_client: Option<&crate::auto_aspect_cache::CollectionAutoAspectCacheClient>,
 ) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
     let perf_start = crate::perf::is_enabled().then(Instant::now);
     let classify_start = crate::perf::is_enabled().then(Instant::now);
@@ -249,6 +250,16 @@ pub(in crate::app) fn prepare_collection_grid_install(
         &thumbnail_sources,
     );
     let thumbnail_sources = thumbnail_sources?;
+    let auto_aspect_lookup = auto_aspect_client.and_then(|client| {
+        client.get_bounded(
+            snapshot.collection_id(),
+            cancel,
+            std::time::Duration::from_millis(100),
+        )
+    });
+    if cancel.load(Ordering::Acquire) {
+        return Err(CollectionPrepareError::Cancelled);
+    }
     if let Some(start) = perf_start {
         crate::perf::event(
             "collection",
@@ -274,6 +285,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     Ok(CollectionGridPreparedInstall {
         prepared,
         thumbnail_sources,
+        auto_aspect_lookup,
     })
 }
 
@@ -1053,7 +1065,11 @@ impl App {
 
         // Do not leave a prior physical/search grid interactive while the actor and classifier are
         // resolving this collection. The empty install performs no filesystem/database access.
-        self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+        let collection_seed = self
+            .collection_auto_aspect_cache
+            .as_ref()
+            .and_then(|cache| cache.cached(collection_id));
+        self.install_collection_grid_items(Vec::new(), Vec::new(), None, collection_seed);
         // A header choice belongs to the prior root. A collection open, including history and
         // same-root reopen, starts from its installed collection order.
         self.reset_details_sort_to_toolbar();
@@ -1155,6 +1171,10 @@ impl App {
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
+        let auto_aspect_client = self
+            .collection_auto_aspect_cache
+            .as_ref()
+            .map(|cache| cache.client());
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1166,6 +1186,7 @@ impl App {
                     &display_order,
                     &settings,
                     &worker_cancel,
+                    auto_aspect_client.as_ref(),
                 );
                 let _ = sender.send(result);
             });
@@ -1310,7 +1331,7 @@ impl App {
             }
         }
         if deleted_current_root {
-            self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+            self.install_collection_grid_items(Vec::new(), Vec::new(), None, None);
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.installed_items_generation = None;
             }
@@ -1335,7 +1356,7 @@ impl App {
                         && session.installed_items_generation == Some(self.items_generation)
                 });
         if presents_deleted_rows {
-            self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+            self.install_collection_grid_items(Vec::new(), Vec::new(), None, None);
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.installed_items_generation = None;
             }
@@ -1593,6 +1614,7 @@ impl App {
         let CollectionGridPreparedInstall {
             prepared,
             thumbnail_sources,
+            auto_aspect_lookup,
         } = install;
         let CollectionGridPreparedThumbnailSources {
             identity: thumbnail_source_identity,
@@ -1693,12 +1715,17 @@ impl App {
                     .position(|entry| entry.entry_id == anchor.entry_id)
             })
             .collect::<std::collections::HashSet<_>>();
+        let collection_seed = self
+            .collection_auto_aspect_cache
+            .as_mut()
+            .and_then(|cache| cache.adopt_lookup(prepared.collection_id, auto_aspect_lookup));
         self.install_collection_grid_items_with_thumbnail_sources(
             items,
             image_metas,
             selected,
             video_sidecars,
             video_pin_blobs,
+            collection_seed,
         );
         self.checked = checked;
         if let Some(query) = old_search_query {
@@ -1790,6 +1817,7 @@ impl App {
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources: CollectionGridPreparedThumbnailSources::default(),
+                auto_aspect_lookup: None,
             },
             previous,
         );
@@ -1800,6 +1828,7 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
         selected: Option<usize>,
+        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
         self.install_collection_grid_items_with_thumbnail_sources(
             items,
@@ -1807,6 +1836,7 @@ impl App {
             selected,
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            collection_seed,
         );
     }
 
@@ -1817,6 +1847,7 @@ impl App {
         selected: Option<usize>,
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
         video_pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
         if let Some(session) = self.top_level_grid_view.collection_session_mut()
             && let Some(cancel) = session.video_worker_cancel.take()
@@ -1861,7 +1892,7 @@ impl App {
         let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = None;
-        self.reset_and_seed_auto_aspect(&cache_map);
+        self.reset_and_seed_auto_aspect_with_collection_seed(&cache_map, collection_seed);
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let initial_display_px = super::compute_display_px(
@@ -2082,6 +2113,96 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    #[test]
+    fn root_auto_aspect_restores_before_real_rows_and_excludes_unsampleable_items() {
+        use crate::auto_aspect_cache::CollectionAutoAspectCache;
+        use crate::settings::ThumbAspect;
+
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("cover.png");
+        let audio = temp.path().join("song.mp3");
+        let missing = temp.path().join("missing.png");
+        std::fs::write(&image, b"test image").unwrap();
+        std::fs::write(&audio, b"test audio").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = collection_with_sources(
+            &client,
+            &[
+                (image, CollectionResolvedKind::Image),
+                (audio, CollectionResolvedKind::Audio),
+                (missing, CollectionResolvedKind::Image),
+            ],
+        );
+        let cache_path = temp.path().join("auto_aspect_cache.db");
+        let mut writer = CollectionAutoAspectCache::spawn_at(cache_path.clone()).unwrap();
+        writer
+            .record(created.collection_id(), ThumbAspect::Landscape16x9, 7, 9)
+            .unwrap();
+        drop(writer); // Process restart: only the SQLite row survives.
+        app.collection_auto_aspect_cache =
+            Some(CollectionAutoAspectCache::spawn_at(cache_path).unwrap());
+        app.settings.thumb_aspect_auto = true;
+
+        app.open_collection_grid(created.collection_id(), None);
+        assert!(app.items.is_empty());
+        assert_eq!(app.auto_aspect.current, None);
+        wait_for_grid(&mut app, created.collection_id());
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Landscape16x9));
+        assert_eq!(app.auto_aspect_eligible_total(), 1);
+        assert!(matches!(app.auto_aspect_cache_target(),
+            Some(super::super::AutoAspectCacheTarget::CollectionRoot(id)) if id == created.collection_id()));
+
+        app.save_auto_aspect_cache(ThumbAspect::Portrait3x4, 1, 1);
+        app.open_collection_grid(created.collection_id(), None);
+        assert!(app.items.is_empty());
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+        wait_for_grid(&mut app, created.collection_id());
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+
+        let entry = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .entries[0]
+            .clone();
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        session.wanted_revision += 1;
+        assert!(app.auto_aspect_cache_target().is_none());
+        app.save_auto_aspect_cache(ThumbAspect::Square, 1, 1);
+        assert_eq!(
+            app.collection_auto_aspect_cache
+                .as_ref()
+                .unwrap()
+                .cached(created.collection_id())
+                .unwrap()
+                .aspect,
+            ThumbAspect::Portrait3x4
+        );
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        session.wanted_revision = session.accepted_revision;
+        session.position = CollectionGridPosition::PhysicalSource {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key,
+            path: temp.path().join("child"),
+        };
+        assert!(app.auto_aspect_cache_target().is_none());
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        session.position = CollectionGridPosition::Root;
+        session.load = CollectionGridLoadState::Failed {
+            message: "test".into(),
+            installed: None,
+        };
+        assert!(app.auto_aspect_cache_target().is_none());
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Deleted;
+        assert!(app.auto_aspect_cache_target().is_none());
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

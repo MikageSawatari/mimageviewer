@@ -83,7 +83,7 @@ impl App {
                         ui.label(format!("うち動画のサムネイル・波形: {tile_str}"));
                     }
                     if let Some(entries) = self.cache_manager_auto_aspect_entries {
-                        ui.label(format!("比率自動判定キャッシュ: {entries} フォルダ"));
+                        ui.label(format!("比率自動判定キャッシュ: {entries} 件"));
                     }
 
                     ui.add_space(8.0);
@@ -118,12 +118,11 @@ impl App {
                         // remove_file で消せず silent fail するので、削除前に LRU を畳む
                         // (Codex P3)。
                         self.evict_all_catalog_cache();
-                        self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
+                        self.cache_maint_pending = Some(self.spawn_cache_maintenance(
                             crate::cache_maintenance::CacheMaintTask::DeleteOld {
                                 days: self.cache_manager_days as u64,
                             },
                             cache_dir.clone(),
-                            self.video_tile_cache.clone(),
                         ));
                     }
 
@@ -139,13 +138,12 @@ impl App {
                             let auto_aspect_folder = self.auto_aspect_cache_target_path();
                             // 削除前に Connection を畳む (Codex P3): 同上。
                             self.evict_all_catalog_cache();
-                            self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
+                            self.cache_maint_pending = Some(self.spawn_cache_maintenance(
                                 crate::cache_maintenance::CacheMaintTask::DeleteFolder {
                                     folder,
                                     auto_aspect_folder,
                                 },
                                 cache_dir.clone(),
-                                self.video_tile_cache.clone(),
                             ));
                         }
                     }
@@ -224,10 +222,9 @@ impl App {
                             }
                             // 削除前に Connection を畳む (Codex P3): 同上。
                             self.evict_all_catalog_cache();
-                            self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
+                            self.cache_maint_pending = Some(self.spawn_cache_maintenance(
                                 crate::cache_maintenance::CacheMaintTask::DeleteAll,
                                 cache_dir,
-                                self.video_tile_cache.clone(),
                             ));
                             self.cache_manager_confirm_delete_all = false;
                         }

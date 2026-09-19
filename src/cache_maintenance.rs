@@ -53,12 +53,43 @@ pub enum TileThumbOutcome {
     Untouched,
 }
 
+/// UUID cache failure must not suppress the established folder/catalog/tile maintenance.
+/// When it fails, a combined Auto-aspect row count is unknown, not zero.
+pub(crate) enum CollectionAspectOutcome {
+    Applied(crate::auto_aspect_cache::CollectionAutoAspectMaintenanceStats),
+    Failed(String),
+}
+
+impl CollectionAspectOutcome {
+    pub(crate) fn combined_entries(&self, folder_entries: usize) -> Option<usize> {
+        match self {
+            Self::Applied(stats) => Some(folder_entries + stats.remaining),
+            Self::Failed(_) => None,
+        }
+    }
+
+    pub(crate) fn combined_deleted(&self, folder_deleted: usize) -> usize {
+        folder_deleted
+            + match self {
+                Self::Applied(stats) => stats.deleted,
+                Self::Failed(_) => 0,
+            }
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        match self {
+            Self::Applied(_) => None,
+            Self::Failed(error) => Some(error),
+        }
+    }
+}
+
 /// ワーカーから UI に返す結果。
 ///
 /// `tile_thumb_*` フィールドは動画タイル モード キャッシュ
 /// (`video_tile_thumbs.db`) の削除/サイズ情報。`DeleteAll` / `DeleteFolder` 経路
 /// では catalog (静止画 + 動画グリッド) と一緒に削除する。
-pub enum CacheMaintResult {
+pub(crate) enum CacheMaintResult {
     Error(String),
     Stats {
         folders: usize,
@@ -67,6 +98,7 @@ pub enum CacheMaintResult {
         tile_thumb_bytes: u64,
         /// サムネイル比率 Auto モードのフォルダ別確定値キャッシュ件数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     DeleteOldDone {
         deleted: usize,
@@ -75,6 +107,7 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     /// すべて削除完了。`tile_thumb` は動画タイル DB に対する処理結果。
     DeleteAllDone {
@@ -83,6 +116,7 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     DeleteFolderDone {
         existed: bool,
@@ -94,10 +128,11 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
 }
 
-pub struct CacheMaintPending {
+pub(crate) struct CacheMaintPending {
     pub task: CacheMaintTask,
     pub rx: mpsc::Receiver<CacheMaintResult>,
     pub cancel: Arc<AtomicBool>,
@@ -199,10 +234,14 @@ pub fn spawn_archive(
 /// キャッシュ DB (`video_tile_thumbs.db`) も同時に削除する (= ユーザー UX で
 /// 「サムネ削除」と一括で動かす)。`DeleteOld` は tile cache に「最終アクセス時刻」が
 /// 無いため対象外。`Stats` 時は tile DB ファイル サイズも添えて返す。
-pub fn spawn(
+pub(crate) fn spawn(
     task: CacheMaintTask,
     cache_dir: PathBuf,
     video_tile_cache: Option<Arc<TileThumbCache>>,
+    collection_reply: Result<
+        crate::auto_aspect_cache::CollectionAutoAspectMaintenanceReply,
+        String,
+    >,
 ) -> CacheMaintPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -211,6 +250,15 @@ pub fn spawn(
     let spawn_result = std::thread::Builder::new()
         .name("cache-maint".into())
         .spawn(move || {
+            // Collection UUID cache work was admitted on the UI side. Wait here, not in UI,
+            // before reporting a successful combined clear. Failure leaves the other caches usable.
+            let collection_aspect = match collection_reply
+                .and_then(|reply| reply.recv().map_err(|_| "Collection Auto 比率 cache worker が停止しました".to_owned()))
+                .and_then(|result| result)
+            {
+                Ok(stats) => CollectionAspectOutcome::Applied(stats),
+                Err(error) => CollectionAspectOutcome::Failed(error),
+            };
             let result = match task_clone {
                 CacheMaintTask::Stats => {
                     let (folders, bytes) = crate::catalog::cache_stats(&cache_dir);
@@ -221,18 +269,19 @@ pub fn spawn(
                         bytes,
                         tile_thumb_bytes,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteOld { days } => {
                     let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
-                    let (auto_aspect_deleted, auto_aspect_entries) =
-                        auto_aspect_delete_old(days);
+                    let (auto_aspect_deleted, auto_aspect_entries) = auto_aspect_delete_old(days);
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
                     CacheMaintResult::DeleteOldDone {
                         deleted,
                         new_stats,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteAll => {
@@ -261,6 +310,7 @@ pub fn spawn(
                         tile_thumb,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteFolder {
@@ -305,6 +355,7 @@ pub fn spawn(
                         tile_thumb,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
             };
@@ -357,6 +408,56 @@ fn auto_aspect_clear_all() -> (usize, usize) {
         (0, 0),
         "clear_all",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_actor_failure_preserves_folder_maintenance_and_reports_unknown_total() {
+        let _app = crate::app::setup_app_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let db_path = crate::catalog::db_path_for(temp.path(), &folder);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"cached").unwrap();
+        let pending = spawn(
+            CacheMaintTask::DeleteFolder {
+                folder,
+                auto_aspect_folder: None,
+            },
+            temp.path().to_path_buf(),
+            None,
+            Err("collection actor unavailable".into()),
+        );
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!db_path.exists(), "folder cache deletion must still run");
+        assert!(matches!(
+            result,
+            CacheMaintResult::DeleteFolderDone {
+                existed: true,
+                collection_aspect: CollectionAspectOutcome::Failed(_),
+                ..
+            }
+        ));
+
+        let pending = spawn(
+            CacheMaintTask::DeleteAll,
+            temp.path().to_path_buf(),
+            None,
+            Err("collection actor unavailable".into()),
+        );
+        assert!(matches!(
+            pending.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            CacheMaintResult::DeleteAllDone {
+                collection_aspect: CollectionAspectOutcome::Failed(message), ..
+            } if message.contains("collection actor unavailable")
+        ));
+    }
 }
 
 fn auto_aspect_delete_folder(folder: &std::path::Path) -> (usize, usize) {

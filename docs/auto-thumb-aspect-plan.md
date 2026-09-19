@@ -731,7 +731,7 @@ helper メソッド (例: `record_aspect_sample`, `maybe_apply_auto_aspect`) を
 - `ThumbAspect` 候補の追加 (7 種で十分カバー)
 - 「ユーザーごとに学習したカスタム比率」のような ML 系拡張 (オーバーキル)
 
-## 13. Collection root の比率復元（2026-09-20、実装前設計）
+## 13. Collection root の比率復元（2026-09-20）
 
 利用者は Collection を開き直すたび Auto 比率が 1:1 に戻ると報告し、再起動後も保持する
 非同期キャッシュを希望した。現行の root install は `current_folder=None` にしてから
@@ -791,7 +791,18 @@ helper メソッド (例: `record_aspect_sample`, `maybe_apply_auto_aspect`) を
   導く。通常 folder の母数とサンプル経路は変えない。cache の前回 sample gate は現在の
   sample 可能母数で clip し、到達不能な待機を作らない。
 
-実装前レビューでは、空 install と実 install の seed 境界、writer/管理操作の順序、
-prepare Get の timeout / cancel / 遅着と clear 前後の epoch、別 context、Failed / Deleted、
-rename 維持と再起動 roundtrip を確認する。
-検証 build と GUI / 実データ操作はこの設計段階では行わない。
+実装では `CollectionAutoAspectCache` が App 全体の UUID メモリ値を持ち、
+`CollectionAutoAspectDb` だけが専用 table に触れる。短い送信ロックで Get と
+maintenance admission / epoch 更新を直列化し、DB 待ちを UI に持ち込まない。
+prepare worker の Get は最大 100 ms、取消・期限切れ・DB 不調は cache miss とする。
+実 rows の accepted install 前に lookup の epoch を照合して復元し、同一プロセスの
+再訪はメモリ値を優先する。保存は root の exact Ready ID / generation / revision と
+item 件数が一致したときだけ行う。管理操作は Collection actor 応答と従来の
+folder table worker の結果を合算する。UUID 側が失敗しても従来の folder / catalog /
+tile 処理を続け、合算件数は不明、全件削除は部分失敗として明示する。個別 folder
+削除では UUID は件数照会だけなので、actor の不調で folder 削除を妨げない。
+
+focused 回帰は UUID の再起動相当 roundtrip、folder table 非干渉、
+clear/Get epoch 順序、期限・取消、root 初回実 rows 復元、Audio / Placeholder の母数除外、
+管理操作失敗を対象にする。検証結果と build / GUI 状態は
+`collection-implementation-plan.md` §23.2 / §23.3 へ記録する。
