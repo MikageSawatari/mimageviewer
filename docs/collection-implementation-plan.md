@@ -1230,6 +1230,8 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
   Remote は `60F4EFD348C5AD5A1963BD61B7D8DD79855CA4C707B275C901324C9247793AA9`。
   独立 reviewer は UUID actor の順序・部分失敗と UI 差分に追加 blocking 所見なしと判断した。
   GUI / 実データ操作は行っていない。
+  2026-09-20、利用者が確認用ビルドで「治りました」と回答し、追加報告3点の実機確認を完了した。
+  これは当該3点の確認であり、§23.4以降やD-4を含むレビュー全体の完了を意味しない。
 
 ### 23.4 参照解除の非対称（A-3 / C-11）
 
@@ -1256,6 +1258,9 @@ read 経路の入口を `collection_store_client_for_migration` と同じ `Resul
 - navigation の prepare は、actor revision が installed と一致し installed presentation が存在する場合、
   選ばれた target entry（と隣接数件）だけ availability を確認し、全件 stat は revision 前進と明示更新に限る。
   Remote の `persistent_collections.rs` も同じ helper を使う。
+  2026-09-20、利用者は速度優先で、外部ツールによる変更の自動反映を保証せず、mIV が認識した
+  一覧・並び順を保持する方針を承認した。mIV 内の編集・名前変更への追従と、実際の移動先・Remote
+  公開範囲の検証は維持する。再取得契機は後続の実装設計で明記する（本項は未実装）。
 
 ### 23.8 バックアップと全件書き出し（仕様判断 5、K-1）
 
@@ -1281,9 +1286,12 @@ privacy.html / 製品ページの保存データ列挙、移行ガイドの「�
 
 ### 23.11 v4.0.x 以降へ送るもの
 
-B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3、M-2、
+B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3、
 A-8〜A-18 の P3、M3U 対応、登録順ソート、D&D 追加、件数表示、終了時の自動書き出し、通常フォルダの
 セッション限定シャッフル。前提件数（10,000）は known-issues と本書に明記する。
 
 D-4 は 2026-09-19 に利用者が出荷前修正へ戻すことを承認した。現時点では未実装で、
 §23.2 / §23.3 とは別の後続 chunk で扱う。
+
+M-2 も 2026-09-20 に利用者が修正を承認し、出荷前対象へ戻した。未実装で、読み取り失敗を
+正常な空と区別し、旧記録の保全と新しい保存・移行・終了の所有境界を設計中。
