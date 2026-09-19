@@ -12057,7 +12057,7 @@ impl App {
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
             // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpFirst, &key) => {
-                let display_order = self.current_grid_order().to_vec();
+                let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
                 match target {
@@ -12076,7 +12076,7 @@ impl App {
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpLast, &key) => {
-                let display_order = self.current_grid_order().to_vec();
+                let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);
                 match target {
@@ -14069,7 +14069,7 @@ impl App {
         ) {
             return;
         }
-        let display_order = self.current_grid_order().to_vec();
+        let display_order = self.current_reader_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);
         let nav_delta = match page_nav {
             crate::ui_fullscreen::FsPageNav::None => return,

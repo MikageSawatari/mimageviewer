@@ -1719,6 +1719,7 @@ fn order_summary(
 ) -> PersistentCollectionOrderSummary {
     match mode {
         CollectionOrderMode::Manual => PersistentCollectionOrderSummary::Manual,
+        CollectionOrderMode::Shuffle => PersistentCollectionOrderSummary::Shuffle,
         CollectionOrderMode::Standard => PersistentCollectionOrderSummary::Standard {
             value: super::sort_order_wire_value(sort),
             label: sort.label().to_owned(),
@@ -1842,6 +1843,8 @@ mod tests {
             collection_id: CollectionId::new(),
             collection_revision: 1,
             collection_name: "test".to_owned(),
+            order_mode: CollectionOrderMode::Manual,
+            standard_sort: crate::settings::SortOrder::FileName,
             entries: entries.into(),
         }
     }

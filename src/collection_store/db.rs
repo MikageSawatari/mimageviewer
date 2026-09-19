@@ -15,7 +15,7 @@ use super::{
 };
 use crate::settings::SortOrder;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 pub(super) struct CollectionStoreDb {
     conn: Connection,
@@ -50,6 +50,30 @@ impl CollectionStoreDb {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         match version {
             0 => initialize_schema(&conn)?,
+            1 => {
+                // VACUUM INTO includes committed WAL rows. Keep a complete v1 snapshot before
+                // the first schema write; a backup failure must leave the original untouched.
+                let db_file_name =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            CollectionStoreError::Persistence(
+                                "collection database has no filename".into(),
+                            )
+                        })?;
+                crate::db_backup::rotate_generation_backups(
+                    path.parent().unwrap_or_else(|| Path::new(".")),
+                    db_file_name,
+                    &|message| eprintln!("{message}"),
+                    &|destination| {
+                        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .map_err(CollectionStoreError::Persistence)?;
+                migrate_v1_to_v2(&conn)?;
+            }
             SCHEMA_VERSION => {}
             newer => return Err(CollectionStoreError::IncompatibleSchema(newer)),
         }
@@ -152,18 +176,27 @@ impl CollectionStoreDb {
         let tx = self.conn.transaction()?;
         let definition = load_definition(&tx, id)?;
         require_revision(expected_revision, definition.revision)?;
-        if definition.order_mode == mode && definition.standard_sort == standard_sort {
+        if mode != CollectionOrderMode::Shuffle
+            && definition.order_mode == mode
+            && definition.standard_sort == standard_sort
+        {
             let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision(&tx)?)?;
             tx.commit()?;
             return Ok(snapshot);
         }
         tx.execute(
             "UPDATE collections
-             SET order_mode = ?1, sort_order = ?2, revision = revision + 1, updated_at_ms = ?3
-             WHERE id = ?4",
+             SET order_mode = ?1, sort_order = ?2, shuffle_seed = ?3,
+                 revision = revision + 1, updated_at_ms = ?4
+             WHERE id = ?5",
             params![
                 mode.as_str(),
                 sort_order_as_str(standard_sort),
+                if mode == CollectionOrderMode::Shuffle {
+                    format!("{:016x}", new_shuffle_seed())
+                } else {
+                    format!("{:016x}", definition.shuffle_seed)
+                },
                 now_ms(),
                 id.to_string()
             ],
@@ -462,6 +495,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), CollectionStoreError> {
             name TEXT NOT NULL,
             order_mode TEXT NOT NULL,
             sort_order TEXT NOT NULL,
+            shuffle_seed TEXT NOT NULL DEFAULT '0000000000000000',
             revision INTEGER NOT NULL,
             catalog_position INTEGER NOT NULL UNIQUE,
             created_at_ms INTEGER NOT NULL,
@@ -481,10 +515,25 @@ fn initialize_schema(conn: &Connection) -> Result<(), CollectionStoreError> {
          );
          CREATE INDEX idx_collection_entries_collection
             ON collection_entries(collection_id, manual_position);
-         PRAGMA user_version = 1;",
+         PRAGMA user_version = 2;",
     )?;
     tx.commit()?;
     Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), CollectionStoreError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE collections ADD COLUMN shuffle_seed TEXT NOT NULL DEFAULT '0000000000000000';
+         PRAGMA user_version = 2;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn new_shuffle_seed() -> u64 {
+    let bytes = Uuid::new_v4().into_bytes();
+    u64::from_le_bytes(bytes[..8].try_into().expect("UUID has eight leading bytes"))
 }
 
 fn load_catalog(conn: &Connection) -> Result<CollectionCatalogSnapshot, CollectionStoreError> {
@@ -496,7 +545,7 @@ fn load_catalog_with_revision(
     revision: u64,
 ) -> Result<CollectionCatalogSnapshot, CollectionStoreError> {
     let mut statement = conn.prepare(
-        "SELECT id, name, order_mode, sort_order, revision
+        "SELECT id, name, order_mode, sort_order, revision, shuffle_seed
          FROM collections ORDER BY catalog_position ASC",
     )?;
     let rows = statement.query_map([], read_definition_row)?;
@@ -546,7 +595,7 @@ fn load_definition(
     id: CollectionId,
 ) -> Result<CollectionDefinition, CollectionStoreError> {
     conn.query_row(
-        "SELECT id, name, order_mode, sort_order, revision FROM collections WHERE id = ?1",
+        "SELECT id, name, order_mode, sort_order, revision, shuffle_seed FROM collections WHERE id = ?1",
         [id.to_string()],
         read_definition_row,
     )
@@ -589,6 +638,7 @@ fn read_definition_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionDe
     let order_mode: String = row.get(2)?;
     let sort_order: String = row.get(3)?;
     let revision: i64 = row.get(4)?;
+    let seed: String = row.get(5)?;
     Ok(CollectionDefinition {
         id: CollectionId::from_uuid(parse_uuid_sql(&id)?),
         name: row.get(1)?,
@@ -607,6 +657,13 @@ fn read_definition_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionDe
             )
         })?,
         revision: checked_u64_sql(revision, 4)?,
+        shuffle_seed: u64::from_str_radix(&seed, 16).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
     })
 }
 

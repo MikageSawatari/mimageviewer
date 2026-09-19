@@ -33,6 +33,9 @@
 - **A-3 / C-11 参照解除の表示非対称は妥当**。Unavailable の場合も理由付き無効項目を残す。
   A 報告の修正案はこれだけだが C 報告は元ファイル削除も無効にする案であり、両者は同一ではない。
   明示的な元ファイル操作の既存仕様を一括して削らず、対象 identity と操作可能性を個別に検証する。
+  現行の明示的な元ファイル削除は context menu が捕捉した `delete_targets` を削除確認へ渡し、
+  collection actor の参照解除とは別の対象を所有する。actor binding が更新中であることだけを理由に
+  この操作も禁止する案は、そのまま採用する根拠が足りない。まず A 案の表示維持を対象とする。
 - **M-1 rename scope は妥当**。dialog 状態消去より前の scope 捕捉と、dialog → poll を通す回帰が必要。
 - **C-1 / C-2 / C-3 / B-3 は妥当**。Starting / Busy を終端失敗や再生末尾に潰さない。
   再駆動は既存 typed state に帰属させ、単発の遅延 repaint だけに依存しない。
@@ -76,6 +79,14 @@ seek は `still_image` の ordinal として送る。core は画像だけの射�
 10,000 件上限でも応答バイト数による prefix 打ち切りはあり、この問題は消えない。
 2026-09-19、利用者が「出荷前に修正する」を選択。v4.0.0 の対象へ戻す。
 
+修正では request の `target_kind` を候補探索用として維持し、着地した `SparseTarget` の媒体から
+位置の射影を決める。core の同じ exact prepared / Remote 有効列で `{ kind, ordinal, count }` を算出し、
+IPC / HTTP / Web へ型付きで渡す。Web の可視 prefix から位置を再計算しない。
+画像 seek は `still_image` の位置だけを使い、動画・音声は各媒体の位置を使う。
+HTTP の見開き partner 昇格では画像位置を調整し、既存 token / revision / 公開範囲 / session・route の
+失効契約を維持する。混在列の prefix 外リンク、直後の seek、媒体ごとの件数、範囲外拒否、
+非公開行の除外、見開き、競合の回帰を対象とする。これは設計調査の結果で、まだ実装・検証前。
+
 ## 延期候補の扱い
 
 - **B-2**: revision 前進時の全体再 install は残る。データ損失とは区別し、計測を残して延期可能。
@@ -88,3 +99,21 @@ seek は `still_image` の ordinal として送る。core は画像だけの射�
 - その他 P3 群や M3U / 登録順 / D&D 追加は、既定の後続版候補を維持する。
 
 実装・検証の完了状態は実装計画 §23 を正本とし、本書の妥当性判断だけで完了に変更しない。
+
+## A-6 の実装境界（ソート修正とは別の変更）
+
+`JumpToFolderRequest` に既存 Collection root の stamp / entry / source / items generation を
+まとめた origin を捕捉し、`FolderOpenScanPurpose::JumpToPhysicalFolder` の request とともに運ぶ。
+既存 `CollectionGridPhysicalLoadOwner` は source 検証に利用可能だが、ロード採用の owner は
+`Navigation` とする。`CollectionGridPhysical` で採用すると collection の子として残ってしまう。
+
+開始時は root の surface / items / current_folder / selection / address / history を保持する。
+Windows / 非 Windows の ready 処理で origin がまだ一致することを確認し、scan 成功後の
+`load_folder_with_scan_owned` が成功した場合だけ root を退役して選択を適用する。
+既存の物理ロード採用が Collection→Path の履歴を扱う。scan 失敗・切断・取消・競合・scope 拒否では
+root を保ち、失敗後に snapshot を戻す方式を追加しない。
+
+egui の `context_menu_idx` は行番号しか持たず、開いている間の root 再 install で別 entry になり得る。
+items generation に結び付いたメニューの失効を採用境界で扱い、古い番号で新しい項目を操作しない。
+新たな App bool / 独立 pending は作らない。検証は pending / error / cancel / supersede /
+stale revision・generation・context / 成功履歴 / exact selection / A・B / sibling 非干渉を対象とする。

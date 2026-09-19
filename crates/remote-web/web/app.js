@@ -4880,7 +4880,7 @@ export function normalizePersistentCollectionPageGroups(groups, entries) {
   }).filter(Boolean);
 }
 
-function persistentCollectionSortState(order) {
+export function persistentCollectionSortState(order) {
   if (order?.kind === "standard") {
     return {
       selected: order.value,
@@ -4889,6 +4889,13 @@ function persistentCollectionSortState(order) {
         label: order.label,
         short_label: order.short_label,
       }],
+      locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+    };
+  }
+  if (order?.kind === "shuffle") {
+    return {
+      selected: "shuffle",
+      options: [{ value: "shuffle", label: "シャッフル", short_label: "シャッフル" }],
       locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
     };
   }

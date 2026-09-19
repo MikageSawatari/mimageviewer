@@ -343,7 +343,7 @@ pub(crate) enum CollectionGridSnapshotAction {
 
 impl CollectionGridSnapshotAction {
     fn requires_exact_root_revision(&self) -> bool {
-        matches!(self, Self::OpenReorder)
+        matches!(self, Self::OpenReorder | Self::SetOrder { .. })
     }
 }
 
@@ -4535,6 +4535,7 @@ mod tests {
             name: "長い名前の旅行写真と資料コレクション".into(),
             order_mode: CollectionOrderMode::Manual,
             standard_sort: SortOrder::FileName,
+            shuffle_seed: 0,
             revision: 7,
         };
         let paths = [
@@ -4582,6 +4583,7 @@ mod tests {
                     name: "仕事の参考資料".into(),
                     order_mode: CollectionOrderMode::Standard,
                     standard_sort: SortOrder::DateDesc,
+                    shuffle_seed: 0,
                     revision: 2,
                 },
             ]),
@@ -5110,6 +5112,54 @@ mod tests {
         assert_eq!(
             std::fs::read(&import_target).unwrap(),
             b"created-after-preview"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn grid_order_click_does_not_overwrite_a_newer_actor_revision_before_reply_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Exact order");
+        app.open_collection_grid(created.collection_id(), None);
+        wait_for_collection_grid(&mut app, created.collection_id());
+        let clicked = app.collection_grid_root_order().unwrap().unwrap();
+
+        // The mounted root still displays N, while another owner commits N+1. The UI's
+        // load_collection reply is deliberately polled only after that commit.
+        let newer = client
+            .set_order(
+                created.collection_id(),
+                clicked.content.expected_revision,
+                CollectionOrderMode::Standard,
+                SortOrder::DateDesc,
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        app.start_collection_grid_content_action(
+            clicked.content,
+            CollectionGridSnapshotAction::SetOrder {
+                mode: CollectionOrderMode::Shuffle,
+                sort: SortOrder::FileName,
+            },
+        );
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let latest = client
+            .load_collection(created.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest, newer,
+            "a stale order click must not mutate unseen N+1"
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("切り替わった"))
         );
         app.shutdown_collection_runtime_for_exit();
     }

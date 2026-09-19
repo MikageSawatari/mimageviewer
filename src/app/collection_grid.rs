@@ -18,8 +18,8 @@ use super::top_level_grid_view::{
 };
 use super::{App, GridItem, ViewerContextId};
 use crate::collection_store::{
-    CollectionEntryId, CollectionId, CollectionPrepareError, CollectionPreparedSnapshot,
-    CollectionStoreError, prepare_collection_snapshot,
+    CollectionEntryId, CollectionId, CollectionOrderMode, CollectionPrepareError,
+    CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
 };
 
 #[derive(Clone, Debug)]
@@ -34,6 +34,15 @@ pub(crate) struct CollectionGridContentTarget {
     pub(crate) stamp: CollectionGridRequestStamp,
     pub(crate) expected_revision: u64,
     pub(crate) selected_entry_id: Option<CollectionEntryId>,
+}
+
+/// The visible order is read from the exact installed root, never from the independently
+/// refreshed catalog or the global folder sort setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridOrderTarget {
+    pub(crate) content: CollectionGridContentTarget,
+    pub(crate) mode: CollectionOrderMode,
+    pub(crate) standard_sort: crate::settings::SortOrder,
 }
 
 /// Delete-key/context-menu resolution for the mounted collection surface. Root is fail-closed:
@@ -379,6 +388,41 @@ impl App {
             expected_revision: prepared.collection_revision,
             selected_entry_id,
         })
+    }
+
+    pub(crate) fn collection_grid_root_order(
+        &self,
+    ) -> Option<Result<CollectionGridOrderTarget, &'static str>> {
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(session.position, CollectionGridPosition::Root) {
+            return None;
+        }
+        match session.load {
+            CollectionGridLoadState::Deleted => return Some(Err("コレクションは削除されました")),
+            CollectionGridLoadState::Failed { .. } => {
+                return Some(Err("コレクション一覧を読み込めませんでした"));
+            }
+            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_) => {}
+            _ => return Some(Err("コレクション一覧を読み込み中です")),
+        }
+        if session.wanted_revision > session.accepted_revision {
+            return Some(Err("コレクション一覧の更新を待っています"));
+        }
+        let content = match self.collection_grid_content_target() {
+            Ok(target) => target,
+            Err(reason) => return Some(Err(reason)),
+        };
+        let Some(prepared) = session.prepared() else {
+            return Some(Err("コレクション一覧を更新中です"));
+        };
+        if prepared.collection_id != content.stamp.collection_id {
+            return Some(Err("コレクション一覧を更新中です"));
+        }
+        Some(Ok(CollectionGridOrderTarget {
+            content,
+            mode: prepared.order_mode,
+            standard_sort: prepared.standard_sort,
+        }))
     }
 
     pub(crate) fn apply_collection_grid_remove_success(
@@ -1010,6 +1054,9 @@ impl App {
         // Do not leave a prior physical/search grid interactive while the actor and classifier are
         // resolving this collection. The empty install performs no filesystem/database access.
         self.install_collection_grid_items(Vec::new(), Vec::new(), None);
+        // A header choice belongs to the prior root. A collection open, including history and
+        // same-root reopen, starts from its installed collection order.
+        self.reset_details_sort_to_toolbar();
         self.address = "コレクションを読み込み中…".into();
         self.schedule_collection_grid_snapshot();
         if let Some(start) = perf_start {
@@ -1531,6 +1578,14 @@ impl App {
                 },
         } = thumbnail_sources;
         let prepared = Arc::new(prepared);
+        if previous.as_ref().is_some_and(|old| {
+            old.order_mode != prepared.order_mode || old.standard_sort != prepared.standard_sort
+        }) && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
+        {
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+            self.settings.details_sort_ascending = true;
+            self.settings.save();
+        }
         let old_binding_is_current =
             self.top_level_grid_view
                 .collection_session()
@@ -1661,6 +1716,12 @@ impl App {
             } else {
                 CollectionGridLoadState::Ready(presentation)
             };
+        }
+        // install_collection_grid_items rebuilds details while the old load is still Preparing.
+        // Rebuild once the exact new order is published so Standard's display-only header choice
+        // can resume without leaking an old Standard choice into Manual or Shuffle.
+        if self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar {
+            self.rebuild_details_order();
         }
         if let Some(start) = perf_start {
             crate::perf::event(
@@ -1999,6 +2060,207 @@ mod tests {
     }
 
     #[test]
+    fn root_order_controls_use_installed_revision_and_preserve_global_sort_and_header_contract() {
+        use crate::collection_store::CollectionOrderMode;
+        use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
+        use crate::ui_dialogs::collections::CollectionGridSnapshotAction;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, b"source").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.sort_order = SortOrder::DateDesc;
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.open_collection_grid(created.collection_id(), None);
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Toolbar);
+        assert!(app.collection_grid_root_order().unwrap().is_err());
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(super::super::GridSortLockReason::CollectionLoading)
+        );
+        wait_for_grid(&mut app, created.collection_id());
+        let manual = app.collection_grid_root_order().unwrap().unwrap();
+        assert_eq!(manual.mode, CollectionOrderMode::Manual);
+        assert!(app.details_header_sort_locked());
+        assert_eq!(app.grid_sort_lock_reason(), None);
+
+        app.start_collection_grid_content_action(
+            manual.content,
+            CollectionGridSnapshotAction::SetOrder {
+                mode: CollectionOrderMode::Standard,
+                sort: SortOrder::FileName,
+            },
+        );
+        poll_until(
+            &mut app,
+            "Standard order did not install",
+            |app| matches!(app.collection_grid_root_order(), Some(Ok(order)) if order.mode == CollectionOrderMode::Standard && order.content.expected_revision > manual.content.expected_revision),
+        );
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        assert!(!app.details_header_sort_locked());
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        assert!(app.details_header_sort_active());
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(super::super::GridSortLockReason::DetailsHeaderSort)
+        );
+
+        let standard = app.collection_grid_root_order().unwrap().unwrap();
+        app.start_collection_grid_content_action(
+            standard.content,
+            CollectionGridSnapshotAction::SetOrder {
+                mode: CollectionOrderMode::Shuffle,
+                sort: standard.standard_sort,
+            },
+        );
+        poll_until(
+            &mut app,
+            "Shuffle order did not install",
+            |app| matches!(app.collection_grid_root_order(), Some(Ok(order)) if order.mode == CollectionOrderMode::Shuffle && order.content.expected_revision > standard.content.expected_revision),
+        );
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Toolbar);
+        assert!(app.details_header_sort_locked());
+        assert_eq!(app.grid_sort_lock_reason(), None);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        let shuffle = app.collection_grid_root_order().unwrap().unwrap();
+        app.start_collection_grid_content_action(
+            shuffle.content,
+            CollectionGridSnapshotAction::SetOrder {
+                mode: CollectionOrderMode::Shuffle,
+                sort: shuffle.standard_sort,
+            },
+        );
+        poll_until(
+            &mut app,
+            "Shuffle reselection did not install",
+            |app| matches!(app.collection_grid_root_order(), Some(Ok(order)) if order.mode == CollectionOrderMode::Shuffle && order.content.expected_revision > shuffle.content.expected_revision),
+        );
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        let anchor = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .entries[0]
+            .clone();
+        let child = temp.path().join("child.zip");
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .position = CollectionGridPosition::PhysicalSource {
+            entry_id: anchor.entry_id,
+            source_key: anchor.source_key,
+            path: child.clone(),
+        };
+        app.current_folder = Some(child);
+        app.items = vec![
+            GridItem::Image(temp.path().join("b.jpg")),
+            GridItem::Image(temp.path().join("a.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        assert!(app.collection_grid_root_order().is_none());
+        assert!(app.page_order_locked_for_current_view());
+        assert!(!app.details_header_sort_active());
+        assert_eq!(app.details_order, vec![0, 1]);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn standard_root_header_sort_only_reorders_rows_not_reader_or_spread() {
+        use crate::collection_store::CollectionOrderMode;
+        use crate::settings::{DetailsSortKey, GridViewMode, SortOrder, SpreadMode};
+        use crate::ui_dialogs::collections::CollectionGridSnapshotAction;
+        use crate::ui_fullscreen::SpreadPair;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sources = ["c.png", "a.png", "b.png"]
+            .into_iter()
+            .map(|name| {
+                let source = temp.path().join(name);
+                std::fs::write(&source, b"source").unwrap();
+                (source, CollectionResolvedKind::Image)
+            })
+            .collect::<Vec<_>>();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = collection_with_sources(&client, &sources);
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.open_collection_grid(created.collection_id(), None);
+        wait_for_grid(&mut app, created.collection_id());
+
+        let manual = app.collection_grid_root_order().unwrap().unwrap();
+        app.start_collection_grid_content_action(
+            manual.content,
+            CollectionGridSnapshotAction::SetOrder {
+                mode: CollectionOrderMode::Standard,
+                sort: SortOrder::FileName,
+            },
+        );
+        poll_until(&mut app, "Standard order did not install", |app| {
+            matches!(
+                app.collection_grid_root_order(),
+                Some(Ok(order)) if order.mode == CollectionOrderMode::Standard
+                    && order.content.expected_revision > manual.content.expected_revision
+            )
+        });
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.png", "b.png", "c.png"]
+        );
+
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.settings.details_sort_ascending = false;
+        app.rebuild_details_order();
+        assert_eq!(app.current_grid_order(), &[2, 1, 0]);
+        assert_eq!(app.current_reader_order(), &[0, 1, 2]);
+        assert_eq!(app.get_still_image_indices().as_ref(), &[0, 1, 2]);
+        assert_eq!(app.fullscreen_boundary_jump_target(0, true), Some(2));
+        app.spread_mode = SpreadMode::Ltr;
+        assert_eq!(
+            app.resolve_spread_pair(0),
+            SpreadPair::Double { left: 0, right: 1 }
+        );
+
+        // A watch notice may make the root stale while fullscreen still owns the installed rows.
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision += 1;
+        assert!(app.collection_grid_root_order().unwrap().is_err());
+        assert_eq!(app.current_reader_order(), &[0, 1, 2]);
+
+        // A physical child keeps its existing details/navigation order.
+        let entry = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .entries[0]
+            .clone();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .position = CollectionGridPosition::PhysicalSource {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key,
+            path: temp.path().join("child"),
+        };
+        assert_eq!(app.current_reader_order(), app.current_grid_order());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn explicit_collection_open_participates_in_typed_back_forward_history() {
         let temp = tempfile::tempdir().unwrap();
         let physical_a = temp.path().join("physical-a");
@@ -2312,6 +2574,8 @@ mod tests {
             collection_id: previous.collection_id,
             collection_revision: previous.collection_revision + 1,
             collection_name: previous.collection_name.clone(),
+            order_mode: previous.order_mode,
+            standard_sort: previous.standard_sort,
             entries: Arc::from(entries.into_boxed_slice()),
         });
         app.apply_collection_grid_prepared(Arc::clone(&reordered), Some(previous));

@@ -5544,6 +5544,7 @@ impl App {
         let mut settings_changed = false;
         let mut sort_changed = false;
         let sort_lock = self.grid_sort_lock_reason();
+        let root_order = self.collection_grid_root_order().and_then(Result::ok);
         let rating_counts = self.rating_counts();
         let selected_video_path =
             self.selected
@@ -6085,9 +6086,8 @@ impl App {
                             let (add_target, collection_rows, collection_status) =
                                 self.collection_toolbar_catalog();
                             let current_target = self.collection_grid_content_target().ok();
-                            let current_definition = current_target
-                                .as_ref()
-                                .and_then(|target| self.collection_definition(target.stamp.collection_id));
+                            let current_order_state = self.collection_grid_root_order();
+                            let current_order = current_order_state.and_then(Result::ok);
                             let add_target_name = add_target.and_then(|target| {
                                 collection_rows
                                     .iter()
@@ -6160,18 +6160,15 @@ impl App {
                                             }
                                         }
                                         MenuCommandId::CollectionsSetOrderCurrent => {
-                                            ui.add_enabled_ui(current_target.is_some(), |ui| {
+                                            let order_menu = ui.add_enabled_ui(current_order.is_some(), |ui| {
                                                 ui.menu_button(&collection_order_menu_label, |ui| {
-                                                    let current = current_definition.as_ref();
+                                                    let current = current_order;
                                                     if ui
-                                                        .selectable_label(
-                                                            current.is_some_and(|d| d.order_mode == crate::collection_store::CollectionOrderMode::Manual),
-                                                            "手動順",
-                                                        )
+                                                        .button(if current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Manual) { "✓ 手動順" } else { "  手動順" })
                                                         .clicked()
                                                     {
-                                                        let target = current_target.unwrap();
-                                                        let sort = current.map_or(crate::settings::SortOrder::FileName, |d| d.standard_sort);
+                                                        let target = current.unwrap().content;
+                                                        let sort = current.unwrap().standard_sort;
                                                         self.start_collection_grid_content_action(
                                                             target,
                                                             crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
@@ -6181,17 +6178,29 @@ impl App {
                                                         );
                                                         ui.close();
                                                     }
+                                                    if ui
+                                                        .button(if current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Shuffle) { "✓ シャッフル（再選択で並べ直す）" } else { "  シャッフル（再選択で並べ直す）" })
+                                                        .clicked()
+                                                    {
+                                                        let current = current.unwrap();
+                                                        self.start_collection_grid_content_action(
+                                                            current.content,
+                                                            crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                                mode: crate::collection_store::CollectionOrderMode::Shuffle,
+                                                                sort: current.standard_sort,
+                                                            },
+                                                        );
+                                                        ui.close();
+                                                    }
                                                     ui.menu_button("通常ソート", |ui| {
                                                         for &sort in crate::settings::SortOrder::all() {
+                                                            let checked = current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Standard && d.standard_sort == sort);
                                                             if ui
-                                                                .selectable_label(
-                                                                    current.is_some_and(|d| d.order_mode == crate::collection_store::CollectionOrderMode::Standard && d.standard_sort == sort),
-                                                                    sort.label(),
-                                                                )
+                                                                .button(format!("{}{}", if checked { "✓ " } else { "  " }, sort.label()))
                                                                 .clicked()
                                                             {
                                                                 self.start_collection_grid_content_action(
-                                                                    current_target.unwrap(),
+                                                                    current.unwrap().content,
                                                                     crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
                                                                         mode: crate::collection_store::CollectionOrderMode::Standard,
                                                                         sort,
@@ -6203,28 +6212,35 @@ impl App {
                                                     });
                                                 });
                                             });
+                                            if current_order.is_none() {
+                                                order_menu.response.on_disabled_hover_text(
+                                                    current_order_state.and_then(Result::err).unwrap_or("コレクション直下を開くと使用できます"),
+                                                );
+                                            }
                                         }
                                         MenuCommandId::CollectionsRelinkCurrent => {
                                             // Kept as a stable saved-menu command ID for settings
                                             // migration. It is filtered from all rendered menus.
                                         }
                                         MenuCommandId::CollectionsReorderCurrent => {
-                                            let manual = current_definition.as_ref().is_some_and(|d| {
-                                                d.order_mode == crate::collection_store::CollectionOrderMode::Manual
-                                            });
+                                            let manual = current_order.is_some_and(|order| order.mode == crate::collection_store::CollectionOrderMode::Manual);
                                             let response = ui
                                                 .add_enabled(
-                                                    current_target.is_some() && manual,
+                                                    manual,
                                                     egui::Button::new(&collection_reorder_menu_label),
                                                 )
-                                                .on_disabled_hover_text(if current_target.is_none() {
-                                                    "コレクション直下を開くと使用できます"
-                                                } else {
-                                                    "手動順のコレクションだけを並べ替えられます"
-                                                });
+                                                .on_disabled_hover_text(
+                                                    current_order_state.and_then(Result::err).unwrap_or_else(|| {
+                                                        if current_order.is_none() {
+                                                            "コレクション直下を開くと使用できます"
+                                                        } else {
+                                                            "手動順のコレクションだけを並べ替えられます"
+                                                        }
+                                                    }),
+                                                );
                                             if response.clicked() {
                                                 self.start_collection_grid_content_action(
-                                                    current_target.unwrap(),
+                                                    current_order.unwrap().content,
                                                     crate::ui_dialogs::collections::CollectionGridSnapshotAction::OpenReorder,
                                                 );
                                                 ui.close();
@@ -6503,8 +6519,27 @@ impl App {
                                     .on_disabled_hover_text(reason.tooltip());
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
+                                        if let Some(root) = root_order {
+                                            if ui.selectable_label(root.mode == crate::collection_store::CollectionOrderMode::Manual, "手動順").clicked() {
+                                                self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                    mode: crate::collection_store::CollectionOrderMode::Manual,
+                                                    sort: root.standard_sort,
+                                                });
+                                                ui.close();
+                                            }
+                                            if ui.selectable_label(root.mode == crate::collection_store::CollectionOrderMode::Shuffle, "シャッフル（再選択で並べ直す）").clicked() {
+                                                self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                    mode: crate::collection_store::CollectionOrderMode::Shuffle,
+                                                    sort: root.standard_sort,
+                                                });
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                        }
                                         for &order in crate::settings::SortOrder::all() {
-                                            let checked = if self.items_are_rating_view {
+                                            let checked = if let Some(root) = root_order {
+                                                root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
+                                            } else if self.items_are_rating_view {
                                                 self.rating_view_sort
                                                     == crate::rating_view::RatingViewSort::Normal(order)
                                             } else {
@@ -6515,12 +6550,18 @@ impl App {
                                                 .button(format!("{prefix}{}", order.label()))
                                                 .on_hover_text(order.description());
                                             if resp.clicked() {
-                                                self.settings.sort_order = order;
-                                                if self.items_are_rating_view {
+                                                if let Some(root) = root_order {
+                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
+                                                        sort: order,
+                                                    });
+                                                } else if self.items_are_rating_view {
+                                                    self.settings.sort_order = order;
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
                                                 } else {
+                                                    self.settings.sort_order = order;
                                                     sort_changed = true;
                                                 }
                                                 ui.close();
@@ -8262,6 +8303,7 @@ impl App {
             .map(crate::collection_store::CollectionId::from_uuid)
             .collect::<Vec<_>>();
         let sort_lock = self.grid_sort_lock_reason();
+        let root_order = self.collection_grid_root_order().and_then(Result::ok);
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
         }
@@ -8835,9 +8877,34 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             // 子 UI 内で折り返されて縦に積まれる。各ボタンを親の
                             // `horizontal_wrapped` に直接載せ、幅不足時はツールバー全体の
                             // 次行へ自然に流す。
+                            if let Some(root) = root_order {
+                                for (mode, label) in [
+                                    (crate::collection_store::CollectionOrderMode::Manual, "手動"),
+                                    (crate::collection_store::CollectionOrderMode::Shuffle, "シャッフル"),
+                                ] {
+                                    let selected = root.mode == mode;
+                                    let resp = ui.add_enabled(!sort_disabled, egui::Button::selectable(selected, label));
+                                    let resp = match sort_lock {
+                                        Some(reason) => resp.hover_tip_disabled(reason.tooltip()),
+                                        None => resp.on_hover_text(if mode == crate::collection_store::CollectionOrderMode::Shuffle {
+                                            "再選択すると新しい順に並べ直します"
+                                        } else {
+                                            "登録順で表示します"
+                                        }),
+                                    };
+                                    if resp.clicked() && (!selected || mode == crate::collection_store::CollectionOrderMode::Shuffle) {
+                                        self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                            mode,
+                                            sort: root.standard_sort,
+                                        });
+                                    }
+                                }
+                            }
                             for &order in &tb_sorts {
                                 let selected = if sort_disabled {
                                     false
+                                } else if let Some(root) = root_order {
+                                    root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
                                 } else if self.items_are_bookmark_view {
                                     self.bookmark_view_sort
                                         == crate::bookmark_browser::BookmarkViewSort::Normal(order)
@@ -8858,17 +8925,26 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     None => resp.on_hover_text(order.description()),
                                 };
                                 if resp.clicked() && !selected {
-                                    self.settings.sort_order = order;
-                                    self.settings.save();
-                                    if self.items_are_bookmark_view {
+                                    if let Some(root) = root_order {
+                                        self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                            mode: crate::collection_store::CollectionOrderMode::Standard,
+                                            sort: order,
+                                        });
+                                    } else if self.items_are_bookmark_view {
+                                        self.settings.sort_order = order;
+                                        self.settings.save();
                                         self.set_bookmark_view_sort(
                                             crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                         );
                                     } else if self.items_are_rating_view {
+                                        self.settings.sort_order = order;
+                                        self.settings.save();
                                         self.set_rating_view_sort(
                                             crate::rating_view::RatingViewSort::Normal(order),
                                         );
                                     } else {
+                                        self.settings.sort_order = order;
+                                        self.settings.save();
                                         toolbar_sort_changed = true;
                                     }
                                 }
@@ -8907,6 +8983,12 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             let current_text = if let Some(reason) = sort_lock {
                                 reason.short_label().to_string()
+                            } else if let Some(root) = root_order {
+                                match root.mode {
+                                    crate::collection_store::CollectionOrderMode::Manual => "手動".to_string(),
+                                    crate::collection_store::CollectionOrderMode::Shuffle => "シャッフル".to_string(),
+                                    crate::collection_store::CollectionOrderMode::Standard => root.standard_sort.short_label().to_string(),
+                                }
                             } else if self.items_are_bookmark_view {
                                 self.bookmark_view_sort.short_label().to_string()
                             } else if self.items_are_rating_view {
@@ -8928,8 +9010,27 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
+                                        if let Some(root) = root_order {
+                                            for (mode, label) in [
+                                                (crate::collection_store::CollectionOrderMode::Manual, "手動"),
+                                                (crate::collection_store::CollectionOrderMode::Shuffle, "シャッフル（再選択で並べ直す）"),
+                                            ] {
+                                                let selected = root.mode == mode;
+                                                if ui.selectable_label(selected, label).clicked()
+                                                    && (!selected || mode == crate::collection_store::CollectionOrderMode::Shuffle)
+                                                {
+                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                        mode,
+                                                        sort: root.standard_sort,
+                                                    });
+                                                }
+                                            }
+                                            ui.separator();
+                                        }
                                         for &order in &tb_sorts {
-                                            let selected = if self.items_are_bookmark_view {
+                                            let selected = if let Some(root) = root_order {
+                                                root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
+                                            } else if self.items_are_bookmark_view {
                                                 self.bookmark_view_sort
                                                     == crate::bookmark_browser::BookmarkViewSort::Normal(order)
                                             } else if self.items_are_rating_view {
@@ -8943,17 +9044,26 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                 .on_hover_text(order.description());
                                             if resp.clicked() && !selected
                                             {
-                                                self.settings.sort_order = order;
-                                                self.settings.save();
-                                                if self.items_are_bookmark_view {
+                                                if let Some(root) = root_order {
+                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
+                                                        sort: order,
+                                                    });
+                                                } else if self.items_are_bookmark_view {
+                                                    self.settings.sort_order = order;
+                                                    self.settings.save();
                                                     self.set_bookmark_view_sort(
                                                         crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                                     );
                                                 } else if self.items_are_rating_view {
+                                                    self.settings.sort_order = order;
+                                                    self.settings.save();
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
                                                 } else {
+                                                    self.settings.sort_order = order;
+                                                    self.settings.save();
                                                     toolbar_sort_changed = true;
                                                 }
                                             }
@@ -15159,7 +15269,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let book_sort_locked = self.details_header_sort_locked();
         self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
@@ -15608,7 +15718,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let hover_bg = ui.visuals().widgets.hovered.bg_fill;
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let book_sort_locked = self.details_header_sort_locked();
         self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(

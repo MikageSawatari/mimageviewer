@@ -3708,6 +3708,8 @@ mod tests {
             collection_id: prepared.collection_id,
             collection_revision: prepared.collection_revision,
             collection_name: prepared.collection_name.clone(),
+            order_mode: prepared.order_mode,
+            standard_sort: prepared.standard_sort,
             entries: Arc::from(changed_entries),
         });
         let target = prepared_target(&changed.entries[0], CollectionResolvedKind::Image);

@@ -213,6 +213,143 @@ fn database_keeps_ids_manual_order_and_revisions_across_reopen() {
 }
 
 #[test]
+fn v1_migration_preserves_every_collection_entry_and_revision_and_backs_up_original() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let (catalog_before, snapshots_before) = {
+        let mut db = open_db(&temp);
+        let first = db.create_collection("First").unwrap();
+        let second = db.create_collection("Second").unwrap();
+        let first = db
+            .add_batch(
+                first.collection_id(),
+                first.revision(),
+                vec![
+                    registration(r"C:\v1\a.jpg", CollectionResolvedKind::Image),
+                    registration(r"C:\v1\b.zip", CollectionResolvedKind::Zip),
+                ],
+            )
+            .unwrap()
+            .snapshot;
+        let second = db
+            .add_batch(
+                second.collection_id(),
+                second.revision(),
+                vec![registration(r"C:\v1\c.mp3", CollectionResolvedKind::Audio)],
+            )
+            .unwrap()
+            .snapshot;
+        let second = db
+            .set_order(
+                second.collection_id(),
+                second.revision(),
+                CollectionOrderMode::Standard,
+                SortOrder::DateDesc,
+            )
+            .unwrap();
+        let catalog = db.catalog().unwrap();
+        let snapshots: Vec<CollectionSnapshot> = [first.collection_id(), second.collection_id()]
+            .into_iter()
+            .map(|id| db.snapshot(id).unwrap())
+            .collect();
+        (catalog, snapshots)
+    };
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE collections DROP COLUMN shuffle_seed; PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let db = CollectionStoreDb::open_at(&path).unwrap();
+    assert_eq!(db.catalog().unwrap(), catalog_before);
+    for original in &snapshots_before {
+        assert_eq!(db.snapshot(original.collection_id()).unwrap(), *original);
+    }
+    let backup = temp.path().join("collection.db.bak1");
+    assert!(backup.is_file());
+    let backup_conn =
+        Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let backup_version: u32 = backup_conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(backup_version, 1);
+    let backup_count: i64 = backup_conn
+        .query_row("SELECT COUNT(*) FROM collection_entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(backup_count, 3);
+    drop(db);
+    CollectionStoreDb::open_at(&path).unwrap();
+    assert!(
+        !temp.path().join("collection.db.bak2").exists(),
+        "v2 reopen must not rotate a second backup"
+    );
+}
+
+#[test]
+fn shuffle_seed_roundtrips_full_u64_and_reselection_advances_revision_without_moving_manual_positions()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Shuffle").unwrap();
+    let added = db
+        .add_batch(
+            created.collection_id(),
+            created.revision(),
+            vec![
+                registration(r"C:\shuffle\a.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\shuffle\b.jpg", CollectionResolvedKind::Image),
+            ],
+        )
+        .unwrap()
+        .snapshot;
+    let positions = added
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry.manual_position))
+        .collect::<Vec<_>>();
+    let first = db
+        .set_order(
+            created.collection_id(),
+            added.revision(),
+            CollectionOrderMode::Shuffle,
+            SortOrder::FileName,
+        )
+        .unwrap();
+    let second = db
+        .set_order(
+            created.collection_id(),
+            first.revision(),
+            CollectionOrderMode::Shuffle,
+            SortOrder::FileName,
+        )
+        .unwrap();
+    assert_eq!(second.revision(), first.revision() + 1);
+    assert_eq!(second.catalog_revision, first.catalog_revision + 1);
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.manual_position))
+            .collect::<Vec<_>>(),
+        positions
+    );
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE collections SET shuffle_seed = 'ffffffffffffffff' WHERE id = ?1",
+        [created.collection_id().to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    let reopened = open_db(&temp).snapshot(created.collection_id()).unwrap();
+    assert_eq!(reopened.definition.shuffle_seed, u64::MAX);
+}
+
+#[test]
 fn collection_standard_sort_roundtrips_every_list_sort_variant() {
     let temp = tempfile::tempdir().unwrap();
     let mut db = open_db(&temp);
@@ -606,6 +743,87 @@ fn standard_order_uses_aligned_facts_while_manual_ignores_them() {
     );
     assert_eq!(
         effective_collection_order(&snapshot, &facts[..1]),
+        Err(CollectionStoreError::InvalidOrder)
+    );
+}
+
+#[test]
+fn shuffle_order_uses_only_seed_and_entry_identity_and_preserves_standard_fact_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Shuffle order").unwrap();
+    let sources = (0..12)
+        .map(|index| {
+            registration(
+                &format!(r"C:\shuffle\{index:02}.jpg"),
+                CollectionResolvedKind::Image,
+            )
+        })
+        .collect();
+    let manual = db
+        .add_batch(created.collection_id(), created.revision(), sources)
+        .unwrap()
+        .snapshot;
+    let mut shuffle = db
+        .set_order(
+            created.collection_id(),
+            manual.revision(),
+            CollectionOrderMode::Shuffle,
+            SortOrder::FileName,
+        )
+        .unwrap();
+    shuffle.definition.shuffle_seed = 0x0123456789abcdef;
+    let first = effective_collection_order(&shuffle, &[]).unwrap();
+    assert_eq!(first.len(), manual.entries.len());
+    assert_eq!(
+        first
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        first.len()
+    );
+    let mut permuted = shuffle.clone();
+    permuted.entries =
+        std::sync::Arc::from(shuffle.entries.iter().rev().cloned().collect::<Vec<_>>());
+    assert_eq!(effective_collection_order(&permuted, &[]).unwrap(), first);
+    permuted.definition.shuffle_seed = 0xfedcba9876543210;
+    assert_ne!(effective_collection_order(&permuted, &[]).unwrap(), first);
+    let fixed_ids = (1..=5)
+        .map(|number| {
+            CollectionEntryId::from_uuid(
+                uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{number:012x}")).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut fixed = shuffle.clone();
+    fixed.definition.shuffle_seed = 0x0123456789abcdef;
+    fixed.entries = std::sync::Arc::from(
+        shuffle.entries[..5]
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut entry = entry.clone();
+                entry.id = fixed_ids[index];
+                entry
+            })
+            .collect::<Vec<_>>(),
+    );
+    // SHA-256(seed LE bytes || UUID raw bytes), digest ascending, UUID tie-break.
+    assert_eq!(
+        effective_collection_order(&fixed, &[]).unwrap(),
+        vec![
+            fixed_ids[1],
+            fixed_ids[0],
+            fixed_ids[4],
+            fixed_ids[3],
+            fixed_ids[2],
+        ]
+    );
+    let mut standard = shuffle;
+    standard.definition.order_mode = CollectionOrderMode::Standard;
+    assert_eq!(
+        effective_collection_order(&standard, &[]),
         Err(CollectionStoreError::InvalidOrder)
     );
 }

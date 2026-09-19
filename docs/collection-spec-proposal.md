@@ -156,18 +156,23 @@ Sol/xhigh独立担当と親が以下の境界を照合した。製品実装は�
 - `CollectionOrderMode` に `Shuffle` を加え、定義に `shuffle_seed: u64` を持つ。手動 position は変更しない。
   **2026-09-19 設計補正**: 未リリースでも試用中の DB があるため、移行前バックアップと既存データを保持する
   原子的な schema migration を行う。seed は u64 全域を往復できる保存形式を固定する。
-- 有効順は prepare worker が `hash(shuffle_seed, entry_id)` の昇順で作る。entry ID は stable UUID なので、
+- 有効順は prepare worker が `SHA-256(shuffle_seed の little-endian 8 bytes || entry ID の UUID raw 16 bytes)`
+  のdigest辞書順、同値時にはUUID raw bytes昇順で作る。seed はDBに16桁hex TEXTとして保存し、u64全域を
+  往復する。entry ID は stable UUID なので、
   登録・解除・名前変更・再生中の編集があっても残る entry の相対順は変わらず、新規 entry は seed で決まる位置へ
   入る。旧 index に依存しない。
 - 次 / 前 / EOF / Ctrl+↑↓ / スライドショーは既存の latest-next reducer をそのまま使う（有効順が変わるだけ）。
   末尾の折り返しは `VideoContinuousMode::ContinuousLoop` に従い、`Continuous` は末尾で停止、`Off` は 1 件だけ。
-- UI: ソート選択肢「シャッフル」を選ぶと `SetOrder { mode: Shuffle, seed: 新規乱数 }`。既に Shuffle のときに
-  再選択すると seed を引き直す（「並び直す」）。手動順 / 通常ソートへ戻すと seed は保持したまま無視する。
+- UI: ソート選択肢「シャッフル」を選ぶと `SetOrder { mode: Shuffle, sort }` を送り、collection actor の
+  DB更新境界で新規seedを生成・永続化する。既に Shuffle のときに再選択すると seed を引き直す
+  （「並び直す」）。手動順 / 通常ソートへ戻すと seed は保持したまま無視する。
 - 一覧はシャッフル順で表示するので次の曲が見える。専用並べ替え画面は手動順のときだけ（現行どおり）。
 - Remote は prepared snapshot の有効順を読むだけで追従する。wire に order mode を載せる箇所は Shuffle を通す。
   Web の表示分岐と IPC の版も更新する。hash の方式と同値時の entry ID tie-break を明示し、実行間で順序を保つ。
 - Manual / Shuffle は詳細表示の列ヘッダによる一時並べ替えを無効にするが、ツールバー / メニューでの
   並び順選択は有効に保つ。Standard の列ヘッダソートは表示限定で、再生・書き出し・Remote の有効順は変えない。
+  Collection root の見開き・seek・Home / End・slideshow は installed items の有効順（local filter の可視投影）を
+  使い、列ヘッダ順は一覧の描画と選択に限定する。PhysicalSource 子と通常一覧の読み順は従来の表示順を使う。
   表示と選択 target は同じ採用 revision に束ね、読み込み中・更新待ちは理由付きで無効化する。
   同一 root の order 切替でも列ソートを戻し、新 order と items の採用後に詳細表示順を整合させる。
 - 将来候補: ループ折り返し時に seed を引き直す設定（毎周違う順にしたい場合）。

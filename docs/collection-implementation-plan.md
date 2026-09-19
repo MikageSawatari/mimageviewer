@@ -79,7 +79,7 @@ PC、複数 viewer context、Remote が共通利用する正本とする。
 
 ### 3.1 型
 
-初段から次の型を正本とする（名称は Rust 実装時に既存命名へ合わせられるが、意味は変えない）。
+現行の型は次を正本とする（名称は Rust 実装に合わせる）。
 
 ```text
 CollectionId(UUID)
@@ -88,8 +88,8 @@ CollectionSourceNamespace = FileSystemPath
 CollectionSourcePathKey { namespace, normalized_path }
 CollectionResolvedKind = Image | Video | Audio | Folder | Zip | Pdf |
                          ConvertibleArchive | Unresolved
-CollectionOrderMode = Manual | Standard
-CollectionDefinition { id, name, order_mode, standard_sort, revision, ... }
+CollectionOrderMode = Manual | Standard | Shuffle
+CollectionDefinition { id, name, order_mode, standard_sort, shuffle_seed, revision, ... }
 CollectionEntry { id, collection_id, source_path, source_key, manual_position, ... }
 CollectionCatalogSnapshot { catalog_revision, definitions: Arc<[...] > }
 CollectionSnapshot { collection_id, revision, definition, entries: Arc<[...] > }
@@ -112,7 +112,7 @@ CollectionSortFacts { entry_id, name_key, mtime, size, resolved_category }
 
 ```text
 collection_meta(schema_version, catalog_revision)
-collections(id PK, name, order_mode, sort_order, revision, created_at, updated_at)
+collections(id PK, name, order_mode, sort_order, shuffle_seed TEXT, revision, created_at, updated_at)
 collection_entries(
   id PK, collection_id FK, source_namespace, source_path, normalized_path, resolved_kind,
   manual_position, created_at,
@@ -128,7 +128,7 @@ collection_entries(
   conflict、constraint error で一部 collection だけ新 path にならない。
 - mutation ごとに対象 collection revision と catalog revision を commit 内で進める。
   crash 後に定義と entry、順序と revision が半端に見えない。
-- manual position は常に保存し、Standard へ切り替えても書き換えない。Standard 中の追加も
+- manual position は常に保存し、Standard / Shuffle へ切り替えても書き換えない。両モード中の追加も
   manual tail へ追加するため、Manual へ戻したとき元の順序と追加 tail が復元する。
 - migration は schema version で直列化し、未知の新 schema は read/write せず typed
   incompatible とする。DB corruption や open failure を空コレクションへ黙って置換しない。
@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1 計装実装・focused 検証・Codex独立レビュー完了、§23.2 以降は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1 計装、§23.2/23.3 sort / Shuffle の実装・自動検証・Codex独立レビュー完了。§23.4 以降は原則未着手（§23.8 の移行前 DB 保護だけ先行）。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1131,22 +1131,65 @@ request ownership、worker の配置、deadline、取消、表示順は変更し
 
 ### 23.2 ソート UI（A-1 / A-2、案 C。仕様判断 1）
 
-- `top_level_grid_view.surface()` から導く単一の typed 述語（例 `TopLevelViewKind`）を用意し、
-  `page_order_locked_for_current_view` / `grid_sort_lock_reason` / `details_header_sort_active` /
-  `apply_sort_change_reload` / `main_window_title`（A-5）/ `can_jump_to_folder`（A-6）/
-  `ContextMenuViewFlags` を Collection 対応にする。新しい `items_are_collection_view` bool は足さない。
+- `top_level_grid_view` の Collection Root / PhysicalSource 位置、installed presentation の revision / order mode、
+  viewer context と surface stamp に束ねた typed order 対象を正本にする。`grid_sort_lock_reason` /
+  `details_header_sort_active` / `apply_sort_change_reload` / `main_window_title`（A-5）へ通す。
+  loading / stale / failed / deleted はそれぞれの理由で無効にし、独立更新される catalog の定義値を
+  表示中の順序正本にしない。新しい `items_are_collection_view` bool は足さない。
 - ツールバー Buttons / Dropdown と表示メニューの選択肢に「手動順」「シャッフル」を追加し、Collection root では
   定義の `order_mode` / `standard_sort` を選択表示する。Collection 分岐では `settings.sort_order` を書かず
   `CollectionGridSnapshotAction::SetOrder` を送る。`apply_sort_change_reload` は Collection で早期 return。
-- 手動順では `PageOrderFixed` を返して列ヘッダソートを無効化し、通常ソート / シャッフルでは
-  `open_collection_grid` と履歴からの Collection 復帰で `reset_details_sort_to_toolbar()` を呼ぶ。
-- 上部「コレクション」メニューの「並び順」は残し、同じ述語から表示を導く。無効時は理由を出す（A-9）。
+- Manual / Shuffle では列ヘッダだけを固定し、ツールバー / 表示メニューは選択可能に保つ。
+  Standard の列ヘッダソートは既存どおり表示限定で、列ヘッダ所有中はツールバー / 表示メニューを無効にする。
+  Collection root の reader（見開き、seek、Home / End、slideshow 等）は installed items の有効順を
+  local filter で可視投影した列を使い、列ヘッダ順は一覧の描画・選択にだけ使う。PhysicalSource 子と
+  通常一覧の reader は従来の表示順を保つ。
+  `open_collection_grid` と履歴からの復帰、同じ root の order 切替で列ソートを解除し、items と新order公開後に
+  details 表示順を再構築する。ZIP / PDF / 自動画像本の `page_order_locked_for_current_view()` は
+  列ヘッダと details 並びの共通consumerにも使い、本内ページ順を固定する（§1.244）。
+- 上部「コレクション」メニューの「並び順」は残し、同じ installed root 述語から表示を導く。
+  このメニューだけは Standard の列ヘッダ所有中も order を選べ、成功採用時に列ソートを解除する。
+  loading / stale / failed / deleted で無効のときは理由を出す（A-9）。
+- A-6「元の場所へ移動」はこのsort chunkから分離する。既存 `begin_context_jump_to_folder` は開始時にrootを
+  破棄するため流用せず、後続の独立physical jump chunkで stamped scan owner を持ち、成功時だけrootを退役、
+  失敗・取消・遅着では元rootと履歴を保つ。`ContextMenuViewFlags` / `can_jump_to_folder` の変更もそこで行う。
 - 回帰: review README §2.2 の (a)〜(e)。
 
 ### 23.3 シャッフル順（仕様判断 2、設計は仕様案「シャッフル順の設計」）
 
 `CollectionOrderMode::Shuffle` + `shuffle_seed` を model / db / prepare / UI / Remote wire へ通す。
-有効順は `hash(seed, entry_id)` 昇順。再選択で seed 更新。reducer は変更しない。
+有効順は `SHA-256(seed の little-endian 8 bytes || entry ID の UUID raw 16 bytes)` の digest を
+辞書順で昇順、同値なら UUID raw bytes 昇順にする。再選択で seed 更新。reducer は変更しない。
+DB v1→v2 は全collection / entry / revisionを保持する単一transaction移行とし、その前に既存の世代
+バックアップ関数でWAL込みsnapshotを保存する。seed は16桁のhex TEXTでu64全域を保持する。
+Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照合は同じ契約のままO(N)へする。
+
+#### §23.2 / §23.3 実装記録（2026-09-19）
+
+- Collection Root の order UI は installed session の identity / items generation / accepted revision と
+  immutable prepared snapshot を正本にした。loading / stale / failed / deleted を理由付きで無効にし、
+  SetOrder の actor snapshot 採用にも captured revision の exact check を加えた。既存の
+  Import / Export の relaxed revision 契約は変えない。Manual / Shuffle は列ヘッダだけ固定し、
+  上部 Collection メニューは列ヘッダ所有中も選択可能にした。order 採用時と root open / 履歴復帰時は
+  列ヘッダを戻し、新しい items / order の後に details 行順を再構築する。通常一覧の global sort は変更しない。
+- Standard root の列ヘッダ順は一覧表示・選択専用とし、reader / 見開き / seek / Home / End /
+  slideshow / native video は installed 有効順の local-filter 可視投影を使う。PhysicalSource 子と
+  通常一覧の reader は既存の表示順を使う。ZIP / PDF / 画像本の列ヘッダ・details order は
+  共通の `page_order_locked_for_current_view()` から固定し、本内ページ順を守る（§1.244）。
+- Shuffle は seed と entry ID の固定 SHA-256 順を model / DB / prepare / UI / Remote に通した。
+  同モード再選択でも新 seed と revision を発行し、manual position は保持する。DB v1→v2 は
+  WAL を含む世代バックアップを移行前に保存してから単一 transaction で全 collection / entry を保持する。
+  seed の16桁 hex TEXT は u64 全域を往復し、Remote IPC は57、Webは「シャッフル」を表示する。
+  Standard facts の集合照合は同じ契約のまま HashSet で O(N) にした。
+- focused collection 168/168、Remote IPC Shuffle wire、Web 123/123、
+  `scripts/test-full.ps1 -SuppressCrashDialogs` の `[test-full] PASS` / exit 0、
+  core check、viewer-context audit、fmt、UI glyph、diff check が成功した。
+  `scripts/build-dev.ps1 -PreserveRuntime` は居残りプロセス不在を確認して成功し、core / Remote を
+  `target/dev-runtime` に生成した。証跡は `target/collection-sort-verify-20260919/`。
+  Codex独立 reviewer は §23.2/3 と §1.244 の差分・検証を確認し、重大な残件なしと判断した。
+  GUI / 実データは操作していない。
+- A-6「元の場所へ移動」はこの chunk に含めず、root を成功前に破棄しない独立 physical jump として
+  後続で設計・実装する。§23.8 の全件書き出しも未実装で、ここでは schema 移行前の DB 保護だけを先行した。
 
 ### 23.4 参照解除の非対称（A-3 / C-11）
 
@@ -1198,6 +1241,9 @@ privacy.html / 製品ページの保存データ列挙、移行ガイドの「�
 
 ### 23.11 v4.0.x 以降へ送るもの
 
-B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3 / D-4、M-2、
+B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3、M-2、
 A-8〜A-18 の P3、M3U 対応、登録順ソート、D&D 追加、件数表示、終了時の自動書き出し、通常フォルダの
 セッション限定シャッフル。前提件数（10,000）は known-issues と本書に明記する。
+
+D-4 は 2026-09-19 に利用者が出荷前修正へ戻すことを承認した。現時点では未実装で、
+§23.2 / §23.3 とは別の後続 chunk で扱う。

@@ -58,6 +58,8 @@ pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) collection_id: super::CollectionId,
     pub(crate) collection_revision: u64,
     pub(crate) collection_name: String,
+    pub(crate) order_mode: super::CollectionOrderMode,
+    pub(crate) standard_sort: crate::settings::SortOrder,
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
@@ -509,6 +511,8 @@ pub(crate) fn prepare_collection_snapshot_while(
         collection_id: snapshot.collection_id(),
         collection_revision: snapshot.revision(),
         collection_name: snapshot.definition.name.clone(),
+        order_mode: snapshot.definition.order_mode,
+        standard_sort: snapshot.definition.standard_sort,
         entries: Arc::from(entries),
     })
 }
@@ -757,6 +761,7 @@ mod tests {
                 name: "Export".into(),
                 order_mode: mode,
                 standard_sort: sort,
+                shuffle_seed: 0,
                 revision: 7,
             },
             entries: Arc::from(entries),
@@ -785,6 +790,8 @@ mod tests {
             collection_id: CollectionId::new(),
             collection_revision: 9,
             collection_name: "Navigation".into(),
+            order_mode: CollectionOrderMode::Manual,
+            standard_sort: SortOrder::FileName,
             entries: Arc::from(entries),
         }
     }

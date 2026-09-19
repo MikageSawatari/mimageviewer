@@ -175,6 +175,7 @@ const {
   parentContainerAddress,
   parseRoute,
   persistentCollectionIdentityKey,
+  persistentCollectionSortState,
   persistentCollectionHistoryStateForSession,
   persistentCollectionOrdinalLocator,
   persistentCollectionCatalogTruncationText,
@@ -220,6 +221,14 @@ const {
   viewerMenuDefinitions,
   viewerImageUpdateContextExitReason,
 } = await import("./app.js");
+
+test("saved collection sort display distinguishes manual, standard, and shuffle", () => {
+  assert.equal(persistentCollectionSortState({ kind: "manual" }).selected, "manual");
+  assert.equal(persistentCollectionSortState({ kind: "shuffle" }).options[0].label, "シャッフル");
+  assert.deepEqual(persistentCollectionSortState({
+    kind: "standard", value: "file_name", label: "ファイル名", short_label: "名前",
+  }).options, [{ value: "file_name", label: "ファイル名", short_label: "名前" }]);
+});
 
 function deferred() {
   let resolve;

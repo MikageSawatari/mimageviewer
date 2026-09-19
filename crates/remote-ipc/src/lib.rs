@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 56;
+pub const PROTOCOL_VERSION: u32 = 57;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1344,6 +1344,7 @@ pub struct PersistentCollectionCatalogRequest;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistentCollectionOrderSummary {
     Manual,
+    Shuffle,
     Standard {
         value: String,
         label: String,
@@ -3178,7 +3179,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 56);
+        assert_eq!(PROTOCOL_VERSION, 57);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3354,7 +3355,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 56);
+        assert_eq!(PROTOCOL_VERSION, 57);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4361,6 +4362,15 @@ mod tests {
         assert!(!encoded.contains("super-secret"));
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert!(value.get("password").is_none());
+    }
+
+    #[test]
+    fn persistent_collection_shuffle_order_round_trips_on_protocol_57() {
+        assert_eq!(PROTOCOL_VERSION, 57);
+        let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
+        assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
+        let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, PersistentCollectionOrderSummary::Shuffle);
     }
 
     #[test]

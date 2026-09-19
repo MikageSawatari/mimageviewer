@@ -9946,6 +9946,7 @@ fn main_window_title(
     bookmark_view: bool,
     subfolder_expansion_view: bool,
     smart_folder_name: Option<&str>,
+    collection_name: Option<&str>,
     indexing_active: bool,
 ) -> String {
     let base = if reading_history_view {
@@ -9956,6 +9957,8 @@ fn main_window_title(
         "サブフォルダ展開 - mimageviewer".to_string()
     } else if let Some(name) = smart_folder_name {
         format!("スマートフォルダ: {name} - mimageviewer")
+    } else if let Some(name) = collection_name {
+        format!("コレクション: {name} - mimageviewer")
     } else if let Some(path) = effective_folder {
         format!("{} - mimageviewer", path.display())
     } else {
@@ -10011,6 +10014,10 @@ pub(crate) enum GridSortLockReason {
     PageOrderFixed,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
+    CollectionLoading,
+    CollectionStale,
+    CollectionFailed,
+    CollectionDeleted,
 }
 
 impl GridSortLockReason {
@@ -10021,6 +10028,10 @@ impl GridSortLockReason {
         match self {
             Self::PageOrderFixed => "固定",
             Self::DetailsHeaderSort => "列ヘッダ",
+            Self::CollectionLoading => "更新中",
+            Self::CollectionStale => "更新待ち",
+            Self::CollectionFailed => "読込失敗",
+            Self::CollectionDeleted => "削除済み",
         }
     }
 
@@ -10034,6 +10045,12 @@ impl GridSortLockReason {
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
+            Self::CollectionLoading => "コレクション一覧の更新が完了すると並び順を選べます。",
+            Self::CollectionStale => "最新のコレクション一覧が表示されるまで並び順を選べません。",
+            Self::CollectionFailed => {
+                "コレクション一覧を読み込めませんでした。再読み込みしてください。"
+            }
+            Self::CollectionDeleted => "このコレクションは削除されました。",
         }
     }
 }
@@ -20509,6 +20526,9 @@ impl App {
         &mut self,
         physical_mode: PhysicalFolderSortReload,
     ) {
+        if self.collection_grid_root_order().is_some() {
+            return;
+        }
         if self.zip_nav.is_some() {
             self.zip_nav_show_current_level();
             return;
@@ -41156,7 +41176,7 @@ impl App {
     fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
         let mut page_count = 0_i64;
         let mut page_pos = None;
-        for &candidate in self.current_grid_order() {
+        for &candidate in self.current_reader_order() {
             let item = self.items.get(candidate)?;
             if !item.has_page_data() {
                 return None;
@@ -51367,6 +51387,31 @@ impl App {
         }
     }
 
+    /// Reader operations use the installed collection order, even when a Standard root's
+    /// details header temporarily rearranges rows for display. A physical child keeps its
+    /// ordinary page order, and other grids retain their existing display-order navigation.
+    pub(crate) fn current_reader_order(&self) -> &[usize] {
+        let collection_root_installed =
+            self.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.position,
+                        top_level_grid_view::CollectionGridPosition::Root
+                    ) && session.installed_items_generation == Some(self.items_generation)
+                        && session.prepared().is_some_and(|prepared| {
+                            prepared.collection_id == session.identity.collection_id
+                                && prepared.collection_revision == session.accepted_revision
+                                && prepared.entries.len() == self.items.len()
+                        })
+                });
+        if collection_root_installed {
+            &self.visible_indices
+        } else {
+            self.current_grid_order()
+        }
+    }
+
     pub(crate) fn set_grid_view_mode(&mut self, mode: crate::settings::GridViewMode) {
         if self.settings.grid_view_mode == mode {
             return;
@@ -51410,7 +51455,18 @@ impl App {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && !self.current_folder_is_book_folder()
             && !self.items_are_reading_history_view
+            && !self.page_order_locked_for_current_view()
+            && !self.collection_grid_root_order().is_some_and(|order| {
+                !matches!(order, Ok(target) if target.mode == crate::collection_store::CollectionOrderMode::Standard)
+            })
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
+    }
+
+    pub(crate) fn details_header_sort_locked(&self) -> bool {
+        self.page_order_locked_for_current_view()
+            || self.collection_grid_root_order().is_some_and(|order| {
+                !matches!(order, Ok(target) if target.mode == crate::collection_store::CollectionOrderMode::Standard)
+            })
     }
 
     /// 一覧のソート選択 UI を無効化する理由。無ければ選べる。
@@ -51419,6 +51475,33 @@ impl App {
     /// 何も起きない入口が残る (§1.143(a): メニューの「ソート順」は列ヘッダ並べ替え中でも
     /// 選べてしまい、選んでも表示は変わらなかった)。
     pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        if let Some(order) = self.collection_grid_root_order() {
+            return match order {
+                Err(_) => Some(
+                    match self
+                        .top_level_grid_view
+                        .collection_session()
+                        .map(|session| &session.load)
+                    {
+                        Some(top_level_grid_view::CollectionGridLoadState::Deleted) => {
+                            GridSortLockReason::CollectionDeleted
+                        }
+                        Some(top_level_grid_view::CollectionGridLoadState::Failed { .. }) => {
+                            GridSortLockReason::CollectionFailed
+                        }
+                        Some(
+                            top_level_grid_view::CollectionGridLoadState::Ready(_)
+                            | top_level_grid_view::CollectionGridLoadState::Empty(_),
+                        ) => GridSortLockReason::CollectionStale,
+                        _ => GridSortLockReason::CollectionLoading,
+                    },
+                ),
+                Ok(_) if self.details_header_sort_active() => {
+                    Some(GridSortLockReason::DetailsHeaderSort)
+                }
+                Ok(_) => None,
+            };
+        }
         if self.page_order_locked_for_current_view() {
             Some(GridSortLockReason::PageOrderFixed)
         } else if self.details_header_sort_active() {
@@ -70789,7 +70872,7 @@ impl App {
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
-            self.current_grid_order(),
+            self.current_reader_order(),
             fs_idx,
             mode.wraps(),
             |item| matches!(item, GridItem::Video(_)),
@@ -70923,7 +71006,7 @@ impl App {
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
-            self.current_grid_order(),
+            self.current_reader_order(),
             fs_idx,
             mode.wraps(),
             |item| matches!(item, GridItem::Video(_)),
@@ -71217,7 +71300,7 @@ impl App {
 
         let candidates = Self::collect_matching_media_navigation_candidates(
             &self.items,
-            self.current_grid_order(),
+            self.current_reader_order(),
             fs_idx,
             mode.wraps(),
             |item| matches!(item, GridItem::Audio(_)),
@@ -72669,6 +72752,19 @@ impl App {
             self.items_are_smart_folder_view
                 .then_some(smart_folder_name)
                 .flatten(),
+            self.top_level_grid_view
+                .collection_session()
+                .filter(|session| {
+                    matches!(
+                        session.position,
+                        top_level_grid_view::CollectionGridPosition::Root
+                    )
+                })
+                .map(|session| {
+                    session.prepared().map_or("読み込み中", |prepared| {
+                        prepared.collection_name.as_str()
+                    })
+                }),
             self.any_indexer_in_full_scan(),
         );
         // タイトルが変わったときだけ送信する (2026-05-10 修正)。

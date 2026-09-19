@@ -26006,7 +26006,7 @@ impl App {
             if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
                 return cached;
             }
-            let nav = build_nav_indices(&self.items, self.current_grid_order());
+            let nav = build_nav_indices(&self.items, self.current_reader_order());
             self.viewer_navigation_caches.install_nav_indices(nav)
         })
     }
@@ -26018,8 +26018,10 @@ impl App {
         if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
             return cached;
         }
-        let indices =
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order());
+        let indices = crate::ui_helpers::still_image_display_indices(
+            &self.items,
+            self.current_reader_order(),
+        );
         self.viewer_navigation_caches
             .install_still_image_indices(indices)
     }
@@ -26664,7 +26666,7 @@ impl App {
         let music_view_active = fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
         let continuous_reading =
             fs_idx.is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
-        let nav = build_nav_indices(&self.items, self.current_grid_order());
+        let nav = build_nav_indices(&self.items, self.current_reader_order());
         let nav_position =
             fs_idx.and_then(|idx| nav.iter().position(|candidate| *candidate == idx));
         let pending_thumbs = self
@@ -32585,7 +32587,7 @@ impl App {
     /// フォルダ内の先頭の静止画系アイテム (Video 除外) へ折り返す。
     /// 静止画系が一つも無ければスライドショーを停止する。
     fn loop_slideshow_to_first(&mut self, ctx: &egui::Context) {
-        let display_order = self.current_grid_order().to_vec();
+        let display_order = self.current_reader_order().to_vec();
         if let Some(idx) = crate::ui_helpers::first_slideshow_still_idx(&self.items, &display_order)
         {
             self.slideshow_anchor_idx = None;
@@ -33755,13 +33757,16 @@ impl App {
             // split image remains an in-page operation and stays on the existing path below.
             let collection_delta = match page_nav {
                 FsPageNav::Delta(delta) => Some(delta),
-                FsPageNav::Target(target) => {
-                    navigable_delta_between(&self.items, self.current_grid_order(), fs_idx, target)
-                }
+                FsPageNav::Target(target) => navigable_delta_between(
+                    &self.items,
+                    self.current_reader_order(),
+                    fs_idx,
+                    target,
+                ),
                 FsPageNav::Boundary { at_end } => Some(if at_end { 1 } else { -1 }),
                 FsPageNav::Split(step) if step.source_idx != fs_idx => navigable_delta_between(
                     &self.items,
-                    self.current_grid_order(),
+                    self.current_reader_order(),
                     fs_idx,
                     step.source_idx,
                 ),
@@ -33849,7 +33854,7 @@ impl App {
                     }
                 }
             } else if let FsPageNav::Target(new_idx) = page_nav {
-                let display_order = self.current_grid_order().to_vec();
+                let display_order = self.current_reader_order().to_vec();
                 let current_is_media = matches!(
                     self.items.get(fs_idx),
                     Some(GridItem::Video(_) | GridItem::Audio(_))
@@ -33915,12 +33920,12 @@ impl App {
                 crate::logger::log(format!(
                     "[NAV] display unit boundary: fs_idx={fs_idx}, at_end={at_end}, items={}, visible={}",
                     self.items.len(),
-                    self.current_grid_order().len()
+                    self.current_reader_order().len()
                 ));
             } else if let FsPageNav::Delta(nav_delta) = page_nav
                 && nav_delta != 0
             {
-                let display_order = self.current_grid_order().to_vec();
+                let display_order = self.current_reader_order().to_vec();
                 let current_is_media = matches!(
                     self.items.get(fs_idx),
                     Some(GridItem::Video(_) | GridItem::Audio(_))

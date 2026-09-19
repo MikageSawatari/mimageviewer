@@ -4113,20 +4113,32 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
 fn main_window_title_hides_internal_synthetic_paths() {
     let internal = PathBuf::from(r"C:\data\__reading_history__");
     assert_eq!(
-        main_window_title(Some(&internal), true, false, false, None, false),
+        main_window_title(Some(&internal), true, false, false, None, None, false),
         "閲覧履歴 - mimageviewer"
     );
     assert_eq!(
-        main_window_title(Some(&internal), false, true, false, None, false),
+        main_window_title(Some(&internal), false, true, false, None, None, false),
         "ブックマーク - mimageviewer"
     );
     assert_eq!(
-        main_window_title(Some(&internal), false, false, true, None, false),
+        main_window_title(Some(&internal), false, false, true, None, None, false),
         "サブフォルダ展開 - mimageviewer"
     );
     assert_eq!(
-        main_window_title(Some(&internal), false, false, false, Some("未整理"), false,),
+        main_window_title(
+            Some(&internal),
+            false,
+            false,
+            false,
+            Some("未整理"),
+            None,
+            false,
+        ),
         "スマートフォルダ: 未整理 - mimageviewer"
+    );
+    assert_eq!(
+        main_window_title(None, false, false, false, None, Some("旅の写真"), false),
+        "コレクション: 旅の写真 - mimageviewer"
     );
 }
 
@@ -4134,11 +4146,11 @@ fn main_window_title_hides_internal_synthetic_paths() {
 fn main_window_title_preserves_real_path_and_indexing_suffix() {
     let folder = PathBuf::from(r"C:\Pictures");
     assert_eq!(
-        main_window_title(Some(&folder), false, false, false, None, true),
+        main_window_title(Some(&folder), false, false, false, None, None, true),
         r"C:\Pictures - mimageviewer  (インデックス更新中)"
     );
     assert_eq!(
-        main_window_title(None, false, false, false, None, false),
+        main_window_title(None, false, false, false, None, None, false),
         "mimageviewer"
     );
 }
@@ -23171,6 +23183,39 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(PathBuf::from(r"C:\test\book.pdf"));
 
         assert!(app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn details_header_and_display_order_follow_the_shared_physical_page_lock() {
+        use crate::settings::{DetailsSortKey, GridViewMode};
+
+        let mut app = setup_app();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\test\b.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\test\a.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.current_folder = Some(app.tmp.path().join("plain"));
+        app.rebuild_details_order();
+        assert!(app.details_header_sort_active());
+        assert_eq!(app.details_order, vec![1, 0]);
+
+        for container in ["book.zip", "book.pdf"] {
+            app.current_folder = Some(PathBuf::from(format!(r"C:\test\{container}")));
+            assert!(app.page_order_locked_for_current_view());
+            app.rebuild_details_order();
+            assert!(!app.details_header_sort_active(), "{container}");
+            assert_eq!(app.details_order, vec![0, 1], "{container}");
+        }
+
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("image-book"));
+        assert!(app.page_order_locked_for_current_view());
+        app.rebuild_details_order();
+        assert!(!app.details_header_sort_active());
+        assert_eq!(app.details_order, vec![0, 1]);
     }
 
     #[test]
@@ -42560,6 +42605,7 @@ fn install_collection_item_for_detached_plan(
             name: "Detached origin".into(),
             order_mode: CollectionOrderMode::Manual,
             standard_sort: crate::settings::SortOrder::FileName,
+            shuffle_seed: 0,
             revision: 7,
         },
         entries: std::sync::Arc::from(vec![CollectionEntry {

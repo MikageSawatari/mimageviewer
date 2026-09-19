@@ -159,6 +159,7 @@ pub enum CollectionOrderMode {
     #[default]
     Manual,
     Standard,
+    Shuffle,
 }
 
 impl CollectionOrderMode {
@@ -166,6 +167,7 @@ impl CollectionOrderMode {
         match self {
             Self::Manual => "manual",
             Self::Standard => "standard",
+            Self::Shuffle => "shuffle",
         }
     }
 
@@ -173,6 +175,7 @@ impl CollectionOrderMode {
         match value {
             "manual" => Some(Self::Manual),
             "standard" => Some(Self::Standard),
+            "shuffle" => Some(Self::Shuffle),
             _ => None,
         }
     }
@@ -184,6 +187,7 @@ pub struct CollectionDefinition {
     pub name: String,
     pub order_mode: CollectionOrderMode,
     pub standard_sort: SortOrder,
+    pub shuffle_seed: u64,
     pub revision: u64,
 }
 
@@ -366,22 +370,45 @@ pub fn effective_collection_order(
     snapshot: &CollectionSnapshot,
     facts: &[CollectionSortFacts],
 ) -> Result<Vec<CollectionEntryId>, CollectionStoreError> {
-    if snapshot.definition.order_mode == CollectionOrderMode::Manual {
-        return Ok(snapshot.entries.iter().map(|entry| entry.id).collect());
+    match snapshot.definition.order_mode {
+        CollectionOrderMode::Manual => {
+            return Ok(snapshot.entries.iter().map(|entry| entry.id).collect());
+        }
+        CollectionOrderMode::Shuffle => {
+            use sha2::{Digest, Sha256};
+            let seed = snapshot.definition.shuffle_seed.to_le_bytes();
+            let mut keyed = snapshot
+                .entries
+                .iter()
+                .map(|entry| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(seed);
+                    hasher.update(entry.id.as_uuid().as_bytes());
+                    (hasher.finalize(), entry.id)
+                })
+                .collect::<Vec<_>>();
+            keyed.sort_by(|(a_hash, a_id), (b_hash, b_id)| {
+                a_hash
+                    .cmp(b_hash)
+                    .then_with(|| a_id.as_uuid().cmp(&b_id.as_uuid()))
+            });
+            return Ok(keyed.into_iter().map(|(_, id)| id).collect());
+        }
+        CollectionOrderMode::Standard => {}
     }
     if facts.len() != snapshot.entries.len() {
         return Err(CollectionStoreError::InvalidOrder);
     }
 
     let mut prepared = Vec::with_capacity(facts.len());
+    let entry_ids = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<std::collections::HashSet<_>>();
     let mut seen = std::collections::HashSet::with_capacity(facts.len());
     for fact in facts {
-        if !seen.insert(fact.entry_id)
-            || !snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.id == fact.entry_id)
-        {
+        if !seen.insert(fact.entry_id) || !entry_ids.contains(&fact.entry_id) {
             return Err(CollectionStoreError::InvalidOrder);
         }
         prepared.push((fact, snapshot.definition.standard_sort.name_key(&fact.name)));
