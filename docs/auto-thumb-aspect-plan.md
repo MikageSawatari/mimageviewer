@@ -730,3 +730,68 @@ helper メソッド (例: `record_aspect_sample`, `maybe_apply_auto_aspect`) を
 - 新しい worker thread の追加 (既存 thumb 経路で十分量のデータが流れる)
 - `ThumbAspect` 候補の追加 (7 種で十分カバー)
 - 「ユーザーごとに学習したカスタム比率」のような ML 系拡張 (オーバーキル)
+
+## 13. Collection root の比率復元（2026-09-20、実装前設計）
+
+利用者は Collection を開き直すたび Auto 比率が 1:1 に戻ると報告し、再起動後も保持する
+非同期キャッシュを希望した。現行の root install は `current_folder=None` にしてから
+`reset_and_seed_auto_aspect` を呼ぶため、path 専用の `auto_aspect_cache_target_path` は
+`None` を返す。既存のフォルダ・ZIP/PDF・ブックマーク用 path key を Collection ID の
+代用品にしない。以下は §4.6 / §12 の既存機能に Collection root だけを追加する設計である。
+
+- 対象を `Path(path)` / `CollectionRoot(collection_id)` の局所 typed target として扱う。
+  root の保存だけは、現在の surface / session ID、`Root` 位置、`Ready`、installed items
+  generation、accepted revision と prepared revision / entry 数が一致する場合に限る。
+  初回空 install、`Failed`、`Deleted`、PhysicalSource 子、別 viewer context、Remote の
+  read-only 経路は Collection 保存対象にしない。通常 path target の規則は変えない。
+- `auto_aspect_cache.db` には UUID key 専用 table を追加し、既存 `folder_key` table と
+  path 正規化規則を変更しない。値は `aspect` / `sample_count` / `eligible_total` /
+  `updated_at` の既存形式と同じ。Collection ID は UUID raw/canonical 表現から決定し、
+  rename、order 変更、再起動で同じ key を使う。collection DB に cache 値を書かない。
+- App が process 全体の Collection cache owner（UUID→確定値の小さな map と順序付き
+  disk writer client）を持つ。`AutoAspectState` と samples は従来どおり viewer context ごと。
+  同一プロセスの reopen は map を空 install 時点で即復元する。初回起動で map に無い ID は
+  現行の空 install で item が 0 件かつ Auto ラベルが「自動」なので、別 Collection の比率を
+  流用しない。既存の Collection prepare worker が cache actor の `Get(collection_id)` へ
+  問い合わせ、応答を prepared install payload に載せる。actor が read / write / clear / prune
+  を単一 queue で処理するため、clear より後の Get は古い DB 行を読めない。accepted ID /
+  generation / revision の結果だけ、実 rows
+  install の `reset_and_seed_auto_aspect` より前に採用する。Get が予算内に成功した場合、
+  最初の実 item 描画は復元比率から始まる。起動時全件ロードと UI thread SQLite read は追加しない。
+  復元は optional cache なので prepare は Get を無期限に待たない。例えば 100 ms の
+  cache 専用予算で小刻みに cancel を確認し、期限・actor停止・DB error なら cache miss として
+  現行の Auto 判定を続ける。期限後の遅着応答は破棄する。これは optional cache 取得の
+  latency 上限であり、Collection snapshot / classify の再試行や表示内容の変更ではない。
+- 確定した結果は process map へ直ちに反映し、専用の単一 writer channel へ送る。
+  writer が別接続で upsert を順序通り処理し、App 終了では既存の DB writer と同じく
+  queued writes を drain する。worker 失敗は cache miss として扱い、folder/Collection の
+  item・order install を失敗にしない。通常の UI update / open / install には DB 操作や
+  join を追加しない。終了時の drain は既存 writer と同じ lifecycle として検証する。
+  UI で確定後に map を更新してから `Upsert` を enqueue するため、同一プロセスの再openは
+  disk への未反映より新しい map 値を優先する。これより前に開始した Get の遅着も
+  install 時の map 優先で上書きできない。write 失敗は記録し、次回起動で disk に残った
+  最後の確定値から復元する。
+- cache manager の Stats / DeleteOld / DeleteAll は専用 table を合算する。
+  Collection の clear / age-prune command を管理操作の admission 時点で writer queue に
+  入れ、それ以前の upsert の後、以後の upsert の前に並べる。管理 worker が返答を待ち、
+  既存 folder table 操作と件数を合算する。既存 `AutoAspectCacheDb` の folder 用
+  `count` / `clear_all` / `delete_older_than_days` は UUID table に触れず、Collection
+  table の read / write / cleanup はすべてこの actor owner だけが実行する。
+  clear command の enqueue または SQLite 実行に失敗した場合は manager に成功と表示せず、
+  folder table の操作が済んでいても部分失敗を報告する。enqueue 失敗なら map / epoch を
+  変えず、SQLite 失敗なら旧 DB 行が後続 Get で再び見える可能性を失敗結果として伝える。
+  enqueue 成功時には App map を失効させ、prepare 中の
+  Get 結果には cache epoch を添えて失効後の遅着採用を拒否する。clear admission の直後に
+  始まる Get も actor queue では clear の後ろへ並び、処理前の DB 行を新 epoch として
+  採用しない。個別 folder 削除は
+  Collection ID に触れず、Collection 削除通知で新たな同期 DB write は行わない。
+  未参照 UUID 行は通常の age-prune に委ねる。cache manager の合算数は「件」と表示する。
+- Collection root の sample 可能母数は `CollectionPlaceholder` と、固定音楽アイコンで
+  thumbnail sample を出さない `Audio` を除外する同一純述語から seed / decision の両方を
+  導く。通常 folder の母数とサンプル経路は変えない。cache の前回 sample gate は現在の
+  sample 可能母数で clip し、到達不能な待機を作らない。
+
+実装前レビューでは、空 install と実 install の seed 境界、writer/管理操作の順序、
+prepare Get の timeout / cancel / 遅着と clear 前後の epoch、別 context、Failed / Deleted、
+rename 維持と再起動 roundtrip を確認する。
+検証 build と GUI / 実データ操作はこの設計段階では行わない。

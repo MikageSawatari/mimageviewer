@@ -1191,6 +1191,24 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
 - A-6「元の場所へ移動」はこの chunk に含めず、root を成功前に破棄しない独立 physical jump として
   後続で設計・実装する。§23.8 の全件書き出しも未実装で、ここでは schema 移行前の DB 保護だけを先行した。
 
+#### §23.2 / §23.3 追加の利用者報告（2026-09-20）
+
+- 利用者は、再生中に Shuffle へ切り替えるとソート表示が「更新中」のままになり、次の項目まで
+  一覧へ反映されないと報告した。コード上、`poll_collection_grid` は fullscreen leaf が開いている間、
+  表示中の `items` と index の結び付きを守るため root の再 install を保留する。現在の root の
+  ID・revision・items generation・件数が installed snapshot と一致し、更新が保留されている場合は、
+  ソート選択の無効理由を「反映待ち」と表示する。説明文は、表示中の項目を閉じると一覧更新が再開し、
+  次の項目への移動が成功した場合も latest order を採用することを示す。初回読込は「更新中」、
+  削除・読込失敗は各専用理由を優先する。再生中の root install 条件と navigation owner は変えない。
+- 利用者は、ソート Dropdown の長い Shuffle 項目に scrollbar が重なると報告した。
+  アプリ共通の floating scrollbar 予約幅は 0 で、egui ComboBox は content closure より前に
+  ScrollArea を作る。ソート popup の `popup_style` に既定 `menu_style` と scrollbar 最大幅分の
+  局所 gutter を設定し、他の一覧・popup の style は変えない。
+- headless 回帰は fullscreen root の Shuffle notice→保留表示→close 後の採用と、Popup の
+  予約幅・既定メニュー装飾を対象とし、各 1/1 成功。core check、`cargo fmt --all --check`、
+  UI glyph check、`git diff --check` も成功した。full gate と確認 build は、別件の
+  Collection Auto 比率 cache 修正と集約するまで未実施。GUI と実データでの操作は未実施。
+
 ### 23.4 参照解除の非対称（A-3 / C-11）
 
 `CollectionRootDeleteResolution::Unavailable(reason)` のとき `RemoveFromCollection` を無効項目 +

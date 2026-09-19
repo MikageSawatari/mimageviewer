@@ -1200,6 +1200,31 @@ impl App {
                 .is_some_and(|session| matches!(session.position, CollectionGridPosition::Root))
     }
 
+    /// A newer root is waiting for the fullscreen leaf to release the installed item indices.
+    /// This is a display reason only: the existing poll/navigation owners decide when to install.
+    pub(crate) fn collection_grid_refresh_waits_for_viewer(&self) -> bool {
+        let Some(index) = self.fullscreen_idx else {
+            return false;
+        };
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return false;
+        };
+        let Some(stamp) = self.collection_grid_stamp() else {
+            return false;
+        };
+        let Some(prepared) = session.prepared() else {
+            return false;
+        };
+        matches!(session.position, CollectionGridPosition::Root)
+            && session.installed_items_generation == Some(self.items_generation)
+            && prepared.collection_id == stamp.collection_id
+            && prepared.collection_revision == session.accepted_revision
+            && prepared.entries.len() == self.items.len()
+            && index < self.items.len()
+            && (session.wanted_revision > session.accepted_revision
+                || matches!(session.load, CollectionGridLoadState::RequestNeeded { .. }))
+    }
+
     pub(crate) fn collection_grid_empty_message(&self) -> Option<String> {
         let session = self.top_level_grid_view.collection_session()?;
         if !matches!(session.position, CollectionGridPosition::Root) {
@@ -3361,6 +3386,92 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_root_order_change_reports_viewer_deferred_until_close() {
+        use crate::collection_store::CollectionOrderMode;
+        use crate::settings::SortOrder;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sources = ["first.mp4", "second.mp4"]
+            .into_iter()
+            .map(|name| {
+                let path = temp.path().join(name);
+                std::fs::write(&path, b"video").unwrap();
+                (path, CollectionResolvedKind::Video)
+            })
+            .collect::<Vec<_>>();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &sources);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(super::super::GridSortLockReason::CollectionLoading)
+        );
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.grid_sort_lock_reason(), None);
+        let original_generation = app.items_generation;
+        app.fullscreen_idx = Some(0);
+
+        let shuffled = recv(
+            client
+                .set_order(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    CollectionOrderMode::Shuffle,
+                    SortOrder::FileName,
+                )
+                .expect("set order request"),
+        );
+        poll_until(&mut app, "fullscreen missed Shuffle notice", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.wanted_revision == shuffled.revision())
+        });
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded { installed: Some(_) }
+        ));
+        assert_eq!(app.items_generation, original_generation);
+        let deferred = super::super::GridSortLockReason::CollectionViewerDeferred;
+        assert_eq!(app.grid_sort_lock_reason(), Some(deferred));
+        assert_eq!(deferred.short_label(), "反映待ち");
+        assert!(
+            deferred
+                .tooltip()
+                .contains("次の項目への移動が成功した場合")
+        );
+
+        // The label follows the current installed binding; a stale generation cannot claim
+        // that the active viewer is what prevents an unrelated Grid refresh.
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = Some(original_generation + 1);
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(super::super::GridSortLockReason::CollectionLoading)
+        );
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = Some(original_generation);
+
+        app.fullscreen_idx = None;
+        poll_until(
+            &mut app,
+            "Shuffle order did not install after closing viewer",
+            |app| {
+                matches!(
+                    app.collection_grid_root_order(),
+                    Some(Ok(root)) if root.mode == CollectionOrderMode::Shuffle
+                        && root.content.expected_revision == shuffled.revision()
+                )
+            },
+        );
+        assert_eq!(app.grid_sort_lock_reason(), None);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn fullscreen_leaf_defers_refresh_and_delete_presentation_until_close() {
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("visible.png");
@@ -3396,6 +3507,10 @@ mod tests {
         ));
         assert_eq!(app.items_generation, held_generation);
         assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(super::super::GridSortLockReason::CollectionDeleted)
+        );
 
         app.fullscreen_idx = None;
         app.poll_collection_grid(&egui::Context::default());

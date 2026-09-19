@@ -1583,6 +1583,20 @@ fn toolbar_combo_slot<R>(
     .inner
 }
 
+/// The app uses overlay scrollbars globally. The sort popup's long Shuffle row needs a local
+/// viewport gutter because ComboBox creates its ScrollArea before calling the content closure.
+fn sort_combo_popup_style() -> egui::style::StyleModifier {
+    egui::style::StyleModifier::new(|style| {
+        egui::containers::menu::menu_style(style);
+        let scroll = &mut style.spacing.scroll;
+        if scroll.floating {
+            scroll.floating_allocated_width = scroll
+                .floating_allocated_width
+                .max(scroll.bar_inner_margin + scroll.bar_width + scroll.bar_outer_margin);
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CollectionToolbarIntent {
     SelectTarget(crate::collection_store::CollectionId),
@@ -9007,6 +9021,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
                                     .height(TOOLBAR_SORT_COMBO_HEIGHT)
+                                    .popup_style(sort_combo_popup_style())
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
@@ -23789,7 +23804,9 @@ mod decide_drag_payload_tests {
 /// `advance_cursor_after_rect` を使うので **折り返し判定を一度も通らない**。
 #[cfg(test)]
 mod toolbar_wrap_tests {
-    use super::{toolbar_combo_slot, toolbar_combo_width, toolbar_text_width};
+    use super::{
+        sort_combo_popup_style, toolbar_combo_slot, toolbar_combo_width, toolbar_text_width,
+    };
     use eframe::egui;
 
     const SELECTED_TEXTS: &[&str] = &[
@@ -23800,6 +23817,57 @@ mod toolbar_wrap_tests {
         "とても長いスマートフォルダの名前をここに入れて折り返しを試す",
         "C:/very/long/favorite/folder/name/that/keeps/going",
     ];
+
+    #[test]
+    fn sort_popup_reserves_floating_scrollbar_width_before_its_contents() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| {
+            style.spacing.scroll = egui::style::ScrollStyle::floating();
+            style.spacing.scroll.floating_allocated_width = 0.0;
+        });
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(500.0, 400.0),
+        ));
+        let mut combo_id = None;
+        let mut observed_popup_style = None;
+        for frame in 0..4 {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let combo = egui::ComboBox::from_id_salt("sort-popup-test")
+                        .width(100.0)
+                        .height(80.0)
+                        .popup_style(sort_combo_popup_style())
+                        .selected_text("シャッフル")
+                        .show_ui(ui, |ui| {
+                            observed_popup_style = Some((
+                                ui.spacing().scroll.allocated_width(),
+                                ui.spacing().button_padding.x,
+                            ));
+                            for row in 0..20 {
+                                let _ =
+                                    ui.selectable_label(row == 0, "シャッフル（再選択で並べ直す）");
+                            }
+                        });
+                    combo_id = Some(combo.response.id);
+                });
+            });
+            if frame == 0 {
+                egui::Popup::open_id(&ctx, combo_id.unwrap().with("popup"));
+            }
+        }
+        let (reserved, menu_padding) = observed_popup_style.expect("sort popup contents");
+        assert!(
+            reserved >= 14.0,
+            "expanded floating bar needs a full gutter"
+        );
+        assert_eq!(
+            menu_padding, 2.0,
+            "ComboBox menu appearance must remain intact"
+        );
+        assert_eq!(ctx.style().spacing.scroll.floating_allocated_width, 0.0);
+    }
 
     /// パネル幅 `panel_w` で折り返し行を 1 回描き、`build` が集めた値を返す。
     ///

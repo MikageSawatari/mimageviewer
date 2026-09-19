@@ -10015,6 +10015,7 @@ pub(crate) enum GridSortLockReason {
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
     CollectionLoading,
+    CollectionViewerDeferred,
     CollectionStale,
     CollectionFailed,
     CollectionDeleted,
@@ -10029,6 +10030,7 @@ impl GridSortLockReason {
             Self::PageOrderFixed => "固定",
             Self::DetailsHeaderSort => "列ヘッダ",
             Self::CollectionLoading => "更新中",
+            Self::CollectionViewerDeferred => "反映待ち",
             Self::CollectionStale => "更新待ち",
             Self::CollectionFailed => "読込失敗",
             Self::CollectionDeleted => "削除済み",
@@ -10046,6 +10048,9 @@ impl GridSortLockReason {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
             Self::CollectionLoading => "コレクション一覧の更新が完了すると並び順を選べます。",
+            Self::CollectionViewerDeferred => {
+                "表示中の項目を閉じると一覧の更新を再開します。次の項目への移動が成功した場合も最新順を採用します。"
+            }
             Self::CollectionStale => "最新のコレクション一覧が表示されるまで並び順を選べません。",
             Self::CollectionFailed => {
                 "コレクション一覧を読み込めませんでした。再読み込みしてください。"
@@ -51488,6 +51493,9 @@ impl App {
                         }
                         Some(top_level_grid_view::CollectionGridLoadState::Failed { .. }) => {
                             GridSortLockReason::CollectionFailed
+                        }
+                        _ if self.collection_grid_refresh_waits_for_viewer() => {
+                            GridSortLockReason::CollectionViewerDeferred
                         }
                         Some(
                             top_level_grid_view::CollectionGridLoadState::Ready(_)
