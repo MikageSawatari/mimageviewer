@@ -38,7 +38,13 @@
   復元する。設計上の正本は [top-level-grid-view.md](top-level-grid-view.md) §2。
 - root / scoped / container の open・成功・失敗・取消・戻りと、非同期完了の所有者を調べる。
   コレクション・通常フォルダ・検索・別 viewer context を壊さず、同族経路にも回帰を追加する。
-- 現時点では利用者報告であり、こちらの再現・根因確定・実機検証は未実施。
+- 2026-09-20 の保存済みログでは、PDF 開始直後に同じ 321 件のスマート一覧を再設置し、
+  PDF の列挙完了に至らない流れが反復している。通常の main 成功経路の診断テスト 2 件は成功した。
+  保存設定の読み取り専用照合とコード調査では、お気に入りの FileName 順と共通 DateAsc 順の
+  切替が frame-end reconcile から root 再 prepare を起こす連鎖が有力。Folder から戻る際の
+  位置復元後にも同じ再 prepare が起き得る。ログに caller はなく、まだ根因確定ではない。
+  次は favorite overlay と frame-end reconcile を通す回帰で確かめる。
+  調査証跡: `target/section257-log-triage-20260920.txt`。製品修正・実機検証は未実施。
 
 ### 1.256 一覧の本サムネイルに前回読んだ位置のメーターを表示する — >>438 (2026-09-19)
 

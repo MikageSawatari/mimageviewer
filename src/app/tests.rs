@@ -67068,6 +67068,121 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn smart_folder_folder_open_then_parent_handler_restores_root_offset() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-parent-handler-origin");
+        let source = app.tmp.path().join("smart-parent-handler-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        let entries = (0..32)
+            .map(|index| source.join(format!("entry-{index:02}")))
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Parent Handler", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let entry = entries.last().unwrap();
+        select_real_path(&mut app, entry);
+        app.scroll_offset_y = 900.0;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(entry));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(entry.clone()),
+            super::FolderOpenOutcome::Loaded
+        ));
+        let parent = match app.resolve_grid_parent_nav() {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            other => panic!("Backspace must resolve to smart root: {other:?}"),
+        };
+        assert!(crate::folder_tree::path_eq(
+            &parent,
+            &crate::app::smart_folder::smart_folder_synthetic_path(id)
+        ));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(parent),
+            super::FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(app.scroll_offset_y, 900.0);
+        assert!(app.smart_folder_pending.is_none());
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, entry))
+        );
+    }
+
+    #[test]
+    fn smart_folder_pdf_open_then_parent_handler_restores_root_offset() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-pdf-parent-origin");
+        let source = app.tmp.path().join("smart-pdf-parent-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart PDF Parent", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        select_real_path(&mut app, &pdf);
+        app.scroll_offset_y = 430.0;
+        app.scroll_to_selected = false;
+        assert!(app.begin_smart_folder_drill(&pdf));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(pdf.clone()),
+            super::FolderOpenOutcome::Loaded
+        ));
+        let (pending_path, password, pending_handle) = app
+            .pdf_enumerate_pending
+            .take()
+            .expect("main PDF open must enqueue enumeration");
+        pending_handle.cancel();
+        drop(pending_handle);
+        let completed = crate::pdf_loader::completed_enumerate_handle_for_test(
+            &pdf,
+            Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 1,
+            }]),
+        );
+        app.pdf_enumerate_pending = Some((pending_path, password, completed));
+        app.poll_pdf_enumerate();
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+
+        let parent = match app.resolve_grid_parent_nav() {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            other => panic!("Backspace must resolve to smart root: {other:?}"),
+        };
+        assert!(crate::folder_tree::path_eq(
+            &parent,
+            &crate::app::smart_folder::smart_folder_synthetic_path(id)
+        ));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(parent),
+            super::FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(app.scroll_offset_y, 430.0);
+        assert!(app.smart_folder_pending.is_none());
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, &pdf))
+        );
+    }
+
+    #[test]
     fn smart_folder_ctrl_down_from_entry_a_to_c_returns_cursor_to_c() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
