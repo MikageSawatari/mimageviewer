@@ -6682,12 +6682,98 @@ mod paused_similar_feature_tests {
             app.similar_index_progress(),
             crate::similar_index::IndexProgress::Idle
         );
-        assert!(!app.similar_query_results_are_stale());
         let _ = app.query_similar_book(&item);
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             crate::similar_book_query::BookQueryDemandSnapshot::Active(_)
         ));
+    }
+
+    #[test]
+    fn similar_book_heading_position_does_not_change_while_index_worker_runs() {
+        let mut app = setup_product_similar_app();
+        let origin_path = PathBuf::from(r"C:\books\layout\001.png");
+        let origin_key = crate::similar_index::item_key_for_file(&origin_path);
+        app.items = vec![GridItem::Image(origin_path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.fs_info_panel.locked = true;
+        app.similar_panel.select_similar_tab_for_test();
+        app.similar_panel
+            .set_item_query_override_for_test(crate::similar_index::ItemQuery::Ready(
+                crate::similar_index::ItemMatches {
+                    origin: crate::similar_index::OriginItem {
+                        item_key: origin_key.clone(),
+                        kind: crate::similar_db::ItemKind::Image,
+                        mtime: 1,
+                        file_size: 2,
+                        width: 100,
+                        height: 100,
+                        format: crate::similar_image::SimilarImageFormat::Png,
+                        target: Some(crate::similar_index::SimilarItemTarget::File(origin_path)),
+                    },
+                    hits: Vec::new(),
+                },
+            ));
+        app.similar_panel
+            .set_book_query_override_for_test(crate::similar_index::BookQuery::Ready(
+                crate::similar_index::BookRelations {
+                    origin: std::sync::Arc::new(crate::similar_index::BookOrigin {
+                        pages: vec![crate::similar_index::BookOriginPage {
+                            item_key: origin_key,
+                            baseline: crate::similar_index::BookPageBaseline::Unmatched,
+                        }]
+                        .into_boxed_slice(),
+                    }),
+                    hits: Vec::new(),
+                },
+            ));
+
+        let draw_heading = |app: &mut AppTestEnvForTest| {
+            let _ = crate::ui_metadata_panel::take_book_section_heading_rect_for_test();
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let input = egui::RawInput {
+                screen_rect: Some(full_rect),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                });
+            });
+            crate::ui_metadata_panel::take_book_section_heading_rect_for_test()
+                .expect("ready book result must draw the book section heading")
+        };
+
+        app.similar_index
+            .as_ref()
+            .expect("product Similar service")
+            .force_progress_with_loaded_snapshot_for_test(
+                crate::similar_index::IndexProgress::Idle,
+            );
+        let idle_heading = draw_heading(&mut app);
+
+        app.similar_index
+            .as_ref()
+            .expect("product Similar service")
+            .force_progress_with_loaded_snapshot_for_test(
+                crate::similar_index::IndexProgress::Running(
+                    crate::similar_index::RunningProgress {
+                        stage: crate::similar_index::IndexStage::Scanning,
+                        current_path: None,
+                        report: crate::similar_index::IndexReport::default(),
+                    },
+                ),
+            );
+        let running_heading = draw_heading(&mut app);
+
+        assert_eq!(
+            idle_heading.min.y, running_heading.min.y,
+            "index progress must not move the book section"
+        );
     }
 
     #[test]

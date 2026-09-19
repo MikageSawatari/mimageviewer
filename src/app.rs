@@ -22190,12 +22190,6 @@ impl App {
         similar_index.query_item(&key)
     }
 
-    pub(crate) fn similar_query_results_are_stale(&self) -> bool {
-        self.similar_index
-            .as_ref()
-            .is_some_and(|index| index.query_results_are_stale())
-    }
-
     pub(crate) fn query_similar_book(
         &self,
         item: &GridItem,

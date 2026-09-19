@@ -55569,24 +55569,24 @@ mod tests {
                 target_origin_slot,
             ),
         );
-        app.similar_panel.set_item_query_override_for_test(
-            crate::similar_index::ItemQuery::Ready(crate::similar_index::ItemMatches {
-                origin: crate::similar_index::OriginItem {
-                    item_key: crate::similar_index::item_key_for_file(&origin_paths[fs_idx]),
-                    kind: crate::similar_db::ItemKind::Image,
-                    mtime: 11,
-                    file_size: 13,
-                    width: 1200,
-                    height: 1600,
-                    format: crate::similar_image::SimilarImageFormat::Png,
-                    target: Some(crate::similar_index::SimilarItemTarget::File(
-                        origin_paths[fs_idx].clone(),
-                    )),
+        app.similar_panel
+            .set_item_query_override_for_test(crate::similar_index::ItemQuery::Ready(
+                crate::similar_index::ItemMatches {
+                    origin: crate::similar_index::OriginItem {
+                        item_key: crate::similar_index::item_key_for_file(&origin_paths[fs_idx]),
+                        kind: crate::similar_db::ItemKind::Image,
+                        mtime: 11,
+                        file_size: 13,
+                        width: 1200,
+                        height: 1600,
+                        format: crate::similar_image::SimilarImageFormat::Png,
+                        target: Some(crate::similar_index::SimilarItemTarget::File(
+                            origin_paths[fs_idx].clone(),
+                        )),
+                    },
+                    hits: Vec::new(),
                 },
-                hits: Vec::new(),
-            }),
-            true,
-        );
+            ));
 
         let original_ids = original_page_indices.map(|idx| {
             insert_similar_preview_dispatcher_static_page(
@@ -56038,24 +56038,24 @@ mod tests {
         app.similar_panel.set_book_query_override_for_test(
             fullscreen_book_query_with_physical_target(&origin, &target),
         );
-        app.similar_panel.set_item_query_override_for_test(
-            crate::similar_index::ItemQuery::Ready(crate::similar_index::ItemMatches {
-                origin: crate::similar_index::OriginItem {
-                    item_key: crate::similar_index::item_key_for_file(&origin),
-                    kind: crate::similar_db::ItemKind::Image,
-                    mtime: 1,
-                    file_size: 1,
-                    width: 100,
-                    height: 100,
-                    format: crate::similar_image::SimilarImageFormat::Jpeg,
-                    target: Some(crate::similar_index::SimilarItemTarget::File(
-                        origin.clone(),
-                    )),
+        app.similar_panel
+            .set_item_query_override_for_test(crate::similar_index::ItemQuery::Ready(
+                crate::similar_index::ItemMatches {
+                    origin: crate::similar_index::OriginItem {
+                        item_key: crate::similar_index::item_key_for_file(&origin),
+                        kind: crate::similar_db::ItemKind::Image,
+                        mtime: 1,
+                        file_size: 1,
+                        width: 100,
+                        height: 100,
+                        format: crate::similar_image::SimilarImageFormat::Jpeg,
+                        target: Some(crate::similar_index::SimilarItemTarget::File(
+                            origin.clone(),
+                        )),
+                    },
+                    hits: Vec::new(),
                 },
-                hits: Vec::new(),
-            }),
-            true,
-        );
+            ));
 
         let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
             app.render_fullscreen_viewport(ctx);

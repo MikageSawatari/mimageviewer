@@ -647,6 +647,18 @@ impl SimilarIndexManager {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_progress_with_loaded_snapshot_for_test(&self, progress: IndexProgress) {
+        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Ready(Arc::new(
+            SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
+                records: Box::new([]),
+                store_id: [1; 16],
+                applied_seq: 0,
+            }),
+        ));
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+    }
+
     /// 同じ表示項目と同じメモリ snapshot への照会は Arc ごと再利用する。
     /// 線形走査と SQLite point lookup は worker 上だけで行う。
     pub fn query_item(&self, item_key: &str) -> Arc<ItemQuery> {
@@ -802,19 +814,6 @@ impl SimilarIndexManager {
             return failed;
         }
         preparing
-    }
-
-    /// 走査中に Complete 済みの旧 snapshot を表示しているかを UI へ伝える。
-    pub fn query_results_are_stale(&self) -> bool {
-        matches!(
-            self.progress(),
-            IndexProgress::Running(_)
-                | IndexProgress::AwaitingWatch(_)
-                | IndexProgress::AwaitingArray(_)
-        ) && matches!(
-            &*self.memory.lock().unwrap_or_else(|e| e.into_inner()),
-            MemoryState::Ready(_)
-        )
     }
 
     /// お気に入り編集の状態表示用集計。署名本体は読まず、DB I/O は専用 worker で行う。
@@ -7912,24 +7911,6 @@ mod tests {
         let mut loading = MemoryState::Loading;
         retain_ready_memory_or_unload(&mut loading);
         assert!(matches!(loading, MemoryState::Unloaded));
-    }
-
-    #[test]
-    fn stale_indicator_requires_a_running_job_and_a_loaded_snapshot() {
-        let manager = SimilarIndexManager::new(PathBuf::from("unused-test-data-dir"));
-        *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
-            stage: IndexStage::Scanning,
-            current_path: None,
-            report: IndexReport::default(),
-        });
-        assert!(!manager.query_results_are_stale());
-
-        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(snapshot_from_rows(&[row(
-            1, "origin", [0; 32], 1,
-        )])));
-        assert!(manager.query_results_are_stale());
-        *manager.progress.lock().unwrap() = IndexProgress::Idle;
-        assert!(!manager.query_results_are_stale());
     }
 
     #[test]

@@ -194,8 +194,6 @@ pub(crate) struct SimilarPanelState {
     book_query_override: Option<std::sync::Arc<crate::similar_index::BookQuery>>,
     #[cfg(test)]
     item_query_override: Option<std::sync::Arc<crate::similar_index::ItemQuery>>,
-    #[cfg(test)]
-    results_are_stale_override: Option<bool>,
     thumbnails: std::collections::HashMap<String, SimilarThumbEntry>,
     /// 受け付けた順。上限を超えた分をここから古い順に落とす。
     thumb_order: std::collections::VecDeque<String>,
@@ -210,7 +208,7 @@ pub(crate) struct SimilarPanelState {
     ///
     /// 本を読み進めると起点はページごとに変わり、そのたびに照会が走る。返るまでの数フレーム
     /// を spinner に差し替えると内容が明滅するため、同一 origin の再照会では前の結果を
-    /// 「更新中」と明記して保持する。別ページの結果は現在画像として表示しない。
+    /// そのまま保持する。別ページの結果は現在画像として表示しない。
     retained_item_ready: Vec<RetainedItemReady>,
     pub(crate) preview: crate::similar_preview::SimilarPreviewState,
     thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
@@ -230,8 +228,6 @@ impl Default for SimilarPanelState {
             book_query_override: None,
             #[cfg(test)]
             item_query_override: None,
-            #[cfg(test)]
-            results_are_stale_override: None,
             thumbnails: std::collections::HashMap::new(),
             thumb_order: std::collections::VecDeque::new(),
             thumb_jobs: std::collections::VecDeque::new(),
@@ -260,10 +256,8 @@ impl SimilarPanelState {
     pub(crate) fn set_item_query_override_for_test(
         &mut self,
         query: crate::similar_index::ItemQuery,
-        results_are_stale: bool,
     ) {
         self.item_query_override = Some(std::sync::Arc::new(query));
-        self.results_are_stale_override = Some(results_are_stale);
     }
 
     fn upsert_history_entry(
@@ -987,7 +981,6 @@ struct SimilarPageView<'a> {
     heading: Option<&'static str>,
     item_key: Option<&'a str>,
     model: SimilarPanelModel<'a>,
-    showing_previous: bool,
 }
 
 struct TracedSimilarAction<T> {
@@ -2468,12 +2461,6 @@ impl App {
                             Some(self.query_similar_book(item))
                         },
                     );
-                    let results_are_stale = self.similar_query_results_are_stale();
-                    #[cfg(test)]
-                    let results_are_stale = self
-                        .similar_panel
-                        .results_are_stale_override
-                        .unwrap_or(results_are_stale);
                     // Fresh Ready results are the only indexed freshness signal for a preview.
                     // Preparing falls back to last_ready below, and a missing hit is not proof that
                     // the underlying resource was deleted.
@@ -2510,14 +2497,12 @@ impl App {
                             }),
                             item_key: page_keys.get(slot).and_then(Option::as_deref),
                             model: similar_panel_model(shown.query()),
-                            showing_previous: shown.is_refreshing(),
                         })
                         .collect();
                     draw_similar_panel(
                         ui,
                         &views,
                         book.as_deref(),
-                        results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
                         self.settings.thumb_quality,
@@ -3685,12 +3670,10 @@ fn draw_metadata_panel_tabs(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn draw_similar_panel(
     ui: &mut egui::Ui,
     views: &[SimilarPageView<'_>],
     book: Option<&crate::similar_index::BookQuery>,
-    results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -3703,23 +3686,6 @@ fn draw_similar_panel(
 ) {
     let move_frame = SimilarMoveFrameInput::capture(ctx, state);
     draw_similar_book_history(ui, state, &move_frame, actions);
-    if results_are_stale
-        && views.iter().any(|view| {
-            !matches!(
-                view.model,
-                SimilarPanelModel::NoIndex
-                    | SimilarPanelModel::Preparing
-                    | SimilarPanelModel::Failed(_)
-            )
-        })
-    {
-        ui.label(
-            egui::RichText::new("索引を更新中です。変更は更新完了後に結果へ反映されます")
-                .color(DIM_COLOR)
-                .size(11.0),
-        );
-        ui.add_space(8.0);
-    }
     // 本の関係を先に出す。これは本ごとに決まるので読み進めても動かない。ページの結果は
     // 件数が変わるので、後ろに置かないと本の節が上下に動いてしまう。
     if let Some(book) = book {
@@ -3866,7 +3832,6 @@ fn draw_similar_page_results(
             SimilarCompareState::Idle
         }
     };
-    let showing_previous = view.showing_previous;
     match view.model {
         SimilarPanelModel::NoIndex => {
             draw_similar_state_message(
@@ -3920,9 +3885,6 @@ fn draw_similar_page_results(
                         .size(14.0)
                         .strong(),
                 );
-                if showing_previous {
-                    ui.label(egui::RichText::new("(更新中)").color(DIM_COLOR).size(10.0));
-                }
             });
             ui.add_space(4.0);
             let origin_response = draw_similar_card(
@@ -4042,6 +4004,9 @@ thread_local! {
     static LAST_BOOK_MOVE_BUTTON_RECT: std::cell::Cell<Option<egui::Rect>> = const {
         std::cell::Cell::new(None)
     };
+    static LAST_BOOK_SECTION_HEADING_RECT: std::cell::Cell<Option<egui::Rect>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -4068,6 +4033,11 @@ fn book_draw_probe_finish() -> BookDrawProbe {
 #[cfg(test)]
 pub(crate) fn take_book_move_button_rect_for_test() -> Option<egui::Rect> {
     LAST_BOOK_MOVE_BUTTON_RECT.with(|rect| rect.take())
+}
+
+#[cfg(test)]
+pub(crate) fn take_book_section_heading_rect_for_test() -> Option<egui::Rect> {
+    LAST_BOOK_SECTION_HEADING_RECT.with(|rect| rect.take())
 }
 
 #[cfg(test)]
@@ -4124,12 +4094,14 @@ fn draw_book_relations(
     if matches!(book, BookQuery::NotBook | BookQuery::NotIndexed) {
         return;
     }
-    ui.label(
+    let _heading = ui.label(
         egui::RichText::new("この本と重なる本")
             .color(egui::Color32::WHITE)
             .size(14.0)
             .strong(),
     );
+    #[cfg(test)]
+    LAST_BOOK_SECTION_HEADING_RECT.with(|last| last.set(Some(_heading.rect)));
     ui.add_space(4.0);
     match book {
         BookQuery::NotBook | BookQuery::NotIndexed => {}
@@ -5041,7 +5013,6 @@ pub fn draw_similar_states_snapshot_fixture(ui: &mut egui::Ui) {
                         heading: None,
                         item_key: None,
                         model,
-                        showing_previous: false,
                     },
                     &mut state,
                     72,
@@ -5221,13 +5192,11 @@ fn draw_metadata_panel_snapshot_fixture_with_capability(
                         heading: None,
                         item_key: Some(current_page.as_str()),
                         model: SimilarPanelModel::Results(&matches),
-                        showing_previous: false,
                     }];
                     draw_similar_panel(
                         ui,
                         &views,
                         Some(&book),
-                        true,
                         &mut state,
                         72,
                         85,
@@ -7763,7 +7732,6 @@ mod similar_panel_tests {
                             ui,
                             &[],
                             Some(book),
-                            false,
                             state,
                             72,
                             85,
@@ -8488,7 +8456,6 @@ mod similar_panel_tests {
                         heading: None,
                         item_key: Some(matches.origin.item_key.as_str()),
                         model: SimilarPanelModel::Results(&matches),
-                        showing_previous: false,
                     };
                     let mut actions = super::SimilarPanelActions::default();
                     let move_frame = super::SimilarMoveFrameInput::capture(ctx, state);
