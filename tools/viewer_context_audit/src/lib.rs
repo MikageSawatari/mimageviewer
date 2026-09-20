@@ -102,9 +102,9 @@ struct KnownFindingEntry {
 const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     AllowlistEntry {
         file: "src/app/smart_folder.rs",
-        function: "preserve_smart_folder_session_for_load",
+        function: "take_visible_smart_folder_grid",
         rule: Rule::A2b,
-        reason: "Moves the current grid surface into SmartFolderPreparedGrid, which remains nested under the same context-owned TopLevelGridView; it preserves an authorized smart-folder drill session and never transfers the viewer context to another window or owner.",
+        reason: "After the source lease and visible-adoption checks, the resident Smart Root moves its mounted main grid into the same TopLevelGridView session's Child.parked_root::Visible. Root return restores it to that same context; no viewer context or window ownership is transferred.",
     },
     AllowlistEntry {
         file: "src/app.rs",

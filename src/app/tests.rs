@@ -6590,6 +6590,45 @@ pub(crate) mod phase_c_support {
         }
     }
 
+    impl AppTestEnv {
+        /// Exercise the production staged child entry while older navigation fixtures are
+        /// migrated to wait for the visible adoption instead of assuming synchronous loading.
+        pub(crate) fn begin_staged_smart_drill(&mut self, path: &std::path::Path) -> bool {
+            let Some(kind) = self.app.smart_physical_target_kind(path) else {
+                return false;
+            };
+            self.app
+                .begin_smart_physical_navigation(path.to_path_buf(), kind, false, None, None)
+                .is_ok()
+        }
+
+        pub(crate) fn open_staged_smart_folder_and_wait(
+            &mut self,
+            ctx: &egui::Context,
+            path: &std::path::Path,
+        ) {
+            assert!(self.begin_staged_smart_drill(path));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                self.poll_smart_folder(ctx);
+                if self.smart_folder_transition.is_none()
+                    && self
+                        .top_level_grid_view
+                        .smart_folder()
+                        .and_then(|state| state.scoped_current())
+                        == Some(path)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "staged smart folder did not adopt {path:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
     pub(crate) fn setup_app() -> AppTestEnv {
         setup_app_with_similar_capability(crate::similar_index::SimilarFeatureCapability::Enabled)
     }
@@ -9750,6 +9789,7 @@ mod folder_pane_open_nav_tests {
             nav_tx
                 .send(FolderNavThreadResult {
                     outcome: None,
+                    smart_kind: None,
                     scanned: FolderNavScanResult::NotNeeded,
                 })
                 .is_err(),
@@ -49651,6 +49691,7 @@ mod still_window_mode_key_tests {
         detached_tx
             .send(FolderNavThreadResult {
                 outcome: None,
+                smart_kind: None,
                 scanned: FolderNavScanResult::NotNeeded,
             })
             .unwrap();
@@ -50405,6 +50446,7 @@ mod still_window_mode_key_tests {
         result_tx
             .send(FolderNavThreadResult {
                 outcome: None,
+                smart_kind: None,
                 scanned: FolderNavScanResult::NotNeeded,
             })
             .unwrap();
@@ -58731,7 +58773,13 @@ mod still_window_mode_key_tests {
             legacy_renames: Vec::new(),
         };
 
-        app.finalize_zip_enumerate(zip_path.clone(), 0, Ok(enumeration));
+        app.finalize_zip_enumerate(
+            zip_path.clone(),
+            0,
+            Ok(enumeration),
+            None,
+            VisibleInstallAuthority::Ordinary,
+        );
 
         let state = app
             .archive_convert
@@ -66303,6 +66351,7 @@ mod details_meta_priority_tests {
 mod smart_folder_transition_tests {
     use super::phase_c_support::setup_app;
     use super::*;
+    use crate::settings::SortOrder;
 
     fn wait_for_smart_folder(app: &mut App, ctx: &egui::Context, id: uuid::Uuid) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -66325,6 +66374,7 @@ mod smart_folder_transition_tests {
                 && app.current_smart_folder_id == Some(id)
                 && app.smart_folder_pending.is_none()
                 && app.smart_folder_prepare_pending.is_none()
+                && app.smart_folder_transition.is_none()
                 && app.search_pending.is_none()
             {
                 return;
@@ -66332,6 +66382,43 @@ mod smart_folder_transition_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("smart folder {id} did not become idle");
+    }
+
+    fn wait_for_staged_smart_terminal(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() && std::time::Instant::now() < deadline {
+            app.poll_smart_folder(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.smart_folder_transition.is_none(),
+            "staged Smart request did not finish"
+        );
+    }
+
+    fn wait_for_smart_folder_scope(app: &mut App, ctx: &egui::Context, path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .smart_folder()
+            .and_then(|state| state.scoped_current())
+            != Some(path)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scoped smart return timed out: target={:?} current={:?} surface={:?} transition={} scan={} prepare={} search_active={}",
+                path,
+                app.current_folder,
+                app.top_level_grid_view.surface(),
+                app.smart_folder_transition.is_some(),
+                app.smart_folder_pending.is_some(),
+                app.smart_folder_prepare_pending.is_some(),
+                app.global_search.active,
+            );
+            app.poll_sidecar_restore(ctx);
+            app.poll_smart_folder(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn definition(name: &str, source: PathBuf) -> crate::settings::SmartFolderDefinition {
@@ -66344,12 +66431,1296 @@ mod smart_folder_transition_tests {
         definition
     }
 
+    fn remember_smart_source_filename_sort(app: &mut App, source: &Path) {
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::DateAsc;
+        let favorite =
+            crate::settings::FavoriteEntry::new("smart source".to_owned(), source.to_path_buf());
+        let mut favorite_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
+        favorite_state.sort_order = SortOrder::FileName;
+        app.favorite_view_states.insert(favorite.id, favorite_state);
+        app.settings.favorites.push(favorite);
+    }
+
     fn assert_no_transient_top_level_view(app: &App) {
         assert!(!app.show_search_bar, "Ctrl+F must be closed");
         assert!(!app.favsearch.active, "Ctrl+S must be closed");
         assert!(!app.global_search.active, "Ctrl+G must be closed");
         assert!(!app.tag_view.active, "Ctrl+T must be closed");
         assert!(!app.is_snapshot_active(), "Snapshot Lock must be released");
+    }
+
+    #[test]
+    fn staged_smart_root_scan_keeps_central_modal_and_input_gate() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-root-modal-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let definition = definition("Staged Root Modal", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+
+        app.open_smart_folder_staged(id, false);
+        assert!(app.smart_folder_transition.is_some());
+        assert!(app.staged_smart_root_modal_visible());
+        assert_eq!(
+            app.modal_dialog_block_reason(),
+            Some("smart_folder_transition")
+        );
+        assert!(!app.grid_open_from_click_allowed());
+        assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+
+        let ctx = egui::Context::default();
+        assert!(
+            app.shortcuts_blocked_by_text_input(&ctx),
+            "main keyboard and gamepad dispatch must share the modal gate"
+        );
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_smart_folder_overlay(ctx);
+        });
+        assert!(ctx.memory(|memory| memory.top_modal_layer().is_some()));
+    }
+
+    #[test]
+    fn staged_smart_root_modal_cancel_owns_only_its_request() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-root-modal-cancel-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let definition = definition("Staged Root Modal Cancel", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        app.open_smart_folder_staged(id, false);
+        let old_request = app.smart_folder_transition_sequence;
+        app.open_smart_folder_staged(id, false);
+        let current_request = app.smart_folder_transition_sequence;
+        assert_ne!(old_request, current_request);
+        assert!(!app.cancel_staged_smart_root_modal_request(old_request));
+        assert_eq!(
+            app.smart_folder_request_status(id, current_request),
+            super::smart_folder::SmartFolderRequestStatus::Pending
+        );
+        assert!(app.cancel_staged_smart_root_modal_request(current_request));
+        assert!(app.smart_folder_transition.is_none());
+        assert_eq!(app.modal_dialog_block_reason(), None);
+        app.poll_smart_folder(&egui::Context::default());
+        assert!(
+            app.smart_folder_transition.is_none(),
+            "late worker may not revive the dialog"
+        );
+        app.open_smart_folder_staged(id, false);
+        let independent = app.tmp.path().join("independent-folder");
+        std::fs::create_dir_all(&independent).unwrap();
+        app.start_folder_pane_open(independent);
+        assert!(app.smart_folder_transition.is_none());
+        app.poll_smart_folder(&egui::Context::default());
+        assert_eq!(app.modal_dialog_block_reason(), None);
+    }
+
+    #[test]
+    fn staged_smart_root_open_keeps_prior_folder_until_prepared_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("staged-root-prior");
+        let source = app.tmp.path().join("staged-root-source");
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(prior.clone());
+        app.address = prior.display().to_string();
+        app.items = vec![GridItem::Folder(prior.join("visible-child"))];
+        app.selected = Some(0);
+        app.scroll_offset_y = 147.0;
+        let definition = definition("Staged Root", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+
+        app.open_smart_folder_staged(id, false);
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 147.0);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.items_are_smart_folder_view {
+            assert!(std::time::Instant::now() < deadline, "root was not adopted");
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.current_smart_folder_id, Some(id));
+        assert!(app.smart_folder_transition.is_none());
+    }
+
+    #[test]
+    fn staged_smart_history_scoped_target_keeps_prior_until_adoption() {
+        use crate::app::top_level_grid_view::{SmartFolderPosition, SmartFolderViewState};
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-history-prior");
+        let source = app.tmp.path().join("smart-history-source");
+        let child = source.join("book");
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(prior.clone());
+        app.address = prior.display().to_string();
+        app.items = vec![GridItem::Folder(prior.join("visible"))];
+        app.selected = Some(0);
+        app.scroll_offset_y = 311.0;
+        let definition = definition("Smart History", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let mut target = SmartFolderViewState::root(id, vec![child.clone()]);
+        target.position = SmartFolderPosition::Scoped {
+            entry_index: 0,
+            entry_root: child.clone(),
+            current: child.clone(),
+            current_kind: crate::app::smart_folder::SmartChildKind::Folder,
+            back_stack: Vec::new(),
+        };
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+        let ctx = egui::Context::default();
+
+        assert!(app.begin_smart_history_navigation(
+            target.clone(),
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        assert_eq!(app.scroll_offset_y, 311.0);
+        assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
+        assert_eq!(app.folder_nav_back_stack.len(), 1);
+        assert!(app.folder_nav_forward_stack.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(child.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history child adoption timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.top_level_grid_view.smart_folder(), Some(&target));
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.folder_nav_forward_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(prior)),
+        );
+    }
+
+    #[test]
+    fn staged_smart_history_root_commits_once_and_does_not_suppress_next_navigation() {
+        use crate::app::top_level_grid_view::SmartFolderViewState;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-history-root-prior");
+        let source = app.tmp.path().join("smart-history-root-source");
+        let next = app.tmp.path().join("smart-history-root-next");
+        for path in [&prior, &source, &next] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(prior.clone());
+        app.address = prior.display().to_string();
+        let definition = definition("Smart History Root", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let target = SmartFolderViewState::root(id, Vec::new());
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+        let ctx = egui::Context::default();
+
+        assert!(app.begin_smart_history_navigation(
+            target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.folder_nav_back_stack.len(), 1);
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.items_are_smart_folder_view {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history root adoption timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.folder_nav_forward_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(prior)),
+        );
+        assert!(!app.suppress_folder_nav_record_once);
+
+        assert!(matches!(
+            app.load_folder_or_convert_archive(next),
+            super::FolderOpenOutcome::Loaded
+        ));
+        assert!(matches!(
+            app.folder_nav_back_stack.last(),
+            Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == id
+        ));
+    }
+
+    #[test]
+    fn staged_smart_history_cancel_keeps_search_rows_and_history() {
+        use crate::app::top_level_grid_view::{
+            SmartFolderViewState, TopLevelGridSurface, TopLevelSearchView,
+        };
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-history-cancel-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let row = app.tmp.path().join("search-result.jpg");
+        app.global_search.active = true;
+        app.global_search.query = "test".into();
+        app.global_search.last_executed = "test".into();
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
+        app.items = vec![GridItem::Image(row.clone())];
+        app.selected = Some(0);
+        app.scroll_offset_y = 425.0;
+        let definition = definition("Smart History Cancel", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let target = SmartFolderViewState::root(id, Vec::new());
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+
+        assert!(app.begin_smart_history_navigation(
+            target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        app.cancel_smart_folder_pending_and_restore_origin();
+        app.poll_smart_folder(&egui::Context::default());
+        assert!(app.smart_folder_transition.is_none());
+        assert!(app.global_search.active);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Global)
+        ));
+        assert_eq!(app.items[0].drag_source_path(), Some(row.as_path()));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 425.0);
+        assert_eq!(app.folder_nav_back_stack.len(), 1);
+        assert!(app.folder_nav_forward_stack.is_empty());
+    }
+
+    #[test]
+    fn independent_folder_pane_intent_retires_offscreen_smart_request_before_poll() {
+        let mut app = setup_app();
+        let prior = app.tmp.path().join("smart-pane-prior");
+        let destination = app.tmp.path().join("smart-pane-destination");
+        let smart_source = app.tmp.path().join("smart-pane-source");
+        for path in [&prior, &destination, &smart_source] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        app.current_folder = Some(prior.clone());
+        let definition = definition("Smart Pane", smart_source);
+        app.settings.smart_folders = vec![definition.clone()];
+        let ctx = egui::Context::default();
+
+        app.open_smart_folder_staged(definition.id, false);
+        assert!(app.smart_folder_transition.is_some());
+        assert!(app.staged_smart_root_modal_visible());
+        assert_eq!(app.staged_smart_loading_message(), None);
+        app.start_folder_open_scan(destination.clone(), FolderOpenScanPurpose::PaneNavigation);
+        assert!(app.smart_folder_transition.is_none());
+        assert!(!app.staged_smart_root_modal_visible());
+        assert!(app.staged_smart_loading_message().is_none());
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let ready = loop {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                break ready;
+            }
+            assert!(std::time::Instant::now() < deadline, "pane scan timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
+        assert_eq!(ready.path, destination);
+        app.load_folder_with_scan(ready.path, Some(ready.scan));
+        assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+    }
+
+    #[test]
+    fn detached_folder_intent_preserves_main_offscreen_smart_request() {
+        let mut app = setup_app();
+        let detached =
+            app.build_active_context_for_test(Some(921), DetachedSource::Image, |_context| {});
+        let smart_source = app.tmp.path().join("smart-detached-source");
+        let detached_destination = app.tmp.path().join("smart-detached-destination");
+        std::fs::create_dir_all(&smart_source).unwrap();
+        std::fs::create_dir_all(&detached_destination).unwrap();
+        let definition = definition("Smart Detached", smart_source);
+        app.settings.smart_folders = vec![definition.clone()];
+        app.open_smart_folder_staged(definition.id, false);
+        assert!(app.smart_folder_transition.is_some());
+        let request_sequence = app.smart_folder_transition_sequence;
+
+        app.with_viewer_context(detached, |mounted| {
+            mounted.start_folder_open_scan(
+                detached_destination,
+                FolderOpenScanPurpose::DetachedFolder,
+            );
+        })
+        .unwrap();
+        assert!(app.smart_folder_transition.is_some());
+        assert_eq!(app.smart_folder_transition_sequence, request_sequence);
+    }
+
+    #[test]
+    fn staged_smart_history_reverse_cancels_pending_without_popping() {
+        use crate::app::smart_folder::StagedSmartHistoryAction;
+        use crate::app::top_level_grid_view::SmartFolderViewState;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-history-reverse-prior");
+        let source = app.tmp.path().join("smart-history-reverse-source");
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(prior.clone());
+        app.items = vec![GridItem::Image(prior.join("visible.jpg"))];
+        let definition = definition("History Reverse", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let target = SmartFolderViewState::root(id, Vec::new());
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+        assert!(app.begin_smart_history_navigation(
+            target.clone(),
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert!(matches!(
+            app.advance_staged_smart_history(
+                crate::app::smart_folder::SmartHistoryDirection::Forward
+            ),
+            Some(StagedSmartHistoryAction::Handled)
+        ));
+        app.poll_smart_folder(&egui::Context::default());
+        assert!(app.smart_folder_transition.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        assert_eq!(
+            app.folder_nav_back_stack,
+            vec![FolderNavHistoryTarget::SmartFolder(target)]
+        );
+        assert!(app.folder_nav_forward_stack.is_empty());
+    }
+
+    #[test]
+    fn staged_smart_history_repeated_back_commits_virtual_destination_once() {
+        use crate::app::smart_folder::StagedSmartHistoryAction;
+        use crate::app::top_level_grid_view::SmartFolderViewState;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-history-double-prior");
+        let source_a = app.tmp.path().join("smart-history-double-a");
+        let source_b = app.tmp.path().join("smart-history-double-b");
+        for path in [&prior, &source_a, &source_b] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(source_a.join("a.jpg"), []).unwrap();
+        std::fs::write(source_b.join("b.jpg"), []).unwrap();
+        app.current_folder = Some(prior.clone());
+        let definition_a = definition("History A", source_a);
+        let definition_b = definition("History B", source_b);
+        let root_a = SmartFolderViewState::root(definition_a.id, Vec::new());
+        let root_b = SmartFolderViewState::root(definition_b.id, Vec::new());
+        app.settings.smart_folders = vec![definition_a, definition_b];
+        app.folder_nav_back_stack = vec![
+            FolderNavHistoryTarget::SmartFolder(root_a.clone()),
+            FolderNavHistoryTarget::SmartFolder(root_b.clone()),
+        ];
+        assert!(app.begin_smart_history_navigation(
+            root_b.clone(),
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert!(matches!(
+            app.advance_staged_smart_history(crate::app::smart_folder::SmartHistoryDirection::Back),
+            Some(StagedSmartHistoryAction::Handled)
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
+        assert_eq!(app.folder_nav_back_stack.len(), 2);
+        wait_for_smart_folder(&mut app, &egui::Context::default(), root_a.definition_id);
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![
+                FolderNavHistoryTarget::Path(prior),
+                FolderNavHistoryTarget::SmartFolder(root_b),
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_smart_history_second_back_can_dispatch_ordinary_folder() {
+        use crate::app::smart_folder::StagedSmartHistoryAction;
+        use crate::app::top_level_grid_view::SmartFolderViewState;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let current = app.tmp.path().join("smart-history-mixed-current");
+        let earlier = app.tmp.path().join("smart-history-mixed-earlier");
+        let source = app.tmp.path().join("smart-history-mixed-smart");
+        for path in [&current, &earlier, &source] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(earlier.join("page.jpg"), []).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(current.clone());
+        let definition = definition("History Mixed", source);
+        let root = SmartFolderViewState::root(definition.id, Vec::new());
+        app.settings.smart_folders = vec![definition];
+        app.folder_nav_back_stack = vec![
+            FolderNavHistoryTarget::Path(earlier.clone()),
+            FolderNavHistoryTarget::SmartFolder(root.clone()),
+        ];
+        assert!(app.begin_smart_history_navigation(
+            root.clone(),
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        let action =
+            app.advance_staged_smart_history(crate::app::smart_folder::SmartHistoryDirection::Back);
+        assert!(matches!(
+            &action,
+            Some(StagedSmartHistoryAction::Dispatch { .. })
+        ));
+        let mut rollback = None;
+        let path = app.dispatch_staged_smart_history_action(action.unwrap(), &mut rollback);
+        assert_eq!(path.as_deref(), Some(earlier.as_path()));
+        assert!(rollback.is_some());
+        assert!(matches!(
+            app.load_folder_or_convert_archive(path.unwrap()),
+            super::FolderOpenOutcome::Loaded
+        ));
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![
+                FolderNavHistoryTarget::Path(current),
+                FolderNavHistoryTarget::SmartFolder(root),
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_smart_history_root_with_changed_sort_waits_for_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-history-root-sort-source");
+        let child = source.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        let definition = definition("History Root Sort", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(child.as_path()))
+            .unwrap();
+        assert!(app.begin_smart_grid_container_navigation(index, child.clone(), false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(child.as_path()) {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let root = match app.folder_history_back_target().cloned() {
+            Some(FolderNavHistoryTarget::SmartFolder(root)) => root,
+            other => panic!("child history must point to its root: {other:?}"),
+        };
+        let history_before = app.folder_nav_back_stack.clone();
+        app.settings.sort_order = SortOrder::DateDesc;
+        assert!(app.begin_smart_history_navigation(
+            root,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
+        assert_eq!(app.folder_nav_back_stack, history_before);
+        assert!(app.smart_folder_transition.is_some());
+    }
+
+    #[test]
+    fn staged_smart_search_return_keeps_results_until_root_adoption() {
+        use crate::app::top_level_grid_view::{
+            SmartFolderViewState, TopLevelGridRestore, TopLevelGridSurface, TopLevelSearchView,
+        };
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-search-return-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let definition = definition("Smart Search Return", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let root = SmartFolderViewState::root(id, Vec::new());
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(TopLevelSearchView::Global),
+            Some(TopLevelGridRestore::SmartFolder(root)),
+        );
+        app.global_search.active = true;
+        app.global_search.query = "result".into();
+        app.global_search.last_executed = "result".into();
+        let row = app.tmp.path().join("result.jpg");
+        app.items = vec![GridItem::Image(row.clone())];
+        app.selected = Some(0);
+        app.scroll_offset_y = 390.0;
+        let history_before = app.folder_nav_history_snapshot();
+        let ctx = egui::Context::default();
+
+        app.close_global_search();
+        assert!(app.global_search.active);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Global)
+        ));
+        assert_eq!(app.items[0].drag_source_path(), Some(row.as_path()));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 390.0);
+        assert_eq!(app.folder_nav_back_stack, history_before.back_stack);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.items_are_smart_folder_view {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search return root timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.global_search.active);
+        assert_eq!(app.current_smart_folder_id, Some(id));
+        assert_eq!(app.folder_nav_back_stack, history_before.back_stack);
+    }
+
+    #[test]
+    fn staged_smart_pdf_open_survives_favorite_reconcile_until_visible_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-smart-pdf-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        remember_smart_source_filename_sort(&mut app, &source);
+        let definition = definition("Staged Smart PDF", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(pdf.as_path()))
+            .expect("root PDF row");
+        app.scroll_offset_y = 320.0;
+        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            &pdf,
+            Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 1,
+            }]),
+        ));
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.scroll_offset_y, 320.0);
+        assert!(app.smart_folder_prepare_pending.is_none());
+        app.poll_smart_folder(&ctx);
+        app.poll_smart_folder(&ctx);
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        app.poll_pdf_enumerate();
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_root_pdf_fullscreen_ctrl_next_opens_next_root_book() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sort_order = SortOrder::FileName;
+        let source = app.tmp.path().join("smart-root-pdf-ctrl-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let first = source.join("book-a.pdf");
+        let second = source.join("book-b.pdf");
+        for pdf in [&first, &second] {
+            std::fs::write(pdf, b"%PDF-1.4\n").unwrap();
+        }
+        let definition = definition("Smart Root PDF Ctrl", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &first);
+        assert!(app.begin_smart_grid_container_navigation(index, first.clone(), false));
+        finish_smart_pdf_enumeration(&mut app, &first);
+        assert_eq!(app.current_folder.as_deref(), Some(first.as_path()));
+
+        app.fullscreen_idx = Some(0);
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut second_enumeration_started = false;
+        while app.folder_nav_pending.is_some() || app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ctrl navigation stalled"
+            );
+            if let Some(result) = app.poll_folder_nav() {
+                app.apply_folder_nav_result(&ctx, result);
+            }
+            second_enumeration_started |= app.replace_staged_pdf_enumeration_for_test(
+                &second,
+                Ok(vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 1,
+                }]),
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(second_enumeration_started, "next root PDF was not opened");
+        assert_eq!(app.current_folder.as_deref(), Some(second.as_path()));
+    }
+
+    #[test]
+    fn smart_root_pdf_ctrl_skips_empty_root_folder_in_both_directions() {
+        for (forward, source_name, target_name) in [
+            (true, "a-book.pdf", "c-book.pdf"),
+            (false, "c-book.pdf", "a-book.pdf"),
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sort_order = SortOrder::FileName;
+            let source = app.tmp.path().join("smart-root-skip-empty-source");
+            let first = source.join("a-book.pdf");
+            let empty = source.join("b-empty-folder");
+            let last = source.join("c-book.pdf");
+            std::fs::create_dir_all(&empty).unwrap();
+            for pdf in [&first, &last] {
+                std::fs::write(pdf, b"%PDF-1.4\n").unwrap();
+            }
+            let definition = definition("Smart Root Skip Empty", source.clone());
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder_staged(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            assert_eq!(
+                app.top_level_grid_view
+                    .smart_folder()
+                    .unwrap()
+                    .navigation_entries
+                    .iter()
+                    .map(|entry| entry.logical_path.as_path())
+                    .collect::<Vec<_>>(),
+                vec![first.as_path(), empty.as_path(), last.as_path()]
+            );
+            let start = source.join(source_name);
+            let target = source.join(target_name);
+            let index = select_real_path(&mut app, &start);
+            assert!(app.begin_smart_grid_container_navigation(index, start.clone(), false));
+            finish_smart_pdf_enumeration(&mut app, &start);
+            app.fullscreen_idx = Some(0);
+            app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut target_preflight_started = false;
+            while app.folder_nav_pending.is_some() || app.smart_folder_transition.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "root book traversal stalled"
+                );
+                if let Some(result) = app.poll_folder_nav() {
+                    app.apply_folder_nav_result(&ctx, result);
+                }
+                target_preflight_started |= app.replace_staged_pdf_enumeration_for_test(
+                    &target,
+                    Ok(vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }]),
+                );
+                app.poll_smart_folder(&ctx);
+                std::thread::yield_now();
+            }
+            assert!(
+                target_preflight_started,
+                "empty root Folder must be skipped forward={forward} current={:?}",
+                app.current_folder
+            );
+            assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+        }
+    }
+
+    #[test]
+    fn smart_root_folder_ctrl_skips_empty_descendant_to_next_book() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sort_order = SortOrder::FileName;
+        let source = app.tmp.path().join("smart-root-mixed-ctrl-source");
+        let folder = source.join("a-folder");
+        let pdf = source.join("b-book.pdf");
+        let empty_child = folder.join("empty-child");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&empty_child).unwrap();
+        std::fs::write(folder.join("page.jpg"), []).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let definition = definition("Smart Root Mixed Ctrl", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let entries = &app
+            .top_level_grid_view
+            .smart_folder()
+            .unwrap()
+            .navigation_entries;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.logical_path.as_path())
+                .collect::<Vec<_>>(),
+            vec![folder.as_path(), pdf.as_path(), empty_child.as_path()]
+        );
+        app.open_staged_smart_folder_and_wait(&ctx, &folder);
+        app.fullscreen_idx = Some(0);
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut pdf_preflight_started = false;
+        while app.folder_nav_pending.is_some() || app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mixed Ctrl navigation stalled"
+            );
+            if let Some(result) = app.poll_folder_nav() {
+                app.apply_folder_nav_result(&ctx, result);
+            }
+            pdf_preflight_started |= app.replace_staged_pdf_enumeration_for_test(
+                &pdf,
+                Ok(vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 1,
+                }]),
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(pdf_preflight_started);
+        assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+    }
+
+    #[test]
+    fn smart_root_nav_rejects_old_order_and_deleted_candidate_before_staging() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-root-nav-stale-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let first = source.join("book-a.pdf");
+        let second = source.join("book-b.pdf");
+        for pdf in [&first, &second] {
+            std::fs::write(pdf, b"%PDF-1.4\n").unwrap();
+        }
+        let definition = definition("Smart Root Nav Stale", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let make_result = |state| super::FolderNavResult {
+            path: Some(second.clone()),
+            smart_kind: Some(super::smart_folder::SmartChildKind::Pdf),
+            hit_image_folder: true,
+            forward: true,
+            mode: super::FolderNavMode::SmartFolder {
+                state,
+                fullscreen: false,
+            },
+            queued_steps: 0,
+            scanned: super::FolderNavScanResult::NotNeeded,
+        };
+        let captured = app.top_level_grid_view.smart_folder().unwrap().clone();
+        let mut reversed = captured.navigation_entries.as_ref().clone();
+        reversed.reverse();
+        app.top_level_grid_view
+            .smart_folder_mut()
+            .unwrap()
+            .refresh_navigation_entries(reversed);
+        app.apply_folder_nav_result(&ctx, make_result(captured));
+        assert!(app.smart_folder_transition.is_none());
+        assert!(app.items_are_smart_folder_view);
+
+        let captured = app.top_level_grid_view.smart_folder().unwrap().clone();
+        app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&second));
+        app.apply_folder_nav_result(&ctx, make_result(captured));
+        assert!(
+            app.smart_folder_transition.is_none(),
+            "a deleted row must not be staged while the visible order is still resident"
+        );
+        assert!(app.items_are_smart_folder_view);
+    }
+
+    #[test]
+    fn smart_root_nav_does_not_adopt_book_after_order_changes_during_preflight() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-root-nav-preflight-stale");
+        std::fs::create_dir_all(&source).unwrap();
+        let first = source.join("book-a.pdf");
+        let second = source.join("book-b.pdf");
+        for pdf in [&first, &second] {
+            std::fs::write(pdf, b"%PDF-1.4\n").unwrap();
+        }
+        let definition = definition("Smart Preflight Stale", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &first);
+        assert!(app.begin_smart_grid_container_navigation(index, first.clone(), false));
+        let mut reversed = app
+            .top_level_grid_view
+            .smart_folder()
+            .unwrap()
+            .navigation_entries
+            .as_ref()
+            .clone();
+        reversed.reverse();
+        app.top_level_grid_view
+            .smart_folder_mut()
+            .unwrap()
+            .refresh_navigation_entries(reversed);
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            &first,
+            Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 1,
+            }]),
+        ));
+        app.poll_smart_folder(&ctx);
+        app.poll_smart_folder(&ctx);
+        assert!(app.smart_folder_transition.is_none());
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.current_smart_folder_id, Some(id));
+        assert_ne!(app.current_folder.as_deref(), Some(first.as_path()));
+    }
+
+    #[test]
+    fn staged_smart_pdf_password_cancel_preserves_root_and_old_workers() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-smart-password-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let definition = definition("Staged Smart Password", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(pdf.as_path()))
+            .expect("root PDF row");
+        app.scroll_offset_y = 250.0;
+        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            &pdf,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Password required",
+            )),
+        ));
+        app.poll_smart_folder(&ctx);
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.pdf_password_dialog_path(), Some(pdf.clone()));
+        assert!(app.cancel_pdf_password_dialog_request());
+        assert!(app.smart_folder_transition.is_none());
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.scroll_offset_y, 250.0);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(pdf.as_path()))
+        );
+    }
+
+    #[test]
+    fn staged_smart_folder_return_restores_root_selection_scroll_and_aspect() {
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-smart-return-source");
+        let entries = (0..24)
+            .map(|index| source.join(format!("book-{index:02}")))
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.settings.thumb_aspect_auto = true;
+        remember_smart_source_filename_sort(&mut app, &source);
+        let definition = definition("Staged Return", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let entry = entries.last().unwrap();
+        select_real_path(&mut app, entry);
+        let selected = app.selected.unwrap();
+        let aspect = ThumbAspect::Portrait2x3;
+        app.auto_aspect.items_generation = app.items_generation;
+        app.auto_aspect
+            .samples
+            .insert(selected, aspect.height_ratio());
+        app.auto_aspect.current = Some(aspect);
+        app.scroll_offset_y = 900.0;
+        app.scroll_to_selected = false;
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(entry.as_path()))
+            .expect("selected root child");
+        assert!(app.begin_smart_grid_container_navigation(index, entry.clone(), false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(entry.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child was not adopted"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let parent = match app.resolve_grid_parent_nav() {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            other => panic!("Backspace must resolve to smart root: {other:?}"),
+        };
+        assert!(matches!(
+            app.load_folder_or_convert_archive(parent),
+            super::FolderOpenOutcome::Loaded
+        ));
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        assert_eq!(app.scroll_offset_y, 900.0);
+        assert_eq!(app.effective_thumb_aspect(), aspect);
+        assert!(
+            selected_real_path(&app).is_some_and(|path| crate::folder_tree::path_eq(path, entry))
+        );
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn staged_smart_folder_child_scan_preserves_root_until_visible_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-smart-child-source");
+        let child = source.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        let definition = definition("Staged Smart Child", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let root_items = app.items.len();
+        app.scroll_offset_y = 230.0;
+        app.scroll_to_selected = false;
+
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(child.as_path()))
+            .expect("root child row");
+        assert!(app.begin_smart_grid_container_navigation(index, child.clone(), false));
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.items.len(), root_items);
+        assert_eq!(app.scroll_offset_y, 230.0);
+        assert_eq!(
+            app.top_level_grid_view.smart_folder().unwrap().position,
+            crate::app::top_level_grid_view::SmartFolderPosition::Root
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(child.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child was not adopted"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(child.join("page.jpg").as_path()))
+        );
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+    }
+
+    #[test]
+    fn staged_smart_folder_child_scan_failure_keeps_visible_root_owner() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("staged-smart-child-failure-source");
+        let child = source.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        let definition = definition("Staged Smart Child Failure", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let root_path = app.current_folder.clone();
+        let root_count = app.items.len();
+        app.scroll_offset_y = 230.0;
+        std::fs::remove_dir_all(&child).unwrap();
+
+        assert!(
+            app.begin_smart_physical_navigation(
+                child,
+                crate::app::smart_folder::SmartChildKind::Folder,
+                false,
+                None,
+                None,
+            )
+            .is_ok()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed scan did not finish"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.current_folder, root_path);
+        assert_eq!(app.items.len(), root_count);
+        assert_eq!(app.scroll_offset_y, 230.0);
+        assert!(app.items_are_smart_folder_view);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn staged_smart_folder_rejected_child_keeps_collection_snapshot_owner() {
+        use crate::app::top_level_grid_view::{
+            SmartFolderPosition, SmartFolderViewState, TopLevelGridRestore, TopLevelGridSurface,
+        };
+        use crate::collection_store::CollectionResolvedKind;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-rejected-collection.jpg");
+        let source = app.tmp.path().join("smart-rejected-source");
+        let child = source.join("book");
+        std::fs::write(&prior, b"prior").unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        let restore = super::install_collection_item_for_detached_plan(
+            &mut app,
+            &prior,
+            CollectionResolvedKind::Image,
+        );
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        let definition = definition("Rejected Smart Child", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let mut target = SmartFolderViewState::root(id, vec![child.clone()]);
+        target.position = SmartFolderPosition::Scoped {
+            entry_index: 0,
+            entry_root: child.clone(),
+            current: child,
+            current_kind: crate::app::smart_folder::SmartChildKind::Folder,
+            back_stack: Vec::new(),
+        };
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+        let history = app.folder_nav_history_snapshot();
+        assert!(app.begin_smart_history_navigation(
+            target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rejected child timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Snapshot
+        ));
+        assert!(matches!(
+            app.top_level_grid_view.return_to(),
+            Some(TopLevelGridRestore::Collection(collection))
+                if collection.identity.collection_id == restore.identity.collection_id
+        ));
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.items[0].drag_source_path(), Some(prior.as_path()));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn staged_smart_folder_collection_lease_survives_revision_refresh() {
+        use crate::collection_store::CollectionResolvedKind;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-lease-collection.jpg");
+        let source = app.tmp.path().join("smart-lease-source");
+        std::fs::write(&prior, b"prior").unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        super::install_collection_item_for_detached_plan(
+            &mut app,
+            &prior,
+            CollectionResolvedKind::Image,
+        );
+        let definition = definition("Smart Lease", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        app.open_smart_folder_staged(id, false);
+        assert!(app.smart_folder_transition.is_some());
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .accepted_revision += 1;
+        wait_for_smart_folder(&mut app, &egui::Context::default(), id);
+        assert!(app.smart_folder_transition.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn staged_smart_folder_collection_lease_rejects_same_id_reopen() {
+        use crate::app::top_level_grid_view::{CollectionGridIdentity, TopLevelGridSurface};
+        use crate::collection_store::CollectionResolvedKind;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let prior = app.tmp.path().join("smart-lease-reopen-collection.jpg");
+        let source = app.tmp.path().join("smart-lease-reopen-source");
+        std::fs::write(&prior, b"prior").unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let restore = super::install_collection_item_for_detached_plan(
+            &mut app,
+            &prior,
+            CollectionResolvedKind::Image,
+        );
+        let definition = definition("Smart Lease Reopen", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        app.open_smart_folder_staged(id, false);
+        assert!(app.smart_folder_transition.is_some());
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: restore.identity.collection_id,
+            }),
+            None,
+        );
+        let replacement = app.tmp.path().join("replacement-collection.jpg");
+        app.items = vec![GridItem::Image(replacement.clone())];
+        app.poll_smart_folder(&egui::Context::default());
+        assert!(app.smart_folder_transition.is_none());
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity)
+                if identity.collection_id == restore.identity.collection_id
+        ));
+        assert_eq!(app.items[0].drag_source_path(), Some(replacement.as_path()));
+    }
+
+    #[test]
+    fn staged_smart_folder_superseded_child_keeps_new_folder_navigation() {
+        use crate::app::top_level_grid_view::{SmartFolderPosition, SmartFolderViewState};
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-supersede-source");
+        let child = source.join("book");
+        let next = app.tmp.path().join("smart-supersede-next");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        std::fs::write(next.join("next.jpg"), []).unwrap();
+        let row = app.tmp.path().join("search-result.jpg");
+        app.global_search.active = true;
+        app.global_search.query = "test".into();
+        app.global_search.last_executed = "test".into();
+        app.top_level_grid_view.replace_surface(
+            crate::app::top_level_grid_view::TopLevelGridSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        );
+        app.items = vec![GridItem::Image(row)];
+        let definition = definition("Superseded Smart Child", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let mut target = SmartFolderViewState::root(id, vec![child.clone()]);
+        target.position = SmartFolderPosition::Scoped {
+            entry_index: 0,
+            entry_root: child.clone(),
+            current: child,
+            current_kind: crate::app::smart_folder::SmartChildKind::Folder,
+            back_stack: Vec::new(),
+        };
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+        assert!(app.begin_smart_history_navigation(
+            target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert!(matches!(
+            app.load_folder_or_convert_archive(next.clone()),
+            super::FolderOpenOutcome::Loaded
+        ));
+        let ctx = egui::Context::default();
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.current_folder.as_deref(), Some(next.as_path()));
+        assert!(app.smart_folder_transition.is_none());
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(next.join("next.jpg").as_path()))
+        );
+        assert_ne!(app.current_smart_folder_id, Some(id));
     }
 
     #[test]
@@ -66456,8 +67827,7 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(app, &ctx, smart_id);
 
         select_real_path(app, &entry);
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -66544,7 +67914,7 @@ mod smart_folder_transition_tests {
                     reading_history_return_from: None,
                     suppress_rating_filter: false,
                     suppress_facet_filter: false,
-                    smart_folder_drill: false,
+                    smart_folder_owner: SmartGridArchiveOwner::None,
                     collection_grid_owner: None,
                     collection_navigation_continuation: None,
                 },
@@ -66604,11 +67974,15 @@ mod smart_folder_transition_tests {
 
     fn wait_for_snapshot_archive_listing(app: &mut App, cached: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
+        while (app.zip_enumerate_pending.is_some() || app.smart_folder_transition.is_some())
+            && std::time::Instant::now() < deadline
+        {
             app.poll_zip_enumerate();
+            app.poll_smart_folder(&egui::Context::default());
             std::thread::yield_now();
         }
         assert!(app.zip_enumerate_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
         assert!(matches!(
             app.items.as_slice(),
             [GridItem::ZipImage { zip_path, entry_name }]
@@ -66717,16 +68091,42 @@ mod smart_folder_transition_tests {
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
                     intent
                 )
-            ) if intent.smart_folder_drill
+            ) if matches!(intent.smart_folder_owner, SmartGridArchiveOwner::Transition(_))
         ));
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        let prior_folder = app.current_folder.clone();
+        let prior_address = app.address.clone();
         publish_convert_done_and_open(&mut app, &cached);
 
         assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder, prior_folder);
+        assert_eq!(app.address, prior_address);
+        assert!(app.archive_source_override.is_none());
+        assert_eq!(convertible_archive_main_state(&app), before);
+        assert!(app.smart_folder_transition.is_some());
+        // The conversion result is not a visible-load commit. Its source effects travel with
+        // the pending ZIP owner until the current enumerate result installs.
+
+        wait_for_snapshot_archive_listing(&mut app, &cached);
         assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
         assert_eq!(
             app.archive_source_override.as_deref(),
             Some(source.as_path())
+        );
+        assert_eq!(app.address, source.to_string_lossy());
+        let workspace = &app.quick_folder_workspaces[app.active_quick_folder_slot.unwrap().index()];
+        assert_eq!(workspace.target.as_deref(), Some(source.as_path()));
+        assert!(
+            workspace
+                .recent_folders
+                .iter()
+                .any(|recent| recent == &source)
+        );
+        assert!(
+            !workspace
+                .recent_folders
+                .iter()
+                .any(|recent| recent == &cached)
         );
         assert!(app.reading_history_return_from.is_none());
         assert_eq!(
@@ -66748,22 +68148,7 @@ mod smart_folder_transition_tests {
                 .and_then(|state| state.scoped_current()),
             Some(source.as_path())
         );
-        assert!(
-            app.items.is_empty(),
-            "successful load boundary replaces the source grid with the archive loading state"
-        );
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
-            app.poll_zip_enumerate();
-            std::thread::yield_now();
-        }
-        assert!(app.zip_enumerate_pending.is_none());
-        assert!(matches!(
-            app.items.as_slice(),
-            [GridItem::ZipImage { zip_path, entry_name }]
-                if zip_path == &cached && entry_name == "page-001.jpg"
-        ));
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -66773,6 +68158,718 @@ mod smart_folder_transition_tests {
         // Mutation `omit_success_completion_commit`: remove commit_main_grid_archive_transition
         // from the loaded pending_nav branch. The reservation/suppression/smart-scope assertions
         // all fail.
+    }
+
+    #[test]
+    fn smart_convertible_cache_hit_defers_source_effects_until_zip_install() {
+        let mut app = setup_app();
+        let (source, before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("smart-cache-hit.zip");
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        let prior_folder = app.current_folder.clone();
+        let prior_address = app.address.clone();
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(app.archive_convert.is_none());
+        assert!(app.smart_folder_transition.is_some());
+        assert_eq!(app.current_folder, prior_folder);
+        assert_eq!(app.address, prior_address);
+        assert!(app.archive_source_override.is_none());
+        assert_eq!(convertible_archive_main_state(&app), before);
+
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_eq!(app.address, source.to_string_lossy());
+        let workspace = &app.quick_folder_workspaces[app.active_quick_folder_slot.unwrap().index()];
+        assert_eq!(workspace.target.as_deref(), Some(source.as_path()));
+        assert!(
+            workspace
+                .recent_folders
+                .iter()
+                .any(|recent| recent == &source)
+        );
+        assert!(
+            !workspace
+                .recent_folders
+                .iter()
+                .any(|recent| recent == &cached)
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(source.as_path())
+        );
+    }
+
+    #[test]
+    fn stale_same_source_archive_dialog_cannot_cancel_new_smart_zip_request() {
+        let mut app = setup_app();
+        let (source, before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("smart-archive-reopen.zip");
+        write_convert_completion_zip(&cached);
+        let ctx = egui::Context::default();
+        assert!(app.handle_gamepad_grid_accept(&ctx).is_none());
+        let old_owner = match &app.archive_convert.as_ref().unwrap().completion {
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                intent,
+            ) => super::OpenRequestOwner::MainGridArchive(intent.clone()),
+            other => panic!("expected main archive conversion, got {other:?}"),
+        };
+        let old_request = app.smart_folder_transition_sequence;
+        record_convertible_archive_cache(&mut app, &source, &cached);
+
+        assert!(app.handle_gamepad_grid_accept(&ctx).is_none());
+        assert!(app.archive_convert.is_none());
+        assert!(app.smart_folder_transition.is_some());
+        assert!(app.smart_folder_transition_sequence > old_request);
+        assert_eq!(convertible_archive_main_state(&app), before);
+        app.abort_smart_archive_open_for_owner(&old_owner);
+        assert!(app.smart_folder_transition.is_some());
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+    }
+
+    #[test]
+    fn staged_smart_convertible_cache_hit_uses_source_only_at_visible_adoption() {
+        let mut app = setup_app();
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let root = app.tmp.path().join("staged-convertible-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("book.7z");
+        let cached = app.tmp.path().join("staged-convertible-cache.zip");
+        std::fs::write(&source, b"archive source").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        let definition = definition("Staged Convertible", root);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &source);
+        let before_items = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
+        let before_address = app.address.clone();
+
+        assert!(app.begin_smart_grid_container_navigation(index, source.clone(), false));
+        assert_eq!(app.address, before_address);
+        assert!(app.archive_source_override.is_none());
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            before_items
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(cached.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged cache ZIP did not install"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_eq!(app.address, source.to_string_lossy());
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(super::top_level_grid_view::SmartFolderPosition::Container { root_entry, current })
+                if root_entry == &source && current == &source
+        ));
+        assert!(app.smart_folder_transition.is_none());
+    }
+
+    #[test]
+    fn smart_pdf_adoption_retires_old_pending_before_new_fullscreen_defer() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("smart-pdf-defer-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let target = source.join("new.pdf");
+        let old = app.tmp.path().join("old-visible.pdf");
+        std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&old, b"%PDF-1.4\n").unwrap();
+        let definition = definition("Smart PDF Defer", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &target);
+        let old_handle =
+            crate::pdf_loader::completed_enumerate_handle_for_test(&old, Ok(Vec::new()));
+        app.pdf_enumerate_pending = Some((old, None, old_handle));
+
+        assert!(app.begin_smart_grid_container_navigation(index, target.clone(), true));
+        assert!(
+            app.staged_smart_loading_message()
+                .is_some_and(|message| message.contains("PDF"))
+        );
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            &target,
+            Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 1,
+            }]),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(target.as_path()) {
+            assert!(std::time::Instant::now() < deadline, "PDF adopt timed out");
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.pdf_enumerate_pending.as_ref().map(|(path, _, _)| path),
+            Some(&target)
+        );
+        assert!(app.fs_nav_after_pdf_enumerate.is_some());
+    }
+
+    #[test]
+    fn staged_smart_child_sort_edit_converges_after_adoption_or_cancel() {
+        for adopt in [true, false] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(format!("smart-pdf-sort-{adopt}"));
+            std::fs::create_dir_all(&source).unwrap();
+            let target = source.join("book.pdf");
+            std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+            let definition = definition("Smart Sort While Opening", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder_staged(id, false);
+            wait_for_smart_folder(&mut app, &ctx, id);
+            let index = select_real_path(&mut app, &target);
+            assert!(app.begin_smart_grid_container_navigation(index, target.clone(), false));
+
+            app.settings.sort_order = SortOrder::DateDesc;
+            assert!(app.reprepare_current_smart_folder_for_sort());
+            assert!(app.smart_folder_prepare_pending.is_none());
+            if adopt {
+                assert!(app.replace_staged_pdf_enumeration_for_test(
+                    &target,
+                    Ok(vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }]),
+                ));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while app.current_folder.as_deref() != Some(target.as_path()) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child adoption stalled"
+                    );
+                    app.poll_smart_folder(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+                assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+                assert!(app.smart_folder_transition.is_some());
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+                assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+            } else {
+                app.cancel_smart_folder_pending_and_restore_origin();
+                assert!(app.smart_folder_transition.is_none());
+                assert!(app.smart_folder_prepare_pending.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn smart_zip_adoption_retires_same_path_old_pending_before_late_poll() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("smart-zip-stale-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let zip_path = source.join("book.zip");
+        write_convert_completion_zip(&zip_path);
+        let definition = definition("Smart ZIP Stale", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &zip_path);
+        let stale_result = crate::zip_loader::enumerate_image_entries_detailed(&zip_path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(stale_result)).unwrap();
+        let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.zip_enumerate_pending = Some(ZipEnumeratePending {
+            zip_path: zip_path.clone(),
+            input_seq: 1,
+            cancel: std::sync::Arc::clone(&old_cancel),
+            rx,
+        });
+
+        assert!(app.begin_smart_grid_container_navigation(index, zip_path.clone(), false));
+        assert!(app.zip_enumerate_pending.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(zip_path.as_path()) {
+            assert!(std::time::Instant::now() < deadline, "ZIP adopt timed out");
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.zip_enumerate_pending.is_none());
+        let generation = app.items_generation;
+        app.poll_zip_enumerate();
+        assert_eq!(app.items_generation, generation);
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
+    }
+
+    #[test]
+    fn smart_zip_adoption_retires_old_pending_before_new_fullscreen_open() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("smart-zip-defer-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let zip_path = source.join("new.zip");
+        let old_path = app.tmp.path().join("old-visible.zip");
+        write_convert_completion_zip(&zip_path);
+        write_convert_completion_zip(&old_path);
+        let definition = definition("Smart ZIP Defer", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder(&mut app, &ctx, id);
+        let index = select_real_path(&mut app, &zip_path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(crate::zip_loader::enumerate_image_entries_detailed(
+            &old_path,
+        )
+        .unwrap()))
+            .unwrap();
+        let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.zip_enumerate_pending = Some(ZipEnumeratePending {
+            zip_path: old_path,
+            input_seq: 1,
+            cancel: std::sync::Arc::clone(&old_cancel),
+            rx,
+        });
+
+        assert!(app.begin_smart_grid_container_navigation(index, zip_path.clone(), true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(zip_path.as_path()) {
+            assert!(std::time::Instant::now() < deadline, "ZIP adopt timed out");
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+    }
+
+    #[test]
+    fn old_visible_container_failures_do_not_finish_staged_smart_fullscreen_navigation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let visible = app.tmp.path().join("visible-page.jpg");
+        app.items = vec![GridItem::Image(visible)];
+        app.thumbnails = vec![ThumbnailState::Failed];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.begin_fs_folder_navigation_sequence(&ctx, 0);
+        app.mark_smart_folder_navigation_sequence();
+        app.bind_smart_folder_navigation_sequence(42);
+        assert!(app.fs_navigation_sequence_owned_by_smart_folder());
+
+        let old_pdf = app.tmp.path().join("old-visible.pdf");
+        let old_handle = crate::pdf_loader::completed_enumerate_handle_for_test(
+            &old_pdf,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "old PDF failed",
+            )),
+        );
+        app.pdf_enumerate_pending = Some((old_pdf, None, old_handle));
+        app.poll_pdf_enumerate();
+        assert!(app.fs_navigation_sequence_owned_by_smart_folder());
+
+        let old_zip = app.tmp.path().join("old-visible.zip");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("old ZIP failed".to_owned())).unwrap();
+        app.zip_enumerate_pending = Some(ZipEnumeratePending {
+            zip_path: old_zip,
+            input_seq: 1,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        });
+        app.poll_zip_enumerate();
+        assert!(app.fs_navigation_sequence_owned_by_smart_folder());
+    }
+
+    #[test]
+    fn smart_fullscreen_folder_nav_carries_continuation_into_nested_zip_and_cancel() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-nested-nav-source");
+        let first = source.join("first");
+        let nested = source.join("nested");
+        let zip_path = nested.join("book.zip");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(first.join("page.jpg"), []).unwrap();
+        write_convert_completion_zip(&zip_path);
+        let definition = definition("Smart Nested Nav", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        app.open_staged_smart_folder_and_wait(&ctx, &first);
+
+        let mode = super::FolderNavMode::SmartFolder {
+            state: app.top_level_grid_view.smart_folder().unwrap().clone(),
+            fullscreen: true,
+        };
+        app.fullscreen_idx = Some(0);
+        app.begin_fs_folder_navigation_sequence(&ctx, 0);
+        app.mark_smart_folder_navigation_sequence();
+        let initial_sequence = app.smart_folder_transition_sequence;
+        assert!(
+            app.begin_smart_folder_dfs_navigation(
+                nested.clone(),
+                super::smart_folder::SmartChildKind::Folder,
+                None,
+                0,
+                mode,
+                super::HistoryTrigger::UserChosen,
+                false,
+            )
+            .is_ok()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(nested.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first child adoption stalled"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.smart_folder_transition.is_some(),
+            "nested ZIP must own the continuation"
+        );
+        assert!(app.smart_folder_transition_sequence > initial_sequence + 1);
+        assert!(app.fs_navigation_sequence_owned_by_smart_folder());
+
+        // Cancelling the second preflight leaves the already adopted folder as the visible owner.
+        app.cancel_smart_folder_pending_and_restore_origin();
+        assert!(app.smart_folder_transition.is_none());
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(!app.fs_navigation_sequence_owned_by_smart_folder());
+
+        app.open_staged_smart_folder_and_wait(&ctx, &first);
+        let mode = super::FolderNavMode::SmartFolder {
+            state: app.top_level_grid_view.smart_folder().unwrap().clone(),
+            fullscreen: true,
+        };
+        app.fullscreen_idx = Some(0);
+        app.begin_fs_folder_navigation_sequence(&ctx, 0);
+        app.mark_smart_folder_navigation_sequence();
+        assert!(
+            app.begin_smart_folder_dfs_navigation(
+                nested.clone(),
+                super::smart_folder::SmartChildKind::Folder,
+                None,
+                0,
+                mode,
+                super::HistoryTrigger::UserChosen,
+                false,
+            )
+            .is_ok()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(zip_path.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nested ZIP adoption stalled: current={:?} transition={} fullscreen={:?} scope={:?} items={:?} visible={:?} lock={:?}",
+                app.current_folder,
+                app.smart_folder_transition.is_some(),
+                app.fullscreen_idx,
+                app.top_level_grid_view
+                    .smart_folder()
+                    .and_then(|state| state.scoped_current()),
+                app.items,
+                app.visible_indices,
+                app.fs_nav_locked_gen,
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.smart_folder_transition.is_none());
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(!app.fs_navigation_sequence_owned_by_smart_folder());
+
+        let saved = app.top_level_grid_view.smart_folder().unwrap().clone();
+        assert!(matches!(
+            saved.position,
+            super::top_level_grid_view::SmartFolderPosition::Scoped {
+                current_kind: crate::app::smart_folder::SmartChildKind::Zip,
+                ..
+            }
+        ));
+        let outside = app.tmp.path().join("outside-nested-zip");
+        std::fs::create_dir_all(&outside).unwrap();
+        app.load_folder(outside.clone());
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        assert!(app.begin_smart_history_navigation(
+            saved,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(outside.as_path()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(zip_path.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nested ZIP history restore stalled"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Direct(path))
+                if crate::folder_tree::path_eq(&path, &nested)
+        ));
+    }
+
+    #[test]
+    fn smart_fullscreen_ctrl_escape_cancels_unbound_dfs_before_child_adoption() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("smart-ctrl-escape-source");
+        let first = source.join("first");
+        let second = source.join("second");
+        for folder in [&first, &second] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("page.jpg"), []).unwrap();
+        }
+        let definition = definition("Smart Ctrl Escape", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        app.open_staged_smart_folder_and_wait(&ctx, &first);
+        app.fullscreen_idx = Some(0);
+        app.begin_fs_folder_navigation_sequence(&ctx, 0);
+        assert!(app.start_smart_folder_scope_nav(true, true));
+        assert!(app.folder_nav_pending.is_some());
+        assert!(app.fs_navigation_sequence_owned_by_smart_folder());
+
+        app.close_fullscreen();
+        assert!(app.folder_nav_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
+        assert!(!app.fs_navigation_sequence_owned_by_smart_folder());
+        assert_eq!(app.current_folder.as_deref(), Some(first.as_path()));
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.current_folder.as_deref(), Some(first.as_path()));
+    }
+
+    #[test]
+    fn nested_smart_pdf_history_reopens_as_pdf_after_source_session_is_gone() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-nested-pdf-source");
+        let folder = source.join("folder");
+        let pdf = folder.join("book.pdf");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let definition = definition("Smart Nested PDF", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        app.open_staged_smart_folder_and_wait(&ctx, &folder);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        let saved = app.top_level_grid_view.smart_folder().unwrap().clone();
+        assert!(matches!(
+            saved.position,
+            super::top_level_grid_view::SmartFolderPosition::Scoped {
+                current_kind: crate::app::smart_folder::SmartChildKind::Pdf,
+                ..
+            }
+        ));
+
+        let outside = app.tmp.path().join("outside-nested-pdf");
+        std::fs::create_dir_all(&outside).unwrap();
+        app.load_folder(outside.clone());
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        assert!(app.begin_smart_history_navigation(
+            saved,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(outside.as_path()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut injected = false;
+        while app.current_folder.as_deref() != Some(pdf.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nested PDF history restore stalled"
+            );
+            app.poll_smart_folder(&ctx);
+            if !injected {
+                injected = app.replace_staged_pdf_enumeration_for_test(
+                    &pdf,
+                    Ok(vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }]),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(injected);
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Direct(path))
+                if crate::folder_tree::path_eq(&path, &folder)
+        ));
+    }
+
+    #[test]
+    fn nested_smart_convertible_history_keeps_logical_kind_and_cache_alias() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let source = app.tmp.path().join("smart-nested-archive-source");
+        let folder = source.join("folder");
+        let archive = folder.join("book.7z");
+        let cached = app.tmp.path().join("smart-nested-archive-cache.zip");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&archive, b"archive source").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &archive, &cached);
+        let definition = definition("Smart Nested Archive", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder_staged(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        app.open_staged_smart_folder_and_wait(&ctx, &folder);
+        let index = select_real_path(&mut app, &archive);
+        assert!(app.begin_smart_grid_container_navigation(index, archive.clone(), false));
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        let saved = app.top_level_grid_view.smart_folder().unwrap().clone();
+        assert!(matches!(
+            saved.position,
+            super::top_level_grid_view::SmartFolderPosition::Scoped {
+                current_kind: crate::app::smart_folder::SmartChildKind::ConvertibleArchive,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(archive.as_path())
+        );
+
+        let outside = app.tmp.path().join("outside-nested-archive");
+        std::fs::create_dir_all(&outside).unwrap();
+        app.load_folder(outside.clone());
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        assert!(app.begin_smart_history_navigation(
+            saved,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(outside.as_path()));
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(archive.as_path())
+        );
+        assert_eq!(app.address, archive.to_string_lossy());
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Direct(path))
+                if crate::folder_tree::path_eq(&path, &folder)
+        ));
+    }
+
+    #[test]
+    fn staged_zip_pin_facts_use_logical_source_before_current_folder_changes() {
+        let app = setup_app();
+        let source = app.tmp.path().join("logical-book.7z");
+        let cached = app.tmp.path().join("cached-book.zip");
+        let file = std::fs::File::create(&cached).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("bookA/page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+        let pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "bookA/page.jpg".into(),
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&source.join("bookA"), &pin)
+            .unwrap();
+        assert_ne!(app.current_folder.as_deref(), Some(cached.as_path()));
+        let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&cached).unwrap();
+        let grid = app.prepare_zip_grid(cached, enumeration, Some(&source));
+        assert!(
+            grid.existing_keys
+                .iter()
+                .any(|key| key.contains("#pin:bookA/page.jpg"))
+        );
+    }
+
+    #[test]
+    fn smart_convertible_zip_late_result_cannot_replace_a_new_folder() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("smart-late-cache.zip");
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(app.smart_folder_transition.is_some());
+        let destination = app.tmp.path().join("smart-late-other-folder");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        // The pane request is the independent navigation intent. It retires the offscreen ZIP
+        // before either the scan or ZIP worker can publish a visible result.
+        app.start_folder_pane_open(destination.clone());
+        assert!(app.smart_folder_transition.is_none());
+        app.load_folder(destination.clone());
+        assert!(app.zip_enumerate_pending.is_none());
+        app.poll_zip_enumerate();
+        app.poll_smart_folder(&egui::Context::default());
+        assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+        assert!(app.archive_source_override.is_none());
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert_ne!(app.address, source.to_string_lossy());
     }
 
     #[test]
@@ -67194,7 +69291,8 @@ mod smart_folder_transition_tests {
         );
         app.top_level_grid_view
             .install_smart_folder_session(smart_session);
-        assert!(app.authorize_smart_folder_session_open(&source));
+        assert!(app.begin_staged_smart_drill(&source));
+        let staged_request = app.smart_folder_transition_sequence;
 
         let outside = app.tmp.path().join("outside-snapshot-scope");
         std::fs::create_dir_all(&outside).unwrap();
@@ -67223,34 +69321,24 @@ mod smart_folder_transition_tests {
         );
         assert_eq!(app.snapshot_count(), snapshot_count_before);
 
-        // Prove the authorization assertion is not a field-presence check: after temporarily
-        // removing only the snapshot precondition, the exact previously authorized source is
-        // still consumable by the real session boundary.
-        let snapshot = app
-            .snapshot
-            .take()
-            .expect("snapshot remains active after refusal");
-        assert!(app.preserve_smart_folder_session_for_load(&source));
-        app.snapshot = Some(snapshot);
-        // Mutation `smart_session_effect_before_snapshot_guard`: move
-        // preserve_smart_folder_session_for_load/clear_smart_folder_view_state back above the
-        // guard. It consumes/drops the authorization and surface, so the surface/session and
-        // behavioral authorization assertions fail. Moving the reading-history reconciliation
-        // back above the guard independently fails the reservation assertion.
+        assert_eq!(app.smart_folder_transition_sequence, staged_request);
+        assert!(app.smart_folder_transition.is_some());
+        // A refused out-of-scope open must not consume the staged Smart request or mutate the
+        // mounted session, history reservation, or visible rows before that request is adopted.
     }
 
     fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.folder_nav_pending.is_some() {
+        while app.folder_nav_pending.is_some() || app.smart_folder_transition.is_some() {
             if let Some(result) = app.poll_folder_nav() {
                 app.apply_folder_nav_result(ctx, result);
-            } else {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "smart-folder navigation did not finish before the deadline"
-                );
-                std::thread::yield_now();
             }
+            app.poll_smart_folder(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "smart-folder navigation did not finish before the deadline"
+            );
+            std::thread::yield_now();
         }
         assert_eq!(app.pending_folder_nav_steps, 0);
     }
@@ -67313,10 +69401,8 @@ mod smart_folder_transition_tests {
         let ctx = egui::Context::default();
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry.clone());
-        assert!(app.begin_smart_folder_drill(&child));
-        app.load_folder(child.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &child);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -67331,17 +69417,17 @@ mod smart_folder_transition_tests {
             Some(crate::ui_main::AddressBarNav::Direct(path))
                 if crate::folder_tree::path_eq(&path, &entry)
         ));
-        app.load_folder(entry.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(matches!(
             app.resolve_grid_parent_nav(),
             Some(crate::ui_main::AddressBarNav::Direct(path))
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
 
-        assert!(app.begin_smart_folder_drill(&child));
-        app.load_folder(child.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &child);
         app.open_global_search();
         app.close_global_search();
+        wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -67353,6 +69439,7 @@ mod smart_folder_transition_tests {
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         assert!(app.is_snapshot_active());
         app.deactivate_snapshot();
+        wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -67363,7 +69450,18 @@ mod smart_folder_transition_tests {
 
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         app.load_folder(grandchild.clone());
+        assert!(
+            matches!(
+                app.top_level_grid_view.return_to(),
+                Some(super::top_level_grid_view::TopLevelGridRestore::SmartFolder(_))
+            ),
+            "snapshot child navigation must retain its Smart return owner: surface={:?} return_to={:?} current={:?}",
+            app.top_level_grid_view.surface(),
+            app.top_level_grid_view.return_to(),
+            app.current_folder
+        );
         app.deactivate_snapshot();
+        wait_for_smart_folder_scope(&mut app, &ctx, &grandchild);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -67372,6 +69470,7 @@ mod smart_folder_transition_tests {
             "snapshot child navigation must remain in the original smart scope"
         );
         app.load_folder(child.clone());
+        wait_for_smart_folder_scope(&mut app, &ctx, &child);
 
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal.clone())];
         let back = app.navigate_folder_history_back().expect("history back");
@@ -67384,13 +69483,17 @@ mod smart_folder_transition_tests {
         let forward = app
             .navigate_folder_history_forward()
             .expect("history forward");
+        assert!(matches!(
+            &forward,
+            FolderNavHistoryTarget::SmartFolder(state)
+                if state.scoped_current() == Some(child.as_path())
+        ));
         assert_eq!(
             app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::NotSynthetic
+            super::SyntheticFolderHistoryDispatch::Restored
         );
-        app.load_folder(forward.into_path().expect("real folder target"));
-        assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        assert!(app.top_level_grid_view.smart_folder().is_none());
+        wait_for_smart_folder_scope(&mut app, &ctx, &child);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
     }
 
     #[test]
@@ -67414,8 +69517,7 @@ mod smart_folder_transition_tests {
         select_real_path(&mut app, &entry);
         app.scroll_offset_y = 234.0;
         app.scroll_to_selected = false;
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
 
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
@@ -67458,11 +69560,7 @@ mod smart_folder_transition_tests {
         select_real_path(&mut app, entry);
         app.scroll_offset_y = 900.0;
         app.scroll_to_selected = false;
-        assert!(app.begin_smart_folder_drill(entry));
-        assert!(matches!(
-            app.load_folder_or_convert_archive(entry.clone()),
-            super::FolderOpenOutcome::Loaded
-        ));
+        app.open_staged_smart_folder_and_wait(&ctx, entry);
         let parent = match app.resolve_grid_parent_nav() {
             Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
@@ -67504,28 +69602,8 @@ mod smart_folder_transition_tests {
         select_real_path(&mut app, &pdf);
         app.scroll_offset_y = 430.0;
         app.scroll_to_selected = false;
-        assert!(app.begin_smart_folder_drill(&pdf));
-        assert!(matches!(
-            app.load_folder_or_convert_archive(pdf.clone()),
-            super::FolderOpenOutcome::Loaded
-        ));
-        let (pending_path, password, pending_handle) = app
-            .pdf_enumerate_pending
-            .take()
-            .expect("main PDF open must enqueue enumeration");
-        pending_handle.cancel();
-        drop(pending_handle);
-        let completed = crate::pdf_loader::completed_enumerate_handle_for_test(
-            &pdf,
-            Ok(vec![crate::pdf_loader::PdfPageEntry {
-                page_num: 0,
-                mtime: 1,
-                file_size: 1,
-            }]),
-        );
-        app.pdf_enumerate_pending = Some((pending_path, password, completed));
-        app.poll_pdf_enumerate();
-        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
 
         let parent = match app.resolve_grid_parent_nav() {
             Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
@@ -67545,6 +69623,681 @@ mod smart_folder_transition_tests {
             selected_real_path(&app)
                 .is_some_and(|selected| crate::folder_tree::path_eq(selected, &pdf))
         );
+    }
+
+    #[test]
+    fn smart_root_pdf_open_survives_favorite_reconcile_and_installs_pages() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-favorite-pdf-origin");
+        let source = app.tmp.path().join("smart-favorite-pdf-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(origin);
+        remember_smart_source_filename_sort(&mut app, &source);
+        let definition = definition("Smart Favorite PDF", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert_eq!(app.settings.sort_order, SortOrder::DateAsc);
+
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        // The root remains visible during cache-cold enumeration, so its common sort remains
+        // active until the PDF page grid is actually adopted.
+        assert_eq!(app.settings.sort_order, SortOrder::DateAsc);
+        assert!(app.smart_folder_transition.is_some());
+
+        // App::update reconciles the favorite owner after dispatching the grid-open handler.
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        assert!(
+            app.smart_folder_prepare_pending.is_none(),
+            "frame-end favorite reconciliation must not reprepare the resident root over the PDF"
+        );
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        assert!(app.smart_folder_prepare_pending.is_none());
+    }
+
+    #[test]
+    fn smart_root_parent_return_keeps_offset_and_aspect_after_favorite_reconcile() {
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-favorite-return-origin");
+        let source = app.tmp.path().join("smart-favorite-return-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        let entries = (0..32)
+            .map(|index| source.join(format!("entry-{index:02}")))
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), []).unwrap();
+        }
+        app.current_folder = Some(origin);
+        app.settings.thumb_aspect_auto = true;
+        remember_smart_source_filename_sort(&mut app, &source);
+        let definition = definition("Smart Favorite Return", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        let entry = entries.last().unwrap();
+        select_real_path(&mut app, entry);
+        let selected = app.selected.unwrap();
+        let saved_offset = 900.0;
+        let saved_aspect = ThumbAspect::Portrait2x3;
+        app.auto_aspect.items_generation = app.items_generation;
+        app.auto_aspect
+            .samples
+            .insert(selected, saved_aspect.height_ratio());
+        app.auto_aspect.current = Some(saved_aspect);
+        app.scroll_offset_y = saved_offset;
+        app.scroll_to_selected = false;
+        app.open_staged_smart_folder_and_wait(&ctx, entry);
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        let parent = match app.resolve_grid_parent_nav() {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            other => panic!("Backspace must resolve to smart root: {other:?}"),
+        };
+        assert!(matches!(
+            app.load_folder_or_convert_archive(parent),
+            super::FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(app.scroll_offset_y, saved_offset);
+        assert_eq!(app.effective_thumb_aspect(), saved_aspect);
+        assert!(
+            selected_real_path(&app)
+                .is_some_and(|selected| crate::folder_tree::path_eq(selected, entry))
+        );
+
+        // The same frame-end reconciliation used by App::update must preserve the moved root.
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        assert!(
+            app.smart_folder_prepare_pending.is_none(),
+            "return must not replace the prepared root with a fresh first-row install"
+        );
+        assert_eq!(app.scroll_offset_y, saved_offset);
+        assert_eq!(app.effective_thumb_aspect(), saved_aspect);
+        assert!(!app.scroll_to_selected);
+    }
+
+    #[test]
+    fn smart_root_failed_folder_scan_keeps_the_unadopted_root() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-failed-scan-origin");
+        let source = app.tmp.path().join("smart-failed-scan-source");
+        let entry = source.join("entry");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Failed Scan", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &entry);
+        app.scroll_offset_y = 180.0;
+        app.scroll_to_selected = false;
+
+        std::fs::remove_dir_all(&entry).unwrap();
+        assert!(app.begin_staged_smart_drill(&entry));
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(entry.as_path())),
+            "failed scan must leave the previously visible root installed"
+        );
+        assert_eq!(app.scroll_offset_y, 180.0);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+    }
+
+    #[test]
+    fn smart_child_failed_scan_keeps_the_prior_scope_and_view() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-child-failed-origin");
+        let source = app.tmp.path().join("smart-child-failed-source");
+        let entry = source.join("entry");
+        let child = entry.join("child");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(entry.join("page.jpg"), []).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Child Failed Scan", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(child.as_path()))
+        );
+        std::fs::remove_dir_all(&child).unwrap();
+        assert!(app.begin_staged_smart_drill(&child));
+        wait_for_staged_smart_terminal(&mut app, &ctx);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current())
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &entry)),
+            "failed child scan must not publish the unadopted child as current scope"
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(child.as_path()))
+        );
+    }
+
+    #[test]
+    fn smart_root_pdf_password_cancel_keeps_the_unadopted_root() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("smart-password-cancel-origin");
+        let source = app.tmp.path().join("smart-password-cancel-source");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Password Cancel", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &pdf);
+        app.scroll_offset_y = 250.0;
+        app.scroll_to_selected = false;
+        assert!(app.begin_staged_smart_drill(&pdf));
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            &pdf,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Password required",
+            )),
+        ));
+        app.poll_smart_folder(&ctx);
+        assert_eq!(app.smart_pdf_password_dialog_path(), Some(pdf.clone()));
+        assert!(app.cancel_pdf_password_dialog_request());
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(pdf.as_path())),
+            "password cancellation must leave the root PDF row visible"
+        );
+        assert_eq!(app.scroll_offset_y, 250.0);
+    }
+
+    fn finish_smart_pdf_enumeration(app: &mut App, pdf: &Path) {
+        assert!(app.replace_staged_pdf_enumeration_for_test(
+            pdf,
+            Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 1,
+            }]),
+        ));
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() {
+            app.poll_smart_folder(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged PDF pages did not become visible"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.poll_pdf_enumerate();
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+    }
+
+    #[test]
+    fn smart_root_pdf_container_history_round_trip_keeps_root_ctrl_order() {
+        use super::top_level_grid_view::SmartFolderPosition;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-container-history-source");
+        let folder = source.join("folder");
+        let pdf = source.join("book.pdf");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let origin = app.tmp.path().join("smart-container-history-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.current_folder = Some(origin);
+        let definition = definition("Smart Container History", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entries
+                .len(),
+            2
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .entry_at_offset(true),
+            Some(pdf.as_path())
+        );
+
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        assert!(matches!(
+            &app.top_level_grid_view.smart_folder().unwrap().position,
+            SmartFolderPosition::Container { root_entry, current }
+                if root_entry == &pdf && current == &pdf
+        ));
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .entry_at_offset(true),
+            Some(folder.as_path())
+        );
+
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to smart root"),
+        };
+        assert!(matches!(back.position, SmartFolderPosition::Root));
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(SmartFolderPosition::Root)
+        ));
+
+        let forward = match app.folder_history_forward_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("forward to PDF"),
+        };
+        assert!(matches!(
+            forward.position,
+            SmartFolderPosition::Container { .. }
+        ));
+        assert!(app.begin_smart_history_navigation(
+            forward,
+            crate::app::smart_folder::SmartHistoryDirection::Forward,
+        ));
+        wait_for_no_resident_smart_pdf_open(&mut app, &ctx, &pdf);
+        assert!(
+            matches!(&app.top_level_grid_view.smart_folder().unwrap().position, SmartFolderPosition::Container { root_entry, current } if root_entry == &pdf && current == &pdf)
+        );
+    }
+
+    fn wait_for_no_resident_smart_pdf_open(app: &mut App, ctx: &egui::Context, pdf: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = app.replace_staged_pdf_enumeration_for_test(
+                pdf,
+                Ok(vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 1,
+                }]),
+            );
+            if matches!(
+                app.top_level_grid_view.smart_folder().map(|state| &state.position),
+                Some(super::top_level_grid_view::SmartFolderPosition::Container { current, .. })
+                    if current == pdf
+            ) && matches!(app.items.as_slice(), [GridItem::PdfPage { .. }])
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no-resident PDF restore timed out: current={:?} surface={:?} staged={} pdf_pending={} items={:?}",
+                app.current_folder,
+                app.top_level_grid_view.surface(),
+                app.smart_folder_transition.is_some(),
+                app.pdf_enumerate_pending.is_some(),
+                app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>()
+            );
+            app.poll_sidecar_restore(ctx);
+            app.poll_smart_folder(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn no_resident_smart_pdf_history_back_rebuilds_root_then_restores_container() {
+        use super::top_level_grid_view::SmartFolderPosition;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-no-resident-pdf-source");
+        let pdf = source.join("book.pdf");
+        let normal = app.tmp.path().join("smart-no-resident-normal");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart No Resident PDF", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(SmartFolderPosition::Container { .. })
+        ));
+
+        app.load_folder(normal.clone());
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(
+            matches!(app.folder_history_back_target(), Some(FolderNavHistoryTarget::SmartFolder(state)) if matches!(state.position, SmartFolderPosition::Container { .. }))
+        );
+
+        let before = app.folder_nav_history_snapshot();
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to no-resident PDF"),
+        };
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        wait_for_no_resident_smart_pdf_open(&mut app, &ctx, &pdf);
+        assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+        assert!(
+            !app.folder_nav_back_stack
+                .iter()
+                .chain(app.folder_nav_forward_stack.iter())
+                .any(|target| matches!(target, FolderNavHistoryTarget::Path(path) if path == &pdf))
+        );
+
+        let mut rollback = Some(app.folder_nav_history_snapshot());
+        let forward = app
+            .navigate_folder_history_forward()
+            .expect("forward to normal folder");
+        assert_eq!(forward, normal);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target_with_rollback(&forward, &mut rollback),
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
+        );
+        app.load_folder(forward.into_path().unwrap());
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+        assert!(
+            matches!(app.folder_history_back_target(), Some(FolderNavHistoryTarget::SmartFolder(state)) if matches!(state.position, SmartFolderPosition::Container { .. }))
+        );
+    }
+
+    #[test]
+    fn offscreen_parked_root_delete_is_not_resurrected_by_history_back() {
+        use super::top_level_grid_view::SmartFolderPosition;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-offscreen-delete-source");
+        let folder = source.join("book");
+        let deleted = source.join("deleted.jpg");
+        let normal = app.tmp.path().join("smart-offscreen-delete-normal");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), []).unwrap();
+        std::fs::write(&deleted, []).unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart Offscreen Delete", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &folder);
+        app.open_staged_smart_folder_and_wait(&ctx, &folder);
+        app.load_folder(normal);
+        let container_target = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("folder history target missing"),
+        };
+        assert!(app.begin_smart_history_navigation(
+            container_target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        wait_for_smart_folder_scope(&mut app, &ctx, &folder);
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .unwrap()
+                .has_offscreen_root()
+        );
+
+        std::fs::remove_file(&deleted).unwrap();
+        app.remove_paths_from_smart_folder_snapshots(&[deleted.clone()]);
+        assert!(
+            app.smart_folder_removed_paths
+                .get(&id)
+                .is_some_and(|removed| {
+                    removed.contains(&crate::path_key::normalize_keep_drive(&deleted))
+                })
+        );
+        let history_before = app.folder_nav_history_snapshot();
+        let root_target = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("root history target missing"),
+        };
+        assert!(matches!(root_target.position, SmartFolderPosition::Root));
+        assert!(app.begin_smart_history_navigation(
+            root_target,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(SmartFolderPosition::Scoped { .. })
+        ));
+        assert_eq!(app.folder_nav_back_stack, history_before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history_before.forward_stack);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "root return timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            app.top_level_grid_view
+                .smart_folder()
+                .map(|state| &state.position),
+            Some(SmartFolderPosition::Root)
+        ));
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(deleted.as_path()))
+        );
+        assert_eq!(
+            app.folder_nav_back_stack.len() + 1,
+            history_before.back_stack.len()
+        );
+        assert_eq!(
+            app.folder_nav_forward_stack.len(),
+            history_before.forward_stack.len() + 1
+        );
+    }
+
+    #[test]
+    fn no_resident_smart_pdf_history_cancel_restores_prior_folder_and_pop_snapshot() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-no-resident-cancel-source");
+        let pdf = source.join("book.pdf");
+        let normal = app.tmp.path().join("smart-no-resident-cancel-normal");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart No Resident Cancel", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        app.load_folder(normal.clone());
+
+        let before = app.folder_nav_history_snapshot();
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to PDF"),
+        };
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
+        app.cancel_smart_folder_pending_and_restore_origin();
+        assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+    }
+
+    #[test]
+    fn no_resident_smart_pdf_password_cancel_rolls_back_history_after_root_prepare() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-no-resident-password-source");
+        let pdf = source.join("book.pdf");
+        let normal = app.tmp.path().join("smart-no-resident-password-normal");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart No Resident Password", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        app.load_folder(normal.clone());
+
+        let before = app.folder_nav_history_snapshot();
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to PDF"),
+        };
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.replace_staged_pdf_enumeration_for_test(
+            &pdf,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Password required",
+            )),
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "root-first PDF continuation timed out"
+            );
+            app.poll_sidecar_restore(&ctx);
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.poll_smart_folder(&ctx);
+        app.poll_smart_folder(&ctx);
+        assert!(app.smart_pdf_password_dialog_path().is_some());
+        assert!(app.cancel_pdf_password_dialog_request());
+        assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
+    }
+
+    #[test]
+    fn no_resident_smart_pdf_missing_root_row_rolls_back_history() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-no-resident-missing-source");
+        let pdf = source.join("book.pdf");
+        let normal = app.tmp.path().join("smart-no-resident-missing-normal");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.current_folder = Some(normal.clone());
+        let definition = definition("Smart Missing PDF", source);
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        select_real_path(&mut app, &pdf);
+        assert!(app.begin_staged_smart_drill(&pdf));
+        finish_smart_pdf_enumeration(&mut app, &pdf);
+        app.load_folder(normal.clone());
+        std::fs::remove_file(&pdf).unwrap();
+
+        let before = app.folder_nav_history_snapshot();
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to PDF"),
+        };
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing row scan timed out"
+            );
+            app.poll_sidecar_restore(&ctx);
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
     }
 
     #[test]
@@ -67569,8 +70322,7 @@ mod smart_folder_transition_tests {
 
         select_real_path(&mut app, &entries[0]);
         app.scroll_to_selected = false;
-        assert!(app.begin_smart_folder_drill(&entries[0]));
-        app.load_folder(entries[0].clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entries[0]);
         assert!(app.start_smart_folder_scope_nav(true, false));
         assert!(app.start_smart_folder_scope_nav(true, false));
         drain_smart_folder_nav(&mut app, &ctx);
@@ -67616,8 +70368,7 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         select_real_path(&mut app, &entry);
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(app.start_smart_folder_scope_nav(true, false));
         drain_smart_folder_nav(&mut app, &ctx);
         assert!(
@@ -67659,8 +70410,7 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         select_real_path(&mut app, &entry_a);
-        assert!(app.begin_smart_folder_drill(&entry_c));
-        app.load_folder(entry_c.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry_c);
         std::fs::remove_dir_all(&entry_c).unwrap();
         app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&entry_c));
 
@@ -67716,8 +70466,7 @@ mod smart_folder_transition_tests {
         app.selected = Some(selected);
         app.scroll_offset_y = saved_offset;
         app.scroll_to_selected = false;
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(
             app.top_level_grid_view
                 .smart_folder_session()
@@ -67807,8 +70556,7 @@ mod smart_folder_transition_tests {
         app.scroll_offset_y = saved_offset;
         app.scroll_to_selected = false;
 
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         app.settings.grid_cols = changed_cols;
 
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
@@ -67841,6 +70589,55 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn smart_root_return_reprepares_only_for_actual_sort_or_grouping_change() {
+        for change in ["sort", "grouping"] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let source = app.tmp.path().join(format!("smart-stamp-source-{change}"));
+            let first = source.join("first");
+            let second = source.join("second");
+            std::fs::create_dir_all(&first).unwrap();
+            std::fs::create_dir_all(&second).unwrap();
+            std::fs::write(first.join("page.jpg"), []).unwrap();
+            std::fs::write(second.join("page.jpg"), []).unwrap();
+            let origin = app.tmp.path().join(format!("smart-stamp-origin-{change}"));
+            std::fs::create_dir_all(&origin).unwrap();
+            app.current_folder = Some(origin);
+            app.settings.sort_order = SortOrder::DateAsc;
+            let definition = definition("Smart Stamp", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            select_real_path(&mut app, &second);
+            app.open_staged_smart_folder_and_wait(&ctx, &second);
+
+            match change {
+                "sort" => app.settings.sort_order = SortOrder::FileName,
+                "grouping" => {
+                    app.settings.smart_folders[0].grouping =
+                        crate::settings::SubfolderExpansionOrder::FolderGrouped;
+                }
+                _ => unreachable!(),
+            }
+            let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+            assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+            assert!(
+                app.smart_folder_transition.is_some(),
+                "{change} must rebuild the root in its staged owner"
+            );
+            assert_eq!(app.current_folder.as_deref(), Some(second.as_path()));
+            assert!(!app.items_are_smart_folder_view);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            assert!(
+                selected_real_path(&app)
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, &second))
+            );
+        }
+    }
+
+    #[test]
     fn leaving_smart_folder_session_discards_result_and_synthetic_return_rescans() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -67860,14 +70657,14 @@ mod smart_folder_transition_tests {
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         app.load_folder(outside);
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
 
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
+        assert!(app.top_level_grid_view.smart_folder_session().is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
     }
 
@@ -67890,9 +70687,11 @@ mod smart_folder_transition_tests {
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
 
         app.open_smart_folder(id, true);
-        assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        assert!(app.smart_folder_transition.is_some());
         assert!(app.smart_folder_prepare_pending.is_none());
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
     }
 
     #[test]
@@ -67919,8 +70718,7 @@ mod smart_folder_transition_tests {
                 .any(|item| item.drag_source_path() == Some(deleted.as_path()))
         );
 
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         std::fs::remove_file(&deleted).unwrap();
         app.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(&deleted));
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
@@ -67952,8 +70750,7 @@ mod smart_folder_transition_tests {
         let ctx = egui::Context::default();
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry);
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
 
         let mut grouped = definition;
         grouped.grouping = crate::settings::SubfolderExpansionOrder::FolderGrouped;
@@ -67971,9 +70768,17 @@ mod smart_folder_transition_tests {
         ));
 
         app.settings.smart_folders[0].rules[0].include_descendants = false;
+        let old_keys = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
         app.invalidate_smart_folder_definition(id);
-        assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            old_keys,
+            "definition refresh must retain the old visible owner until adoption"
+        );
+        assert!(app.smart_folder_transition.is_some());
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
     }
 
     #[test]
@@ -68003,18 +70808,47 @@ mod smart_folder_transition_tests {
             &state,
             &crate::app::smart_folder::smart_folder_synthetic_path(id),
             true,
+            false,
             opts,
             app.settings.folder_skip_limit,
             &cancel,
         )
         .expect("first root entry");
         assert_eq!(root_target.path, first);
+        let root_fullscreen_target = super::navigate_smart_folder_scope(
+            &state,
+            &crate::app::smart_folder::smart_folder_synthetic_path(id),
+            true,
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("first playable descendant in the first root Folder");
+        assert_eq!(root_fullscreen_target.path, first_child);
+        assert!(root_fullscreen_target.hit_image_folder);
+
+        let mut reverse_state = state.clone();
+        assert!(reverse_state.enter_containing_path(&second));
+        let reverse_fullscreen_target = super::navigate_smart_folder_scope(
+            &reverse_state,
+            &second,
+            false,
+            true,
+            opts,
+            app.settings.folder_skip_limit,
+            &cancel,
+        )
+        .expect("last playable descendant in the previous root Folder");
+        assert_eq!(reverse_fullscreen_target.path, later_child);
+        assert!(reverse_fullscreen_target.hit_image_folder);
 
         assert!(state.enter_containing_path(&first));
         let child_target = super::navigate_smart_folder_scope(
             &state,
             &first,
             true,
+            false,
             opts,
             app.settings.folder_skip_limit,
             &cancel,
@@ -68026,6 +70860,7 @@ mod smart_folder_transition_tests {
             &state,
             &first_child,
             true,
+            false,
             opts,
             app.settings.folder_skip_limit,
             &cancel,
@@ -68037,6 +70872,7 @@ mod smart_folder_transition_tests {
             &state,
             &later_child,
             true,
+            false,
             opts,
             app.settings.folder_skip_limit,
             &cancel,
@@ -68065,24 +70901,25 @@ mod smart_folder_transition_tests {
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
-        assert!(app.begin_smart_folder_drill(&entry));
-        app.load_folder(entry.clone());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(matches!(
             app.folder_history_back_target(),
             Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == id
         ));
 
-        let back = app.navigate_folder_history_back().expect("history back");
+        let back = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("history back"),
+        };
+        assert_eq!(back.definition_id, id);
         assert!(matches!(
-            &back,
-            FolderNavHistoryTarget::SmartFolder(state)
-                if state.definition_id == id
-                    && matches!(state.position, super::top_level_grid_view::SmartFolderPosition::Root)
+            back.position,
+            super::top_level_grid_view::SmartFolderPosition::Root
         ));
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&back),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        assert!(app.begin_smart_history_navigation(
+            back,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
+        ));
         assert!(matches!(
             app.top_level_grid_view
                 .smart_folder()
@@ -68090,18 +70927,17 @@ mod smart_folder_transition_tests {
             Some(super::top_level_grid_view::SmartFolderPosition::Root)
         ));
 
-        let forward = app
-            .navigate_folder_history_forward()
-            .expect("history forward");
-        assert!(matches!(
-            &forward,
-            FolderNavHistoryTarget::SmartFolder(state)
-                if state.definition_id == id && state.scoped_current() == Some(entry.as_path())
+        let forward = match app.folder_history_forward_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("history forward"),
+        };
+        assert_eq!(forward.definition_id, id);
+        assert_eq!(forward.scoped_current(), Some(entry.as_path()));
+        assert!(app.begin_smart_history_navigation(
+            forward,
+            crate::app::smart_folder::SmartHistoryDirection::Forward,
         ));
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        wait_for_smart_folder_scope(&mut app, &ctx, &entry);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -68113,18 +70949,18 @@ mod smart_folder_transition_tests {
             "scoped history restore must not suppress the next user transition"
         );
 
-        let _ = app.begin_smart_folder_drill(&child);
-        app.load_folder(child);
-        let back_to_entry = app.navigate_folder_history_back().expect("back to entry");
-        assert!(matches!(
-            &back_to_entry,
-            FolderNavHistoryTarget::SmartFolder(state)
-                if state.definition_id == id && state.scoped_current() == Some(entry.as_path())
+        app.open_staged_smart_folder_and_wait(&ctx, &child);
+        let back_to_entry = match app.folder_history_back_target() {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => state.clone(),
+            _ => panic!("back to entry"),
+        };
+        assert_eq!(back_to_entry.definition_id, id);
+        assert_eq!(back_to_entry.scoped_current(), Some(entry.as_path()));
+        assert!(app.begin_smart_history_navigation(
+            back_to_entry,
+            crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&back_to_entry),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        wait_for_smart_folder_scope(&mut app, &ctx, &entry);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -68195,26 +71031,34 @@ mod smart_folder_transition_tests {
         let definition = definition("Smart", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
 
         app.open_local_metadata_search();
         app.open_smart_folder(id, false);
+        assert!(
+            app.show_search_bar,
+            "prior search remains visible until Smart adoption"
+        );
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert_no_transient_top_level_view(&app);
-        app.cancel_smart_folder_pending();
 
         app.open_favsearch();
         app.open_smart_folder(id, false);
+        assert!(app.favsearch.active);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert_no_transient_top_level_view(&app);
-        app.cancel_smart_folder_pending();
 
         app.open_global_search();
         app.open_smart_folder(id, false);
+        assert!(app.global_search.active);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert_no_transient_top_level_view(&app);
-        app.cancel_smart_folder_pending();
 
         app.open_tag_view();
         app.open_smart_folder(id, false);
+        assert!(app.tag_view.active);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
         assert_no_transient_top_level_view(&app);
-        app.cancel_smart_folder_pending();
     }
 
     #[test]
@@ -68230,27 +71074,32 @@ mod smart_folder_transition_tests {
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
 
-        // A history/search restore installs the target surface before discovering that its
-        // in-memory snapshot is missing. That target must not become a recursive cancel origin.
-        app.top_level_grid_view.replace_surface(
-            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
-                super::top_level_grid_view::SmartFolderViewState::root(id, Vec::new()),
-            ),
-        );
+        let ctx = egui::Context::default();
         app.open_smart_folder(id, false);
-        assert!(app.smart_folder_pending.is_some());
-        assert!(matches!(
-            app.smart_folder_open_origin.as_ref(),
-            Some(super::top_level_grid_view::TopLevelGridRestore::SmartFolder(_))
-        ));
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        let old_session = app
+            .top_level_grid_view
+            .smart_folder_session()
+            .unwrap()
+            .definition_id();
+        app.open_smart_folder(id, false);
+        assert!(app.smart_folder_transition.is_some());
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .unwrap()
+                .definition_id(),
+            old_session,
+        );
 
         app.cancel_smart_folder_pending_and_restore_origin();
 
+        assert!(app.smart_folder_transition.is_none());
         assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert!(app.smart_folder_confirm_pending.is_none());
-        assert!(app.top_level_grid_view.smart_folder().is_none());
-        assert_eq!(app.current_folder.as_ref(), Some(&normal));
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        assert_eq!(app.current_smart_folder_id, Some(id));
     }
 
     #[test]
@@ -68272,9 +71121,12 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
 
         app.open_smart_folder(id, false);
-
+        assert!(
+            app.is_snapshot_active(),
+            "prior lock remains until visible adoption"
+        );
+        wait_for_smart_folder_idle(&mut app, &egui::Context::default(), id);
         assert_no_transient_top_level_view(&app);
-        app.cancel_smart_folder_pending();
     }
 
     #[test]
@@ -68286,32 +71138,32 @@ mod smart_folder_transition_tests {
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
         app.open_smart_folder(id, false);
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
 
         app.open_local_metadata_search();
 
-        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
         assert!(app.show_search_bar);
         app.poll_smart_folder(&egui::Context::default());
         assert!(!app.items_are_smart_folder_view);
 
         app.open_smart_folder(id, false);
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
         app.open_favsearch();
-        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
         assert!(app.favsearch.active);
 
         app.open_smart_folder(id, false);
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
         app.open_global_search();
-        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
         assert!(app.global_search.active);
 
         app.open_smart_folder(id, false);
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
         app.open_tag_view();
-        assert!(app.smart_folder_pending.is_none());
+        assert!(app.smart_folder_transition.is_none());
         assert!(app.tag_view.active);
     }
 
@@ -68489,11 +71341,19 @@ mod smart_folder_transition_tests {
         app.open_favsearch();
         app.current_folder = Some(super::search_results_synthetic_path());
         app.open_local_metadata_search();
-        assert!(app.smart_folder_pending.is_some());
+        assert!(app.smart_folder_transition.is_some());
         app.open_global_search();
 
         assert!(app.smart_folder_pending.is_none());
         assert!(app.smart_folder_prepare_pending.is_none());
+        assert!(
+            app.smart_folder_transition.is_none(),
+            "new search must retire the staged Smart return: projected={:?} main={:?} global={} favorite={}",
+            app.projected_viewer_context_id(),
+            app.viewer_context_main(),
+            app.global_search.active,
+            app.favsearch.active
+        );
         assert_eq!(app.global_search.saved_folder.as_ref(), Some(&smart_path));
     }
 
@@ -68576,19 +71436,11 @@ mod smart_folder_transition_tests {
         let ctx = egui::Context::default();
 
         app.open_smart_folder(a_id, false);
-        assert_eq!(
-            app.smart_folder_open_origin
-                .as_ref()
-                .and_then(|origin| origin.legacy_path()),
-            Some(normal.clone())
-        );
+        assert!(app.favsearch.active);
+        assert!(app.smart_folder_transition.is_some());
         app.open_smart_folder(b_id, false);
-        assert_eq!(
-            app.smart_folder_open_origin
-                .as_ref()
-                .and_then(|origin| origin.legacy_path()),
-            Some(normal.clone())
-        );
+        assert!(app.favsearch.active);
+        assert!(app.smart_folder_transition.is_some());
         wait_for_smart_folder_idle(&mut app, &ctx, b_id);
         assert_eq!(
             app.folder_history_back_target(),
@@ -68633,20 +71485,16 @@ mod smart_folder_transition_tests {
             let source = app.tmp.path().join(format!("smart-{incoming:?}"));
             std::fs::create_dir_all(&normal).unwrap();
             std::fs::create_dir_all(source.join("book")).unwrap();
+            app.current_folder = Some(normal.clone());
+            app.open_favsearch();
             app.current_folder = Some(super::search_results_synthetic_path());
-            app.favsearch.active = true;
-            app.favsearch.saved_folder = Some(normal.clone());
             let definition = definition("Smart", source);
             let id = definition.id;
             app.settings.smart_folders = vec![definition];
 
             app.open_smart_folder(id, false);
-            assert_eq!(
-                app.smart_folder_open_origin
-                    .as_ref()
-                    .and_then(|origin| origin.legacy_path()),
-                Some(normal.clone())
-            );
+            assert!(app.favsearch.active);
+            assert!(app.smart_folder_transition.is_some());
             match incoming {
                 SearchMode::LocalMeta => app.open_local_metadata_search(),
                 SearchMode::Favsearch => app.open_favsearch(),
@@ -68654,7 +71502,7 @@ mod smart_folder_transition_tests {
                 SearchMode::TagView => app.open_tag_view(),
             }
 
-            assert!(app.smart_folder_pending.is_none());
+            assert!(app.smart_folder_transition.is_none());
             assert!(app.smart_folder_prepare_pending.is_none());
             match incoming {
                 SearchMode::LocalMeta => {

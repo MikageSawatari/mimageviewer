@@ -290,7 +290,7 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 | `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
 | `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
-| `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill のグリッド、リング、ゲームパッド、フルスクリーン | `entry_root` 内だけを DFS。端では root snapshot の表示順で前後 entry へ移る。着地前に `SmartFolderViewState` を更新し、`fullscreen=true` は先頭 image-like を再表示 |
+| `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill / root 直下の本のグリッド、リング、ゲームパッド、フルスクリーン | Folder `entry_root` 内だけを DFS。端または root 直下の本からは、最終 root items 表示順の Folder/PDF/ZIP/変換書庫 entry へ移る（単体画像・動画は除外）。worker に渡した単一の型付き root 列と可視列が異なれば旧結果は採用しない。新しい Folder/PDF/ZIP は offscreen `SmartFolderTransition` で準備し、可視採用時に `SmartFolderViewState` と fullscreen 継続を一度だけ更新する |
 
 実装上の要点:
 
@@ -324,6 +324,16 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
   `current_folder` ではなくスタックトップを使う。
 - SmartFolder モードでは worker に渡した state snapshot だけで範囲を判定する。連鎖時は
   `TopLevelGridView` の最新 scoped current / entry index から mode を作り直し、古い entry へ戻らない。
+- SmartFolder の新規 child は DFS 完了後も旧表示・旧 worker/pending を保持したまま別 request
+  で Folder scan / PDF・ZIP 列挙 / 変換 alias を準備する。同 mode の追加 Ctrl 入力は
+  typed continuation に累積し、可視採用後だけ fullscreen を再開して次の DFS に進む。
+  ZIP/PDF だけの中間フォルダを経る二段目も同じ continuation を移す。Esc、別 mode、
+  stale / error は exact request の lock と holdover だけを終える。旧可視 PDF/ZIP の検証結果は
+  この新要求の fullscreen sequence を消費しない。詳細は
+  [§1.257 の実装記録](section257-smart-folder-navigation.md)。
+- SmartFolder root の offscreen scan/count/prepare/Ready は元一覧を背面に残して中央
+  `egui::Modal` と共通入力 gate を使う。中止は表示時の exact transition ID のみを
+  退役させ、古い worker 完了を無効にする。子の `ChildPreflight` は非モーダルのままにする。
 
 モード境界のキャンセル:
 

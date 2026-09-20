@@ -3,6 +3,15 @@
 ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
 通常画像ファイルとの処理分岐が多く、修正漏れが起きやすい。**ZIP/PDF 対応のある機能を触るときは必ずこのドキュメントを見る**。
 
+スマートフォルダから物理子の Folder/PDF/ZIP/変換アーカイブへ入る場合は、
+新要求の scan/列挙を表示中の一覧と別 owner で進める。成功して表示する直前にだけ
+旧一覧・旧 PDF/ZIP receiver を退役し、準備結果を一回 install する。PDF warm cache の
+placeholder は採用後も同じ enumerate handle で検証する。取消・未採用エラー・古い完了は
+旧一覧と履歴に触れない。変換 cache ZIP は実ロード先であり、favorite・address・履歴・pin
+の元 source は元アーカイブである。詳細は [§1.257 の実装記録](section257-smart-folder-navigation.md)。
+スマートフォルダの Ctrl+↑/↓ は最終 root 一覧の表示順から Folder/PDF/ZIP/変換書庫だけを
+一つの列として横断する。Folder 内部では従来の DFS を続け、単体画像・動画は横断対象にしない。
+
 ---
 
 ## 1. GridItem バリアント

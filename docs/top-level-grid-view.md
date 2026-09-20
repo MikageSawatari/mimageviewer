@@ -41,17 +41,20 @@ offset をそのまま復元し、増減・並べ替えがあれば開いた ID 
 `TopLevelGridSurface::SmartFolder(SmartFolderViewState)` は次を所有する。
 
 - 定義 ID
-- root snapshot に表示された実フォルダ entry の順序
-- `Root`、または `Scoped { entry_index, entry_root, current, back_stack }`
+- root snapshot の最終表示順から作る、Folder/PDF/ZIP/変換書庫の単一ナビゲーション列（単体画像・動画は除外）
+- `Root`、`Scoped { entry_index, entry_root, current, current_kind, back_stack }`、または root 行の PDF/ZIP 用 `Container { root_entry, current }`
 
 同じ `TopLevelGridView` が `SmartFolderSession` も唯一所有する。session は完成済みの走査
-snapshot、sort 用 metadata、root の materialize 済み grid を保持する。root から配下の
-フォルダ / PDF / ZIP / 変換アーカイブを開くときは、一覧を clone せず session へ move し、
-root へ戻ると同じ items・サムネイル・選択・スクロール位置を move で戻す。この復帰では
-scan も prepare も開始せず、進捗 UI も出さない。
+snapshot、sort 用 metadata、root の materialize 済み grid を保持する。採用済み session は
+`Root` / `Child` の排他 phase、新しい open は別の `SmartFolderTransition` が所有する。未採用の
+open は現在表示中の一覧・scope・worker と検索/Collection の owner を保持する。root から配下の
+フォルダ / PDF / ZIP / 変換アーカイブの可視結果を採用するときだけ、一覧を clone せず session へ move し、
+root へ戻ると同じ items・サムネイル・選択・スクロール位置を move で戻す。worker が実際に
+構築した sort/display/grouping stamp と現在の表示設定が同じなら scan/prepare は開始しない。
+設定を明示変更した場合だけ保存 snapshot から再準備し、元 root 行の path を選択 anchor とする。
 
-root 復帰時の選択は、退避時の選択を無条件に戻すのではなく、session の最新
-`active_child` を包含する root-level entry で置き換える。子孫へ深く降りている場合も、
+root 復帰時の選択は、退避時の選択を無条件に戻すのではなく、session の採用済み
+`Child.logical_path` を包含する root-level entry で置き換える。子孫へ深く降りている場合も、
 通常フォルダの親復帰が「戻り先直下の子」を選ぶのと同様に、その子孫を所有する最深の
 root entry を選ぶ。選択の適用は通常の parent navigation と同じ select-after-load /
 `scroll_to_selected` / ensure-visible 経路を使う。entry が削除されて root items から消えた
@@ -75,12 +78,13 @@ newly installed root generation; a child's auto-aspect state must never be paire
 詳細表示中の列数変更は実レイアウトを変えないため不一致にせず、詳細行高は `DETAILS_ROW_H` 固定、
 サムネイルの decode target はセル geometry の入力ではないため比較対象に含めない。
 
-セッション内 open はグリッド / 親移動 / Ctrl+上下の request が対象 path を型付きで許可し、
-共通の `load_folder_with_scan_claimed` / `start_loading_items_inner` 境界だけがその許可を消費する。
-アドレスバー、お気に入り、通常フォルダ、検索、別の最上位 surface には許可がないため、
-同じ境界で session が破棄される。`open_smart_folder()` は `begin` を通して同じ定義の session
-も必ず破棄し、明示的な再選択を従来どおり full scan にする。履歴に残る
-`SmartFolderViewState` は位置だけであり、破棄後の synthetic path 復帰は scan からやり直す。
+セッション内 open はグリッド / 親移動 / Ctrl+上下と同一 smart scope 内の直接 folder load が
+対象 path を型付きで stage し、Folder scan 成功後または PDF/ZIP の可視 install 境界だけが
+その要求を採用する。scan Err、変換取消、cache-cold PDF password cancel は元表示を維持する。
+scope 外への独立ナビゲーションは未採用 transition を退役させる。`open_smart_folder()` の明示的な
+再選択も full scan を新要求に stage し、成功採用時だけ旧 session を破棄する。履歴に残る
+`SmartFolderViewState` は位置と Scoped の採用済み物理 kind だけを持ち、session 破棄後の復帰は
+root を offscreen で scan→prepare してから子を開く。元表示と履歴は子の採用まで保持する。
 
 detached / ParkedLive 用の context 複製は表示 identity を複製しても、main surface が所有する
 `SmartFolderSession` は複製しない。巨大 result と worker/cache を sibling context に共有せず、
@@ -91,15 +95,21 @@ drill に入り、以後の通常フォルダ列挙にはスマートフォル�
 `スマートフォルダ名 > entry名 > 子フォルダ...` とする。
 
 Backspace / 親移動は `entry_root` より外へ出ない。entry root の親は実ファイルシステムの親では
-なく、保持済み root snapshot である。Ctrl+↑/↓ は entry 内だけを DFS し、端へ達した場合だけ
-root snapshot の表示順で前後のフォルダ entry へ移る。グリッド、リング、ゲームパッド、画像
+なく、保持済み root snapshot である。Ctrl+↑/↓ は Folder entry 内の DFS を維持し、端へ達した場合は
+root snapshot の表示順で前後の Folder/PDF/ZIP/変換書庫 entry へ移る。root 直下の本からも同じ列で
+前後へ移動する。Grid は直下画像のない root Folder もその entry 自体へ入り、Fullscreen は
+同 Folder の配下を前進時は先頭、後退時は末尾から再生可能な子を探す。空の scope を尽くしたら
+次の root entry を調べ、skip 上限に達した場合のみ従来の空 Folder fallback を使う。
+グリッド、リング、ゲームパッド、画像
 フルスクリーン、native 動画は同じ `FolderNavMode::SmartFolder` を使う。
 
-通常の戻る / 進む履歴では scoped drill 内の実パスをそのまま保存せず、同じスマートフォルダの
-synthetic path と、履歴 stack の同じ添字に置く `SmartFolderViewState` の組で位置を表す。root と
-各 scoped current は state が異なる別の履歴地点として扱うため、root から実フォルダを開いた後に
-「戻る」で root、「進む」で実フォルダへ復帰できる。検索、★固定、履歴、別スマートフォルダとの
-往復でも `current` と親 stack を含む scope 全体を復元する。
+通常の戻る / 進む履歴では scoped drill や root container 内の実パスをそのまま保存せず、
+`SmartFolderViewState` の位置を型付きで保持する。root と各 Scoped/Container current は別の
+履歴地点なので「戻る」で root、「進む」で元の子へ復帰する。Container は root 行の本を一つの
+entry として保持し、Ctrl+上下では隣の表示対象 entry へ移る。session 不在の
+履歴復元は scan→prepare で root を offscreen 再構築した後に子を開く継続要求と pop 前の履歴 peek を
+同じ owner が保持し、取消・未採用失敗時には元表示・履歴を変更しない。検索、★固定、別スマート
+フォルダとの往復でも scope 全体を復元する。
 
 ### コレクションrootと物理子のowner
 
@@ -140,10 +150,9 @@ root 再準備では新しい実フォルダ表示順を state へ反映する�
 並び替え後の index へ追従できる。削除・リネームで entry が消えた場合は stale な実パスを
 scope として保持せず root へ戻す。定義削除、worker cancel、別最上位ビューへの遷移は既存の
 smart generation / cancel 境界と `TopLevelGridView` の ownership を両方確認する。
-未完成の cache-miss restore では、先に設定した SmartFolder target surface 自身を中止時の
-復元元にしない。中止時は、背面に完成済みスマートフォルダ一覧が残っていればそれをそのまま
-復元し、完成済み一覧も有効 snapshot もない自己参照 origin なら保存済み実フォルダへ戻る。
-汎用 restore を再帰的に呼んで同じ scan を開始し直してはならない。
+cache-miss の履歴復帰は、採用前に target SmartFolder surface を公開しない。旧 visible owner を
+保ったまま root/child を準備し、成功時に一回だけ表示と履歴を切り替える。取消時の同期 reload や
+汎用 restore の再帰呼出しは必要ない。
 
 resident session は鮮度更新の単位でもある。rating / tag / adjustment 等の書き込みは表示中の
 セル状態を直接更新できるが、membership・順序・再利用 metadata は明示 reopen まで凍結する。

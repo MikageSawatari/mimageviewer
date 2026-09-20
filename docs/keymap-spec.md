@@ -317,8 +317,8 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | 既定キーなし (`GridOpenCurrentDriveRoot`) | 現在位置のルートディレクトリへ移動する。通常フォルダ、ZIP/PDF/変換アーカイブ内では `effective_folder()` のドライブ root / UNC share root を対象にする。検索中・★固定中は無効 |
 | 既定キーなし (`GridOpenDriveC..Z`) | 対応する `C:\`〜`Z:\` のドライブルートを直接開く |
 | 既定キーなし (`GridSwitchDriveC..Z`) | アクティブな A/B クイックフォルダスロットごとに覚えている、そのドライブの最後の場所へ切り替える。未訪問または最後の場所が存在しない場合は対象ドライブ root へフォールバックする |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ。スマートフォルダでは現在の実フォルダ entry 内だけを遡り、端では root 一覧の前のフォルダ entry へ |
-| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。Action: `GridTreeFolderNext`。検索中は次のヒットフォルダへ移動。★固定 中は snapshot 内の次 entry へ。スマートフォルダでは現在の実フォルダ entry 内だけを進み、端では root 一覧の次のフォルダ entry へ |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の前の Folder/本 entry へ（単体画像・動画は除外） |
+| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。Action: `GridTreeFolderNext`。検索中は次のヒットフォルダへ移動。★固定 中は snapshot 内の次 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の次の Folder/本 entry へ（単体画像・動画は除外） |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。Action: `GridSiblingFolderPrev` / `GridSiblingFolderNext`。同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟には入らない。検索中は無効。★固定 中は snapshot 内の前/次 image-like entry へ (Folder/Zip/Pdf entry は skip) |
 | <kbd>Home</kbd> / <kbd>End</kbd> | サムネイル一覧の先頭 / 末尾へ移動する。Action: `GridMoveFirst` / `GridMoveLast` |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | サムネイル一覧を 1 ページ分前 / 次へ移動する。Action: `GridPagePrev` / `GridPageNext` |
@@ -470,7 +470,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 現在の表示順で、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプ。Action: `FsFixedJumpPrev` / `FsFixedJumpNext`。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む。左右の意味はページ表示の RTL で反転し、「カーソルキー左右の方向」の影響は受けない。動画は対象外 |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。1 回押すごとに必ず 1 ページ動く)。結果はセッション内の一時アンカーとして保持し、`spread_db` には保存しない。Single モードでは前 / 次ファイル。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。独立 detached 静止画窓でも窓自身の物理兄弟順を使う |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸で循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 

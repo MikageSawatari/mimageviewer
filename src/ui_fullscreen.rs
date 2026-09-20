@@ -10363,6 +10363,108 @@ impl App {
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
 
+    pub(crate) fn mark_smart_folder_navigation_sequence(&mut self) {
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+            && matches!(
+                sequence.target,
+                FsNavigationSequenceTarget::FolderItems { .. }
+            )
+        {
+            sequence.purpose = FsNavigationPurpose::SmartFolderNavigation { request_id: None };
+        }
+    }
+
+    pub(crate) fn bind_smart_folder_navigation_sequence(&mut self, request_id: u64) {
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+            && matches!(
+                sequence.purpose,
+                FsNavigationPurpose::SmartFolderNavigation { request_id: None }
+            )
+        {
+            sequence.purpose = FsNavigationPurpose::SmartFolderNavigation {
+                request_id: Some(request_id),
+            };
+        }
+    }
+
+    pub(crate) fn adopt_smart_folder_navigation_sequence(&mut self, request_id: u64) {
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+            && matches!(
+                sequence.purpose,
+                FsNavigationPurpose::SmartFolderNavigation {
+                    request_id: Some(owner),
+                } if owner == request_id
+            )
+        {
+            sequence.purpose = FsNavigationPurpose::Ordinary;
+        }
+    }
+
+    pub(crate) fn finish_smart_folder_navigation_sequence(&mut self, request_id: u64) {
+        let owns_sequence = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.purpose,
+                    FsNavigationPurpose::SmartFolderNavigation {
+                        request_id: Some(owner),
+                    } if owner == request_id
+                )
+            });
+        if owns_sequence {
+            self.finish_fs_navigation_sequence(
+                crate::app::FsNavigationSequenceFinish::RequestFailed,
+            );
+        }
+    }
+
+    pub(crate) fn finish_unbound_smart_folder_navigation_sequence(&mut self) {
+        let owns_unbound_sequence = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.purpose,
+                    FsNavigationPurpose::SmartFolderNavigation { request_id: None }
+                )
+            });
+        if owns_unbound_sequence {
+            self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::Superseded);
+        }
+    }
+
+    pub(crate) fn fs_navigation_sequence_owned_by_smart_folder(&self) -> bool {
+        self.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.purpose,
+                    FsNavigationPurpose::SmartFolderNavigation { .. }
+                )
+            })
+    }
+
+    pub(crate) fn finish_visible_container_fs_nav_failed(&mut self) {
+        if !self.fs_navigation_sequence_owned_by_smart_folder() {
+            self.finish_fs_navigation_sequence(
+                crate::app::FsNavigationSequenceFinish::RequestFailed,
+            );
+        }
+    }
+
     fn begin_fs_page_navigation_sequence(
         &mut self,
         ctx: &egui::Context,
@@ -11066,6 +11168,9 @@ impl App {
     }
 
     pub(crate) fn suspend_fs_navigation_sequence_for_password(&mut self) -> bool {
+        if self.fs_navigation_sequence_owned_by_smart_folder() {
+            return false;
+        }
         let Some(sequence) = self
             .fs_holdover_tex
             .as_mut()
@@ -11196,6 +11301,12 @@ impl App {
     /// 「items が進む前」(= 旧ページがロード済み判定で誤って解除される) のを
     /// items_generation チェックで防ぐ。
     pub(crate) fn poll_fs_nav_lock(&mut self, ctx: &egui::Context) {
+        // The old visible PDF/ZIP may finish verification while a Smart Ctrl traversal is
+        // preparing offscreen. That generation belongs to the source view, not the new folder
+        // target; only the staged request's visible adoption may satisfy this holdover.
+        if self.fs_navigation_sequence_owned_by_smart_folder() {
+            return;
+        }
         if let Some(sequence) = self
             .fs_holdover_tex
             .as_ref()
@@ -24959,7 +25070,7 @@ impl App {
                 self.finish_similar_move_diagnostic("presented");
                 self.similar_panel.complete_similar_book_visit(intent);
             }
-            FsNavigationPurpose::Ordinary => {
+            FsNavigationPurpose::Ordinary | FsNavigationPurpose::SmartFolderNavigation { .. } => {
                 if let Some(location) = presented_location() {
                     self.similar_panel.observe_ordinary_book_page(location);
                 }
@@ -33201,6 +33312,12 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
+        // A follow-up for the same staged Smart DFS belongs to its typed request. The generic
+        // folder-items sequence blocks unrelated targets until adoption, so admit this input
+        // before consulting that block; sibling/page navigation remains blocked as before.
+        if self.accumulate_staged_smart_fullscreen_ctrl_step(forward) {
+            return;
+        }
         if self.fs_navigation_sequence_blocks_new_target() {
             self.note_fullscreen_nav_request_dropped();
             return;

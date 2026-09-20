@@ -61,6 +61,7 @@
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
+| [section257-smart-folder-navigation.md](section257-smart-folder-navigation.md) | スマートフォルダからの PDF 読み込み取消と親復帰位置の不具合。お気に入り表示設定の適用先、root/物理子の所有境界と回帰検証 |
 | [fullscreen-folder-sidecar-transition-investigation-20260913.md](fullscreen-folder-sidecar-transition-investigation-20260913.md) | §1.233 サイドカー復元の非同期待機と画像フォルダ移動の表示保持。v3.9.0退行のログ・所有境界・修正検証 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |

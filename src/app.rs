@@ -485,9 +485,28 @@ pub(crate) struct MainGridArchiveTransitionIntent {
     reading_history_return_from: Option<PathBuf>,
     suppress_rating_filter: bool,
     suppress_facet_filter: bool,
-    smart_folder_drill: bool,
+    pub(crate) smart_folder_owner: SmartGridArchiveOwner,
     collection_grid_owner: Option<top_level_grid_view::CollectionGridSourceOpenOwner>,
     collection_navigation_continuation: Option<CollectionArchiveNavigationContinuation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmartGridArchiveOwner {
+    None,
+    /// A Smart grid open without a staged request must never fall into ordinary conversion.
+    UnclaimedSmart,
+    Transition(u64),
+}
+
+/// Source-facing effects retained by a Smart Folder archive open until the cached ZIP's
+/// visible generation is installed. The cache path is only an implementation alias.
+#[derive(Clone)]
+pub(crate) struct SmartFolderArchiveCommit {
+    pub(crate) owner: OpenRequestOwner,
+    pub(crate) source_path: PathBuf,
+    pub(crate) cache_path: PathBuf,
+    pub(crate) restore_reading_history: bool,
+    pub(crate) restore_bookmark_view: Option<BookmarkViewState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3100,6 +3119,7 @@ pub(crate) struct PdfPasswordRequest {
 /// 事前スキャンがあれば UI スレッドの `load_folder` は `read_dir` をスキップできる。
 pub(crate) struct FolderNavThreadResult {
     outcome: Option<crate::folder_tree::FolderNavOutcome>,
+    smart_kind: Option<smart_folder::SmartChildKind>,
     /// `outcome.path` がディレクトリなら scan 成否を保持する。ZIP/PDF ファイルは
     /// 専用ローダーに委譲するため `NotNeeded`。
     scanned: FolderNavScanResult,
@@ -3119,6 +3139,35 @@ pub(crate) struct ZipEnumeratePending {
     pub input_seq: u64,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<crate::zip_loader::ZipEnumeration, String>>,
+}
+
+struct PreparedZipGrid {
+    nav: crate::zip_tree::ZipNavState,
+    items: Vec<GridItem>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    existing_keys: std::collections::HashSet<String>,
+    has_foreign_archives: bool,
+}
+
+/// The shared item installer is entered by ordinary navigation or by one fully prepared Smart
+/// physical-open request. This is distinct from `OpenRequestOwner`: admission is cheap and
+/// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
+enum VisibleInstallAuthority<'a> {
+    Ordinary,
+    SmartPhysical {
+        request_id: u64,
+        definition_id: uuid::Uuid,
+        logical_source: &'a Path,
+        load_path: &'a Path,
+    },
+}
+
+struct FolderListingMetrics {
+    seq: u64,
+    started: std::time::Instant,
+    scan_started: std::time::Instant,
+    pre_scanned: bool,
+    path_display: String,
 }
 
 impl Drop for ZipEnumeratePending {
@@ -5183,6 +5232,8 @@ fn resolve_converted_archive_candidate_with(
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
     pub path: Option<PathBuf>,
+    /// Captured by the worker from the Smart root row or nested DFS candidate.
+    pub smart_kind: Option<smart_folder::SmartChildKind>,
     /// `folder_should_stop` をパスしたフォルダ (= 画像/動画/ZIP/PDF あり) か。
     /// `false` のときは skip_limit 尽きまたは DFS 末端でのフォールバック、または
     /// 結果自体が `None` (path も None)。Fullscreen モードの後処理は false なら
@@ -5800,42 +5851,194 @@ fn navigate_smart_folder_scope(
     state: &top_level_grid_view::SmartFolderViewState,
     current: &Path,
     forward: bool,
+    fullscreen: bool,
     tree_opts: crate::folder_tree::FolderTreeOptions,
     skip_limit: usize,
     cancel: &AtomicBool,
 ) -> Option<FolderNavOutcome> {
+    if !fullscreen {
+        // Grid traversal retains its existing behavior: enter the next displayed Folder even
+        // when its images are only in descendants, then traverse that Folder on the next key.
+        if let Some(entry_root) = state.scoped_entry_root() {
+            let outcome = navigate_folder_with_skip(
+                current,
+                |path| {
+                    let next = if forward {
+                        next_folder_dfs(path, tree_opts)
+                    } else {
+                        prev_folder_dfs(path, tree_opts)
+                    }?;
+                    crate::search_index_db::is_under(&next, entry_root).then_some(next)
+                },
+                |path, cancel| {
+                    crate::folder_tree::folder_should_stop_with_options(path, cancel, tree_opts)
+                },
+                skip_limit,
+                Some(cancel),
+            );
+            if outcome.is_some() {
+                return outcome;
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let entry = state.navigation_entry_at_offset(forward)?;
+        let path = entry.logical_path.clone();
+        let hit_image_folder = entry.kind != smart_folder::SmartChildKind::Folder
+            || crate::folder_tree::folder_should_stop_with_options(&path, Some(cancel), tree_opts);
+        return (!cancel.load(Ordering::Relaxed)).then_some(FolderNavOutcome {
+            path,
+            hit_image_folder,
+        });
+    }
+
+    // Fullscreen requires a playable destination. One skip budget spans the remainder of
+    // the current Folder's DFS and later root entries. An exhausted subtree advances to the
+    // next entry; only reaching the budget returns the closest empty Folder fallback.
+    let mut first_empty: Option<PathBuf> = None;
+    let mut empty_checked = 0usize;
+    let limit = skip_limit.max(1);
+    let mut visit = |path: PathBuf, kind: smart_folder::SmartChildKind| {
+        let usable = kind != smart_folder::SmartChildKind::Folder
+            || crate::folder_tree::folder_should_stop_with_options(&path, Some(cancel), tree_opts);
+        if usable {
+            return Some(FolderNavOutcome {
+                path,
+                hit_image_folder: true,
+            });
+        }
+        if first_empty.is_none() {
+            first_empty = Some(path);
+        }
+        empty_checked += 1;
+        if empty_checked >= limit {
+            first_empty.clone().map(|path| FolderNavOutcome {
+                path,
+                hit_image_folder: false,
+            })
+        } else {
+            None
+        }
+    };
+
     if let Some(entry_root) = state.scoped_entry_root() {
-        let outcome = navigate_folder_with_skip(
-            current,
-            |path| {
-                let next = if forward {
-                    next_folder_dfs(path, tree_opts)
-                } else {
-                    prev_folder_dfs(path, tree_opts)
-                }?;
-                crate::search_index_db::is_under(&next, entry_root).then_some(next)
-            },
-            |path, cancel| {
-                crate::folder_tree::folder_should_stop_with_options(path, cancel, tree_opts)
-            },
-            skip_limit,
-            Some(cancel),
-        );
-        if outcome.is_some() {
-            return outcome;
+        let mut cursor = current.to_path_buf();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let next = if forward {
+                next_folder_dfs(&cursor, tree_opts)
+            } else {
+                prev_folder_dfs(&cursor, tree_opts)
+            };
+            let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, entry_root))
+            else {
+                break;
+            };
+            if let Some(outcome) = visit(next.clone(), smart_folder::SmartChildKind::Folder) {
+                return (!cancel.load(Ordering::Relaxed)).then_some(outcome);
+            }
+            cursor = next;
         }
     }
 
-    if cancel.load(Ordering::Relaxed) {
-        return None;
+    let Some(mut index) = state.navigation_start_index(forward) else {
+        return if cancel.load(Ordering::Relaxed) {
+            None
+        } else {
+            first_empty.map(|path| FolderNavOutcome {
+                path,
+                hit_image_folder: false,
+            })
+        };
+    };
+    while let Some(entry) = state.navigation_entries.get(index) {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if entry.kind == smart_folder::SmartChildKind::Folder {
+            // A root Folder can contain the first/last playable child even if its own grid is
+            // empty. Descend within its physical scope before moving to the next root row.
+            let root = entry.logical_path.as_path();
+            let mut cursor = if forward {
+                root.to_path_buf()
+            } else {
+                crate::folder_tree::last_descendant_dir(root, tree_opts)
+            };
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if let Some(outcome) = visit(cursor.clone(), smart_folder::SmartChildKind::Folder) {
+                    return (!cancel.load(Ordering::Relaxed)).then_some(outcome);
+                }
+                if !forward && crate::folder_tree::path_eq(&cursor, root) {
+                    break;
+                }
+                let next = if forward {
+                    next_folder_dfs(&cursor, tree_opts)
+                } else {
+                    prev_folder_dfs(&cursor, tree_opts)
+                };
+                let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, root))
+                else {
+                    break;
+                };
+                cursor = next;
+            }
+        } else if let Some(outcome) = visit(entry.logical_path.clone(), entry.kind) {
+            return (!cancel.load(Ordering::Relaxed)).then_some(outcome);
+        }
+        index = if forward {
+            index + 1
+        } else if let Some(previous) = index.checked_sub(1) {
+            previous
+        } else {
+            break;
+        };
     }
-    let path = state.entry_at_offset(forward)?.to_path_buf();
-    let hit_image_folder =
-        crate::folder_tree::folder_should_stop_with_options(&path, Some(cancel), tree_opts);
-    Some(FolderNavOutcome {
-        path,
-        hit_image_folder,
-    })
+    if cancel.load(Ordering::Relaxed) {
+        None
+    } else {
+        first_empty.map(|path| FolderNavOutcome {
+            path,
+            hit_image_folder: false,
+        })
+    }
+}
+
+/// The worker already knows whether it scanned a directory. Resolve virtual file kinds from
+/// its captured typed root row or the DFS candidate extension; the UI must not probe the file.
+fn smart_folder_nav_target_kind(
+    state: &top_level_grid_view::SmartFolderViewState,
+    path: &Path,
+    scanned: &FolderNavScanResult,
+) -> Option<smart_folder::SmartChildKind> {
+    if let Some(entry) = state
+        .navigation_entries
+        .iter()
+        .find(|entry| crate::folder_tree::path_eq(&entry.logical_path, path))
+    {
+        return Some(entry.kind);
+    }
+    if matches!(
+        scanned,
+        FolderNavScanResult::Ready(_) | FolderNavScanResult::Failed(_)
+    ) {
+        return Some(smart_folder::SmartChildKind::Folder);
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if crate::folder_tree::is_pdf_extension(&extension) {
+        Some(smart_folder::SmartChildKind::Pdf)
+    } else if crate::folder_tree::is_zip_extension(&extension) {
+        Some(smart_folder::SmartChildKind::Zip)
+    } else if crate::folder_tree::is_convertible_archive_path(path) {
+        Some(smart_folder::SmartChildKind::ConvertibleArchive)
+    } else {
+        None
+    }
 }
 
 use eframe::egui;
@@ -8740,20 +8943,25 @@ pub(crate) struct FsNavigationSequence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationPurpose {
     Ordinary,
+    /// A Smart Ctrl traversal owns the holdover before DFS resolves and while its offscreen
+    /// child is preparing. The visible source PDF/ZIP receiver must not finish this sequence.
+    SmartFolderNavigation {
+        request_id: Option<u64>,
+    },
     SimilarBookVisit(SimilarBookNavigationIntent),
 }
 
 impl FsNavigationPurpose {
     pub(crate) fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
         match self {
-            Self::Ordinary => None,
+            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.as_ref(),
         }
     }
 
     pub(crate) fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
         match self {
-            Self::Ordinary => None,
+            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.take(),
         }
     }
@@ -13970,7 +14178,7 @@ pub struct App {
     pub(crate) smart_folder_metadata_revision: u64,
     /// Source view captured when a smart-folder scan starts. Search result synthetic paths are
     /// never stored here; their pre-search return context is transferred directly instead.
-    pub(crate) smart_folder_open_origin: Option<top_level_grid_view::TopLevelGridRestore>,
+    pub(crate) smart_folder_open_origin: Option<smart_folder::SmartFolderOpenOrigin>,
     /// Ctrl+F is an in-view filter for an installed smart folder. A prepare replaces item indices,
     /// so the query is re-run against the new order after installation.
     pub(crate) smart_folder_local_search_reapply: Option<String>,
@@ -13979,6 +14187,10 @@ pub struct App {
     pub(crate) smart_folder_removed_paths:
         std::collections::HashMap<uuid::Uuid, std::collections::HashSet<String>>,
     pub(crate) smart_folder_generation: u64,
+    /// The unadopted next navigation owns its own scan/prepare work. Installed Smart rows and
+    /// their presentation workers stay in the visible owner until this request adopts.
+    pub(crate) smart_folder_transition: Option<smart_folder::SmartFolderTransition>,
+    pub(crate) smart_folder_transition_sequence: u64,
     pub(crate) smart_folder_pending: Option<smart_folder::SmartFolderPending>,
     pub(crate) smart_folder_prepare_pending: Option<smart_folder::SmartFolderPreparePending>,
     pub(crate) smart_folder_confirm_pending: Option<smart_folder::SmartFolderConfirmPending>,
@@ -16718,6 +16930,8 @@ impl App {
             smart_folder_local_search_reapply: None,
             smart_folder_removed_paths: std::collections::HashMap::new(),
             smart_folder_generation: 0,
+            smart_folder_transition: None,
+            smart_folder_transition_sequence: 0,
             smart_folder_pending: None,
             smart_folder_prepare_pending: None,
             smart_folder_confirm_pending: None,
@@ -18538,6 +18752,7 @@ impl App {
             self.subfolder_expansion_pending.is_some() => "subfolder_expansion_pending",
             self.subfolder_expansion_confirm_pending.is_some()
                 => "subfolder_expansion_confirm_pending",
+            self.staged_smart_root_modal_visible() => "smart_folder_transition",
             self.smart_folder_pending.is_some() => "smart_folder_pending",
             self.smart_folder_prepare_pending.is_some() => "smart_folder_prepare_pending",
             self.smart_folder_confirm_pending.is_some() => "smart_folder_confirm_pending",
@@ -18997,7 +19212,7 @@ impl App {
                 .then(|| source_path.to_path_buf()),
             suppress_rating_filter,
             suppress_facet_filter,
-            smart_folder_drill: self.top_level_grid_view.smart_folder_session().is_some(),
+            smart_folder_owner: self.smart_grid_archive_owner_for_source(source_path),
             collection_grid_owner: self.collection_grid_source_open_owner(idx, source_path),
             collection_navigation_continuation: None,
         })
@@ -19014,7 +19229,7 @@ impl App {
             reading_history_return_from: None,
             suppress_rating_filter: false,
             suppress_facet_filter: false,
-            smart_folder_drill: false,
+            smart_folder_owner: SmartGridArchiveOwner::None,
             collection_grid_owner: Some(collection_grid_owner),
             collection_navigation_continuation: continuation,
         })
@@ -19026,12 +19241,23 @@ impl App {
         let OpenRequestOwner::MainGridArchive(intent) = owner else {
             return true;
         };
-        intent
-            .collection_grid_owner
-            .as_ref()
-            .is_none_or(|collection| {
-                self.collection_grid_source_open_owner_is_current(collection, &intent.source_path)
-            })
+        let smart_current = match intent.smart_folder_owner {
+            SmartGridArchiveOwner::None => true,
+            SmartGridArchiveOwner::UnclaimedSmart => false,
+            SmartGridArchiveOwner::Transition(request_id) => {
+                self.smart_folder_transition_request_is_current(request_id, &intent.source_path)
+            }
+        };
+        smart_current
+            && intent
+                .collection_grid_owner
+                .as_ref()
+                .is_none_or(|collection| {
+                    self.collection_grid_source_open_owner_is_current(
+                        collection,
+                        &intent.source_path,
+                    )
+                })
     }
 
     fn main_grid_archive_transition_landed_is_current(&self, owner: &OpenRequestOwner) -> bool {
@@ -19049,36 +19275,26 @@ impl App {
             })
     }
 
-    /// Smart-folder sessions require a one-shot authorization before the common load boundary can
-    /// preserve their prepared grid. This does not advance the smart-folder position; the actual
-    /// position is committed only after the caller proves that the load succeeded.
-    pub(crate) fn prepare_main_grid_archive_transition_for_load(
-        &mut self,
-        owner: &OpenRequestOwner,
-        load_path: &Path,
-    ) {
-        let OpenRequestOwner::MainGridArchive(intent) = owner else {
-            return;
-        };
-        if !intent.smart_folder_drill {
-            return;
-        }
-        let _ = self.authorize_smart_folder_session_open(load_path);
-    }
-
     /// Commit the source-grid transition exactly once, after the destination load has been adopted
     /// by main. In particular, conversion request adoption is not a commit boundary.
     pub(crate) fn commit_main_grid_archive_transition(&mut self, owner: &OpenRequestOwner) {
         let OpenRequestOwner::MainGridArchive(intent) = owner else {
             return;
         };
+        // Smart archive source effects are committed by its one visible-adoption hook. The
+        // conversion callback is admission only and may outlive cancellation or source switch.
+        if matches!(
+            intent.smart_folder_owner,
+            SmartGridArchiveOwner::Transition(_)
+        ) {
+            return;
+        }
         if !self.main_grid_archive_transition_landed_is_current(owner) {
             return;
         }
         self.reading_history_return_from = intent.reading_history_return_from.clone();
-        if intent.smart_folder_drill {
-            self.begin_smart_folder_drill(&intent.source_path);
-        }
+        // Smart-folder scope/history/favorite are committed by the visible-load hook.
+        // Conversion admission and a ZIP enumerate pending are not adoption boundaries.
         if intent.suppress_rating_filter {
             self.maybe_suppress_rating_filter_for_opened_container_path(&intent.source_path);
         }
@@ -19160,15 +19376,8 @@ impl App {
             return Some(nav);
         }
         if let Some(nav) = self.smart_folder_parent_nav_target() {
-            if let crate::ui_main::AddressBarNav::Direct(path) = &nav
-                && !smart_folder::is_smart_folder_synthetic_path(path)
-            {
-                self.authorize_smart_folder_session_open(path);
-                self.select_after_load = self
-                    .effective_folder()
-                    .and_then(|current| current.file_name().map(|name| name.to_os_string()))
-                    .and_then(|name| name.to_str().map(str::to_string));
-            }
+            // A parent target is only a navigation intent here. The staged physical request
+            // carries its selection anchor and applies it after the parent is adopted.
             return Some(nav);
         }
         if self.items_are_smart_folder_view {
@@ -19229,11 +19438,6 @@ impl App {
             return Some(nav);
         }
         if let Some(nav) = self.smart_folder_parent_nav_target() {
-            if let crate::ui_main::AddressBarNav::Direct(path) = &nav
-                && !smart_folder::is_smart_folder_synthetic_path(path)
-            {
-                self.authorize_smart_folder_session_open(path);
-            }
             return Some(nav);
         }
         if self.items_are_smart_folder_view {
@@ -19661,6 +19865,12 @@ impl App {
     }
 
     fn folder_nav_current_target(&self) -> Option<FolderNavHistoryTarget> {
+        // A Smart surface's `return_to` is the view to restore when leaving Smart, not its
+        // current Back/Forward position. In a no-resident history continuation the prior Folder
+        // remains there after Child adoption, so history must read the visible typed position.
+        if let Some(state) = self.top_level_grid_view.smart_folder() {
+            return Some(FolderNavHistoryTarget::SmartFolder(state.clone()));
+        }
         let restore = self.current_top_level_restore_snapshot()?;
         let target = FolderNavHistoryTarget::from_restore(&restore)?;
         if let FolderNavHistoryTarget::Collection(collection) = &target
@@ -19719,8 +19929,13 @@ impl App {
         ) {
             return self.collection_grid_restore_snapshot();
         }
-        if let Some(return_to) = self.top_level_grid_view.return_to() {
-            return Some(return_to.clone());
+        if !matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::SmartFolder(_)
+        ) {
+            if let Some(return_to) = self.top_level_grid_view.return_to() {
+                return Some(return_to.clone());
+            }
         }
         match self.top_level_grid_view.surface() {
             TopLevelGridSurface::SmartFolder(state) => {
@@ -19950,6 +20165,30 @@ impl App {
             })
     }
 
+    fn dispatch_staged_smart_history_action(
+        &mut self,
+        action: smart_folder::StagedSmartHistoryAction,
+        history_nav_rollback: &mut Option<FolderNavHistorySnapshot>,
+    ) -> Option<PathBuf> {
+        let smart_folder::StagedSmartHistoryAction::Dispatch { target, rollback } = action else {
+            return None;
+        };
+        let mut snapshot = Some(rollback);
+        match self.dispatch_synthetic_folder_history_target_with_rollback(&target, &mut snapshot) {
+            SyntheticFolderHistoryDispatch::NotSynthetic => {
+                *history_nav_rollback = snapshot.take();
+                target.into_path()
+            }
+            SyntheticFolderHistoryDispatch::Restored => None,
+            SyntheticFolderHistoryDispatch::Unavailable => {
+                if let Some(snapshot) = snapshot.take() {
+                    self.restore_folder_nav_history(snapshot);
+                }
+                None
+            }
+        }
+    }
+
     pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
         // アクティブな A/B スロットの最近開いたフォルダ一覧を返す。
         if let Some(workspace) = self.active_quick_folder_workspace() {
@@ -19987,14 +20226,14 @@ impl App {
         &mut self,
         target: &FolderNavHistoryTarget,
     ) -> SyntheticFolderHistoryDispatch {
-        let smart_folder_target = matches!(target, FolderNavHistoryTarget::SmartFolder(_));
-        let smart_folder_restore_is_scoped = matches!(
-            target,
-            FolderNavHistoryTarget::SmartFolder(top_level_grid_view::SmartFolderViewState {
-                position: top_level_grid_view::SmartFolderPosition::Scoped { .. },
-                ..
-            })
-        );
+        self.dispatch_synthetic_folder_history_target_with_rollback(target, &mut None)
+    }
+
+    fn dispatch_synthetic_folder_history_target_with_rollback(
+        &mut self,
+        target: &FolderNavHistoryTarget,
+        history_rollback: &mut Option<FolderNavHistorySnapshot>,
+    ) -> SyntheticFolderHistoryDispatch {
         let dispatch = match target {
             FolderNavHistoryTarget::Collection(restore) => {
                 let collection_id = restore.identity.collection_id;
@@ -20037,8 +20276,13 @@ impl App {
                 SyntheticFolderHistoryDispatch::Restored
             }
             FolderNavHistoryTarget::SmartFolder(state) => {
-                self.restore_smart_folder_view_state(state.clone());
-                SyntheticFolderHistoryDispatch::Restored
+                if self
+                    .restore_smart_folder_view_state_with_history(state.clone(), history_rollback)
+                {
+                    SyntheticFolderHistoryDispatch::Restored
+                } else {
+                    SyntheticFolderHistoryDispatch::Unavailable
+                }
             }
             FolderNavHistoryTarget::Path(target)
                 if crate::folder_tree::path_eq(target, &drive_list_synthetic_path()) =>
@@ -20089,16 +20333,11 @@ impl App {
         };
 
         if dispatch == SyntheticFolderHistoryDispatch::Restored {
-            // 合成ビュー再構築は load_folder を通らないため、navigate_* が立てた
-            // suppress ワンショットをここで消費する。ただしスマートフォルダは非同期install
-            // が履歴遷移を記録するため、そのinstallまで維持する。snapshot missでopen経路が
-            // 一度clearしていても、history dispatchが所有権を立て直す。
-            // root / snapshot-miss は非同期 prepare の install が suppress を消費する。
-            // scoped state は上の restore 中に実フォルダを同期 load 済みなので、ここで
-            // 新しい suppress を残すと次のユーザー操作が履歴に入らなくなる。
-            self.set_active_folder_nav_suppress_record_once(
-                smart_folder_target && !smart_folder_restore_is_scoped,
-            );
+            // This dispatch owns the one-shot set by navigate_back/forward. Smart Folder
+            // history records only at its typed successful adoption (or restores the pop
+            // snapshot on abort), so no later Path/scope recorder consumes this one-shot.
+            // Retire it now: an async terminal must not clear a newer navigation's flag.
+            self.set_active_folder_nav_suppress_record_once(false);
         }
         dispatch
     }
@@ -21286,6 +21525,36 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
         }
+        if matches!(owner, OpenRequestOwner::Navigation)
+            && !self.navigation_scope.is_detached_physical()
+            && let Some(kind) = self.smart_physical_target_kind(&path)
+        {
+            if kind == smart_folder::SmartChildKind::ConvertibleArchive {
+                if let Some(index) = self.items.iter().position(|item| {
+                    matches!(item, GridItem::ConvertibleArchive { path: source, .. }
+                        if crate::folder_tree::path_eq(source, &path))
+                }) {
+                    return if self.begin_smart_grid_container_navigation(
+                        index,
+                        path,
+                        auto_fullscreen,
+                    ) {
+                        FolderOpenOutcome::Loaded
+                    } else {
+                        FolderOpenOutcome::Ignored
+                    };
+                }
+            } else {
+                return if self
+                    .begin_smart_physical_navigation(path, kind, auto_fullscreen, None, None)
+                    .is_ok()
+                {
+                    FolderOpenOutcome::Loaded
+                } else {
+                    FolderOpenOutcome::Ignored
+                };
+            }
+        }
         // Claim the visible-open lifecycle before dispatching by container type. In particular,
         // archive B must replace an in-flight archive A before request_* observes the old state.
         if !self.claim_open_request_owner(&path, &owner) {
@@ -21348,7 +21617,8 @@ impl App {
         {
             self.pending_auto_fs_open = true;
         }
-        if self.load_folder_with_scan_claimed(path, None, owner) {
+        if self.load_folder_with_scan_claimed(path, None, owner, VisibleInstallAuthority::Ordinary)
+        {
             FolderOpenOutcome::Loaded
         } else {
             FolderOpenOutcome::Ignored
@@ -21374,10 +21644,19 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             return false;
         }
+        if matches!(owner, OpenRequestOwner::Navigation)
+            && !self.navigation_scope.is_detached_physical()
+            && let Some(kind) = self.smart_physical_target_kind(&path)
+            && kind != smart_folder::SmartChildKind::ConvertibleArchive
+        {
+            return self
+                .begin_smart_physical_navigation(path, kind, false, pre_scan, None)
+                .is_ok();
+        }
         if !self.claim_open_request_owner(&path, &owner) {
             return false;
         }
-        self.load_folder_with_scan_claimed(path, pre_scan, owner)
+        self.load_folder_with_scan_claimed(path, pre_scan, owner, VisibleInstallAuthority::Ordinary)
     }
 
     /// Pure preflight for whether a visible open belongs to the current snapshot scope.
@@ -21570,7 +21849,9 @@ impl App {
             OpenRequestOwner::Navigation
             | OpenRequestOwner::MainGridArchive(_)
             | OpenRequestOwner::Bookmark(_) => {
-                if let Some(origin) = history_origin {
+                if let Some(origin) = history_origin
+                    && !self.smart_folder_session_owns_load(path)
+                {
                     self.record_folder_nav_transition_from_current(
                         FolderNavHistoryTarget::Path(path.to_path_buf()),
                         Some(origin.clone()),
@@ -21594,6 +21875,7 @@ impl App {
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
+        authority: VisibleInstallAuthority<'_>,
     ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
         let independent_navigation = !detached_physical
@@ -21629,10 +21911,8 @@ impl App {
         // A converted cache ZIP is an implementation alias outside the source archive's smart
         // scope. Keep the resident session mounted here; the typed owner commits the logical
         // source path only after the cache/direct load proves successful.
-        let defer_main_grid_archive_transition =
-            matches!(&owner, OpenRequestOwner::MainGridArchive(_));
         if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
-            let preserve_smart_folder_session = self.preserve_smart_folder_session_for_load(&path);
+            let preserve_smart_folder_session = self.smart_folder_session_owns_load(&path);
             if self.smart_folder_pending.is_some()
                 || self.smart_folder_prepare_pending.is_some()
                 || self.smart_folder_confirm_pending.is_some()
@@ -21659,9 +21939,6 @@ impl App {
                 self.suppress_nav_record_for_search_restore = false;
                 return true;
             }
-            if !defer_main_grid_archive_transition {
-                self.reconcile_smart_folder_scoped_real_folder_load(&path);
-            }
         }
         if matches!(
             self.top_level_grid_view.surface(),
@@ -21674,14 +21951,16 @@ impl App {
         }
         // 閲覧履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
         // (アドレスバー / 履歴戻る / フォルダナビ等。予約した本そのものを開き直す場合は維持)。
-        if self
-            .reading_history_return_from
-            .as_ref()
-            .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
+        if !self.smart_folder_session_owns_load(&path)
+            && self
+                .reading_history_return_from
+                .as_ref()
+                .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
         {
             self.reading_history_return_from = None;
         }
         if !detached_physical
+            && !self.smart_folder_session_owns_load(&path)
             && matches!(
                 owner,
                 OpenRequestOwner::Navigation
@@ -21703,7 +21982,9 @@ impl App {
             OpenRequestOwner::CollectionGridPhysical(collection) => &collection.target_path,
             OpenRequestOwner::Navigation => &path,
         };
-        self.transition_favorite_view_for_path(Some(favorite_path));
+        if !self.smart_folder_session_owns_load(&path) {
+            self.transition_favorite_view_for_path(Some(favorite_path));
+        }
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
@@ -21767,7 +22048,10 @@ impl App {
                     ..
                 })
         );
-        if collection_history_origin.is_none() && !collection_owned_navigation {
+        if collection_history_origin.is_none()
+            && !collection_owned_navigation
+            && !self.smart_folder_session_owns_load(&path)
+        {
             self.record_folder_nav_transition_from_current(
                 FolderNavHistoryTarget::Path(path.clone()),
                 navigation_history_origin,
@@ -21881,6 +22165,37 @@ impl App {
             self.pending_auto_fs_open = false;
             return false;
         }
+        self.install_scanned_folder_listing(
+            path,
+            scan,
+            authority,
+            FolderListingMetrics {
+                seq: lf_seq,
+                started: lf_t0,
+                scan_started: scan_t0,
+                pre_scanned,
+                path_display: lf_path_disp,
+            },
+        )
+    }
+
+    /// Shared, already-admitted Folder listing tail. Smart opens enter here only after their
+    /// offscreen scan and visible-adoption checks succeed; this function cannot reject an open.
+    fn install_scanned_folder_listing(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        authority: VisibleInstallAuthority<'_>,
+        metrics: FolderListingMetrics,
+    ) -> bool {
+        let detached_physical = self.navigation_scope.is_detached_physical();
+        let FolderListingMetrics {
+            seq: lf_seq,
+            started: lf_t0,
+            scan_started: scan_t0,
+            pre_scanned,
+            path_display: lf_path_disp,
+        } = metrics;
         // Surface adoption is the canonical cache-key boundary. A collection-owned physical
         // source deliberately keeps the Collection surface (and therefore uses full paths),
         // while an independent navigation adopts Folder and keeps the ordinary basename keys.
@@ -22063,13 +22378,15 @@ impl App {
         self.stack_script_error = None;
 
         let items_len = items.len();
-        self.start_loading_items(
+        self.start_loading_items_inner(
             path,
             items,
             image_metas,
             existing_keys,
             video_items,
             Some(folder_signature),
+            None,
+            authority,
         );
         if let Some((
             script_enabled,
@@ -23360,6 +23677,12 @@ impl App {
 
     /// お気に入り検索バーを閉じて、元のフォルダに戻る。
     pub(crate) fn close_favsearch(&mut self) {
+        if let Some(top_level_grid_view::TopLevelGridRestore::SmartFolder(state)) =
+            self.top_level_grid_view.return_to().cloned()
+            && self.begin_smart_search_return_navigation(state)
+        {
+            return;
+        }
         let return_context = self.dismiss_favsearch_without_restore();
         self.restore_view_return_context(return_context);
     }
@@ -23452,6 +23775,12 @@ impl App {
     /// タグビューを閉じて、開く前のフォルダに戻る。
     pub(crate) fn close_tag_view(&mut self) {
         if !self.tag_view.active {
+            return;
+        }
+        if let Some(top_level_grid_view::TopLevelGridRestore::SmartFolder(state)) =
+            self.top_level_grid_view.return_to().cloned()
+            && self.begin_smart_search_return_navigation(state)
+        {
             return;
         }
         let return_context = self.dismiss_tag_view_without_restore();
@@ -24643,7 +24972,9 @@ impl App {
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
         ));
-        self.transition_favorite_view_for_path(Some(&zip_path));
+        if !self.smart_folder_session_owns_load(&zip_path) {
+            self.transition_favorite_view_for_path(Some(&zip_path));
+        }
 
         #[cfg(windows)]
         {
@@ -24784,7 +25115,13 @@ impl App {
         // zip_enumerate_pending を含めることで担保する。
 
         if let Some(enumeration) = prepared {
-            self.finalize_zip_enumerate(zip_path, input_seq, Ok(enumeration));
+            self.finalize_zip_enumerate(
+                zip_path,
+                input_seq,
+                Ok(enumeration),
+                None,
+                VisibleInstallAuthority::Ordinary,
+            );
             return;
         }
 
@@ -24831,7 +25168,13 @@ impl App {
                 crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
             }
             .map_err(|e| e.to_string());
-            self.finalize_zip_enumerate(zip_path, input_seq, result);
+            self.finalize_zip_enumerate(
+                zip_path,
+                input_seq,
+                result,
+                None,
+                VisibleInstallAuthority::Ordinary,
+            );
             return;
         }
 
@@ -24859,7 +25202,7 @@ impl App {
             // 放置すると grid 抑止 / holdover 維持が永続化するので明示的に破棄する
             // (PDF 側 cancel ガードと対称)。
             self.fs_nav_after_pdf_enumerate = None;
-            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+            self.finish_visible_container_fs_nav_failed();
             return;
         }
         let result = match pending.rx.try_recv() {
@@ -24870,7 +25213,7 @@ impl App {
                 self.zip_enumerate_pending = None;
                 // ワーカー切断ではフルスクリーン復帰が起きない: defer フラグを破棄。
                 self.fs_nav_after_pdf_enumerate = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -24888,40 +25231,23 @@ impl App {
         let zip_path = pending.zip_path.clone();
         let input_seq = pending.input_seq;
         self.zip_enumerate_pending = None;
-        self.finalize_zip_enumerate(zip_path, input_seq, result);
+        self.finalize_zip_enumerate(
+            zip_path,
+            input_seq,
+            result,
+            None,
+            VisibleInstallAuthority::Ordinary,
+        );
     }
 
-    /// enumerate 結果 → group/sort → `start_loading_items`。
-    /// async (poll_zip_enumerate) と sync fallback (spawn 失敗時) の両方から呼ぶ。
-    fn finalize_zip_enumerate(
-        &mut self,
+    /// One ZIP materialization for ordinary loads and staged Smart adoption. The existing
+    /// batch pin lookup and any cascaded pin resolution stay immediately before install.
+    fn prepare_zip_grid(
+        &self,
         zip_path: PathBuf,
-        input_seq: u64,
-        result: Result<crate::zip_loader::ZipEnumeration, String>,
-    ) {
-        let sort = BOOK_READING_PAGE_ORDER;
-        let enumeration = match result {
-            Ok(e) => e,
-            Err(e) => {
-                // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
-                // (line 6142 の `.take()` には到達しない早期 return パス)。
-                self.fs_nav_after_pdf_enumerate = None;
-                self.archive_auto_fs_paint_trace = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
-                self.start_loading_items(
-                    zip_path,
-                    Vec::new(),
-                    Vec::new(),
-                    std::collections::HashSet::new(),
-                    Vec::new(),
-                    None,
-                );
-                self.set_empty_items_reason(
-                    crate::empty_items_reason::EmptyItemsReason::ZipEnumerateFailed { detail: e },
-                );
-                return;
-            }
-        };
+        enumeration: crate::zip_loader::ZipEnumeration,
+        logical_pin_source: Option<&Path>,
+    ) -> PreparedZipGrid {
         let has_foreign_archives = enumeration.has_foreign_archives;
         let entries = enumeration.entries;
         crate::logger::log(format!(
@@ -24941,6 +25267,7 @@ impl App {
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
         let mut existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
+        let mut pinned_keys = Vec::new();
         // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。
         // base の zipdir:{prefix} しか existing に無いと delete_missing が pinned 行を毎回
         // 消して再生成になる (Codex P2)。pinned cache key も存続キーに含める。
@@ -24955,12 +25282,19 @@ impl App {
             // (`zip_pin_root_path`) になる。ここを cache ZIP root のまま引くと
             // 変換アーカイブ内の本ピンだけ existing_keys に乗らず、delete_missing が
             // pinned 行を毎回 prune して再生成ループになる (set/lookup 側との対称性)。
-            let pin_root = zip_pin_root_path(
-                &tree.zip_path,
-                self.archive_source_override.as_deref(),
-                self.current_folder.as_deref(),
-            )
-            .to_path_buf();
+            // The staged Smart request has not published `current_folder` yet. Its logical
+            // source is already the exact pin root; ordinary loads keep the historical
+            // current-folder/override resolution below.
+            let pin_root = if let Some(logical_source) = logical_pin_source {
+                logical_source.to_path_buf()
+            } else {
+                zip_pin_root_path(
+                    &tree.zip_path,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                )
+                .to_path_buf()
+            };
             let dir_keys: Vec<(String, PathBuf)> = existing_keys
                 .iter()
                 .filter_map(|k| k.strip_prefix("zipdir:").map(|p| p.to_string()))
@@ -25013,25 +25347,111 @@ impl App {
                     }
                 })
                 .collect();
-            existing_keys.extend(pinned);
+            pinned_keys = pinned;
         }
+        Self::materialize_zip_grid(
+            tree,
+            existing_keys,
+            pinned_keys,
+            has_foreign_archives,
+            &self.settings.grid_display_order,
+        )
+    }
+
+    /// The DB pin facts above are resolved immediately before adoption. Row construction uses
+    /// only that fact set and the enumeration tree; ordinary and Smart installs share it.
+    fn materialize_zip_grid(
+        tree: Arc<crate::zip_tree::ZipTree>,
+        mut existing_keys: std::collections::HashSet<String>,
+        pinned_keys: Vec<String>,
+        has_foreign_archives: bool,
+        grid_display_order: &crate::settings::GridDisplayOrder,
+    ) -> PreparedZipGrid {
+        let sort = BOOK_READING_PAGE_ORDER;
+        existing_keys.extend(pinned_keys);
         let nav = crate::zip_tree::ZipNavState::new(tree);
         let (mut items, mut image_metas) = nav.materialize_current(sort);
         crate::grid_item::arrange_grid_items(
             &mut items,
             &mut image_metas,
-            &self.settings.grid_display_order,
+            grid_display_order,
             Some(sort),
         );
+        PreparedZipGrid {
+            nav,
+            items,
+            image_metas,
+            existing_keys,
+            has_foreign_archives,
+        }
+    }
+
+    /// enumerate 結果 → group/sort → `start_loading_items`。
+    /// async (poll_zip_enumerate) と sync fallback (spawn 失敗時) の両方から呼ぶ。
+    fn finalize_zip_enumerate(
+        &mut self,
+        zip_path: PathBuf,
+        input_seq: u64,
+        result: Result<crate::zip_loader::ZipEnumeration, String>,
+        logical_pin_source: Option<&Path>,
+        authority: VisibleInstallAuthority<'_>,
+    ) {
+        let enumeration = match result {
+            Ok(e) => e,
+            Err(e) => {
+                // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
+                // (line 6142 の `.take()` には到達しない早期 return パス)。
+                self.fs_nav_after_pdf_enumerate = None;
+                self.archive_auto_fs_paint_trace = None;
+                self.finish_visible_container_fs_nav_failed();
+                self.start_loading_items_inner(
+                    zip_path,
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    authority,
+                );
+                self.set_empty_items_reason(
+                    crate::empty_items_reason::EmptyItemsReason::ZipEnumerateFailed { detail: e },
+                );
+                return;
+            }
+        };
+        let prepared = self.prepare_zip_grid(zip_path.clone(), enumeration, logical_pin_source);
+        self.finalize_prepared_zip_grid(zip_path, input_seq, prepared, authority);
+    }
+
+    /// Install ZIP rows that have already been materialized from the exact enumeration and
+    /// the single pin lookup. Staged Smart navigation calls this only after its prior owner
+    /// has been retired; ordinary ZIP completion prepares and installs in the same poll.
+    fn finalize_prepared_zip_grid(
+        &mut self,
+        zip_path: PathBuf,
+        input_seq: u64,
+        prepared: PreparedZipGrid,
+        authority: VisibleInstallAuthority<'_>,
+    ) {
+        let PreparedZipGrid {
+            nav,
+            items,
+            image_metas,
+            existing_keys,
+            has_foreign_archives,
+        } = prepared;
         let installed_items = items.len();
 
-        self.start_loading_items(
+        self.start_loading_items_inner(
             zip_path.clone(),
             items,
             image_metas,
             existing_keys,
             Vec::new(),
             None,
+            None,
+            authority,
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -25606,7 +26026,9 @@ impl App {
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
         ));
-        self.transition_favorite_view_for_path(Some(&pdf_path));
+        if !self.smart_folder_session_owns_load(&pdf_path) {
+            self.transition_favorite_view_for_path(Some(&pdf_path));
+        }
 
         #[cfg(windows)]
         if self.should_preserve_active_detached_image_window_for_main_context_change() {
@@ -25838,10 +26260,10 @@ impl App {
         match outcome {
             DeferredFsOpenOutcome::Opened => {}
             DeferredFsOpenOutcome::NoPlayableItem => {
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
             }
             DeferredFsOpenOutcome::RequiredTargetMissing => {
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
                 self.show_feedback_toast("移動先の画像が見つかりません".to_string());
             }
         }
@@ -25863,6 +26285,33 @@ impl App {
         pdf_path: &Path,
         has_saved_password: bool,
     ) -> Option<u32> {
+        let (page_count, mtime, file_size) =
+            self.peek_pdf_meta_cache(pdf_path, has_saved_password)?;
+        let (items, image_metas, existing_keys) =
+            Self::build_pdf_meta_placeholder_rows(pdf_path, page_count, mtime, file_size);
+        crate::logger::log(format!(
+            "  pdf meta cache hit: {} page_count={page_count} (instant placeholder)",
+            pdf_path.file_name()?.to_string_lossy()
+        ));
+        self.start_loading_items(
+            pdf_path.to_path_buf(),
+            items,
+            image_metas,
+            existing_keys,
+            Vec::new(),
+            None,
+        );
+        Some(page_count)
+    }
+
+    /// Read only the metadata already available through the warm catalog. Staged Smart opens
+    /// use this before committing a placeholder; ordinary PDF opens still perform exactly one
+    /// lookup and one row build through `try_apply_pdf_meta_cache`.
+    fn peek_pdf_meta_cache(
+        &mut self,
+        pdf_path: &Path,
+        has_saved_password: bool,
+    ) -> Option<(u32, i64, u64)> {
         let filename = pdf_path.file_name()?.to_str()?.to_string();
         let parent = pdf_path.parent()?.to_path_buf();
 
@@ -25905,7 +26354,19 @@ impl App {
             return None;
         }
 
-        // ── placeholder grid 構築 ──
+        Some((page_count, mtime, file_size))
+    }
+
+    fn build_pdf_meta_placeholder_rows(
+        pdf_path: &Path,
+        page_count: u32,
+        mtime: i64,
+        file_size: u64,
+    ) -> (
+        Vec<GridItem>,
+        Vec<Option<(i64, i64)>>,
+        std::collections::HashSet<String>,
+    ) {
         let mut items: Vec<GridItem> = Vec::with_capacity(page_count as usize);
         let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(page_count as usize);
         let mut existing_keys: std::collections::HashSet<String> =
@@ -25919,21 +26380,30 @@ impl App {
             image_metas.push(Some((mtime, file_size as i64)));
             existing_keys.insert(crate::grid_item::pdf_page_cache_key(i));
         }
+        (items, image_metas, existing_keys)
+    }
 
-        crate::logger::log(format!(
-            "  pdf meta cache hit: {filename} page_count={page_count} (instant placeholder)"
-        ));
-
-        self.start_loading_items(
-            pdf_path.to_path_buf(),
-            items,
-            image_metas,
-            existing_keys,
-            Vec::new(),
-            None,
-        );
-
-        Some(page_count)
+    fn build_pdf_page_rows(
+        pdf_path: &Path,
+        pages: &[crate::pdf_loader::PdfPageEntry],
+    ) -> (
+        Vec<GridItem>,
+        Vec<Option<(i64, i64)>>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut items = Vec::with_capacity(pages.len());
+        let mut image_metas = Vec::with_capacity(pages.len());
+        let mut existing_keys = std::collections::HashSet::with_capacity(pages.len());
+        for page in pages {
+            existing_keys.insert(crate::grid_item::pdf_page_cache_key(page.page_num));
+            items.push(GridItem::PdfPage {
+                pdf_path: pdf_path.to_path_buf(),
+                page_num: page.page_num,
+                content_type: None,
+            });
+            image_metas.push(Some((page.mtime, page.file_size as i64)));
+        }
+        (items, image_metas, existing_keys)
     }
 
     /// PDF ページ列挙の非同期応答をポーリングする。
@@ -25957,7 +26427,7 @@ impl App {
             // `poll_fs_nav_lock` の defer 経路がフラグを見て永続的に grid を抑止する
             // (= UI フリーズに見える)。明示的に破棄する。
             self.fs_nav_after_pdf_enumerate = None;
-            self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+            self.finish_visible_container_fs_nav_failed();
             return;
         }
 
@@ -25970,7 +26440,7 @@ impl App {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
                 self.start_loading_items(
                     path,
                     Vec::new(),
@@ -25999,7 +26469,7 @@ impl App {
                 // cancel 経路でもフルスクリーン復帰はもう起きないので defer フラグを破棄する。
                 // 残すと grid 抑止 / holdover 維持が永続化して UI フリーズに見える。
                 self.fs_nav_after_pdf_enumerate = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
                 return;
             }
         }
@@ -26098,21 +26568,8 @@ impl App {
                 };
 
                 if need_rebuild {
-                    let mut items: Vec<GridItem> = Vec::new();
-                    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-                    let mut existing_keys: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-
-                    for page in &pages {
-                        let key = crate::grid_item::pdf_page_cache_key(page.page_num);
-                        existing_keys.insert(key);
-                        items.push(GridItem::PdfPage {
-                            pdf_path: pdf_path.clone(),
-                            page_num: page.page_num,
-                            content_type: None, // render 時に解析
-                        });
-                        image_metas.push(Some((page.mtime, page.file_size as i64)));
-                    }
+                    let (items, image_metas, existing_keys) =
+                        Self::build_pdf_page_rows(&pdf_path, &pages);
 
                     self.start_loading_items(
                         pdf_path.clone(),
@@ -26180,7 +26637,7 @@ impl App {
                 // グリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+                self.finish_visible_container_fs_nav_failed();
                 self.start_loading_items(
                     pdf_path,
                     Vec::new(),
@@ -26216,7 +26673,7 @@ impl App {
         // が `items_generation <= locked_gen` で永久にロック解除しない
         // (= holdover が居座る)。明示オープン由来の reopen は残す場合でも、
         // パスワード入力中の nav lock はここで解放する。
-        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+        self.finish_visible_container_fs_nav_failed();
     }
 
     pub(crate) fn pdf_password_dialog_path(&self) -> Option<PathBuf> {
@@ -26234,6 +26691,7 @@ impl App {
         self.pdf_password_request
             .as_ref()
             .map(|request| request.path.clone())
+            .or_else(|| self.smart_pdf_password_dialog_path())
     }
 
     pub(crate) fn pdf_password_request_pending_in_any_context(&self) -> bool {
@@ -26285,20 +26743,25 @@ impl App {
                 })
                 .unwrap_or(false);
         }
+        if self.pdf_password_request.is_none()
+            && self.retry_smart_pdf_password_request(password.clone(), save)
+        {
+            return true;
+        }
         self.retry_pdf_password_request_in_mounted_context(password, save)
     }
 
     fn cancel_pdf_password_request_in_mounted_context(&mut self) -> bool {
-        if self.pdf_password_request.take().is_none() {
+        let Some(request) = self.pdf_password_request.take() else {
             return false;
-        }
+        };
         if self.cancel_collection_pdf_password_request() {
             self.pdf_password_pending_save = None;
             return true;
         }
         self.pdf_password_pending_save = None;
         self.fs_nav_after_pdf_enumerate = None;
-        self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+        self.finish_visible_container_fs_nav_failed();
         self.restore_rating_filter_suppression();
         true
     }
@@ -26314,6 +26777,9 @@ impl App {
                     app.cancel_pdf_password_request_in_mounted_context()
                 })
                 .unwrap_or(false);
+        }
+        if self.pdf_password_request.is_none() && self.cancel_smart_pdf_password_request() {
+            return true;
         }
         self.cancel_pdf_password_request_in_mounted_context()
     }
@@ -26636,6 +27102,7 @@ impl App {
             video_items,
             folder_signature,
             None,
+            VisibleInstallAuthority::Ordinary,
         );
     }
 
@@ -26655,6 +27122,7 @@ impl App {
             video_items,
             None,
             Some(metadata),
+            VisibleInstallAuthority::Ordinary,
         );
     }
 
@@ -26667,6 +27135,7 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
+        authority: VisibleInstallAuthority<'_>,
     ) {
         // An earlier accepted load owns the sole restore continuation.  Results from sibling
         // folder/PDF/ZIP workers that were already in flight must not replace its generation and
@@ -26679,9 +27148,46 @@ impl App {
             return;
         }
         let detached_physical = self.navigation_scope.is_detached_physical();
-        let preserve_smart_folder_session = !detached_physical
-            && !smart_folder::is_smart_folder_synthetic_path(&source_path)
-            && self.preserve_smart_folder_session_for_load(&source_path);
+        let smart_open_path = match &authority {
+            VisibleInstallAuthority::Ordinary => None,
+            VisibleInstallAuthority::SmartPhysical {
+                request_id,
+                definition_id,
+                logical_source,
+                load_path,
+            } => {
+                if detached_physical
+                    || !crate::folder_tree::path_eq(&source_path, load_path)
+                    || self
+                        .top_level_grid_view
+                        .smart_folder_session()
+                        .is_none_or(|session| session.definition_id() != *definition_id)
+                {
+                    crate::logger::log(format!(
+                        "smart visible install rejected request={request_id} path={}",
+                        source_path.display()
+                    ));
+                    return;
+                }
+                Some((*logical_source).to_path_buf())
+            }
+        };
+        let preserve_smart_folder_session = match &authority {
+            VisibleInstallAuthority::Ordinary => {
+                !detached_physical
+                    && !smart_folder::is_smart_folder_synthetic_path(&source_path)
+                    && self.preserve_smart_folder_session_for_load(&source_path)
+            }
+            // The staged transition has already moved its prepared root and target position
+            // into the settled session at the visible-adoption boundary. Reinterpreting App
+            // field presence here would admit an unrelated older completion with the same path.
+            VisibleInstallAuthority::SmartPhysical { .. } => true,
+        };
+        if preserve_smart_folder_session {
+            if let Some(logical_path) = smart_open_path.as_deref() {
+                self.transition_favorite_view_for_path(Some(logical_path));
+            }
+        }
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         if !detached_physical {
             self.clear_color_filter_for_new_items();
@@ -26900,6 +27406,13 @@ impl App {
 
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
+        if let Some(logical_path) = smart_open_path.as_deref()
+            && !crate::folder_tree::path_eq(logical_path, &source_path)
+        {
+            // The visible generation is being adopted now. Source-scoped rating/pin decisions
+            // below must see the original archive, not its converted cache alias.
+            self.archive_source_override = Some(logical_path.to_path_buf());
+        }
         self.current_folder_rating_cache = None;
         if !detached_physical {
             self.reset_folder_rating_counts();
@@ -26938,6 +27451,12 @@ impl App {
                 .book_address_label_for_path(&source_path)
                 .unwrap_or_else(|| source_path.to_string_lossy().to_string());
             self.archive_source_override = None;
+        }
+        if let Some(logical_path) = smart_open_path.as_deref()
+            && !crate::folder_tree::path_eq(logical_path, &source_path)
+        {
+            self.address = logical_path.to_string_lossy().to_string();
+            self.archive_source_override = Some(logical_path.to_path_buf());
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -38855,6 +39374,9 @@ impl App {
                             {
                                 return None;
                             }
+                            if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                                return None;
+                            }
                             // detached に採用されず、通常の main navigation が確定した境界で更新する。
                             self.note_reading_history_open(idx);
                             if auto_fs {
@@ -38863,7 +39385,6 @@ impl App {
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             self.record_rating_view_nav_open(&p);
-                            self.begin_smart_folder_drill(&p);
                             return Some(self.grid_physical_navigation(idx, p));
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
@@ -38892,8 +39413,12 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
-                            let owner = self.main_grid_archive_open_owner(idx, &pf);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
+                            if self.begin_smart_grid_container_navigation(idx, pf.clone(), auto_fs)
+                            {
+                                return None;
+                            }
+                            let owner = self.main_grid_archive_open_owner(idx, &pf);
                             let search_rollback = if self.favsearch.active
                                 || self.tag_view.active
                                 || self.rating_view_nav_context_active()
@@ -39174,6 +39699,15 @@ impl App {
     pub(crate) fn cancel_inflight_order_dependent_folder_nav(&mut self) {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
+            if matches!(
+                pending.mode,
+                FolderNavMode::SmartFolder {
+                    fullscreen: true,
+                    ..
+                }
+            ) {
+                self.finish_unbound_smart_folder_navigation_sequence();
+            }
         }
         self.clear_pending_folder_nav_steps();
         // Do not release the current navigation holdover here. Its owning fullscreen sequence
@@ -39214,6 +39748,14 @@ impl App {
         forward: bool,
         mode: FolderNavMode,
     ) {
+        // Repeated Ctrl traversal extends the staged request's virtual step count. No second
+        // DFS may start from the still-visible previous folder before the first child lands.
+        if self.accumulate_staged_smart_folder_dfs_step(forward, &mode) {
+            return;
+        }
+        // A different DFS intent wins over an offscreen Smart open. Visible refresh and old
+        // PDF/ZIP verification do not pass through this input boundary.
+        self.retire_staged_smart_navigation_for_independent_intent();
         if let Some(pending) = self.folder_nav_pending.as_ref() {
             if folder_nav_mode_same_kind(&pending.mode, &mode) {
                 // 既に同一モードで nav 進行中: 連打を累積するだけ
@@ -39223,8 +39765,18 @@ impl App {
                 return;
             }
             // モードが変わった (例: fullscreen → grid) → 旧 DFS をキャンセル
+            let old_smart_fullscreen = matches!(
+                pending.mode,
+                FolderNavMode::SmartFolder {
+                    fullscreen: true,
+                    ..
+                }
+            );
             pending.cancel.store(true, Ordering::Relaxed);
             self.folder_nav_pending = None;
+            if old_smart_fullscreen {
+                self.finish_unbound_smart_folder_navigation_sequence();
+            }
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         self.pending_folder_nav_steps = 0;
@@ -39291,6 +39843,13 @@ impl App {
             FolderNavMode::SmartFolder { state, .. } => Some(state.clone()),
             _ => None,
         };
+        let smart_fullscreen = matches!(
+            &mode,
+            FolderNavMode::SmartFolder {
+                fullscreen: true,
+                ..
+            }
+        );
         // Detached physical navigation is a still-viewer operation. It shares
         // SlideshowNext's still predicate so media-only folders never promote
         // the independent still window into an unowned media session.
@@ -39318,7 +39877,13 @@ impl App {
             }
             let outcome = if let Some(state) = smart_state.as_ref() {
                 navigate_smart_folder_scope(
-                    state, &current, forward, tree_opts, skip_limit, &cancel_w,
+                    state,
+                    &current,
+                    forward,
+                    smart_fullscreen,
+                    tree_opts,
+                    skip_limit,
+                    &cancel_w,
                 )
             } else if sibling_only {
                 if cancel_w.load(Ordering::Relaxed) {
@@ -39474,7 +40039,16 @@ impl App {
                 );
             }
             if !cancelled {
-                let _ = tx.send(FolderNavThreadResult { outcome, scanned });
+                let smart_kind = smart_state.as_ref().and_then(|state| {
+                    outcome.as_ref().and_then(|outcome| {
+                        smart_folder_nav_target_kind(state, &outcome.path, &scanned)
+                    })
+                });
+                let _ = tx.send(FolderNavThreadResult {
+                    outcome,
+                    smart_kind,
+                    scanned,
+                });
             }
         });
 
@@ -39681,6 +40255,12 @@ impl App {
     }
 
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
+        if !matches!(
+            &purpose,
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+        ) {
+            self.retire_staged_smart_navigation_for_independent_intent();
+        }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         if let Some(mut prev) = self.folder_pane_open_pending.take() {
             prev.cancel_with_diagnostic("scan_replaced");
@@ -39903,6 +40483,25 @@ impl App {
                 let should_detach =
                     self.settings.detached_viewer_open_images_in_window && image_book;
                 if !should_detach {
+                    let scan = if self.top_level_grid_view.smart_folder_session().is_some() {
+                        let source_index = self.items.iter().position(|item| {
+                            matches!(item, GridItem::Folder(folder)
+                                if crate::folder_tree::path_eq(folder, &ready.path))
+                        });
+                        match self.begin_smart_physical_navigation(
+                            ready.path.clone(),
+                            smart_folder::SmartChildKind::Folder,
+                            image_book,
+                            Some(scan),
+                            source_index,
+                        ) {
+                            Ok(()) => return None,
+                            Err(Some(scan)) => scan,
+                            Err(None) => return None,
+                        }
+                    } else {
+                        scan
+                    };
                     // Rejoin the exact main navigation pipeline used by Enter/double-click/
                     // gamepad. This restores history/search/smart-folder behavior for mixed
                     // folders instead of terminating an unmaterialized detached context.
@@ -39917,7 +40516,6 @@ impl App {
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
                     }
-                    self.begin_smart_folder_drill(&ready.path);
                     // If the user changed from always-new to full-feature mode during a slow
                     // scan, preserve the current full-feature auto-open policy.
                     self.pending_auto_fs_open = image_book;
@@ -40151,6 +40749,7 @@ impl App {
                 };
                 Some(FolderNavResult {
                     path,
+                    smart_kind: thread_result.smart_kind,
                     hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
@@ -40165,6 +40764,7 @@ impl App {
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
                 Some(FolderNavResult {
                     path: None,
+                    smart_kind: None,
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
@@ -40249,15 +40849,20 @@ impl App {
                 if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                     return None;
                 }
+                if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                    return None;
+                }
                 self.note_reading_history_open(idx);
                 self.pending_auto_fs_open = auto_fs;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 self.record_rating_view_nav_open(&p);
-                self.begin_smart_folder_drill(&p);
                 Some(self.grid_physical_navigation(idx, p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
+                if self.begin_smart_grid_container_navigation(idx, path.clone(), auto_fs) {
+                    return None;
+                }
                 let owner = self.main_grid_archive_open_owner(idx, &path);
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
@@ -40392,6 +40997,11 @@ impl App {
             });
             return "enumerate_defer";
         }
+        if self.staged_smart_child_preflight_from_visible_scope() {
+            // The newly selected ZIP/PDF is still preparing offscreen. Its typed navigation
+            // continuation will reopen the viewer after that child becomes visible.
+            return "smart_transition_defer";
+        }
         if let Some(new_idx) = target_idx {
             #[cfg(windows)]
             let target_is_video = matches!(self.items.get(new_idx), Some(GridItem::Video(_)));
@@ -40503,6 +41113,25 @@ impl App {
                     );
                 }
             };
+        if let FolderNavMode::SmartFolder { state, fullscreen } = &result.mode {
+            let probe = result.path.as_deref().unwrap_or_else(|| {
+                // An empty worker result still belongs to the captured root order.
+                // The synthetic path cannot be a deleted physical entry.
+                Path::new("")
+            });
+            if !self.smart_folder_navigation_target_current(state, probe) {
+                self.clear_pending_folder_nav_steps();
+                if *fullscreen {
+                    self.finish_unbound_smart_folder_navigation_sequence();
+                    self.release_fs_nav_lock();
+                }
+                self.show_feedback_toast(
+                    "スマートフォルダの並びが変わりました。もう一度操作してください".into(),
+                );
+                emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_order_stale");
+                return;
+            }
+        }
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
@@ -40706,39 +41335,39 @@ impl App {
                 }
             }
             FolderNavMode::SmartFolder { fullscreen, .. } => {
-                if !self.prepare_smart_folder_nav_target(&path) {
-                    self.clear_pending_folder_nav_steps();
-                    self.release_fs_nav_lock();
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_scope_changed");
-                    return;
-                }
                 #[cfg(windows)]
                 let restore_video_tile = fullscreen && self.video_tile_mode_active;
                 #[cfg(not(windows))]
                 let restore_video_tile = false;
-                if fullscreen {
-                    self.close_fullscreen_for_folder_nav_reopen();
-                }
-                let open_outcome = self.load_folder_nav_target(path, scanned);
-                if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                let Some(kind) = result.smart_kind else {
                     self.clear_pending_folder_nav_steps();
+                    self.finish_unbound_smart_folder_navigation_sequence();
                     self.release_fs_nav_lock();
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "open_ignored");
+                    self.show_feedback_toast("移動先を確認できませんでした".into());
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_kind_missing");
                     return;
-                }
-                if fullscreen {
-                    let reason = self.reopen_fullscreen_after_folder_nav_load(
-                        ctx,
-                        restore_video_tile,
-                        false,
-                        history_trigger,
-                    );
-                    if reason == "enumerate_defer" {
-                        self.chain_folder_nav_if_pending(queued_steps, continuation_mode.clone());
-                        emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
-                        return;
+                };
+                match self.begin_smart_folder_dfs_navigation(
+                    path,
+                    kind,
+                    scanned,
+                    queued_steps,
+                    continuation_mode,
+                    history_trigger,
+                    restore_video_tile,
+                ) {
+                    Ok(()) => {
+                        // The prior grid/fullscreen still owns its resources. Reopen and consume
+                        // the queued DFS steps only after the scanned child becomes visible.
+                        emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_staged");
+                    }
+                    Err(_) => {
+                        self.clear_pending_folder_nav_steps();
+                        self.release_fs_nav_lock();
+                        emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_scope_changed");
                     }
                 }
+                return;
             }
             FolderNavMode::Fullscreen
             | FolderNavMode::SiblingFullscreen
@@ -56944,6 +57573,9 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // A staged Ctrl traversal still leaves the old fullscreen visible. If that fullscreen
+        // is explicitly closed before adoption, it no longer authorizes a deferred reopen.
+        self.retire_staged_smart_fullscreen_nav_for_close();
         self.cancel_collection_navigation_intent();
         #[cfg(windows)]
         if self.video_presentation_transition.is_transitioning() {
@@ -57152,6 +57784,10 @@ impl App {
                 FolderNavMode::Fullscreen
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::Favsearch {
+                        fullscreen: true,
+                        ..
+                    }
+                    | FolderNavMode::SmartFolder {
                         fullscreen: true,
                         ..
                     }
@@ -74292,43 +74928,89 @@ impl App {
                         None
                     }
                     crate::ui_main::AddressBarNav::HistoryBack => {
-                        let snapshot = self.folder_nav_history_snapshot();
-                        let target = self.navigate_folder_history_back();
-                        match target {
-                            Some(target) => {
-                                match self.dispatch_synthetic_folder_history_target(&target) {
-                                    SyntheticFolderHistoryDispatch::NotSynthetic => {
-                                        history_nav_rollback = Some(snapshot);
-                                        target.into_path()
-                                    }
-                                    SyntheticFolderHistoryDispatch::Restored => None,
-                                    SyntheticFolderHistoryDispatch::Unavailable => {
-                                        self.restore_folder_nav_history(snapshot);
-                                        None
+                        if let Some(action) = self
+                            .advance_staged_smart_history(smart_folder::SmartHistoryDirection::Back)
+                        {
+                            self.dispatch_staged_smart_history_action(
+                                action,
+                                &mut history_nav_rollback,
+                            )
+                        } else if let Some(FolderNavHistoryTarget::SmartFolder(state)) =
+                            self.folder_history_back_target().cloned()
+                        {
+                            self.begin_smart_history_navigation(
+                                state,
+                                smart_folder::SmartHistoryDirection::Back,
+                            );
+                            None
+                        } else {
+                            let mut snapshot = Some(self.folder_nav_history_snapshot());
+                            let target = self.navigate_folder_history_back();
+                            match target {
+                                Some(target) => {
+                                    match self
+                                        .dispatch_synthetic_folder_history_target_with_rollback(
+                                            &target,
+                                            &mut snapshot,
+                                        ) {
+                                        SyntheticFolderHistoryDispatch::NotSynthetic => {
+                                            history_nav_rollback = snapshot.take();
+                                            target.into_path()
+                                        }
+                                        SyntheticFolderHistoryDispatch::Restored => None,
+                                        SyntheticFolderHistoryDispatch::Unavailable => {
+                                            if let Some(snapshot) = snapshot.take() {
+                                                self.restore_folder_nav_history(snapshot);
+                                            }
+                                            None
+                                        }
                                     }
                                 }
+                                None => None,
                             }
-                            None => None,
                         }
                     }
                     crate::ui_main::AddressBarNav::HistoryForward => {
-                        let snapshot = self.folder_nav_history_snapshot();
-                        let target = self.navigate_folder_history_forward();
-                        match target {
-                            Some(target) => {
-                                match self.dispatch_synthetic_folder_history_target(&target) {
-                                    SyntheticFolderHistoryDispatch::NotSynthetic => {
-                                        history_nav_rollback = Some(snapshot);
-                                        target.into_path()
-                                    }
-                                    SyntheticFolderHistoryDispatch::Restored => None,
-                                    SyntheticFolderHistoryDispatch::Unavailable => {
-                                        self.restore_folder_nav_history(snapshot);
-                                        None
+                        if let Some(action) = self.advance_staged_smart_history(
+                            smart_folder::SmartHistoryDirection::Forward,
+                        ) {
+                            self.dispatch_staged_smart_history_action(
+                                action,
+                                &mut history_nav_rollback,
+                            )
+                        } else if let Some(FolderNavHistoryTarget::SmartFolder(state)) =
+                            self.folder_history_forward_target().cloned()
+                        {
+                            self.begin_smart_history_navigation(
+                                state,
+                                smart_folder::SmartHistoryDirection::Forward,
+                            );
+                            None
+                        } else {
+                            let mut snapshot = Some(self.folder_nav_history_snapshot());
+                            let target = self.navigate_folder_history_forward();
+                            match target {
+                                Some(target) => {
+                                    match self
+                                        .dispatch_synthetic_folder_history_target_with_rollback(
+                                            &target,
+                                            &mut snapshot,
+                                        ) {
+                                        SyntheticFolderHistoryDispatch::NotSynthetic => {
+                                            history_nav_rollback = snapshot.take();
+                                            target.into_path()
+                                        }
+                                        SyntheticFolderHistoryDispatch::Restored => None,
+                                        SyntheticFolderHistoryDispatch::Unavailable => {
+                                            if let Some(snapshot) = snapshot.take() {
+                                                self.restore_folder_nav_history(snapshot);
+                                            }
+                                            None
+                                        }
                                     }
                                 }
+                                None => None,
                             }
-                            None => None,
                         }
                     }
                 }

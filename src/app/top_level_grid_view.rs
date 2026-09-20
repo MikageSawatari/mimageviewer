@@ -20,41 +20,73 @@ pub(crate) enum TopLevelSearchView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SmartFolderPosition {
     Root,
+    /// A root row opened as a virtual book. Ctrl traversal uses its exact root entry.
+    Container {
+        root_entry: PathBuf,
+        current: PathBuf,
+    },
     Scoped {
         entry_index: usize,
         entry_root: PathBuf,
         current: PathBuf,
+        /// The adopted physical item at `current`. History restoration cannot infer a nested
+        /// PDF/ZIP from a row after the source session has been left.
+        current_kind: super::smart_folder::SmartChildKind,
         back_stack: Vec<PathBuf>,
     },
+}
+
+/// One navigable row in the prepared Smart root's effective display order.
+/// Images, videos, and presentation-only rows never enter this list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmartRootNavEntry {
+    pub(crate) logical_path: PathBuf,
+    pub(crate) kind: super::smart_folder::SmartChildKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SmartFolderViewState {
     pub(crate) definition_id: uuid::Uuid,
-    /// prepare 済み root grid に現れた実フォルダの表示順。
-    pub(crate) folder_entries: Arc<Vec<PathBuf>>,
+    /// The single navigation order, derived from the final prepared root rows.
+    pub(crate) navigation_entries: Arc<Vec<SmartRootNavEntry>>,
     pub(crate) position: SmartFolderPosition,
 }
 
 impl SmartFolderViewState {
     pub(crate) fn root(definition_id: uuid::Uuid, folder_entries: Vec<PathBuf>) -> Self {
+        Self::root_with_navigation_entries(
+            definition_id,
+            folder_entries
+                .into_iter()
+                .map(|logical_path| SmartRootNavEntry {
+                    logical_path,
+                    kind: super::smart_folder::SmartChildKind::Folder,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn root_with_navigation_entries(
+        definition_id: uuid::Uuid,
+        navigation_entries: Vec<SmartRootNavEntry>,
+    ) -> Self {
         Self {
             definition_id,
-            folder_entries: Arc::new(folder_entries),
+            navigation_entries: Arc::new(navigation_entries),
             position: SmartFolderPosition::Root,
         }
     }
 
     pub(crate) fn scoped_current(&self) -> Option<&Path> {
         match &self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { current, .. } => Some(current),
         }
     }
 
     pub(crate) fn scoped_entry_root(&self) -> Option<&Path> {
         match &self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { entry_root, .. } => Some(entry_root),
         }
     }
@@ -62,21 +94,24 @@ impl SmartFolderViewState {
     #[cfg(test)]
     pub(crate) fn entry_index(&self) -> Option<usize> {
         match self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { entry_index, .. } => Some(entry_index),
         }
     }
 
     fn containing_entry_index(&self, path: &Path) -> Option<usize> {
-        self.folder_entries
+        self.navigation_entries
             .iter()
-            .position(|entry| crate::folder_tree::path_eq(entry, path))
+            .position(|entry| crate::folder_tree::path_eq(&entry.logical_path, path))
             .or_else(|| {
-                self.folder_entries
+                self.navigation_entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, entry)| crate::search_index_db::is_under(path, entry))
-                    .max_by_key(|(_, entry)| entry.components().count())
+                    .filter(|(_, entry)| {
+                        entry.kind == super::smart_folder::SmartChildKind::Folder
+                            && crate::search_index_db::is_under(path, &entry.logical_path)
+                    })
+                    .max_by_key(|(_, entry)| entry.logical_path.components().count())
                     .map(|(index, _)| index)
             })
     }
@@ -85,8 +120,8 @@ impl SmartFolderViewState {
     /// 通常フォルダの親復帰でいう「戻り先直下の子」に相当する entry root を解決する。
     pub(crate) fn containing_entry(&self, path: &Path) -> Option<&Path> {
         self.containing_entry_index(path)
-            .and_then(|index| self.folder_entries.get(index))
-            .map(PathBuf::as_path)
+            .and_then(|index| self.navigation_entries.get(index))
+            .map(|entry| entry.logical_path.as_path())
     }
 
     /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
@@ -95,11 +130,20 @@ impl SmartFolderViewState {
         let Some(entry_index) = self.containing_entry_index(path) else {
             return false;
         };
-        let entry_root = self.folder_entries[entry_index].clone();
+        let entry = &self.navigation_entries[entry_index];
+        let entry_root = entry.logical_path.clone();
+        if entry.kind != super::smart_folder::SmartChildKind::Folder {
+            self.position = SmartFolderPosition::Container {
+                root_entry: entry_root.clone(),
+                current: entry_root,
+            };
+            return true;
+        }
         self.position = SmartFolderPosition::Scoped {
             entry_index,
             entry_root: entry_root.clone(),
             current: entry_root,
+            current_kind: super::smart_folder::SmartChildKind::Folder,
             back_stack: Vec::new(),
         };
         self.move_to(path)
@@ -119,6 +163,7 @@ impl SmartFolderViewState {
         let SmartFolderPosition::Scoped {
             entry_root,
             current,
+            current_kind,
             back_stack,
             ..
         } = &mut self.position
@@ -136,6 +181,7 @@ impl SmartFolderViewState {
             .is_some_and(|parent| crate::folder_tree::path_eq(parent, path))
         {
             *current = path.to_path_buf();
+            *current_kind = super::smart_folder::SmartChildKind::Folder;
             back_stack.pop();
             return true;
         }
@@ -145,6 +191,7 @@ impl SmartFolderViewState {
         {
             back_stack.push(current.clone());
             *current = path.to_path_buf();
+            *current_kind = super::smart_folder::SmartChildKind::Folder;
             return true;
         }
         let mut lineage = Vec::new();
@@ -168,10 +215,14 @@ impl SmartFolderViewState {
         lineage.reverse();
         *back_stack = lineage;
         *current = path.to_path_buf();
+        *current_kind = super::smart_folder::SmartChildKind::Folder;
         true
     }
 
     pub(crate) fn parent_target(&self) -> Option<SmartFolderParentTarget> {
+        if matches!(self.position, SmartFolderPosition::Container { .. }) {
+            return Some(SmartFolderParentTarget::Root);
+        }
         let SmartFolderPosition::Scoped {
             entry_root,
             current,
@@ -192,29 +243,72 @@ impl SmartFolderViewState {
         }
     }
 
-    pub(crate) fn entry_at_offset(&self, forward: bool) -> Option<&Path> {
-        let index = match self.position {
+    pub(crate) fn navigation_start_index(&self, forward: bool) -> Option<usize> {
+        Some(match self.position {
             SmartFolderPosition::Root if forward => 0,
-            SmartFolderPosition::Root => self.folder_entries.len().checked_sub(1)?,
+            SmartFolderPosition::Root => self.navigation_entries.len().checked_sub(1)?,
+            SmartFolderPosition::Container { ref root_entry, .. } => {
+                let current = self.navigation_entries.iter().position(|entry| {
+                    crate::folder_tree::path_eq(&entry.logical_path, root_entry)
+                })?;
+                if forward {
+                    current.checked_add(1)?
+                } else {
+                    current.checked_sub(1)?
+                }
+            }
             SmartFolderPosition::Scoped { entry_index, .. } if forward => {
                 entry_index.checked_add(1)?
             }
             SmartFolderPosition::Scoped { entry_index, .. } => entry_index.checked_sub(1)?,
-        };
-        self.folder_entries.get(index).map(PathBuf::as_path)
+        })
+    }
+
+    pub(crate) fn navigation_entry_at_offset(&self, forward: bool) -> Option<&SmartRootNavEntry> {
+        let index = self.navigation_start_index(forward)?;
+        self.navigation_entries.get(index)
+    }
+
+    pub(crate) fn entry_at_offset(&self, forward: bool) -> Option<&Path> {
+        self.navigation_entry_at_offset(forward)
+            .map(|entry| entry.logical_path.as_path())
     }
 
     /// root 再準備後の表示順を取り込む。現在 entry が同じ path として残っていれば
     /// scope と現在地を維持し、削除・リネームで見つからなければ安全に root へ戻す。
-    pub(crate) fn refresh_folder_entries(&mut self, folder_entries: Vec<PathBuf>) -> bool {
+    pub(crate) fn refresh_navigation_entries(
+        &mut self,
+        navigation_entries: Vec<SmartRootNavEntry>,
+    ) -> bool {
         let retained_index = self.scoped_entry_root().and_then(|entry_root| {
-            folder_entries
-                .iter()
-                .position(|entry| crate::folder_tree::path_eq(entry, entry_root))
+            navigation_entries.iter().position(|entry| {
+                entry.kind == super::smart_folder::SmartChildKind::Folder
+                    && crate::folder_tree::path_eq(&entry.logical_path, entry_root)
+            })
         });
-        self.folder_entries = Arc::new(folder_entries);
+        let container_retained = match &self.position {
+            SmartFolderPosition::Container { root_entry, .. } => {
+                let old_kind = self
+                    .navigation_entries
+                    .iter()
+                    .find(|entry| crate::folder_tree::path_eq(&entry.logical_path, root_entry))
+                    .map(|entry| entry.kind);
+                navigation_entries.iter().any(|entry| {
+                    Some(entry.kind) == old_kind
+                        && entry.kind != super::smart_folder::SmartChildKind::Folder
+                        && crate::folder_tree::path_eq(&entry.logical_path, root_entry)
+                })
+            }
+            _ => false,
+        };
+        self.navigation_entries = Arc::new(navigation_entries);
         match (&mut self.position, retained_index) {
             (SmartFolderPosition::Root, _) => true,
+            (SmartFolderPosition::Container { .. }, _) if container_retained => true,
+            (SmartFolderPosition::Container { .. }, _) => {
+                self.position = SmartFolderPosition::Root;
+                false
+            }
             (SmartFolderPosition::Scoped { entry_index, .. }, Some(index)) => {
                 *entry_index = index;
                 true
@@ -224,6 +318,18 @@ impl SmartFolderViewState {
                 false
             }
         }
+    }
+
+    pub(crate) fn refresh_folder_entries(&mut self, folder_entries: Vec<PathBuf>) -> bool {
+        self.refresh_navigation_entries(
+            folder_entries
+                .into_iter()
+                .map(|logical_path| SmartRootNavEntry {
+                    logical_path,
+                    kind: super::smart_folder::SmartChildKind::Folder,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -773,7 +879,7 @@ impl super::App {
                 if self.smart_folder_busy() {
                     return;
                 }
-                self.open_smart_folder(state.definition_id, true);
+                let _ = self.refresh_smart_folder_staged(state.definition_id);
             }
             TopLevelGridSurface::SubfolderExpansion => {
                 if self.subfolder_expansion_busy() {
@@ -1165,6 +1271,69 @@ mod tests {
         assert!(state.enter_containing_path(&second));
         assert_eq!(state.entry_at_offset(true), None);
         assert_eq!(state.entry_at_offset(false), Some(first.as_path()));
+    }
+
+    #[test]
+    fn smart_root_navigation_uses_one_display_order_for_folders_and_books() {
+        use super::super::smart_folder::SmartChildKind;
+        let id = uuid::Uuid::new_v4();
+        let folder = PathBuf::from(r"C:\books\folder");
+        let nested_pdf = folder.join("nested.pdf");
+        let pdf = PathBuf::from(r"C:\books\book.pdf");
+        let zip = PathBuf::from(r"C:\books\book.zip");
+        let archive = PathBuf::from(r"C:\books\book.7z");
+        let entries = vec![
+            SmartRootNavEntry {
+                logical_path: folder.clone(),
+                kind: SmartChildKind::Folder,
+            },
+            SmartRootNavEntry {
+                logical_path: nested_pdf.clone(),
+                kind: SmartChildKind::Pdf,
+            },
+            SmartRootNavEntry {
+                logical_path: pdf.clone(),
+                kind: SmartChildKind::Pdf,
+            },
+            SmartRootNavEntry {
+                logical_path: zip.clone(),
+                kind: SmartChildKind::Zip,
+            },
+            SmartRootNavEntry {
+                logical_path: archive.clone(),
+                kind: SmartChildKind::ConvertibleArchive,
+            },
+        ];
+        let mut state = SmartFolderViewState::root_with_navigation_entries(id, entries.clone());
+        assert_eq!(state.entry_at_offset(true), Some(folder.as_path()));
+        assert_eq!(state.entry_at_offset(false), Some(archive.as_path()));
+        assert!(state.enter_containing_path(&nested_pdf));
+        assert!(
+            matches!(state.position, SmartFolderPosition::Container { .. }),
+            "an exact root book must win over its ancestor Folder"
+        );
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+        assert_eq!(state.entry_at_offset(false), Some(folder.as_path()));
+        assert!(state.enter_containing_path(&folder.join("chapter")));
+        assert_eq!(state.entry_at_offset(true), Some(nested_pdf.as_path()));
+        // A nested book may also have its own root row. The two entries are distinct
+        // navigation contexts; re-entering it as a root row advances the index and is finite.
+        assert!(state.move_to(&nested_pdf));
+        assert_eq!(state.entry_at_offset(true), Some(nested_pdf.as_path()));
+        assert!(state.enter_containing_path(&nested_pdf));
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+
+        assert!(state.enter_containing_path(&folder.join("chapter")));
+
+        let mut reordered = entries;
+        reordered.swap(1, 2);
+        assert!(state.refresh_navigation_entries(reordered));
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+        assert!(!state.refresh_navigation_entries(vec![SmartRootNavEntry {
+            logical_path: zip,
+            kind: SmartChildKind::Zip,
+        }]));
+        assert!(matches!(state.position, SmartFolderPosition::Root));
     }
 
     #[test]

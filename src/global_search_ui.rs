@@ -1547,6 +1547,12 @@ impl App {
         if !self.global_search.active {
             return;
         }
+        if let Some(crate::app::top_level_grid_view::TopLevelGridRestore::SmartFolder(state)) =
+            self.top_level_grid_view.return_to().cloned()
+            && self.begin_smart_search_return_navigation(state)
+        {
+            return;
+        }
         let return_context = self.dismiss_global_search_without_restore();
         self.restore_view_return_context(return_context);
     }

@@ -473,7 +473,7 @@ fn next_sibling_or_ancestor_sibling(path: &Path, opts: FolderTreeOptions) -> Opt
 }
 
 /// path の最も深い最後の子孫フォルダを返す（子がなければ path 自身）。
-fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
+pub(crate) fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
     let mut visited = HashSet::new();
     last_descendant_dir_inner(path, opts, 0, &mut visited)
 }

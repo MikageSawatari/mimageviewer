@@ -3478,7 +3478,7 @@ impl App {
                 "gamepad_smart_folder_nav",
                 Some(&format!("definition_id={definition_id}")),
             );
-            self.open_smart_folder(definition_id, false);
+            self.open_smart_folder_staged(definition_id, false);
             ctx.request_repaint();
         }
         None
@@ -7070,13 +7070,16 @@ impl App {
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                let auto_fullscreen = self.should_auto_fullscreen_grid_container(idx);
+                if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fullscreen) {
+                    return None;
+                }
                 self.note_reading_history_open(idx);
-                if self.should_auto_fullscreen_grid_container(idx) {
+                if auto_fullscreen {
                     self.pending_auto_fs_open = true;
                 }
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
-                self.begin_smart_folder_drill(&p);
                 Some(AddressBarNav::Direct(p))
             }
             Some(GridItem::Image(_))
@@ -7097,16 +7100,20 @@ impl App {
             }
             Some(GridItem::CollectionPlaceholder { .. }) => None,
             Some(GridItem::ConvertibleArchive { path, format }) => {
-                let owner = self.main_grid_archive_open_owner(idx, &path);
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
-                } else if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
+                } else if self.begin_smart_grid_container_navigation(idx, path.clone(), auto_fs) {
+                    // The Smart request owns conversion and adopts its logical source once.
                 } else {
-                    self.request_archive_convert_owned(path, format, auto_fs, owner);
+                    let owner = self.main_grid_archive_open_owner(idx, &path);
+                    if let Some(cached) = self.try_archive_cache_lookup(&path) {
+                        self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
+                    } else {
+                        self.request_archive_convert_owned(path, format, auto_fs, owner);
+                    }
                 }
                 None
             }

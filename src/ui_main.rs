@@ -6891,7 +6891,7 @@ impl App {
         if let Some(id) = smart_folder_open {
             let refresh =
                 self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
-            self.open_smart_folder(id, refresh);
+            self.open_smart_folder_staged(id, refresh);
         }
 
         (fav_nav, sort_changed)
@@ -8197,19 +8197,14 @@ impl App {
     pub(crate) fn render_container_enumerate_overlay(&self, ctx: &egui::Context) {
         let pdf_pending = self.pdf_enumerate_pending.is_some();
         let zip_pending = self.zip_enumerate_pending.is_some();
-        if !pdf_pending && !zip_pending {
+        let staged_smart_message = self.staged_smart_loading_message();
+        if !pdf_pending && !zip_pending && staged_smart_message.is_none() {
             return;
         }
         // items 空のときは中央ラベルに任せる (二重表示を防ぐ)
         if self.items.is_empty() {
             return;
         }
-
-        let label = if pdf_pending {
-            "PDF を読み込み中…"
-        } else {
-            "ZIP を読み込み中…"
-        };
 
         // 進捗バーが既に出ている場合は、その上に積み上がるよう Y オフセットを調整する。
         // 進捗バー本体は ~40-80px の高さ、ここではざっくり 60px 上に置く。
@@ -8228,11 +8223,25 @@ impl App {
                 egui::Frame::popup(ui.style())
                     .fill(PROGRESS_BG_COLOR)
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(label)
-                                .monospace()
-                                .color(PROGRESS_LABEL_COLOR),
-                        );
+                        if pdf_pending || zip_pending {
+                            let label = if pdf_pending {
+                                "PDF を読み込み中…"
+                            } else {
+                                "ZIP を読み込み中…"
+                            };
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .monospace()
+                                    .color(PROGRESS_LABEL_COLOR),
+                            );
+                        }
+                        if let Some(message) = staged_smart_message.as_deref() {
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .monospace()
+                                    .color(PROGRESS_LABEL_COLOR),
+                            );
+                        }
                     });
             });
 
@@ -9678,7 +9687,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if let Some(id) = toolbar_smart_folder_open {
             let refresh =
                 self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
-            self.open_smart_folder(id, refresh);
+            self.open_smart_folder_staged(id, refresh);
         }
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
@@ -14131,11 +14140,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         {
                             return nav;
                         }
+                        if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                            return nav;
+                        }
                         self.note_reading_history_open(idx);
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
                         self.record_rating_view_nav_open(&p);
-                        self.begin_smart_folder_drill(&p);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
@@ -14150,11 +14161,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                         return nav;
                     }
+                    if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                        return nav;
+                    }
                     self.note_reading_history_open(idx);
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     self.record_rating_view_nav_open(&p);
-                    self.begin_smart_folder_drill(&p);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
                     if auto_fs {
                         self.pending_auto_fs_open = true;
@@ -14199,6 +14212,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
+                    if self.begin_smart_grid_container_navigation(
+                        idx,
+                        pf.clone(),
+                        self.settings.effective_auto_fullscreen_zip_pdf(),
+                    ) {
+                        return nav;
+                    }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
@@ -16435,6 +16455,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {
                     let collection_message = self.collection_grid_empty_message();
+                    let staged_smart_message = self.staged_smart_loading_message();
                     self.pending_grid_scroll = None;
                     // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
                     // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
@@ -16447,7 +16468,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let failure = self.empty_items_reason().map(|reason| reason.message());
                     let global_search_progress =
                         global_searching.then(|| self.global_search_progress_message());
-                    let msg = if let Some(message) = collection_message.as_deref() {
+                    let msg = if let Some(message) = staged_smart_message {
+                        message
+                    } else if let Some(message) = collection_message.as_deref() {
                         message.to_owned()
                     } else if self.items_are_bookmark_view
                         && self.bookmark_browser_pending.is_some()
@@ -23528,6 +23551,57 @@ mod grid_reclick_open_tests {
             handler_harness(GridClickSelectionMode::Explorer, true, Some(0), true, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn smart_root_modal_blocks_real_image_cell_until_exact_cancel() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            true,
+            Some(0),
+            false,
+            false,
+        );
+        let image = harness.state().app.tmp.path().join("other-image.jpg");
+        std::fs::write(&image, []).unwrap();
+        let source = harness.state().app.tmp.path().join("smart-modal-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), []).unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("Modal Gate");
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            source,
+            true,
+            Default::default(),
+        ));
+        let id = definition.id;
+        {
+            let app = &mut harness.state_mut().app;
+            app.active_quick_folder_slot = None;
+            app.items[0] = GridItem::Image(image);
+            app.settings.smart_folders = vec![definition];
+            app.open_smart_folder_staged(id, false);
+            assert!(app.staged_smart_root_modal_visible());
+        }
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.fullscreen_idx, None);
+
+        let request_id = harness.state().app.smart_folder_transition_sequence;
+        assert!(
+            harness
+                .state_mut()
+                .app
+                .cancel_staged_smart_root_modal_request(request_id)
+        );
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+        harness
+            .state_mut()
+            .app
+            .poll_smart_folder(&egui::Context::default());
+        assert!(
+            !harness.state().app.staged_smart_root_modal_visible(),
+            "the cancelled scan must not replace the newly opened image"
+        );
     }
 
     #[test]

@@ -1011,7 +1011,11 @@ impl App {
         if let Some(id) = open_definition {
             let refresh =
                 self.items_are_smart_folder_view && self.current_smart_folder_id == Some(id);
-            self.open_smart_folder(id, refresh);
+            if refresh {
+                let _ = self.refresh_smart_folder_staged(id);
+            } else {
+                self.open_smart_folder_staged(id, false);
+            }
         }
         if !commit_blocked && (escape_pressed || close_requested || !open) {
             self.show_smart_folder_editor = false;

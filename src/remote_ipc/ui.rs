@@ -589,6 +589,7 @@ enum RemoteBookmarkRequestAction {
 struct PendingFullscreenRestore {
     item_key: String,
     view: ReloadedView,
+    smart_request_id: Option<u64>,
     wait_frames: u8,
 }
 
@@ -3561,19 +3562,36 @@ impl crate::app::App {
         if fullscreen_key.is_some() {
             self.close_fullscreen();
         }
-        match view {
-            ReloadedView::ReadingHistory => self.enter_reading_history(),
-            ReloadedView::Rating => self.reload_current_rating_view_preserving_sort(),
-            ReloadedView::Bookmarks => self.refresh_bookmark_browser(),
-            ReloadedView::SmartFolder(id) => self.open_smart_folder(id, true),
-            ReloadedView::Other => self.reload_current_folder_preserving_override(),
-        }
-        self.remote_session_ui.pending_fullscreen_restore =
-            fullscreen_key.map(|item_key| PendingFullscreenRestore {
+        let smart_request_id = match view {
+            ReloadedView::ReadingHistory => {
+                self.enter_reading_history();
+                None
+            }
+            ReloadedView::Rating => {
+                self.reload_current_rating_view_preserving_sort();
+                None
+            }
+            ReloadedView::Bookmarks => {
+                self.refresh_bookmark_browser();
+                None
+            }
+            ReloadedView::SmartFolder(id) => self.refresh_smart_folder_staged(id),
+            ReloadedView::Other => {
+                self.reload_current_folder_preserving_override();
+                None
+            }
+        };
+        self.remote_session_ui.pending_fullscreen_restore = fullscreen_key.and_then(|item_key| {
+            if matches!(view, ReloadedView::SmartFolder(_)) && smart_request_id.is_none() {
+                return None;
+            }
+            Some(PendingFullscreenRestore {
                 item_key,
                 view,
+                smart_request_id,
                 wait_frames: 0,
-            });
+            })
+        });
         self.remote_session_ui.paused_animation_restore_key = paused_animation_key;
         crate::logger::log("remote_ipc: local control restored; current view reload requested");
     }
@@ -3588,10 +3606,14 @@ impl crate::app::App {
             ReloadedView::Rating => self.rating_view_pending.is_none(),
             ReloadedView::Bookmarks => self.bookmark_browser_pending.is_none(),
             ReloadedView::SmartFolder(id) => {
-                self.current_smart_folder_id == Some(id)
-                    && self.smart_folder_pending.is_none()
-                    && self.smart_folder_prepare_pending.is_none()
-                    && self.smart_folder_confirm_pending.is_none()
+                let Some(request_id) = pending.smart_request_id else {
+                    return;
+                };
+                match self.smart_folder_request_status(id, request_id) {
+                    crate::app::smart_folder::SmartFolderRequestStatus::Pending => false,
+                    crate::app::smart_folder::SmartFolderRequestStatus::Adopted => true,
+                    crate::app::smart_folder::SmartFolderRequestStatus::Retired => return,
+                }
             }
             // 通常フォルダの同期/非同期差を吸収し、旧 items を同フレームに拾わない。
             ReloadedView::Other => pending.wait_frames >= 2,
@@ -4291,6 +4313,7 @@ mod tests {
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),
                 view: ReloadedView::Other,
+                smart_request_id: None,
                 wait_frames: 1,
             }),
         });

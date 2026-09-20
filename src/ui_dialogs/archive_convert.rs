@@ -327,6 +327,13 @@ impl App {
         {
             return false;
         }
+        if matches!(
+            &owner,
+            crate::app::OpenRequestOwner::MainGridArchive(intent)
+                if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
+        ) {
+            return self.supply_smart_archive_load_alias(&src, &cached_zip, &owner);
+        }
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
@@ -348,9 +355,13 @@ impl App {
             })
             .cloned();
         self.transition_favorite_view_for_path(Some(&src));
-        self.prepare_main_grid_archive_transition_for_load(&transition_owner, &cached_zip);
-        self.authorize_smart_folder_session_alias(&src, &cached_zip);
-        self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
+        let load_accepted = self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
+        if !load_accepted {
+            self.abort_smart_archive_open_for_owner(&transition_owner);
+            let current = self.effective_folder();
+            self.transition_favorite_view_for_path(current.as_deref());
+            return false;
+        }
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
         // return するため)。その場合は override / address / recent を更新しない
@@ -383,6 +394,40 @@ impl App {
         self.transition_favorite_view_for_path(Some(&src));
         self.commit_main_grid_archive_transition(&transition_owner);
         true
+    }
+
+    /// Complete only the source-facing half of a Smart Folder archive open. The common visible
+    /// install already set `current_folder` to the cache ZIP and the logical source override;
+    /// this request carries the effects that the async early return deliberately deferred.
+    pub(crate) fn commit_smart_folder_archive_source(
+        &mut self,
+        commit: crate::app::SmartFolderArchiveCommit,
+    ) {
+        if !self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, &commit.cache_path))
+            || !self
+                .archive_source_override
+                .as_ref()
+                .is_some_and(|source| crate::folder_tree::path_eq(source, &commit.source_path))
+        {
+            return;
+        }
+        let source = commit.source_path;
+        self.address = source.to_string_lossy().to_string();
+        if !(self.global_search.active || self.favsearch.active) {
+            self.forget_recent_folder(&commit.cache_path);
+            self.remember_recent_folder(&source);
+        }
+        self.update_active_quick_folder_target(&source);
+        if commit.restore_reading_history {
+            self.reading_history_return_from = Some(source.clone());
+        }
+        if let Some(state) = commit.restore_bookmark_view {
+            self.bookmark_view_state = Some(state);
+        }
+        self.commit_main_grid_archive_transition(&commit.owner);
     }
 
     /// 変換ダイアログを開始する (スキャン fase から)。
@@ -700,7 +745,11 @@ impl App {
             "archive transition cancelled reason={reason} source={}",
             state.src_path.display()
         ));
+        let open_owner = state.completion.open_owner();
         drop(state);
+        if let Some(owner) = open_owner.as_ref() {
+            self.abort_smart_archive_open_for_owner(owner);
+        }
         if let Some(owner) = detached_owner.as_ref() {
             self.invalidate_detached_grid_archive_open_owner(owner);
         }
@@ -872,11 +921,18 @@ impl App {
                 }
                 return;
             }
+            if let Some(owner @ crate::app::OpenRequestOwner::MainGridArchive(intent)) =
+                open_owner.as_ref()
+                && matches!(
+                    intent.smart_folder_owner,
+                    crate::app::SmartGridArchiveOwner::Transition(_)
+                )
+            {
+                let _ = self.supply_smart_archive_load_alias(&src, &src, owner);
+                return;
+            }
             if auto_fs {
                 self.pending_auto_fs_open = true;
-            }
-            if let Some(owner) = open_owner.as_ref() {
-                self.prepare_main_grid_archive_transition_for_load(owner, &src);
             }
             self.load_zip_as_folder_with_input_seq(src.clone(), input_seq);
             let loaded = self
@@ -1091,26 +1147,38 @@ impl App {
                     }
                     return;
                 };
+                if let Some(source) = src.as_deref()
+                    && matches!(
+                        &open_owner,
+                        crate::app::OpenRequestOwner::MainGridArchive(intent)
+                            if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
+                    )
+                {
+                    let _ = self.supply_smart_archive_load_alias(source, &nav, &open_owner);
+                    return;
+                }
                 if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
                 if let Some(source) = src.as_deref() {
-                    self.authorize_smart_folder_session_alias(source, &nav);
                     // cache ZIP は実装 alias。初回継承値も user-facing source へ入る直前の
                     // 有効状態から採る。
                     self.transition_favorite_view_for_path(Some(source));
                 }
-                self.prepare_main_grid_archive_transition_for_load(&open_owner, &nav);
                 let transition_owner = open_owner.clone();
-                self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
+                let load_accepted = self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
+                if !load_accepted {
+                    self.abort_smart_archive_open_for_owner(&transition_owner);
+                }
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
                 // 更新せず、変換ダイアログを開いたときに変えた履歴スタックも巻き戻す
                 // (override と current_folder の不整合・nav スタック残りを防ぐ、Codex P1/P2)。
-                let loaded = self
-                    .current_folder
-                    .as_ref()
-                    .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
+                let loaded = load_accepted
+                    && self
+                        .current_folder
+                        .as_ref()
+                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
                 if !loaded {
                     let current = self.effective_folder();
                     self.transition_favorite_view_for_path(current.as_deref());
@@ -1464,6 +1532,10 @@ impl App {
                 .archive_convert
                 .as_ref()
                 .and_then(|state| state.nav_history_rollback.clone());
+            let smart_owner = self
+                .archive_convert
+                .as_ref()
+                .and_then(|state| state.completion.open_owner());
             let bookmark_owner = self
                 .archive_convert
                 .as_ref()
@@ -1480,6 +1552,9 @@ impl App {
                 .and_then(|state| state.deferred_fullscreen.take())
                 .is_some();
             self.archive_convert = None;
+            if let Some(owner) = smart_owner.as_ref() {
+                self.abort_smart_archive_open_for_owner(owner);
+            }
             if let Some(owner) = bookmark_owner {
                 self.cancel_bookmark_open_request(owner.request_id, "archive_dialog_closed");
             }
@@ -1569,10 +1644,14 @@ impl App {
                 | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
                     // User cancellation closes every phase of the shared archive lifecycle.
                     let nav_history_rollback = state.nav_history_rollback.clone();
+                    let smart_owner = state.completion.open_owner();
                     let had_deferred = state.deferred_fullscreen.is_some();
                     let bookmark_owner = state.completion.bookmark_owner().cloned();
                     let detached_owner = state.completion.detached_grid_archive_owner().cloned();
                     self.archive_convert = None;
+                    if let Some(owner) = smart_owner.as_ref() {
+                        self.abort_smart_archive_open_for_owner(owner);
+                    }
                     if let Some(owner) = bookmark_owner {
                         self.cancel_bookmark_open_request(
                             owner.request_id,
