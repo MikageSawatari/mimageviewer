@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>コレクションを作って続けて見る・聴く — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="離れた場所の画像・動画・音声をコレクションに登録し、並び順を変えて続けて見る・聴く手順。元ファイル操作、テキストの取り込み・書き出しも説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-collections.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-collections.html">
+  <meta property="og:title" content="コレクションを作って続けて見る・聴く｜mImageViewer">
+  <meta property="og:description" content="離れた場所の画像・動画・音声をコレクションに登録し、並び順を変えて続けて見る・聴く手順。元ファイル操作、テキストの取り込み・書き出しも説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="コレクションを作って続けて見る・聴く｜mImageViewer">
+  <meta name="twitter:description" content="離れた場所の画像・動画・音声をコレクションに登録し、並び順を変えて続けて見る・聴く手順。元ファイル操作、テキストの取り込み・書き出しも説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>コレクションを作って続けて見る・聴く</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+    <h1 class="page-title">コレクションを作って続けて見る・聴く</h1>
+    <p class="page-desc">
+      複数のフォルダにある画像・動画・音声を、元の場所を変えずに一つの一覧へまとめます。
+      ページをコピーして新しい本を作る場合は<a href="tut-books.html">製本のチュートリアル</a>をご覧ください。
+    </p>
+
+    <h2>1. 名前付きの一覧を作る</h2>
+    <p>
+      上部の「コレクション」から「コレクションの管理…」を開き、新しい名前を付けます。
+      管理画面は一覧の入れ物を作る場所です。中身を見るときは「開く」でメインの一覧へ移ります。
+    </p>
+
+    <h2>2. 追加先を選んで登録する</h2>
+    <p>
+      ツールバーの「コレクション:」で、いま作った一覧を追加先に選びます。
+      追加したいファイルやフォルダにチェックを付けて「追加」を押してください。
+      チェックがあればチェック済みを優先し、なければ現在選択中の 1 件を追加します。
+      重複した項目は飛ばされます。「追加」だけでは今見ているフォルダから移動しません。
+    </p>
+    <p>
+      よく使う一覧は管理画面で固定できます。ツールバーに出た名前のボタンを左クリックすると開き、
+      右クリックするとその一覧へ直接追加できます。追加先を切り替えなくても整理できます。
+    </p>
+
+    <h2>3. 並び順を決めて見る</h2>
+    <p>
+      「開く」でコレクション直下の一覧を表示します。順番は「手動順」「通常ソート」「シャッフル」から選べます。
+      手動順の「並べ替え…」では、サムネイルを選んでドラッグまたは左右ボタンで配置し、ウィンドウを閉じると保存します。
+      シャッフルをもう一度選ぶと並び直せます。元の手動順は消えません。
+      画像のページ送りやスライドショー、動画・音声の連続再生はこの一覧の有効な順番に従います。
+    </p>
+
+    <h2>4. 元の場所へ戻る・登録だけを外す</h2>
+    <p>
+      項目を右クリックして「元の場所へ移動」を選ぶと、実際のフォルダへ移れます。
+      コレクション直下の <kbd>Delete</kbd> または「コレクションから外す」は登録だけを消し、元ファイルは残します。
+      元ファイルを削除したいときは、明示された「元ファイルをゴミ箱へ移動」を選んでください。
+      コレクションから開いた実フォルダ内では通常のファイル操作になります。
+    </p>
+
+    <h2>5. テキストで持ち出す</h2>
+    <p>
+      コレクション直下のメニューから、現在の一覧を有効な順番のパス一覧として書き出せます。
+      上部「コレクション」の「すべてのコレクションをテキストで書き出す…（新規フォルダ）」では、
+      選んだ親フォルダの中に新しいフォルダを作り、一覧ごとのテキストと最後に索引ファイルを保存します。
+      元の画像・動画やタグなどをコピーする操作ではありません。
+    </p>
+    <p>
+      テキストから取り込むときはコレクションを開いてメニューからファイルを選び、
+      1 行 1 パスの内容を確認してから登録します。相対パスはテキストファイルの場所を基準にします。
+      正しい形式、上限、欠損項目の扱いは<a href="collections.html#import">コレクションのリファレンス</a>をご覧ください。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        ZIP・PDF の中の 1 ページだけ、コレクションの入れ子は登録できません。
+        元ファイルが見つからなくなっても項目は一覧に残ります。
+        詳しい操作と保存データは<a href="collections.html">コレクション</a>にまとめています。
+      </div>
+    </div>
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

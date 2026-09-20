@@ -34,14 +34,8 @@
 | サブ展開 snapshot | `std::thread` (`subfolder-expansion` / `subfolder-view-prepare`) + mpsc | 最大 1 scan + 1 prepare | 現在地以下の画像 / 動画、ZIP/PDF 本体、設定上の画像フォルダ本を共通 recursive snapshot walker で列挙する。ZIP/PDF 内部は開かない。`GlobalIoSemaphore` Normal priority と `ActivityGate` を通し、`Arc<AtomicBool>` で cancel、generation で stale 結果を破棄する。大量ソート、metadata 構築、コンテナピンの一括照会も worker 側で行う |
 | スマートフォルダ snapshot | `std::thread` (`smart-folder-scan` / `smart-folder-prepare`) + mpsc | 最大 1 scan + 1 prepare | 保存済みの複数ルールを OR 結合し、ルールごとの実検索元 / 再帰指定からフォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブを列挙する。各 `read_dir` の候補へ通常一覧と同じ同名ファイル規則を物理フォルダ単位で適用してから保存条件を判定し、動画 sidecar は full-path key の snapshot で表示準備へ渡す。★ / タグ / 編集状態と一覧復元用の個別編集状態は prepare worker で exact-key batch 取得し、変換アーカイブ対応表、catalog、固定代表も同 worker で準備する。開始時に snapshot した現在の全体ソート順と定義固有のグループ化単位でフラット一覧を構築し、UI は同期 DB I/O をせず完成 snapshot だけを install する。削除は scan 開始世代以後の tombstone を成功 snapshot へ適用してから破棄し、全 source 失敗では保持する。★ / タグ / 編集状態・定義変更は再 prepare する。通常一覧のソート順・サムネイル / 詳細表示は上書きしない。定義変更・移動・終了時は cancel、generation と定義 snapshot の一致で stale 結果を拒否する。cancel時はreceiver内に到着済みの巨大な`Done`結果と大件数確認待ちsnapshotをpending所有者ごと専用drop workerへ移し、UIスレッドで破棄しない |
 | 保存コレクションroot prepare / サムネイル | actor snapshot + `collection-grid-prepare` / `collection-navigation-prepare` worker + viewer bundle thumbnail pool + session専用video worker | viewer contextごとにprepare最大1、通常pool、video最大1 | exact collection revisionを物理sourceへ分類し、複数folderの動画sidecarを最大64 parentまで通常folder規則で列挙し、正規化full-path mapとvideo pinのread-only batchを同じ取消可能prepare結果に含める。cancel時は途中mapをpublishしない。root installはbundleのitems generation / channel / cache / queueを更新して通常画像・container workerを再spawnする。video workerだけは`CollectionGridSession`専用cancelを持ち、refresh・surface退出・context dropで停止する。session dropは別synthetic surfaceが再利用するbundle共有pool tokenをcancelしない。watch更新とlatest再生root着地は同じprepare結果を使い、`ThumbMsg.items_gen`一致だけを採用する。Remote read-onlyは同じsidecar探索helperを使うが既存64-parent cap、順序、fallback、wireを変えない。 |
-
-保存コレクションの同revision navigationは viewer bundle の`Ready / Empty`が持つ準備済み順序・
-sidecar / pin payloadをkey一致時だけ再利用し、移動候補と見開きslotの実在はworkerで再確認する。
-動画pin WebP mapはvideo workerと`Arc`共有し、保持は64 MiBまで。超過時は全件prepareへ戻り、
-内容を省略しない。Remoteの永続コレクションは単一engineを全IPC workerが共有するため、
-認証済みsession ownerとrefresh epochで1件のprepared / full wire factsを所有し、
-明示snapshot・session交代・revision / 設定変更で再構築する。actor watch、request lease、cancel、
-target path guardはcache hitでも毎要求実行する。
+| 保存コレクション actor | `collection-store` 常駐 thread + bounded command channel | App 全体で 1 本 | `collection.db` の定義・参照・順序を直列 transaction で更新し、revision watch を配信する。起動時は既存 DB の整合を検証してから世代バックアップを作り、単一 read transaction の全件書き出し snapshot を worker へ渡す。UI thread は DB を直接読まない |
+| 保存コレクション import / export | 短命 worker + mpsc + cancel token | ダイアログの単一操作 owner ごとに最大 1 | import は最大 32 MiB + 1 byte まで読み、非空 50,000 行を超えると全体拒否する。確認後に分類・actor 追加へ進み、上限 10,000 件の残容量だけ入力順に追加する。単件書き出しと全件書き出しは UI thread 外で有効順を直列化し、全件は新規フォルダへ各ファイルを作った後、最後に索引を公開する。取消・close・遅い応答を同じ typed operation が退役させる |
 | Collection Auto 比率 cache | `std::thread` (`collection-auto-aspect-cache`、常駐) + mpsc、root prepare worker からの期限付き Get | App 全体で DB actor 1 本。prepare Get は最大 100 ms | UUID 専用 table の Get / Upsert / Count / Clear / age-prune は単一 actor queue で処理する。Get と管理操作の admission は短い送信 lock で直列化し、clear 前の遅着結果は epoch で拒否する。App は ID→確定値のメモリ map を持ち、同一プロセスの再訪を即復元する。cache manager worker が Collection 応答と従来の folder table 操作を合算する。actor 不調でも folder/catalog/tile の整理を続け、合算件数を不明・結果を部分失敗として報告する。UI thread は UUID SQLite を読まない |
 | content identity 台帳 | `std::thread` (`content-identity-recorder`、常駐) + mpsc | 1 | 編集・表示状態・★・タグの確定通知を受け、metadata、A1 の段 1 / 段 2 hash、`content_identity.db` 更新を UI thread 外で行う。検出設定とは独立して常に記録し、同一 `(file_key, size, hashed_mtime)` は再 hash しない |
 | content identity 検出 | `std::thread` (`content-identity-index-load` / `content-identity-detect`) + mpsc | 設定 ON 時に index load 最大 1、開いた物理フォルダごとに detect 最大 1 | 起動時の台帳 snapshot を size 索引へ読み、通常の物理フォルダ走査完了後に段 0 を UI 側メモリだけで実施する。通過項目だけ `GlobalIoSemaphore` Low の detect worker が A1 の段 1 / 段 2 hash を再利用する。`STORES` 経由の rename / hard purge / orphan cleanup が `edit_origin` を commit した完了通知では旧 snapshot を Loading で即時 gate し、folder worker を cancel して Low priority で全件再読込する。再読込中の writer 完了行は queue へ merge し、段 0 に DB I/O を加えない。フォルダ切替 / 設定 OFF / App drop で cancel し、各 target 前、Low permit 待ち、各 read 前に token を確認する。結果は folder key + items generation + 現在の物理 surface を再検証してから A3 用候補へ保持する |
@@ -97,6 +91,14 @@ target path guardはcache hitでも毎要求実行する。
 | 補正レイヤー書き込みワーカー | `std::thread` (常駐、最初の保存で遅延起動) | 1 | 補正レイヤー文書の直列化 (q8 量子化 → deflate → base64) + `local_adjust.db` 書き込み。24MP で 70.6ms、かつマスク系スライダーのドラッグ中は毎フレーム走っていた。**同じ page key は最新 generation だけ書く** (要求 1 件が原寸マスクを抱えるので、合体しないとキューにメモリが積み上がる)。サイドカー `mimageviewer.dat` へのミラーは、結果 (`EditStoreOutcome`) が `Committed` のときだけ UI スレッド側が行う (R-26、§5.7) |
 | 編集内容の一括貼り付け / リセット | `std::thread` (`edit-bundle-bulk`) + bounded mpsc + `Arc<AtomicBool>` | 一括 job ごとに 1 本。回転だけのリセットは worker 0 本 | UI は在メモリ状態だけで対象と種類別件数を確定する。開始前に補正レイヤー producer と保存 worker の非同期 fence を待ち、後着の保存が一括 transaction を上書きしないようにする。worker は対象順に、未取得の通常画像 / ZIP 内画像 / raster PDF の寸法解決、貼り付け bundle の変換、リセット時に残す 6 DB 項目の strict 読み込み、対象 1 件ごとの attached transaction を行い、結果を 1 件ずつ返す。UI は成功結果だけ runtime / cache / sidecar へ反映し、必要なら同じ対象の回転を解除する。キャンセルは次の対象へ進む前に確認し、適用済み項目は保持する。プロセス終了時は次 item を止め、進行中 item の outcome を受信・反映してから join し、既存の sidecar flush へ渡す |
 | タスクトレイ (v0.9) | `std::thread` (常駐) | 1 (設定 ON 時のみ) | `mimv-tray` スレッド。`tray-icon` クレートで隠し HWND を作成 → `PeekMessageW` ポンプ (50ms 周期) + `TrayIconEvent` / `MenuEvent` の try_recv → `TrayEvent::Open / TogglePause / Quit` を UI に送信。`ActivityGate::set_paused` + `GlobalIoSemaphore::set_throttled` はメインスレッドで適用 |
+
+保存コレクションの同revision navigationは viewer bundle の`Ready / Empty`が持つ準備済み順序・
+sidecar / pin payloadをkey一致時だけ再利用し、移動候補と見開きslotの実在はworkerで再確認する。
+動画pin WebP mapはvideo workerと`Arc`共有し、保持は64 MiBまで。超過時は全件prepareへ戻り、
+内容を省略しない。Remoteの永続コレクションは単一engineを全IPC workerが共有するため、
+認証済みsession ownerとrefresh epochで1件のprepared / full wire factsを所有し、
+明示snapshot・session交代・revision / 設定変更で再構築する。actor watch、request lease、cancel、
+target path guardはcache hitでも毎要求実行する。
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
 

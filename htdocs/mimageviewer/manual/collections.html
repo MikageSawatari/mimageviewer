@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>コレクション — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="ファイルやフォルダを移動せずに名前付きの一覧へまとめるコレクションの使い方。追加、並べ替え、再生、取り込み・書き出し、元ファイル操作と保存先を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/collections.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/collections.html">
+  <meta property="og:title" content="コレクション｜mImageViewer">
+  <meta property="og:description" content="ファイルやフォルダを移動せずに名前付きの一覧へまとめるコレクションの使い方。追加、並べ替え、再生、取り込み・書き出し、元ファイル操作と保存先を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="コレクション｜mImageViewer">
+  <meta name="twitter:description" content="ファイルやフォルダを移動せずに名前付きの一覧へまとめるコレクションの使い方。追加、並べ替え、再生、取り込み・書き出し、元ファイル操作と保存先を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>コレクション</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html" class="active">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">コレクション</h1>
+    <p class="page-desc">
+      離れた場所にある画像、動画、音声、フォルダや本を、名前を付けた一覧にまとめます。
+      登録するだけなら元ファイルは移動・コピーしません。ページをコピーして 1 冊を作る
+      <a href="books.html">製本・本棚</a>とは異なり、元の場所への参照を並べて閲覧する機能です。
+      まず操作を試す場合は<a href="tut-collections.html">コレクションのチュートリアル</a>をご覧ください。
+    </p>
+
+    <h2 id="start">作成・追加・開く</h2>
+    <ol>
+      <li>上部の「コレクション」→「コレクションの管理…」で名前付きの一覧を作ります。管理画面は作成・名前変更・固定・削除などを行う場所で、登録内容はメインの一覧で開きます。</li>
+      <li>ツールバーの「コレクション:」で追加先を選びます。「追加」はチェック済み項目を優先し、チェックがなければ現在選択した項目を登録します。「開く」は選んだコレクションの一覧へ移動します。追加だけでは表示中の場所は変わりません。</li>
+      <li>よく使うコレクションを管理画面で固定すると、ツールバーに名前のボタンが出ます。左クリックで開き、右クリックでそのコレクションへ追加できます。追加先の選択と固定した一覧は再起動後も残ります。</li>
+    </ol>
+    <p>
+      コレクションの一覧から画像・動画・音声・フォルダ・ZIP・PDF を開くと、通常の閲覧方法に進みます。
+      本やフォルダから親の一覧へ戻る操作では、コレクション内で開いていた位置を復元します。
+      フルスクリーンを閉じる操作だけで必ずコレクション直下へ戻るわけではなく、通常の閲覧設定に従います。
+      別のコレクションを明示的に開いた移動はフォルダバーの戻る・進む履歴に入ります。
+      同じ元項目を一つのコレクションへ重複登録することはできません。
+    </p>
+    <p>
+      操作カスタマイズでは、グリッド、静止画フルスクリーン、動画・音声表示に別々の「追加先のコレクションへ追加」キーを割り当てられます。既定キーはありません。
+      静止画は現在の実画像 1 件、動画・音声は現在の実ファイル 1 件を追加します。音声の VST プラグイン画面を操作中は、このキーを受け付けません。
+      ZIP・PDF 内の仮想ページは本体へ暗黙に置き換えず、理由を知らせて追加を断ります。ZIP・PDF 本体はグリッドから登録できます。
+    </p>
+
+    <h2 id="order">一覧の順番と並べ替え</h2>
+    <ul>
+      <li><strong>手動順：</strong>保存された順番で表示します。コレクション直下で「並べ替え…」を選ぶと、専用のサムネイル画面で複数選択・ドラッグ・左右移動を使って順番を変えられます。閉じると保存します。ほかの操作と競合した場合は、最新内容を読み直して変更を破棄するか、変更を破棄して閉じるかを選びます。</li>
+      <li><strong>通常ソート：</strong>名前・番号・日付・サイズなどの順を選びます。詳細表示の列見出しを押した一時的な並べ替えは画面上だけで、再生、書き出し、リモート閲覧の順番は変えません。</li>
+      <li><strong>シャッフル：</strong>一覧にも並び替えた順番を表示します。もう一度「シャッフル」を選ぶと新しい順に並べ直します。手動順の配置は残るため、手動順へ戻せます。</li>
+    </ul>
+    <p>
+      前後の画像、スライドショー、動画・音声の連続再生は、それぞれの種類を一覧の有効な順番から選びます。
+      <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> は、登録したフォルダ・ZIP・PDF・対応書庫をコレクションの有効な順番で移動します。登録フォルダの子を移動対象の一覧へ自動追加しません。
+      開いたフォルダの子ファイルが、コレクション直下へ自動登録されることはありません。
+      再生中に並びを変えても現在の再生は続き、次へ進むときに更新後の順番を使います。
+    </p>
+
+    <h2 id="source">元の場所と元ファイルの操作</h2>
+    <p>
+      コレクション直下のセルを右クリックして「元の場所へ移動」を選ぶと、その項目がある実フォルダへ移ります。
+      元項目が見つからない場合も親フォルダを開ければ移動し、項目を選択できなかったことを通知します。
+      「コレクションから外す」または直下の <kbd>Delete</kbd> は登録だけを解除し、元ファイルを削除しません。
+      コレクションから開いた実フォルダ内では、通常の <kbd>Delete</kbd> が実ファイル操作になります。
+    </p>
+    <p>
+      直下の右クリックにある「元ファイルをゴミ箱へ移動 (タグ・評価も整理)」や「元ファイルのWindowsメニュー」は、明示した元ファイルを対象にします。
+      Windows メニューで選ぶ操作も元ファイルに作用します。参照解除と元ファイル操作を区別して選んでください。
+      元のファイルが一時的に読めない、見つからない、または未対応でも登録行は残し、理由を表示します。
+      外部で元ファイルを変更した直後の自動反映は保証しません。明示的な更新や開き直しで再評価します。
+      参照先を変更したい場合は古い登録を外し、新しい場所の項目を追加してください。
+    </p>
+
+    <h2 id="import">テキストから取り込む</h2>
+    <p>
+      コレクション直下の「コレクション」メニューからテキストを選び、確認画面で内容を見てから登録します。
+      1 行につき 1 パスの UTF-8 テキストを使い、先頭の BOM と LF / CRLF の改行に対応します。
+      相対パスは選んだテキストファイルのあるフォルダを基準にします。
+      空白を含むパスは行全体を二重引用符で囲めます。空行は読み飛ばしますが、<code>#</code> で始まる行はコメントではなくパスとして扱います。
+      URL は指定できません。
+    </p>
+    <p>
+      無効な行があると取り込み全体を開始しません。重複は確認画面に示して追加しません。
+      テキストは 32 MiB 以下、空行を除いて 50,000 行以下にしてください。これを超えると確認用の一部だけを登録することもできません。
+      読み取り・書式確認の段階では各対象パスへアクセスせず、登録を確定してから実ファイルを確認します。
+      1 コレクションの登録上限は別に 10,000 件です。容量が足りない場合は入力順に残りの件数まで追加し、追加・重複・上限で拒否された件数を知らせます。
+    </p>
+
+    <h2 id="export">テキストへ書き出す・保存データ</h2>
+    <p>
+      コレクション直下からの書き出しは現在の有効な順番で全登録パスを出力します。
+      画面上の絞り込みや詳細表示の一時的な列ソートで行を省かず、見つからない項目も含めます。
+      上部「コレクション」→「すべてのコレクションをテキストで書き出す…（新規フォルダ）」では親フォルダを選び、
+      その中に新しい専用フォルダを作って 1 コレクション 1 ファイルで保存します。
+      この全件書き出しでは既存ファイルを上書きしません。最後に <code>collections-index.txt</code> を作成して完了とします。
+      途中で失敗・中止した場合は未完成のフォルダを案内し、成功として扱いません。
+      書き出すのはパスの一覧で、元ファイルやタグ・評価などのバックアップではありません。
+    </p>
+    <p>
+      名前と登録内容はアプリのデータフォルダ内の <code>collection.db</code> に自動保存されます。
+      正常に読める既存データベースは起動時に検証し、通常は <code>collection.db.bak1</code> 〜 <code>collection.db.bak10</code> の世代バックアップを作ります。通常の起動ではバックアップ作成だけが失敗しても登録を使い続けます。保存形式の移行前にバックアップを作れなかった場合は、移行を中止します。
+      通常の設定リセットやメタ情報の移行にはコレクションは含まれません。別の PC へ一覧を持ち出す場合はテキスト書き出しを使ってください。
+    </p>
+
+    <h2 id="limits">利用範囲</h2>
+    <p>
+      1 コレクションには最大 10,000 件を新たに登録できます。すでに上限を超える古い一覧は読取・解除・並べ替えを続けられますが、追加はできません。
+      コレクションの入れ子、ZIP・PDF 内の 1 ページだけの登録、参照先を付け替える画面はありません。
+      <a href="remote.html">mIV Remote</a> からはコレクションを読み取り専用で閲覧できます。
+      リモートで作成・編集・削除はできず、見える項目は公開が許された場所に限られます。
+    </p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -44,6 +44,15 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。
 
+名前付きコレクションの root は、複数の実フォルダにある外側の項目を 1 つの一覧へ並べる
+`TopLevelGridView::Collection` である。登録できるのは実ファイル・実フォルダ・ZIP/PDF
+などの本体で、`ZipImage` / `ZipDir` / `PdfPage` の仮想ページや階層は単独登録しない。
+通常フォルダでは短いファイル名で引ける sidecar / video pin / thumbnail の対応も、
+コレクションでは同名ファイルが異なる親に存在し得るため正規化した full path をキーにする。
+root の準備は worker が行い、source を開いて子へ入った後も root の戻り先と現在 entry を
+viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
+取消・失敗では元の root を保つ。
+
 通常グリッドの表示順は `Settings.grid_display_order` の 4 行割り当てで決まる。カテゴリは
 実フォルダ (`Folder`) / アーカイブ類 (`ZipFile` / `PdfFile` / `ConvertibleArchive`、ZIP 内では
 `ZipDir`) / 画像 (`Image` / `ZipImage` / `PdfPage` / `Stack`) / 動画・音声 (`Video` / `Audio`)。

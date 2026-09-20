@@ -33,8 +33,8 @@
 | [post-v3.8.0-priority-work.md](post-v3.8.0-priority-work.md) | v3.8.0公開後の優先修正。§1.208動画音声モード、§1.209サイドカー取り込み、類似索引改善、CIの担当・不変条件・検収判断 |
 | [post-v3.10.0-development.md](post-v3.10.0-development.md) | v3.10.0後の修正・sort・コレクション開発順と、不在中の隔離検証 |
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
-| [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 手動コレクションの仕様案。並び・閲覧範囲・入出力・Remoteの未決事項 |
-| [collection-implementation-plan.md](collection-implementation-plan.md) | 名前付き永続コレクションのactor、PC管理・一覧、最新順再生、Remote read-only統合の実装・検収台帳 |
+| [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
+| [collection-implementation-plan.md](collection-implementation-plan.md) | 名前付き永続コレクションのactor、PC管理・一覧、最新順再生、Remote read-only統合、出荷前修正の実装・検収台帳 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
 | [collection-playback-plan.md](collection-playback-plan.md) | Phase 4のPC向けCtrl+上下、通常next / prev、slideshow、三媒体EOFを最新prepared順へ接続した所有設計と検収記録 |
 | [collection-remote-plan.md](collection-remote-plan.md) | Phase 5の認証済みRemote一覧・閲覧、server-side latest navigation、session / route owner、path・budget・終了順の実装・検収記録 |
