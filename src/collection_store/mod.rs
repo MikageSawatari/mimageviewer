@@ -5,12 +5,14 @@
 //! immutable snapshot、text import/export の正本を提供する。
 
 mod db;
+mod export_all;
 mod model;
 mod path;
 mod prepare;
 mod runtime;
 mod text;
 
+pub(crate) use export_all::{CollectionAllExportFailure, write_all_collections_export};
 pub use model::*;
 pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
 pub(crate) use prepare::{

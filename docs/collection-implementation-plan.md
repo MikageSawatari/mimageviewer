@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7（登録上限・import資源上限・preview仮想化・PC/Remote prepare再利用）は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 / §23.7 は実機確認待ち。A-6 / D-4 の統合 full gate / build と、§23.7 前後半の統合 full gate / build は2026-09-20に通過した。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7（登録上限・import資源上限・preview仮想化・PC/Remote prepare再利用）は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 / §23.7 は実機確認待ち。A-6 / D-4 の統合 full gate / build と、§23.7 前後半の統合 full gate / build は2026-09-20に通過した。§23.8 は移行前 DB 保護に続き、起動時バックアップと一括書き出しを実装・検証中。ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1366,11 +1366,25 @@ Remote service `9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5
 
 ### 23.8 バックアップと全件書き出し（仕様判断 5、K-1）
 
-- actor 起動時に `db_backup::rotate_generation_backups(data_dir, "collection.db", ..)` を tags.db と同じ
-  `rotate_backups_once` パターンで 1 回回す。settings-family lease には含めない（§3.3）。
-- 上部「コレクション」メニューに「すべてのコレクションをテキストで書き出す…」を追加する。フォルダ選択 →
-  1 コレクション 1 ファイル（`<name>.txt`、名前衝突は連番）+ `collections-index.txt`（名前・並び順・件数）。
-  既存の export serializer と worker を流用し、開始時の immutable catalog / snapshot を固定する。
+- 新規 DB は世代を回さない。既存 v2 は read-only probe の `integrity_check(1)` と全 catalog / entry の
+  読み取りが成功した後、actor Ready 前に `db_backup::rotate_generation_backups` で WAL 込み snapshot を
+  起動ごとに 1 回作る。通常 v2 の backup 失敗はログに残して機能を維持する。v1 は旧 schema と FK の
+  read-only 検証後に既存の移行前 backup を必須とし、同じ起動で二重 rotate しない。将来版・破損 DB は
+  既存 backup chain を回さない。
+  shared backup helper は変更しない。snapshot 作成段階の失敗では chain は不変だが、後段の世代 rename は
+  全体として原子的ではなく、失敗時に一部世代が移動する可能性がある。settings-family reset 対象外。
+- 上部メニューの一括書き出しは、選択した親フォルダ内に一意の新規サブフォルダを作ることを UI に明示する。
+  actor の単一 read transaction で catalog 順と全 snapshot を同一 revision に固定し、その時点の
+  `GridDisplayOrder` とともに worker へ渡す。既存の prepare/serializer により manual / standard / shuffle の
+  有効順と欠損参照を保つ。Windows の予約名・無効文字・長い名前・大小文字衝突と manifest 名を安全化し、
+  1 コレクション 1 ファイルを create_new で書く。順番・UUID・escape 済み名前・sort mode・件数・filename
+  を記録した `collections-index.txt` を最後に完成印として公開する。失敗・取消時は成功とせず未完成フォルダを
+  案内し、外部ファイルを含む recursive cleanup はしない。単一コレクションの atomic replace export は維持する。
+
+2026-09-20 K-1 焦点検証: `collection_store::` 45 件、`ui_dialogs::collections::tests::` 33 件、
+`keymap::tests::` 142 件が PASS。`cargo check -p mimageviewer --bin mimageviewer-core`、fmt、
+UI glyph（危険 glyph 0）、`viewer_context_audit`、`git diff --check` は exit 0。
+独立 review 後の全体 gate / 確認用 build は §23.9 と統合するため、この chunk では未実行。
 
 ### 23.9 キー操作（A-4）
 

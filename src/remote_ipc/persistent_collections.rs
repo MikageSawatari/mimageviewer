@@ -2058,6 +2058,7 @@ fn load_settings() -> Result<Settings, PersistentCollectionError> {
 
 fn map_store_error(value: CollectionStoreError) -> PersistentCollectionError {
     let code = match value {
+        CollectionStoreError::Cancelled => PersistentCollectionErrorCode::Cancelled,
         CollectionStoreError::Starting => PersistentCollectionErrorCode::Starting,
         CollectionStoreError::Busy => PersistentCollectionErrorCode::Busy,
         CollectionStoreError::Unavailable => PersistentCollectionErrorCode::Unavailable,

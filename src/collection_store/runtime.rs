@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 
@@ -6,10 +7,10 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased, 
 
 use super::db::CollectionStoreDb;
 use super::{
-    CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntryId, CollectionId,
-    CollectionMigrationOutcome, CollectionOrderMode, CollectionRegistration,
-    CollectionRevisionNotice, CollectionSourceMigration, CollectionSourceMigrationBatch,
-    CollectionStoreError,
+    CollectionAllExportSnapshot, CollectionBatchAddOutcome, CollectionCatalogSnapshot,
+    CollectionEntryId, CollectionId, CollectionMigrationOutcome, CollectionOrderMode,
+    CollectionRegistration, CollectionRevisionNotice, CollectionSourceMigration,
+    CollectionSourceMigrationBatch, CollectionStoreError,
 };
 use crate::settings::SortOrder;
 
@@ -490,6 +491,21 @@ impl CollectionStoreClient {
         self.request(|reply| Command::LoadCollection { id, reply })
     }
 
+    pub fn export_all_snapshot(
+        &self,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<(AtomicUsize, AtomicUsize)>,
+    ) -> Result<
+        Receiver<Result<CollectionAllExportSnapshot, CollectionStoreError>>,
+        CollectionStoreError,
+    > {
+        self.request(|reply| Command::ExportAllSnapshot {
+            cancel,
+            progress,
+            reply,
+        })
+    }
+
     pub fn create_collection(
         &self,
         name: String,
@@ -716,6 +732,11 @@ enum Command {
         id: CollectionId,
         reply: Sender<Result<super::CollectionSnapshot, CollectionStoreError>>,
     },
+    ExportAllSnapshot {
+        cancel: Arc<AtomicBool>,
+        progress: Arc<(AtomicUsize, AtomicUsize)>,
+        reply: Sender<Result<CollectionAllExportSnapshot, CollectionStoreError>>,
+    },
     Create {
         name: String,
         reply: Sender<Result<super::CollectionSnapshot, CollectionStoreError>>,
@@ -797,6 +818,9 @@ impl Command {
                 let _ = reply.send(Err(CollectionStoreError::Unavailable));
             }
             Self::AddBatch { reply, .. } => {
+                let _ = reply.send(Err(CollectionStoreError::Unavailable));
+            }
+            Self::ExportAllSnapshot { reply, .. } => {
                 let _ = reply.send(Err(CollectionStoreError::Unavailable));
             }
             Self::MigrateSources { reply, .. } | Self::MigrateSourceBatch { reply, .. } => {
@@ -891,6 +915,13 @@ fn process_command(
         }
         Command::LoadCollection { id, reply } => {
             let _ = reply.send(db.snapshot(id));
+        }
+        Command::ExportAllSnapshot {
+            cancel,
+            progress,
+            reply,
+        } => {
+            let _ = reply.send(db.export_all_snapshot(&cancel, &progress));
         }
         Command::Create { name, reply } => {
             let result = db.create_collection(&name);

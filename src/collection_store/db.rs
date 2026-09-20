@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -17,25 +18,54 @@ use crate::settings::SortOrder;
 
 const SCHEMA_VERSION: u32 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionDbStartup {
+    New,
+    ExistingUnversioned,
+    ExistingV1,
+    ExistingV2,
+}
+
+impl CollectionDbStartup {
+    fn expected_version(self) -> u32 {
+        match self {
+            Self::New | Self::ExistingUnversioned => 0,
+            Self::ExistingV1 => 1,
+            Self::ExistingV2 => SCHEMA_VERSION,
+        }
+    }
+}
+
 pub(super) struct CollectionStoreDb {
     conn: Connection,
 }
 
 impl CollectionStoreDb {
     pub(super) fn open_at(path: &Path) -> Result<Self, CollectionStoreError> {
-        if path
+        let existed = path
             .try_exists()
-            .map_err(|error| CollectionStoreError::Persistence(error.to_string()))?
-        {
+            .map_err(|error| CollectionStoreError::Persistence(error.to_string()))?;
+        let startup = if existed {
             let probe = Connection::open_with_flags(
                 path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )?;
             let version: u32 = probe.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if version > SCHEMA_VERSION {
-                return Err(CollectionStoreError::IncompatibleSchema(version));
+            match version {
+                0 => CollectionDbStartup::ExistingUnversioned,
+                1 => {
+                    validate_existing_v1(&probe)?;
+                    CollectionDbStartup::ExistingV1
+                }
+                SCHEMA_VERSION => {
+                    validate_existing_v2(&probe)?;
+                    CollectionDbStartup::ExistingV2
+                }
+                newer => return Err(CollectionStoreError::IncompatibleSchema(newer)),
             }
-        }
+        } else {
+            CollectionDbStartup::New
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| CollectionStoreError::Persistence(error.to_string()))?;
@@ -46,11 +76,18 @@ impl CollectionStoreDb {
         if version > SCHEMA_VERSION {
             return Err(CollectionStoreError::IncompatibleSchema(version));
         }
+        if version != startup.expected_version() {
+            return Err(CollectionStoreError::Persistence(
+                "collection schema changed during startup".into(),
+            ));
+        }
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        match version {
-            0 => initialize_schema(&conn)?,
-            1 => {
+        match startup {
+            CollectionDbStartup::New | CollectionDbStartup::ExistingUnversioned => {
+                initialize_schema(&conn)?;
+            }
+            CollectionDbStartup::ExistingV1 => {
                 // VACUUM INTO includes committed WAL rows. Keep a complete v1 snapshot before
                 // the first schema write; a backup failure must leave the original untouched.
                 let db_file_name =
@@ -74,8 +111,32 @@ impl CollectionStoreDb {
                 .map_err(CollectionStoreError::Persistence)?;
                 migrate_v1_to_v2(&conn)?;
             }
-            SCHEMA_VERSION => {}
-            newer => return Err(CollectionStoreError::IncompatibleSchema(newer)),
+            CollectionDbStartup::ExistingV2 => {
+                // This is the only normal-startup rotation. A newly created DB and the
+                // v1 migration above must not displace an older known-good generation.
+                let db_file_name =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            CollectionStoreError::Persistence(
+                                "collection database has no filename".into(),
+                            )
+                        })?;
+                if let Err(error) = crate::db_backup::rotate_generation_backups(
+                    path.parent().unwrap_or_else(|| Path::new(".")),
+                    db_file_name,
+                    &|message| eprintln!("{message}"),
+                    &|destination| {
+                        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                ) {
+                    eprintln!(
+                        "collection startup backup failed; continuing with validated database: {error}"
+                    );
+                }
+            }
         }
         Ok(Self { conn })
     }
@@ -89,6 +150,36 @@ impl CollectionStoreDb {
         id: CollectionId,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
         load_snapshot(&self.conn, id)
+    }
+
+    pub(super) fn export_all_snapshot(
+        &self,
+        cancel: &AtomicBool,
+        progress: &(AtomicUsize, AtomicUsize),
+    ) -> Result<super::CollectionAllExportSnapshot, CollectionStoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let catalog = load_catalog(&tx)?;
+        progress
+            .1
+            .store(catalog.definitions.len(), Ordering::Release);
+        let mut snapshots = Vec::with_capacity(catalog.definitions.len());
+        for definition in catalog.definitions.iter() {
+            if cancel.load(Ordering::Acquire) {
+                return Err(CollectionStoreError::Cancelled);
+            }
+            snapshots.push(load_snapshot_with_catalog_cancel(
+                &tx,
+                definition.id,
+                catalog.catalog_revision,
+                Some(cancel),
+            )?);
+            progress.0.fetch_add(1, Ordering::Release);
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionStoreError::Cancelled);
+        }
+        tx.commit()?;
+        Ok(super::CollectionAllExportSnapshot { catalog, snapshots })
     }
 
     pub(super) fn create_collection(
@@ -495,6 +586,55 @@ impl CollectionStoreDb {
     }
 }
 
+fn validate_integrity(conn: &Connection) -> Result<(), CollectionStoreError> {
+    let integrity: String = conn.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(CollectionStoreError::Persistence(format!(
+            "collection database integrity check failed: {integrity}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_v1(conn: &Connection) -> Result<(), CollectionStoreError> {
+    validate_integrity(conn)?;
+    catalog_revision(conn)?;
+    let mut collections = conn.prepare(
+        "SELECT id, name, order_mode, sort_order, revision, '0000000000000000'
+         FROM collections ORDER BY catalog_position ASC",
+    )?;
+    for row in collections.query_map([], read_definition_row)? {
+        row?;
+    }
+    validate_entries_and_foreign_keys(conn)
+}
+
+fn validate_existing_v2(conn: &Connection) -> Result<(), CollectionStoreError> {
+    validate_integrity(conn)?;
+    // Read-only probing includes committed WAL rows. Validate every row before displacing an
+    // older known-good generation; neither SQLite integrity_check nor a catalog query checks FK.
+    load_catalog(conn)?;
+    validate_entries_and_foreign_keys(conn)
+}
+
+fn validate_entries_and_foreign_keys(conn: &Connection) -> Result<(), CollectionStoreError> {
+    let mut entries = conn.prepare(
+        "SELECT id, collection_id, source_namespace, source_path, normalized_path,
+                resolved_kind, manual_position
+         FROM collection_entries ORDER BY collection_id, manual_position",
+    )?;
+    for row in entries.query_map([], read_entry_row)? {
+        row?;
+    }
+    let mut foreign_keys = conn.prepare("PRAGMA foreign_key_check")?;
+    if foreign_keys.query([])?.next()?.is_some() {
+        return Err(CollectionStoreError::Persistence(
+            "collection database foreign key check failed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn initialize_schema(conn: &Connection) -> Result<(), CollectionStoreError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -584,6 +724,15 @@ fn load_snapshot_with_catalog(
     id: CollectionId,
     catalog_revision: u64,
 ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
+    load_snapshot_with_catalog_cancel(conn, id, catalog_revision, None)
+}
+
+fn load_snapshot_with_catalog_cancel(
+    conn: &Connection,
+    id: CollectionId,
+    catalog_revision: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<super::CollectionSnapshot, CollectionStoreError> {
     let definition = load_definition(conn, id)?;
     let mut statement = conn.prepare(
         "SELECT id, collection_id, source_namespace, source_path, normalized_path,
@@ -594,6 +743,9 @@ fn load_snapshot_with_catalog(
     let rows = statement.query_map([id.to_string()], read_entry_row)?;
     let mut entries = Vec::new();
     for row in rows {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+            return Err(CollectionStoreError::Cancelled);
+        }
         entries.push(row?);
     }
     Ok(super::CollectionSnapshot {

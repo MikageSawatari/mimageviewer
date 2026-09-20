@@ -460,12 +460,299 @@ fn v1_migration_preserves_every_collection_entry_and_revision_and_backs_up_origi
         })
         .unwrap();
     assert_eq!(backup_count, 3);
+    drop(backup_conn);
     drop(db);
     CollectionStoreDb::open_at(&path).unwrap();
     assert!(
-        !temp.path().join("collection.db.bak2").exists(),
-        "v2 reopen must not rotate a second backup"
+        temp.path().join("collection.db.bak2").exists(),
+        "a separate validated v2 startup rotates the v1 generation once"
     );
+    let prior = Connection::open_with_flags(
+        temp.path().join("collection.db.bak2"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let prior_version: u32 = prior
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(prior_version, 1);
+}
+
+#[test]
+fn new_database_does_not_rotate_and_existing_v2_backup_includes_committed_wal() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let mut db = CollectionStoreDb::open_at(&path).unwrap();
+    assert!(!temp.path().join("collection.db.bak1").exists());
+    let created = db.create_collection("WAL member").unwrap();
+    db.add_batch(
+        created.collection_id(),
+        created.revision(),
+        vec![registration(
+            r"C:\wal\one.png",
+            CollectionResolvedKind::Image,
+        )],
+    )
+    .unwrap();
+    drop(db);
+    let reopened = CollectionStoreDb::open_at(&path).unwrap();
+    let backup = Connection::open_with_flags(
+        temp.path().join("collection.db.bak1"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let count: i64 = backup
+        .query_row("SELECT COUNT(*) FROM collection_entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        reopened
+            .snapshot(created.collection_id())
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    drop(backup);
+    drop(reopened);
+    CollectionStoreDb::open_at(&path).unwrap();
+    assert!(temp.path().join("collection.db.bak2").exists());
+}
+
+#[test]
+fn actor_ready_on_existing_v2_follows_startup_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let runtime = CollectionStoreRuntime::start_at(path.clone()).unwrap();
+    wait_ready(&runtime);
+    runtime.shutdown_and_join();
+    assert!(!temp.path().join("collection.db.bak1").exists());
+
+    let runtime = CollectionStoreRuntime::start_at(path).unwrap();
+    wait_ready(&runtime);
+    assert!(temp.path().join("collection.db.bak1").is_file());
+    runtime.shutdown_and_join();
+}
+
+#[test]
+fn invalid_or_future_v2_does_not_rotate_known_good_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let backup = temp.path().join("collection.db.bak1");
+    std::fs::write(&backup, b"known good").unwrap();
+    std::fs::write(&path, b"not sqlite").unwrap();
+    assert!(CollectionStoreDb::open_at(&path).is_err());
+    assert_eq!(std::fs::read(&backup).unwrap(), b"known good");
+    assert!(!temp.path().join("collection.db.bak2").exists());
+
+    std::fs::remove_file(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", 999).unwrap();
+    drop(conn);
+    assert!(matches!(
+        CollectionStoreDb::open_at(&path),
+        Err(CollectionStoreError::IncompatibleSchema(999))
+    ));
+    assert_eq!(std::fs::read(&backup).unwrap(), b"known good");
+    assert!(!temp.path().join("collection.db.bak2").exists());
+}
+
+#[test]
+fn orphaned_v2_entry_does_not_displace_known_good_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    drop(CollectionStoreDb::open_at(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute(
+        "INSERT INTO collection_entries
+         (id, collection_id, source_namespace, source_path, normalized_path,
+          resolved_kind, manual_position, created_at_ms)
+         VALUES (?1, ?2, 'filesystem_path', ?3, ?4, 'image', 0, 0)",
+        rusqlite::params![
+            CollectionEntryId::new().to_string(),
+            CollectionId::new().to_string(),
+            r"C:\orphan\image.png",
+            "c:/orphan/image.png",
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let backup = temp.path().join("collection.db.bak1");
+    std::fs::write(&backup, b"known good").unwrap();
+    assert!(
+        matches!(CollectionStoreDb::open_at(&path), Err(CollectionStoreError::Persistence(message)) if message.contains("foreign key"))
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), b"known good");
+    assert!(!temp.path().join("collection.db.bak2").exists());
+}
+
+#[test]
+fn existing_v2_backup_snapshot_failure_is_nonfatal_without_rotating_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let mut db = CollectionStoreDb::open_at(&path).unwrap();
+    let created = db.create_collection("Keep available").unwrap();
+    drop(db);
+    std::fs::write(temp.path().join("collection.db.bak1"), b"known good").unwrap();
+    std::fs::create_dir(temp.path().join("collection.db.bak.tmp-snapshot")).unwrap();
+    let db = CollectionStoreDb::open_at(&path).unwrap();
+    assert_eq!(
+        db.snapshot(created.collection_id())
+            .unwrap()
+            .definition
+            .name,
+        "Keep available"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("collection.db.bak1")).unwrap(),
+        b"known good"
+    );
+    assert!(!temp.path().join("collection.db.bak2").exists());
+}
+
+#[test]
+fn v1_backup_failure_remains_fail_closed_before_schema_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    drop(CollectionStoreDb::open_at(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE collections DROP COLUMN shuffle_seed; PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::write(temp.path().join("collection.db.bak1"), b"known good").unwrap();
+    std::fs::create_dir(temp.path().join("collection.db.bak.tmp-snapshot")).unwrap();
+    assert!(matches!(
+        CollectionStoreDb::open_at(&path),
+        Err(CollectionStoreError::Persistence(_))
+    ));
+    let conn = Connection::open(&path).unwrap();
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(
+        std::fs::read(temp.path().join("collection.db.bak1")).unwrap(),
+        b"known good"
+    );
+}
+
+#[test]
+fn corrupt_v1_schema_does_not_rotate_a_known_good_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    drop(CollectionStoreDb::open_at(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE collections DROP COLUMN shuffle_seed; PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute(
+        "INSERT INTO collection_entries
+         (id, collection_id, source_namespace, source_path, normalized_path,
+          resolved_kind, manual_position, created_at_ms)
+         VALUES (?1, ?2, 'filesystem_path', ?3, ?4, 'image', 0, 0)",
+        rusqlite::params![
+            CollectionEntryId::new().to_string(),
+            CollectionId::new().to_string(),
+            r"C:\broken-v1\image.png",
+            "c:/broken-v1/image.png",
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let backup = temp.path().join("collection.db.bak1");
+    std::fs::write(&backup, b"known good").unwrap();
+    assert!(
+        matches!(CollectionStoreDb::open_at(&path), Err(CollectionStoreError::Persistence(message)) if message.contains("foreign key"))
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), b"known good");
+    assert!(!temp.path().join("collection.db.bak2").exists());
+    let conn = Connection::open(&path).unwrap();
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+}
+
+#[test]
+fn one_actor_export_request_freezes_catalog_and_all_member_revisions() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
+    wait_ready(&runtime);
+    let client = runtime.client();
+    let first = client
+        .create_collection("First".into())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let second = client
+        .create_collection("Second".into())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let progress = std::sync::Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let frozen = client
+        .export_all_snapshot(cancel, std::sync::Arc::clone(&progress))
+        .unwrap();
+    let changed = client
+        .rename_collection(first.collection_id(), first.revision(), "After".into())
+        .unwrap();
+    let bundle = frozen
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    changed
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bundle
+            .catalog
+            .definitions
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["First", "Second"]
+    );
+    assert_eq!(
+        bundle
+            .snapshots
+            .iter()
+            .map(|row| row.definition.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["First", "Second"]
+    );
+    assert!(
+        bundle
+            .snapshots
+            .iter()
+            .all(|row| row.catalog_revision == bundle.catalog.catalog_revision)
+    );
+    assert_eq!(bundle.snapshots[1].collection_id(), second.collection_id());
+    assert_eq!(progress.0.load(std::sync::atomic::Ordering::Acquire), 2);
+
+    let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+    let receiver = client
+        .export_all_snapshot(
+            cancelled,
+            std::sync::Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))),
+        )
+        .unwrap();
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Err(CollectionStoreError::Cancelled)
+    ));
+    runtime.shutdown_and_join();
 }
 
 #[test]
@@ -1315,6 +1602,8 @@ fn settings_full_reset_does_not_change_collection_family_or_runtime_snapshot() {
         .unwrap()
         .unwrap();
     let before_files = collection_family_bytes(&collection_path);
+    let backup = data_dir.join("collection.db.bak1");
+    std::fs::write(&backup, b"collection backup survives reset").unwrap();
 
     let permit = crate::settings_db::quiesce_settings_family().unwrap();
     let reset = crate::settings_restore::full_reset_with_permit(data_dir, &permit).unwrap();
@@ -1325,6 +1614,10 @@ fn settings_full_reset_does_not_change_collection_family_or_runtime_snapshot() {
             .is_some_and(|name| name.to_string_lossy().starts_with("collection.db"))
     }));
     assert_eq!(collection_family_bytes(&collection_path), before_files);
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        b"collection backup survives reset"
+    );
 
     let after_snapshot = client
         .load_collection(created.collection_id())

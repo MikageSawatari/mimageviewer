@@ -16,13 +16,15 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::collection_store::{
-    CollectionBatchAddOutcome, CollectionCatalogSnapshot, CollectionEntry, CollectionEntryId,
-    CollectionId, CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
+    CollectionAllExportFailure, CollectionAllExportSnapshot, CollectionBatchAddOutcome,
+    CollectionCatalogSnapshot, CollectionEntry, CollectionEntryId, CollectionId,
+    CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
     CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
     CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
     CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime,
     MAX_COLLECTION_IMPORT_BYTES, parse_collection_text, prepare_collection_export,
-    prepare_collection_registrations, serialize_collection_paths, write_collection_export_atomic,
+    prepare_collection_registrations, serialize_collection_paths, write_all_collections_export,
+    write_collection_export_atomic,
 };
 
 const COLLECTION_REORDER_DEFAULT_WINDOW_W: f32 = 880.0;
@@ -495,11 +497,29 @@ enum CollectionDialogOperation {
         progress: Arc<(AtomicUsize, AtomicUsize)>,
         task: WorkerTask<Result<(), CollectionPrepareError>>,
     },
+    ExportAllSnapshot {
+        parent: PathBuf,
+        display_order: crate::settings::GridDisplayOrder,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<(AtomicUsize, AtomicUsize)>,
+        receiver: Receiver<Result<CollectionAllExportSnapshot, CollectionStoreError>>,
+    },
+    ExportAllWriting {
+        progress: Arc<(AtomicUsize, AtomicUsize)>,
+        task: WorkerTask<Result<PathBuf, CollectionAllExportFailure>>,
+    },
 }
 
 impl CollectionDialogOperation {
     fn is_idle(&self) -> bool {
         matches!(self, Self::Idle)
+    }
+
+    fn is_export_all(&self) -> bool {
+        matches!(
+            self,
+            Self::ExportAllSnapshot { .. } | Self::ExportAllWriting { .. }
+        )
     }
 
     fn manager_close_behavior(&self) -> CollectionManagerCloseBehavior {
@@ -516,7 +536,10 @@ impl CollectionDialogOperation {
 
     fn is_detached(&self) -> bool {
         match self {
-            Self::ToolbarAddSnapshot(_) | Self::GridSnapshot(_) => true,
+            Self::ToolbarAddSnapshot(_)
+            | Self::GridSnapshot(_)
+            | Self::ExportAllSnapshot { .. }
+            | Self::ExportAllWriting { .. } => true,
             Self::ConfirmRemove {
                 origin: CollectionOperationOrigin::Grid(_),
                 ..
@@ -574,6 +597,8 @@ impl CollectionDialogOperation {
             Self::ReadingImport { task, .. } => task.cancel(),
             Self::Classifying { task, .. } => task.cancel(),
             Self::ExportWriting { task, .. } => task.cancel(),
+            Self::ExportAllSnapshot { cancel, .. } => cancel.store(true, Ordering::Release),
+            Self::ExportAllWriting { task, .. } => task.cancel(),
             _ => {}
         }
     }
@@ -775,8 +800,10 @@ impl CollectionUiState {
         self.wanted_collection_revision = 0;
         self.checked_entries.clear();
         self.selected_entry = None;
-        self.operation.cancel_worker();
-        self.operation = CollectionDialogOperation::Idle;
+        if !self.operation.is_export_all() {
+            self.operation.cancel_worker();
+            self.operation = CollectionDialogOperation::Idle;
+        }
         if let Some(id) = id {
             self.request_snapshot(id, 0);
         }
@@ -942,6 +969,7 @@ impl CollectionUiState {
 
 fn collection_error_message(error: &CollectionStoreError) -> String {
     match error {
+        CollectionStoreError::Cancelled => "コレクション処理を取り消しました。".into(),
         CollectionStoreError::Busy => {
             "コレクション処理が混み合っています。もう一度お試しください。".into()
         }
@@ -1639,7 +1667,9 @@ impl App {
             | CollectionDialogOperation::GridSnapshot(_)
             | CollectionDialogOperation::Submitting(_)
             | CollectionDialogOperation::ExportSnapshot { .. }
-            | CollectionDialogOperation::ExportWriting { .. } => false,
+            | CollectionDialogOperation::ExportWriting { .. }
+            | CollectionDialogOperation::ExportAllSnapshot { .. }
+            | CollectionDialogOperation::ExportAllWriting { .. } => false,
         }
     }
 
@@ -2372,6 +2402,88 @@ impl App {
                     CollectionDialogOperation::Idle
                 }
             },
+            CollectionDialogOperation::ExportAllSnapshot {
+                parent,
+                display_order,
+                cancel,
+                progress,
+                receiver,
+            } => match receiver.try_recv() {
+                Ok(Ok(bundle)) if !cancel.load(Ordering::Acquire) => {
+                    progress.0.store(0, Ordering::Release);
+                    progress.1.store(bundle.snapshots.len(), Ordering::Release);
+                    let worker_progress = Arc::clone(&progress);
+                    match WorkerTask::spawn("collection-export-all", move |worker_cancel| {
+                        write_all_collections_export(
+                            &parent,
+                            &bundle,
+                            &display_order,
+                            &worker_cancel,
+                            &worker_progress,
+                        )
+                    }) {
+                        Ok(task) => CollectionDialogOperation::ExportAllWriting { progress, task },
+                        Err(error) => {
+                            self.collection_ui.message = Some((true, error.clone()));
+                            self.show_feedback_toast(error);
+                            CollectionDialogOperation::Idle
+                        }
+                    }
+                }
+                Ok(Ok(_)) | Ok(Err(CollectionStoreError::Cancelled)) => {
+                    let message = "一括書き出しを取り消しました。".to_owned();
+                    self.collection_ui.message = Some((false, message.clone()));
+                    self.show_feedback_toast(message);
+                    CollectionDialogOperation::Idle
+                }
+                Ok(Err(error)) => {
+                    let message = collection_error_message(&error);
+                    self.collection_ui.message = Some((true, message.clone()));
+                    self.show_feedback_toast(message);
+                    CollectionDialogOperation::Idle
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    CollectionDialogOperation::ExportAllSnapshot {
+                        parent,
+                        display_order,
+                        cancel,
+                        progress,
+                        receiver,
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    let message = "一括書き出し用一覧の応答が失われました。".to_owned();
+                    self.collection_ui.message = Some((true, message.clone()));
+                    self.show_feedback_toast(message);
+                    CollectionDialogOperation::Idle
+                }
+            },
+            CollectionDialogOperation::ExportAllWriting { progress, mut task } => match task
+                .poll_finished()
+            {
+                None => CollectionDialogOperation::ExportAllWriting { progress, task },
+                Some(Ok(Ok(folder))) => {
+                    let message = format!(
+                        "すべてのコレクションを {} へ書き出しました。",
+                        folder.display()
+                    );
+                    self.collection_ui.message = Some((false, message.clone()));
+                    self.show_feedback_toast(message);
+                    CollectionDialogOperation::Idle
+                }
+                Some(Ok(Err(error))) => {
+                    let cancelled = matches!(error, CollectionAllExportFailure::Cancelled { .. });
+                    let message = error.message();
+                    self.collection_ui.message = Some((!cancelled, message.clone()));
+                    self.show_feedback_toast(message);
+                    CollectionDialogOperation::Idle
+                }
+                Some(Err(error)) => {
+                    self.collection_ui.message = Some((true, error.clone()));
+                    self.show_feedback_toast(error);
+                    CollectionDialogOperation::Idle
+                }
+            },
             operation => operation,
         };
     }
@@ -2925,6 +3037,35 @@ impl App {
         }
     }
 
+    pub(crate) fn collection_export_all_available(&self) -> bool {
+        self.collection_ui.can_edit() && self.collection_ui.operation.is_idle()
+    }
+
+    pub(crate) fn start_collection_export_all(&mut self, parent: PathBuf) {
+        if !self.collection_export_all_available() {
+            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            return;
+        }
+        let Some(client) = self.collection_ui.client.clone() else {
+            self.show_feedback_toast("コレクションを利用できません。".into());
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        match client.export_all_snapshot(Arc::clone(&cancel), Arc::clone(&progress)) {
+            Ok(receiver) => {
+                self.collection_ui.operation = CollectionDialogOperation::ExportAllSnapshot {
+                    parent,
+                    display_order: self.settings.grid_display_order.clone(),
+                    cancel,
+                    progress,
+                    receiver,
+                };
+            }
+            Err(error) => self.show_feedback_toast(collection_error_message(&error)),
+        }
+    }
+
     pub(crate) fn show_collection_manager(&mut self, ctx: &egui::Context) {
         if !self.collection_ui.show_manager {
             self.show_detached_collection_operation_status(ctx);
@@ -3135,13 +3276,24 @@ impl App {
             });
 
         if cancel_worker {
-            let toolbar_origin = self.collection_ui.operation.toolbar_add_origin().cloned();
-            self.collection_ui.operation.cancel_worker();
-            self.collection_ui.operation = CollectionDialogOperation::Idle;
-            if let Some(origin) = toolbar_origin {
-                self.report_collection_add_result(&origin, false, "追加を取り消しました。".into());
+            if self.collection_ui.operation.is_export_all() {
+                // Keep the owner until its reply reports whether a partial folder exists.
+                self.collection_ui.operation.cancel_worker();
+                self.collection_ui.message =
+                    Some((false, "一括書き出しを取り消しています…".into()));
             } else {
-                self.collection_ui.message = Some((false, "処理を取り消しました。".into()));
+                let toolbar_origin = self.collection_ui.operation.toolbar_add_origin().cloned();
+                self.collection_ui.operation.cancel_worker();
+                self.collection_ui.operation = CollectionDialogOperation::Idle;
+                if let Some(origin) = toolbar_origin {
+                    self.report_collection_add_result(
+                        &origin,
+                        false,
+                        "追加を取り消しました。".into(),
+                    );
+                } else {
+                    self.collection_ui.message = Some((false, "処理を取り消しました。".into()));
+                }
             }
         }
 
@@ -3177,6 +3329,8 @@ impl App {
                     | CollectionDialogOperation::Submitting(_)
                     | CollectionDialogOperation::ExportSnapshot { .. }
                     | CollectionDialogOperation::ExportWriting { .. }
+                    | CollectionDialogOperation::ExportAllSnapshot { .. }
+                    | CollectionDialogOperation::ExportAllWriting { .. }
             );
         if !show {
             return;
@@ -3191,6 +3345,10 @@ impl App {
                 cancel = draw_collection_operation_status(ui, &self.collection_ui.operation);
             });
         if cancel {
+            if self.collection_ui.operation.is_export_all() {
+                self.collection_ui.operation.cancel_worker();
+                return;
+            }
             let add_origin = self.collection_ui.operation.toolbar_add_origin().cloned();
             self.collection_ui.operation.cancel_worker();
             self.collection_ui.operation = CollectionDialogOperation::Idle;
@@ -4262,6 +4420,26 @@ fn draw_collection_operation_status(
                     "{} へ書き出しています… {done}/{total}",
                     destination.display()
                 ));
+                cancel |= ui.button("取り消す").clicked();
+            });
+        }
+        CollectionDialogOperation::ExportAllSnapshot { progress, .. } => {
+            let done = progress.0.load(Ordering::Acquire);
+            let total = progress.1.load(Ordering::Acquire);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "全コレクションの内容を固定しています… {done}/{total}"
+                ));
+                cancel |= ui.button("取り消す").clicked();
+            });
+        }
+        CollectionDialogOperation::ExportAllWriting { progress, .. } => {
+            let done = progress.0.load(Ordering::Acquire);
+            let total = progress.1.load(Ordering::Acquire);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("全コレクションを書き出しています… {done}/{total}"));
                 cancel |= ui.button("取り消す").clicked();
             });
         }
@@ -6661,6 +6839,68 @@ mod tests {
         assert!(app.collection_ui.message.as_ref().is_some_and(|(_, text)| {
             text.contains(&format!("revision {}", latest.revision()))
         }));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn all_export_keeps_its_owner_across_manager_selection_and_reports_completed_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        create_collection(&mut app, "First");
+        create_collection(&mut app, "Second");
+        assert!(app.collection_export_all_available());
+        app.start_collection_export_all(temp.path().to_path_buf());
+        assert!(!app.collection_export_all_available());
+        app.start_collection_export_all(temp.path().join("must-not-start"));
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::ExportAllSnapshot { .. }
+        ));
+        app.collection_ui.select_collection(None);
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::ExportAllSnapshot { .. }
+        ));
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let folder = temp.path().join("collections-export");
+        assert!(folder.join("collections-index.txt").exists());
+        let index = std::fs::read_to_string(folder.join("collections-index.txt")).unwrap();
+        assert!(index.contains("First") && index.contains("Second"));
+        assert!(app.collection_ui.message.as_ref().is_some_and(|(error, text)| !error && text.contains(&folder.display().to_string())));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn cancelled_all_export_actor_reply_cannot_start_a_late_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        let (send, receiver) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.collection_ui.operation = CollectionDialogOperation::ExportAllSnapshot {
+            parent: temp.path().to_path_buf(),
+            display_order: crate::settings::GridDisplayOrder::default(),
+            cancel: Arc::clone(&cancel),
+            progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))),
+            receiver,
+        };
+        app.collection_ui.operation.cancel_worker();
+        let empty = CollectionAllExportSnapshot {
+            catalog: CollectionCatalogSnapshot {
+                catalog_revision: 1,
+                definitions: Arc::from([]),
+            },
+            snapshots: Vec::new(),
+        };
+        send.send(Ok(empty)).unwrap();
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(!temp.path().join("collections-export").exists());
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("取り消しました"))
+        );
         app.shutdown_collection_runtime_for_exit();
     }
 

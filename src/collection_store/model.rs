@@ -211,6 +211,13 @@ pub struct CollectionCatalogSnapshot {
     pub definitions: Arc<[CollectionDefinition]>,
 }
 
+/// One actor read transaction freezes catalog order and every member snapshot together.
+#[derive(Clone, Debug)]
+pub struct CollectionAllExportSnapshot {
+    pub catalog: CollectionCatalogSnapshot,
+    pub snapshots: Vec<CollectionSnapshot>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionSnapshot {
     pub catalog_revision: u64,
@@ -310,6 +317,7 @@ pub struct CollectionMigrationOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CollectionStoreError {
+    Cancelled,
     Busy,
     Starting,
     Unavailable,
@@ -333,6 +341,7 @@ impl CollectionStoreError {
 impl fmt::Display for CollectionStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("collection operation cancelled"),
             Self::Busy => f.write_str("collection store is busy"),
             Self::Starting => f.write_str("collection store is starting"),
             Self::Unavailable => f.write_str("collection store is unavailable"),

@@ -5650,6 +5650,9 @@ impl App {
         let collection_export_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsExportCurrent);
+        let collection_export_all_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsExportAll);
         let collection_order_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsSetOrderCurrent);
@@ -6169,6 +6172,18 @@ impl App {
                                                         current_target.unwrap(),
                                                         crate::ui_dialogs::collections::CollectionGridSnapshotAction::Export(path),
                                                     );
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsExportAll => {
+                                            if ui.add_enabled(self.collection_export_all_available(), egui::Button::new(&collection_export_all_menu_label))
+                                                .on_hover_text("選択した場所に新しい書き出しフォルダを作成します。既存ファイルは上書きしません。")
+                                                .on_disabled_hover_text("コレクションの準備完了後、ほかの処理がないときに使用できます")
+                                                .clicked()
+                                            {
+                                                if let Some(parent) = rfd::FileDialog::new().pick_folder() {
+                                                    self.start_collection_export_all(parent);
                                                 }
                                                 ui.close();
                                             }
