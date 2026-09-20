@@ -28123,7 +28123,7 @@ impl App {
                 cancel,
                 video_items,
                 self.video_thumb_overrides.clone(),
-                pin_blobs,
+                Arc::new(pin_blobs),
             );
         }
         if crate::perf::is_enabled() {
@@ -31979,7 +31979,7 @@ impl App {
                 Arc::clone(&self.cancel_token),
                 video_items,
                 self.video_thumb_overrides.clone(),
-                pin_blobs,
+                Arc::new(pin_blobs),
             );
         }
         if changed.book_bookmarks {
@@ -36482,7 +36482,7 @@ impl App {
         // Phase 8.B': ユーザーピン留め フレームの WebP マップ (動画 path → WebP)。
         // priority chain の最上位で使う。空 BLOB のものは含まれない (= 抽出失敗で
         // ピンを保存したケース、fall-through する)。
-        pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>>,
+        pin_blobs: Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
     ) {
         let thumb_size = self.last_cell_size.max(256.0) as i32;
         let display_px = compute_display_px(

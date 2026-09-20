@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 const COLLECTION_NAV_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 use super::folder_scan::ScannedDir;
+#[cfg(test)]
+use super::top_level_grid_view::CollectionGridThumbnailSources;
 use super::top_level_grid_view::{
-    CollectionGridIdentity, CollectionGridLoadState, CollectionGridPosition,
-    CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources, CollectionGridSession,
-    CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
-    TopLevelGridSurface,
+    CollectionGridIdentity, CollectionGridLoadState, CollectionGridNavigationSources,
+    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources,
+    CollectionGridSession, CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
 use crate::collection_store::{
@@ -180,7 +181,7 @@ impl CollectionNavigationRequest {
 pub(in crate::app) struct CollectionNavigationRequest {
     origin: CollectionNavigationOrigin,
     action: CollectionNavigationAction,
-    root_thumbnail_sources: Option<Arc<CollectionGridPreparedThumbnailSources>>,
+    pub(in crate::app) root_thumbnail_sources: Option<Arc<CollectionGridNavigationSources>>,
     perf_started_at: Option<std::time::Instant>,
 }
 
@@ -1504,8 +1505,36 @@ impl App {
         snapshot: CollectionSnapshot,
     ) {
         let exact_revision = snapshot.revision();
+        let reuse_key =
+            self.collection_grid_prepare_reuse_key(request.origin.collection_id, exact_revision);
+        let retained = self
+            .top_level_grid_view
+            .collection_session()
+            .filter(|session| session.identity.collection_id == request.origin.collection_id)
+            .and_then(CollectionGridSession::installed_presentation)
+            .filter(|presentation| {
+                presentation.reuse_key == reuse_key
+                    && reuse_key.order.matches_prepared(&presentation.prepared)
+            })
+            .and_then(|presentation| {
+                presentation
+                    .sources
+                    .retained()
+                    .map(|sources| (Arc::clone(&presentation.prepared), Arc::clone(sources)))
+            });
+        if let Some((prepared, sources)) = retained {
+            let mut request = request;
+            request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources {
+                reuse_key,
+                sources,
+            }));
+            let target_kind = request.action.target_kind();
+            self.spawn_collection_navigation_preflight(ctx, request, watch, prepared, target_kind);
+            return;
+        }
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
+        let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1521,6 +1550,7 @@ impl App {
                     &settings,
                     &worker_cancel,
                     None,
+                    pin_stamp,
                 );
                 if let Some(start) = perf_start {
                     crate::perf::event(
@@ -1784,10 +1814,19 @@ impl App {
                 _ => match receiver.try_recv() {
                     Ok(Ok(install))
                         if install.prepared.collection_id == request.origin.collection_id
-                            && install.prepared.collection_revision == exact_revision =>
+                            && install.prepared.collection_revision == exact_revision
+                            && install.reuse_key
+                                == self.collection_grid_prepare_reuse_key(
+                                    request.origin.collection_id,
+                                    exact_revision,
+                                ) =>
                     {
                         let mut request = request;
-                        request.root_thumbnail_sources = Some(Arc::new(install.thumbnail_sources));
+                        request.root_thumbnail_sources =
+                            Some(Arc::new(CollectionGridNavigationSources {
+                                reuse_key: install.reuse_key,
+                                sources: Arc::new(install.thumbnail_sources),
+                            }));
                         let target_kind = request.action.target_kind();
                         self.spawn_collection_navigation_preflight(
                             ctx,
@@ -1797,7 +1836,8 @@ impl App {
                             target_kind,
                         );
                     }
-                    Ok(Ok(_)) | Ok(Err(CollectionPrepareError::Cancelled)) => {}
+                    Ok(Ok(_)) => self.restart_collection_navigation(ctx, request),
+                    Ok(Err(CollectionPrepareError::Cancelled)) => {}
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.finish_collection_navigation_without_target(ctx, &request.action)
                     }
@@ -2244,6 +2284,19 @@ impl App {
         if !self.collection_navigation_request_is_current(request) {
             return false;
         }
+        if request
+            .root_thumbnail_sources
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.reuse_key
+                    != self.collection_grid_prepare_reuse_key(
+                        request.origin.collection_id,
+                        prepared.collection_revision,
+                    )
+            })
+        {
+            return false;
+        }
         let revision_is_current = match observe_revision(watch, request.origin.collection_id) {
             RevisionObservation::Unchanged => true,
             RevisionObservation::Revision(revision) => revision <= prepared.collection_revision,
@@ -2279,6 +2332,19 @@ impl App {
                 sequence if sequence == request.origin.intent_sequence
                     || sequence == request.origin.intent_sequence.wrapping_add(1)
             )
+        {
+            return false;
+        }
+        if request
+            .root_thumbnail_sources
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.reuse_key
+                    != self.collection_grid_prepare_reuse_key(
+                        request.origin.collection_id,
+                        prepared.collection_revision,
+                    )
+            })
         {
             return false;
         }
@@ -2395,7 +2461,7 @@ impl App {
         let prepared_thumbnail_source_identity = request
             .root_thumbnail_sources
             .as_deref()
-            .map(|sources| sources.identity)
+            .map(|owner| owner.sources.identity)
             .unwrap_or_default();
         // A linked detached viewer and the visible main Grid may intentionally share the same
         // mounted collection context. Moving between entries in an unchanged immutable root must
@@ -2421,7 +2487,12 @@ impl App {
                 collection_root_presentation_is_identical(
                     installed.prepared.as_ref(),
                     prepared.as_ref(),
-                ) && installed.thumbnail_source_identity == prepared_thumbnail_source_identity
+                ) && installed.sources.identity() == prepared_thumbnail_source_identity
+                    && installed.reuse_key
+                        == self.collection_grid_prepare_reuse_key(
+                            request.origin.collection_id,
+                            prepared.collection_revision,
+                        )
             })
             .cloned();
         if let Some(installed) = installed {
@@ -2512,23 +2583,22 @@ impl App {
             (request.action.is_media_eof() && preserved_player.is_some())
                 .then_some(prepared.entries.len())
         });
-        let thumbnail_sources = match request.root_thumbnail_sources.take() {
-            Some(sources) => match Arc::try_unwrap(sources) {
-                Ok(sources) => sources,
-                Err(_) => {
-                    crate::logger::log(
-                        "[collection-nav] prepared thumbnail payload still has another owner at root commit",
-                    );
-                    return None;
-                }
-            },
-            None => CollectionGridPreparedThumbnailSources::default(),
+        let (thumbnail_sources, reuse_key) = match request.root_thumbnail_sources.take() {
+            Some(owner) => (owner.sources.as_ref().clone(), owner.reuse_key.clone()),
+            None => (
+                CollectionGridPreparedThumbnailSources::default(),
+                self.collection_grid_prepare_reuse_key(
+                    request.origin.collection_id,
+                    prepared.collection_revision,
+                ),
+            ),
         };
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources,
                 auto_aspect_lookup: None,
+                reuse_key,
             },
             previous,
         );
@@ -2636,6 +2706,20 @@ impl App {
                 return;
             }
             _ => {}
+        }
+        if request
+            .root_thumbnail_sources
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.reuse_key
+                    != self.collection_grid_prepare_reuse_key(
+                        request.origin.collection_id,
+                        prepared.collection_revision,
+                    )
+            })
+        {
+            self.restart_collection_navigation(ctx, request);
+            return;
         }
         if !self.collection_navigation_exact_target_is_current(&request, &prepared, &ready.target) {
             return;
@@ -3289,6 +3373,318 @@ mod tests {
         .unwrap()
     }
 
+    fn navigation_sources(
+        app: &App,
+        prepared: &CollectionPreparedSnapshot,
+        sources: CollectionGridPreparedThumbnailSources,
+    ) -> Arc<CollectionGridNavigationSources> {
+        Arc::new(CollectionGridNavigationSources {
+            reuse_key: app.collection_grid_prepare_reuse_key(
+                prepared.collection_id,
+                prepared.collection_revision,
+            ),
+            sources: Arc::new(sources),
+        })
+    }
+
+    #[test]
+    fn navigation_reuses_exact_presentation_without_full_prepare_and_pin_mutation_invalidates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.mp3");
+        let second = temp.path().join("second.mp3");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.video_pin_db =
+            Some(crate::video_pins::VideoPinDb::open_at(&temp.path().join("pins.db")).unwrap());
+        let created = recv(client.create_collection("reuse".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &first,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &second,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        let reuse_key = app.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
+        app.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                prepared: (*prepared).clone(),
+                thumbnail_sources: prepared_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                ),
+                auto_aspect_lookup: None,
+                reuse_key,
+            },
+            None,
+        );
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        let request = manual_navigation_request(&mut app, 0);
+        app.spawn_collection_navigation_prepare(
+            &egui::Context::default(),
+            request,
+            client.subscribe().unwrap(),
+            added.snapshot.clone(),
+        );
+        assert!(
+            matches!(app.top_level_grid_view.collection_navigation_pending_for_test(),
+            Some(CollectionNavigationPending::Preflighting { prepared: reused, .. }) if Arc::ptr_eq(reused, &installed.prepared)),
+            "same revision uses the already classified listing and thumbnail payload; no full stat/sidecar/pin pass is started"
+        );
+        app.cancel_collection_navigation_intent();
+
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .set_pin(&first, 1.0, b"webp")
+            .unwrap();
+        let request = manual_navigation_request(&mut app, 0);
+        app.spawn_collection_navigation_prepare(
+            &egui::Context::default(),
+            request,
+            client.subscribe().unwrap(),
+            added.snapshot,
+        );
+        assert!(
+            matches!(
+                app.top_level_grid_view
+                    .collection_navigation_pending_for_test(),
+                Some(CollectionNavigationPending::Preparing { .. })
+            ),
+            "a successful app pin edit forces full preparation even with the same actor revision"
+        );
+        app.cancel_collection_navigation_intent();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn physical_child_carries_reusable_thumbnail_payload_back_to_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let next_folder = temp.path().join("next");
+        let video = temp.path().join("movie.mp4");
+        let sidecar = temp.path().join("movie.jpg");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&next_folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+        std::fs::write(&video, b"movie").unwrap();
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("sources".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &folder,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &next_folder,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &video,
+                            CollectionResolvedKind::Video,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        let pin_blobs = Arc::new(std::collections::HashMap::from([(
+            video.clone(),
+            vec![1, 2, 3, 4],
+        )]));
+        let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            video_sidecars: std::collections::HashMap::from([(
+                "video-key".into(),
+                sidecar.clone(),
+            )]),
+            video_pin_blobs: Arc::clone(&pin_blobs),
+        });
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        let reuse_key = app.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
+        app.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                prepared: (*prepared).clone(),
+                thumbnail_sources: sources,
+                auto_aspect_lookup: None,
+                reuse_key,
+            },
+            None,
+        );
+        app.selected = Some(0);
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        let retained = installed.sources.retained().unwrap().clone();
+        assert!(Arc::ptr_eq(&retained.payload.video_pin_blobs, &pin_blobs));
+        let mut origin = app.collection_outer_navigation_origin(None).unwrap();
+        origin.intent_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let request = CollectionNavigationRequest {
+            origin,
+            action: CollectionNavigationAction::OuterGrid {
+                forward: true,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: Some(Arc::new(CollectionGridNavigationSources {
+                reuse_key: installed.reuse_key.clone(),
+                sources: retained,
+            })),
+            perf_started_at: None,
+        };
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Folder);
+        let owner = app
+            .collection_navigation_source_open_owner(
+                &request,
+                &client.subscribe().unwrap(),
+                Arc::clone(&installed.prepared),
+                &target,
+            )
+            .unwrap();
+        app.current_folder = Some(folder.clone());
+        assert!(app.commit_collection_grid_source_open_owned(&owner, folder));
+        let child_presentation = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(
+            &child_presentation.prepared,
+            &installed.prepared
+        ));
+        assert!(Arc::ptr_eq(
+            &child_presentation
+                .sources
+                .retained()
+                .unwrap()
+                .payload
+                .video_pin_blobs,
+            &pin_blobs,
+        ));
+        let mut return_origin = app.collection_outer_navigation_origin(None).unwrap();
+        return_origin.intent_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let return_request = CollectionNavigationRequest {
+            origin: return_origin,
+            action: CollectionNavigationAction::OuterGrid {
+                forward: true,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+        };
+        app.spawn_collection_navigation_prepare(
+            &egui::Context::default(),
+            return_request.clone(),
+            client.subscribe().unwrap(),
+            added.snapshot,
+        );
+        assert!(matches!(
+            app.top_level_grid_view.collection_navigation_pending_for_test(),
+            Some(CollectionNavigationPending::Preflighting { prepared: reused, .. })
+                if Arc::ptr_eq(reused, &installed.prepared)
+        ));
+        app.cancel_collection_navigation_intent();
+        let mut return_request = return_request;
+        return_request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources {
+            reuse_key: child_presentation.reuse_key.clone(),
+            sources: child_presentation.sources.retained().unwrap().clone(),
+        }));
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Folder);
+        assert!(
+            app.install_collection_navigation_root(
+                &mut return_request,
+                Arc::clone(&installed.prepared),
+                &target,
+                false,
+            )
+            .is_some()
+        );
+        assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar));
+        let root_presentation = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &root_presentation
+                .sources
+                .retained()
+                .unwrap()
+                .payload
+                .video_pin_blobs,
+            &pin_blobs,
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn pin_blob_retention_budget_is_bounded_without_truncating_installed_payload() {
+        use super::super::top_level_grid_view::{
+            MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES, collection_pin_blob_sizes_fit_retention_budget,
+        };
+        assert!(collection_pin_blob_sizes_fit_retention_budget([
+            MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES
+        ]));
+        assert!(!collection_pin_blob_sizes_fit_retention_budget([
+            MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES,
+            1
+        ]));
+        assert!(!collection_pin_blob_sizes_fit_retention_budget([
+            usize::MAX,
+            1
+        ]));
+    }
+
     fn manual_navigation_request(app: &mut App, origin_idx: usize) -> CollectionNavigationRequest {
         CollectionNavigationRequest {
             origin: app
@@ -3658,17 +4054,20 @@ mod tests {
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
             },
-            root_thumbnail_sources: Some(Arc::new(prepared_thumbnail_sources(
-                CollectionGridThumbnailSources {
-                    video_sidecars: std::collections::HashMap::from([(
-                        "full-video-key".into(),
-                        sidecar.clone(),
-                    )]),
-                    video_pin_blobs: std::collections::HashMap::new(),
-                },
-            ))),
+            root_thumbnail_sources: None,
             perf_started_at: None,
         };
+        request.root_thumbnail_sources = Some(navigation_sources(
+            &app,
+            &prepared,
+            prepared_thumbnail_sources(CollectionGridThumbnailSources {
+                video_sidecars: std::collections::HashMap::from([(
+                    "full-video-key".into(),
+                    sidecar.clone(),
+                )]),
+                video_pin_blobs: Arc::new(std::collections::HashMap::new()),
+            }),
+        ));
 
         assert!(
             app.install_collection_navigation_root(&mut request, prepared, &target, false)
@@ -3917,7 +4316,10 @@ mod tests {
                 "video-key".into(),
                 sidecar_a.clone(),
             )]),
-            video_pin_blobs: std::collections::HashMap::from([(first.clone(), vec![1, 2, 3])]),
+            video_pin_blobs: Arc::new(std::collections::HashMap::from([(
+                first.clone(),
+                vec![1, 2, 3],
+            )])),
         };
         let prepared_sources_a = prepared_thumbnail_sources(sources_a.clone());
         let identity_a = prepared_sources_a.identity;
@@ -3927,18 +4329,27 @@ mod tests {
             }),
             None,
         );
+        let reuse_key = app.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_sources_a,
                 auto_aspect_lookup: None,
+                reuse_key,
             },
             None,
         );
         app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
         let generation = app.items_generation;
         let mut request = manual_navigation_request(&mut app, 0);
-        request.root_thumbnail_sources = Some(Arc::new(prepared_thumbnail_sources(sources_a)));
+        request.root_thumbnail_sources = Some(navigation_sources(
+            &app,
+            &prepared,
+            prepared_thumbnail_sources(sources_a),
+        ));
         let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Video);
         assert!(
             app.install_collection_navigation_root(
@@ -3961,11 +4372,18 @@ mod tests {
                 "video-key".into(),
                 sidecar_a.clone(),
             )]),
-            video_pin_blobs: std::collections::HashMap::from([(first.clone(), vec![1, 2, 3])]),
+            video_pin_blobs: Arc::new(std::collections::HashMap::from([(
+                first.clone(),
+                vec![1, 2, 3],
+            )])),
         };
         let prepared_sidecar_changed = prepared_thumbnail_sources(sidecar_changed);
         let sidecar_changed_identity = prepared_sidecar_changed.identity;
-        request.root_thumbnail_sources = Some(Arc::new(prepared_sidecar_changed));
+        request.root_thumbnail_sources = Some(navigation_sources(
+            &app,
+            &prepared,
+            prepared_sidecar_changed,
+        ));
         assert!(
             app.install_collection_navigation_root(
                 &mut request,
@@ -3985,11 +4403,12 @@ mod tests {
                 "video-key".into(),
                 sidecar_a.clone(),
             )]),
-            video_pin_blobs: std::collections::HashMap::from([(first, vec![4, 5, 6])]),
+            video_pin_blobs: Arc::new(std::collections::HashMap::from([(first, vec![4, 5, 6])])),
         };
         let prepared_pin_changed = prepared_thumbnail_sources(pin_changed);
         let pin_changed_identity = prepared_pin_changed.identity;
-        request.root_thumbnail_sources = Some(Arc::new(prepared_pin_changed));
+        request.root_thumbnail_sources =
+            Some(navigation_sources(&app, &prepared, prepared_pin_changed));
         assert!(
             app.install_collection_navigation_root(&mut request, prepared, &target, false)
                 .is_some()
@@ -4000,7 +4419,7 @@ mod tests {
             app.top_level_grid_view
                 .collection_session()
                 .and_then(CollectionGridSession::installed_presentation)
-                .map(|installed| installed.thumbnail_source_identity),
+                .map(|installed| installed.sources.identity()),
             Some(pin_changed_identity),
         );
         app.shutdown_collection_runtime_for_exit();

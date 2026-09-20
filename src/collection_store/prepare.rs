@@ -63,6 +63,34 @@ pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
+/// A classified order is reusable only for this exact actor revision and display projection.
+/// Callers add their own presentation or Remote policy keys before retaining it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionPrepareReuseKey {
+    pub(crate) collection_id: super::CollectionId,
+    pub(crate) revision: u64,
+    pub(crate) display_order: crate::settings::GridDisplayOrder,
+}
+
+impl CollectionPrepareReuseKey {
+    pub(crate) fn new(
+        collection_id: super::CollectionId,
+        revision: u64,
+        display_order: &crate::settings::GridDisplayOrder,
+    ) -> Self {
+        Self {
+            collection_id,
+            revision,
+            display_order: display_order.clone(),
+        }
+    }
+
+    pub(crate) fn matches_prepared(&self, prepared: &CollectionPreparedSnapshot) -> bool {
+        self.collection_id == prepared.collection_id
+            && self.revision == prepared.collection_revision
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCollectionEntry {
     pub(crate) entry_id: CollectionEntryId,

@@ -12,7 +12,8 @@ const COLLECTION_GRID_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
     CollectionGridPhysicalLoadOrigin, CollectionGridPhysicalLoadOwner, CollectionGridPosition,
-    CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources,
+    CollectionGridPrepareReuseKey, CollectionGridPreparedInstall,
+    CollectionGridPreparedThumbnailSources, CollectionGridPresentationSources,
     CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
     CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
     CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
@@ -145,6 +146,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     settings: &crate::settings::Settings,
     cancel: &AtomicBool,
     auto_aspect_client: Option<&crate::auto_aspect_cache::CollectionAutoAspectCacheClient>,
+    pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
 ) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
     let perf_start = crate::perf::is_enabled().then(Instant::now);
     let classify_start = crate::perf::is_enabled().then(Instant::now);
@@ -239,7 +241,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     let thumbnail_sources = prepare_collection_grid_thumbnail_sources(
         CollectionGridThumbnailSources {
             video_sidecars: sidecars.by_video_path,
-            video_pin_blobs,
+            video_pin_blobs: Arc::new(video_pin_blobs),
         },
         cancel,
     );
@@ -288,6 +290,12 @@ pub(in crate::app) fn prepare_collection_grid_install(
         prepared,
         thumbnail_sources,
         auto_aspect_lookup,
+        reuse_key: CollectionGridPrepareReuseKey::new(
+            snapshot.collection_id(),
+            snapshot.revision(),
+            settings,
+            pin_stamp,
+        ),
     })
 }
 
@@ -930,21 +938,42 @@ impl App {
         if !self.collection_grid_source_open_owner_landed_is_current(owner, &path) {
             return false;
         }
-        if let Some(prepared) = owner.navigation_prepared.clone()
-            && let Some(session) = self.top_level_grid_view.collection_session_mut()
-        {
-            session.accepted_revision = prepared.collection_revision;
-            session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
-            let presentation = Arc::new(CollectionGridInstalledPresentation::new(
-                prepared,
-                CollectionGridThumbnailSourceIdentity::default(),
-            ));
-            session.load = if presentation.prepared.entries.is_empty() {
-                CollectionGridLoadState::Empty(presentation)
-            } else {
-                CollectionGridLoadState::Ready(presentation)
-            };
-            session.installed_items_generation = None;
+        if let Some(prepared) = owner.navigation_prepared.clone() {
+            let presentation = owner
+                .navigation_request
+                .as_ref()
+                .and_then(|request| request.root_thumbnail_sources.as_ref())
+                .map(|source_owner| {
+                    Arc::new(CollectionGridInstalledPresentation::from_prepared_sources(
+                        Arc::clone(&prepared),
+                        Arc::clone(&source_owner.sources),
+                        source_owner.reuse_key.clone(),
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    Arc::new(CollectionGridInstalledPresentation::new(
+                        prepared,
+                        CollectionGridPresentationSources::Oversized(
+                            CollectionGridThumbnailSourceIdentity::default(),
+                        ),
+                        self.collection_grid_prepare_reuse_key(
+                            owner.stamp.collection_id,
+                            owner.accepted_revision,
+                        ),
+                    ))
+                });
+            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                session.accepted_revision = presentation.prepared.collection_revision;
+                session.wanted_revision = session
+                    .wanted_revision
+                    .max(presentation.prepared.collection_revision);
+                session.load = if presentation.prepared.entries.is_empty() {
+                    CollectionGridLoadState::Empty(presentation)
+                } else {
+                    CollectionGridLoadState::Ready(presentation)
+                };
+                session.installed_items_generation = None;
+            }
         }
         self.commit_collection_grid_source_open(owner.anchor.clone(), path);
         true
@@ -1198,6 +1227,7 @@ impl App {
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
+        let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
         let auto_aspect_client = self
             .collection_auto_aspect_cache
             .as_ref()
@@ -1214,6 +1244,7 @@ impl App {
                     &settings,
                     &worker_cancel,
                     auto_aspect_client.as_ref(),
+                    pin_stamp,
                 );
                 let _ = sender.send(result);
             });
@@ -1587,6 +1618,11 @@ impl App {
                     let accepts = self.collection_grid_stamp_is_current(stamp)
                         && prepared.prepared.collection_id == stamp.collection_id
                         && prepared.prepared.collection_revision == exact_revision
+                        && prepared.reuse_key
+                            == self.collection_grid_prepare_reuse_key(
+                                stamp.collection_id,
+                                exact_revision,
+                            )
                         && self
                             .top_level_grid_view
                             .collection_session()
@@ -1620,6 +1656,13 @@ impl App {
                     if accepts {
                         self.apply_collection_grid_prepared_install(prepared, installed);
                         ctx.request_repaint();
+                    } else if self.collection_grid_stamp_is_current(stamp)
+                        && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    {
+                        session.load = CollectionGridLoadState::RequestNeeded {
+                            installed,
+                            not_before: None,
+                        };
                     }
                 }
                 Ok(Err(CollectionPrepareError::Cancelled)) => {
@@ -1686,6 +1729,19 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn collection_grid_prepare_reuse_key(
+        &self,
+        collection_id: crate::collection_store::CollectionId,
+        revision: u64,
+    ) -> CollectionGridPrepareReuseKey {
+        CollectionGridPrepareReuseKey::new(
+            collection_id,
+            revision,
+            &self.settings,
+            self.video_pin_db.as_ref().map(|db| db.mutation_stamp()),
+        )
+    }
+
     pub(in crate::app) fn apply_collection_grid_prepared_install(
         &mut self,
         install: CollectionGridPreparedInstall,
@@ -1696,9 +1752,22 @@ impl App {
             prepared,
             thumbnail_sources,
             auto_aspect_lookup,
+            reuse_key,
         } = install;
+        let presentation_sources =
+            if super::top_level_grid_view::collection_pin_blob_sizes_fit_retention_budget(
+                thumbnail_sources
+                    .payload
+                    .video_pin_blobs
+                    .values()
+                    .map(Vec::len),
+            ) {
+                CollectionGridPresentationSources::Retained(Arc::new(thumbnail_sources.clone()))
+            } else {
+                CollectionGridPresentationSources::Oversized(thumbnail_sources.identity)
+            };
         let CollectionGridPreparedThumbnailSources {
-            identity: thumbnail_source_identity,
+            identity: _,
             payload:
                 CollectionGridThumbnailSources {
                     video_sidecars,
@@ -1842,7 +1911,8 @@ impl App {
             session.installed_items_generation = Some(installed_generation);
             let presentation = Arc::new(CollectionGridInstalledPresentation::new(
                 prepared,
-                thumbnail_source_identity,
+                presentation_sources,
+                reuse_key,
             ));
             session.load = if presentation.prepared.entries.is_empty() {
                 CollectionGridLoadState::Empty(presentation)
@@ -1894,11 +1964,16 @@ impl App {
         prepared: Arc<CollectionPreparedSnapshot>,
         previous: Option<Arc<CollectionPreparedSnapshot>>,
     ) {
+        let reuse_key = self.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
                 thumbnail_sources: CollectionGridPreparedThumbnailSources::default(),
                 auto_aspect_lookup: None,
+                reuse_key,
             },
             previous,
         );
@@ -1916,7 +1991,7 @@ impl App {
             image_metas,
             selected,
             std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
+            Arc::new(std::collections::HashMap::new()),
             collection_seed,
         );
     }
@@ -1927,7 +2002,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         selected: Option<usize>,
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
-        video_pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+        video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
         // A grid menu owns the old item generation. Do not let its saved row index operate on

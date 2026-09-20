@@ -532,21 +532,95 @@ pub(crate) struct CollectionGridPreparedInstall {
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
     pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailSources,
     pub(crate) auto_aspect_lookup: Option<crate::auto_aspect_cache::CollectionAutoAspectLookup>,
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CollectionGridThumbnailSources {
     pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
-    pub(crate) video_pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>>,
+    pub(crate) video_pin_blobs: std::sync::Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CollectionGridThumbnailSourceIdentity(pub(crate) [u8; 32]);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CollectionGridPreparedThumbnailSources {
     pub(crate) identity: CollectionGridThumbnailSourceIdentity,
     pub(crate) payload: CollectionGridThumbnailSources,
+}
+
+pub(crate) const MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn collection_pin_blob_sizes_fit_retention_budget(
+    lengths: impl IntoIterator<Item = usize>,
+) -> bool {
+    lengths
+        .into_iter()
+        .try_fold(0usize, |sum, length| sum.checked_add(length))
+        .is_some_and(|total| total <= MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPrepareReuseKey {
+    pub(crate) order: crate::collection_store::CollectionPrepareReuseKey,
+    pub(crate) sidecar_scan_fingerprint: i64,
+    pub(crate) skip_image_if_video_exists: bool,
+    pub(crate) video_thumb_use_sidecar_image: bool,
+    pub(crate) pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+}
+
+impl CollectionGridPrepareReuseKey {
+    pub(crate) fn new(
+        collection_id: crate::collection_store::CollectionId,
+        revision: u64,
+        settings: &crate::settings::Settings,
+        pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    ) -> Self {
+        Self {
+            order: crate::collection_store::CollectionPrepareReuseKey::new(
+                collection_id,
+                revision,
+                &settings.grid_display_order,
+            ),
+            sidecar_scan_fingerprint: super::folder_scan::image_page_recognition_fingerprint(
+                settings,
+            ),
+            skip_image_if_video_exists: settings.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            pin_stamp,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPresentationSources {
+    Retained(std::sync::Arc<CollectionGridPreparedThumbnailSources>),
+    Oversized(CollectionGridThumbnailSourceIdentity),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridNavigationSources {
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+    pub(crate) sources: std::sync::Arc<CollectionGridPreparedThumbnailSources>,
+}
+
+impl CollectionGridPresentationSources {
+    pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
+        match self {
+            Self::Retained(sources) => sources.identity,
+            Self::Oversized(identity) => *identity,
+        }
+    }
+
+    pub(crate) fn retained(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridPreparedThumbnailSources>> {
+        match self {
+            Self::Retained(sources) => Some(sources),
+            Self::Oversized(_) => None,
+        }
+    }
 }
 
 impl PartialEq for CollectionGridPreparedThumbnailSources {
@@ -569,17 +643,34 @@ impl Default for CollectionGridPreparedThumbnailSources {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionGridInstalledPresentation {
     pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
-    pub(crate) thumbnail_source_identity: CollectionGridThumbnailSourceIdentity,
+    pub(crate) sources: CollectionGridPresentationSources,
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
 }
 
 impl CollectionGridInstalledPresentation {
+    pub(crate) fn from_prepared_sources(
+        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+        sources: std::sync::Arc<CollectionGridPreparedThumbnailSources>,
+        reuse_key: CollectionGridPrepareReuseKey,
+    ) -> Self {
+        let retained = if collection_pin_blob_sizes_fit_retention_budget(
+            sources.payload.video_pin_blobs.values().map(Vec::len),
+        ) {
+            CollectionGridPresentationSources::Retained(sources)
+        } else {
+            CollectionGridPresentationSources::Oversized(sources.identity)
+        };
+        Self::new(prepared, retained, reuse_key)
+    }
     pub(crate) fn new(
         prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
-        thumbnail_source_identity: CollectionGridThumbnailSourceIdentity,
+        sources: CollectionGridPresentationSources,
+        reuse_key: CollectionGridPrepareReuseKey,
     ) -> Self {
         Self {
             prepared,
-            thumbnail_source_identity,
+            sources,
+            reuse_key,
         }
     }
 
@@ -587,9 +678,18 @@ impl CollectionGridInstalledPresentation {
     pub(crate) fn without_thumbnail_sources(
         prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
     ) -> std::sync::Arc<Self> {
+        let settings = crate::settings::Settings::default();
         std::sync::Arc::new(Self::new(
-            prepared,
-            CollectionGridThumbnailSourceIdentity::default(),
+            std::sync::Arc::clone(&prepared),
+            CollectionGridPresentationSources::Oversized(
+                CollectionGridThumbnailSourceIdentity::default(),
+            ),
+            CollectionGridPrepareReuseKey::new(
+                prepared.collection_id,
+                prepared.collection_revision,
+                &settings,
+                None,
+            ),
         ))
     }
 }
@@ -1104,6 +1204,13 @@ impl TopLevelGridView {
 
     pub(crate) fn collection_navigation_pending(&self) -> bool {
         self.collection_navigation_pending.is_some()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn collection_navigation_pending_for_test(
+        &self,
+    ) -> Option<&super::collection_navigation::CollectionNavigationPending> {
+        self.collection_navigation_pending.as_ref()
     }
 
     pub(in crate::app) fn collection_navigation_owns_fs_lock(&self) -> bool {

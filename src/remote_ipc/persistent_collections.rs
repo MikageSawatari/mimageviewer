@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, select_biased};
@@ -16,8 +16,8 @@ use mimageviewer_ipc::{
     PersistentCollectionSnapshotRequest, PersistentCollectionSnapshotResponse,
     PersistentCollectionSparseTarget, PersistentCollectionSummary,
     PersistentCollectionTargetPosition, RemoteAddress, RemoteEntryKind, RemotePagePresentationRole,
-    RemoteReadingDirection, RemoteSingletonSpreadPlacement, RemoteSpreadMode, RequestId,
-    ServerMessage,
+    RemoteReadingDirection, RemoteSessionIdentity, RemoteSingletonSpreadPlacement,
+    RemoteSpreadMode, RequestId, ServerMessage,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use crate::collection_store::{
     CollectionCatalogSnapshot, CollectionEntryId, CollectionId, CollectionNavigationAnchor,
     CollectionNavigationAnchorResolution, CollectionNavigationDirection,
     CollectionNavigationEntryIdentity, CollectionNavigationTail, CollectionNavigationTargetKind,
-    CollectionOrderMode, CollectionPreparedNavigationCandidates,
+    CollectionOrderMode, CollectionPrepareReuseKey, CollectionPreparedNavigationCandidates,
     CollectionPreparedNavigationTarget, CollectionPreparedSnapshot,
     CollectionRemoteProducerControl, CollectionRemoteRequestLease, CollectionResolvedKind,
     CollectionRevisionNotice, CollectionRevisionWatch, CollectionSnapshot,
@@ -45,6 +45,63 @@ const MAX_REMOTE_COLLECTION_CATALOG: usize = 100_000;
 #[derive(Clone)]
 pub(super) struct PersistentCollectionEngine {
     producer: CollectionRemoteProducerControl,
+    cache: Arc<Mutex<PersistentCollectionViewCache>>,
+}
+
+#[derive(Default)]
+struct PersistentCollectionViewCache {
+    refresh_epoch: u64,
+    owner: Option<RemoteSessionIdentity>,
+    entry: Option<PersistentCollectionCachedView>,
+}
+
+#[derive(Clone, Copy)]
+enum ViewPublication {
+    SnapshotRefresh,
+    Navigation,
+}
+
+impl PersistentCollectionViewCache {
+    fn accepts_publication(
+        &self,
+        epoch: u64,
+        owner: &RemoteSessionIdentity,
+        collection_id: CollectionId,
+        revision: u64,
+    ) -> bool {
+        self.refresh_epoch == epoch
+            && self.owner.as_ref() == Some(owner)
+            && !self.entry.as_ref().is_some_and(|entry| {
+                entry.owner == *owner
+                    && entry.key.order.collection_id == collection_id
+                    && entry.key.order.revision > revision
+            })
+    }
+}
+
+#[derive(Clone)]
+struct PersistentCollectionCachedView {
+    owner: RemoteSessionIdentity,
+    key: PersistentCollectionViewKey,
+    prepared: Arc<CollectionPreparedSnapshot>,
+    facts: Arc<PersistentCollectionViewFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistentCollectionViewKey {
+    order: CollectionPrepareReuseKey,
+    spread: SpreadRequest,
+    spread_page_gap_px: u32,
+}
+
+impl PersistentCollectionViewKey {
+    fn new(id: CollectionId, revision: u64, settings: &Settings, spread: SpreadRequest) -> Self {
+        Self {
+            order: CollectionPrepareReuseKey::new(id, revision, &settings.grid_display_order),
+            spread,
+            spread_page_gap_px: settings.spread_page_gap_px,
+        }
+    }
 }
 
 struct PersistentCollectionViewFacts {
@@ -118,7 +175,7 @@ fn stream_bounded_wire_entries<T>(
 
 struct ExactPrepared {
     loaded: CollectionSnapshot,
-    prepared: CollectionPreparedSnapshot,
+    prepared: Arc<CollectionPreparedSnapshot>,
     /// Subscribe-before-load watch retained through response construction.
     watch: CollectionRevisionWatch,
 }
@@ -143,7 +200,7 @@ impl ExactPrepared {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpreadRequest {
     mode: Option<RemoteSpreadMode>,
     direction: Option<RemoteReadingDirection>,
@@ -152,7 +209,99 @@ struct SpreadRequest {
 
 impl PersistentCollectionEngine {
     pub(super) fn new(producer: CollectionRemoteProducerControl) -> Self {
-        Self { producer }
+        Self {
+            producer,
+            cache: Arc::new(Mutex::new(PersistentCollectionViewCache::default())),
+        }
+    }
+
+    fn begin_snapshot_refresh(&self, owner: &RemoteSessionIdentity) -> u64 {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.refresh_epoch = cache.refresh_epoch.wrapping_add(1);
+        cache.owner = Some(owner.clone());
+        cache.entry = None;
+        cache.refresh_epoch
+    }
+
+    fn navigation_cache_candidate(
+        &self,
+        owner: &RemoteSessionIdentity,
+        id: CollectionId,
+        settings: &Settings,
+        spread: SpreadRequest,
+    ) -> (u64, Option<PersistentCollectionCachedView>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.owner.as_ref() != Some(owner) {
+            cache.refresh_epoch = cache.refresh_epoch.wrapping_add(1);
+            cache.owner = Some(owner.clone());
+            cache.entry = None;
+        }
+        let candidate = cache
+            .entry
+            .as_ref()
+            .filter(|entry| {
+                entry.owner == *owner
+                    && entry.key
+                        == PersistentCollectionViewKey::new(
+                            id,
+                            entry.key.order.revision,
+                            settings,
+                            spread,
+                        )
+            })
+            .cloned();
+        (cache.refresh_epoch, candidate)
+    }
+
+    fn publish_view(
+        &self,
+        epoch: u64,
+        owner: &RemoteSessionIdentity,
+        exact: &ExactPrepared,
+        facts: &Arc<PersistentCollectionViewFacts>,
+        settings: &Settings,
+        spread: SpreadRequest,
+        lease: &CollectionRemoteRequestLease,
+        cancellation: &RemoteOperationCancellation,
+        deadline: Instant,
+        publication: ViewPublication,
+    ) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !request_is_current(lease, cancellation, deadline)
+            || !cache.accepts_publication(
+                epoch,
+                owner,
+                exact.prepared.collection_id,
+                exact.prepared.collection_revision,
+            )
+        {
+            return;
+        }
+        cache.entry = Some(PersistentCollectionCachedView {
+            owner: owner.clone(),
+            key: PersistentCollectionViewKey::new(
+                exact.prepared.collection_id,
+                exact.prepared.collection_revision,
+                settings,
+                spread,
+            ),
+            prepared: Arc::clone(&exact.prepared),
+            facts: Arc::clone(facts),
+        });
+        if matches!(publication, ViewPublication::SnapshotRefresh) {
+            // A navigate that began while this explicit refresh was rebuilding facts may have
+            // observed the same start epoch. Its older result must not replace this refresh.
+            cache.refresh_epoch = cache.refresh_epoch.wrapping_add(1);
+        }
     }
 
     fn view_facts(
@@ -236,6 +385,22 @@ impl PersistentCollectionEngine {
             return Err(request_interrupted_error(cancellation, deadline));
         }
         Ok(facts)
+    }
+
+    fn navigation_view_facts(
+        &self,
+        cached: Option<&PersistentCollectionCachedView>,
+        exact: &ExactPrepared,
+        settings: &Settings,
+        spread: SpreadRequest,
+        lease: &CollectionRemoteRequestLease,
+        cancellation: &RemoteOperationCancellation,
+        deadline: Instant,
+    ) -> Result<Arc<PersistentCollectionViewFacts>, PersistentCollectionError> {
+        match cached.filter(|cached| Arc::ptr_eq(&cached.prepared, &exact.prepared)) {
+            Some(cached) => Ok(Arc::clone(&cached.facts)),
+            None => self.view_facts(exact, settings, spread, lease, cancellation, deadline),
+        }
     }
 
     pub(super) fn catalog(
@@ -337,6 +502,7 @@ impl PersistentCollectionEngine {
         &self,
         request_id: RequestId,
         request: PersistentCollectionSnapshotRequest,
+        owner: &RemoteSessionIdentity,
         cancellation: &RemoteOperationCancellation,
     ) -> PersistentCollectionSnapshotResponse {
         let id = match parse_collection_id(&request.collection_id) {
@@ -358,9 +524,10 @@ impl PersistentCollectionEngine {
             direction: request.reading_direction,
             force_single: request.force_single_page,
         };
+        let cache_epoch = self.begin_snapshot_refresh(owner);
         let deadline = Instant::now() + EXACT_REQUEST_BUDGET;
         'exact: for _ in 0..MAX_EXACT_RESTARTS {
-            let exact = match exact_prepared(&lease, cancellation, id, &settings, deadline) {
+            let exact = match exact_prepared(&lease, cancellation, id, &settings, deadline, None) {
                 Ok(value) => value,
                 Err(value) => return PersistentCollectionSnapshotResponse::Error(value),
             };
@@ -390,6 +557,18 @@ impl PersistentCollectionEngine {
                     deadline,
                 ));
             }
+            self.publish_view(
+                cache_epoch,
+                owner,
+                &exact,
+                &facts,
+                &settings,
+                spread,
+                &lease,
+                cancellation,
+                deadline,
+                ViewPublication::SnapshotRefresh,
+            );
             return PersistentCollectionSnapshotResponse::Success(payload);
         }
         PersistentCollectionSnapshotResponse::Error(busy_error())
@@ -399,6 +578,7 @@ impl PersistentCollectionEngine {
         &self,
         request_id: RequestId,
         request: PersistentCollectionNavigateRequest,
+        owner: &RemoteSessionIdentity,
         cancellation: &RemoteOperationCancellation,
     ) -> PersistentCollectionNavigateResponse {
         let id = match parse_collection_id(&request.collection_id) {
@@ -433,17 +613,32 @@ impl PersistentCollectionEngine {
             direction: request.reading_direction,
             force_single: request.force_single_page,
         };
+        let (cache_epoch, cached) = self.navigation_cache_candidate(owner, id, &settings, spread);
         let deadline = Instant::now() + EXACT_REQUEST_BUDGET;
         'exact: for _ in 0..MAX_EXACT_RESTARTS {
-            let exact = match exact_prepared(&lease, cancellation, id, &settings, deadline) {
+            let exact = match exact_prepared(
+                &lease,
+                cancellation,
+                id,
+                &settings,
+                deadline,
+                cached.as_ref(),
+            ) {
                 Ok(value) => value,
                 Err(value) => return PersistentCollectionNavigateResponse::Error(value),
             };
-            let facts =
-                match self.view_facts(&exact, &settings, spread, &lease, cancellation, deadline) {
-                    Ok(facts) => facts,
-                    Err(value) => return PersistentCollectionNavigateResponse::Error(value),
-                };
+            let facts = match self.navigation_view_facts(
+                cached.as_ref(),
+                &exact,
+                &settings,
+                spread,
+                &lease,
+                cancellation,
+                deadline,
+            ) {
+                Ok(facts) => facts,
+                Err(value) => return PersistentCollectionNavigateResponse::Error(value),
+            };
             let exact_view_token = facts.token.clone();
             let anchor = match request
                 .anchor
@@ -635,6 +830,18 @@ impl PersistentCollectionEngine {
                         deadline,
                     ));
                 }
+                self.publish_view(
+                    cache_epoch,
+                    owner,
+                    &exact,
+                    &facts,
+                    &settings,
+                    spread,
+                    &lease,
+                    cancellation,
+                    deadline,
+                    ViewPublication::Navigation,
+                );
                 return response;
             }
             let reason = if eligible_count == 0 {
@@ -673,6 +880,18 @@ impl PersistentCollectionEngine {
                     deadline,
                 ));
             }
+            self.publish_view(
+                cache_epoch,
+                owner,
+                &exact,
+                &facts,
+                &settings,
+                spread,
+                &lease,
+                cancellation,
+                deadline,
+                ViewPublication::Navigation,
+            );
             return response;
         }
         PersistentCollectionNavigateResponse::Error(busy_error())
@@ -752,6 +971,7 @@ fn exact_prepared(
     collection_id: CollectionId,
     settings: &Settings,
     deadline: Instant,
+    reuse: Option<&PersistentCollectionCachedView>,
 ) -> Result<ExactPrepared, PersistentCollectionError> {
     for _ in 0..MAX_EXACT_RESTARTS {
         if Instant::now() >= deadline {
@@ -783,6 +1003,27 @@ fn exact_prepared(
         }
         let loaded = actor_result??;
         let mut observed = watch.take_latest();
+        if let Some(cached) = reuse.filter(|cached| {
+            cached.key.order
+                == CollectionPrepareReuseKey::new(
+                    collection_id,
+                    loaded.revision(),
+                    &settings.grid_display_order,
+                )
+                && cached.key.order.matches_prepared(&cached.prepared)
+        }) {
+            if notice_invalidates(&loaded, observed.as_ref()) {
+                continue;
+            }
+            if !request_is_current(lease, cancellation, deadline) {
+                return Err(request_interrupted_error(cancellation, deadline));
+            }
+            return Ok(ExactPrepared {
+                loaded,
+                prepared: Arc::clone(&cached.prepared),
+                watch,
+            });
+        }
         let prepare_start = crate::perf::is_enabled().then(Instant::now);
         let prepared = prepare_collection_snapshot_while(
             &loaded,
@@ -864,7 +1105,7 @@ fn exact_prepared(
         );
         return Ok(ExactPrepared {
             loaded,
-            prepared,
+            prepared: Arc::new(prepared),
             watch,
         });
     }
@@ -2422,5 +2663,228 @@ mod tests {
                 last_known_kind: Some(RemoteEntryKind::Image)
             }
         ));
+    }
+
+    #[test]
+    fn view_cache_is_one_session_exact_key_and_explicit_refresh_retires_old_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            temp.path().join("collection.db"),
+        )
+        .unwrap();
+        let engine =
+            PersistentCollectionEngine::new(CollectionRemoteProducerControl::new(runtime.client()));
+        let prepared = Arc::new(prepared(vec![prepared_entry(
+            "11111111-1111-4111-8111-111111111111",
+            r"C:\collection\one.jpg",
+        )]));
+        let owner = RemoteSessionIdentity {
+            client_id: "device".into(),
+            session_id: "session-a".into(),
+        };
+        let other = RemoteSessionIdentity {
+            client_id: "device".into(),
+            session_id: "session-b".into(),
+        };
+        let settings = Settings::default();
+        let spread = SpreadRequest {
+            mode: Some(RemoteSpreadMode::Single),
+            direction: Some(RemoteReadingDirection::Ltr),
+            force_single: false,
+        };
+        let facts = Arc::new(PersistentCollectionViewFacts {
+            token: "exact".into(),
+            configured: RemoteSpreadMode::Single,
+            effective: RemoteSpreadMode::Single,
+            direction: RemoteReadingDirection::Ltr,
+            entries: Arc::from([]),
+            groups: Arc::from([]),
+            remote_eligible: Arc::from([]),
+        });
+        {
+            let mut cache = engine.cache.lock().unwrap();
+            cache.owner = Some(owner.clone());
+            cache.entry = Some(PersistentCollectionCachedView {
+                owner: owner.clone(),
+                key: PersistentCollectionViewKey::new(
+                    prepared.collection_id,
+                    prepared.collection_revision,
+                    &settings,
+                    spread,
+                ),
+                prepared: Arc::clone(&prepared),
+                facts: Arc::clone(&facts),
+            });
+        }
+        let (epoch, hit) =
+            engine.navigation_cache_candidate(&owner, prepared.collection_id, &settings, spread);
+        let hit = hit.expect("same owner/revision/settings reuses full wire facts");
+        assert!(Arc::ptr_eq(&hit.prepared, &prepared));
+        assert!(Arc::ptr_eq(&hit.facts, &facts));
+        let another_collection = CollectionId::new();
+        assert!(engine.cache.lock().unwrap().accepts_publication(
+            epoch,
+            &owner,
+            another_collection,
+            0,
+        ));
+        assert!(!engine.cache.lock().unwrap().accepts_publication(
+            epoch,
+            &owner,
+            prepared.collection_id,
+            0,
+        ));
+        let mut changed = settings.clone();
+        changed.spread_page_gap_px += 1;
+        assert!(
+            engine
+                .navigation_cache_candidate(&owner, prepared.collection_id, &changed, spread)
+                .1
+                .is_none()
+        );
+        assert!(
+            engine
+                .navigation_cache_candidate(
+                    &owner,
+                    prepared.collection_id,
+                    &settings,
+                    SpreadRequest {
+                        force_single: true,
+                        ..spread
+                    }
+                )
+                .1
+                .is_none()
+        );
+
+        let refreshed_epoch = engine.begin_snapshot_refresh(&owner);
+        assert_ne!(epoch, refreshed_epoch);
+        assert!(
+            engine
+                .navigation_cache_candidate(&owner, prepared.collection_id, &settings, spread)
+                .1
+                .is_none()
+        );
+        assert!(!engine.cache.lock().unwrap().accepts_publication(
+            epoch,
+            &owner,
+            prepared.collection_id,
+            prepared.collection_revision
+        ));
+        let (_, cross_session) =
+            engine.navigation_cache_candidate(&other, prepared.collection_id, &settings, spread);
+        assert!(cross_session.is_none());
+        assert!(!engine.cache.lock().unwrap().accepts_publication(
+            refreshed_epoch,
+            &owner,
+            prepared.collection_id,
+            prepared.collection_revision
+        ));
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn navigation_reuses_actor_checked_prepared_and_full_wire_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            temp.path().join("collection.db"),
+        )
+        .unwrap();
+        let engine =
+            PersistentCollectionEngine::new(CollectionRemoteProducerControl::new(runtime.client()));
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match runtime.try_recv_event() {
+                Some(crate::collection_store::CollectionRuntimeEvent::Ready(_)) => break,
+                Some(event) => panic!("collection startup failed: {event:?}"),
+                None => assert!(
+                    Instant::now() < startup_deadline,
+                    "collection startup timed out"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let created = runtime
+            .client()
+            .create_collection("cached".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let id = created.collection_id();
+        let lease = engine.producer.begin_request().unwrap();
+        let (cancellation, _wake_tx) = RemoteOperationCancellation::for_test();
+        let settings = Settings::default();
+        let spread = SpreadRequest {
+            mode: Some(RemoteSpreadMode::Single),
+            direction: Some(RemoteReadingDirection::Ltr),
+            force_single: false,
+        };
+        let deadline = Instant::now() + EXACT_REQUEST_BUDGET;
+        let initial = exact_prepared(&lease, &cancellation, id, &settings, deadline, None).unwrap();
+        let facts = engine
+            .view_facts(&initial, &settings, spread, &lease, &cancellation, deadline)
+            .unwrap();
+        let owner = RemoteSessionIdentity {
+            client_id: "device".into(),
+            session_id: "session".into(),
+        };
+        let epoch = engine.begin_snapshot_refresh(&owner);
+        engine.publish_view(
+            epoch,
+            &owner,
+            &initial,
+            &facts,
+            &settings,
+            spread,
+            &lease,
+            &cancellation,
+            deadline,
+            ViewPublication::SnapshotRefresh,
+        );
+        let (_, cached) = engine.navigation_cache_candidate(&owner, id, &settings, spread);
+        let cached = cached.expect("snapshot published the exact view");
+        let again = exact_prepared(
+            &lease,
+            &cancellation,
+            id,
+            &settings,
+            deadline,
+            Some(&cached),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&again.prepared, &initial.prepared));
+        let reused = engine
+            .navigation_view_facts(
+                Some(&cached),
+                &again,
+                &settings,
+                spread,
+                &lease,
+                &cancellation,
+                deadline,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&reused, &facts));
+        let renamed = runtime
+            .client()
+            .rename_collection(id, created.revision(), "changed".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let changed = exact_prepared(
+            &lease,
+            &cancellation,
+            id,
+            &settings,
+            deadline,
+            Some(&cached),
+        )
+        .unwrap();
+        assert_eq!(changed.prepared.collection_revision, renamed.revision());
+        assert!(!Arc::ptr_eq(&changed.prepared, &initial.prepared));
+        drop(lease);
+        runtime.shutdown_and_join();
     }
 }

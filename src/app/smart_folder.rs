@@ -6730,7 +6730,7 @@ impl App {
                 Arc::clone(&self.cancel_token),
                 video_items,
                 self.video_thumb_overrides.clone(),
-                HashMap::new(),
+                Arc::new(HashMap::new()),
             );
         }
         self.items_are_global_search_view = false;

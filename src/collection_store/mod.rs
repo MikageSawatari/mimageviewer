@@ -16,10 +16,11 @@ pub use path::{CollectionImportPathPolicy, CollectionSourcePath};
 pub(crate) use prepare::{
     CollectionNavigationAnchor, CollectionNavigationAnchorResolution,
     CollectionNavigationDirection, CollectionNavigationEntryIdentity, CollectionNavigationTail,
-    CollectionNavigationTargetKind, CollectionPrepareError, CollectionPreparedNavigationCandidates,
-    CollectionPreparedNavigationTarget, CollectionPreparedRegistration, CollectionPreparedSnapshot,
-    CollectionSourcePreparation, PreparedCollectionEntry, inspect_collection_source,
-    prepare_collection_export, prepare_collection_registrations, prepare_collection_snapshot,
+    CollectionNavigationTargetKind, CollectionPrepareError, CollectionPrepareReuseKey,
+    CollectionPreparedNavigationCandidates, CollectionPreparedNavigationTarget,
+    CollectionPreparedRegistration, CollectionPreparedSnapshot, CollectionSourcePreparation,
+    PreparedCollectionEntry, inspect_collection_source, prepare_collection_export,
+    prepare_collection_registrations, prepare_collection_snapshot,
     prepare_collection_snapshot_while, resolve_prepared_collection_navigation,
     write_collection_export_atomic,
 };

@@ -167,6 +167,18 @@ pub(crate) struct RemoteOperationCancellation {
 }
 
 impl RemoteOperationCancellation {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, crossbeam_channel::Sender<()>) {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        (
+            Self {
+                flag: Arc::new(AtomicBool::new(false)),
+                wake_rx,
+            },
+            wake_tx,
+        )
+    }
+
     pub(crate) fn flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.flag)
     }

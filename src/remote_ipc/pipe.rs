@@ -1051,11 +1051,11 @@ fn worker_loop(
                             },
                         }
                     }
-                    ClientMessage::PersistentCollectionSnapshot { id, request, .. } => {
+                    ClientMessage::PersistentCollectionSnapshot { id, request, owner } => {
                         match persistent_collection_engine {
                             Some(engine) => ServerMessage::PersistentCollectionSnapshot {
                                 id,
-                                response: engine.snapshot(id, request, &session_cancel),
+                                response: engine.snapshot(id, request, &owner, &session_cancel),
                             },
                             None => ServerMessage::PersistentCollectionSnapshot {
                                 id,
@@ -1066,11 +1066,11 @@ fn worker_loop(
                             },
                         }
                     }
-                    ClientMessage::PersistentCollectionNavigate { id, request, .. } => {
+                    ClientMessage::PersistentCollectionNavigate { id, request, owner } => {
                         match persistent_collection_engine {
                             Some(engine) => ServerMessage::PersistentCollectionNavigate {
                                 id,
-                                response: engine.navigate(id, request, &session_cancel),
+                                response: engine.navigate(id, request, &owner, &session_cancel),
                             },
                             None => ServerMessage::PersistentCollectionNavigate {
                                 id,

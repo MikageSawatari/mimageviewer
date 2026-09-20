@@ -1505,7 +1505,7 @@ impl App {
             new_cancel,
             candidates,
             std::collections::HashMap::new(),
-            pin_blobs,
+            std::sync::Arc::new(pin_blobs),
         );
     }
 

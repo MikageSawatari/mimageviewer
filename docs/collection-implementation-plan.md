@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7 前半（登録上限・import資源上限・preview仮想化）は実装・自動検証・Codex 独立レビュー完了。同節のprepare再利用は未着手。§23.4 / §23.6 / A-6 / D-4 は実機確認待ち。A-6 / D-4 の統合 full gate / build は2026-09-20に通過した。§23.7 前半のfull gate / buildは後続prepare再利用と統合する。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7（登録上限・import資源上限・preview仮想化・PC/Remote prepare再利用）は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 / §23.7 は実機確認待ち。A-6 / D-4 の統合 full gate / build と、§23.7 前後半の統合 full gate / build は2026-09-20に通過した。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1328,11 +1328,41 @@ worker実読込 1件、長path preview snapshot 1件を通過し、snapshot PNG�
 bin check / fmt / UI glyph / viewer context audit / diff checkも通過。独立reviewerは追加blockingなしで
 前半差分を受理した。GUIは起動していない。
 - navigation の prepare は、actor revision が installed と一致し installed presentation が存在する場合、
-  選ばれた target entry（と隣接数件）だけ availability を確認し、全件 stat は revision 前進と明示更新に限る。
+  選ばれた target entry（と隣接数件）だけ availability を確認し、全件 stat は revision 前進、明示更新、保持予算超過など再利用不能時に行う。
   Remote の `persistent_collections.rs` も同じ helper を使う。
   2026-09-20、利用者は速度優先で、外部ツールによる変更の自動反映を保証せず、mIV が認識した
   一覧・並び順を保持する方針を承認した。mIV 内の編集・名前変更への追従と、実際の移動先・Remote
-  公開範囲の検証は維持する。再取得契機は後続の実装設計で明記する（本項は未実装）。
+  公開範囲の検証は維持する。再取得契機は以下に記す。
+
+2026-09-20、後半 B-4 / D-2 は同じ actor collection ID・revision・GridDisplayOrder を
+`CollectionPrepareReuseKey` として PC / Remote の再利用判定に共用する。PC は viewer context の
+`Ready / Empty` が持つ実サムネイル情報と、sidecar 判定設定・動画 pin DB instance / 成功書込世代まで
+一致するときだけ navigation の全件 prepare を省く。可視 root の同一 binding は cursor だけを進め、
+child から root へ戻る場合は保持した sidecar と pin payload から再設置する。pin WebP は動画 worker と
+`Arc` で共有して複製しない。長期保持する pin BLOB の合計が 64 MiB を超える場合だけ保持せず、
+次の移動は従来の完全 prepare に戻す。表示する項目・ピン・並び順はこの予算で省略しない。
+アプリ内 pin 変更の成功、collection revision 前進、表示設定変更、明示更新 / 開き直し、source
+失効は再 prepare の契機とし、worker 開始・受信・着地直前に key と owner を再検証する。
+preflight は実際の移動先と見開き slot だけ再確認し、欠損候補は有限探索の次へ進める。
+
+Remote は共有 engine 全体で認証済み client / session ID を owner とする有界な 1 件だけに immutable prepared と full wire facts
+（公開可能列、token、prefix、見開き group）を保持し、navigate の actor watch / exact revision 確認後に
+同じ key なら全件 stat / path guard を省く。snapshot 要求は既存の明示更新として毎回再構築し、
+開始・完了 epoch で古い navigate の遅延結果が refresh を上書きしない。route / session / producer の
+取消、実 target / partner の path guard、HTTP 側再検証は従来どおり行う。外部編集は明示更新まで
+認識済み一覧へ自動反映しない。
+
+後半 B-4 / D-2 の焦点検証は PC navigation 26件、Collection grid 32件、Remote persistent
+collection 11件、video pin DB mutation stamp 1件が通過した。Remote の actor watch / load 後の
+prepared と full wire facts の `Arc` 再利用、別 collection ID の小さい revision への切替、PC の
+PhysicalSource owner 転送から root 再設置までの sidecar / pin payload 同一性も回帰で固定した。
+`cargo check`、fmt、UI glyph、viewer context audit、diff check と Codex 独立レビューは通過。
+§23.7 前後半を統合した `RUST_TEST_THREADS=1` の `scripts/test-full.ps1 -SuppressCrashDialogs` は
+`[test-full] PASS`、UI snapshot 53/53、process error mode `0x00008001` 復元を確認した。
+常駐 mIV がないことを確認して `scripts/build-dev.ps1 -PreserveRuntime` も `[build-dev] DONE`、
+core / Remote service 両実行ファイル生成、VCRT/PE 検査通過。アプリ・通常 profile・実データは起動していない。
+SHA-256 は core `BA9743D88BDB27674723349289D72F2B776D7CC406B3C2E0ACE999CC5FBBCDD4`、
+Remote service `9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5`。
 
 ### 23.8 バックアップと全件書き出し（仕様判断 5、K-1）
 

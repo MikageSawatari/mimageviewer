@@ -727,3 +727,15 @@ HTTPはtarget住所とpositionのkind・範囲を再検証し、見開きの片�
 画像seekにはStillImage位置だけを使う。可視prefixから位置を再計算せず、従来の
 session / route / token / revision失効と通常のFolder・集約Collection・child閲覧を維持する。
 独立レビューは追加blockingなしで受理し、core 8件、IPC 3件、HTTP焦点1件、Web 409件が通過した。
+
+## 18. 同revisionのprepared / wire facts再利用（D-2、2026-09-20）
+
+永続コレクションの `snapshot` は明示再読込として全件prepareと公開可能列・token・root prefixを
+作り直す。`navigate` は毎要求でsubscribe-before-loadのactor snapshotと現在revisionを確認するが、
+同じ認証済みclient / session、collection ID / revision、GridDisplayOrder、spread指定・page gapなら
+共有engineの1件だけ保持したimmutable preparedとfull wire factsを再利用する。可視prefixからordinalや
+公開可否を再計算しない。新しいsnapshotの開始・完了はcache epochを進め、先行navigateの遅延結果が
+明示再読込を上書きしない。session交代、revision / 設定変更、producer終了ではcache hitしない。
+実際に採用するtargetと見開きpartnerは毎回再stat・path guardし、HTTP側の住所・公開scope再検証、
+token / revision / route / session取消と D-4 の媒体別位置も維持する。外部変更は利用者が承認した
+認識済み一覧固定に従い、明示snapshotまで全件の自動再分類は行わない。
