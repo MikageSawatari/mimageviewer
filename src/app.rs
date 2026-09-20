@@ -4699,6 +4699,7 @@ pub(crate) enum FolderOpenScanPurpose {
     /// cannot leak the selection into a later unrelated load.
     JumpToPhysicalFolder {
         selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+        origin: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     },
     /// A similar-result navigation to one exact image in a physical folder.  The
     /// completed scan and leaf identity move together; the current viewer is not
@@ -12910,7 +12911,7 @@ pub struct App {
 
     // ── 右クリックコンテキストメニュー ─────────────────────────
     /// コンテキストメニューの対象アイテムインデックス
-    pub(crate) context_menu_idx: Option<usize>,
+    pub(crate) context_menu_idx: Option<crate::ui_dialogs::context_menu::GridContextMenuOwner>,
     /// コンテキストメニューの表示座標 (右クリック時に記録)
     pub(crate) context_menu_pos: egui::Pos2,
     /// マウス右ドラッグのリングフリック状態。グリッド / フルスクリーンで共通。
@@ -40140,6 +40141,34 @@ impl App {
     ) -> Option<PathBuf> {
         use crate::ui_dialogs::context_menu::JumpToFolderDestination;
 
+        if let Some(origin) = request.origin.as_ref() {
+            let JumpToFolderDestination::PhysicalDirectory(path) = &request.destination else {
+                return None;
+            };
+            if !self.collection_jump_origin_is_current(path, &request.selection, origin) {
+                self.show_feedback_toast(
+                    "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
+                );
+                return None;
+            }
+            if self.sidecar_restore_active() {
+                return None;
+            }
+            if !self.snapshot_scope_allows_open(path, &OpenRequestOwner::Navigation) {
+                self.show_snapshot_out_of_scope_open_feedback();
+                return None;
+            }
+            // The collection root remains fully mounted until this scan is adopted.
+            self.start_folder_open_scan(
+                path.clone(),
+                FolderOpenScanPurpose::JumpToPhysicalFolder {
+                    selection: request.selection,
+                    origin: request.origin,
+                },
+            );
+            return None;
+        }
+
         self.dismiss_source_for_jump_to_folder(&request);
         let destination_label = request.destination.path().to_string_lossy().to_string();
 
@@ -40171,6 +40200,7 @@ impl App {
                     path,
                     FolderOpenScanPurpose::JumpToPhysicalFolder {
                         selection: request.selection,
+                        origin: None,
                     },
                 );
                 None
@@ -40182,6 +40212,65 @@ impl App {
                 ));
                 Some(path)
             }
+        }
+    }
+
+    fn collection_jump_origin_is_current(
+        &self,
+        destination: &Path,
+        selection: &crate::ui_dialogs::context_menu::JumpToFolderSelection,
+        origin: &top_level_grid_view::CollectionGridPhysicalLoadOwner,
+    ) -> bool {
+        use crate::ui_dialogs::context_menu::JumpToFolderSelection;
+        let JumpToFolderSelection::ExactPath(source) = selection else {
+            return false;
+        };
+        matches!(
+            &origin.origin,
+            top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root { .. }
+        ) && origin.accepted_revision == origin.wanted_revision
+            && !self.navigation_scope.is_detached_physical()
+            && crate::folder_tree::path_eq(source, &origin.root_source_path)
+            && source
+                .parent()
+                .is_some_and(|parent| crate::folder_tree::path_eq(parent, destination))
+            && self.collection_grid_physical_load_owner_is_current(origin, &origin.root_source_path)
+    }
+
+    fn apply_jump_to_physical_folder_ready(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+        origin: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+    ) {
+        if let Some(origin) = origin.as_ref() {
+            if !self.collection_jump_origin_is_current(&path, &selection, origin) {
+                if self.collection_grid_context_id() == origin.stamp.context_id {
+                    self.show_feedback_toast(
+                        "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
+                    );
+                }
+                return;
+            }
+            if self.sidecar_restore_active() {
+                return;
+            }
+            if !self.snapshot_scope_allows_open(&path, &OpenRequestOwner::Navigation) {
+                self.show_snapshot_out_of_scope_open_feedback();
+                return;
+            }
+            // A legacy basename hint must not override the exact source after adoption.
+            // Restore it if an unexpected load refusal leaves the root mounted.
+            let previous_hint = self.select_after_load.take();
+            if self.load_folder_with_scan_owned(path, Some(scan), OpenRequestOwner::Navigation) {
+                self.finish_jump_to_physical_folder_selection(selection);
+            } else {
+                self.select_after_load = previous_hint;
+            }
+        } else {
+            self.load_folder_with_scan(path, Some(scan));
+            self.finish_jump_to_physical_folder_selection(selection);
         }
     }
 
@@ -40556,9 +40645,8 @@ impl App {
                 ));
                 None
             }
-            FolderOpenScanPurpose::JumpToPhysicalFolder { selection } => {
-                self.load_folder_with_scan(ready.path, Some(scan));
-                self.finish_jump_to_physical_folder_selection(selection);
+            FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin } => {
+                self.apply_jump_to_physical_folder_ready(ready.path, scan, selection, origin);
                 None
             }
             FolderOpenScanPurpose::RequiredFullscreenTarget {
@@ -75096,9 +75184,11 @@ impl App {
                         purpose,
                     } = ready;
                     match (purpose, scan) {
-                        (FolderOpenScanPurpose::JumpToPhysicalFolder { selection }, Ok(scan)) => {
-                            self.load_folder_with_scan(path, Some(scan));
-                            self.finish_jump_to_physical_folder_selection(selection);
+                        (
+                            FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin },
+                            Ok(scan),
+                        ) => {
+                            self.apply_jump_to_physical_folder_ready(path, scan, selection, origin);
                             None
                         }
                         (FolderOpenScanPurpose::CurrentViewOrderRefresh { order }, Ok(scan)) => {

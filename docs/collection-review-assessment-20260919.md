@@ -129,3 +129,9 @@ egui の `context_menu_idx` は行番号しか持たず、開いている間の 
 items generation に結び付いたメニューの失効を採用境界で扱い、古い番号で新しい項目を操作しない。
 新たな App bool / 独立 pending は作らない。検証は pending / error / cancel / supersede /
 stale revision・generation・context / 成功履歴 / exact selection / A・B / sibling 非干渉を対象とする。
+
+2026-09-20 実装: grid メニュー index は context / items generation を含む owner に統合し、
+同じ context の Collection 再 install でだけ失効させた。元 source の parent を非同期 scan し、
+成功時に通常 Navigation として採用する。元項目が一覧から消えていても親 Folder へ移動し、
+既存の exact 不在通知を出す。採用前の一覧 materialize や対象不在による移動拒否は加えない。
+焦点テスト・コンパイル・整形の結果は [実装計画 §23.6A](collection-implementation-plan.md#236a-コレクションから元の場所へ移動a-6) を正本とする。

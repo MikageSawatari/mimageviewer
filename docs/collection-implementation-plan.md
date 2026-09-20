@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 は実機確認待ち。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 は実機確認待ち。A-6 の物理位置移動は実装・焦点検証・独立レビュー完了（統合 gate / build 待ち）。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1282,6 +1282,32 @@ Busy/Starting 後に同じ revision の要求も落とさない。window を閉�
 
 この変更でコード上の一過性 admission 経路を扱うが、利用者が報告した一度だけの
 「ぱらどっとが読み込み中で止まった」事象は再現・原因特定されておらず、解決済みとは扱わない。
+
+### 23.6A コレクションから元の場所へ移動（A-6）
+
+コレクション root のセルメニューに「元の場所へ移動」を追加した。Folder 本体も含め、元 source の
+親ディレクトリを worker で走査し、元項目の実パスを exact selection として運ぶ。
+`JumpToFolderRequest` と既存 `FolderOpenScanPurpose::JumpToPhysicalFolder` が
+`CollectionGridPhysicalLoadOwner::Root` を開始から完了まで所有し、surface / context / revision /
+entry / source / items generation を開始時と ready 時に再検証する。Collection root の items、選択、
+scroll、address、history、cache は走査中に保持し、失敗・断線・取消・置換・stale・scope 拒否では
+退役しない。成功採用は `OpenRequestOwner::Navigation` に限り、物理 Folder として Collection→Path
+履歴を作る。元項目が走査後の一覧から消えた、または表示設定で除外されたときも親 Folder への移動は
+成功とし、既存の exact 不在通知を出して別項目を誤選択しない。
+
+grid メニューの保存対象は index 単独から context と items generation を持つ owner へ替えた。
+Collection の再 install は同じ context / generation の古いメニューだけを失効させ、別 viewer の
+メニューは保持する。A-6 のメニュー可否は元 source owner の実行前判定から導き、revision 更新待ち
+などは理由付きで無効化する。表示後に owner が失効した押下には再選択案内を出す。
+参照解除の可否は変更しない。Collection Fullscreen にはこの Grid 専用入口を出さない。
+Search / 閲覧履歴の既存 Jump は開始時に source を退役する従来契約を維持する。
+Windows の ready / scan error、共通 ready の成功・取消・revision / items / context stale、
+元項目不在、履歴、別 quick-folder 履歴、メニュー世代と既存 Search Jump の焦点回帰を通した。
+2026-09-20、独立 reviewer は追加 blocking なしで A-6 完成差分を受理した。
+`cargo check -p mimageviewer --bin mimageviewer-core`、焦点テスト（location 3、menu model 1、
+handler 1、既存 Search Jump 3）、`cargo fmt --all -- --check`、UI glyph、`git diff --check` は通過した。
+統合 full gate / `build-dev.ps1 -PreserveRuntime` は後続修正とまとめて実施する。
+GUI 起動・通常 profile / 実データ操作は行っていない。
 
 ### 23.7 上限と大量件数（仕様判断 3、B-1 / B-4 / D-2）
 

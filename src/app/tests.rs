@@ -11712,6 +11712,7 @@ mod phase_c_folder_nav_history_tests {
         let request = JumpToFolderRequest {
             destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
             selection: JumpToFolderSelection::ExactPath(selected_path.clone()),
+            origin: None,
         };
         assert!(app.begin_context_jump_to_folder(request).is_none());
 
@@ -11779,6 +11780,7 @@ mod phase_c_folder_nav_history_tests {
             app.begin_context_jump_to_folder(JumpToFolderRequest {
                 destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
                 selection: JumpToFolderSelection::ExactPath(book.clone()),
+                origin: None,
             })
             .is_none()
         );
@@ -11827,6 +11829,7 @@ mod phase_c_folder_nav_history_tests {
             let request = JumpToFolderRequest {
                 destination: JumpToFolderDestination::PhysicalDirectory(destination),
                 selection: JumpToFolderSelection::None,
+                origin: None,
             };
             assert!(app.begin_context_jump_to_folder(request).is_none());
             assert!(!app.favsearch.active);
@@ -11887,6 +11890,7 @@ mod phase_c_folder_nav_history_tests {
             app.begin_context_jump_to_folder(JumpToFolderRequest {
                 destination: JumpToFolderDestination::PhysicalDirectory(destination),
                 selection: JumpToFolderSelection::None,
+                origin: None,
             })
             .is_none()
         );
@@ -11926,6 +11930,7 @@ mod phase_c_folder_nav_history_tests {
                 target.parent().unwrap().to_path_buf(),
             ),
             selection: JumpToFolderSelection::ExactPath(target),
+            origin: None,
         });
 
         assert!(app.tag_view.active);
@@ -11962,6 +11967,7 @@ mod phase_c_folder_nav_history_tests {
                 .begin_context_jump_to_folder(JumpToFolderRequest {
                     destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
                     selection: JumpToFolderSelection::ExactPath(missing),
+                    origin: None,
                 })
                 .is_none()
         );
@@ -11995,6 +12001,7 @@ mod phase_c_folder_nav_history_tests {
                     selection: JumpToFolderSelection::ExactPath(
                         failed_destination.join("target.jpg"),
                     ),
+                    origin: None,
                 })
                 .is_none()
         );
@@ -12051,6 +12058,7 @@ mod phase_c_folder_nav_history_tests {
         let navigate = app.begin_context_jump_to_folder(JumpToFolderRequest {
             destination: JumpToFolderDestination::ArchiveContainer(archive.clone()),
             selection: JumpToFolderSelection::None,
+            origin: None,
         });
         assert_eq!(navigate.as_ref(), Some(&archive));
         assert!(matches!(

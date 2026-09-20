@@ -14313,7 +14313,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 idx,
             );
             self.update_last_selected_image();
-            self.context_menu_idx = Some(idx);
+            self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
             // アイテムメニューを開いた経路を残す。ヘッダ右クリックでこのメニューが
             // 出る間欠不具合 (§1.168) は再現待ちで、`context_menu_idx` を書くのは
@@ -14384,7 +14384,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 "[ctxmenu-probe] path=folder_bg pos={pos:?} view_mode={:?}",
                 self.settings.grid_view_mode
             ));
-            self.context_menu_idx = Some(usize::MAX);
+            self.context_menu_idx = Some(self.capture_grid_context_menu_owner(usize::MAX));
             self.context_menu_pos = pos;
             ctx.request_repaint();
         }
@@ -14525,7 +14525,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 idx,
             );
             self.update_last_selected_image();
-            self.context_menu_idx = Some(idx);
+            self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = pos;
             // §1.168 の経路特定用。cell 経路と同じ理由でここにも残す。
             crate::logger::log(format!(

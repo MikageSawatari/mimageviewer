@@ -29,9 +29,9 @@ fn primary_mouse_button_physically_down() -> bool {
 /// だけが先に走るという順序の脆さを避ける (Codex P3)。
 #[derive(Debug)]
 pub(crate) enum ContextMenuAction {
-    /// 検索結果 (Ctrl+G / Ctrl+S / タグ) または閲覧履歴から実フォルダへ着地する。
-    /// source surface の終了、destination、移動後の exact selection を一つの request に
-    /// 保持し、優先度判定でこの action が勝った後だけ適用する。
+    /// 検索結果・閲覧履歴・コレクション root から実フォルダへ着地する。
+    /// source、destination、移動後の exact selection を一つの request に保持し、
+    /// 優先度判定でこの action が勝った後だけ適用する。
     JumpToFolder(JumpToFolderRequest),
     /// ZIP/PDF/対応アーカイブを、グローバル設定ではなく明示モードで開く。
     OpenGridContainer {
@@ -68,6 +68,17 @@ pub(crate) enum JumpToFolderSelection {
 pub(crate) struct JumpToFolderRequest {
     pub(crate) destination: JumpToFolderDestination,
     pub(crate) selection: JumpToFolderSelection,
+    /// A collection root keeps its displayed generation until this exact source open commits.
+    pub(crate) origin: Option<crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+}
+
+/// The grid menu belongs to one viewer context and one immutable item generation.
+/// An index alone can name another collection entry after an async install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridContextMenuOwner {
+    pub(crate) index: usize,
+    pub(crate) context_id: crate::app::ViewerContextId,
+    pub(crate) items_generation: u64,
 }
 
 fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
@@ -77,6 +88,7 @@ fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
         GridItem::Folder(path) => Some(JumpToFolderRequest {
             destination: JumpToFolderDestination::PhysicalDirectory(native_nav_path(path)),
             selection: JumpToFolderSelection::None,
+            origin: None,
         }),
         GridItem::SearchContainer { path, kind, .. } => {
             let destination = match kind {
@@ -90,6 +102,7 @@ fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
             Some(JumpToFolderRequest {
                 destination,
                 selection: JumpToFolderSelection::None,
+                origin: None,
             })
         }
         _ => {
@@ -98,6 +111,7 @@ fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
             Some(JumpToFolderRequest {
                 destination: JumpToFolderDestination::PhysicalDirectory(destination),
                 selection: JumpToFolderSelection::ExactPath(exact_path),
+                origin: None,
             })
         }
     }
@@ -109,6 +123,7 @@ fn jump_to_book_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
     Some(JumpToFolderRequest {
         destination: JumpToFolderDestination::PhysicalDirectory(destination),
         selection: JumpToFolderSelection::ExactPath(exact_path),
+        origin: None,
     })
 }
 
@@ -760,6 +775,19 @@ fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
 }
 
 impl crate::app::App {
+    pub(crate) fn capture_grid_context_menu_owner(&self, index: usize) -> GridContextMenuOwner {
+        GridContextMenuOwner {
+            index,
+            context_id: self.collection_grid_context_id(),
+            items_generation: self.items_generation,
+        }
+    }
+
+    pub(crate) fn grid_context_menu_owner_is_current(&self, owner: GridContextMenuOwner) -> bool {
+        owner.context_id == self.collection_grid_context_id()
+            && owner.items_generation == self.items_generation
+    }
+
     fn show_bookmark_grid_context_menu(
         &mut self,
         ctx: &egui::Context,
@@ -855,7 +883,11 @@ impl crate::app::App {
     /// コンテキストメニューを表示する。
     pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<ContextMenuAction> {
         let idx = match self.context_menu_idx {
-            Some(i) => i,
+            Some(owner) if self.grid_context_menu_owner_is_current(owner) => owner.index,
+            Some(_) => {
+                self.context_menu_idx = None;
+                return None;
+            }
             None => return None,
         };
 
@@ -1361,6 +1393,7 @@ impl crate::app::App {
                     crate::context_menu_model::CollectionReferenceAvailability::NotCollectionRoot
                 }
             },
+            collection_jump: self.collection_jump_action_state(target),
             view,
             pin: self.context_menu_pin_state(target, view),
             external_tools,
@@ -1647,12 +1680,8 @@ impl crate::app::App {
                 }
                 None
             }
-            MenuCommand::JumpToFolder => {
-                jump_to_folder_request(&target.item).map(ContextMenuAction::JumpToFolder)
-            }
-            MenuCommand::JumpToBookFolder => {
-                jump_to_book_folder_request(&target.item).map(ContextMenuAction::JumpToFolder)
-            }
+            MenuCommand::JumpToFolder => self.dispatch_context_jump_request(target, false),
+            MenuCommand::JumpToBookFolder => self.dispatch_context_jump_request(target, true),
             MenuCommand::OpenContainerAsPage => {
                 target
                     .item_index
@@ -1783,6 +1812,80 @@ impl crate::app::App {
                     self.remove_reading_history_entry_for_idx(idx);
                 }
                 None
+            }
+        }
+    }
+
+    fn dispatch_context_jump_request(
+        &mut self,
+        target: &NativeGridContextMenuTarget,
+        book: bool,
+    ) -> Option<ContextMenuAction> {
+        let request = self.context_jump_request(target, book);
+        if request.is_none() && target.collection_root_delete.is_collection_root() {
+            self.show_feedback_toast(
+                "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
+            );
+        }
+        request.map(ContextMenuAction::JumpToFolder)
+    }
+
+    fn collection_jump_action_state(
+        &self,
+        target: &NativeGridContextMenuTarget,
+    ) -> Option<ContextMenuActionState> {
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        if target.surface != ContextMenuSurface::Grid {
+            return None;
+        }
+        let disabled_reason = match &target.collection_root_delete {
+            CollectionRootDeleteResolution::NotCollectionRoot => return None,
+            CollectionRootDeleteResolution::Unavailable(reason) => Some((*reason).to_owned()),
+            CollectionRootDeleteResolution::Ready(_) => self
+                .context_jump_request(target, false)
+                .is_none()
+                .then(|| "コレクション一覧を更新中です".to_owned()),
+        };
+        Some(ContextMenuActionState {
+            label: "元の場所へ移動".to_owned(),
+            enabled: disabled_reason.is_none(),
+            disabled_reason,
+        })
+    }
+
+    fn context_jump_request(
+        &self,
+        target: &NativeGridContextMenuTarget,
+        book: bool,
+    ) -> Option<JumpToFolderRequest> {
+        let mut request = if book {
+            jump_to_book_folder_request(&target.item)?
+        } else {
+            jump_to_folder_request(&target.item)?
+        };
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        match &target.collection_root_delete {
+            CollectionRootDeleteResolution::NotCollectionRoot => Some(request),
+            CollectionRootDeleteResolution::Unavailable(_) => None,
+            CollectionRootDeleteResolution::Ready(_) => {
+                let index = target.item_index?;
+                let source = target.item.drag_source_path()?;
+                let origin = self.collection_grid_physical_load_owner(index, source)?;
+                if !matches!(
+                    &origin.origin,
+                    crate::app::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root { .. }
+                ) || origin.accepted_revision != origin.wanted_revision
+                    || !self.collection_grid_physical_load_owner_is_current(&origin, source)
+                {
+                    return None;
+                }
+                // Even a Folder cell jumps to its parent so the original cell can be selected.
+                let source = native_nav_path(source);
+                request.destination =
+                    JumpToFolderDestination::PhysicalDirectory(parent_folder_for_nav(&source)?);
+                request.selection = JumpToFolderSelection::ExactPath(source);
+                request.origin = Some(origin);
+                Some(request)
             }
         }
     }
@@ -2679,6 +2782,7 @@ mod delete_confirm_tests {
                     r"C:\media\album"
                 )),
                 selection: JumpToFolderSelection::ExactPath(image),
+                origin: None,
             })
         );
 
@@ -2693,6 +2797,7 @@ mod delete_confirm_tests {
             Some(JumpToFolderRequest {
                 destination: JumpToFolderDestination::PhysicalDirectory(folder),
                 selection: JumpToFolderSelection::None,
+                origin: None,
             })
         );
 
@@ -2707,6 +2812,7 @@ mod delete_confirm_tests {
             Some(JumpToFolderRequest {
                 destination: JumpToFolderDestination::ArchiveContainer(archive),
                 selection: JumpToFolderSelection::None,
+                origin: None,
             })
         );
     }
@@ -2722,6 +2828,7 @@ mod delete_confirm_tests {
                     r"C:\media\shelf"
                 )),
                 selection: JumpToFolderSelection::ExactPath(book),
+                origin: None,
             })
         );
     }
@@ -2804,6 +2911,64 @@ mod delete_confirm_tests {
         let mut labels = Vec::new();
         visit(nodes, &mut labels);
         labels
+    }
+
+    #[test]
+    fn collection_jump_menu_projects_source_availability_without_disabling_reference_remove() {
+        fn state(nodes: &[MenuNode], wanted: MenuCommand) -> Option<(bool, Option<String>)> {
+            for node in nodes {
+                match node {
+                    MenuNode::Item {
+                        command,
+                        enabled,
+                        disabled_reason,
+                        ..
+                    } if *command == wanted => return Some((*enabled, disabled_reason.clone())),
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(found) = state(children, wanted.clone()) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut app = crate::app::setup_app_for_test();
+        let mut root = target(
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                crate::app::collection_grid::CollectionGridRemoveTarget {
+                    stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                        context_id: crate::app::ViewerContextId::for_test(1),
+                        surface_generation: 2,
+                        collection_id: crate::collection_store::CollectionId::new(),
+                    },
+                    expected_revision: 3,
+                    entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                },
+            );
+        let nodes = app.context_menu_nodes(&root, false);
+        let jump = state(&nodes, MenuCommand::JumpToFolder).expect("grid location jump");
+        assert!(!jump.0);
+        assert_eq!(jump.1.as_deref(), Some("コレクション一覧を更新中です"));
+        assert_eq!(
+            state(&nodes, MenuCommand::RemoveFromCollection),
+            Some((true, None))
+        );
+        assert!(app.dispatch_context_jump_request(&root, false).is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| { toast.0.contains("もう一度選択してください") })
+        );
+
+        root.surface = ContextMenuSurface::Fullscreen;
+        let nodes = app.context_menu_nodes(&root, false);
+        assert!(state(&nodes, MenuCommand::JumpToFolder).is_none());
     }
 
     #[test]

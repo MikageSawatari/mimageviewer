@@ -1930,6 +1930,14 @@ impl App {
         video_pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
+        // A grid menu owns the old item generation. Do not let its saved row index operate on
+        // the newly installed collection; a menu owned by another viewer context is untouched.
+        if self
+            .context_menu_idx
+            .is_some_and(|owner| self.grid_context_menu_owner_is_current(owner))
+        {
+            self.context_menu_idx = None;
+        }
         if let Some(session) = self.top_level_grid_view.collection_session_mut()
             && let Some(cancel) = session.video_worker_cancel.take()
         {
@@ -3220,6 +3228,272 @@ mod tests {
         );
         assert!(app.current_folder.is_none());
         app.shutdown_collection_runtime_for_exit();
+    }
+
+    fn collection_jump_request(
+        app: &App,
+        source: &Path,
+    ) -> crate::ui_dialogs::context_menu::JumpToFolderRequest {
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+        JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(
+                source.parent().unwrap().to_path_buf(),
+            ),
+            selection: JumpToFolderSelection::ExactPath(source.to_path_buf()),
+            origin: Some(
+                app.collection_grid_physical_load_owner(0, source)
+                    .expect("mounted collection source"),
+            ),
+        }
+    }
+
+    #[test]
+    fn collection_location_jump_preserves_root_until_success_and_selects_exact_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("source-folder");
+        std::fs::create_dir(&parent).unwrap();
+        let source = parent.join("image.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let sibling = super::super::QuickFolderSlotId::B;
+        let sibling_history = vec![super::super::FolderNavHistoryTarget::Path(
+            temp.path().join("sibling-location"),
+        )];
+        app.quick_folder_workspaces[sibling.index()]
+            .history
+            .back_stack = sibling_history.clone();
+        app.selected = Some(0);
+        app.scroll_offset_y = 107.0;
+        let generation = app.items_generation;
+        let address = app.address.clone();
+        let request = collection_jump_request(&app, &source);
+        assert!(app.begin_context_jump_to_folder(request).is_none());
+        assert!(app.context_folder_jump_pending());
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 107.0);
+        assert_eq!(app.address, address);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(matches!(
+            pending.purpose,
+            super::super::FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+        ));
+        app.cancel_folder_pane_open();
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(
+            app.items_generation, generation,
+            "cancellation keeps the source root"
+        );
+
+        let request = collection_jump_request(&app, &source);
+        assert!(app.begin_context_jump_to_folder(request.clone()).is_none());
+        let replaced_cancel = Arc::clone(&app.folder_pane_open_pending.as_ref().unwrap().cancel);
+        assert!(app.begin_context_jump_to_folder(request.clone()).is_none());
+        assert!(replaced_cancel.load(Ordering::Relaxed));
+        assert_eq!(app.items_generation, generation);
+        let pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        let scan = super::super::folder_scan::scan_directory_with_settings(&parent, &app.settings)
+            .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            parent.clone(),
+            scan,
+            request.selection,
+            request.origin,
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
+        assert!(app.selected.is_some_and(|index| {
+            app.items[index]
+                .drag_source_path()
+                .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
+        }));
+        assert!(app.scroll_to_selected);
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(restore))
+                if restore.identity.collection_id == snapshot.collection_id()
+        ));
+        assert_eq!(
+            app.quick_folder_workspaces[sibling.index()]
+                .history
+                .back_stack,
+            sibling_history
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_location_jump_rejects_stale_revision_items_and_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("image.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let request = collection_jump_request(&app, &source);
+        let held_generation = app.items_generation;
+        let origin = request.origin.clone().unwrap();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision += 1;
+        assert!(app.begin_context_jump_to_folder(request.clone()).is_none());
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| { toast.0.contains("もう一度選択してください") })
+        );
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(temp.path(), &app.settings)
+                .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            temp.path().to_path_buf(),
+            scan,
+            request.selection.clone(),
+            Some(origin.clone()),
+        );
+        assert_eq!(app.items_generation, held_generation);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision = origin.wanted_revision;
+        app.items_generation += 1;
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(temp.path(), &app.settings)
+                .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            temp.path().to_path_buf(),
+            scan,
+            request.selection.clone(),
+            Some(origin.clone()),
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+
+        app.items_generation = held_generation;
+        let mut wrong_context = origin;
+        wrong_context.stamp.context_id = ViewerContextId::for_test(999);
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(temp.path(), &app.settings)
+                .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            temp.path().to_path_buf(),
+            scan,
+            request.selection,
+            Some(wrong_context),
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_location_jump_scan_failure_keeps_root_and_missing_leaf_reports_exact_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("image.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let generation = app.items_generation;
+        let request = collection_jump_request(&app, &source);
+        assert!(app.begin_context_jump_to_folder(request).is_none());
+        let pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        let ready = super::super::FolderPaneOpenReady {
+            path: pending.path,
+            scan: Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )),
+            purpose: pending.purpose,
+        };
+        assert!(
+            app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        assert_eq!(app.items_generation, generation);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+
+        let request = collection_jump_request(&app, &source);
+        std::fs::remove_file(&source).unwrap();
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(temp.path(), &app.settings)
+                .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            temp.path().to_path_buf(),
+            scan,
+            request.selection,
+            request.origin,
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("移動先の項目が見つかりません")
+        }));
+        assert!(!app.selected.is_some_and(|index| {
+            app.items[index]
+                .drag_source_path()
+                .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
+        }));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn grid_menu_owner_rejects_replaced_items_and_collection_install_preserves_sibling_menu() {
+        let mut app = crate::app::setup_app_for_test();
+        let current = app.capture_grid_context_menu_owner(0);
+        app.context_menu_idx = Some(current);
+        app.install_collection_grid_items(Vec::new(), Vec::new(), None, None);
+        assert!(app.context_menu_idx.is_none());
+
+        let current = app.capture_grid_context_menu_owner(0);
+        let sibling = crate::ui_dialogs::context_menu::GridContextMenuOwner {
+            context_id: ViewerContextId::for_test(current.context_id.serial() + 100),
+            ..current
+        };
+        app.context_menu_idx = Some(sibling);
+        app.install_collection_grid_items(Vec::new(), Vec::new(), None, None);
+        assert_eq!(app.context_menu_idx, Some(sibling));
+
+        app.context_menu_idx = Some(current);
+        assert!(app.show_context_menu(&egui::Context::default()).is_none());
+        assert!(app.context_menu_idx.is_none());
     }
 
     #[test]

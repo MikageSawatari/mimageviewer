@@ -479,6 +479,7 @@ impl ContextMenuPreviewScenario {
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
+            collection_jump: None,
             view: ContextMenuViewFlags {
                 in_search,
                 search: in_search,
@@ -871,6 +872,8 @@ pub struct ContextMenuInput {
     pub has_explorer_folder: bool,
     /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
     pub collection_reference: CollectionReferenceAvailability,
+    /// Collection root の元の場所への移動。参照解除とは別の可否を持つ。
+    pub collection_jump: Option<ContextMenuActionState>,
     pub view: ContextMenuViewFlags,
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
@@ -1347,7 +1350,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         );
     }
 
-    let can_jump_to_folder = input.view.in_search
+    let collection_root_grid = input.surface == ContextMenuSurface::Grid
+        && input.collection_reference.is_collection_root();
+    let can_jump_to_folder = (input.view.in_search || collection_root_grid)
         && !input.is_folder_context
         && matches!(
             input.kind,
@@ -1372,7 +1377,31 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         );
     let mut navigation_group = Vec::new();
     if can_jump_to_folder {
-        navigation_group.push(item(MenuCommand::JumpToFolder, "フォルダに移動"));
+        let label = if collection_root_grid {
+            "元の場所へ移動"
+        } else {
+            "フォルダに移動"
+        };
+        navigation_group.push(match &input.collection_reference {
+            CollectionReferenceAvailability::Unavailable(reason) if collection_root_grid => {
+                MenuNode::Item {
+                    command: MenuCommand::JumpToFolder,
+                    label: label.to_owned(),
+                    enabled: false,
+                    disabled_reason: Some(reason.clone()),
+                }
+            }
+            _ if collection_root_grid => {
+                let state = input.collection_jump.as_ref();
+                MenuNode::Item {
+                    command: MenuCommand::JumpToFolder,
+                    label: label.to_owned(),
+                    enabled: state.is_none_or(|state| state.enabled),
+                    disabled_reason: state.and_then(|state| state.disabled_reason.clone()),
+                }
+            }
+            _ => item(MenuCommand::JumpToFolder, label),
+        });
     }
     if can_jump_to_book {
         navigation_group.push(item(
@@ -1531,6 +1560,7 @@ mod tests {
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
+            collection_jump: None,
             view: ContextMenuViewFlags::default(),
             pin: None,
             external_tools: Vec::new(),
@@ -2452,6 +2482,51 @@ mod tests {
                 ..
             } if label == "元ファイルをゴミ箱へ移動 (タグ・評価も整理) [2件]"
         )));
+    }
+
+    #[test]
+    fn collection_root_location_jump_is_scoped_and_disabled_when_binding_is_unavailable() {
+        let mut collection = input(ContextMenuItemKind::Folder, ContextMenuSurface::Grid);
+        collection.collection_reference = CollectionReferenceAvailability::Ready;
+        let nodes = build_context_menu(&collection);
+        let (label, enabled, reason) =
+            command_state(&nodes, MenuCommand::JumpToFolder).expect("collection location jump");
+        assert_eq!(label, "元の場所へ移動");
+        assert!(enabled);
+        assert!(reason.is_none());
+
+        collection.collection_jump = Some(ContextMenuActionState {
+            label: "元の場所へ移動".into(),
+            enabled: false,
+            disabled_reason: Some("更新中".into()),
+        });
+        let nodes = build_context_menu(&collection);
+        let (_, enabled, reason) = command_state(&nodes, MenuCommand::JumpToFolder).unwrap();
+        assert!(!enabled);
+        assert_eq!(reason.as_deref(), Some("更新中"));
+        assert!(
+            command_state(&nodes, MenuCommand::RemoveFromCollection)
+                .is_some_and(|(_, enabled, _)| enabled)
+        );
+
+        collection.collection_reference =
+            CollectionReferenceAvailability::Unavailable("一覧を更新中".into());
+        let nodes = build_context_menu(&collection);
+        let (_, enabled, reason) = command_state(&nodes, MenuCommand::JumpToFolder).unwrap();
+        assert!(!enabled);
+        assert_eq!(reason.as_deref(), Some("一覧を更新中"));
+
+        collection.collection_reference = CollectionReferenceAvailability::NotCollectionRoot;
+        assert!(
+            command_state(&build_context_menu(&collection), MenuCommand::JumpToFolder).is_none()
+        );
+
+        let mut fullscreen = input(ContextMenuItemKind::Image, ContextMenuSurface::Fullscreen);
+        fullscreen.collection_reference = CollectionReferenceAvailability::Ready;
+        assert!(
+            command_state(&build_context_menu(&fullscreen), MenuCommand::JumpToFolder).is_none(),
+            "fullscreen does not dispatch a collection location jump"
+        );
     }
 
     #[test]
