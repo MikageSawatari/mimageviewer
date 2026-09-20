@@ -452,7 +452,11 @@ impl ContextMenuPreviewScenario {
         };
         let is_folder_context = self == Self::GridFolderBackground;
         let has_checked = self == Self::GridCheckedRealFiles;
-        let collection_reference = self == Self::GridCollectionItem;
+        let collection_reference = if self == Self::GridCollectionItem {
+            CollectionReferenceAvailability::Ready
+        } else {
+            CollectionReferenceAvailability::NotCollectionRoot
+        };
         let in_search = self == Self::GridSearchImage;
         let reading_history = self == Self::GridZipReadingHistory;
         let normal_pin = matches!(
@@ -475,7 +479,6 @@ impl ContextMenuPreviewScenario {
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
-            collection_source_context: collection_reference,
             view: ContextMenuViewFlags {
                 in_search,
                 search: in_search,
@@ -866,16 +869,41 @@ pub struct ContextMenuInput {
     pub can_use_folder_commands: bool,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
-    /// 現在のcellまたはchecked集合が同じcollection bindingに属する参照か。
-    pub collection_reference: bool,
-    /// Collection root の参照項目。元ファイル操作には明示ラベルを付ける。
-    pub collection_source_context: bool,
+    /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
+    pub collection_reference: CollectionReferenceAvailability,
     pub view: ContextMenuViewFlags,
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
     pub associated_apps: Vec<AssociatedAppMenuEntry>,
     pub shortcuts: ContextMenuShortcutLabels,
     pub layout: ContextMenuLayoutSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectionReferenceAvailability {
+    NotCollectionRoot,
+    Ready,
+    Unavailable(String),
+}
+
+impl CollectionReferenceAvailability {
+    fn is_collection_root(&self) -> bool {
+        !matches!(self, Self::NotCollectionRoot)
+    }
+
+    fn remove_node(&self, label: impl Into<String>) -> Option<MenuNode> {
+        let label = label.into();
+        match self {
+            Self::NotCollectionRoot => None,
+            Self::Ready => Some(item(MenuCommand::RemoveFromCollection, label)),
+            Self::Unavailable(reason) => Some(MenuNode::Item {
+                command: MenuCommand::RemoveFromCollection,
+                label,
+                enabled: false,
+                disabled_reason: Some(reason.clone()),
+            }),
+        }
+    }
 }
 
 /// メニューに併記するキーの表示。**実際の割り当てから作った文字列**を呼び出し側が入れる。
@@ -1146,14 +1174,11 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             )],
         );
         if input.surface == ContextMenuSurface::Grid {
-            if input.collection_reference {
-                push_group(
-                    &mut nodes,
-                    [item(
-                        MenuCommand::RemoveFromCollection,
-                        format!("コレクションから外す [{}件]", input.checked_count),
-                    )],
-                );
+            if let Some(remove) = input
+                .collection_reference
+                .remove_node(format!("コレクションから外す [{}件]", input.checked_count))
+            {
+                push_group(&mut nodes, [remove]);
             }
             push_group(
                 &mut nodes,
@@ -1204,7 +1229,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             push_group(&mut nodes, [open_with]);
         }
         if input.surface == ContextMenuSurface::Grid {
-            let delete_label = if input.collection_source_context {
+            let delete_label = if input.collection_reference.is_collection_root() {
                 format!(
                     "元ファイルをゴミ箱へ移動 (タグ・評価も整理) [{}件]",
                     input.checked_count
@@ -1424,17 +1449,13 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         push_group(&mut nodes, [open_with]);
     }
 
-    if input.surface == ContextMenuSurface::Grid
-        && !input.is_folder_context
-        && input.collection_reference
-    {
-        push_group(
-            &mut nodes,
-            [item(
-                MenuCommand::RemoveFromCollection,
-                "コレクションから外す",
-            )],
-        );
+    if input.surface == ContextMenuSurface::Grid && !input.is_folder_context {
+        if let Some(remove) = input
+            .collection_reference
+            .remove_node("コレクションから外す")
+        {
+            push_group(&mut nodes, [remove]);
+        }
     }
 
     if input.surface == ContextMenuSurface::Grid
@@ -1445,7 +1466,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             &mut nodes,
             [item(
                 MenuCommand::MoveToRecycleBin,
-                if input.collection_source_context {
+                if input.collection_reference.is_collection_root() {
                     "元ファイルをゴミ箱へ移動 (タグ・評価も整理)"
                 } else {
                     "ゴミ箱へ移動 (タグ・評価も整理)"
@@ -1509,8 +1530,7 @@ mod tests {
             can_use_folder_commands: false,
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
-            collection_reference: false,
-            collection_source_context: false,
+            collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
             view: ContextMenuViewFlags::default(),
             pin: None,
             external_tools: Vec::new(),
@@ -2399,8 +2419,7 @@ mod tests {
     #[test]
     fn collection_root_lists_reference_remove_before_explicit_source_delete() {
         let mut collection = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
-        collection.collection_reference = true;
-        collection.collection_source_context = true;
+        collection.collection_reference = CollectionReferenceAvailability::Ready;
         let nodes = build_context_menu(&collection);
         let commands = menu_shape(&nodes);
         let remove = commands
@@ -2433,6 +2452,48 @@ mod tests {
                 ..
             } if label == "元ファイルをゴミ箱へ移動 (タグ・評価も整理) [2件]"
         )));
+    }
+
+    #[test]
+    fn unavailable_collection_reference_keeps_disabled_remove_with_reason() {
+        let reason = "コレクション一覧を更新中のため、登録解除できません";
+        let mut collection = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        collection.collection_reference =
+            CollectionReferenceAvailability::Unavailable(reason.into());
+        for checked in [false, true] {
+            collection.has_checked = checked;
+            collection.checked_count = if checked { 2 } else { 0 };
+            collection.checked_file_operation_selection = if checked {
+                CheckedFileOperationSelection::RealOnly
+            } else {
+                CheckedFileOperationSelection::Empty
+            };
+            let nodes = build_context_menu(&collection);
+            let (label, enabled, disabled_reason) =
+                command_state(&nodes, MenuCommand::RemoveFromCollection).unwrap();
+            assert_eq!(
+                label,
+                if checked {
+                    "コレクションから外す [2件]"
+                } else {
+                    "コレクションから外す"
+                }
+            );
+            assert!(!enabled);
+            assert_eq!(disabled_reason.as_deref(), Some(reason));
+            let (delete_label, delete_enabled, _) =
+                command_state(&nodes, MenuCommand::MoveToRecycleBin).unwrap();
+            assert!(delete_label.starts_with("元ファイルをゴミ箱へ移動"));
+            assert!(delete_enabled);
+        }
+        collection.collection_reference = CollectionReferenceAvailability::NotCollectionRoot;
+        assert!(
+            command_state(
+                &build_context_menu(&collection),
+                MenuCommand::RemoveFromCollection
+            )
+            .is_none()
+        );
     }
 
     #[test]

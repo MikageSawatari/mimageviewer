@@ -494,6 +494,8 @@ impl Eq for CollectionGridSourceOpenOwner {}
 pub(crate) enum CollectionGridLoadState {
     RequestNeeded {
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        /// Busy/Starting admission is retried only after this deadline.
+        not_before: Option<std::time::Instant>,
     },
     Snapshot {
         stamp: CollectionGridRequestStamp,
@@ -597,7 +599,7 @@ impl CollectionGridLoadState {
         &self,
     ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
         match self {
-            Self::RequestNeeded { installed }
+            Self::RequestNeeded { installed, .. }
             | Self::Snapshot { installed, .. }
             | Self::Preparing { installed, .. }
             | Self::Failed { installed, .. } => installed.as_ref(),
@@ -640,7 +642,10 @@ impl CollectionGridSession {
             accepted_revision: 0,
             wanted_revision: 0,
             observed_catalog_revision: 0,
-            load: CollectionGridLoadState::RequestNeeded { installed: None },
+            load: CollectionGridLoadState::RequestNeeded {
+                installed: None,
+                not_before: None,
+            },
             watch: None,
             restore_anchor: None,
             installed_items_generation: None,
@@ -651,11 +656,14 @@ impl CollectionGridSession {
     pub(crate) fn cancel_pending(&mut self) {
         let previous = std::mem::replace(
             &mut self.load,
-            CollectionGridLoadState::RequestNeeded { installed: None },
+            CollectionGridLoadState::RequestNeeded {
+                installed: None,
+                not_before: None,
+            },
         );
         log_collection_grid_pending_cancel(&previous);
         let installed = match previous {
-            CollectionGridLoadState::RequestNeeded { installed }
+            CollectionGridLoadState::RequestNeeded { installed, .. }
             | CollectionGridLoadState::Failed { installed, .. } => installed,
             CollectionGridLoadState::Snapshot { installed, .. } => installed,
             CollectionGridLoadState::Preparing {
@@ -670,7 +678,10 @@ impl CollectionGridSession {
             }
             CollectionGridLoadState::Deleted => None,
         };
-        self.load = CollectionGridLoadState::RequestNeeded { installed };
+        self.load = CollectionGridLoadState::RequestNeeded {
+            installed,
+            not_before: None,
+        };
     }
 
     pub(crate) fn prepared(
@@ -769,6 +780,7 @@ impl Clone for CollectionGridSession {
             observed_catalog_revision: self.observed_catalog_revision,
             load: CollectionGridLoadState::RequestNeeded {
                 installed: self.load.installed().cloned(),
+                not_before: None,
             },
             watch: None,
             restore_anchor: self.restore_anchor.clone(),
@@ -1116,6 +1128,12 @@ impl TopLevelGridView {
 
     pub(in crate::app) fn collection_navigation_sequence(&self) -> u64 {
         self.collection_navigation_sequence
+    }
+
+    pub(in crate::app) fn collection_navigation_poll_delay(&self) -> Option<std::time::Duration> {
+        self.collection_navigation_pending
+            .as_ref()
+            .map(|pending| pending.poll_delay())
     }
 
     pub(in crate::app) fn take_collection_navigation_retired_fs_lock(&mut self) -> bool {

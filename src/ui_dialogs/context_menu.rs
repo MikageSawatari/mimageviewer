@@ -1348,8 +1348,19 @@ impl crate::app::App {
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
-            collection_reference: target.collection_root_delete.ready_target().is_some(),
-            collection_source_context: target.collection_root_delete.is_collection_root(),
+            collection_reference: match &target.collection_root_delete {
+                crate::app::collection_grid::CollectionRootDeleteResolution::Ready(_) => {
+                    crate::context_menu_model::CollectionReferenceAvailability::Ready
+                }
+                crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                    reason,
+                ) => crate::context_menu_model::CollectionReferenceAvailability::Unavailable(
+                    (*reason).to_owned(),
+                ),
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {
+                    crate::context_menu_model::CollectionReferenceAvailability::NotCollectionRoot
+                }
+            },
             view,
             pin: self.context_menu_pin_state(target, view),
             external_tools,
@@ -3392,6 +3403,53 @@ mod delete_confirm_tests {
             native_grid_shell_menu_placement(&root, true),
             ShellMenuPlacement::Inline,
             "Collection PhysicalSource and ordinary folders keep the global Inline setting"
+        );
+    }
+
+    #[test]
+    fn unavailable_collection_reference_is_visible_with_reason_but_physical_delete_remains_separate()
+     {
+        fn state<'a>(
+            nodes: &'a [MenuNode],
+            wanted: MenuCommand,
+        ) -> Option<(bool, Option<&'a str>)> {
+            for node in nodes {
+                match node {
+                    MenuNode::Item {
+                        command,
+                        enabled,
+                        disabled_reason,
+                        ..
+                    } if *command == wanted => {
+                        return Some((*enabled, disabled_reason.as_deref()));
+                    }
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(found) = state(children, wanted.clone()) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut app = crate::app::setup_app_for_test();
+        let mut target = target(
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        target.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                "コレクションの参照を確認しています",
+            );
+        let nodes = app.context_menu_nodes(&target, false);
+        assert_eq!(
+            state(&nodes, MenuCommand::RemoveFromCollection),
+            Some((false, Some("コレクションの参照を確認しています")))
+        );
+        assert_eq!(
+            state(&nodes, MenuCommand::MoveToRecycleBin),
+            Some((true, None))
         );
     }
 

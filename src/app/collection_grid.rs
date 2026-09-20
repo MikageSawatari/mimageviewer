@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const COLLECTION_GRID_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
@@ -1055,7 +1057,9 @@ impl App {
         self.top_level_grid_view
             .begin(TopLevelGridSurface::Collection(identity), return_to);
         let watch = self
-            .collection_store_client()
+            .collection_store_client_for_read()
+            .ok()
+            .flatten()
             .and_then(|client| client.subscribe().ok());
         if let Some(session) = self.top_level_grid_view.collection_session_mut() {
             session.wanted_revision = restore.as_ref().map_or(0, |state| state.revision_at_open);
@@ -1124,19 +1128,34 @@ impl App {
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return;
         };
-        if !matches!(session.load, CollectionGridLoadState::RequestNeeded { .. }) {
+        let CollectionGridLoadState::RequestNeeded { not_before, .. } = &session.load else {
+            return;
+        };
+        if not_before.is_some_and(|deadline| Instant::now() < deadline) {
             return;
         }
         let minimum_revision = session.wanted_revision.max(session.accepted_revision);
         let installed = session.load.installed().cloned();
-        let Some(client) = self.collection_store_client() else {
-            if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-                session.load = CollectionGridLoadState::Failed {
-                    message: "コレクションを利用できません".into(),
-                    installed,
-                };
+        let client = match self.collection_store_client_for_read() {
+            Ok(Some(client)) => client,
+            Err(error) if error.is_read_retryable() => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::RequestNeeded {
+                        installed,
+                        not_before: Some(Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL),
+                    };
+                }
+                return;
             }
-            return;
+            Ok(None) | Err(_) => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::Failed {
+                        message: "コレクションを利用できません".into(),
+                        installed,
+                    };
+                }
+                return;
+            }
         };
         let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.load_collection(stamp.collection_id) {
@@ -1148,6 +1167,14 @@ impl App {
                         queued_at,
                         installed,
                         receiver,
+                    };
+                }
+            }
+            Err(error) if error.is_read_retryable() => {
+                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    session.load = CollectionGridLoadState::RequestNeeded {
+                        installed,
+                        not_before: Some(Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL),
                     };
                 }
             }
@@ -1221,6 +1248,30 @@ impl App {
                 .is_some_and(|session| matches!(session.position, CollectionGridPosition::Root))
     }
 
+    /// Delayed polling only for the mounted root. A parked child/fullscreen leaf may keep a
+    /// request owner, but it must not keep the UI awake while its presentation is protected.
+    pub(crate) fn collection_grid_poll_delay(&self) -> Option<Duration> {
+        if !self.collection_grid_root_materialize_active() || self.collection_grid_stamp().is_none()
+        {
+            return None;
+        }
+        let session = self.top_level_grid_view.collection_session()?;
+        match &session.load {
+            CollectionGridLoadState::RequestNeeded {
+                not_before: Some(deadline),
+                ..
+            } => Some(deadline.saturating_duration_since(Instant::now())),
+            CollectionGridLoadState::RequestNeeded {
+                not_before: None, ..
+            } => Some(Duration::ZERO),
+            CollectionGridLoadState::Snapshot { .. }
+            | CollectionGridLoadState::Preparing { .. } => {
+                Some(COLLECTION_GRID_READ_RETRY_INTERVAL)
+            }
+            _ => None,
+        }
+    }
+
     /// A newer root is waiting for the fullscreen leaf to release the installed item indices.
     /// This is a display reason only: the existing poll/navigation owners decide when to install.
     pub(crate) fn collection_grid_refresh_waits_for_viewer(&self) -> bool {
@@ -1252,10 +1303,14 @@ impl App {
             return None;
         }
         match &session.load {
-            CollectionGridLoadState::RequestNeeded { installed: None }
+            CollectionGridLoadState::RequestNeeded {
+                installed: None, ..
+            }
             | CollectionGridLoadState::Snapshot { .. }
             | CollectionGridLoadState::Preparing { .. } => Some("コレクションを読み込み中…".into()),
-            CollectionGridLoadState::RequestNeeded { installed: Some(_) } => None,
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_), ..
+            } => None,
             CollectionGridLoadState::Empty(_) => Some("コレクションに項目はありません".into()),
             CollectionGridLoadState::Failed {
                 message,
@@ -1294,7 +1349,9 @@ impl App {
             .is_some_and(|session| session.watch.is_none());
         if needs_watch
             && let Some(watch) = self
-                .collection_store_client()
+                .collection_store_client_for_read()
+                .ok()
+                .flatten()
                 .and_then(|client| client.subscribe().ok())
             && let Some(session) = self.top_level_grid_view.collection_session_mut()
         {
@@ -1375,7 +1432,10 @@ impl App {
                 ) {
                     Some(std::mem::replace(
                         &mut session.load,
-                        CollectionGridLoadState::RequestNeeded { installed: None },
+                        CollectionGridLoadState::RequestNeeded {
+                            installed: None,
+                            not_before: None,
+                        },
                     ))
                 } else {
                     None
@@ -1458,8 +1518,23 @@ impl App {
                             } else if let Some(session) =
                                 self.top_level_grid_view.collection_session_mut()
                             {
-                                session.load = CollectionGridLoadState::RequestNeeded { installed };
+                                session.load = CollectionGridLoadState::RequestNeeded {
+                                    installed,
+                                    not_before: None,
+                                };
                             }
+                        }
+                    }
+                    Ok(Err(error)) if error.is_read_retryable() => {
+                        if self.collection_grid_stamp_is_current(stamp)
+                            && let Some(session) = self.top_level_grid_view.collection_session_mut()
+                        {
+                            session.load = CollectionGridLoadState::RequestNeeded {
+                                installed,
+                                not_before: Some(
+                                    Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL,
+                                ),
+                            };
                         }
                     }
                     Ok(Err(error)) => {
@@ -1552,7 +1627,10 @@ impl App {
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
-                        session.load = CollectionGridLoadState::RequestNeeded { installed };
+                        session.load = CollectionGridLoadState::RequestNeeded {
+                            installed,
+                            not_before: None,
+                        };
                     }
                 }
                 Ok(Err(error)) => {
@@ -1603,6 +1681,9 @@ impl App {
             | None => {}
         }
         self.schedule_collection_grid_snapshot();
+        if let Some(delay) = self.collection_grid_poll_delay() {
+            ctx.request_repaint_after(delay);
+        }
     }
 
     pub(in crate::app) fn apply_collection_grid_prepared_install(
@@ -2045,7 +2126,7 @@ mod tests {
         app.install_collection_runtime(runtime);
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while app.collection_store_client().is_none() {
+        while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
             assert!(
                 Instant::now() < deadline,
                 "collection runtime did not become ready"
@@ -3549,7 +3630,10 @@ mod tests {
         });
         assert!(matches!(
             app.top_level_grid_view.collection_session().unwrap().load,
-            CollectionGridLoadState::RequestNeeded { installed: Some(_) }
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_),
+                ..
+            }
         ));
         assert_eq!(app.items_generation, original_generation);
         let deferred = super::super::GridSortLockReason::CollectionViewerDeferred;
@@ -3717,7 +3801,10 @@ mod tests {
         let session = app.top_level_grid_view.collection_session().unwrap();
         assert!(matches!(
             session.load,
-            CollectionGridLoadState::RequestNeeded { installed: Some(_) }
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_),
+                ..
+            }
         ));
         assert_eq!(
             session.prepared().unwrap().collection_revision,
@@ -3989,6 +4076,97 @@ mod tests {
             );
         })
         .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn root_read_waits_for_starting_and_busy_without_losing_its_watch_or_spinning() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[]);
+        let ctx = egui::Context::default();
+        app.collection_ui.set_read_phase_for_test(true);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        let first_deadline = match &app.top_level_grid_view.collection_session().unwrap().load {
+            CollectionGridLoadState::RequestNeeded {
+                not_before: Some(deadline),
+                ..
+            } => *deadline,
+            _ => panic!("Starting must retain read demand"),
+        };
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .watch
+                .is_none()
+        );
+        assert!(app.collection_grid_poll_delay().unwrap() > Duration::ZERO);
+        app.poll_collection_grid(&ctx);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded {
+                not_before: Some(deadline), ..
+            } if deadline == first_deadline
+        ));
+
+        app.collection_ui.set_read_phase_for_test(false);
+        let (barrier_reply, entered, release) = client.test_barrier().unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut queued = Vec::new();
+        loop {
+            match client.list_catalog() {
+                Ok(reply) => queued.push(reply),
+                Err(CollectionStoreError::Busy) => break,
+                other => panic!("unexpected actor admission: {other:?}"),
+            }
+        }
+        if let CollectionGridLoadState::RequestNeeded { not_before, .. } = &mut app
+            .top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load
+        {
+            *not_before = Some(Instant::now());
+        }
+        app.poll_collection_grid(&ctx);
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .watch
+                .is_some()
+        );
+        let busy_deadline = match &app.top_level_grid_view.collection_session().unwrap().load {
+            CollectionGridLoadState::RequestNeeded {
+                not_before: Some(deadline),
+                ..
+            } => *deadline,
+            _ => panic!("Busy must retain read demand"),
+        };
+        app.poll_collection_grid(&ctx);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded {
+                not_before: Some(deadline), ..
+            } if deadline == busy_deadline
+        ));
+        release.send(()).unwrap();
+        barrier_reply
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        drop(queued);
+        if let CollectionGridLoadState::RequestNeeded { not_before, .. } = &mut app
+            .top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load
+        {
+            *not_before = Some(Instant::now());
+        }
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.collection_grid_poll_delay(), None);
         app.shutdown_collection_runtime_for_exit();
     }
 

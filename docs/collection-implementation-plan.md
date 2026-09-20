@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1 計装、§23.2/23.3 sort / Shuffle の実装・自動検証・Codex独立レビュー完了。§23.4 以降は原則未着手（§23.8 の移行前 DB 保護だけ先行）。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 は実機確認待ち。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1238,6 +1238,12 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
 `CollectionRootDeleteResolution::Unavailable(reason)` のとき `RemoveFromCollection` を無効項目 +
 `disabled_reason` として残す（`MenuNode::Item { enabled, disabled_reason }` の前例）。
 
+実装・自動検証完了（2026-09-20、実機確認待ち）。Grid/Fullscreen の単一選択・複数選択で同じ typed resolution から
+参照解除の表示、無効化、理由を導く。Delete キーの既存理由通知も維持する。
+`MoveToRecycleBin` は捕捉済みの実ファイル target を持つ別操作であり、参照解除が
+Unavailable でも既存の明示削除契約を変更しない。model と menu handler の焦点回帰、
+全体 gate、独立コードレビュー、確認ビルドは成功した。検証結果は §23.6 に集約する。
+
 ### 23.5 rename migration scope（M-1）
 
 `poll_rename_pending` が読む `rename_target_is_file` を `clear_rename_dialog_state()` より前に確定させるか、
@@ -1252,8 +1258,30 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
 ### 23.6 一過性状態の typed 化（C-1 / C-2 / C-3 / B-3）
 
 read 経路の入口を `collection_store_client_for_migration` と同じ `Result<Option<_>, CollectionStoreError>` へ揃え、
-`Busy` / `Starting` / 並べ替え保存中は終端 `Failed` や無言 drop にせず `RequestNeeded` + `request_repaint_after`
-で再駆動する。Grid の `Snapshot` / `Preparing` 待ちは tail repaint reasons に加える。
+`Busy` / `Starting` は終端 `Failed` や無言 drop にせず `RequestNeeded` + `request_repaint_after`
+で再駆動する。並べ替え保存中も read は編集可否から独立し、actor が受け付ければ進む。
+Grid の `Snapshot` / `Preparing` と期限付き再受付は、表示中の root に限って
+遅延 poll とし、tail の即時 repaint reasons には入れない。即時 repaint によって遅延予約が
+失われ得るため、各 pass で残り時間を再予約する。
+
+実装・自動検証完了（2026-09-20、実機確認待ち）。read client は Manager の編集可否と切り離し、Grid は既存 session の
+`RequestNeeded` に次回受付時刻を保持する。Manager の catalog / selected snapshot は
+`Idle → RequestNeeded → InFlight` の単一 owner で明示 refresh と新しい需要を保存し、
+Busy/Starting 後に同じ revision の要求も落とさない。window を閉じても runtime/catalog の
+需要は消さず、選択・runtime の変更時に旧 snapshot 要求を退役する。navigation は既存 pending に
+`RequestNeeded` を加え、subscribe 済み watch と source/intent を保ったまま load Busy を待つ。
+繰り返し届く同一 slideshow / EOF 通知は既存要求の期限を伸ばさず、別 action/serial は別意図として
+扱う。terminal read error は真の末尾として表示しない。新規・関連焦点回帰 158 件、
+本体 lib 8,750 件（45 件除外）を含む `scripts/test-full.ps1 -SuppressCrashDialogs`、
+`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run --locked -p viewer_context_audit`、
+`cargo fmt --all -- --check`、UI glyph と差分検査は成功した。独立コードレビューに blocking 所見なし。
+`scripts/build-dev.ps1 -PreserveRuntime` も成功し、core SHA-256 は
+`F89E782A2BB6BC09E048075CA4EF4376887B1E5BB4A8743E0C88FAD0038772BB`。
+自動検証ログは `target/section23-full-gate-20260920.txt`、ビルドログは
+`target/section23-build-20260920.txt`。GUI 起動・実データ操作は行っていない。
+
+この変更でコード上の一過性 admission 経路を扱うが、利用者が報告した一度だけの
+「ぱらどっとが読み込み中で止まった」事象は再現・原因特定されておらず、解決済みとは扱わない。
 
 ### 23.7 上限と大量件数（仕様判断 3、B-1 / B-4 / D-2）
 

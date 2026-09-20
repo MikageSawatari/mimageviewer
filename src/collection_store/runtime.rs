@@ -642,7 +642,7 @@ impl CollectionStoreClient {
     }
 
     #[cfg(test)]
-    pub(super) fn test_barrier(
+    pub(crate) fn test_barrier(
         &self,
     ) -> Result<
         (

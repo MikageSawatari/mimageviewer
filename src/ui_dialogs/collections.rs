@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use eframe::egui;
@@ -34,6 +34,7 @@ const COLLECTION_REORDER_MAX_TILE_PX: f32 = 240.0;
 const COLLECTION_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 48.0;
 const COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 18.0;
 const COLLECTION_REORDER_SCROLLBAR_RESERVE_PX: f32 = 24.0;
+const COLLECTION_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CollectionRuntimePhase {
@@ -86,6 +87,50 @@ struct SnapshotRequest {
     minimum_revision: u64,
     queued_at: Option<Instant>,
     receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+}
+
+/// One owner for an explicit read demand, its accepted actor request, and a newer coalesced
+/// demand. A revision already displayed does not erase a same-revision explicit refresh.
+enum CollectionReadSlot<R, D> {
+    Idle,
+    RequestNeeded { demand: D, not_before: Instant },
+    InFlight { request: R, next: Option<D> },
+}
+
+impl<R, D> CollectionReadSlot<R, D> {
+    fn is_some(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn is_none(&self) -> bool {
+        !self.is_some()
+    }
+
+    fn take_in_flight(&mut self) -> Option<(R, Option<D>)> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::InFlight { request, next } => Some((request, next)),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn retry_delay(&self, now: Instant) -> Option<Duration> {
+        match self {
+            Self::Idle => None,
+            Self::RequestNeeded { not_before, .. } => {
+                Some(not_before.saturating_duration_since(now))
+            }
+            Self::InFlight { .. } => Some(COLLECTION_READ_RETRY_INTERVAL),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotReadDemand {
+    collection_id: CollectionId,
+    minimum_revision: u64,
 }
 
 impl Drop for CatalogRequest {
@@ -547,11 +592,11 @@ pub(crate) struct CollectionUiState {
     watch: Option<CollectionRevisionWatch>,
     phase: CollectionRuntimePhase,
     catalog: Option<CollectionCatalogSnapshot>,
-    catalog_request: Option<CatalogRequest>,
+    catalog_request: CollectionReadSlot<CatalogRequest, u64>,
     wanted_catalog_revision: u64,
     selected_id: Option<CollectionId>,
     snapshot: Option<CollectionSnapshot>,
-    snapshot_request: Option<SnapshotRequest>,
+    snapshot_request: CollectionReadSlot<SnapshotRequest, SnapshotReadDemand>,
     wanted_collection_revision: u64,
     show_manager: bool,
     checked_entries: HashSet<CollectionEntryId>,
@@ -572,11 +617,11 @@ impl Default for CollectionUiState {
             watch: None,
             phase: CollectionRuntimePhase::Inert,
             catalog: None,
-            catalog_request: None,
+            catalog_request: CollectionReadSlot::Idle,
             wanted_catalog_revision: 0,
             selected_id: None,
             snapshot: None,
-            snapshot_request: None,
+            snapshot_request: CollectionReadSlot::Idle,
             wanted_collection_revision: 0,
             show_manager: false,
             checked_entries: HashSet::new(),
@@ -591,6 +636,14 @@ impl Default for CollectionUiState {
 }
 
 impl CollectionUiState {
+    #[cfg(test)]
+    pub(crate) fn set_read_phase_for_test(&mut self, starting: bool) {
+        self.phase = if starting {
+            CollectionRuntimePhase::Starting
+        } else {
+            CollectionRuntimePhase::Ready
+        };
+    }
     fn can_edit(&self) -> bool {
         matches!(self.phase, CollectionRuntimePhase::Ready)
             && self
@@ -628,8 +681,8 @@ impl CollectionUiState {
     fn shutdown_for_exit(&mut self) {
         self.operation.cancel_worker();
         self.operation = CollectionDialogOperation::Idle;
-        self.catalog_request = None;
-        self.snapshot_request = None;
+        self.catalog_request = CollectionReadSlot::Idle;
+        self.snapshot_request = CollectionReadSlot::Idle;
         self.watch = None;
         self.events = None;
         self.client = None;
@@ -643,23 +696,71 @@ impl CollectionUiState {
 
     fn request_catalog(&mut self, minimum_revision: u64) {
         self.wanted_catalog_revision = self.wanted_catalog_revision.max(minimum_revision);
-        if self.catalog_request.is_some() {
+        let demand = self.wanted_catalog_revision;
+        match &mut self.catalog_request {
+            CollectionReadSlot::Idle => {
+                self.catalog_request = CollectionReadSlot::RequestNeeded {
+                    demand,
+                    not_before: Instant::now(),
+                };
+            }
+            CollectionReadSlot::RequestNeeded {
+                demand: existing, ..
+            } => *existing = (*existing).max(demand),
+            CollectionReadSlot::InFlight { next, .. } => {
+                *next = Some(next.unwrap_or(0).max(demand));
+            }
+        }
+        self.drive_catalog_request(Instant::now());
+    }
+
+    fn drive_catalog_request(&mut self, now: Instant) {
+        let CollectionReadSlot::RequestNeeded { demand, not_before } = &self.catalog_request else {
+            return;
+        };
+        if now < *not_before {
+            return;
+        }
+        let minimum_revision = *demand;
+        if !matches!(self.phase, CollectionRuntimePhase::Ready) {
+            if matches!(self.phase, CollectionRuntimePhase::Starting) {
+                self.catalog_request = CollectionReadSlot::RequestNeeded {
+                    demand: minimum_revision,
+                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                };
+            } else {
+                self.catalog_request = CollectionReadSlot::Idle;
+                self.message = Some((true, "コレクションを利用できません。".into()));
+            }
             return;
         }
         let Some(client) = &self.client else {
+            self.catalog_request = CollectionReadSlot::Idle;
+            self.message = Some((true, "コレクションを利用できません。".into()));
             return;
         };
         let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.list_catalog() {
             Ok(receiver) => {
-                self.catalog_request = Some(CatalogRequest {
-                    minimum_revision: self.wanted_catalog_revision,
-                    queued_at,
-                    receiver,
-                });
+                self.catalog_request = CollectionReadSlot::InFlight {
+                    request: CatalogRequest {
+                        minimum_revision,
+                        queued_at,
+                        receiver,
+                    },
+                    next: None,
+                };
             }
-            Err(CollectionStoreError::Starting | CollectionStoreError::Busy) => {}
-            Err(error) => self.message = Some((true, collection_error_message(&error))),
+            Err(error) if error.is_read_retryable() => {
+                self.catalog_request = CollectionReadSlot::RequestNeeded {
+                    demand: minimum_revision,
+                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                };
+            }
+            Err(error) => {
+                self.catalog_request = CollectionReadSlot::Idle;
+                self.message = Some((true, collection_error_message(&error)));
+            }
         }
     }
 
@@ -669,7 +770,7 @@ impl CollectionUiState {
         }
         self.selected_id = id;
         self.snapshot = None;
-        self.snapshot_request = None;
+        self.snapshot_request = CollectionReadSlot::Idle;
         self.wanted_collection_revision = 0;
         self.checked_entries.clear();
         self.selected_entry = None;
@@ -685,24 +786,97 @@ impl CollectionUiState {
             return;
         }
         self.wanted_collection_revision = self.wanted_collection_revision.max(minimum_revision);
-        if self.snapshot_request.is_some() {
+        let demand = SnapshotReadDemand {
+            collection_id,
+            minimum_revision: self.wanted_collection_revision,
+        };
+        match &mut self.snapshot_request {
+            CollectionReadSlot::Idle => {
+                self.snapshot_request = CollectionReadSlot::RequestNeeded {
+                    demand,
+                    not_before: Instant::now(),
+                };
+            }
+            CollectionReadSlot::RequestNeeded {
+                demand: existing, ..
+            } if existing.collection_id == collection_id => {
+                existing.minimum_revision = existing.minimum_revision.max(demand.minimum_revision);
+            }
+            CollectionReadSlot::InFlight { next, .. } => {
+                let minimum_revision = next
+                    .as_ref()
+                    .filter(|existing| existing.collection_id == collection_id)
+                    .map_or(demand.minimum_revision, |existing| {
+                        existing.minimum_revision.max(demand.minimum_revision)
+                    });
+                *next = Some(SnapshotReadDemand {
+                    collection_id,
+                    minimum_revision,
+                });
+            }
+            CollectionReadSlot::RequestNeeded { .. } => {
+                self.snapshot_request = CollectionReadSlot::RequestNeeded {
+                    demand,
+                    not_before: Instant::now(),
+                };
+            }
+        }
+        self.drive_snapshot_request(Instant::now());
+    }
+
+    fn drive_snapshot_request(&mut self, now: Instant) {
+        let CollectionReadSlot::RequestNeeded { demand, not_before } = &self.snapshot_request
+        else {
+            return;
+        };
+        if now < *not_before {
+            return;
+        }
+        let demand = *demand;
+        if self.selected_id != Some(demand.collection_id) {
+            self.snapshot_request = CollectionReadSlot::Idle;
+            return;
+        }
+        if !matches!(self.phase, CollectionRuntimePhase::Ready) {
+            if matches!(self.phase, CollectionRuntimePhase::Starting) {
+                self.snapshot_request = CollectionReadSlot::RequestNeeded {
+                    demand,
+                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                };
+            } else {
+                self.snapshot_request = CollectionReadSlot::Idle;
+                self.message = Some((true, "コレクションを利用できません。".into()));
+            }
             return;
         }
         let Some(client) = &self.client else {
+            self.snapshot_request = CollectionReadSlot::Idle;
+            self.message = Some((true, "コレクションを利用できません。".into()));
             return;
         };
         let queued_at = crate::perf::is_enabled().then(Instant::now);
-        match client.load_collection(collection_id) {
+        match client.load_collection(demand.collection_id) {
             Ok(receiver) => {
-                self.snapshot_request = Some(SnapshotRequest {
-                    collection_id,
-                    minimum_revision: self.wanted_collection_revision,
-                    queued_at,
-                    receiver,
-                });
+                self.snapshot_request = CollectionReadSlot::InFlight {
+                    request: SnapshotRequest {
+                        collection_id: demand.collection_id,
+                        minimum_revision: demand.minimum_revision,
+                        queued_at,
+                        receiver,
+                    },
+                    next: None,
+                };
             }
-            Err(CollectionStoreError::Starting | CollectionStoreError::Busy) => {}
-            Err(error) => self.message = Some((true, collection_error_message(&error))),
+            Err(error) if error.is_read_retryable() => {
+                self.snapshot_request = CollectionReadSlot::RequestNeeded {
+                    demand,
+                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                };
+            }
+            Err(error) => {
+                self.snapshot_request = CollectionReadSlot::Idle;
+                self.message = Some((true, collection_error_message(&error)));
+            }
         }
     }
 
@@ -1703,14 +1877,8 @@ impl App {
         }
     }
 
-    pub(crate) fn collection_store_client(&self) -> Option<CollectionStoreClient> {
-        self.collection_ui
-            .can_edit()
-            .then(|| self.collection_ui.client.clone())
-            .flatten()
-    }
-
-    pub(crate) fn collection_store_client_for_migration(
+    /// Read admission is independent of manager edits and manual-order saves.
+    pub(crate) fn collection_store_client_for_read(
         &self,
     ) -> Result<Option<CollectionStoreClient>, CollectionStoreError> {
         match &self.collection_ui.phase {
@@ -1728,6 +1896,12 @@ impl App {
                 Err(CollectionStoreError::Unavailable)
             }
         }
+    }
+
+    pub(crate) fn collection_store_client_for_migration(
+        &self,
+    ) -> Result<Option<CollectionStoreClient>, CollectionStoreError> {
+        self.collection_store_client_for_read()
     }
 
     pub(crate) fn select_collection_management_target(&mut self, id: CollectionId) {
@@ -1761,16 +1935,18 @@ impl App {
                 CollectionRuntimeEvent::Failed(error) => {
                     self.collection_ui.phase =
                         CollectionRuntimePhase::Failed(collection_error_message(&error));
-                    self.collection_ui.catalog_request = None;
-                    self.collection_ui.snapshot_request = None;
+                    self.collection_ui.watch = None;
+                    self.collection_ui.catalog_request = CollectionReadSlot::Idle;
+                    self.collection_ui.snapshot_request = CollectionReadSlot::Idle;
                     self.collection_ui.operation.cancel_worker();
                     self.collection_ui.operation = CollectionDialogOperation::Idle;
                     self.collection_ui.message = Some((true, collection_error_message(&error)));
                 }
                 CollectionRuntimeEvent::Closed => {
                     self.collection_ui.phase = CollectionRuntimePhase::Closed;
-                    self.collection_ui.catalog_request = None;
-                    self.collection_ui.snapshot_request = None;
+                    self.collection_ui.watch = None;
+                    self.collection_ui.catalog_request = CollectionReadSlot::Idle;
+                    self.collection_ui.snapshot_request = CollectionReadSlot::Idle;
                     self.collection_ui.operation.cancel_worker();
                     self.collection_ui.operation = CollectionDialogOperation::Idle;
                 }
@@ -1794,7 +1970,7 @@ impl App {
             }
         }
 
-        if let Some(mut request) = self.collection_ui.catalog_request.take() {
+        if let Some((mut request, mut next)) = self.collection_ui.catalog_request.take_in_flight() {
             let minimum_revision = request.minimum_revision;
             let reply = request.receiver.try_recv();
             if !matches!(&reply, Err(crossbeam_channel::TryRecvError::Empty))
@@ -1828,34 +2004,40 @@ impl App {
                     self.collection_ui.install_catalog(catalog);
                     self.prune_collection_folder_history_from_ready_catalog();
                 }
+                Ok(Err(error)) if error.is_read_retryable() => {
+                    self.collection_ui.catalog_request = CollectionReadSlot::RequestNeeded {
+                        demand: minimum_revision,
+                        not_before: Instant::now() + COLLECTION_READ_RETRY_INTERVAL,
+                    };
+                }
                 Ok(Err(error)) => {
+                    next = None;
                     self.collection_ui.message = Some((true, collection_error_message(&error)))
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    self.collection_ui.catalog_request = Some(request)
+                    self.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+                        request,
+                        next: next.take(),
+                    };
+                    // In-flight demand owns the coalesced follow-up until this reply arrives.
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    next = None;
                     self.collection_ui.message =
                         Some((true, "コレクション一覧の応答が失われました。".into()))
                 }
             }
-            if self.collection_ui.catalog_request.is_none()
-                && self
-                    .collection_ui
-                    .catalog
-                    .as_ref()
-                    .map_or(0, |catalog| catalog.catalog_revision)
-                    < self
-                        .collection_ui
-                        .wanted_catalog_revision
-                        .max(minimum_revision)
+            if !matches!(
+                self.collection_ui.phase,
+                CollectionRuntimePhase::Failed(_) | CollectionRuntimePhase::Closed
+            ) && let Some(next) = next
             {
-                self.collection_ui
-                    .request_catalog(self.collection_ui.wanted_catalog_revision);
+                self.collection_ui.request_catalog(next);
             }
         }
 
-        if let Some(mut request) = self.collection_ui.snapshot_request.take() {
+        if let Some((mut request, mut next)) = self.collection_ui.snapshot_request.take_in_flight()
+        {
             let collection_id = request.collection_id;
             let minimum_revision = request.minimum_revision;
             let reply = request.receiver.try_recv();
@@ -1890,47 +2072,76 @@ impl App {
             match reply {
                 Ok(Ok(snapshot)) => self.collection_ui.install_snapshot(snapshot),
                 Ok(Err(CollectionStoreError::NotFound)) => {
+                    next = None;
                     self.collection_ui
                         .request_catalog(self.collection_ui.wanted_catalog_revision);
                 }
+                Ok(Err(error)) if error.is_read_retryable() => {
+                    self.collection_ui.snapshot_request = CollectionReadSlot::RequestNeeded {
+                        demand: SnapshotReadDemand {
+                            collection_id,
+                            minimum_revision,
+                        },
+                        not_before: Instant::now() + COLLECTION_READ_RETRY_INTERVAL,
+                    };
+                }
                 Ok(Err(error)) => {
+                    next = None;
                     self.collection_ui.message = Some((true, collection_error_message(&error)))
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    self.collection_ui.snapshot_request = Some(request)
+                    self.collection_ui.snapshot_request = CollectionReadSlot::InFlight {
+                        request,
+                        next: next.take(),
+                    };
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    next = None;
                     self.collection_ui.message =
                         Some((true, "コレクション内容の応答が失われました。".into()))
                 }
             }
-            if self.collection_ui.snapshot_request.is_none()
-                && self.collection_ui.selected_id == Some(collection_id)
-                && self
-                    .collection_ui
-                    .snapshot
-                    .as_ref()
-                    .map_or(0, CollectionSnapshot::revision)
-                    < self
-                        .collection_ui
-                        .wanted_collection_revision
-                        .max(minimum_revision)
+            if !matches!(
+                self.collection_ui.phase,
+                CollectionRuntimePhase::Failed(_) | CollectionRuntimePhase::Closed
+            ) && self.collection_ui.selected_id == Some(collection_id)
+                && let Some(next) = next
             {
                 self.collection_ui
-                    .request_snapshot(collection_id, self.collection_ui.wanted_collection_revision);
+                    .request_snapshot(next.collection_id, next.minimum_revision);
             }
         }
 
+        self.collection_ui.drive_catalog_request(Instant::now());
+        self.collection_ui.drive_snapshot_request(Instant::now());
+
+        self.poll_collection_ui_tail(ctx);
+    }
+
+    fn poll_collection_ui_tail(&mut self, ctx: &egui::Context) {
         self.poll_collection_operation(ctx);
         self.poll_collection_reorder(ctx);
         self.reconcile_collection_toolbar_target();
-        if matches!(self.collection_ui.phase, CollectionRuntimePhase::Starting)
-            || self.collection_ui.catalog_request.is_some()
-            || self.collection_ui.snapshot_request.is_some()
-            || !self.collection_ui.operation.is_idle()
-        {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        if let Some(delay) = self.collection_ui_poll_delay() {
+            ctx.request_repaint_after(delay);
         }
+    }
+
+    /// Also queried at the App frame tail: UI controls can create a read demand after this
+    /// module's poll has already run in the same pass.
+    pub(crate) fn collection_ui_poll_delay(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let read_delay = [
+            self.collection_ui.catalog_request.retry_delay(now),
+            self.collection_ui.snapshot_request.retry_delay(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let runtime_delay = (matches!(self.collection_ui.phase, CollectionRuntimePhase::Starting)
+            || !self.collection_ui.operation.is_idle())
+        .then_some(COLLECTION_READ_RETRY_INTERVAL);
+        read_delay.into_iter().chain(runtime_delay).min()
     }
 
     fn poll_collection_operation(&mut self, _ctx: &egui::Context) {
@@ -4101,6 +4312,178 @@ mod tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn manager_read_demand_waits_for_starting_and_busy_then_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let snapshot = create_collection(&mut app, "read demand");
+        let id = snapshot.collection_id();
+        app.collection_ui.select_collection(Some(id));
+        wait_for(&mut app, |app| {
+            app.collection_ui
+                .snapshot
+                .as_ref()
+                .is_some_and(|current| current.collection_id() == id)
+                && app.collection_ui.snapshot_request.is_none()
+        });
+
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        let ctx = egui::Context::default();
+        // A UI control may create this demand after the read poll in the same pass. The App
+        // frame tail must still observe its typed deadline and reserve a wakeup.
+        app.poll_collection_ui(&ctx);
+        app.collection_ui.request_catalog(snapshot.revision());
+        app.collection_ui.request_snapshot(id, snapshot.revision());
+        assert!(app.collection_ui_poll_delay().unwrap() > Duration::ZERO);
+        let (catalog_deadline, snapshot_deadline) = match (
+            &app.collection_ui.catalog_request,
+            &app.collection_ui.snapshot_request,
+        ) {
+            (
+                CollectionReadSlot::RequestNeeded {
+                    not_before: catalog,
+                    ..
+                },
+                CollectionReadSlot::RequestNeeded {
+                    not_before: snapshot,
+                    ..
+                },
+            ) => (*catalog, *snapshot),
+            _ => panic!("Starting must keep both explicit read demands"),
+        };
+        app.poll_collection_ui(&ctx);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { not_before, .. } if not_before == catalog_deadline
+        ));
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::RequestNeeded { not_before, .. } if not_before == snapshot_deadline
+        ));
+
+        app.collection_ui.phase = CollectionRuntimePhase::Ready;
+        let (barrier_reply, entered, release) = client.test_barrier().unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut queued = Vec::new();
+        loop {
+            match client.list_catalog() {
+                Ok(reply) => queued.push(reply),
+                Err(CollectionStoreError::Busy) => break,
+                other => panic!("unexpected actor admission: {other:?}"),
+            }
+        }
+        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+            &mut app.collection_ui.catalog_request
+        {
+            *not_before = Instant::now();
+        }
+        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+            &mut app.collection_ui.snapshot_request
+        {
+            *not_before = Instant::now();
+        }
+        app.poll_collection_ui(&ctx);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { .. }
+        ));
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::RequestNeeded { .. }
+        ));
+        release.send(()).unwrap();
+        barrier_reply
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        drop(queued);
+        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+            &mut app.collection_ui.catalog_request
+        {
+            *not_before = Instant::now();
+        }
+        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+            &mut app.collection_ui.snapshot_request
+        {
+            *not_before = Instant::now();
+        }
+        wait_for(&mut app, |app| {
+            app.collection_ui.catalog_request.is_none()
+                && app.collection_ui.snapshot_request.is_none()
+                && app
+                    .collection_ui
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.collection_id() == id)
+        });
+        assert_eq!(app.collection_ui_poll_delay(), None);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn manager_explicit_same_revision_refresh_and_selection_switch_keep_their_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let first = create_collection(&mut app, "first");
+        let second = create_collection(&mut app, "second");
+        let first_id = first.collection_id();
+        let second_id = second.collection_id();
+        app.collection_ui.select_collection(Some(first_id));
+        wait_for(&mut app, |app| {
+            app.collection_ui.catalog_request.is_none()
+                && app.collection_ui.snapshot_request.is_none()
+                && app
+                    .collection_ui
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.collection_id() == first_id)
+        });
+        let catalog_revision = app.collection_ui.catalog.as_ref().unwrap().catalog_revision;
+        let (barrier_reply, entered, release) = client.test_barrier().unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        app.collection_ui.request_catalog(catalog_revision);
+        app.collection_ui.request_catalog(catalog_revision);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::InFlight { next: Some(revision), .. } if revision == catalog_revision
+        ));
+        app.collection_ui
+            .request_snapshot(first_id, first.revision());
+        app.collection_ui
+            .request_snapshot(first_id, first.revision());
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::InFlight { next: Some(SnapshotReadDemand { collection_id, .. }), .. }
+                if collection_id == first_id
+        ));
+        // Closing the manager is presentation only. The toolbar/catalog request still belongs
+        // to the runtime, while switching the selected target retires old snapshot follow-ups.
+        app.collection_ui.show_manager = false;
+        app.collection_ui.select_collection(Some(second_id));
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::InFlight { ref request, next: None }
+                if request.collection_id == second_id
+        ));
+        release.send(()).unwrap();
+        barrier_reply
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_for(&mut app, |app| {
+            app.collection_ui.catalog_request.is_none()
+                && app.collection_ui.snapshot_request.is_none()
+                && app
+                    .collection_ui
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.collection_id() == second_id)
+        });
+        assert_eq!(app.collection_ui.selected_id, Some(second_id));
+        assert!(!app.collection_ui.show_manager);
+        app.shutdown_collection_runtime_for_exit();
     }
 
     fn wait_for_collection_grid(app: &mut App, collection_id: CollectionId) {

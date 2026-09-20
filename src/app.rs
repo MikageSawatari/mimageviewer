@@ -75311,7 +75311,16 @@ impl App {
         if fs_cleanup_pending {
             reasons.push("fs_viewport_cleanup");
         }
-        let idle_upgrade_delay = if reasons.is_empty() && ai_upscale_poll_delay.is_none() {
+        // Collection reads use a delayed poll, including the remaining admission deadline.
+        // Re-arm it every frame because an unrelated immediate repaint can replace a timer.
+        let collection_grid_poll_delay = self.collection_grid_poll_delay();
+        let collection_ui_poll_delay = self.collection_ui_poll_delay();
+        let delayed_poll_delay = ai_upscale_poll_delay
+            .into_iter()
+            .chain(collection_grid_poll_delay)
+            .chain(collection_ui_poll_delay)
+            .min();
+        let idle_upgrade_delay = if reasons.is_empty() && delayed_poll_delay.is_none() {
             self.thumb_idle_upgrade_recheck_delay()
         } else {
             None
@@ -75319,7 +75328,7 @@ impl App {
 
         if !reasons.is_empty() {
             ctx.request_repaint();
-        } else if let Some(delay) = ai_upscale_poll_delay {
+        } else if let Some(delay) = delayed_poll_delay {
             ctx.request_repaint_after(delay);
         } else if let Some(delay) = idle_upgrade_delay {
             ctx.request_repaint_after(delay);
@@ -75332,8 +75341,14 @@ impl App {
         if crate::perf::is_enabled() {
             let action = if !reasons.is_empty() {
                 "request_repaint"
-            } else if ai_upscale_poll_delay.is_some() {
+            } else if ai_upscale_poll_delay.is_some_and(|delay| Some(delay) == delayed_poll_delay) {
                 "request_repaint_after_ai_upscale"
+            } else if collection_grid_poll_delay
+                .is_some_and(|delay| Some(delay) == delayed_poll_delay)
+            {
+                "request_repaint_after_collection_grid"
+            } else if collection_ui_poll_delay.is_some() {
+                "request_repaint_after_collection_ui"
             } else if idle_upgrade_delay.is_some() {
                 "request_repaint_after_idle_upgrade"
             } else {

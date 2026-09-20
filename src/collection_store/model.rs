@@ -319,6 +319,12 @@ pub enum CollectionStoreError {
     Persistence(String),
 }
 
+impl CollectionStoreError {
+    pub fn is_read_retryable(&self) -> bool {
+        matches!(self, Self::Busy | Self::Starting)
+    }
+}
+
 impl fmt::Display for CollectionStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
