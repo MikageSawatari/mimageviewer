@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 は実機確認待ち。A-6 / D-4 の統合 full gate / build は2026-09-20に通過した。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7 前半（登録上限・import資源上限・preview仮想化）は実装・自動検証・Codex 独立レビュー完了。同節のprepare再利用は未着手。§23.4 / §23.6 / A-6 / D-4 は実機確認待ち。A-6 / D-4 の統合 full gate / build は2026-09-20に通過した。§23.7 前半のfull gate / buildは後続prepare再利用と統合する。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1312,8 +1312,21 @@ GUI 起動・通常 profile / 実データ操作は行っていない。
 ### 23.7 上限と大量件数（仕様判断 3、B-1 / B-4 / D-2）
 
 - 1 コレクション 10,000 件の定数を model に置き、`add_batch` / import の actor 側で typed に拒否する。
-  Remote の `MAX_REMOTE_COLLECTION_ENTRIES` は同じ定数から導く。
-- import 確認画面を `show_rows` で仮想化し、`read_to_string` と `parse_collection_text` に上限を置く。
+  Remote の永続 root entry prefix は同じ定数から導く。catalog 100,000 件と既存 aggregate 100,000 件は別上限とする。
+- import 確認画面を `show_rows` で仮想化し、worker の実読込を 32 MiB + 1 byte に制限する。
+  pure `parse_collection_text` も 32 MiB と非空 50,000 行を独立に拒否し、資源超過時は preview 全体を採用しない。
+  これらの資源上限は 1 コレクション 10,000 件の登録上限とは別である。
+
+2026-09-20、前半を実装。actor transaction は `COUNT(*)` を正本として既存/同batch重複を先に分類し、
+入力順で残容量へ追加する。結果は追加・重複・容量拒否の3件数を表示し、追加0件ならrevision / 通知を
+進めない。既存の上限超過データは読取・削除・手動並替を維持する。importは資源超過をpreview全体拒否とし、
+無効パス時のall-or-none分類、確認前の対象path非アクセスを維持する。長いpathは固定高の可視行だけ省略表示し、
+hoverで全文を確認できる。Remote rootは10,000件またはwire予算内のdisplay unit境界prefixを返し、
+full eligible / seek / totalは旧上限超過データを含むexact全件のままにする。
+焦点検証はstore 24件（容量境界、旧上限超過、SQL rollback、資源境界を含む）、Remote prefix 1件、
+worker実読込 1件、長path preview snapshot 1件を通過し、snapshot PNGを目視確認した。
+bin check / fmt / UI glyph / viewer context audit / diff checkも通過。独立reviewerは追加blockingなしで
+前半差分を受理した。GUIは起動していない。
 - navigation の prepare は、actor revision が installed と一致し installed presentation が存在する場合、
   選ばれた target entry（と隣接数件）だけ availability を確認し、全件 stat は revision 前進と明示更新に限る。
   Remote の `persistent_collections.rs` も同じ helper を使う。

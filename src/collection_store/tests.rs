@@ -76,7 +76,8 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
     let preview = parse_collection_text(
         "\u{feff}\"missing folder/a.jpg\"\r\n#literal.png\r\nsub/../#literal.png\r\n\r\nhttps://bad/x\r\n",
         Path::new(r"C:\NeverExists\list.txt"),
-    );
+    )
+    .unwrap();
     assert_eq!(preview.lines.len(), 4);
     assert_eq!(
         preview.lines[0].status,
@@ -104,7 +105,8 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
     let serialized = serialize_collection_paths(accepted.iter().map(PathBuf::as_path));
     assert!(serialized.starts_with(r#""C:\NeverExists\missing folder\a.jpg""#));
     assert!(serialized.ends_with("\r\n"));
-    let reparsed = parse_collection_text(&serialized, Path::new(r"C:\Export\collection.txt"));
+    let reparsed =
+        parse_collection_text(&serialized, Path::new(r"C:\Export\collection.txt")).unwrap();
     assert_eq!(
         reparsed
             .accepted_paths()
@@ -112,6 +114,184 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
             .collect::<Vec<_>>(),
         accepted
     );
+}
+
+#[test]
+fn text_preview_rejects_byte_and_nonempty_line_resource_limits_without_partial_preview() {
+    let source = Path::new(r"C:\Imports\list.txt");
+    let at_byte_limit = " ".repeat(MAX_COLLECTION_IMPORT_BYTES);
+    assert!(
+        parse_collection_text(&at_byte_limit, source)
+            .unwrap()
+            .lines
+            .is_empty()
+    );
+    let over_byte_limit = format!("{at_byte_limit} ");
+    assert_eq!(
+        parse_collection_text(&over_byte_limit, source),
+        Err(CollectionImportLimitError::Bytes)
+    );
+
+    let at_line_limit = "C:\\Media\\same.jpg\r\n".repeat(MAX_COLLECTION_IMPORT_NONEMPTY_LINES);
+    let preview = parse_collection_text(&at_line_limit, source).unwrap();
+    assert_eq!(preview.lines.len(), MAX_COLLECTION_IMPORT_NONEMPTY_LINES);
+    assert_eq!(
+        preview.lines[1].status,
+        CollectionImportLineStatus::Duplicate { first_line: 1 }
+    );
+    assert_eq!(
+        parse_collection_text(
+            &format!("{at_line_limit}\r\nC:\\Media\\next.jpg\r\n"),
+            source
+        ),
+        Err(CollectionImportLimitError::NonemptyLines)
+    );
+}
+
+#[test]
+fn add_batch_uses_authoritative_count_and_keeps_oversized_legacy_entries_editable() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Capacity").unwrap();
+    let id = created.collection_id();
+    // Seed old data directly to keep this boundary test independent of the new admission path.
+    let mut conn = Connection::open(&path).unwrap();
+    let tx = conn.transaction().unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO collection_entries
+             (id, collection_id, source_namespace, source_path, normalized_path,
+              resolved_kind, manual_position, created_at_ms)
+             VALUES (?1, ?2, 'filesystem_path', ?3, ?4, 'image', ?5, 0)",
+            )
+            .unwrap();
+        for index in 0..MAX_COLLECTION_ENTRIES - 1 {
+            insert
+                .execute(rusqlite::params![
+                    CollectionEntryId::new().to_string(),
+                    id.to_string(),
+                    format!(r"C:\seed\{index}.jpg"),
+                    format!("c:/seed/{index}.jpg"),
+                    index as i64,
+                ])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+
+    let outcome = db
+        .add_batch(
+            id,
+            created.revision(),
+            vec![
+                registration(r"C:\seed\0.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\new\first.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\new\second.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\new\second.jpg", CollectionResolvedKind::Image),
+            ],
+        )
+        .unwrap();
+    assert_eq!(outcome.added.len(), 1);
+    assert_eq!(outcome.duplicates.len(), 2);
+    assert_eq!(outcome.capacity_rejected.len(), 1);
+    assert_eq!(outcome.snapshot.entries.len(), MAX_COLLECTION_ENTRIES);
+    assert_eq!(outcome.snapshot.revision(), created.revision() + 1);
+
+    let unchanged = db
+        .add_batch(
+            id,
+            outcome.snapshot.revision(),
+            vec![
+                registration(r"C:\seed\0.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\new\first.jpg", CollectionResolvedKind::Image),
+            ],
+        )
+        .unwrap();
+    assert!(unchanged.added.is_empty());
+    assert_eq!(unchanged.duplicates.len(), 2);
+    assert!(unchanged.capacity_rejected.is_empty());
+    assert_eq!(unchanged.snapshot.revision(), outcome.snapshot.revision());
+    assert_eq!(
+        unchanged.snapshot.catalog_revision,
+        outcome.snapshot.catalog_revision
+    );
+
+    conn.execute(
+        "INSERT INTO collection_entries
+         (id, collection_id, source_namespace, source_path, normalized_path,
+          resolved_kind, manual_position, created_at_ms)
+         VALUES (?1, ?2, 'filesystem_path', 'C:\\legacy\\extra.jpg',
+                 'c:/legacy/extra.jpg', 'image', ?3, 0)",
+        rusqlite::params![
+            CollectionEntryId::new().to_string(),
+            id.to_string(),
+            MAX_COLLECTION_ENTRIES as i64
+        ],
+    )
+    .unwrap();
+    let legacy = db.snapshot(id).unwrap();
+    assert_eq!(legacy.entries.len(), MAX_COLLECTION_ENTRIES + 1);
+    let rejected = db
+        .add_batch(
+            id,
+            legacy.revision(),
+            vec![registration(
+                r"C:\new\third.jpg",
+                CollectionResolvedKind::Image,
+            )],
+        )
+        .unwrap();
+    assert!(rejected.added.is_empty());
+    assert_eq!(rejected.capacity_rejected.len(), 1);
+    assert_eq!(rejected.snapshot.revision(), legacy.revision());
+
+    let reversed = legacy
+        .entries
+        .iter()
+        .rev()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    let reordered = db
+        .reorder_manual(id, legacy.revision(), reversed.clone())
+        .unwrap();
+    assert_eq!(reordered.entries[0].id, reversed[0]);
+    let removed = db
+        .remove_entries(id, reordered.revision(), vec![reversed[0]])
+        .unwrap();
+    assert_eq!(removed.entries.len(), MAX_COLLECTION_ENTRIES);
+}
+
+#[test]
+fn add_batch_sql_failure_rolls_back_earlier_insert_and_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("collection.db");
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Atomic add").unwrap();
+    Connection::open(path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_second BEFORE INSERT ON collection_entries
+         WHEN NEW.normalized_path = 'c:/atomic/second.jpg'
+         BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        db.add_batch(
+            created.collection_id(),
+            created.revision(),
+            vec![
+                registration(r"C:\atomic\first.jpg", CollectionResolvedKind::Image),
+                registration(r"C:\atomic\second.jpg", CollectionResolvedKind::Image),
+            ]
+        )
+        .is_err()
+    );
+    let after = db.snapshot(created.collection_id()).unwrap();
+    assert!(after.entries.is_empty());
+    assert_eq!(after.revision(), created.revision());
+    assert_eq!(after.catalog_revision, created.catalog_revision);
 }
 
 #[test]

@@ -1,7 +1,29 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{CollectionSourcePath, CollectionSourcePathKey};
+
+pub const MAX_COLLECTION_IMPORT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_COLLECTION_IMPORT_NONEMPTY_LINES: usize = 50_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionImportLimitError {
+    Bytes,
+    NonemptyLines,
+}
+
+impl fmt::Display for CollectionImportLimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bytes => write!(f, "インポートテキストは32 MiB以下にしてください。"),
+            Self::NonemptyLines => write!(
+                f,
+                "インポートテキストの空行以外は50,000行以下にしてください。"
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CollectionImportLineStatus {
@@ -36,10 +58,17 @@ impl CollectionImportPreview {
 }
 
 /// 外部 text の純解析。ファイルの存在確認、link 解決、DB、network access は行わない。
-pub fn parse_collection_text(text: &str, source_text_path: &Path) -> CollectionImportPreview {
+pub fn parse_collection_text(
+    text: &str,
+    source_text_path: &Path,
+) -> Result<CollectionImportPreview, CollectionImportLimitError> {
+    if text.len() > MAX_COLLECTION_IMPORT_BYTES {
+        return Err(CollectionImportLimitError::Bytes);
+    }
     let mut lines = Vec::new();
     let mut first_by_key: HashMap<CollectionSourcePathKey, usize> = HashMap::new();
     let base_dir = source_text_path.parent().unwrap_or(source_text_path);
+    let mut nonempty_lines = 0;
 
     for (index, raw_line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
         let line_number = index + 1;
@@ -47,6 +76,10 @@ pub fn parse_collection_text(text: &str, source_text_path: &Path) -> CollectionI
         let trimmed = original.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        nonempty_lines += 1;
+        if nonempty_lines > MAX_COLLECTION_IMPORT_NONEMPTY_LINES {
+            return Err(CollectionImportLimitError::NonemptyLines);
         }
         let value = match unquote_whole_line(trimmed) {
             Ok(value) => value,
@@ -91,7 +124,7 @@ pub fn parse_collection_text(text: &str, source_text_path: &Path) -> CollectionI
             }),
         }
     }
-    CollectionImportPreview { lines }
+    Ok(CollectionImportPreview { lines })
 }
 
 /// 現在の有効順を UTF-8 text 本文へ直列化する純関数。

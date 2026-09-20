@@ -11,7 +11,7 @@ use super::{
     CollectionEntryId, CollectionId, CollectionMigrationOutcome, CollectionOrderMode,
     CollectionRegistration, CollectionResolvedKind, CollectionSourceMigration,
     CollectionSourceMigrationBatch, CollectionSourceNamespace, CollectionSourcePathKey,
-    CollectionStoreError,
+    CollectionStoreError, MAX_COLLECTION_ENTRIES,
 };
 use crate::settings::SortOrder;
 
@@ -222,8 +222,15 @@ impl CollectionStoreDb {
             [id.to_string()],
             |row| row.get(0),
         )?;
+        let existing_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM collection_entries WHERE collection_id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut remaining = MAX_COLLECTION_ENTRIES.saturating_sub(existing_count as usize);
         let mut added = Vec::new();
         let mut duplicates = Vec::new();
+        let mut capacity_rejected = Vec::new();
         let now = now_ms();
         let mut batch_seen = HashSet::new();
         for registration in registrations {
@@ -231,6 +238,10 @@ impl CollectionStoreDb {
                 || source_exists(&tx, id, &registration.source_key)?
             {
                 duplicates.push(registration.source_key);
+                continue;
+            }
+            if remaining == 0 {
+                capacity_rejected.push(registration.source_key);
                 continue;
             }
             let entry_id = CollectionEntryId::new();
@@ -251,6 +262,7 @@ impl CollectionStoreDb {
                 ],
             )?;
             position += 1;
+            remaining -= 1;
             added.push(entry_id);
         }
         let catalog_revision = if added.is_empty() {
@@ -265,6 +277,7 @@ impl CollectionStoreDb {
             snapshot,
             added: Arc::from(added),
             duplicates: Arc::from(duplicates),
+            capacity_rejected: Arc::from(capacity_rejected),
         })
     }
 

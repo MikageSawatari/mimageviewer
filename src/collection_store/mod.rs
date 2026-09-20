@@ -30,7 +30,8 @@ pub use runtime::{
     CollectionRevisionWatch, CollectionRuntimeEvent, CollectionStoreClient, CollectionStoreRuntime,
 };
 pub use text::{
-    CollectionImportLine, CollectionImportLineStatus, CollectionImportPreview,
+    CollectionImportLimitError, CollectionImportLine, CollectionImportLineStatus,
+    CollectionImportPreview, MAX_COLLECTION_IMPORT_BYTES, MAX_COLLECTION_IMPORT_NONEMPTY_LINES,
     parse_collection_text, serialize_collection_paths,
 };
 

@@ -306,7 +306,12 @@ producer / session current gateを通し、actor Starting / Closedや削除前ca
 
 ### 6.3 response budget
 
-既存aggregateの100,000件上限は共通定数へ寄せる。ただし件数だけでresponse安全性を判定しない。永続entryでは
+永続コレクションの root entry prefix は共通 `MAX_COLLECTION_ENTRIES`（10,000 件）まで公開する。
+catalog の定義一覧と既存 aggregate の 100,000 件上限は別に保つ。旧データが 10,000 件を超えていても
+full prepared / Remote 公開可能列と server-side navigation / seek / total は全件を対象とし、可視 prefix だけに
+縮めない。応答バイト数による早期 prefix 打ち切りも引き続き適用する。
+
+件数だけでresponse安全性を判定しない。永続entryでは
 entry ID、source identity token、tagged state、thumbnail / detail、page groups、response enumとServerMessage envelopeも
 増えるため、完成serde frameが`MAX_RESPONSE_FRAME_BYTES`（現在64 MiB）未満であることをbuilderの最終条件にする。
 entryと、それを参照するpage groupを同じstable prefix境界で追加し、完成responseを計測して超える手前で止める。

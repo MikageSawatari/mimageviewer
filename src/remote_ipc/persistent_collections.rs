@@ -30,8 +30,8 @@ use crate::collection_store::{
     CollectionPreparedNavigationTarget, CollectionPreparedSnapshot,
     CollectionRemoteProducerControl, CollectionRemoteRequestLease, CollectionResolvedKind,
     CollectionRevisionNotice, CollectionRevisionWatch, CollectionSnapshot,
-    CollectionSourcePreparation, CollectionStoreError, PreparedCollectionEntry,
-    inspect_collection_source, prepare_collection_snapshot_while,
+    CollectionSourcePreparation, CollectionStoreError, MAX_COLLECTION_ENTRIES,
+    PreparedCollectionEntry, inspect_collection_source, prepare_collection_snapshot_while,
     resolve_prepared_collection_navigation,
 };
 use crate::settings::Settings;
@@ -40,7 +40,7 @@ use super::session::RemoteOperationCancellation;
 
 const EXACT_REQUEST_BUDGET: Duration = Duration::from_secs(9);
 const MAX_EXACT_RESTARTS: usize = 16;
-const MAX_REMOTE_COLLECTION_ENTRIES: usize = 100_000;
+const MAX_REMOTE_COLLECTION_CATALOG: usize = 100_000;
 
 #[derive(Clone)]
 pub(super) struct PersistentCollectionEngine {
@@ -84,7 +84,7 @@ impl BoundedWirePrefix {
 
     fn observe(&mut self, wire: PersistentCollectionEntry) {
         self.observed += 1;
-        if !self.accepting || self.entries.len() >= MAX_REMOTE_COLLECTION_ENTRIES {
+        if !self.accepting || self.entries.len() >= MAX_COLLECTION_ENTRIES {
             return;
         }
         let cost = wire_entry_budget_cost(&wire);
@@ -262,7 +262,7 @@ impl PersistentCollectionEngine {
             for definition in catalog
                 .definitions
                 .iter()
-                .take(MAX_REMOTE_COLLECTION_ENTRIES)
+                .take(MAX_REMOTE_COLLECTION_CATALOG)
             {
                 if !request_is_current(&lease, cancellation, deadline) {
                     return PersistentCollectionCatalogResponse::Error(request_interrupted_error(
@@ -2359,6 +2359,33 @@ mod tests {
         assert!(retained.retained_bytes < 32 * 1024);
         assert!(retained.entries.len() < 100_000);
         assert!(!retained.accepting);
+    }
+
+    #[test]
+    fn root_wire_prefix_uses_store_capacity_without_truncating_full_observation() {
+        let inputs = vec![(); MAX_COLLECTION_ENTRIES + 1];
+        let mut observed = 0;
+        let retained = stream_bounded_wire_entries(
+            &inputs,
+            usize::MAX,
+            || true,
+            |_| PersistentCollectionEntry {
+                identity: PersistentCollectionIdentity {
+                    entry_id: "entry".into(),
+                    source_identity: "source".into(),
+                },
+                name: "image".into(),
+                state: PersistentCollectionEntryState::Missing {
+                    last_known_kind: Some(RemoteEntryKind::Image),
+                },
+            },
+            |_, _| observed += 1,
+        )
+        .unwrap();
+        assert_eq!(retained.entries.len(), MAX_COLLECTION_ENTRIES);
+        assert_eq!(retained.observed, MAX_COLLECTION_ENTRIES + 1);
+        assert_eq!(observed, MAX_COLLECTION_ENTRIES + 1);
+        assert_eq!(MAX_REMOTE_COLLECTION_CATALOG, 100_000);
     }
 
     #[test]

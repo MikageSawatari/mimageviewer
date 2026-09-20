@@ -5,6 +5,7 @@
 //! 変更しない。
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,9 +20,9 @@ use crate::collection_store::{
     CollectionId, CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
     CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
     CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
-    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime, parse_collection_text,
-    prepare_collection_export, prepare_collection_registrations, serialize_collection_paths,
-    write_collection_export_atomic,
+    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime,
+    MAX_COLLECTION_IMPORT_BYTES, parse_collection_text, prepare_collection_export,
+    prepare_collection_registrations, serialize_collection_paths, write_collection_export_atomic,
 };
 
 const COLLECTION_REORDER_DEFAULT_WINDOW_W: f32 = 880.0;
@@ -2723,12 +2724,14 @@ impl App {
                     }
                     self.collection_ui
                         .request_catalog(self.collection_ui.wanted_catalog_revision);
-                    let mut message = format!("{} 件を追加しました。", outcome.added.len());
-                    if !outcome.duplicates.is_empty() {
-                        message.push_str(&format!(
-                            " 重複 {} 件は追加していません。",
-                            outcome.duplicates.len()
-                        ));
+                    let mut message = format!(
+                        "追加 {} 件、重複 {} 件、上限による拒否 {} 件。",
+                        outcome.added.len(),
+                        outcome.duplicates.len(),
+                        outcome.capacity_rejected.len()
+                    );
+                    if !outcome.capacity_rejected.is_empty() {
+                        message.push_str(" 1コレクションの登録上限は10,000件です。");
                     }
                     if !errors.is_empty() {
                         message.push_str("\n");
@@ -3256,11 +3259,23 @@ impl App {
         let worker_path = source_path.clone();
         match WorkerTask::spawn("collection-import-read", move |cancel| {
             let perf_start = crate::perf::is_enabled().then(Instant::now);
-            let read = std::fs::read_to_string(&worker_path);
-            let bytes = read.as_ref().map_or(0, String::len);
-            let result = read
-                .map(|text| parse_collection_text(&text, &worker_path))
-                .map_err(|error| format!("インポートファイルを読めませんでした: {error}"));
+            let mut bytes = 0;
+            let result = (|| {
+                let file = std::fs::File::open(&worker_path)
+                    .map_err(|error| format!("インポートファイルを読めませんでした: {error}"))?;
+                let mut bounded = Vec::new();
+                file.take((MAX_COLLECTION_IMPORT_BYTES + 1) as u64)
+                    .read_to_end(&mut bounded)
+                    .map_err(|error| format!("インポートファイルを読めませんでした: {error}"))?;
+                bytes = bounded.len();
+                if bytes > MAX_COLLECTION_IMPORT_BYTES {
+                    return Err("インポートテキストは32 MiB以下にしてください。".to_owned());
+                }
+                let text = String::from_utf8(bounded).map_err(|error| {
+                    format!("インポートファイルはUTF-8で保存してください: {error}")
+                })?;
+                parse_collection_text(&text, &worker_path).map_err(|error| error.to_string())
+            })();
             if let Some(start) = perf_start {
                 crate::perf::event(
                     "collection",
@@ -3556,8 +3571,9 @@ impl App {
                     ui.heading("インポート内容の確認");
                     ui.label(format!("追加先: {}", self.collection_ui.catalog.as_ref().and_then(|catalog| catalog.definitions.iter().find(|item| item.id == collection_id)).map(|item| item.name.as_str()).unwrap_or("不明")));
                     ui.weak("この確認までは対象ファイルやフォルダへアクセスしていません。確認後に存在と種類を調べます。");
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for line in &preview.lines {
+                    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+                    egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, preview.lines.len(), |ui, row_range| {
+                        for line in &preview.lines[row_range] {
                             let is_network = line.source_key.as_ref().is_some_and(|key| {
                                 key.normalized_path().starts_with("//")
                             });
@@ -3569,7 +3585,11 @@ impl App {
                                 (CollectionImportLineStatus::Duplicate { .. }, _) => "重複",
                                 (CollectionImportLineStatus::Invalid { .. }, _) => "無効",
                             };
-                            ui.label(format!("{}: [{status}] {}", line.line_number, line.resolved_path.as_ref().map_or_else(|| line.original.clone(), |path| path.display().to_string())));
+                            let full_text = format!("{}: [{status}] {}", line.line_number, line.resolved_path.as_ref().map_or_else(|| line.original.clone(), |path| path.display().to_string()));
+                            ui.add_sized(
+                                [ui.available_width(), row_height],
+                                egui::Label::new(&full_text).truncate(),
+                            ).on_hover_text(full_text);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -4297,6 +4317,31 @@ mod tests {
         app.collection_ui.snapshot.clone().unwrap()
     }
 
+    #[test]
+    fn import_worker_rejects_actual_oversized_file_before_preview_or_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        let snapshot = create_collection(&mut app, "Import limit");
+        let source = temp.path().join("oversized.txt");
+        std::fs::write(&source, vec![b' '; MAX_COLLECTION_IMPORT_BYTES + 1]).unwrap();
+        app.start_collection_import_read(snapshot.collection_id(), snapshot.revision(), source);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        assert!(
+            app.collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(error, message)| { *error && message.contains("32 MiB") })
+        );
+        assert!(
+            app.collection_ui
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
     fn press_delete(app: &mut App) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
@@ -4988,10 +5033,12 @@ mod tests {
                 .collection_session_mut()
                 .unwrap()
                 .installed_items_generation = Some(app.items_generation);
+            let long_path = format!(r"D:\Photo\{}new-image.png", "summer-album\\".repeat(30));
             let preview = parse_collection_text(
-                "D:\\Photo\\new-image.png\n\\\\server\\share\\network.png\nNUL\\bad.png\n",
+                &format!("{long_path}\n\\\\server\\share\\network.png\nNUL\\bad.png\n"),
                 std::path::Path::new(r"D:\Import\collection.txt"),
-            );
+            )
+            .unwrap();
             app.collection_ui.operation = CollectionDialogOperation::PreviewImport {
                 collection_id,
                 expected_revision: 7,
@@ -6256,7 +6303,8 @@ mod tests {
         let preview = parse_collection_text(
             &format!("{}\n", real.display()),
             &temp.path().join("import.txt"),
-        );
+        )
+        .unwrap();
         app.collection_ui.operation = CollectionDialogOperation::PreviewImport {
             collection_id: target.collection_id(),
             expected_revision: target.revision(),

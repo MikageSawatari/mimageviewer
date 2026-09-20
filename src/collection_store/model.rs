@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 use crate::settings::{ListingSortMetadata, SortOrder};
 
+/// Maximum number of references that may be newly registered in one collection.
+/// Older collections above this limit remain readable and editable.
+pub const MAX_COLLECTION_ENTRIES: usize = 10_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CollectionId(Uuid);
@@ -294,6 +298,7 @@ pub struct CollectionBatchAddOutcome {
     pub snapshot: CollectionSnapshot,
     pub added: Arc<[CollectionEntryId]>,
     pub duplicates: Arc<[CollectionSourcePathKey]>,
+    pub capacity_rejected: Arc<[CollectionSourcePathKey]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
