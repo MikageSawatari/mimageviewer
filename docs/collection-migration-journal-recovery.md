@@ -98,7 +98,10 @@ Automated verification on 2026-09-20:
 - `scripts/build-dev.ps1 -PreserveRuntime`: passed; core and remote service built in `target/dev-runtime`.
 
 No normal-profile application launch, real-data edit, or interactive input was
-part of automated verification. A user-run interactive check remains pending.
+part of automated verification. On 2026-09-20 the user reported that rename
+tracking worked in the verification build. This confirms the ordinary rename
+path; unreadable-journal and retry behavior are covered by the automated checks
+above, not by a user-reported corrupt-journal exercise.
 
 The existing persistence-**write** failure path still accepts a new filesystem
 operation before its resulting migration intent has a durable ACK, then holds
