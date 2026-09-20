@@ -177,6 +177,8 @@ const {
   persistentCollectionIdentityKey,
   persistentCollectionSortState,
   persistentCollectionHistoryStateForSession,
+  persistentCollectionImagePosition,
+  persistentCollectionLandedPosition,
   persistentCollectionOrdinalLocator,
   persistentCollectionCatalogTruncationText,
   persistentCollectionEntryIndexByIdentity,
@@ -460,11 +462,13 @@ test("persistent EOF terminal stops only its current viewer and settles once", a
 
 test("persistent target position keeps the full ordinal while sparse arrays stay local", () => {
   assert.deepEqual(persistentCollectionTargetPosition(41, 100_000), {
+    kind: "still_image",
     ordinal: 41,
     count: 100_000,
     label: "42 / 100000",
   });
   assert.deepEqual(persistentCollectionTargetPosition(99, 3), {
+    kind: "still_image",
     ordinal: 2,
     count: 3,
     label: "3 / 3",
@@ -476,6 +480,64 @@ test("persistent target position keeps the full ordinal while sparse arrays stay
   });
   assert.equal(persistentCollectionOrdinalLocator(-1), null);
   assert.equal(persistentCollectionOrdinalLocator(1.5), null);
+});
+
+test("persistent landed positions use the actual media projection and reject invalid wire", () => {
+  const targets = [
+    ["direct_image_display_unit", "still_image"],
+    ["direct_video", "video"],
+    ["direct_audio", "audio"],
+  ];
+  for (const [targetKind, positionKind] of targets) {
+    assert.deepEqual(
+      persistentCollectionLandedPosition(
+        { kind: positionKind, ordinal: 2, count: 4 },
+        { kind: targetKind }
+      ),
+      { kind: positionKind, ordinal: 2, count: 4, label: "3 / 4" }
+    );
+    assert.equal(
+      persistentCollectionLandedPosition(
+        { kind: "navigable_media", ordinal: 2, count: 4 },
+        { kind: targetKind }
+      ),
+      null
+    );
+  }
+  const image = { kind: "direct_image_display_unit" };
+  for (const position of [
+    { kind: "video", ordinal: 1, count: 3 },
+    { kind: "still_image", ordinal: 3, count: 3 },
+    { kind: "still_image", ordinal: -1, count: 3 },
+    { kind: "still_image", ordinal: 0, count: 0 },
+    { kind: "still_image", ordinal: 0.5, count: 3 },
+    { kind: "still_image", ordinal: 0, count: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.equal(persistentCollectionLandedPosition(position, image), null);
+  }
+});
+
+test("prefix-external image route keeps its core image ordinal for the next seek", () => {
+  const prefix = { entry_id: "prefix", source_identity: "a".repeat(64) };
+  const outside = { entry_id: "outside", source_identity: "b".repeat(64) };
+  const sparsePosition = persistentCollectionLandedPosition(
+    { kind: "still_image", ordinal: 41, count: 90 },
+    { kind: "direct_image_display_unit" }
+  );
+  const context = {
+    rootBinding: { images: [{ persistent_identity: prefix }] },
+    imageCount: 90,
+    sparsePosition,
+  };
+  assert.deepEqual(persistentCollectionImagePosition(context, outside), sparsePosition);
+  assert.deepEqual(persistentCollectionOrdinalLocator(sparsePosition.ordinal), {
+    direction: "current", locate_entry_id: null, locate_ordinal: 41,
+  });
+  context.sparsePosition = persistentCollectionLandedPosition(
+    { kind: "video", ordinal: 3, count: 8 },
+    { kind: "direct_video" }
+  );
+  assert.equal(persistentCollectionImagePosition(context, outside), null);
 });
 
 test("session replacement retires persistent collection history without changing the route", () => {

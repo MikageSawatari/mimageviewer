@@ -97,7 +97,14 @@ IPC / HTTP / Web へ型付きで渡す。Web の可視 prefix から位置を再
 画像 seek は `still_image` の位置だけを使い、動画・音声は各媒体の位置を使う。
 HTTP の見開き partner 昇格では画像位置を調整し、既存 token / revision / 公開範囲 / session・route の
 失効契約を維持する。混在列の prefix 外リンク、直後の seek、媒体ごとの件数、範囲外拒否、
-非公開行の除外、見開き、競合の回帰を対象とする。これは設計調査の結果で、まだ実装・検証前。
+非公開行の除外、見開き、競合の回帰を対象とする。
+
+2026-09-20 実装・独立レビュー受理: protocol v58 の `position: { kind, ordinal, count }` は
+着地した実媒体の exact Remote 公開可能列から計算する。候補本体と画像見開きpageも同じ列に限定し、
+Current対象が再検証で消えた場合はpartnerへ誤着地しない。HTTPのpartner昇格は画像位置だけを
+範囲内で補正し、Webの画像seekは `still_image` の位置だけを使う。混在媒体、非公開行、
+prefix外リンクからのseek、範囲外拒否、見開き、route/session失効の焦点回帰が通過した。
+全体gateと確認用ビルドの結果は [実装計画 §23](collection-implementation-plan.md#23-v400-出荷前レビュー後の修正計画2026-09-16) に記録する。
 
 ## 延期候補の扱い
 

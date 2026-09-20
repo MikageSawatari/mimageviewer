@@ -14,8 +14,9 @@ use mimageviewer_ipc::{
     FavoriteSearchRequest, MediaErrorCode, PageDemandRequest, PagePriority,
     PersistentCollectionEntryState, PersistentCollectionErrorCode,
     PersistentCollectionNavigatePayload, PersistentCollectionNavigateRequest,
-    PersistentCollectionSnapshotPayload, PersistentCollectionSnapshotRequest,
-    PersistentCollectionSparseTarget, RemoteAddress, RemoteAiJobError, RemoteAiJobErrorCode,
+    PersistentCollectionPositionKind, PersistentCollectionSnapshotPayload,
+    PersistentCollectionSnapshotRequest, PersistentCollectionSparseTarget,
+    PersistentCollectionTargetPosition, RemoteAddress, RemoteAiJobError, RemoteAiJobErrorCode,
     RemoteAiStartRequest, RemoteArchiveConfirmRequest, RemoteArchiveJobError,
     RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest, RemoteArchiveStartRequest,
     RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity,
@@ -2808,7 +2809,7 @@ fn api_saved_collection_navigate(
             if let PersistentCollectionNavigatePayload::Landed {
                 replacement,
                 target,
-                target_ordinal,
+                position,
                 ..
             } = &mut success.value
             {
@@ -2816,7 +2817,7 @@ fn api_saved_collection_navigate(
                     validate_persistent_snapshot_addresses(&state.library, payload);
                 }
                 if let Err(error) =
-                    validate_persistent_target_address(&state.library, target, target_ordinal)
+                    validate_persistent_target_address(&state.library, target, position)
                 {
                     return store_error_response(error).with_header("Cache-Control", "no-store");
                 }
@@ -2867,10 +2868,27 @@ fn validate_persistent_snapshot_addresses(
 fn validate_persistent_target_address(
     library: &Library,
     target: &mut PersistentCollectionSparseTarget,
-    target_ordinal: &mut usize,
+    position: &mut PersistentCollectionTargetPosition,
 ) -> Result<(), StoreError> {
+    let expected_kind = match target {
+        PersistentCollectionSparseTarget::DirectImageDisplayUnit { .. } => {
+            PersistentCollectionPositionKind::StillImage
+        }
+        PersistentCollectionSparseTarget::DirectVideo { .. } => {
+            PersistentCollectionPositionKind::Video
+        }
+        PersistentCollectionSparseTarget::DirectAudio { .. } => {
+            PersistentCollectionPositionKind::Audio
+        }
+    };
+    if position.kind != expected_kind || position.count == 0 || position.ordinal >= position.count {
+        return Err(StoreError::BadRequest);
+    }
     match target {
         PersistentCollectionSparseTarget::DirectImageDisplayUnit { group } => {
+            if group.pages.is_empty() || group.pages.len() > 2 {
+                return Err(StoreError::BadRequest);
+            }
             let original = group
                 .pages
                 .iter()
@@ -2878,7 +2896,8 @@ fn validate_persistent_target_address(
                 .collect::<Vec<_>>();
             let original_anchor_index = original
                 .iter()
-                .position(|identity| identity == &group.anchor);
+                .position(|identity| identity == &group.anchor)
+                .ok_or(StoreError::BadRequest)?;
             group.pages.retain(|slot| {
                 library
                     .validate_remote_file_kind(&slot.address, RemoteEntryKind::Image)
@@ -2889,16 +2908,19 @@ fn validate_persistent_target_address(
             }
             if !group.pages.iter().any(|slot| slot.identity == group.anchor) {
                 let survivor = &group.pages[0].identity;
-                if let (Some(old), Some(new)) = (
-                    original_anchor_index,
-                    original.iter().position(|identity| identity == survivor),
-                ) {
-                    *target_ordinal = if new >= old {
-                        (*target_ordinal).saturating_add(new - old)
-                    } else {
-                        (*target_ordinal).saturating_sub(old - new)
-                    };
-                }
+                let new = original
+                    .iter()
+                    .position(|identity| identity == survivor)
+                    .ok_or(StoreError::BadRequest)?;
+                let ordinal = if new >= original_anchor_index {
+                    position.ordinal.checked_add(new - original_anchor_index)
+                } else {
+                    position.ordinal.checked_sub(original_anchor_index - new)
+                };
+                let Some(ordinal) = ordinal.filter(|ordinal| *ordinal < position.count) else {
+                    return Err(StoreError::BadRequest);
+                };
+                position.ordinal = ordinal;
                 group.anchor = survivor.clone();
             }
             Ok(())
@@ -5722,14 +5744,82 @@ mod tests {
                 singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
             },
         };
-        let mut ordinal = 7;
-        validate_persistent_target_address(&library, &mut target, &mut ordinal).unwrap();
+        let mut position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 7,
+            count: 10,
+        };
+        let original_target = target.clone();
+        validate_persistent_target_address(&library, &mut target, &mut position).unwrap();
         let PersistentCollectionSparseTarget::DirectImageDisplayUnit { group } = target else {
             unreachable!();
         };
         assert_eq!(group.pages.len(), 1);
         assert_eq!(group.anchor, survivor);
-        assert_eq!(ordinal, 8);
+        assert_eq!(position.ordinal, 8);
+
+        let mut beyond = original_target.clone();
+        let mut last_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 9,
+            count: 10,
+        };
+        assert!(matches!(
+            validate_persistent_target_address(&library, &mut beyond, &mut last_position),
+            Err(StoreError::BadRequest)
+        ));
+        let mut wrong_kind = original_target;
+        let mut video_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::Video,
+            ordinal: 1,
+            count: 2,
+        };
+        assert!(matches!(
+            validate_persistent_target_address(&library, &mut wrong_kind, &mut video_position),
+            Err(StoreError::BadRequest)
+        ));
+
+        let reverse_survivor = PersistentCollectionIdentity {
+            entry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            source_identity: "b".repeat(64),
+        };
+        let reverse_blocked = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        let mut reverse = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: PersistentCollectionPageGroup {
+                anchor: reverse_blocked.clone(),
+                pages: vec![
+                    PersistentCollectionPageSlot {
+                        identity: reverse_survivor.clone(),
+                        address: RemoteAddress::file(survivor_path.to_string_lossy().into_owned()),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                    PersistentCollectionPageSlot {
+                        identity: reverse_blocked,
+                        address: RemoteAddress::file("../blocked.jpg"),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                ],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
+            },
+        };
+        let mut reverse_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 8,
+            count: 10,
+        };
+        validate_persistent_target_address(&library, &mut reverse, &mut reverse_position).unwrap();
+        assert_eq!(reverse_position.ordinal, 7);
+        let PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: reverse_group,
+        } = reverse
+        else {
+            unreachable!();
+        };
+        assert_eq!(reverse_group.anchor, reverse_survivor);
 
         let mut gone = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
             group: PersistentCollectionPageGroup {
@@ -5744,7 +5834,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            validate_persistent_target_address(&library, &mut gone, &mut ordinal),
+            validate_persistent_target_address(&library, &mut gone, &mut position),
             Err(StoreError::NotFound)
         ));
     }

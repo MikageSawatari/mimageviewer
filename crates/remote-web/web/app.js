@@ -5044,6 +5044,8 @@ async function locatePersistentCollectionRouteTarget(route, identity, requestOwn
     expectedRouteHash: expectedHash,
   }) || savedCollectionRootContext()?.routeSequence !== routeSequence) return false;
   if (response.result !== "landed" || !response.target) return false;
+  const targetPosition = persistentCollectionLandedPosition(response.position, response.target);
+  if (!targetPosition) return false;
   if (response.replacement) {
     applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage);
   }
@@ -5051,10 +5053,6 @@ async function locatePersistentCollectionRouteTarget(route, identity, requestOwn
   if (!current || current.collectionId !== route.collectionId) return false;
   current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
   current.viewToken = String(response.exact_view_token ?? current.viewToken);
-  const targetPosition = persistentCollectionTargetPosition(
-    response.target_ordinal,
-    response.target_count
-  );
   const target = response.target;
   if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
     return false;
@@ -5404,9 +5402,17 @@ function captureViewerPageGroupRequest(
 
 function currentPersistentImagePosition() {
   const context = persistentDirectViewerContext();
+  return persistentCollectionImagePosition(
+    context,
+    persistentIdentityOf(currentPageGroup()?.anchor)
+  );
+}
+
+export function persistentCollectionImagePosition(context, anchorIdentity) {
   if (!context) return null;
-  if (context.sparsePosition) return context.sparsePosition;
-  const anchorIdentity = persistentIdentityOf(currentPageGroup()?.anchor);
+  if (context.sparsePosition) {
+    return context.sparsePosition.kind === "still_image" ? context.sparsePosition : null;
+  }
   const prefixImages = context.rootBinding?.images ?? [];
   const ordinal = persistentCollectionEntryIndexByIdentity(prefixImages, anchorIdentity);
   return ordinal >= 0
@@ -7336,9 +7342,29 @@ export function persistentCollectionTargetPosition(ordinal, count) {
   const safeCount = Math.max(1, Number(count) || 1);
   const safeOrdinal = clamp(Number(ordinal) || 0, 0, safeCount - 1);
   return {
+    kind: "still_image",
     ordinal: safeOrdinal,
     count: safeCount,
     label: `${safeOrdinal + 1} / ${safeCount}`,
+  };
+}
+
+export function persistentCollectionLandedPosition(position, target) {
+  const expectedKind = {
+    direct_image_display_unit: "still_image",
+    direct_video: "video",
+    direct_audio: "audio",
+  }[target?.kind];
+  const ordinal = position?.ordinal;
+  const count = position?.count;
+  if (!expectedKind || position?.kind !== expectedKind ||
+      !Number.isSafeInteger(ordinal) || !Number.isSafeInteger(count) ||
+      count < 1 || ordinal < 0 || ordinal >= count) return null;
+  return {
+    kind: expectedKind,
+    ordinal,
+    count,
+    label: `${ordinal + 1} / ${count}`,
   };
 }
 
@@ -7466,6 +7492,11 @@ async function performPersistentCollectionNavigation(step, intent, signal) {
     settlePersistentEofFailure(intent, signal);
     throw new Error("次の項目の応答が不正です。");
   }
+  const targetPosition = persistentCollectionLandedPosition(response.position, response.target);
+  if (!targetPosition) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
   try {
     if (response.replacement) {
       applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage, {
@@ -7484,10 +7515,6 @@ async function performPersistentCollectionNavigation(step, intent, signal) {
   }
   current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
   current.viewToken = String(response.exact_view_token ?? current.viewToken);
-  const targetPosition = persistentCollectionTargetPosition(
-    response.target_ordinal,
-    response.target_count
-  );
   const target = response.target;
   if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
     settlePersistentEofFailure(intent, signal);

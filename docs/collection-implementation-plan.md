@@ -1101,7 +1101,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 は実機確認待ち。A-6 の物理位置移動は実装・焦点検証・独立レビュー完了（統合 gate / build 待ち）。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4 は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 は実機確認待ち。A-6 / D-4 の統合 full gate / build は2026-09-20に通過した。§23.8 の移行前 DB 保護だけ先行し、ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1306,7 +1306,7 @@ Windows の ready / scan error、共通 ready の成功・取消・revision / it
 2026-09-20、独立 reviewer は追加 blocking なしで A-6 完成差分を受理した。
 `cargo check -p mimageviewer --bin mimageviewer-core`、焦点テスト（location 3、menu model 1、
 handler 1、既存 Search Jump 3）、`cargo fmt --all -- --check`、UI glyph、`git diff --check` は通過した。
-統合 full gate / `build-dev.ps1 -PreserveRuntime` は後続修正とまとめて実施する。
+後続D-4と統合した full gate / `build-dev.ps1 -PreserveRuntime` は後述のとおり通過した。
 GUI 起動・通常 profile / 実データ操作は行っていない。
 
 ### 23.7 上限と大量件数（仕様判断 3、B-1 / B-4 / D-2）
@@ -1349,8 +1349,25 @@ B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）�
 A-8〜A-18 の P3、M3U 対応、登録順ソート、D&D 追加、件数表示、終了時の自動書き出し、通常フォルダの
 セッション限定シャッフル。前提件数（10,000）は known-issues と本書に明記する。
 
-D-4 は 2026-09-19 に利用者が出荷前修正へ戻すことを承認した。現時点では未実装で、
-§23.2 / §23.3 とは別の後続 chunk で扱う。
+D-4 は 2026-09-19 に利用者が出荷前修正へ戻すことを承認し、2026-09-20 に
+§23.2 / §23.3 とは別の後続 chunk として実装・焦点検証・独立レビューを完了した。
+request の `target_kind` は探索用に維持し、着地した実媒体の typed `position` を exact Remote 公開列から返す。
+protocol v57 → v58。candidate本体と画像group pageの公開可否を同じ列で照合し、対象消失時の
+partner誤着地を拒否する。HTTPの画像partner昇格はchecked ordinal補正、Webの画像seekは
+`still_image` 位置だけを使う。core焦点 8、IPC 3、HTTP 1、Web 409件が通過し、
+`cargo check`、fmt、UI glyph、diff-checkも通過した。A-6と統合した全体gate / 確認用buildも通過した。
+
+2026-09-20の統合checkpoint: `RUST_TEST_THREADS=1`で
+`scripts/test-full.ps1 -SuppressCrashDialogs` は `[test-full] PASS`、exit 0。
+UI snapshotは53/53、vendor egui / egui-wgpu / eframeは25 / 9 / 15で、process error modeは
+`0x00008001`に復元した。Web全体のNodeテストは409/409。
+`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --all -- --check`、
+`python scripts/check_ui_glyphs.py`（危険glyph 0）、`cargo run --locked -p viewer_context_audit --quiet`、
+`git diff --check` はすべてexit 0。mimageviewer / core / remoteのresident不在確認後、
+`scripts/build-dev.ps1 -PreserveRuntime` はcore / RemoteとVCRT PE検査（runtime 4 / PE 2）でexit 0。
+core SHA-256は`63143304F2CAEF6B5EE2AC8AB921C65BA2F80F8ED1C26443EFE2CAB0855FFBE2`、
+Remoteは`9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5`。
+GUIと通常profile / 実データは起動・操作していない。
 
 M-2 も 2026-09-20 に利用者が修正を承認し、出荷前対象へ戻した。読み取り失敗を
 正常な空と区別し、旧記録の保全と新しい保存・移行・終了の所有境界を修正した。

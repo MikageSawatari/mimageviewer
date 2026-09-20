@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 57;
+pub const PROTOCOL_VERSION: u32 = 58;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1540,6 +1540,21 @@ pub enum PersistentCollectionSparseTarget {
     },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionPositionKind {
+    StillImage,
+    Video,
+    Audio,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionTargetPosition {
+    pub kind: PersistentCollectionPositionKind,
+    pub ordinal: usize,
+    pub count: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistentCollectionAnchorResolution {
@@ -1567,8 +1582,7 @@ pub enum PersistentCollectionNavigatePayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replacement: Option<PersistentCollectionSnapshotPayload>,
         target: PersistentCollectionSparseTarget,
-        target_ordinal: usize,
-        target_count: usize,
+        position: PersistentCollectionTargetPosition,
         anchor_resolution: PersistentCollectionAnchorResolution,
     },
     Boundary {
@@ -3179,7 +3193,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 57);
+        assert_eq!(PROTOCOL_VERSION, 58);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3355,7 +3369,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 57);
+        assert_eq!(PROTOCOL_VERSION, 58);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4365,8 +4379,8 @@ mod tests {
     }
 
     #[test]
-    fn persistent_collection_shuffle_order_round_trips_on_protocol_57() {
-        assert_eq!(PROTOCOL_VERSION, 57);
+    fn persistent_collection_shuffle_order_round_trips_on_protocol_58() {
+        assert_eq!(PROTOCOL_VERSION, 58);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();
@@ -4409,6 +4423,51 @@ mod tests {
             let decoded: PersistentCollectionNavigateRequest =
                 serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn persistent_collection_landed_position_is_a_typed_protocol_58_field() {
+        let identity = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        for (kind, target) in [
+            (
+                PersistentCollectionPositionKind::Video,
+                PersistentCollectionSparseTarget::DirectVideo {
+                    identity: identity.clone(),
+                    address: RemoteAddress::file("C:/media/movie.mp4"),
+                },
+            ),
+            (
+                PersistentCollectionPositionKind::Audio,
+                PersistentCollectionSparseTarget::DirectAudio {
+                    identity: identity.clone(),
+                    address: RemoteAddress::file("C:/media/song.mp3"),
+                },
+            ),
+        ] {
+            let payload = PersistentCollectionNavigatePayload::Landed {
+                exact_revision: 7,
+                exact_view_token: "view".to_owned(),
+                replacement: None,
+                target,
+                position: PersistentCollectionTargetPosition {
+                    kind,
+                    ordinal: 2,
+                    count: 5,
+                },
+                anchor_resolution: PersistentCollectionAnchorResolution::EntryId,
+            };
+            let encoded = serde_json::to_value(&payload).unwrap();
+            assert_eq!(encoded["position"]["ordinal"], 2);
+            assert_eq!(encoded["position"]["count"], 5);
+            assert!(encoded.get("target_ordinal").is_none());
+            assert!(encoded.get("target_count").is_none());
+            let decoded: PersistentCollectionNavigatePayload =
+                serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, payload);
         }
     }
 }

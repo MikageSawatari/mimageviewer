@@ -1871,7 +1871,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-collection の session spread request と address-based `page_groups` を追加した現行版は **v49**。
+現行版は **v58**。v58 は永続コレクションの着地位置を実媒体別の
+`{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
+catalog / snapshot / navigation を追加した。collection の session spread request と
+address-based `page_groups` を追加した版は v49。
 v48 はブラウザの明示 logout で current owner を release する `SessionRelease` を追加した。
 v47 は root 以外の Serve path を型付きで通知する。v46 は
 `RemoteWebConnectionInfo.tailscale_https_certificate` と

@@ -12,9 +12,10 @@ use mimageviewer_ipc::{
     PersistentCollectionNavigateResponse, PersistentCollectionNavigationDirection,
     PersistentCollectionNavigationKind, PersistentCollectionNavigationTail,
     PersistentCollectionOrderSummary, PersistentCollectionPageGroup, PersistentCollectionPageSlot,
-    PersistentCollectionSnapshotPayload, PersistentCollectionSnapshotRequest,
-    PersistentCollectionSnapshotResponse, PersistentCollectionSparseTarget,
-    PersistentCollectionSummary, RemoteAddress, RemoteEntryKind, RemotePagePresentationRole,
+    PersistentCollectionPositionKind, PersistentCollectionSnapshotPayload,
+    PersistentCollectionSnapshotRequest, PersistentCollectionSnapshotResponse,
+    PersistentCollectionSparseTarget, PersistentCollectionSummary,
+    PersistentCollectionTargetPosition, RemoteAddress, RemoteEntryKind, RemotePagePresentationRole,
     RemoteReadingDirection, RemoteSingletonSpreadPlacement, RemoteSpreadMode, RequestId,
     ServerMessage,
 };
@@ -22,7 +23,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::collection_store::{
-    CollectionCatalogSnapshot, CollectionId, CollectionNavigationAnchor,
+    CollectionCatalogSnapshot, CollectionEntryId, CollectionId, CollectionNavigationAnchor,
     CollectionNavigationAnchorResolution, CollectionNavigationDirection,
     CollectionNavigationEntryIdentity, CollectionNavigationTail, CollectionNavigationTargetKind,
     CollectionOrderMode, CollectionPreparedNavigationCandidates,
@@ -472,6 +473,8 @@ impl PersistentCollectionEngine {
                 Err(value) => return PersistentCollectionNavigateResponse::Error(value),
             };
             let mut tried = HashSet::new();
+            let eligible_targets =
+                remote_eligible_target_set(&exact.prepared, &facts.remote_eligible);
             let target_kind = collection_navigation_target_kind(request.target_kind);
             let candidates = match request.direction {
                 PersistentCollectionNavigationDirection::Forward
@@ -527,12 +530,12 @@ impl PersistentCollectionEngine {
                 wire_anchor_resolution(candidates.anchor_resolution)
             };
             let candidate_count = candidates.targets.len();
-            let eligible = remote_eligible_entries(
+            let eligible_count = remote_eligible_entries(
                 &exact.prepared,
                 &facts.remote_eligible,
                 request.target_kind,
-            );
-            let eligible_count = eligible.len();
+            )
+            .len();
             for target in candidates.targets {
                 if !request_is_current(&lease, cancellation, deadline) {
                     return PersistentCollectionNavigateResponse::Error(request_interrupted_error(
@@ -541,13 +544,18 @@ impl PersistentCollectionEngine {
                     ));
                 }
                 tried.insert(target.entry_id);
+                if !eligible_targets.contains(&(target.entry_id, target.resolved_kind)) {
+                    continue;
+                }
                 let target_wire = match target.resolved_kind {
                     CollectionResolvedKind::Image => {
-                        let Some(group) =
-                            image_display_unit_for_target(&exact, &facts, target.entry_id, || {
-                                request_is_current(&lease, cancellation, deadline)
-                            })
-                        else {
+                        let Some(group) = image_display_unit_for_target(
+                            &exact,
+                            &facts,
+                            &eligible_targets,
+                            target.entry_id,
+                            || request_is_current(&lease, cancellation, deadline),
+                        ) else {
                             continue;
                         };
                         PersistentCollectionSparseTarget::DirectImageDisplayUnit { group }
@@ -584,17 +592,21 @@ impl PersistentCollectionEngine {
                 };
                 let landed_entry_id = match &target_wire {
                     PersistentCollectionSparseTarget::DirectImageDisplayUnit { group } => {
-                        Uuid::parse_str(&group.anchor.entry_id)
-                            .ok()
-                            .map(crate::collection_store::CollectionEntryId::from_uuid)
-                            .unwrap_or(target.entry_id)
+                        let Ok(anchor_id) = Uuid::parse_str(&group.anchor.entry_id) else {
+                            continue;
+                        };
+                        crate::collection_store::CollectionEntryId::from_uuid(anchor_id)
                     }
                     _ => target.entry_id,
                 };
-                let ordinal = eligible
-                    .iter()
-                    .position(|entry| entry.entry_id == landed_entry_id)
-                    .unwrap_or(0);
+                let Some(position) = landed_target_position(
+                    &exact.prepared,
+                    &facts.remote_eligible,
+                    &target_wire,
+                    landed_entry_id,
+                ) else {
+                    continue;
+                };
                 let replacement_needed = request.presented_view_token != exact_view_token
                     || request.presented_revision != exact.prepared.collection_revision;
                 let response = match bounded_landed_response(
@@ -608,8 +620,7 @@ impl PersistentCollectionEngine {
                     deadline,
                     replacement_needed,
                     target_wire,
-                    ordinal,
-                    eligible.len(),
+                    position,
                     anchor_resolution.clone(),
                 ) {
                     Ok(value) => value,
@@ -1053,8 +1064,7 @@ fn bounded_landed_response(
     deadline: Instant,
     replacement_needed: bool,
     target: PersistentCollectionSparseTarget,
-    target_ordinal: usize,
-    target_count: usize,
+    position: PersistentCollectionTargetPosition,
     anchor_resolution: PersistentCollectionAnchorResolution,
 ) -> Result<PersistentCollectionNavigateResponse, PersistentCollectionError> {
     let mut current = || request_is_current(lease, cancellation, deadline);
@@ -1064,8 +1074,7 @@ fn bounded_landed_response(
             exact_view_token: exact_view_token.to_owned(),
             replacement,
             target: target.clone(),
-            target_ordinal,
-            target_count,
+            position,
             anchor_resolution: anchor_resolution.clone(),
         })
     };
@@ -1121,6 +1130,7 @@ fn bounded_landed_response(
 fn image_display_unit_for_target(
     exact: &ExactPrepared,
     facts: &PersistentCollectionViewFacts,
+    eligible_targets: &HashSet<(CollectionEntryId, CollectionResolvedKind)>,
     target_entry_id: crate::collection_store::CollectionEntryId,
     mut keep_running: impl FnMut() -> bool,
 ) -> Option<PersistentCollectionPageGroup> {
@@ -1146,6 +1156,9 @@ fn image_display_unit_for_target(
             return None;
         }
         let entry = exact.prepared.entries.get(index)?;
+        if !eligible_targets.contains(&(entry.entry_id, CollectionResolvedKind::Image)) {
+            continue;
+        }
         let CollectionSourcePreparation::Available { kind, .. } =
             inspect_collection_source(&entry.source_path)
         else {
@@ -1166,7 +1179,7 @@ fn image_display_unit_for_target(
             role: RemotePagePresentationRole::Navigation,
         });
     }
-    if pages.is_empty() {
+    if !image_group_retains_target(&pages, target_entry_id) {
         return None;
     }
     let anchor = if facts.effective.is_rtl() && pages.len() == 2 {
@@ -1180,6 +1193,14 @@ fn image_display_unit_for_target(
         slice: crate::ui_fullscreen::remote_page_slice(spec.slice),
         singleton_placement: RemoteSingletonSpreadPlacement::Center,
     })
+}
+
+fn image_group_retains_target(
+    pages: &[PersistentCollectionPageSlot],
+    target_entry_id: CollectionEntryId,
+) -> bool {
+    let target_id = target_entry_id.to_string();
+    pages.iter().any(|page| page.identity.entry_id == target_id)
 }
 
 fn wire_snapshot(
@@ -1537,6 +1558,52 @@ fn remote_eligible_entries<'a>(
         .filter(|entry| resolved_kind_matches_navigation(entry.kind, target))
         .filter_map(|entry| prepared.entries.get(entry.prepared_index))
         .collect()
+}
+
+fn remote_eligible_target_set(
+    prepared: &CollectionPreparedSnapshot,
+    remote_eligible: &[RemoteEligibleEntry],
+) -> HashSet<(CollectionEntryId, CollectionResolvedKind)> {
+    remote_eligible
+        .iter()
+        .filter_map(|eligible| {
+            prepared
+                .entries
+                .get(eligible.prepared_index)
+                .map(|entry| (entry.entry_id, eligible.kind))
+        })
+        .collect()
+}
+
+fn landed_target_position(
+    prepared: &CollectionPreparedSnapshot,
+    remote_eligible: &[RemoteEligibleEntry],
+    target: &PersistentCollectionSparseTarget,
+    landed_entry_id: crate::collection_store::CollectionEntryId,
+) -> Option<PersistentCollectionTargetPosition> {
+    let (kind, projection) = match target {
+        PersistentCollectionSparseTarget::DirectImageDisplayUnit { .. } => (
+            PersistentCollectionPositionKind::StillImage,
+            PersistentCollectionNavigationKind::StillImage,
+        ),
+        PersistentCollectionSparseTarget::DirectVideo { .. } => (
+            PersistentCollectionPositionKind::Video,
+            PersistentCollectionNavigationKind::Video,
+        ),
+        PersistentCollectionSparseTarget::DirectAudio { .. } => (
+            PersistentCollectionPositionKind::Audio,
+            PersistentCollectionNavigationKind::Audio,
+        ),
+    };
+    let eligible = remote_eligible_entries(prepared, remote_eligible, projection);
+    let ordinal = eligible
+        .iter()
+        .position(|entry| entry.entry_id == landed_entry_id)?;
+    Some(PersistentCollectionTargetPosition {
+        kind,
+        ordinal,
+        count: eligible.len(),
+    })
 }
 
 fn collection_navigation_target_kind(
@@ -1930,6 +1997,213 @@ mod tests {
             .targets
             .is_empty()
         );
+    }
+
+    #[test]
+    fn landed_position_uses_the_actual_media_projection_not_the_route_search_kind() {
+        let entries = [
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "one.jpg",
+                CollectionResolvedKind::Image,
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222",
+                "one.mp4",
+                CollectionResolvedKind::Video,
+            ),
+            (
+                "33333333-3333-4333-8333-333333333333",
+                "blocked.jpg",
+                CollectionResolvedKind::Image,
+            ),
+            (
+                "44444444-4444-4444-8444-444444444444",
+                "one.mp3",
+                CollectionResolvedKind::Audio,
+            ),
+            (
+                "55555555-5555-4555-8555-555555555555",
+                "two.jpg",
+                CollectionResolvedKind::Image,
+            ),
+            (
+                "66666666-6666-4666-8666-666666666666",
+                "two.mp4",
+                CollectionResolvedKind::Video,
+            ),
+            (
+                "77777777-7777-4777-8777-777777777777",
+                "two.mp3",
+                CollectionResolvedKind::Audio,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, name, kind)| {
+            let mut entry = prepared_entry(id, &format!(r"C:\collection\{name}"));
+            entry.availability = CollectionSourcePreparation::Available {
+                kind,
+                mtime: 1,
+                file_size: Some(1),
+            };
+            entry.item = match kind {
+                CollectionResolvedKind::Video => {
+                    crate::grid_item::GridItem::Video(entry.source_path.clone())
+                }
+                CollectionResolvedKind::Audio => {
+                    crate::grid_item::GridItem::Audio(entry.source_path.clone())
+                }
+                _ => entry.item,
+            };
+            entry
+        })
+        .collect::<Vec<_>>();
+        let snapshot = prepared(entries);
+        let remote_eligible = [
+            (0, CollectionResolvedKind::Image),
+            (1, CollectionResolvedKind::Video),
+            (3, CollectionResolvedKind::Audio),
+            (4, CollectionResolvedKind::Image),
+            (5, CollectionResolvedKind::Video),
+            (6, CollectionResolvedKind::Audio),
+        ]
+        .map(|(prepared_index, kind)| RemoteEligibleEntry {
+            prepared_index,
+            kind,
+        });
+        let eligible_targets = remote_eligible_target_set(&snapshot, &remote_eligible);
+        assert!(
+            !eligible_targets
+                .contains(&(snapshot.entries[2].entry_id, CollectionResolvedKind::Image))
+        );
+        assert!(
+            eligible_targets
+                .contains(&(snapshot.entries[4].entry_id, CollectionResolvedKind::Image))
+        );
+        let blocked_route = current_candidates(
+            &snapshot,
+            None,
+            Some("33333333-3333-4333-8333-333333333333"),
+            CollectionNavigationTargetKind::NavigableMedia,
+        );
+        assert_eq!(blocked_route.targets.len(), 1);
+        assert!(!eligible_targets.contains(&(
+            blocked_route.targets[0].entry_id,
+            blocked_route.targets[0].resolved_kind
+        )));
+        for index in [0, 1, 3, 4, 5, 6] {
+            let target = prepared_navigation_target(
+                &snapshot.entries[index],
+                CollectionNavigationTargetKind::NavigableMedia,
+            )
+            .unwrap();
+            assert!(eligible_targets.contains(&(target.entry_id, target.resolved_kind)));
+        }
+        let image = &snapshot.entries[4];
+        let identity = wire_identity(image.entry_id, &image.source_key);
+        let image_target = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: PersistentCollectionPageGroup {
+                anchor: identity.clone(),
+                pages: vec![PersistentCollectionPageSlot {
+                    identity,
+                    address: RemoteAddress::file(r"C:\collection\two.jpg"),
+                    role: RemotePagePresentationRole::Navigation,
+                }],
+                slice: crate::ui_fullscreen::remote_page_slice(crate::page_split::PageSlice::Full),
+                singleton_placement: RemoteSingletonSpreadPlacement::Center,
+            },
+        };
+        assert_eq!(
+            landed_target_position(&snapshot, &remote_eligible, &image_target, image.entry_id),
+            Some(PersistentCollectionTargetPosition {
+                kind: PersistentCollectionPositionKind::StillImage,
+                ordinal: 1,
+                count: 2,
+            })
+        );
+        for (index, kind, target) in [
+            (
+                5,
+                PersistentCollectionPositionKind::Video,
+                PersistentCollectionSparseTarget::DirectVideo {
+                    identity: wire_identity(
+                        snapshot.entries[5].entry_id,
+                        &snapshot.entries[5].source_key,
+                    ),
+                    address: RemoteAddress::file(r"C:\collection\two.mp4"),
+                },
+            ),
+            (
+                6,
+                PersistentCollectionPositionKind::Audio,
+                PersistentCollectionSparseTarget::DirectAudio {
+                    identity: wire_identity(
+                        snapshot.entries[6].entry_id,
+                        &snapshot.entries[6].source_key,
+                    ),
+                    address: RemoteAddress::file(r"C:\collection\two.mp3"),
+                },
+            ),
+        ] {
+            assert_eq!(
+                landed_target_position(
+                    &snapshot,
+                    &remote_eligible,
+                    &target,
+                    snapshot.entries[index].entry_id
+                ),
+                Some(PersistentCollectionTargetPosition {
+                    kind,
+                    ordinal: 1,
+                    count: 2
+                })
+            );
+        }
+        assert_eq!(
+            landed_target_position(
+                &snapshot,
+                &remote_eligible,
+                &image_target,
+                snapshot.entries[2].entry_id
+            ),
+            None,
+            "a blocked image cannot silently become ordinal zero"
+        );
+        assert!(
+            current_ordinal_candidates(
+                &snapshot,
+                &remote_eligible,
+                2,
+                CollectionNavigationTargetKind::StillImage,
+            )
+            .targets
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn image_group_does_not_promote_a_partner_when_the_requested_target_disappears() {
+        let target_id = CollectionEntryId::from_uuid(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        );
+        let partner_id = CollectionEntryId::from_uuid(
+            Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        );
+        let slot = |id: CollectionEntryId| PersistentCollectionPageSlot {
+            identity: PersistentCollectionIdentity {
+                entry_id: id.to_string(),
+                source_identity: "a".repeat(64),
+            },
+            address: RemoteAddress::file(r"C:\collection\image.jpg"),
+            role: RemotePagePresentationRole::Navigation,
+        };
+        assert!(!image_group_retains_target(&[], target_id));
+        assert!(!image_group_retains_target(&[slot(partner_id)], target_id));
+        assert!(image_group_retains_target(&[slot(target_id)], target_id));
+        assert!(image_group_retains_target(
+            &[slot(target_id), slot(partner_id)],
+            target_id,
+        ));
     }
 
     #[test]

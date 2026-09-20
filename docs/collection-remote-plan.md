@@ -401,13 +401,15 @@ PersistentCollectionNavigatePayload =
         exact_view_token,
         binding: Unchanged | Replace(snapshot payload),
         target: SparseTarget(DirectImageDisplayUnit | DirectVideo | DirectAudio),
-        target_ordinal,
-        target_count,
+        position: { kind: StillImage | Video | Audio, ordinal, count },
         anchor_resolution
     }
   | Boundary { exact_revision, anchor_resolution, reason }
 ```
 
+`target_kind` は候補探索用のままとし、着地位置は `SparseTarget` の実媒体で決める。
+`position` は同じ exact prepared と Remote 公開可能列の媒体別射影から算出し、prefix外でも
+browserは一覧の可視prefixから再計算しない。画像の位置だけが画像seekのordinalとなる。
 tokenが同一ならbrowserはcurrent immutable root bindingを保ち、target identityだけを照合する。tokenが違う場合は
 target landingと同じcommitでexact snapshotへbindingを置き換える。`SparseTarget`は常にresponseと同じcollection ID、
 exact revision、exact view tokenへ結び付くself-contained unitであり、root prefixに同じentryがある場合だけそのentryと
@@ -705,3 +707,18 @@ SHA-256は順に`C2945D9C4B04D2040CD172E1385CB1B2B61856594C3E8A068DC816859827B55
 バックログ§1.246のZIP混在child順疑いは、本体 / bookmark / 既存Remote container間の既存差である。本Phaseは
 persistent root / outer順だけを追加し、childを既存Remote `enumerate_zip`へ合流させたため症状修正を混ぜていない。
 §1.246でchild materializeを共通化する際も、本Phaseのroot owner / return identityを変更しない。
+
+## 17. 混在媒体の着地位置（D-4、2026-09-20）
+
+prefix外の永続コレクションリンクで `NavigableMedia` を探索条件に使うと、旧応答のordinalは
+画像・動画・音声の混在列を指し、画像seekが使う画像列とは一致しなかった。protocol v58では
+`Landed.position: { kind: StillImage | Video | Audio, ordinal, count }` を単一の着地位置とする。
+coreは実際の `SparseTarget` 媒体からkindを決め、同じexact preparedとRemote公開可能列から
+媒体別ordinal/countを計算する。候補本体と画像group内のpageも同じ公開可能列で確認し、
+非公開候補や再検証で消えた画像targetをpartnerへ誤着地させない。
+
+HTTPはtarget住所とpositionのkind・範囲を再検証し、見開きの片側が拒否された場合は
+残った隣接画像へのordinalをcheckedに補正する。WebはSparseTargetとpositionのkindを照合し、
+画像seekにはStillImage位置だけを使う。可視prefixから位置を再計算せず、従来の
+session / route / token / revision失効と通常のFolder・集約Collection・child閲覧を維持する。
+独立レビューは追加blockingなしで受理し、core 8件、IPC 3件、HTTP焦点1件、Web 409件が通過した。
