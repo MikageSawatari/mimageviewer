@@ -29,6 +29,38 @@
 
 ## 1. 優先候補
 
+### 1.262 ポータブル版の複数コピーを同時起動できない (single-instance 名が data_dir で分かれない) — コード調査 (2026-09-21)
+
+- 現状 (コード参照のみ、実機では未確認): single-instance の 4 つの名前 (mutex / activate event /
+  open-path pipe / shutdown event) に `_data_<hash>` が付くのは、解決済み data_dir がその build
+  flavor の既定と**異なるときだけ** (`src/single_instance.rs` の `data_dir_namespace_suffix`)。
+  portable の既定は各コピー自身の `<exe_dir>\data` (`src/data_dir.rs` の `flavor_default`) なので、
+  別フォルダへ置いたコピー同士は、data_dir が別でもどちらも suffix 無しの
+  `Global\mImageViewerInstance_portable_v1` を取り合う。
+- コード上の帰結: 2 個目のコピーは起動せず、1 個目のコピーの activate event を叩いて終了する。
+  起動引数のパスも 1 個目へ転送される (`src/lib.rs` の single-instance 分岐)。保存先が別で DB は
+  衝突しないので、排他する理由の無い組み合わせを排他している。
+- 現状の回避策: 2 個目を `--data-dir` で自分の `data` 以外へ向ける。既定と同じパスを明示しても
+  suffix は付かないので分かれない。
+- 方針 (利用者決定 2026-09-21): **portable は常に解決済み data_dir から suffix を導出する。**
+  非 portable は現状維持 (既定 data_dir の名前はインストーラの `AppMutex` / shutdown event と
+  一致している必要がある)。
+- 変更箇所の当たり: `ProcessNames::for_data_dir` / `data_dir_namespace_suffix` の「既定と同じなら
+  suffix 無し」を portable では適用しない。基底名の `_portable_v1` はそのまま残し、その後ろへ
+  suffix を付ける。portable は launcher を使わないので、launcher の build.rs による定数抽出には
+  影響しない。
+- 不変条件: 同じコピー (= 同じ data_dir) の 2 重起動排除と、表記違い (相対 / junction /
+  大文字小文字 / verbatim prefix) の同一視は維持する (`resolved_data_dir_key`)。4 つの名前は
+  必ず同じ suffix で揃える。
+- 移行: 不要 (永続データではない)。フォルダを移動すると名前が変わるが、実行中でなければ影響しない。
+- 同時に更新する文書: [portable-build-plan.md](portable-build-plan.md) §4.5 の「ポータブル同士の
+  2 重起動排除は引き続き効く」を同一コピー同士に限る記述へ直し、§8 の検証チェックリストへ
+  「別フォルダのコピー 2 つを同時起動」を足す。利用者向けマニュアルに複数コピーの記述が
+  あるかは未確認。
+- テスト: `default_data_dir_keeps_all_legacy_names_exactly` は非 portable の契約として残す。
+  portable feature 下で「既定 data_dir でも suffix が付く」「別 exe_dir の既定同士は別名になる」を足す。
+- 規模 / 優先度: Small / P3。
+
 ### 1.259 リモート: 1ページ表示の左右入力が本体と逆になり得る — コード調査 (2026-09-20)
 
 - きっかけは「横長分割を試すとページを送るボタンが逆になる」という X 上の投稿。投稿者へは
