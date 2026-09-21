@@ -255,11 +255,14 @@
     <p>The App stores the following data <strong>only on your own PC</strong>; none of it is sent anywhere.</p>
     <ul class="pink-list">
       <li>Application settings and view state</li>
-      <li>Thumbnail cache</li>
+      <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
+      <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
+      <li>An index for finding alternate versions (image locations, formats, dimensions, and information used to compare their appearance)</li>
       <li>PDF passwords (encrypted using the Windows data-protection API)</li>
       <li>The remote-viewing PIN (stored in a form that cannot be turned back into the PIN)</li>
       <li>Remote-viewing operation records (timings and similar numbers, plus the names of the pages you opened)</li>
+      <li>Images temporarily exported for external tools (removed when the App exits)</li>
     </ul>
     <div class="info-box">
       Data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
