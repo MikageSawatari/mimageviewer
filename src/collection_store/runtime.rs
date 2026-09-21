@@ -852,7 +852,31 @@ fn actor_main(
             return;
         }
     };
-    let catalog = match db.catalog() {
+    let catalog_started = crate::perf::is_enabled().then(std::time::Instant::now);
+    let catalog_result = db.catalog();
+    if let Some(started) = catalog_started {
+        crate::perf::event(
+            "collection",
+            "startup_catalog",
+            None,
+            0,
+            &[
+                (
+                    "ms",
+                    serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "outcome",
+                    serde_json::Value::from(if catalog_result.is_ok() {
+                        "ok"
+                    } else {
+                        "error"
+                    }),
+                ),
+            ],
+        );
+    }
+    let catalog = match catalog_result {
         Ok(catalog) => catalog,
         Err(error) => {
             set_phase(&admission, AdmissionPhase::Closed);
@@ -925,7 +949,7 @@ fn process_command(
         }
         Command::Create { name, reply } => {
             let result = db.create_collection(&name);
-            mutated = result.is_ok();
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::Rename {
@@ -934,11 +958,8 @@ fn process_command(
             name,
             reply,
         } => {
-            let before = db.snapshot(id).ok().map(|snapshot| snapshot.revision());
             let result = db.rename_collection(id, expected_revision, &name);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|snapshot| Some(snapshot.revision()) != before);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::Delete {
@@ -947,7 +968,7 @@ fn process_command(
             reply,
         } => {
             let result = db.delete_collection(id, expected_revision);
-            mutated = result.is_ok();
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::SetOrder {
@@ -957,11 +978,8 @@ fn process_command(
             standard_sort,
             reply,
         } => {
-            let before = db.snapshot(id).ok().map(|snapshot| snapshot.revision());
             let result = db.set_order(id, expected_revision, mode, standard_sort);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|snapshot| Some(snapshot.revision()) != before);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::AddBatch {
@@ -971,9 +989,7 @@ fn process_command(
             reply,
         } => {
             let result = db.add_batch(id, expected_revision, registrations);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|outcome| !outcome.added.is_empty());
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::RemoveEntries {
@@ -982,11 +998,8 @@ fn process_command(
             entry_ids,
             reply,
         } => {
-            let before = db.snapshot(id).ok().map(|snapshot| snapshot.revision());
             let result = db.remove_entries(id, expected_revision, entry_ids);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|snapshot| Some(snapshot.revision()) != before);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::ReorderManual {
@@ -995,11 +1008,8 @@ fn process_command(
             order,
             reply,
         } => {
-            let before = db.snapshot(id).ok().map(|snapshot| snapshot.revision());
             let result = db.reorder_manual(id, expected_revision, order);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|snapshot| Some(snapshot.revision()) != before);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::Relink {
@@ -1009,20 +1019,15 @@ fn process_command(
             registration,
             reply,
         } => {
-            let before = db.snapshot(id).ok().map(|snapshot| snapshot.revision());
             let result = db.relink(id, expected_revision, entry_id, registration);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|snapshot| Some(snapshot.revision()) != before);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::MigrateSources { migration, reply } => {
             let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
             let result = db.migrate_sources(migration);
             collection_migration_perf_event(perf_start, 1, &result);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|outcome| outcome.updated_entries != 0);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         Command::MigrateSourceBatch { batch, reply } => {
@@ -1030,9 +1035,7 @@ fn process_command(
             let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
             let result = db.migrate_source_batch(batch);
             collection_migration_perf_event(perf_start, mappings, &result);
-            mutated = result
-                .as_ref()
-                .is_ok_and(|outcome| outcome.updated_entries != 0);
+            mutated = db.take_last_mutation_applied();
             let _ = reply.send(result);
         }
         #[cfg(test)]

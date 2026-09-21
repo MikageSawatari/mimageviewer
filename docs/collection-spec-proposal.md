@@ -144,8 +144,12 @@ Sol/xhigh独立担当と親が以下の境界を照合した。製品実装は�
 4. **確定（仕様）: 専用並べ替え画面はキャンセルを持たず、閉じる時に保存する。** 本棚の並べ替えモードが
    「閉じる時は保存」（[compile-book-plan.md §2.2](compile-book-plan.md)）であるのと同型。Conflict 時だけ
    「最新内容を読み直す（変更破棄）」「変更を破棄して閉じる」を出す現行を維持し、マニュアルに明記する。
-5. **確定（2026-09-17）: `collection.db` の世代バックアップと全件書き出しを初回に含める。** 起動時に settings.db / tags.db と
-   同じ `db_backup::rotate_generation_backups` で `collection.db.bak1..bak10` を回す。上部「コレクション」
+5. **確定（2026-09-17、2026-09-21 契機補正）: `collection.db` の世代バックアップと全件書き出しを初回に含める。**
+   既存 DB は起動時に read-only 検証するが、通常の世代ローテーションはそのセッション最初の実変更直前だけ、
+   settings.db / tags.db と同じ `db_backup::rotate_generation_backups` で `collection.db.bak1..bak10` を回す。
+   read-only 再起動、拒否、同値操作では世代を消費しない。未編集の空 DB は再起動後も空世代を作らず、最初の成功変更後に
+   backup を arm して次の実変更前に最初の有用な状態を保存する。v1 / 既存 unversioned DB は schema 書込み前の
+   backup を必須とし、失敗時は移行を止める。上部「コレクション」
    メニューに「すべてのコレクションをテキストで書き出す…」（フォルダ選択、1 コレクション 1 ファイル + 一覧
    ファイル、既存の export serializer と worker を流用）を追加する。終了時の自動書き出しと世代管理は v4.x の
    候補（自動書き出しは終了 drain 境界に乗せる必要があり、初回は手動に留める）。

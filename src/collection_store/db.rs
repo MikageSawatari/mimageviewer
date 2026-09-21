@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
@@ -27,6 +27,17 @@ enum CollectionDbStartup {
 }
 
 impl CollectionDbStartup {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::ExistingUnversioned => "unversioned",
+            Self::ExistingV1 => "v1",
+            Self::ExistingV2 => "v2",
+        }
+    }
+}
+
+impl CollectionDbStartup {
     fn expected_version(self) -> u32 {
         match self {
             Self::New | Self::ExistingUnversioned => 0,
@@ -36,42 +47,196 @@ impl CollectionDbStartup {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionBackupState {
+    NotRequired,
+    Required,
+    Completed,
+    AttemptedFailed,
+}
+
+enum PreparedMutation<N, W> {
+    NoOp(N),
+    Reject(CollectionStoreError),
+    Write(W),
+}
+
+#[derive(Clone, Copy)]
+struct MutationGuard {
+    catalog_revision: u64,
+    collection: Option<(CollectionId, u64)>,
+}
+
+impl MutationGuard {
+    fn catalog(conn: &Connection) -> Result<Self, CollectionStoreError> {
+        Ok(Self {
+            catalog_revision: catalog_revision(conn)?,
+            collection: None,
+        })
+    }
+
+    fn collection(
+        conn: &Connection,
+        id: CollectionId,
+        expected_revision: u64,
+    ) -> Result<Result<Self, CollectionStoreError>, CollectionStoreError> {
+        let definition = match load_definition(conn, id) {
+            Ok(definition) => definition,
+            Err(error @ CollectionStoreError::NotFound) => return Ok(Err(error)),
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = require_revision(expected_revision, definition.revision) {
+            return Ok(Err(error));
+        }
+        Ok(Ok(Self {
+            catalog_revision: catalog_revision(conn)?,
+            collection: Some((id, expected_revision)),
+        }))
+    }
+
+    fn revalidate(self, conn: &Connection) -> Result<(), CollectionStoreError> {
+        require_revision(self.catalog_revision, catalog_revision(conn)?)?;
+        if let Some((id, revision)) = self.collection {
+            require_revision(revision, load_definition(conn, id)?.revision)?;
+        }
+        Ok(())
+    }
+}
+
+struct PreparedCreate {
+    guard: MutationGuard,
+    id: CollectionId,
+    name: String,
+    position: i64,
+}
+
+struct PreparedRename {
+    guard: MutationGuard,
+    id: CollectionId,
+    name: String,
+}
+
+struct PreparedDelete {
+    guard: MutationGuard,
+    id: CollectionId,
+}
+
+struct PreparedSetOrder {
+    guard: MutationGuard,
+    id: CollectionId,
+    mode: CollectionOrderMode,
+    standard_sort: SortOrder,
+    shuffle_seed: u64,
+}
+
+struct PreparedAddBatch {
+    guard: MutationGuard,
+    id: CollectionId,
+    position: i64,
+    added: Vec<(CollectionEntryId, CollectionRegistration)>,
+    duplicates: Vec<CollectionSourcePathKey>,
+    capacity_rejected: Vec<CollectionSourcePathKey>,
+}
+
+struct PreparedRemoveEntries {
+    guard: MutationGuard,
+    id: CollectionId,
+    entry_ids: Vec<CollectionEntryId>,
+}
+
+struct PreparedReorderManual {
+    guard: MutationGuard,
+    id: CollectionId,
+    previous: Vec<CollectionEntryId>,
+    order: Vec<CollectionEntryId>,
+}
+
+struct PreparedRelink {
+    guard: MutationGuard,
+    id: CollectionId,
+    entry_id: CollectionEntryId,
+    previous: CollectionEntry,
+    registration: CollectionRegistration,
+}
+
+struct PreparedMigration {
+    guard: MutationGuard,
+    previous_entries: Vec<CollectionEntry>,
+    replacements: Vec<(
+        CollectionEntryId,
+        CollectionId,
+        CollectionSourcePathKey,
+        PathBuf,
+    )>,
+}
+
+#[derive(Default)]
+struct OpenTimings {
+    startup: Option<CollectionDbStartup>,
+    open: Duration,
+    validate: Duration,
+    backup: Duration,
+    schema: Duration,
+}
+
 pub(super) struct CollectionStoreDb {
     conn: Connection,
+    path: PathBuf,
+    session_backup: SessionBackupState,
+    last_mutation_applied: bool,
+    #[cfg(test)]
+    before_apply_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl CollectionStoreDb {
     pub(super) fn open_at(path: &Path) -> Result<Self, CollectionStoreError> {
+        let mut timings = OpenTimings::default();
+        let result = Self::open_at_inner(path, &mut timings);
+        emit_open_perf(&timings, result.as_ref().err());
+        result
+    }
+
+    fn open_at_inner(path: &Path, timings: &mut OpenTimings) -> Result<Self, CollectionStoreError> {
         let existed = path
             .try_exists()
             .map_err(|error| CollectionStoreError::Persistence(error.to_string()))?;
         let startup = if existed {
+            let started = Instant::now();
             let probe = Connection::open_with_flags(
                 path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )?;
+            timings.open += started.elapsed();
             let version: u32 = probe.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            match version {
+            let startup = match version {
                 0 => CollectionDbStartup::ExistingUnversioned,
-                1 => {
-                    validate_existing_v1(&probe)?;
-                    CollectionDbStartup::ExistingV1
-                }
-                SCHEMA_VERSION => {
-                    validate_existing_v2(&probe)?;
-                    CollectionDbStartup::ExistingV2
-                }
+                1 => CollectionDbStartup::ExistingV1,
+                SCHEMA_VERSION => CollectionDbStartup::ExistingV2,
                 newer => return Err(CollectionStoreError::IncompatibleSchema(newer)),
-            }
+            };
+            timings.startup = Some(startup);
+            let validate_started = Instant::now();
+            let validation = match startup {
+                CollectionDbStartup::ExistingUnversioned => validate_integrity(&probe),
+                CollectionDbStartup::ExistingV1 => validate_existing_v1(&probe),
+                CollectionDbStartup::ExistingV2 => validate_existing_v2(&probe),
+                CollectionDbStartup::New => unreachable!(),
+            };
+            timings.validate = validate_started.elapsed();
+            validation?;
+            startup
         } else {
             CollectionDbStartup::New
         };
+        timings.startup = Some(startup);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| CollectionStoreError::Persistence(error.to_string()))?;
         }
+        let open_started = Instant::now();
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(3))?;
+        timings.open += open_started.elapsed();
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(CollectionStoreError::IncompatibleSchema(version));
@@ -81,64 +246,129 @@ impl CollectionStoreDb {
                 "collection schema changed during startup".into(),
             ));
         }
-        conn.pragma_update(None, "foreign_keys", true)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        match startup {
-            CollectionDbStartup::New | CollectionDbStartup::ExistingUnversioned => {
-                initialize_schema(&conn)?;
-            }
-            CollectionDbStartup::ExistingV1 => {
-                // VACUUM INTO includes committed WAL rows. Keep a complete v1 snapshot before
-                // the first schema write; a backup failure must leave the original untouched.
-                let db_file_name =
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .ok_or_else(|| {
-                            CollectionStoreError::Persistence(
-                                "collection database has no filename".into(),
-                            )
-                        })?;
-                crate::db_backup::rotate_generation_backups(
-                    path.parent().unwrap_or_else(|| Path::new(".")),
-                    db_file_name,
-                    &|message| eprintln!("{message}"),
-                    &|destination| {
-                        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    },
-                )
-                .map_err(CollectionStoreError::Persistence)?;
-                migrate_v1_to_v2(&conn)?;
-            }
+        let session_backup = match startup {
+            // The empty generation is not useful. The first successful write arms the normal
+            // first-mutation backup so the next real change preserves that first useful state.
+            CollectionDbStartup::New => SessionBackupState::NotRequired,
             CollectionDbStartup::ExistingV2 => {
-                // This is the only normal-startup rotation. A newly created DB and the
-                // v1 migration above must not displace an older known-good generation.
-                let db_file_name =
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .ok_or_else(|| {
-                            CollectionStoreError::Persistence(
-                                "collection database has no filename".into(),
-                            )
-                        })?;
-                if let Err(error) = crate::db_backup::rotate_generation_backups(
-                    path.parent().unwrap_or_else(|| Path::new(".")),
-                    db_file_name,
-                    &|message| eprintln!("{message}"),
-                    &|destination| {
-                        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    },
-                ) {
-                    eprintln!(
-                        "collection startup backup failed; continuing with validated database: {error}"
-                    );
+                let catalog_revision = catalog_revision(&conn)?;
+                let collection_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM collections", [], |row| row.get(0))?;
+                if catalog_revision == 0 && collection_count == 0 {
+                    SessionBackupState::NotRequired
+                } else {
+                    SessionBackupState::Required
                 }
             }
+            CollectionDbStartup::ExistingUnversioned | CollectionDbStartup::ExistingV1 => {
+                let backup_started = Instant::now();
+                let backup_result = rotate_collection_backup(&conn, path);
+                timings.backup = backup_started.elapsed();
+                match backup_result {
+                    Ok(()) => crate::logger::log(format!(
+                        "collection schema backup completed startup={} elapsed_ms={:.3}",
+                        startup.label(),
+                        timings.backup.as_secs_f64() * 1000.0
+                    )),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "collection schema backup failed; startup stopped before schema write startup={} elapsed_ms={:.3}: {error}",
+                            startup.label(),
+                            timings.backup.as_secs_f64() * 1000.0
+                        ));
+                        return Err(CollectionStoreError::Persistence(error));
+                    }
+                }
+                SessionBackupState::Completed
+            }
+        };
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let schema_started = Instant::now();
+        let schema_result = match startup {
+            CollectionDbStartup::New | CollectionDbStartup::ExistingUnversioned => {
+                initialize_schema(&conn)
+            }
+            CollectionDbStartup::ExistingV1 => migrate_v1_to_v2(&conn),
+            CollectionDbStartup::ExistingV2 => Ok(()),
+        };
+        timings.schema = schema_started.elapsed();
+        schema_result?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            session_backup,
+            last_mutation_applied: false,
+            #[cfg(test)]
+            before_apply_hook: None,
+        })
+    }
+
+    fn execute_prepared<N, W>(
+        &mut self,
+        prepared: PreparedMutation<N, W>,
+        apply: impl FnOnce(&mut Connection, W) -> Result<N, CollectionStoreError>,
+    ) -> Result<N, CollectionStoreError> {
+        self.last_mutation_applied = false;
+        match prepared {
+            PreparedMutation::NoOp(value) => Ok(value),
+            PreparedMutation::Reject(error) => Err(error),
+            PreparedMutation::Write(write) => {
+                self.ensure_session_backup();
+                #[cfg(test)]
+                if let Some(hook) = self.before_apply_hook.take() {
+                    hook();
+                }
+                let value = apply(&mut self.conn, write)?;
+                if self.session_backup == SessionBackupState::NotRequired {
+                    self.session_backup = SessionBackupState::Required;
+                }
+                self.last_mutation_applied = true;
+                Ok(value)
+            }
         }
-        Ok(Self { conn })
+    }
+
+    fn ensure_session_backup(&mut self) {
+        if self.session_backup != SessionBackupState::Required {
+            return;
+        }
+        // Mark the attempt before starting. A failed normal snapshot is nonfatal and must not
+        // be retried for every later command in the same session.
+        self.session_backup = SessionBackupState::AttemptedFailed;
+        let started = Instant::now();
+        let result = rotate_collection_backup(&self.conn, &self.path);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(()) => {
+                self.session_backup = SessionBackupState::Completed;
+                crate::logger::log(format!(
+                    "collection first-mutation backup completed elapsed_ms={:.3}",
+                    elapsed.as_secs_f64() * 1000.0
+                ));
+            }
+            Err(error) => crate::logger::log(format!(
+                "collection first-mutation backup failed; continuing with write elapsed_ms={:.3}: {error}",
+                elapsed.as_secs_f64() * 1000.0
+            )),
+        }
+        emit_backup_perf(
+            elapsed,
+            match self.session_backup {
+                SessionBackupState::Completed => "ok",
+                SessionBackupState::AttemptedFailed => "error_continue",
+                _ => unreachable!("a required backup attempt has a terminal state"),
+            },
+        );
+    }
+
+    pub(super) fn take_last_mutation_applied(&mut self) -> bool {
+        std::mem::take(&mut self.last_mutation_applied)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_before_apply_hook(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.before_apply_hook = Some(Box::new(hook));
     }
 
     pub(super) fn catalog(&self) -> Result<CollectionCatalogSnapshot, CollectionStoreError> {
@@ -194,24 +424,47 @@ impl CollectionStoreDb {
         id: CollectionId,
         name: &str,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let name = normalized_name(name)?;
-        let tx = self.conn.transaction()?;
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(catalog_position) + 1, 0) FROM collections",
-            [],
-            |row| row.get(0),
-        )?;
-        let now = now_ms();
-        tx.execute(
-            "INSERT INTO collections
-             (id, name, order_mode, sort_order, revision, catalog_position, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, 'manual', 'file_name', 1, ?3, ?4, ?4)",
-            params![id.to_string(), name, position, now],
-        )?;
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
-        tx.commit()?;
-        Ok(snapshot)
+        self.last_mutation_applied = false;
+        let prepared = match normalized_name(name) {
+            Ok(name) => {
+                let tx = self.conn.unchecked_transaction()?;
+                let guard = MutationGuard::catalog(&tx)?;
+                let position = tx.query_row(
+                    "SELECT COALESCE(MAX(catalog_position) + 1, 0) FROM collections",
+                    [],
+                    |row| row.get(0),
+                )?;
+                tx.commit()?;
+                PreparedMutation::Write(PreparedCreate {
+                    guard,
+                    id,
+                    name: name.to_owned(),
+                    position,
+                })
+            }
+            Err(error) => PreparedMutation::Reject(error),
+        };
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            let now = now_ms();
+            tx.execute(
+                "INSERT INTO collections
+                 (id, name, order_mode, sort_order, revision, catalog_position, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'manual', 'file_name', 1, ?3, ?4, ?4)",
+                params![
+                    prepared.id.to_string(),
+                    prepared.name,
+                    prepared.position,
+                    now
+                ],
+            )?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot =
+                load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn rename_collection(
@@ -220,25 +473,48 @@ impl CollectionStoreDb {
         expected_revision: u64,
         name: &str,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let name = normalized_name(name)?;
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        if definition.name == name {
-            let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision(&tx)?)?;
+        self.last_mutation_applied = false;
+        let prepared = match normalized_name(name) {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(name) => {
+                let tx = self.conn.unchecked_transaction()?;
+                let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+                    Err(error) => PreparedMutation::Reject(error),
+                    Ok(guard) => {
+                        let definition = load_definition(&tx, id)?;
+                        if definition.name == name {
+                            PreparedMutation::NoOp(load_snapshot_with_catalog(
+                                &tx,
+                                id,
+                                guard.catalog_revision,
+                            )?)
+                        } else {
+                            PreparedMutation::Write(PreparedRename {
+                                guard,
+                                id,
+                                name: name.to_owned(),
+                            })
+                        }
+                    }
+                };
+                tx.commit()?;
+                prepared
+            }
+        };
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            let revision = increment_collection_revision(&tx, prepared.id)?;
+            tx.execute(
+                "UPDATE collections SET name = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                params![prepared.name, now_ms(), prepared.id.to_string()],
+            )?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            debug_assert_eq!(snapshot.revision(), revision);
             tx.commit()?;
-            return Ok(snapshot);
-        }
-        let revision = increment_collection_revision(&tx, id)?;
-        tx.execute(
-            "UPDATE collections SET name = ?1, updated_at_ms = ?2 WHERE id = ?3",
-            params![name, now_ms(), id.to_string()],
-        )?;
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
-        debug_assert_eq!(snapshot.revision(), revision);
-        tx.commit()?;
-        Ok(snapshot)
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn delete_collection(
@@ -246,15 +522,26 @@ impl CollectionStoreDb {
         id: CollectionId,
         expected_revision: u64,
     ) -> Result<CollectionCatalogSnapshot, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        tx.execute("DELETE FROM collections WHERE id = ?1", [id.to_string()])?;
-        compact_catalog_positions(&tx)?;
-        let revision = bump_catalog_revision(&tx)?;
-        let catalog = load_catalog_with_revision(&tx, revision)?;
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Ok(guard) => PreparedMutation::Write(PreparedDelete { guard, id }),
+            Err(error) => PreparedMutation::Reject(error),
+        };
         tx.commit()?;
-        Ok(catalog)
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            tx.execute(
+                "DELETE FROM collections WHERE id = ?1",
+                [prepared.id.to_string()],
+            )?;
+            compact_catalog_positions(&tx)?;
+            let revision = bump_catalog_revision(&tx)?;
+            let catalog = load_catalog_with_revision(&tx, revision)?;
+            tx.commit()?;
+            Ok(catalog)
+        })
     }
 
     pub(super) fn set_order(
@@ -264,38 +551,58 @@ impl CollectionStoreDb {
         mode: CollectionOrderMode,
         standard_sort: SortOrder,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        if mode != CollectionOrderMode::Shuffle
-            && definition.order_mode == mode
-            && definition.standard_sort == standard_sort
-        {
-            let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision(&tx)?)?;
-            tx.commit()?;
-            return Ok(snapshot);
-        }
-        tx.execute(
-            "UPDATE collections
-             SET order_mode = ?1, sort_order = ?2, shuffle_seed = ?3,
-                 revision = revision + 1, updated_at_ms = ?4
-             WHERE id = ?5",
-            params![
-                mode.as_str(),
-                sort_order_as_str(standard_sort),
-                if mode == CollectionOrderMode::Shuffle {
-                    format!("{:016x}", new_shuffle_seed())
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(guard) => {
+                let definition = load_definition(&tx, id)?;
+                if mode != CollectionOrderMode::Shuffle
+                    && definition.order_mode == mode
+                    && definition.standard_sort == standard_sort
+                {
+                    PreparedMutation::NoOp(load_snapshot_with_catalog(
+                        &tx,
+                        id,
+                        guard.catalog_revision,
+                    )?)
                 } else {
-                    format!("{:016x}", definition.shuffle_seed)
-                },
-                now_ms(),
-                id.to_string()
-            ],
-        )?;
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
+                    PreparedMutation::Write(PreparedSetOrder {
+                        guard,
+                        id,
+                        mode,
+                        standard_sort,
+                        shuffle_seed: if mode == CollectionOrderMode::Shuffle {
+                            new_shuffle_seed()
+                        } else {
+                            definition.shuffle_seed
+                        },
+                    })
+                }
+            }
+        };
         tx.commit()?;
-        Ok(snapshot)
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            tx.execute(
+                "UPDATE collections
+                 SET order_mode = ?1, sort_order = ?2, shuffle_seed = ?3,
+                     revision = revision + 1, updated_at_ms = ?4
+                 WHERE id = ?5",
+                params![
+                    prepared.mode.as_str(),
+                    sort_order_as_str(prepared.standard_sort),
+                    format!("{:016x}", prepared.shuffle_seed),
+                    now_ms(),
+                    prepared.id.to_string()
+                ],
+            )?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn add_batch(
@@ -304,71 +611,98 @@ impl CollectionStoreDb {
         expected_revision: u64,
         registrations: Vec<CollectionRegistration>,
     ) -> Result<CollectionBatchAddOutcome, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        let mut position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(manual_position) + 1, 0)
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(guard) => {
+                let mut position: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(manual_position) + 1, 0)
              FROM collection_entries WHERE collection_id = ?1",
-            [id.to_string()],
-            |row| row.get(0),
-        )?;
-        let existing_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM collection_entries WHERE collection_id = ?1",
-            [id.to_string()],
-            |row| row.get(0),
-        )?;
-        let mut remaining = MAX_COLLECTION_ENTRIES.saturating_sub(existing_count as usize);
-        let mut added = Vec::new();
-        let mut duplicates = Vec::new();
-        let mut capacity_rejected = Vec::new();
-        let now = now_ms();
-        let mut batch_seen = HashSet::new();
-        for registration in registrations {
-            if !batch_seen.insert(registration.source_key.clone())
-                || source_exists(&tx, id, &registration.source_key)?
-            {
-                duplicates.push(registration.source_key);
-                continue;
+                    [id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let existing_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM collection_entries WHERE collection_id = ?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let mut remaining = MAX_COLLECTION_ENTRIES.saturating_sub(existing_count as usize);
+                let mut added = Vec::new();
+                let mut duplicates = Vec::new();
+                let mut capacity_rejected = Vec::new();
+                let mut batch_seen = HashSet::new();
+                for registration in registrations {
+                    if !batch_seen.insert(registration.source_key.clone())
+                        || source_exists(&tx, id, &registration.source_key)?
+                    {
+                        duplicates.push(registration.source_key);
+                        continue;
+                    }
+                    if remaining == 0 {
+                        capacity_rejected.push(registration.source_key);
+                        continue;
+                    }
+                    added.push((CollectionEntryId::new(), registration));
+                    position += 1;
+                    remaining -= 1;
+                }
+                if added.is_empty() {
+                    PreparedMutation::NoOp(CollectionBatchAddOutcome {
+                        snapshot: load_snapshot_with_catalog(&tx, id, guard.catalog_revision)?,
+                        added: Arc::from([]),
+                        duplicates: Arc::from(duplicates),
+                        capacity_rejected: Arc::from(capacity_rejected),
+                    })
+                } else {
+                    PreparedMutation::Write(PreparedAddBatch {
+                        guard,
+                        id,
+                        position: position - added.len() as i64,
+                        added,
+                        duplicates,
+                        capacity_rejected,
+                    })
+                }
             }
-            if remaining == 0 {
-                capacity_rejected.push(registration.source_key);
-                continue;
-            }
-            let entry_id = CollectionEntryId::new();
-            tx.execute(
-                "INSERT INTO collection_entries
-                 (id, collection_id, source_namespace, source_path, normalized_path,
-                  resolved_kind, manual_position, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    entry_id.to_string(),
-                    id.to_string(),
-                    registration.source_key.namespace().as_str(),
-                    registration.source_path.to_string_lossy(),
-                    registration.source_key.normalized_path(),
-                    registration.resolved_kind.as_str(),
-                    position,
-                    now,
-                ],
-            )?;
-            position += 1;
-            remaining -= 1;
-            added.push(entry_id);
-        }
-        let catalog_revision = if added.is_empty() {
-            catalog_revision(&tx)?
-        } else {
-            increment_collection_revision(&tx, id)?;
-            bump_catalog_revision(&tx)?
         };
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
         tx.commit()?;
-        Ok(CollectionBatchAddOutcome {
-            snapshot,
-            added: Arc::from(added),
-            duplicates: Arc::from(duplicates),
-            capacity_rejected: Arc::from(capacity_rejected),
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            let now = now_ms();
+            let mut position = prepared.position;
+            let added_ids: Vec<CollectionEntryId> =
+                prepared.added.iter().map(|(id, _)| *id).collect();
+            for (entry_id, registration) in prepared.added {
+                tx.execute(
+                    "INSERT INTO collection_entries
+                     (id, collection_id, source_namespace, source_path, normalized_path,
+                      resolved_kind, manual_position, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        entry_id.to_string(),
+                        prepared.id.to_string(),
+                        registration.source_key.namespace().as_str(),
+                        registration.source_path.to_string_lossy(),
+                        registration.source_key.normalized_path(),
+                        registration.resolved_kind.as_str(),
+                        position,
+                        now,
+                    ],
+                )?;
+                position += 1;
+            }
+            increment_collection_revision(&tx, prepared.id)?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(CollectionBatchAddOutcome {
+                snapshot,
+                added: Arc::from(added_ids),
+                duplicates: Arc::from(prepared.duplicates),
+                capacity_rejected: Arc::from(prepared.capacity_rejected),
+            })
         })
     }
 
@@ -378,29 +712,56 @@ impl CollectionStoreDb {
         expected_revision: u64,
         entry_ids: Vec<CollectionEntryId>,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        let mut removed = 0;
-        let mut seen = HashSet::new();
-        for entry_id in entry_ids {
-            if seen.insert(entry_id) {
-                removed += tx.execute(
-                    "DELETE FROM collection_entries WHERE collection_id = ?1 AND id = ?2",
-                    params![id.to_string(), entry_id.to_string()],
-                )?;
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(guard) => {
+                let existing = entry_ids_in_manual_order(&tx, id)?
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                let mut seen = HashSet::new();
+                let entry_ids = entry_ids
+                    .into_iter()
+                    .filter(|entry_id| seen.insert(*entry_id) && existing.contains(entry_id))
+                    .collect::<Vec<_>>();
+                if entry_ids.is_empty() {
+                    PreparedMutation::NoOp(load_snapshot_with_catalog(
+                        &tx,
+                        id,
+                        guard.catalog_revision,
+                    )?)
+                } else {
+                    PreparedMutation::Write(PreparedRemoveEntries {
+                        guard,
+                        id,
+                        entry_ids,
+                    })
+                }
             }
-        }
-        let catalog_revision = if removed == 0 {
-            catalog_revision(&tx)?
-        } else {
-            compact_manual_positions(&tx, id)?;
-            increment_collection_revision(&tx, id)?;
-            bump_catalog_revision(&tx)?
         };
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
         tx.commit()?;
-        Ok(snapshot)
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            for entry_id in &prepared.entry_ids {
+                let removed = tx.execute(
+                    "DELETE FROM collection_entries WHERE collection_id = ?1 AND id = ?2",
+                    params![prepared.id.to_string(), entry_id.to_string()],
+                )?;
+                if removed != 1 {
+                    return Err(CollectionStoreError::Persistence(
+                        "collection entry changed during backup".into(),
+                    ));
+                }
+            }
+            compact_manual_positions(&tx, prepared.id)?;
+            increment_collection_revision(&tx, prepared.id)?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn reorder_manual(
@@ -409,38 +770,66 @@ impl CollectionStoreDb {
         expected_revision: u64,
         order: Vec<CollectionEntryId>,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        if definition.order_mode != CollectionOrderMode::Manual {
-            return Err(CollectionStoreError::ManualOrderInactive);
-        }
-        let current = entry_ids_in_manual_order(&tx, id)?;
-        if !same_ids_exactly_once(&current, &order) {
-            return Err(CollectionStoreError::InvalidOrder);
-        }
-        if current == order {
-            let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision(&tx)?)?;
-            tx.commit()?;
-            return Ok(snapshot);
-        }
-        tx.execute(
-            "UPDATE collection_entries SET manual_position = -manual_position - 1
-             WHERE collection_id = ?1",
-            [id.to_string()],
-        )?;
-        for (position, entry_id) in order.iter().enumerate() {
-            tx.execute(
-                "UPDATE collection_entries SET manual_position = ?1
-                 WHERE collection_id = ?2 AND id = ?3",
-                params![position as i64, id.to_string(), entry_id.to_string()],
-            )?;
-        }
-        increment_collection_revision(&tx, id)?;
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(guard) => {
+                let definition = load_definition(&tx, id)?;
+                if definition.order_mode != CollectionOrderMode::Manual {
+                    PreparedMutation::Reject(CollectionStoreError::ManualOrderInactive)
+                } else {
+                    let current = entry_ids_in_manual_order(&tx, id)?;
+                    if !same_ids_exactly_once(&current, &order) {
+                        PreparedMutation::Reject(CollectionStoreError::InvalidOrder)
+                    } else if current == order {
+                        PreparedMutation::NoOp(load_snapshot_with_catalog(
+                            &tx,
+                            id,
+                            guard.catalog_revision,
+                        )?)
+                    } else {
+                        PreparedMutation::Write(PreparedReorderManual {
+                            guard,
+                            id,
+                            previous: current,
+                            order,
+                        })
+                    }
+                }
+            }
+        };
         tx.commit()?;
-        Ok(snapshot)
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            if entry_ids_in_manual_order(&tx, prepared.id)? != prepared.previous {
+                return Err(CollectionStoreError::Persistence(
+                    "collection order changed during backup".into(),
+                ));
+            }
+            tx.execute(
+                "UPDATE collection_entries SET manual_position = -manual_position - 1
+                 WHERE collection_id = ?1",
+                [prepared.id.to_string()],
+            )?;
+            for (position, entry_id) in prepared.order.iter().enumerate() {
+                tx.execute(
+                    "UPDATE collection_entries SET manual_position = ?1
+                     WHERE collection_id = ?2 AND id = ?3",
+                    params![
+                        position as i64,
+                        prepared.id.to_string(),
+                        entry_id.to_string()
+                    ],
+                )?;
+            }
+            increment_collection_revision(&tx, prepared.id)?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn relink(
@@ -450,41 +839,78 @@ impl CollectionStoreDb {
         entry_id: CollectionEntryId,
         registration: CollectionRegistration,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
-        let definition = load_definition(&tx, id)?;
-        require_revision(expected_revision, definition.revision)?;
-        let current = load_entry(&tx, id, entry_id)?;
-        if current.source_path == registration.source_path
-            && current.source_key == registration.source_key
-            && current.resolved_kind == registration.resolved_kind
-        {
-            let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision(&tx)?)?;
-            tx.commit()?;
-            return Ok(snapshot);
-        }
-        if source_exists_except(&tx, id, entry_id, &registration.source_key)? {
-            return Err(CollectionStoreError::DuplicateSource(
-                registration.source_key,
-            ));
-        }
-        tx.execute(
-            "UPDATE collection_entries
-             SET source_namespace = ?1, source_path = ?2, normalized_path = ?3, resolved_kind = ?4
-             WHERE collection_id = ?5 AND id = ?6",
-            params![
-                registration.source_key.namespace().as_str(),
-                registration.source_path.to_string_lossy(),
-                registration.source_key.normalized_path(),
-                registration.resolved_kind.as_str(),
-                id.to_string(),
-                entry_id.to_string(),
-            ],
-        )?;
-        increment_collection_revision(&tx, id)?;
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let snapshot = load_snapshot_with_catalog(&tx, id, catalog_revision)?;
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
+            Err(error) => PreparedMutation::Reject(error),
+            Ok(guard) => match load_entry(&tx, id, entry_id) {
+                Err(error @ CollectionStoreError::NotFound) => PreparedMutation::Reject(error),
+                Err(error) => return Err(error),
+                Ok(current)
+                    if current.source_path == registration.source_path
+                        && current.source_key == registration.source_key
+                        && current.resolved_kind == registration.resolved_kind =>
+                {
+                    PreparedMutation::NoOp(load_snapshot_with_catalog(
+                        &tx,
+                        id,
+                        guard.catalog_revision,
+                    )?)
+                }
+                Ok(_current)
+                    if source_exists_except(&tx, id, entry_id, &registration.source_key)? =>
+                {
+                    PreparedMutation::Reject(CollectionStoreError::DuplicateSource(
+                        registration.source_key,
+                    ))
+                }
+                Ok(current) => PreparedMutation::Write(PreparedRelink {
+                    guard,
+                    id,
+                    entry_id,
+                    previous: current,
+                    registration,
+                }),
+            },
+        };
         tx.commit()?;
-        Ok(snapshot)
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            if load_entry(&tx, prepared.id, prepared.entry_id)? != prepared.previous {
+                return Err(CollectionStoreError::Persistence(
+                    "collection entry changed during backup".into(),
+                ));
+            }
+            if source_exists_except(
+                &tx,
+                prepared.id,
+                prepared.entry_id,
+                &prepared.registration.source_key,
+            )? {
+                return Err(CollectionStoreError::DuplicateSource(
+                    prepared.registration.source_key,
+                ));
+            }
+            tx.execute(
+                "UPDATE collection_entries
+                 SET source_namespace = ?1, source_path = ?2, normalized_path = ?3, resolved_kind = ?4
+                 WHERE collection_id = ?5 AND id = ?6",
+                params![
+                    prepared.registration.source_key.namespace().as_str(),
+                    prepared.registration.source_path.to_string_lossy(),
+                    prepared.registration.source_key.normalized_path(),
+                    prepared.registration.resolved_kind.as_str(),
+                    prepared.id.to_string(),
+                    prepared.entry_id.to_string(),
+                ],
+            )?;
+            increment_collection_revision(&tx, prepared.id)?;
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let snapshot = load_snapshot_with_catalog(&tx, prepared.id, catalog_revision)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
     }
 
     pub(super) fn migrate_sources(
@@ -500,7 +926,9 @@ impl CollectionStoreDb {
         &mut self,
         batch: CollectionSourceMigrationBatch,
     ) -> Result<CollectionMigrationOutcome, CollectionStoreError> {
-        let tx = self.conn.transaction()?;
+        self.last_mutation_applied = false;
+        let tx = self.conn.unchecked_transaction()?;
+        let guard = MutationGuard::catalog(&tx)?;
         let entries = load_all_entries(&tx)?;
         let mut replacements = Vec::new();
         let mut resulting_keys: HashMap<CollectionId, HashSet<CollectionSourcePathKey>> =
@@ -530,60 +958,161 @@ impl CollectionStoreDb {
                 return Err(CollectionStoreError::DuplicateSource(key));
             }
             if let Some(replacement) = replacement {
-                replacements.push((entry.id, entry.collection_id, replacement));
+                if replacement.path() != entry.source_path || replacement.key() != &entry.source_key
+                {
+                    replacements.push((
+                        entry.id,
+                        entry.collection_id,
+                        replacement.key().clone(),
+                        replacement.path().to_path_buf(),
+                    ));
+                }
             }
         }
 
-        if replacements.is_empty() {
-            let catalog_revision = catalog_revision(&tx)?;
-            tx.commit()?;
-            return Ok(CollectionMigrationOutcome {
-                catalog_revision,
+        let prepared = if replacements.is_empty() {
+            PreparedMutation::NoOp(CollectionMigrationOutcome {
+                catalog_revision: guard.catalog_revision,
                 affected: Arc::from([]),
                 updated_entries: 0,
-            });
-        }
-        let mut affected = HashSet::new();
-        // A batch may exchange two keys in the same collection. Validation above proves that the
-        // final key set is unique, but updating rows directly would still collide with the other
-        // row's old UNIQUE key. Move every affected row into a transaction-local namespace first;
-        // these values can never commit because every following error rolls the transaction back.
-        for (entry_id, _, _) in &replacements {
-            tx.execute(
-                "UPDATE collection_entries
-                 SET source_namespace = '_migration', normalized_path = ?1
-                 WHERE id = ?2",
-                params![entry_id.to_string(), entry_id.to_string()],
-            )?;
-        }
-        for (entry_id, collection_id, replacement) in &replacements {
-            tx.execute(
-                "UPDATE collection_entries
-                 SET source_namespace = ?1, source_path = ?2, normalized_path = ?3
-                 WHERE id = ?4",
-                params![
-                    replacement.key().namespace().as_str(),
-                    replacement.path().to_string_lossy(),
-                    replacement.key().normalized_path(),
-                    entry_id.to_string(),
-                ],
-            )?;
-            affected.insert(*collection_id);
-        }
-        let mut revisions = Vec::with_capacity(affected.len());
-        for id in affected {
-            revisions.push((id, increment_collection_revision(&tx, id)?));
-        }
-        revisions.sort_by_key(|(id, _)| id.as_uuid());
-        let catalog_revision = bump_catalog_revision(&tx)?;
-        let updated_entries = replacements.len();
+            })
+        } else {
+            PreparedMutation::Write(PreparedMigration {
+                guard,
+                previous_entries: entries,
+                replacements,
+            })
+        };
         tx.commit()?;
-        Ok(CollectionMigrationOutcome {
-            catalog_revision,
-            affected: Arc::from(revisions),
-            updated_entries,
+        self.execute_prepared(prepared, |conn, prepared| {
+            let tx = conn.transaction()?;
+            prepared.guard.revalidate(&tx)?;
+            if load_all_entries(&tx)? != prepared.previous_entries {
+                return Err(CollectionStoreError::Persistence(
+                    "collection sources changed during backup".into(),
+                ));
+            }
+            let mut affected = HashSet::new();
+            // A batch may exchange two keys in the same collection. Validation above proves that
+            // the final key set is unique, but updating rows directly would still collide with the
+            // other row's old UNIQUE key. Move every affected row into a transaction-local
+            // namespace first; every following error rolls the transaction back.
+            for (entry_id, _, _, _) in &prepared.replacements {
+                tx.execute(
+                    "UPDATE collection_entries
+                     SET source_namespace = '_migration', normalized_path = ?1
+                     WHERE id = ?2",
+                    params![entry_id.to_string(), entry_id.to_string()],
+                )?;
+            }
+            for (entry_id, collection_id, key, path) in &prepared.replacements {
+                tx.execute(
+                    "UPDATE collection_entries
+                     SET source_namespace = ?1, source_path = ?2, normalized_path = ?3
+                     WHERE id = ?4",
+                    params![
+                        key.namespace().as_str(),
+                        path.to_string_lossy(),
+                        key.normalized_path(),
+                        entry_id.to_string(),
+                    ],
+                )?;
+                affected.insert(*collection_id);
+            }
+            let mut revisions = Vec::with_capacity(affected.len());
+            for id in affected {
+                revisions.push((id, increment_collection_revision(&tx, id)?));
+            }
+            revisions.sort_by_key(|(id, _)| id.as_uuid());
+            let catalog_revision = bump_catalog_revision(&tx)?;
+            let updated_entries = prepared.replacements.len();
+            tx.commit()?;
+            Ok(CollectionMigrationOutcome {
+                catalog_revision,
+                affected: Arc::from(revisions),
+                updated_entries,
+            })
         })
     }
+}
+
+fn rotate_collection_backup(conn: &Connection, path: &Path) -> Result<(), String> {
+    let db_file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "collection database has no filename".to_string())?;
+    crate::db_backup::rotate_generation_backups(
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        db_file_name,
+        &|message| crate::logger::log(message),
+        &|destination| {
+            conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn emit_open_perf(timings: &OpenTimings, error: Option<&CollectionStoreError>) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "collection",
+        "db_open",
+        None,
+        0,
+        &[
+            (
+                "startup",
+                serde_json::Value::from(
+                    timings
+                        .startup
+                        .map_or("unknown", CollectionDbStartup::label),
+                ),
+            ),
+            (
+                "open_ms",
+                serde_json::Value::from(timings.open.as_secs_f64() * 1000.0),
+            ),
+            (
+                "validate_ms",
+                serde_json::Value::from(timings.validate.as_secs_f64() * 1000.0),
+            ),
+            (
+                "backup_ms",
+                serde_json::Value::from(timings.backup.as_secs_f64() * 1000.0),
+            ),
+            (
+                "schema_ms",
+                serde_json::Value::from(timings.schema.as_secs_f64() * 1000.0),
+            ),
+            (
+                "outcome",
+                serde_json::Value::from(if error.is_some() { "error" } else { "ok" }),
+            ),
+        ],
+    );
+}
+
+fn emit_backup_perf(elapsed: Duration, outcome: &'static str) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "collection",
+        "db_backup",
+        None,
+        0,
+        &[
+            ("trigger", serde_json::Value::from("first_mutation")),
+            ("outcome", serde_json::Value::from(outcome)),
+            (
+                "ms",
+                serde_json::Value::from(elapsed.as_secs_f64() * 1000.0),
+            ),
+        ],
+    );
 }
 
 fn validate_integrity(conn: &Connection) -> Result<(), CollectionStoreError> {
